@@ -3599,6 +3599,14 @@ class TestReorderUnhintedInterlopers(unittest.TestCase):
         # — y's reads are not produced by any op in run_start..j-1 after x moved.
         self.assertEqual(result, ["x", "y", "a", "b"])
 
+    def test_trailing_consumer_not_error(self):
+        # Unhinted op after the run that reads run outputs — trailing consumer,
+        # not an interloper.  No hinted ops follow it so it should not raise.
+        a = _make_rui_op("a", hint_ids=(0,))
+        b = _make_rui_op("b", hint_ids=(0,))
+        x = _make_rui_op("x", reads=("a", "b"))
+        self.assertEqual(self._run([a, b, x]), ["a", "b", "x"])
+
     def test_interloper_at_start_of_list(self):
         # Unhinted op before any hinted op — no run started yet, nothing to do.
         x = _make_rui_op("x")

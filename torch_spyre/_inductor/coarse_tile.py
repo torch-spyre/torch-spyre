@@ -214,22 +214,28 @@ def reorder_unhinted_interlopers(graph: GraphLowering) -> None:
             if not isinstance(candidate, ComputedBuffer) or ckey is not None:
                 # Non-ComputedBuffer or differently-hinted op — cannot reorder.
                 break
-            # candidate is an unhinted ComputedBuffer interloper.  Try to move
-            # it before the run start first (preferred: stays closer to its
-            # original position).
+            # candidate is an unhinted ComputedBuffer interloper.  Find the
+            # end of the immediately-following contiguous hinted block (used
+            # as the move-after insertion point).
+            run_end = j + 1
+            while run_end < len(ops) and _hint_key(ops[run_end]) == key:
+                run_end += 1
+            # If no hinted op with this key exists anywhere after j the
+            # candidate is a trailing consumer, not a true interloper — end
+            # the run silently.  A trailing consumer may sit after more
+            # unhinted ops or at end-of-list; either way it cannot split a
+            # group because there is no continuation to protect.
+            if not any(_hint_key(ops[k]) == key for k in range(j + 1, len(ops))):
+                break
+            # Hinted ops follow: candidate genuinely splits the run.  Try to
+            # move it before the run start first (preferred: stays closer to
+            # its original position).
             if _can_move_before(candidate, ops, run_start, j):
                 ops.insert(run_start, ops.pop(j))
                 run_start += 1
                 # j is unchanged: after the rotate, ops[j] is the next op.
                 continue
-            # Try moving after the end of the remaining run.  Find that end.
-            run_end = j + 1
-            while run_end < len(ops) and _hint_key(ops[run_end]) == key:
-                run_end += 1
-            # Only attempt move-after if there are hinted ops to skip over;
-            # if run_end == j + 1 the interloper is already at the run boundary
-            # and inserting at run_end would produce an infinite loop.
-            if run_end > j + 1 and _can_move_after(candidate, ops, j, run_end):
+            if _can_move_after(candidate, ops, j, run_end):
                 ops.insert(run_end, ops.pop(j))
                 # All ops between j and run_end-1 have key; skip past them and
                 # the moved interloper so the outer loop doesn't revisit it.
