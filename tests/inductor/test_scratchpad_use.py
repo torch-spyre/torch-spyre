@@ -826,9 +826,13 @@ class TestCpSatAllocatorIntegration(TestScratchpadUsage):
         with ts_inductor_config.patch(sencores=32):
             with ts_inductor_config.patch(layout_solver="cpsat"):
                 with ts_inductor_config.patch(lx_planning=True):
-                    with self.pre_scheduling_iterating_pass(visitor):
-                        compiled = torch.compile(model, fullgraph=True)
-                        device_result = compiled(*args).to("cpu")
+                    # Make every op LX-eligible (not just the residency
+                    # whitelist) so the solver is free to place the whole graph
+                    # on-chip; the prescribed plans below assume this.
+                    with ts_inductor_config.patch(allow_all_ops_in_lx_planning=True):
+                        with self.pre_scheduling_iterating_pass(visitor):
+                            compiled = torch.compile(model, fullgraph=True)
+                            device_result = compiled(*args).to("cpu")
 
         return cpu_result, device_result, fingerprint
 
@@ -877,13 +881,14 @@ class TestCpSatAllocatorIntegration(TestScratchpadUsage):
         self._assert_prescribed_allocation(f, (x,), expected)
 
     def test_mlp_prescribed_allocation_cpsat(self):
-        """SwiGLU MLP. The three matmul (Reduction) outputs and the down-proj
-        result land in HBM -- matmul outputs are not LX-residency eligible -- so
-        only the SwiGLU pointwise intermediate (the gate/up product feeding the
-        down projection) resides in LX. Every op takes a single 32-way split of
-        one axis: the four hidden-width ops split the stride-1024 axis
-        (``((1024, 32),)``), the down-proj output splits stride-256
-        (``((256, 32),)``).
+        """SwiGLU MLP. With every op LX-eligible, the solver keeps the whole
+        hidden-width region on-chip: the two projection matmuls, their SwiGLU
+        combination, and the down-projection's matmul intermediate all reside in
+        LX. Only the final down-proj result (buf4) spills to HBM -- it is the
+        graph return value, which the caller holds in HBM. Every op takes a
+        single 32-way split of one axis: the four hidden-width ops split the
+        stride-1024 axis (``((1024, 32),)``), the down-proj output splits
+        stride-256 (``((256, 32),)``).
         """
         seq_len, emb_dim, hidden_dim = 128, 256, 4 * 256
 
@@ -901,27 +906,28 @@ class TestCpSatAllocatorIntegration(TestScratchpadUsage):
             return ((x @ up) * torch.nn.functional.silu(x @ gate)) @ down
 
         expected = {
-            "buf0": ("HBM", 262144, (((1024, 32),), ())),
-            "buf1": ("HBM", 262144, (((1024, 32),), ())),
-            "buf2": ("HBM", 262144, (((1024, 32),), ())),
+            "buf0": ("LX", 262144, (((1024, 32),), ())),
+            "buf1": ("LX", 262144, (((1024, 32),), ())),
+            "buf2": ("LX", 262144, (((1024, 32),), ())),
             "buf3": ("LX", 262144, (((1024, 32),), ())),
             "buf4": ("HBM", 65536, (((256, 32),), ())),
         }
         self._assert_prescribed_allocation(mlp, (x, gate, up, down), expected)
 
     def test_sdpa_prescribed_allocation_cpsat(self):
-        """4D scaled-dot-product attention. Five buffers reside in LX (the
-        attention-score / probability intermediates of the
-        matmul -> softmax -> matmul chain); the matmul (Reduction) outputs, the
-        empty constant outputs of the decomposition (SpyreConstantFallback), and
-        the final result spill to HBM.
+        """4D scaled-dot-product attention. With every op LX-eligible, the whole
+        matmul -> softmax -> matmul chain resides in LX (10 of 12 buffers); only
+        the empty constant output of the decomposition (SpyreConstantFallback,
+        buf10) and the final result (buf9) land in HBM.
 
-        This is the case the split structure (rather than a bare core count)
-        actually matters: the ops use *different* 32-core divisions -- a 4x8
-        split across two axes (``((64, 8), (16384, 4))`` and
-        ``((256, 8), (65536, 4))``) for most of the chain, but a single 32-way
-        split (``((256, 32),)``) for one buffer -- alongside 4x4 = 16-way splits
-        (``((1, 8), (256, 4))`` etc.). The empty constant is undivided.
+        Keeping the whole chain resident constrains the core division: residency
+        requires producer and consumer to share a per-core slicing, so every
+        resident op collapses to a single-axis 4-way split (``((16384, 4),)``,
+        ``((65536, 4),)``, ``((256, 4),)``) rather than the more parallel 4x8 /
+        4x4 splits the unconstrained solve picks -- a concrete instance of the
+        residency-vs-parallelism trade-off, visible only because we track the
+        full split and not just the core count. The HBM result keeps a 4-way
+        split (``((64, 4),)``); the empty constant is undivided.
         """
         batch, heads, seq_len, head_dim = 1, 4, 256, 64
         q = self.rand_device((batch, heads, seq_len, head_dim))
@@ -932,18 +938,18 @@ class TestCpSatAllocatorIntegration(TestScratchpadUsage):
             return torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
         expected = {
-            "buf0": ("HBM", 131072, (((64, 8), (16384, 4)), ())),
-            "buf1": ("LX", 131072, (((64, 4), (16384, 4)), ())),
-            "buf2": ("HBM", 524288, (((256, 8), (65536, 4)), ())),
-            "buf3": ("LX", 131072, (((1, 8), (256, 4)), ())),
-            "buf4": ("LX", 524288, (((256, 8), (65536, 4)), ())),
-            "buf5": ("LX", 524288, (((256, 8), (65536, 4)), ())),
-            "buf6": ("LX", 131072, (((1, 8), (256, 4)), ())),
-            "buf7": ("HBM", 524288, (((256, 8), (65536, 4)), ())),
-            "buf8": ("HBM", 131072, (((64, 8), (16384, 4)), ())),
-            "buf9": ("HBM", 131072, (((256, 32),), ())),
+            "buf0": ("LX", 131072, (((16384, 4),), ())),
+            "buf1": ("LX", 131072, (((16384, 4),), ())),
+            "buf2": ("LX", 524288, (((65536, 4),), ())),
+            "buf3": ("LX", 131072, (((256, 4),), ())),
+            "buf4": ("LX", 524288, (((65536, 4),), ())),
+            "buf5": ("LX", 524288, (((65536, 4),), ())),
+            "buf6": ("LX", 131072, (((256, 4),), ())),
+            "buf7": ("LX", 524288, (((65536, 4),), ())),
+            "buf8": ("LX", 131072, (((16384, 4),), ())),
+            "buf9": ("HBM", 131072, (((64, 4),), ())),
             "buf10": ("HBM", 128, ((), ())),
-            "buf12": ("HBM", 131072, (((64, 4), (16384, 4)), ())),
+            "buf12": ("LX", 131072, (((16384, 4),), ())),
         }
         self._assert_prescribed_allocation(sdpa, (q, k, v), expected)
 
