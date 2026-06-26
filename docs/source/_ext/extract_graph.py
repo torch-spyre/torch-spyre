@@ -744,6 +744,23 @@ def _get_git_sha(repo_root):
         return "unknown"
 
 
+def _run_file_extractor(extractor, filepath, repo_root):
+    """Run a single-file extractor and normalize its source_file paths.
+
+    Extractors read their input via the path they are handed and echo it
+    back as each node's ``source_file``. We pass the absolute path so the
+    read resolves regardless of the current working directory (the docs
+    build runs from docs/source on ReadTheDocs, not the repo root), then
+    rewrite ``source_file`` to be relative to ``repo_root`` for display.
+    """
+    nodes, edges = extractor(str(filepath))
+    for node in nodes:
+        src = node.get("source_file")
+        if src:
+            node["source_file"] = str(Path(src).relative_to(repo_root))
+    return nodes, edges
+
+
 def build_graph(torch_spyre_root):
     """Run all extractors and assemble the deduplicated graph."""
     root = Path(torch_spyre_root)
@@ -764,8 +781,7 @@ def build_graph(torch_spyre_root):
 
     for extractor, filepath in op_extractors:
         if filepath.exists():
-            rel = str(filepath.relative_to(repo_root))
-            n, e = extractor(rel)
+            n, e = _run_file_extractor(extractor, filepath, repo_root)
             all_nodes.extend(n)
             all_edges.extend(e)
 
@@ -787,8 +803,7 @@ def build_graph(torch_spyre_root):
 
     for filepath in class_files:
         if filepath.exists():
-            rel = str(filepath.relative_to(repo_root))
-            n, e = extract_classes(rel)
+            n, e = _run_file_extractor(extract_classes, filepath, repo_root)
             all_nodes.extend(n)
             all_edges.extend(e)
 
@@ -802,16 +817,14 @@ def build_graph(torch_spyre_root):
 
     for filepath in codegen_files:
         if filepath.exists():
-            rel = str(filepath.relative_to(repo_root))
-            n, e = extract_codegen_structures(rel)
+            n, e = _run_file_extractor(extract_codegen_structures, filepath, repo_root)
             all_nodes.extend(n)
             all_edges.extend(e)
 
     # --- Configuration / environment variables ---
     config_path = root / "_inductor" / "config.py"
     if config_path.exists():
-        rel = str(config_path.relative_to(repo_root))
-        n, e = extract_config(rel)
+        n, e = _run_file_extractor(extract_config, config_path, repo_root)
         all_nodes.extend(n)
         all_edges.extend(e)
 
