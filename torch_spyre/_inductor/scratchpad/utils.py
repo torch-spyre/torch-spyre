@@ -43,8 +43,11 @@ OP_OUTPUT_GOOD_FOR_LX_REUSE = frozenset(
         "neg",
         "mm",
         "bmm",
+        "batched_matmul",
         "div",
         "realdiv",
+        "expand",
+        "silu",
     }
 )
 
@@ -57,6 +60,8 @@ OP_GOOD_FOR_LX_INPLACE = frozenset(
         "neg",
         "div",
         "realdiv",
+        "mul",
+        "silu",
     }
 )
 
@@ -203,22 +208,39 @@ def get_ncores_for_buffers(
     for buf_name, users in buf_user_deps.items():
         # this dict includes graph input and output
         if using_multicore and len(users) > 1:
-            # K-split-reduction producers leave partial sums on most cores;
-            # only k-last cores hold the final value. Without a broadcast
-            # codepath the buffer is not safe on LX, even if work-slice
-            # geometry happens to match. The flag is meaningful only for
-            # write-deps — a consumer reading a K-split input still gets
-            # its own valid work slice.
+            # A K-split-reduction writer leaves partial sums on most cores (only
+            # k-last cores hold the final value), so it's unsafe on LX even if
+            # geometry matches — the `flag` gate applies to write-deps only.
             ref_view = None
             mismatch = False
+            writer_cores = None
             for op, dep in users:
                 view, flag = _per_core_view_on_buf(op, dep, buf_name, cache)
                 if ref_view is None:
                     ref_view = view
-                if (flag and dep in op.get_read_writes().writes) or (view != ref_view):
+                if dep in op.get_read_writes().writes:
+                    # Size by the writer's core count (the writer sets per-core
+                    # footprint size/writer_cores; readers touch only their slice),
+                    # not max() over users. One writer per buffer (it's named after
+                    # its producing op; an in-place op recurs as a reader, not a
+                    # second writer). _op_num_cores folds in K-split factors, an
+                    # unfaithful output divisor — but a K-split sets `flag` and is
+                    # rejected below, so writer_cores divides only for output splits.
+                    writer_cores = _op_num_cores(op)
+                    if flag:
+                        mismatch = True
+                        break
+                if view != ref_view:
                     mismatch = True
                     break
-            num_cores = -1 if mismatch else max(_op_num_cores(op) for op, _ in users)
+            if mismatch:
+                num_cores = -1
+            elif writer_cores is not None:
+                num_cores = writer_cores
+            else:
+                # No writer (graph input, produced outside the graph): fall back
+                # to the users' (matching) max count.
+                num_cores = max(_op_num_cores(op) for op, _ in users)
         elif using_multicore:
             num_cores = _op_num_cores(users[0][0])
         else:

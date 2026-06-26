@@ -1243,7 +1243,24 @@ def _per_core_view_on_buf(
     rw = op.get_read_writes()
     empty_view = (PerCoreView(work_slice_dims=(), core_to_slot=()), False)
     if not any(n > 1 for d in coeff_splits for n in d.values()):
-        result = empty_view
+        # Single-core (unsplit) op owns the WHOLE buffer on one core. Encode as
+        # explicit all-factor-1 dims so it does NOT alias the broadcast empty_view
+        # a multi-core op yields when its splits all contract on this buffer (Step
+        # 2). Otherwise a 1-core producer and its 32-core consumers compare equal,
+        # the buffer is sized per-consumer-core (under-counted), and a too-large
+        # buffer gets wrongly LX-pinned. Real sliced views always carry a factor>1.
+        buf_layout = V.graph.get_buffer(buf_name).layout
+        if not isinstance(buf_layout, FixedTiledLayout):
+            result = empty_view
+        else:
+            ndims = len(buf_layout.device_layout.device_size)
+            result = (
+                PerCoreView(
+                    work_slice_dims=tuple((i, 1) for i in range(ndims)),
+                    core_to_slot=(),
+                ),
+                False,
+            )
         if cache is not None:
             cache[key] = result
         return result
