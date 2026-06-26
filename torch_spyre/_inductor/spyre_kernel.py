@@ -495,6 +495,14 @@ class SpyreKernel(Kernel[CSEVariable]):
         # can correctly isolate each loop variable's contribution.
 
         index = concretize_index(tensor.index, set(it_space.keys()))
+
+        # insert_post_mutation_restickify may override the input layout for this input tensor.
+        # Restore it here because the tensor data was uploaded as orig_stl.
+        if is_input:
+            overrides = getattr(self.current_node.node, "_input_layout_overrides", {})
+            if (layout := overrides.get(name)) is not None:
+                tensor.layout = layout
+
         device_coords = compute_coordinates(
             tensor.layout.device_layout.device_size,
             tensor.layout.device_layout.stride_map,
@@ -705,21 +713,25 @@ class SpyreKernel(Kernel[CSEVariable]):
         value: RValue,
         mode: StoreMode = None,
     ) -> None:
-        buf = V.graph.get_buffer(name)
+        # mutation_real_name maps mutation aliases to their real destination buffer. Resolve that here,
+        # and mark the buf name as removed so the wrapper does not allocate it separately.
+        real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
+        if real_dst_name != name:
+            V.graph.removed_buffers.add(name)
+        buf = V.graph.get_buffer(real_dst_name)
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
-            raise Unsupported(f"{name} does not have FixedTiledLayout")
+            raise Unsupported(f"{real_dst_name} does not have FixedTiledLayout")
         # Pool buffers are intermediates whose address is baked into the TensorArg
         # allocation dict; registering them as outputs would overflow SEGMENT_OFFSETS.
         # (lx buffers are already excluded from spyre_kernel_args in _tensor_arg.)
         if "pool" not in layout.allocation:
+            # Pass the alias here, not real_dst_name: args.output resolves the
+            # mutation alias internally. (load() passes the pre-resolved real
+            # name to args.input, which does not resolve.)
             _ = self.args.output(name)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        dst = TensorAccess(name, index, layout)
-        real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
-        if real_dst_name != name:
-            # Skip allocating an output buffer; this name is an alias to another buffer
-            V.graph.removed_buffers.add(name)
+        dst = TensorAccess(real_dst_name, index, layout)
         op_info: dict[str, Any] = {}
         if logger.isEnabledFor(logging.DEBUG):
             value_type = type(value).__name__
@@ -916,6 +928,16 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
+
+    def emit_layout_restores(self, restores) -> None:
+        """Emit set_spyre_tensor_layout wrapper calls after this kernel's run.
+
+        The scheduler selects and dedups the restores; this kernel just writes
+        them into the wrapper alongside its own call, using the same wrapper.
+        """
+        wrapper = V.graph.wrapper_code
+        for target_name, alt_stl in restores:
+            wrapper.writeline(f"set_spyre_tensor_layout({target_name}, {alt_stl!r})")
 
 
 def _indirect_syms_used(

@@ -271,6 +271,28 @@ class SuperDSCScheduling(BaseScheduling):
                 raise RuntimeError(f"Unexpected node type: {type(node)}")
         return node_schedule
 
+    def _collect_layout_restores(self, node_schedule) -> list:
+        """Select the layout restores to emit after a kernel call.
+
+        Walks the kernel's nodes for _emit_set_layout tags set by
+        insert_post_mutation_restickify and dedups them against the ones already
+        emitted by earlier kernels, so each target restores once across the whole
+        graph. Selection is the scheduler's job (it owns the node list and the
+        cross-kernel dedup state); the kernel just emits the returned list.
+        """
+        # Dedup is graph-scoped: a target's device layout must be restored
+        # exactly once across the whole generated program, not once per kernel.
+        # The state lives on V.graph (one GraphLowering per compilation), so it
+        # starts empty for each graph without any explicit reset.
+        emitted = V.graph.__dict__.setdefault("_emitted_layout_targets", set())
+        restores = []
+        for snode in node_schedule:
+            emit = getattr(getattr(snode, "node", None), "_emit_set_layout", None)
+            if emit is not None and emit[0] not in emitted:
+                emitted.add(emit[0])
+                restores.append(emit)
+        return restores
+
     def codegen_node(
         self, node: Union[FusedSchedulerNode, SchedulerNode, CountedLoopSchedulerNode]
     ) -> None:
@@ -314,6 +336,7 @@ class SuperDSCScheduling(BaseScheduling):
 
         self.codegen_comment(node_schedule, kernel_name)
         kernel.call_kernel(kernel.kernel_name)
+        kernel.emit_layout_restores(self._collect_layout_restores(node_schedule))
 
         V.graph.removed_buffers |= kernel.removed_buffers
         V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
@@ -369,6 +392,7 @@ class SuperDSCScheduling(BaseScheduling):
 
         self.codegen_comment(all_schedule_nodes, kernel_name)
         kernel.call_kernel(kernel.kernel_name)
+        kernel.emit_layout_restores(self._collect_layout_restores(all_schedule_nodes))
 
         V.graph.removed_buffers |= kernel.removed_buffers
         V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
