@@ -133,6 +133,39 @@ def spyre__fill_scalar(
     return self
 
 
+@torch.library.register_kernel("aten::full", ["spyre"])  # type:ignore
+def spyre_full(
+    size: list | tuple,
+    fill_value: int | float | bool | complex,
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
+) -> torch.Tensor:
+    assert layout in (torch.strided, None), f"doesn't support layout={layout}"
+    assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
+    t = torch.empty(size, dtype=dtype, device=device)
+    torch_spyre._C.fill_tensor(t, float(fill_value))
+    return t
+
+
+@torch.library.register_kernel("aten::ones", ["spyre"])  # type:ignore
+def spyre_ones(
+    size: list | tuple,
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
+) -> torch.Tensor:
+    assert layout in (torch.strided, None), f"doesn't support layout={layout}"
+    assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
+    t = torch.empty(size, dtype=dtype, device=device)
+    torch_spyre._C.fill_tensor(t, 1.0)
+    return t
+
+
 @torch.library.register_kernel("aten::normal_", ["spyre"])  # type:ignore
 def spyre__normal_(self, mean=0.0, std=1.0, *, generator=None):
     # "normal_" generates a random tensor, thus copying
