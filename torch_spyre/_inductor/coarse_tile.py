@@ -190,6 +190,10 @@ def reorder_unhinted_interlopers(graph: GraphLowering) -> None:
 
     When both directions are legal the op is moved before the run (closer
     to its original position).
+
+    Raises ``RuntimeError`` if an interloper cannot be moved in either
+    direction (data-flow dependencies anchor it between hinted ops that share
+    the same hint key).
     """
     ops = graph.operations
     i = 0
