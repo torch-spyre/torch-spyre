@@ -141,9 +141,14 @@ class ScratchpadAllocator(ABC):
             # If the op is tagged as pointwise by pytorch upstream
             # allow all inputs. Does not work for all ops
             return reads
-        if hasattr(op, "data"):
-            return get_op_pointwise_inputs(op)
-        return []
+        # ``.data`` is the Pointwise computation behind a ComputedBuffer; extern
+        # fallback kernels (e.g. SpyreConstantFallback) have no ``.data``.
+        # ``get_op_pointwise_inputs`` expects that Pointwise node and already
+        # returns [] for any non-Pointwise (including None), so a missing
+        # ``.data`` cleanly means "no pointwise inputs". The greedy path's
+        # _filter_ops drops these ops before here; the joint-division path
+        # reaches them, so guard the access.
+        return get_op_pointwise_inputs(getattr(op, "data", None))
 
     def _filter_ops(
         self,

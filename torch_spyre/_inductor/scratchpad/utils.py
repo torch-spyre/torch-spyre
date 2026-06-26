@@ -214,6 +214,12 @@ def buffer_not_read_in_full(graph: GraphLowering | GraphView, buf_name: str) -> 
                 if int(dep.get_numel()) < full:
                     return True
             except (TypeError, ValueError, AttributeError):
+                # A degenerate scalar dep (e.g. a reduction-to-scalar read whose
+                # MemoryDep index is a plain int 0, not a sympy expr) makes
+                # ``get_numel`` raise AttributeError on ``index.free_symbols``.
+                # As with the other failure modes here, an introspection we
+                # can't complete means we can't prove a full read -> unsafe to
+                # pin -> keep in HBM (correct, just unpinned).
                 return True
     return False
 
