@@ -3620,6 +3620,18 @@ class TestReorderUnhintedInterlopers(unittest.TestCase):
         c = _make_rui_op("c", hint_ids=(0,))
         self.assertEqual(self._run([a, x, b, c]), ["x", "a", "b", "c"])
 
+    def test_move_after_op_follows_run(self):
+        # [H, U(reads H), H, H, V(reads U)] — move-before blocked (x reads a);
+        # move-after should land x just after c, before d.
+        # Catches the pop-then-insert off-by-one: insert must be at run_end-1
+        # not run_end after the pop shifts indices.
+        a = _make_rui_op("a", hint_ids=(0,))
+        x = _make_rui_op("x", reads=("a",))
+        b = _make_rui_op("b", hint_ids=(0,))
+        c = _make_rui_op("c", hint_ids=(0,))
+        d = _make_rui_op("d", reads=("x",))  # unhinted, reads x — after run
+        self.assertEqual(self._run([a, x, b, c, d]), ["a", "b", "c", "x", "d"])
+
 
 if __name__ == "__main__":
     unittest.main()

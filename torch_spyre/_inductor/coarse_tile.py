@@ -125,6 +125,11 @@ def _hint_key(op: Operation) -> frozenset | None:
     return frozenset(h.hint_id for h in hints) if hints else None
 
 
+def _written_names(op: ComputedBuffer) -> set[str]:
+    """Return all buffer names written by op: its output plus any mutation targets."""
+    return {op.get_name()} | set(op.get_mutation_names())
+
+
 def _can_move_before(
     op: Operation,
     ops: list[Operation],
@@ -134,19 +139,21 @@ def _can_move_before(
     """Return True if op (currently at ops[end]) can move to just before ops[start].
 
     Legal iff neither direction of data-flow is violated:
-      (a) ops[start..end-1] do not read op's output buffer, and
-      (b) op does not read any buffer produced by ops[start..end-1].
+      (a) ops[start..end-1] do not read or mutate op's written buffers, and
+      (b) op does not read or mutate any buffer written by ops[start..end-1].
     """
     if not isinstance(op, ComputedBuffer):
         return False
-    op_name = op.get_name()
+    op_written = _written_names(op)
     op_reads = op.get_read_names()
+    op_mutates = set(op.get_mutation_names())
     for other in ops[start:end]:
         if not isinstance(other, ComputedBuffer):
             continue
-        if op_name in other.get_read_names():
+        other_written = _written_names(other)
+        if op_written & other.get_read_names():
             return False
-        if other.get_name() in op_reads:
+        if other_written & (op_reads | op_mutates):
             return False
     return True
 
@@ -159,19 +166,21 @@ def _can_move_after(
 ) -> bool:
     """Return True if op (currently at ops[start]) can move to just after ops[end-1].
 
-    Legal iff ops[start+1..end-1] do not read op's output buffer and op does
-    not read any buffer produced by ops[start+1..end-1].
+    Legal iff ops[start+1..end-1] do not read or mutate op's written buffers and
+    op does not read or mutate any buffer written by ops[start+1..end-1].
     """
     if not isinstance(op, ComputedBuffer):
         return False
-    op_name = op.get_name()
+    op_written = _written_names(op)
     op_reads = op.get_read_names()
+    op_mutates = set(op.get_mutation_names())
     for other in ops[start + 1 : end]:
         if not isinstance(other, ComputedBuffer):
             continue
-        if op_name in other.get_read_names():
+        other_written = _written_names(other)
+        if op_written & other.get_read_names():
             return False
-        if other.get_name() in op_reads:
+        if other_written & (op_reads | op_mutates):
             return False
     return True
 
@@ -240,9 +249,14 @@ def reorder_unhinted_interlopers(graph: GraphLowering) -> None:
                 # j is unchanged: after the rotate, ops[j] is the next op.
                 continue
             if _can_move_after(candidate, ops, j, run_end):
-                ops.insert(run_end, ops.pop(j))
-                # All ops between j and run_end-1 have key; skip past them and
-                # the moved interloper so the outer loop doesn't revisit it.
+                # pop(j) shifts everything after j left by one, so the last
+                # hinted op (formerly run_end-1) is now at run_end-2 and the
+                # first non-hinted op after the block (if any) is at run_end-1.
+                # Insert at run_end-1 to land just after the last hinted op.
+                ops.insert(run_end - 1, ops.pop(j))
+                # j=run_end skips the hinted block (now at j..run_end-2) and
+                # the placed interloper (run_end-1), landing on run_end which
+                # is the original boundary op or end-of-list.
                 j = run_end
                 break
             # The interloper cannot be moved in either direction — it has a
