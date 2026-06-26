@@ -769,6 +769,28 @@ const at::Tensor& spyre_resize_(
   return self;
 }
 
+at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
+  TORCH_CHECK(self.is_privateuseone(), "spyre_fill_tensor: tensor must be on spyre device");
+  TORCH_CHECK(self.numel() > 0, "spyre_fill_tensor: cannot fill empty tensor");
+
+  // Get the device allocation (CompositeAddress) from the spyre tensor
+  auto* spyre_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
+  auto& storage = spyre_impl->storage();
+  auto* ctx = static_cast<SharedOwnerCtx*>(storage.data_ptr().get_context());
+
+  // Map torch dtype to DataFormats for the fill pattern conversion
+  DataFormats dtype = get_device_dtype(self.scalar_type());
+
+  // Construct FillParams and launch via SpyreStream
+  flex::FillParams params(&ctx->composite_addr, ctx->composite_addr.total_size(),
+                          flex::RuntimeOperationFill::valueToFillPattern(value, dtype),
+                          /*use_dmai=*/true);
+  SpyreStream stream;
+  stream.launchFill(&params);
+
+  return self;
+}
+
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("empty.memory_format", TORCH_FN(spyre_empty));
   m.impl("empty_strided", TORCH_FN(spyre_empty_strided));

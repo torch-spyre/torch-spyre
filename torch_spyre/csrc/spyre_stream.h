@@ -59,6 +59,7 @@ class SpyreStream {
   void launchD2H(flex::DmaParams* params) const;
   void launchCompute(flex::ComputeParams* params) const;
   void launchHostCallback(flex::HostCallbackParams* params) const;
+  void launchFill(flex::FillParams* params) const;
 
   // Conversions
   c10::Stream unwrap() const;

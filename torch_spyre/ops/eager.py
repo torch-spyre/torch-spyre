@@ -129,8 +129,7 @@ register_torch_compile_kernel(
 def spyre__fill_scalar(
     self: torch.Tensor, other: int | float | bool | complex
 ) -> torch.Tensor:
-    tmp = torch.ones(self.size(), dtype=self.dtype) * other
-    self.copy_(tmp)
+    torch_spyre._C.fill_tensor(self, float(other))
     return self
 
 
@@ -149,12 +148,8 @@ def spyre__normal_(self, mean=0.0, std=1.0, *, generator=None):
 
 @torch.library.register_kernel("aten::zero_", ["spyre"])  # type:ignore
 def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
-    """Zero out the tensor in-place."""
-    # Create zeros on CPU
-    tmp = torch.zeros(self.size(), dtype=self.dtype, device="cpu")
-    # Copy to device
-    self.copy_(tmp)
-    # TODO: Can we zero out tensors in-place without copy
+    """Zero out the tensor in-place using device-side FillDMA."""
+    torch_spyre._C.fill_tensor(self, 0.0)
     return self
 
 
