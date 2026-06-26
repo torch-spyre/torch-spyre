@@ -780,6 +780,156 @@ class TestCpSatAllocatorIntegration(TestScratchpadUsage):
             f"expected the reused intermediate to reside in LX, got {residency}",
         )
 
+    def _cpsat_allocation_fingerprint(
+        self,
+        model: Callable[[Unpack[Ts]], torch.Tensor],
+        args: tuple[Unpack[Ts]],
+    ) -> tuple[torch.Tensor, torch.Tensor, list[tuple[str, int, int]]]:
+        """Compile ``model`` under the cpsat solver (sencores=32, lx_planning on)
+        and return ``(cpu_result, device_result, fingerprint)``.
+
+        The fingerprint is a name-independent signature of the chosen
+        allocation: the sorted list of ``(location, size_bytes, cores)`` over
+        every op, where ``location`` is "LX"/"HBM" and ``cores`` is the product
+        of the committed output/reduction splits. Buffer names (buf0, buf1, ...)
+        are an unstable keying choice, but this profile is deterministic
+        run-to-run, so it can be prescribed exactly.
+        """
+        cpu_result = model(*(t.to("cpu") for t in args))
+
+        fingerprint: list[tuple[str, int, int]] = []
+
+        def visitor(graph: GraphLowering) -> None:
+            fingerprint.clear()
+            for op in graph.operations:
+                layout = graph.get_buffer(op.name).get_layout()
+                device_layout = layout.device_layout
+                allocation = getattr(layout, "allocation", {})
+                out, red = getattr(op, "op_it_space_splits", ({}, {}))
+                cores = math.prod(out.values() or [1]) * math.prod(red.values() or [1])
+                fingerprint.append(
+                    (
+                        "LX" if "lx" in allocation else "HBM",
+                        math.prod(device_layout.device_size[:-1]) * 128,
+                        cores,
+                    )
+                )
+            fingerprint.sort()
+
+        with ts_inductor_config.patch(sencores=32):
+            with ts_inductor_config.patch(layout_solver="cpsat"):
+                with ts_inductor_config.patch(lx_planning=True):
+                    with self.pre_scheduling_iterating_pass(visitor):
+                        compiled = torch.compile(model, fullgraph=True)
+                        device_result = compiled(*args).to("cpu")
+
+        return cpu_result, device_result, fingerprint
+
+    def _assert_prescribed_allocation(
+        self,
+        model: Callable[[Unpack[Ts]], torch.Tensor],
+        args: tuple[Unpack[Ts]],
+        expected: list[tuple[str, int, int]],
+        atol: float = 0.1,
+        rtol: float = 0.1,
+    ) -> None:
+        cpu_result, device_result, fingerprint = self._cpsat_allocation_fingerprint(
+            model, args
+        )
+        self.assertEqual(
+            fingerprint,
+            sorted(expected),
+            "cpsat allocation does not match the prescribed ideal "
+            f"(location, size, cores):\n  expected {sorted(expected)}\n  got      "
+            f"{fingerprint}",
+        )
+        torch.testing.assert_close(
+            device_result,
+            cpu_result,
+            atol=atol,
+            rtol=rtol,
+            msg="prescribed-allocation result diverged from CPU",
+        )
+
+    def test_softmax_prescribed_allocation_cpsat(self):
+        """softmax(dim=0) over (512, 1024): the two reductions (max, sum) and
+        the two pointwise intermediates (exp, the normalised body) all reside in
+        LX; only the final pointwise output spills to HBM (it is the graph
+        return value, which the caller holds in HBM). Every op is split 16 ways.
+        """
+        f = functools.partial(torch.softmax, dim=0)
+        x = self.rand_device((512, 1024))
+        expected = [
+            ("HBM", 1048576, 16),
+            ("LX", 2048, 16),
+            ("LX", 2048, 16),
+            ("LX", 1048576, 16),
+            ("LX", 1048576, 16),
+        ]
+        self._assert_prescribed_allocation(f, (x,), expected)
+
+    def test_mlp_prescribed_allocation_cpsat(self):
+        """SwiGLU MLP. The three matmul (Reduction) outputs and the down-proj
+        result land in HBM -- matmul outputs are not LX-residency eligible -- so
+        only the SwiGLU pointwise intermediate (the gate/up product feeding the
+        down projection) resides in LX. Every op is split across all 32 cores.
+        """
+        seq_len, emb_dim, hidden_dim = 128, 256, 4 * 256
+
+        def kaiming(rows, cols):
+            w = torch.empty(rows, cols, dtype=torch.float16)
+            torch.nn.init.kaiming_uniform_(w)
+            return w.to("spyre")
+
+        x = torch.randn(seq_len, emb_dim, dtype=torch.float16).to("spyre")
+        gate = kaiming(emb_dim, hidden_dim)
+        up = kaiming(emb_dim, hidden_dim)
+        down = kaiming(hidden_dim, emb_dim)
+
+        def mlp(x, gate, up, down):
+            return ((x @ up) * torch.nn.functional.silu(x @ gate)) @ down
+
+        expected = [
+            ("HBM", 65536, 32),
+            ("HBM", 262144, 32),
+            ("HBM", 262144, 32),
+            ("HBM", 262144, 32),
+            ("LX", 262144, 32),
+        ]
+        self._assert_prescribed_allocation(mlp, (x, gate, up, down), expected)
+
+    def test_sdpa_prescribed_allocation_cpsat(self):
+        """4D scaled-dot-product attention. Five buffers reside in LX (the
+        attention-score / probability intermediates of the
+        matmul -> softmax -> matmul chain); the matmul (Reduction) outputs, the
+        empty constant outputs of the decomposition (SpyreConstantFallback), and
+        the final result spill to HBM. Most ops split 32 ways; the softmax body
+        over the key dimension splits 16 ways.
+        """
+        batch, heads, seq_len, head_dim = 1, 4, 256, 64
+        q = self.rand_device((batch, heads, seq_len, head_dim))
+        k = self.rand_device((batch, heads, seq_len, head_dim))
+        v = self.rand_device((batch, heads, seq_len, head_dim))
+
+        def sdpa(q, k, v):
+            return torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+        expected = [
+            ("HBM", 128, 1),
+            ("HBM", 131072, 16),
+            ("HBM", 131072, 32),
+            ("HBM", 131072, 32),
+            ("HBM", 131072, 32),
+            ("HBM", 524288, 32),
+            ("HBM", 524288, 32),
+            ("LX", 131072, 16),
+            ("LX", 131072, 32),
+            ("LX", 131072, 32),
+            ("LX", 524288, 32),
+            ("LX", 524288, 32),
+        ]
+        self._assert_prescribed_allocation(sdpa, (q, k, v), expected)
+
 
 class TestCpSatAllocatorFallback(TestScratchpadUsage):
     """When ``layout_solver="cpsat"`` is selected but ortools is unavailable, the

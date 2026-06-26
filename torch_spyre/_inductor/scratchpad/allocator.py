@@ -126,7 +126,13 @@ class ScratchpadAllocator(ABC):
             # If the op is tagged as pointwise by pytorch upstream
             # allow all inputs. Does not work for all ops
             return reads
-        return get_op_pointwise_inputs(op.data)
+        # Ops without a ``.data`` IR node (e.g. SpyreConstantFallback, the
+        # ``torch.empty`` outputs an SDPA decomposition emits) are not pointwise
+        # and cannot reuse an input in place. DefaultAllocator never reaches them
+        # because it iterates the _filter_ops view; CoOptimizingAllocator iterates
+        # every op, so guard here (get_op_pointwise_inputs returns [] for a
+        # non-Pointwise node, including None).
+        return get_op_pointwise_inputs(getattr(op, "data", None))
 
     def _filter_ops(self, graph: GraphLowering) -> list[Operation]:
         core_div_mismatch = get_ncores_for_buffers(graph)
