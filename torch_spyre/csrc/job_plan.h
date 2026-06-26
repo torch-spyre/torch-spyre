@@ -339,11 +339,14 @@ class JobPlanStepCompute final : public JobPlanStep {
   /**
    * @brief Construct compute step
    *
-   * @param program_address The program's FULL device allocation. flex bounds the segment-7
-   * translation to its total_size() (the real Allocate footprint), never SEGMENT_SIZE.
-   * @param bind_io_addresses Whether to bind the compute operation with inputs and outputs addresses
-   * @param bootstrap_offset Offset within the program allocation where execution begins (0 = base;
-   * the program-correction region size when correction precedes the binary)
+   * @param program_address The program's FULL device allocation. flex bounds
+   * the segment-7 translation to its total_size() (the real Allocate
+   * footprint), never SEGMENT_SIZE.
+   * @param bind_io_addresses Whether to bind the compute operation with inputs
+   * and outputs addresses
+   * @param bootstrap_offset Offset within the program allocation where
+   * execution begins (0 = base; the program-correction region size when
+   * correction precedes the binary)
    */
   explicit JobPlanStepCompute(flex::CompositeAddress program_address,
                               bool bind_io_addresses,

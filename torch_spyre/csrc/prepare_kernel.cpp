@@ -272,9 +272,10 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
   std::string job_bin_ptr_str = cmd["job_bin_ptr"].get<std::string>();
   uint64_t job_bin_ptr = std::stoull(job_bin_ptr_str);
 
-  // job_bin_ptr is the segment-7 virtual address where the program's instructions begin (after the
-  // program-correction region). Validate it is in segment 7 and derive the offset of that entry
-  // point within the program allocation (0 when the binary starts at the allocation base).
+  // job_bin_ptr is the segment-7 virtual address where the program's
+  // instructions begin (after the program-correction region). Validate it is in
+  // segment 7 and derive the offset of that entry point within the program
+  // allocation (0 when the binary starts at the allocation base).
   TORCH_CHECK(
       job_bin_ptr >= prog_offset_base && job_bin_ptr < prog_offset_limit,
       "job_bin_ptr 0x", std::hex, job_bin_ptr,
@@ -282,15 +283,17 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
       prog_offset_limit, ")");
   uint64_t bootstrap_offset = job_bin_ptr - prog_offset_base;
 
-  // Hand flex the program's FULL allocation as a non-owning descriptor over the same chunk (the
-  // owning CompositeAddress stays in job_allocation_, which is later moved into the JobPlan and
-  // outlives this step). flex bounds the segment-7 xlat to its total_size() -- the real deeptools
-  // Allocate footprint -- instead of the 16GB SEGMENT_SIZE. The size grows automatically if/when
+  // Hand flex the program's FULL allocation as a non-owning descriptor over the
+  // same chunk (the owning CompositeAddress stays in job_allocation_, which is
+  // later moved into the JobPlan and outlives this step). flex bounds the
+  // segment-7 xlat to its total_size() -- the real deeptools Allocate footprint
+  // -- instead of the 16GB SEGMENT_SIZE. The size grows automatically if/when
   // deeptools grows the Allocate, requiring no further change here.
   TORCH_CHECK(job_allocation_.at(0).chunks().size() == 1,
               "job_allocation must have 1 chunk");
-  TORCH_CHECK(job_allocation_.at(0).total_size() > 0,
-              "ComputeOnDevice program allocation must be populated (size > 0)");
+  TORCH_CHECK(
+      job_allocation_.at(0).total_size() > 0,
+      "ComputeOnDevice program allocation must be populated (size > 0)");
   flex::CompositeAddress program_address(job_allocation_.at(0).chunks()[0]);
 
   return std::make_unique<JobPlanStepCompute>(
