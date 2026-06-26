@@ -65,9 +65,8 @@ class TestBroadcast(TestCase):
         if not dist.is_initialized():
             dist.init_process_group(f"cpu:gloo,spyre:{C10D_BACKEND}")
 
-        # initialize_library() (called inside createSpyreCCLBackend) creates
-        # the RAS RuntimeContext. Ensure the flex runtime is started after
-        # CCL init so flex::initializeRuntime() sees the existing context.
+        # _lazy_init() must follow CCL init: initialize_library() creates
+        # the RuntimeContext, _lazy_init() attaches to it.
         if not torch.spyre.is_initialized():
             torch.spyre._impl._lazy_init()
 

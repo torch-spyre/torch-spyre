@@ -303,11 +303,8 @@ def _autoload():
         import torch.distributed as dist
 
         def _create_spyre_ccl_backend(store, rank, size, timeout):
-            # Do NOT call _lazy_init() here. The old initialize_library(runtime,
-            # stream) API required the flex runtime to be up first so it could
-            # accept the runtime handle. The new no-arg initialize_library()
-            # creates the RuntimeContext itself; calling startRuntime() first
-            # would result in ContextAlreadyCreated (0x8aff).
+            # Do NOT call _lazy_init() before createSpyreCCLBackend;
+            # initialize_library() now creates the RuntimeContext itself.
             from torch_spyre._C import createSpyreCCLBackend
 
             return createSpyreCCLBackend(store, rank, size, timeout)
