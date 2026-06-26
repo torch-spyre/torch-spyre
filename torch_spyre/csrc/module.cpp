@@ -443,8 +443,12 @@ PYBIND11_MODULE(_C, m) {
         "        If None, uses the current stream. Defaults to None.\n\n"
         "Returns:\n"
         "    Prepared JobPlan ready for execution");
-  m.def("launch_jobplan", &spyre::launchJobPlan, py::arg("job_plan"),
-        py::arg("args"),
+  // Bind the current-stream overload (resolves the current stream internally).
+  m.def("launch_jobplan",
+        static_cast<void (*)(const spyre::JobPlan&,
+                             const std::vector<at::Tensor>&)>(
+            &spyre::launchJobPlan),
+        py::arg("job_plan"), py::arg("args"),
         "Launch a prepared JobPlan with the given tensor arguments.\n\n"
         "Args:\n"
         "    job_plan: The JobPlan to execute\n"
