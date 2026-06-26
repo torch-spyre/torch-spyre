@@ -272,9 +272,10 @@ def _maybe_chunk_large_tensors(graph: GraphLowering) -> None:
 
 @_runs(hints_to_coarse_tile_groups, coarse_tile)
 def _maybe_coarse_tile(graph: GraphLowering) -> None:
-    groups = hints_to_coarse_tile_groups(graph)
-    if groups:
-        coarse_tile(graph, groups=groups)
+    if not config.ignore_wsr_hints:
+        groups = hints_to_coarse_tile_groups(graph)
+        if groups:
+            coarse_tile(graph, groups=groups)
 
 
 @_runs(cost_model_matmul_division, work_distribution)
