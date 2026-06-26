@@ -99,7 +99,7 @@ void _startRuntime() {
               "Device index out of bounds. logical_device_id=",
               logical_device_id, ", number of visible devices=", num_devices);
 
-  std::shared_ptr<Runtime> runtime;
+  std::shared_ptr<flex::RuntimeContext> runtime;
   auto s = flex::initializeRuntime(&runtime, logical_device_id);
   init_from_env();
   if (runtime) {
