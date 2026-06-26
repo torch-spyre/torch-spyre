@@ -690,6 +690,141 @@ class TestDivideRanges(unittest.TestCase):
         self.assertFalse(hasattr(red, _LOOPS_FREE_SYMS_KEY))
         self.assertFalse(hasattr(red, _REDUCTION_FREE_SYMS_KEY))
 
+    # ------------------------------------------------------------------
+    # Device-layout reconstruction tests (FixedTiledLayout path)
+    # ------------------------------------------------------------------
+
+    def _make_ftl_op(self, host_size, dim_order, dtype=torch.float16, elem_arr=None):
+        """Build a ComputedBuffer with a FixedTiledLayout for testing _divide_ranges.
+
+        Returns (op, layout) where layout.device_layout is a SpyreTensorLayout
+        constructed from (host_size, contiguous_strides, dtype, dim_order, elem_arr).
+        """
+        from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise
+
+        from torch_spyre._C import ElementArrangement, SpyreTensorLayout
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        if elem_arr is None:
+            elem_arr = ElementArrangement.STANDARD
+
+        strides = [int(s) for s in FlexibleLayout.contiguous_strides(host_size)]
+        device_layout = SpyreTensorLayout(
+            host_size, strides, dtype, dim_order, elem_arr
+        )
+        layout = FixedTiledLayout(
+            torch.device("cpu"),
+            dtype,
+            [Integer(s) for s in host_size],
+            [Integer(s) for s in strides],
+            device_layout,
+        )
+        pw = Pointwise(
+            device=torch.device("cpu"),
+            dtype=dtype,
+            inner_fn=lambda index: sympy.Integer(1),
+            ranges=[Integer(s) for s in host_size],
+        )
+        op = ComputedBuffer(name="buf0", layout=layout, data=pw)
+        return op, layout
+
+    def test_divide_ranges_transposed_stick_preserved(self):
+        """Tiling a non-stick dim of a transposed-stick layout rebuilds
+        device_layout correctly (headline regression from code review)."""
+        from torch._inductor.ir import FlexibleLayout
+
+        from torch_spyre._C import SpyreTensorLayout
+
+        # [256, 128] with stick on dim0: dim_order=[1, 0].  This is the layout
+        # produced for a transposed Linear weight (model_utils.py restickify).
+        op, layout = self._make_ftl_op([256, 128], dim_order=[1, 0])
+
+        # Tile non-stick dim1 by 2: [256, 128] -> [256, 64].
+        _divide_ranges(op, Integer(2), tiled_dims=[1])
+
+        # Expected: from-scratch SpyreTensorLayout([256, 64], ..., [1, 0]).
+        expected_strides = [
+            int(s) for s in FlexibleLayout.contiguous_strides([256, 64])
+        ]
+        expected = SpyreTensorLayout([256, 64], expected_strides, torch.float16, [1, 0])
+
+        self.assertEqual(layout.device_layout, expected)
+
+        # Also assert it differs from the buggy heuristic result.
+        buggy = SpyreTensorLayout(
+            [1, 256, 64],
+            [64, 64, 1],
+            expected.device_dtype,
+            expected.element_arrangement,
+        )
+        self.assertNotEqual(layout.device_layout, buggy)
+
+    def test_divide_ranges_preserves_element_arrangement(self):
+        """element_arrangement is copied verbatim — not silently reset to STANDARD."""
+        from torch._inductor.ir import FlexibleLayout
+
+        from torch_spyre._C import ElementArrangement, SpyreTensorLayout
+
+        op, layout = self._make_ftl_op(
+            [256, 128], dim_order=[1, 0], elem_arr=ElementArrangement.EXX2
+        )
+
+        _divide_ranges(op, Integer(2), tiled_dims=[1])
+
+        self.assertEqual(
+            layout.device_layout.element_arrangement, ElementArrangement.EXX2
+        )
+
+        # Confirm the rebuilt layout also has the right shape.
+        expected_strides = [
+            int(s) for s in FlexibleLayout.contiguous_strides([256, 64])
+        ]
+        expected = SpyreTensorLayout(
+            [256, 64], expected_strides, torch.float16, [1, 0], ElementArrangement.EXX2
+        )
+        self.assertEqual(layout.device_layout, expected)
+
+    def test_divide_ranges_stride_collision(self):
+        """Tiling an outer dim when stride_map has two entries with the same
+        value (device_size tiebreak case) produces the correct device_layout."""
+        from torch._inductor.ir import FlexibleLayout
+
+        from torch_spyre._C import SpyreTensorLayout
+
+        # [2, 2, 2, 16] contiguous, stick on dim3 (last).  host_stride[0]=64
+        # equals 64*host_stride[3], so the stick tile-count and a non-stick dim
+        # share a stride_map value; device_size must break the tie.
+        op, layout = self._make_ftl_op([2, 2, 2, 16], dim_order=[0, 1, 2, 3])
+
+        # Tile dim0/2: [2,2,2,16] -> [1,2,2,16].
+        _divide_ranges(op, Integer(2), tiled_dims=[0])
+
+        expected_strides = [
+            int(s) for s in FlexibleLayout.contiguous_strides([1, 2, 2, 16])
+        ]
+        expected = SpyreTensorLayout(
+            [1, 2, 2, 16], expected_strides, torch.float16, [0, 1, 2, 3]
+        )
+        self.assertEqual(layout.device_layout, expected)
+
+    def test_resize_device_layout_raises_on_unsupported(self):
+        """_resize_device_layout raises RuntimeError when the stick host dim
+        cannot be uniquely identified from stride_map[-1].
+
+        This guards against unsupported layouts (e.g. future multi-host-dim
+        sticks) rather than silently producing a wrong result.
+        """
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.coarse_tile import _resize_device_layout
+
+        # Build a real [2, 2] STL (stick on dim1, stride_map[-1] == 1).
+        # Then call the helper with a synthetic old_host_size=[1, 1] whose
+        # contiguous strides are both 1 — two dims share stride_map[-1], so
+        # p* cannot be identified uniquely.
+        stl = SpyreTensorLayout([2, 2], [2, 1], torch.float16, [0, 1])
+        with self.assertRaises(RuntimeError):
+            _resize_device_layout(stl, [1, 1], [1, 1])
+
 
 def _mock_op_out_coords(op):
     """Return pre-built coords stored on op by _make_hinted_op, or empty list."""

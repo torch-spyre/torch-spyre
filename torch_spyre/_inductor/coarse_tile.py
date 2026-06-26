@@ -67,6 +67,8 @@ from torch._inductor.ir import (
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
+from torch_spyre._C import SpyreTensorLayout
+
 from .constants import BATCH_MATMUL_OP
 from .logging_utils import get_inductor_logger
 from .loop_info import CoarseTileInfo
@@ -806,26 +808,39 @@ def _allocate_full_buffer(
         stride = stride * s
 
     if isinstance(orig_layout, FixedTiledLayout):
-        # Rebuild SpyreTensorLayout for the full size, preserving the
-        # within-stick dimension from the original per-tile layout.
-        orig_stl = orig_layout.device_layout
-        sm_last = int(list(orig_stl.stride_map)[-1])
-        full_strides_ints = [int(s) for s in strides]
+        # Derive the full buffer's device layout from the per-tile layout by
+        # scaling device_size entries up to the full host size.  The stick
+        # orientation (dim_order / element_arrangement) is propagated verbatim
+        # from orig_layout — both buffers must agree on physical layout so the
+        # scatter copy op computes correct device addresses.
         full_size_ints = [int(s) for s in full_ranges]
-        within_stick_dim = next(
-            (i for i, s in enumerate(full_strides_ints) if s == sm_last), None
-        )
-        if within_stick_dim is None:
-            within_stick_dim = len(full_size_ints) - 1
-        ndim = len(full_size_ints)
-        dim_order = [i for i in range(ndim) if i != within_stick_dim] + [
-            within_stick_dim
-        ]
-        from torch_spyre._C import SpyreTensorLayout
-
-        device_layout = SpyreTensorLayout(
-            full_size_ints, full_strides_ints, dtype, dim_order
-        )
+        tile_size_ints = [int(s) for s in orig_layout.size]
+        try:
+            device_layout = _resize_device_layout(
+                orig_layout.device_layout,
+                tile_size_ints,
+                full_size_ints,
+            )
+        except RuntimeError:
+            # Non-standard device layout (e.g. post-restickify HBM strides that
+            # don't correspond to contiguous host strides).  Fall back to a
+            # default row-major allocation, preserving element_arrangement.
+            logger.debug(
+                "_allocate_full_buffer: _resize_device_layout could not classify "
+                "%r (tile_size=%s full_size=%s); using row-major fallback",
+                orig_layout.device_layout,
+                tile_size_ints,
+                full_size_ints,
+            )
+            ndim_full = len(full_size_ints)
+            full_strides_ints = [int(s) for s in strides]
+            device_layout = SpyreTensorLayout(
+                full_size_ints,
+                full_strides_ints,
+                dtype,
+                list(range(ndim_full)),
+                orig_layout.device_layout.element_arrangement,
+            )
     else:
         device_layout = generic_layout(full_buf)
 
@@ -1120,7 +1135,6 @@ def _propagate_tiled_reduction_op(
         FixedTiledLayout,
         SpyreConstantFallback,
     )  # deferred: avoids circular import
-    from torch_spyre._C import SpyreTensorLayout  # deferred: avoids circular import
 
     scalar_op = SpyreConstantFallback(
         torch.ops.spyre.constant.default, float(identity), dtype, device
@@ -1360,6 +1374,147 @@ def _stamp_group(
         )
 
 
+def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: list[int]):
+    """Return a new SpyreTensorLayout when *tiling* an existing buffer in-place.
+
+    This function handles the ``_divide_ranges`` case: the buffer is the *same*
+    physical allocation; coarse tiling just narrows the iteration range for each
+    loop iteration.  ``device_size`` entries are updated to reflect the smaller
+    per-tile extents.  ``stride_map`` entries are updated only for contiguous
+    host dims (where the physical stride follows from the host extent); for
+    non-contiguous (transposed / col-major) dims the stride is unchanged.
+
+    Classification of device dims (from ``get_generic_stick_layout``):
+
+    * **inner stick** (always ``j == ndev-1``) — ``device_size`` is always
+      ``elems_per_stick``; left unchanged.
+    * **non-stick dim** — matched to a host dim ``p`` by
+      ``device_size[j] == old_host_size[p]``.  When two host dims share the same
+      size, ``stride_map[j]`` is used as a tiebreaker against the expected
+      contiguous host stride.  ``device_size`` updated to ``new_host_size[p]``.
+      ``stride_map`` updated to the new contiguous host stride iff the current
+      ``stride_map`` equals the old contiguous host stride; otherwise unchanged
+      (the physical stride is non-contiguous and invariant to tiling).
+    * **stick tile-count** — the remaining non-singleton device dim(s) not
+      classified as non-stick.  ``device_size`` updated to
+      ``ceil(new_host_size[p*] / eps)``.  ``stride_map`` updated iff the stick
+      host dim is contiguous (same rule as for non-stick dims).
+    * **singleton** (``device_size == 1``) — never exercised; left as-is.
+
+    ``p*`` (the stick host dim) is identified by elimination: the host dim NOT
+    matched by any non-stick device dim.
+
+    ``device_dtype`` and ``element_arrangement`` are copied verbatim from
+    *orig_stl*, preserving EXX2/QFP8/DL16 layouts.
+
+    Raises ``RuntimeError`` if any non-stick device dim matches ambiguously, or
+    if the stick host dim cannot be uniquely determined by elimination.
+    """
+    from torch._inductor.ir import FlexibleLayout
+
+    orig_sm = list(orig_stl.stride_map)
+    orig_ds = list(orig_stl.device_size)
+    eps = orig_stl.elems_per_stick()
+    ndev = len(orig_sm)
+    ndim = len(old_host_size)
+
+    old_hs = [int(s) for s in FlexibleLayout.contiguous_strides(old_host_size)]
+    new_hs = [int(s) for s in FlexibleLayout.contiguous_strides(new_host_size)]
+
+    new_ds = list(orig_ds)
+    new_sm = list(orig_sm)
+
+    # Pass 1: match non-singleton, non-inner-stick device dims to host dims.
+    # Primary key: device_size[j] == old_host_size[p].
+    # When size is ambiguous (two host dims share the same size), use
+    # stride_map[j] == old_contiguous_stride[p] as a tiebreaker.
+    matched_host = {}  # j → p (non-stick matches)
+    unmatched_j = []  # device dims not matched → stick tile-count candidates
+
+    for j in range(ndev - 1):  # j == ndev-1 is always inner stick
+        dsz = orig_ds[j]
+        if dsz == 1:
+            continue  # singleton / sparse placeholder
+        size_cands = [p for p in range(ndim) if old_host_size[p] == dsz]
+        if len(size_cands) == 1:
+            matched_host[j] = size_cands[0]
+        elif len(size_cands) > 1:
+            # Tiebreak by stride_map[j] == contiguous_stride(old_host_size)[p].
+            stride_cands = [p for p in size_cands if old_hs[p] == orig_sm[j]]
+            if len(stride_cands) == 1:
+                matched_host[j] = stride_cands[0]
+            else:
+                unmatched_j.append(j)  # ambiguous even with stride
+        else:
+            unmatched_j.append(j)  # no size match → stick tile-count
+
+    # Identify pstar by elimination: the host dim not claimed by any non-stick
+    # device dim match.  Prefer non-singleton host dims first (the stick normally
+    # has size > 1); fall back to singleton host dims only when every unmatched
+    # candidate is a singleton (e.g. a 1-element stick host dim).
+    matched_p = set(matched_host.values())
+    unmatched_all = [p for p in range(ndim) if p not in matched_p]
+    pstar_cands = [p for p in unmatched_all if old_host_size[p] > 1]
+    if len(pstar_cands) == 0:
+        # All unmatched host dims are size-1 singletons; the stick must be one.
+        pstar_cands = unmatched_all
+    if len(pstar_cands) != 1:
+        raise RuntimeError(
+            f"_resize_device_layout: cannot uniquely identify the stick host dim "
+            f"by elimination in {orig_stl!r} (old_host_size={old_host_size}); "
+            f"unmatched host dims={unmatched_all} "
+            f"(non-singleton candidates={pstar_cands}), "
+            f"non-stick device dims={matched_host}. "
+            f"This layout is not supported by the device-native reconstruction."
+        )
+    pstar = pstar_cands[0]
+
+    # Pass 2: update device_size and (if contiguous) stride_map for non-stick dims.
+    for j, p in matched_host.items():
+        new_ds[j] = new_host_size[p]
+        if new_host_size[p] == 1:
+            new_sm[j] = -1
+        elif orig_sm[j] == old_hs[p]:
+            # Dim p is contiguous: update stride to new contiguous value.
+            new_sm[j] = new_hs[p]
+        # else: non-contiguous stride; leave new_sm[j] = orig_sm[j] (unchanged).
+
+    # Pass 3: update tile-count device dims (unmatched non-singleton dims).
+    for j in unmatched_j:
+        expected_tc = -(-old_host_size[pstar] // eps)  # ceil
+        if orig_ds[j] != expected_tc:
+            raise RuntimeError(
+                f"_resize_device_layout: device dim {j} "
+                f"(stride_map={orig_sm[j]}, device_size={orig_ds[j]}) was not "
+                f"matched as a non-stick dim and does not equal the expected "
+                f"tile-count {expected_tc} for stick host dim {pstar} "
+                f"(old_host_size={old_host_size}) in {orig_stl!r}. "
+                f"This layout is not supported by the device-native reconstruction."
+            )
+        new_ds[j] = -(-new_host_size[pstar] // eps)  # ceil
+        # Update stride_map if the stick host dim is contiguous.
+        if new_host_size[pstar] == 1:
+            new_sm[j] = -1
+        elif orig_sm[j] == eps * old_hs[pstar] or orig_sm[j] == -1:
+            # stick host dim is contiguous (stride_map == eps * contiguous_stride[p*])
+            # or was a singleton (-1); update to eps * new contiguous stride.
+            new_sm[j] = eps * new_hs[pstar]
+        # else: non-contiguous; leave stride unchanged.
+
+    # Pass 4: inner stick (j == ndev-1) — update stride only.
+    j = ndev - 1
+    if new_host_size[pstar] == 1:
+        new_sm[j] = -1
+    elif orig_sm[j] == old_hs[pstar]:
+        # Contiguous stick: update inner-stick stride.
+        new_sm[j] = new_hs[pstar]
+    # else: non-contiguous stick; leave stride unchanged.
+
+    return SpyreTensorLayout(
+        new_ds, new_sm, orig_stl.device_dtype, orig_stl.element_arrangement
+    )
+
+
 def _divide_ranges(
     op: ComputedBuffer,
     loop_count: Expr,
@@ -1442,29 +1597,21 @@ def _divide_ranges(
     _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
     _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
 
-    # Rebuild SpyreTensorLayout for the new host size, preserving the
-    # within-stick dimension.  stride_map[-1] is the element stride of the
-    # within-stick host dimension in the original layout; match it against the
-    # new contiguous strides to identify which host dim remains the stick dim.
+    # Rebuild SpyreTensorLayout for the new host size using device-native
+    # reconstruction: transform the original device layout directly without
+    # guessing a dim_order.
     if not isinstance(layout, FixedTiledLayout):
         return
-    orig_stl = layout.device_layout
-    sm_last = int(list(orig_stl.stride_map)[-1])
-    new_strides_ints = [int(s) for s in layout.stride]
+    # Capture old/new sizes as ints here, after the FixedTiledLayout guard,
+    # so symbolic-size FixedLayout tests above are not affected.
+    # layout.size is already the new (divided) size; reconstruct the old size
+    # by multiplying tiled dims back up: old[i] = new[i] * loop_count.
+    old_host_size = [int(s) for s in layout.size]
+    for i in tiled_dims:
+        old_host_size[i] = int(new_size[i] * loop_count)
     new_size_ints = [int(s) for s in new_size]
-    within_stick_dim = next(
-        (i for i, s in enumerate(new_strides_ints) if s == sm_last), None
-    )
-    if within_stick_dim is None:
-        # Fall back to last dim (covers the common contiguous fp16 case where
-        # sm_last == 1 and the last stride is also 1).
-        within_stick_dim = len(new_size_ints) - 1
-    ndim = len(new_size_ints)
-    dim_order = [i for i in range(ndim) if i != within_stick_dim] + [within_stick_dim]
-    from torch_spyre._C import SpyreTensorLayout
-
-    layout.device_layout = SpyreTensorLayout(
-        new_size_ints, new_strides_ints, layout.dtype, dim_order
+    layout.device_layout = _resize_device_layout(
+        layout.device_layout, old_host_size, new_size_ints
     )
 
 
