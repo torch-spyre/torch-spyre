@@ -28,18 +28,16 @@ using DataConversionInfo = data_conversion_info;
 
 namespace spyre {
 
-using Runtime = flex::RuntimeEntry;
-
 class GlobalRuntime {
  public:
-  static void set(const std::shared_ptr<Runtime>& runtime) {
+  static void set(const std::shared_ptr<flex::RuntimeContext>& runtime) {
     instance() = runtime;
   }
   static void reset() {
     instance().reset();  // sets the shared_ptr to nullptr
   }
 
-  static const std::shared_ptr<Runtime>& get() {
+  static const std::shared_ptr<flex::RuntimeContext>& get() {
     return instance();
   }
 
@@ -47,8 +45,8 @@ class GlobalRuntime {
   GlobalRuntime() = delete;
   ~GlobalRuntime() = delete;
 
-  static std::shared_ptr<Runtime>& instance() {
-    static std::shared_ptr<Runtime> s;
+  static std::shared_ptr<flex::RuntimeContext>& instance() {
+    static std::shared_ptr<flex::RuntimeContext> s;
     return s;
   }
 };
