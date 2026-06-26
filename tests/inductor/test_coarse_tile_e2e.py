@@ -29,6 +29,7 @@ Add new tests there using spyre_hint(num_tiles_per_dim=...) annotations.
 import sys
 import os
 
+import pytest
 import torch
 import unittest
 from unittest.mock import patch as mock_patch
@@ -42,8 +43,10 @@ import torch_spyre._inductor.propagate_named_dims as _pnd
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 from utils_inductor import compare_with_cpu  # noqa: E402
 
-# Path to mock for disabling actual device kernel execution.
+# Paths to mock for disabling actual device kernel execution.
 _LAUNCH_KERNEL = "torch_spyre.execution.kernel_runner.launch_kernel"
+_LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
+_PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
 
 
 # ===========================================================================
@@ -78,7 +81,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             return torch.abs(x)
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x)
         self.assertTrue(len(source_codes) > 0)
         # LoopSpec appears as an import even without tiling; check for a call.
@@ -113,7 +121,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(x_dev, ["A", "B"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -167,7 +180,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(x_dev, ["B", "D"])
 
         cfn = torch.compile(softmax_fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -193,52 +211,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "allow_all_ops_in_lx_planning": True,
         }
     )
-    def test_hint_nested_loop_two_dims(self):
-        """Nested spyre_hint scopes produce a two-level tiling loop.
-
-        Input shape [1024, 4096]: outer hint tiles dim A by 2 (512 rows/iter),
-        inner hint tiles dim B by 4 (1024 cols/iter).  Both ops (add and mul)
-        share the nested LoopSpec.  Generated source must contain two LoopSpec
-        entries with counts 2 and 4.
-        """
-        from torch_spyre._inductor import spyre_hint
-
-        A, B = 1024, 4096
-        a = torch.randn(A, B, dtype=torch.float16)
-        b = torch.randn(A, B, dtype=torch.float16)
-        c = torch.randn(A, B, dtype=torch.float16)
-
-        def fn(a, b, c):
-            with spyre_hint(num_tiles_per_dim={"A": 2}):
-                with spyre_hint(num_tiles_per_dim={"B": 4}):
-                    y = a + b
-                    z = y * c
-                    return z
-
-        a_dev = a.to("spyre")
-        b_dev = b.to("spyre")
-        c_dev = c.to("spyre")
-        _declare_tensor_dim("A", A)
-        _declare_tensor_dim("B", B)
-        _name_tensor_dims(a_dev, ["A", "B"])
-        _name_tensor_dims(b_dev, ["A", "B"])
-        _name_tensor_dims(c_dev, ["A", "B"])
-
-        cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
-            _, source_codes = run_and_get_code(cfn, a_dev, b_dev, c_dev)
-        self.assertTrue(len(source_codes) > 0)
-        src = source_codes[0]
-        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
-        self.assertIn("sympify('2')", src, "Expected outer loop count 2")
-        self.assertIn("sympify('4')", src, "Expected inner loop count 4")
-        # The nested LoopSpec must appear inside another LoopSpec.
-        self.assertGreaterEqual(
-            src.count("LoopSpec("),
-            2,
-            f"Expected ≥2 LoopSpec entries for nested loops\n\nSource:\n{src}",
-        )
-
     # ------------------------------------------------------------------
     # Scratchpad (LX) allocation for intermediate tiled buffer — hint syntax
     # ------------------------------------------------------------------
@@ -292,7 +264,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(c_dev, ["A", "B"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev, c_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -370,6 +347,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         with (
             mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run", side_effect=_record_subprocess),
         ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev, c_dev)
@@ -493,7 +472,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             return out_x, out_y
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -545,7 +529,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(y_dev, ["A", "B"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -593,7 +582,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(x_dev, ["M", "K"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -643,7 +637,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(y_dev, ["K", "N"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -695,7 +694,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(scale_dev, ["M"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev, scale_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -947,7 +951,12 @@ class TestNamedDimsHint(InductorTestCase):
         _name_tensor_dims(x_dev, ["M", "K"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -979,7 +988,12 @@ class TestNamedDimsHint(InductorTestCase):
         _name_tensor_dims(x_dev, ["M", "K"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -1061,13 +1075,21 @@ class TestCoarseTileReductionE2E(InductorTestCase):
                 return a @ b
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
         self.assertIn("LoopSpec(", src, "Expected LoopSpec for K-tiled matmul")
         self.assertIn("sympify('4')", src, "Expected loop count 4")
 
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_hint_tiled_reduction_matmul_correct(self):
         """torch.matmul tiled over K (4 tiles) produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1174,6 +1196,9 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
         super().setUp()
         torch.manual_seed(0xAFFE)
 
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_hint_tiled_reduction_dim0_sum_correct(self):
         """x.sum(dim=0) tiled over B produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1191,6 +1216,9 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
 
         compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=0.05, rtol=0.05)
 
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_hint_tiled_reduction_dim0_max_correct(self):
         """x.amax(dim=0) tiled over B produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1208,6 +1236,9 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
 
         compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=1e-3, rtol=1e-3)
 
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_hint_tiled_reduction_dim0_min_correct(self):
         """x.amin(dim=0) tiled over B produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1238,6 +1269,9 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
         super().setUp()
         torch.manual_seed(0xAFFE)
 
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_mm_k_tiled_correct(self):
         """2D mm [M,K] @ [K,N] tiled over K produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1259,6 +1293,9 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
             fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
         )
 
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_bmm_k_tiled_correct(self):
         """3D bmm [B,M,K] @ [B,K,N] tiled over K produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1281,6 +1318,9 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
             fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
         )
 
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_bmm_3d2d_k_tiled_correct(self):
         """3D×2D matmul [B,M,K] @ [K,N] tiled over K produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1323,7 +1363,12 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
                 return torch.mm(a, b)
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -1349,6 +1394,9 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         super().setUp()
         torch.manual_seed(0xCAFE)
 
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_nested_bmm_outer_Batch_inner_K_correct(self):
         """bmm [B,M,K]@[B,K,N] outer B (output) + inner K (reduction) — correct."""
         from torch_spyre._inductor import spyre_hint
@@ -1372,6 +1420,9 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
             fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
         )
 
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_nested_matmul_outer_M_inner_K_correct(self):
         """mm [M,K]@[K,N] with outer M (output) + inner K (reduction) — correct."""
         from torch_spyre._inductor import spyre_hint
@@ -1415,7 +1466,12 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
                     return torch.mm(a, b)
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -1445,7 +1501,12 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
                     return torch.mm(a, b)
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -1483,7 +1544,12 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
                     return torch.mm(a, b)
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]

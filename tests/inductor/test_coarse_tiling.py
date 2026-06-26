@@ -1684,7 +1684,7 @@ class TestGenerateBundleMlirSnapshot(unittest.TestCase):
             "\t\t%c1 = arith.constant 1 : index\n"
             "\t\t%loop_bound_0 = arith.constant 8 : index\n"
             "\t\tscf.for %i_0 = %c0 to %loop_bound_0 step %c1 {\n"
-            '\t\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json"}\n'
+            '\t\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json", "symbol_ids"=[]}\n'
             "\t\t}\n"
             "\t\treturn\n"
             "\t}\n"
@@ -1698,7 +1698,7 @@ class TestGenerateBundleMlirSnapshot(unittest.TestCase):
         expected = (
             "module {\n"
             "\tfunc.func @sdsc_bundle() {\n"
-            '\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json"}\n'
+            '\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json", "symbol_ids"=[]}\n'
             "\t\treturn\n"
             "\t}\n"
             "}\n"

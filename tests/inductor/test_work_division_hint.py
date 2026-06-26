@@ -25,6 +25,8 @@ from torch_spyre._inductor import config, spyre_hint
 import torch_spyre._inductor.propagate_named_dims as _pnd
 
 _LAUNCH_KERNEL = "torch_spyre.execution.kernel_runner.launch_kernel"
+_LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
+_PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
 
 
 _declare_tensor_dim = _pnd.declare_tensor_dim
@@ -240,7 +242,12 @@ class TestNamedWorkDivisionHint(InductorTestCase):
             with spyre_hint(tiles={"M": 4}):
                 return torch.abs(x)
 
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), x)
         self.assertIn("LoopSpec(", source_codes[0])
         self.assertFalse(any("user-hint" in msg for msg in self._logs()))
@@ -265,7 +272,12 @@ class TestNamedWorkDivisionHint(InductorTestCase):
             with spyre_hint(tiles={"M": 4}, work_div={"N": 2}):
                 return torch.abs(x)
 
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), x)
         self.assertIn("LoopSpec(", source_codes[0])
         self._assert_user_hint_logged()

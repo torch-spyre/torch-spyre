@@ -111,7 +111,9 @@ def _run_and_capture(
     with (
         patch.object(_passes, "propagate_named_dims", capturing_propagate),
         patch.object(_passes, "assign_dim_hints", capturing_assign),
+        patch("torch_spyre.execution.kernel_runner.prepare_kernel"),
         patch("torch_spyre.execution.kernel_runner.launch_kernel"),
+        patch("torch_spyre.execution.kernel_runner.launch_jobplan"),
         patch("torch_spyre.execution.async_compile.subprocess.run"),
     ):
         _compile_and_run(fn, args, DEVICE)

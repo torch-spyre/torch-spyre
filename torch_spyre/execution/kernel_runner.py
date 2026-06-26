@@ -36,7 +36,7 @@ class SpyreSDSCKernelRunner:
         self.kernel_name = name
         self.code_dir = code_dir
         self.jobplan = None
-        dump_spyre_code = os.environ.get("DUMP_SPYRE_CODE", "0")
+        dump_spyre_code = os.environ.get("DUMP_SPYRE_CODE", "1")
         if dump_spyre_code.isdigit() and int(dump_spyre_code) != 0:
             self.jobplan = prepare_kernel(code_dir + "/spyreCodeDir")
 
