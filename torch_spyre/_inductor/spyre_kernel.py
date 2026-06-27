@@ -923,8 +923,16 @@ class SpyreKernel(Kernel[CSEVariable]):
         if getattr(V.graph, "pool_size", 0) > 0:
             call_args.append("_pool")
 
-        # Add remaining kernel arguments
-        call_args.extend(self.args.python_argdefs()[1])
+        # Add remaining kernel arguments, deduplicating tensors that appear as
+        # both input and output (e.g. in-place ops like x *= 2).  With symbolic
+        # args the MLIR bundle emits one !sdscbundle.input_arg<index> per unique
+        # arg_index; passing the same tensor twice would cause a runtime
+        # "Number of inputs mismatches" error in processComputeOnHostCommand.
+        seen: set[str] = set()
+        for arg in self.args.python_argdefs()[1]:
+            if arg not in seen:
+                seen.add(arg)
+                call_args.append(arg)
 
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
