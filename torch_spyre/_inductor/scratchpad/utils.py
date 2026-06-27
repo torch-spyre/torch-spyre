@@ -115,7 +115,9 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
 
 
 def mem_usage_by_buf(
-    graph: GraphLowering | GraphView, cache: Optional[dict] = None
+    graph: GraphLowering | GraphView,
+    cache: Optional[dict] = None,
+    rw_cache: Optional[dict] = None,
 ) -> dict:
     """
     Get a summary of memory usage of each operation.
@@ -123,8 +125,11 @@ def mem_usage_by_buf(
     which has "size_per_core", "size", "core_div_mismatch", "op_inputs" fields
     NOTE:
     if a buf is not in core_div_mismatch => it has no users => graph output
+
+    `rw_cache` ({op name: ReadWrites}) memoizes get_read_writes() across
+    co-opt search leaves; None recomputes it.
     """
-    num_cores_per_op = get_ncores_for_buffers(graph, cache)
+    num_cores_per_op = get_ncores_for_buffers(graph, cache, rw_cache)
     mem_usage: dict = {}
 
     buf_names = {op.name for op in graph.operations}
@@ -136,7 +141,7 @@ def mem_usage_by_buf(
         dev_size = (
             math.prod(dev_layout.device_size[:-1]) * 128
         )  # num_sticks * bytes_per_stick
-        rw = op.get_read_writes()
+        rw = rw_cache[op.get_name()] if rw_cache is not None else op.get_read_writes()
         mem_usage[buf_name] = {
             "size": dev_size,
             "size_per_core": dev_size // num_cores,
@@ -159,6 +164,7 @@ def get_buffer_users(graph: GraphLowering | GraphView) -> dict[str, list[Operati
 
 def _get_buffer_user_deps(
     graph: GraphLowering | GraphView,
+    rw_cache: Optional[dict] = None,
 ) -> dict[str, list[tuple[Operation, MemoryDep]]]:
     """Like get_buffer_users but pairs each op with the specific dep it uses.
 
@@ -166,10 +172,13 @@ def _get_buffer_user_deps(
     one per dep. If their per-core views diverge — read at one index,
     write at another — the buffer is correctly rejected for LX, since
     that's a within-core data hazard, not just cross-op disagreement.
+
+    `rw_cache` ({op name: ReadWrites}) memoizes the split-invariant
+    get_read_writes() across co-opt search leaves; None recomputes it.
     """
     buf_user_deps: dict[str, list[tuple[Operation, MemoryDep]]] = {}
     for op in graph.operations:
-        rw = op.get_read_writes()
+        rw = rw_cache[op.get_name()] if rw_cache is not None else op.get_read_writes()
         for dep in rw.reads | rw.writes:
             buf_user_deps.setdefault(dep.name, []).append((op, dep))
     return buf_user_deps
@@ -189,7 +198,9 @@ def _op_num_cores(op: Operation) -> int:
 
 
 def get_ncores_for_buffers(
-    graph: GraphLowering | GraphView, cache: Optional[dict] = None
+    graph: GraphLowering | GraphView,
+    cache: Optional[dict] = None,
+    rw_cache: Optional[dict] = None,
 ) -> dict[str, int]:
     """
     Return a dictionary mapping buffer names to the number of cores
@@ -200,11 +211,12 @@ def get_ncores_for_buffers(
     Pass an optional `cache` dict to memoize `_per_core_view_on_buf`
     results across calls (e.g. across co-opt search leaves). Safe to
     share only within a single graph, since the cache key includes the
-    op name and `dep` (which carries the buffer name).
+    op name and `dep` (which carries the buffer name). `rw_cache`
+    ({op name: ReadWrites}) likewise memoizes get_read_writes().
     """
     result: dict[str, int] = {}
     using_multicore = config.sencores > 1
-    buf_user_deps = _get_buffer_user_deps(graph)
+    buf_user_deps = _get_buffer_user_deps(graph, rw_cache)
     for buf_name, users in buf_user_deps.items():
         # this dict includes graph input and output
         if using_multicore and len(users) > 1:
@@ -218,7 +230,12 @@ def get_ncores_for_buffers(
                 view, flag = _per_core_view_on_buf(op, dep, buf_name, cache)
                 if ref_view is None:
                     ref_view = view
-                if dep in op.get_read_writes().writes:
+                op_rw = (
+                    rw_cache[op.get_name()]
+                    if rw_cache is not None
+                    else op.get_read_writes()
+                )
+                if dep in op_rw.writes:
                     # Size by the writer's core count (the writer sets per-core
                     # footprint size/writer_cores; readers touch only their slice),
                     # not max() over users. One writer per buffer (it's named after
