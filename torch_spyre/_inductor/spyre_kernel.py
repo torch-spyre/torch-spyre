@@ -40,6 +40,7 @@ from .constants import (
     SEGMENT_OFFSETS,
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
+from . import config as _spyre_config
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .pass_utils import (
@@ -903,11 +904,19 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         for name, tensor_arg in self.spyre_kernel_args:
             tensor_arg.arg_index = actuals.index(name)
-            tensor_arg.allocation["hbm"] = SEGMENT_OFFSETS[
-                tensor_arg.arg_index + 1
-                if has_pool_allocations
-                else tensor_arg.arg_index
-            ]
+            if _spyre_config.bundle_symbolic_args:
+                # On the symbolic path the HBM address is provided at runtime
+                # via input_arg_extract; start_address is never used as a
+                # literal address.  Use the arg_index itself as a small,
+                # positive, human-readable sentinel that is clearly not a
+                # real HBM address (which are O(16 GB) apart).
+                tensor_arg.allocation["hbm"] = tensor_arg.arg_index
+            else:
+                tensor_arg.allocation["hbm"] = SEGMENT_OFFSETS[
+                    tensor_arg.arg_index + 1
+                    if has_pool_allocations
+                    else tensor_arg.arg_index
+                ]
 
         buf = IndentedBuffer()
         buf.writeline("[")
