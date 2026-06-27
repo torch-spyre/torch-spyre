@@ -156,23 +156,25 @@ def generate_bundle(
     # Determine whether a pool parameter is needed (any pool symbol present).
     has_pool = symbolic_args and use_symbols and any(sk.is_pool for sk in symbol_kinds)
     # Indices of kernel-base symbols that become input_arg parameters.
-    # Deduplicated by address value: multiple SDSCs may register the same kernel arg
-    # address independently (no cross-SDSC dedup in generate_sdsc), so we keep only
-    # the first sym_idx for each unique address and map subsequent duplicates to it.
-    # kernel_arg_sym_indices: list of sym_idx values, one per unique kernel arg address.
+    # Deduplicated by arg_index: multiple SDSCs operating on different slices of
+    # the same logical tensor arg share one function parameter (the first-seen
+    # sym_idx, which corresponds to core-0 / the lowest address).  Dedup by
+    # address alone is insufficient — different slices have different addresses
+    # but the same arg_index and must map to one %arg_{ai}_base_addr param.
+    # kernel_arg_sym_indices: list of sym_idx values, one per unique arg_index.
     # kernel_dup_canonical: maps duplicate kernel sym_idx → canonical sym_idx.
     kernel_arg_sym_indices: list[int] = []
     kernel_dup_canonical: dict[int, int] = {}  # duplicate sym_idx → canonical sym_idx
     if symbolic_args and use_symbols:
-        seen_kernel_addr: dict[int, int] = {}  # address → canonical sym_idx
+        seen_kernel_arg_index: dict[int, int] = {}  # arg_index → canonical sym_idx
         for i, kind_i in enumerate(symbol_kinds):
             if kind_i.kind == "kernel":
-                addr = symbols[i]
-                if addr not in seen_kernel_addr:
-                    seen_kernel_addr[addr] = i
+                ai = kind_i.arg_index
+                if ai not in seen_kernel_arg_index:
+                    seen_kernel_arg_index[ai] = i
                     kernel_arg_sym_indices.append(i)
                 else:
-                    kernel_dup_canonical[i] = seen_kernel_addr[addr]
+                    kernel_dup_canonical[i] = seen_kernel_arg_index[ai]
 
     with open(os.path.join(output_dir, "bundle.mlir"), "w") as f:
         logger.info(f"Generating {f.name}")
