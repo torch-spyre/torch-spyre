@@ -1241,14 +1241,20 @@ def _per_core_view_on_buf(
          by device-dim so it's independent of op-local symbol names.
 
     Pass an optional `cache` dict to memoize results across calls,
-    keyed by (op.op_it_space_splits, dep, buf_name).
+    keyed by (op name, op.op_it_space_splits, dep). op name is required:
+    the result also depends on op-derived write_index / read_index /
+    iter_space, so two ops sharing the same (splits, dep) — e.g. a matmul
+    producer and a pointwise consumer of the same buffer — must not alias
+    the same cache entry. buf_name is omitted because the sole caller
+    (get_ncores_for_buffers) always passes buf_name == dep.name, so the
+    frozen MemoryDep `dep` already carries it.
     """
     coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
     if cache is not None:
         # dicts aren't hashable; freeze each into a frozenset of items so
         # the key is hashable and order-independent.
         out, red = coeff_splits
-        key = (frozenset(out.items()), frozenset(red.items()), dep, buf_name)
+        key = (op.get_name(), frozenset(out.items()), frozenset(red.items()), dep)
         hit = cache.get(key)
         if hit is not None:
             return hit
@@ -1260,7 +1266,24 @@ def _per_core_view_on_buf(
     rw = op.get_read_writes()
     empty_view = (PerCoreView(work_slice_dims=(), core_to_slot=()), False)
     if not any(n > 1 for d in coeff_splits for n in d.values()):
-        result = empty_view
+        # Single-core (unsplit) op owns the WHOLE buffer on one core. Encode as
+        # explicit all-factor-1 dims so it does NOT alias the broadcast empty_view
+        # a multi-core op yields when its splits all contract on this buffer (Step
+        # 2). Otherwise a 1-core producer and its 32-core consumers compare equal,
+        # the buffer is sized per-consumer-core (under-counted), and a too-large
+        # buffer gets wrongly LX-pinned. Real sliced views always carry a factor>1.
+        buf_layout = V.graph.get_buffer(buf_name).layout
+        if not isinstance(buf_layout, FixedTiledLayout):
+            result = empty_view
+        else:
+            ndims = len(buf_layout.device_layout.device_size)
+            result = (
+                PerCoreView(
+                    work_slice_dims=tuple((i, 1) for i in range(ndims)),
+                    core_to_slot=(),
+                ),
+                False,
+            )
         if cache is not None:
             cache[key] = result
         return result
