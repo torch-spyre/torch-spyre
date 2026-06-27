@@ -340,26 +340,30 @@ class JobPlanStepCompute final : public JobPlanStep {
   /**
    * @brief Construct compute step
    *
-   * @param binary_address Address of the program binary on device
-   * @param bind_io_addresses Whether to bind the compute operation
-   * @param bootstrap_addr Bootstrap address for program execution
-   * with inputs and outputs addresses
+   * @param program_address The program's FULL device allocation. flex bounds
+   * the segment-7 translation to its total_size() (the real Allocate
+   * footprint), never SEGMENT_SIZE.
+   * @param bind_io_addresses Whether to bind the compute operation with inputs
+   * and outputs addresses
+   * @param bootstrap_offset Offset within the program allocation where
+   * execution begins (0 = base; the program-correction region size when
+   * correction precedes the binary)
    */
-  explicit JobPlanStepCompute(flex::CompositeAddress binary_address,
+  explicit JobPlanStepCompute(flex::CompositeAddress program_address,
                               bool bind_io_addresses,
-                              uint64_t bootstrap_addr = flex::PROG_OFFSET_BASE)
-      : binary_address_(std::move(binary_address)),
+                              uint64_t bootstrap_offset = 0)
+      : program_address_(std::move(program_address)),
         bind_io_addresses_(bind_io_addresses),
-        bootstrap_addr_(bootstrap_addr) {}
+        bootstrap_offset_(bootstrap_offset) {}
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
   void write(std::ostream& os) const override;
 
  private:
-  flex::CompositeAddress binary_address_;
+  flex::CompositeAddress program_address_;
   bool bind_io_addresses_;
-  uint64_t bootstrap_addr_;
+  uint64_t bootstrap_offset_;
 };
 
 /**

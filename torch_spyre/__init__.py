@@ -346,6 +346,11 @@ def _autoload():
     os.environ.setdefault("DT_DEEPRT_VERBOSE", "-1")
     os.environ.setdefault("DTLOG_LEVEL", "error")
 
+    # Enable spyre code with fake addresses by default
+    os.environ.setdefault("DUMP_SPYRE_CODE", "1")
+    # Enable CB split workaround
+    os.environ.setdefault("DXP_SPLIT_CORRECTION_CB", "1")
+
 
 if not profiler.is_available():
     profiler = None
