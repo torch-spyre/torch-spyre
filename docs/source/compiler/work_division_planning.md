@@ -528,15 +528,17 @@ separate, so `spyre_hint(tiles={...})` and `spyre_hint(work_div={...})` can
 coexist in the same scope.
 
 When the work-division planner sees a resolved user hint, it validates the
-request and commits it directly instead of running the automatic priority-based
-distribution. For matmul reductions, a user hint also bypasses the analytic
-cost-model split selection; the hint takes ownership of the split decision.
-Validation checks that:
+request and commits the accepted splits directly instead of running the
+automatic priority-based distribution. Hinted dimensions are considered in user
+priority order. If adding a later split would exceed `SENCORES`, the compiler
+logs a warning and skips that split. For matmul reductions, a user hint also
+bypasses the analytic cost-model split selection; the hint takes ownership of
+the accepted split decision. Validation checks that:
 
 - every split value is a positive integer
-- the product of all requested splits does not exceed `SENCORES`
-- every split evenly divides the stick-adjusted dimension size
-- at most one reduction dimension is split
+- accepted splits do not exceed `SENCORES`
+- every accepted split evenly divides the stick-adjusted dimension size
+- at most one accepted reduction dimension is split
 
 User work-division hints are intentionally authoritative. If Pass 1
 (`span_reduction`) already committed minimum splits for the 256 MB span limit,
