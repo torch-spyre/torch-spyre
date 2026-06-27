@@ -175,6 +175,9 @@ def generate_bundle(
                     kernel_arg_sym_indices.append(i)
                 else:
                     kernel_dup_canonical[i] = seen_kernel_arg_index[ai]
+        # Sort by arg_index so the function signature matches the positional order
+        # that call_kernel passes tensors to .run().
+        kernel_arg_sym_indices.sort(key=lambda idx: symbol_kinds[idx].arg_index)
 
     with open(os.path.join(output_dir, "bundle.mlir"), "w") as f:
         logger.info(f"Generating {f.name}")
