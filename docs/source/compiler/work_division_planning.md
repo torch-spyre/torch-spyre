@@ -536,8 +536,8 @@ bypasses the analytic cost-model split selection; the hint takes ownership of
 the accepted split decision. Validation checks that:
 
 - every split value is a positive integer
-- every split evenly divides the stick-adjusted dimension size
 - accepted splits do not exceed `SENCORES`
+- every accepted split evenly divides the stick-adjusted dimension size
 - at most one accepted reduction dimension is split
 
 User work-division hints are intentionally authoritative. If Pass 1
