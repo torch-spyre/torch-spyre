@@ -125,9 +125,10 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         logs = self._logs()
         self.assertTrue(
             any(
-                "skipping split" in msg
+                "skipping named dim(s)" in msg
                 and "fake_op" in msg
-                and "Lk=8" in msg
+                and "['Lk']" in msg
+                and "(split=8)" in msg
                 and "cores would be 256" in msg
                 and "SENCORES=32" in msg
                 for msg in logs
@@ -152,7 +153,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         self.assertEqual(splits, {h: 4, lk: 8})
         logs = self._logs()
         self.assertTrue(
-            any("skipping split Lq=8" in msg for msg in logs),
+            any("skipping named dim(s) ['Lq'] (split=8)" in msg for msg in logs),
             f"Expected Lq skip warning, got: {logs}",
         )
 
@@ -182,6 +183,21 @@ class TestNamedWorkDivisionHint(InductorTestCase):
                 self._fake_output_td([h, lq]),
                 max_cores=32,
             )
+
+    def test_apply_work_div_hint_prunes_before_divisibility_check_unit(self):
+        h = Symbol("H")
+        lq = Symbol("Lq")
+        op = self._fake_op({h: ["H"], lq: ["Lq"]})
+
+        splits = _wd._apply_user_hint(
+            op,
+            {h: 32, lq: 7},
+            {h: 64, lq: 512},
+            self._fake_output_td([h, lq]),
+            max_cores=32,
+        )
+
+        self.assertEqual(splits, {h: 32})
 
     def test_apply_work_div_hint_multiple_accepted_reduction_splits_raise_unit(self):
         m = Symbol("M")
@@ -454,9 +470,9 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         logs = self._logs()
         self.assertTrue(
             any(
-                "skipping split" in msg
-                and "d2=2" in msg
+                "skipping named dim(s)" in msg
                 and "['K']" in msg
+                and "(split=2)" in msg
                 and "cores would be 8" in msg
                 and "SENCORES=4" in msg
                 for msg in logs
@@ -482,6 +498,8 @@ class TestNamedWorkDivisionHint(InductorTestCase):
 
     @config.patch({"sencores": 8})
     def test_multiple_reduction_splits_raise(self):
+        # Keep L large enough that the failure is reduction-split validation,
+        # not stick alignment.
         M, K, L = 64, 32, 128
         x = torch.randn(M, K, L, dtype=torch.float16).to("spyre")
         _declare_tensor_dim("M", M)
@@ -493,7 +511,9 @@ class TestNamedWorkDivisionHint(InductorTestCase):
             with spyre_hint(work_div={"K": 2, "L": 2}):
                 return x.sum(dim=(1, 2))
 
-        with self.assertRaisesRegex(Exception, "reduction dimensions"):
+        with self.assertRaisesRegex(
+            Exception, "reduction dimensions|expected exactly 1 reduction variable"
+        ):
             torch.compile(fn, dynamic=False)(x)
 
 

@@ -674,6 +674,7 @@ def _apply_user_hint(
     output_td: TensorDep,
     max_cores: int,
 ) -> dict[Symbol, int]:
+    """Apply splits in insertion order, pruning lower-priority overflows."""
     op_name = op.get_name()
 
     splits: dict[Symbol, int] = {}
@@ -698,6 +699,19 @@ def _apply_user_hint(
                 f"work-division iteration space."
             )
 
+        next_cores = cores_used * split
+        if next_cores > max_cores:
+            logger.warning(
+                "work_division_hint: %s skipping named dim(s) %s (split=%s) "
+                "because cores would be %s, exceeding SENCORES=%s",
+                op_name,
+                loop_var_dims.get(sym, []),
+                split,
+                next_cores,
+                max_cores,
+            )
+            continue
+
         dim_size = concretize_expr(it_space_adjusted[sym])
         if dim_size % split != 0:
             raise Unsupported(
@@ -705,19 +719,6 @@ def _apply_user_hint(
                 f"is not evenly divisible by split={split}."
             )
 
-        next_cores = cores_used * split
-        if next_cores > max_cores:
-            logger.warning(
-                "work_division_hint: %s skipping split %s=%s for named dim(s) %s "
-                "because cores would be %s, exceeding SENCORES=%s",
-                op_name,
-                sym,
-                split,
-                loop_var_dims.get(sym, []),
-                next_cores,
-                max_cores,
-            )
-            continue
         splits[sym] = split
         cores_used = next_cores
 
