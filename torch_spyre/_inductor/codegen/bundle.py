@@ -226,8 +226,12 @@ def generate_bundle(
 
         # Emit one declaration per symbol (symbolic_args path):
         #   - "kernel"          → skipped; already a function param + extract op above
-        #   - "kernel_derived"  → arith.addi %arg_{arg_index}, <per_core_offset>
-        #                         deduped by (arg_index, offset) pair
+        #   - "kernel_slice"    → arith.addi %arg_{arg_index}, <slice_offset_bytes>
+        #                         deduped by (arg_index, slice_offset) pair;
+        #                         produces the SSA "sliced base" that per-core offsets
+        #                         and sdsc_execute args reference for sliced tensors
+        #   - "kernel_derived"  → arith.addi <sliced_base_ssa>, <per_core_offset>
+        #                         deduped by (sliced_base_ssa, per_core_offset)
         #   - "pool"            → arith.addi %pool, <pool_offset>
         #                         deduped by pool offset value
         #   - anything else     → arith.constant (non-symbolic path)
@@ -242,15 +246,17 @@ def generate_bundle(
         for dup_idx, canon_idx in kernel_dup_canonical.items():
             if canon_idx in kernel_sym_to_arg_idx:
                 kernel_sym_to_arg_idx[dup_idx] = kernel_sym_to_arg_idx[canon_idx]
-        # sym_canonical[sym_idx] → canonical SSA name for derived/pool symbols (deduped).
-        # Also pre-populate duplicate kernel sym_idx entries with their canonical extracted name.
+        # sym_canonical[sym_idx] → canonical SSA name for derived/pool/slice symbols.
+        # Pre-populate duplicate kernel sym_idx entries with their canonical extracted name.
         sym_canonical: dict[int, str] = {
             dup_idx: f"%arg_{kernel_sym_to_arg_idx[dup_idx]}"
             for dup_idx in kernel_dup_canonical
             if dup_idx in kernel_sym_to_arg_idx
         }
-        # derived_addi_emitted[(arg_index, offset)] → SSA name already emitted
-        derived_addi_emitted: dict[tuple[int, int], str] = {}
+        # slice_addi_emitted[(arg_index, slice_offset)] → SSA name for sliced base
+        slice_addi_emitted: dict[tuple[int, int], str] = {}
+        # derived_addi_emitted[(sliced_base_ssa, per_core_offset)] → SSA name
+        derived_addi_emitted: dict[tuple[str, int], str] = {}
         # pool_addi_emitted[pool_offset_value] → SSA name already emitted
         pool_addi_emitted: dict[int, str] = {}
 
@@ -258,22 +264,51 @@ def generate_bundle(
             if sym_idx in kernel_arg_sym_set:
                 continue  # replaced by function parameter + extract op (or duplicate)
             sk: SymbolKind | None = symbol_kinds[sym_idx] if symbol_kinds else None
-            if sk is not None and sk.is_derived:
-                base_ai = kernel_sym_to_arg_idx.get(sk.base_sym_idx)
-                if base_ai is not None:
-                    key = (base_ai, sk.offset)
-                    if key not in derived_addi_emitted:
-                        offset_ssa = f"%arg_{base_ai}_core_offset_{sk.offset}"
-                        addi_ssa = f"%arg_{base_ai}_core_{sk.offset}"
+            if sk is not None and sk.kind == "kernel_slice":
+                ai = sk.arg_index
+                sl = sk.offset  # slice offset in bytes
+                key = (ai, sl)
+                if key not in slice_addi_emitted:
+                    slice_offset_ssa = f"%arg_{ai}_slice_offset_{sl}"
+                    sliced_base_ssa = f"%arg_{ai}_slice_{sl}"
+                    f.write(f"\t\t{slice_offset_ssa} = arith.constant {sl} : index\n")
+                    f.write(
+                        f"\t\t{sliced_base_ssa} = arith.addi"
+                        f" %arg_{ai}, {slice_offset_ssa} : index\n"
+                    )
+                    slice_addi_emitted[key] = sliced_base_ssa
+                sym_canonical[sym_idx] = slice_addi_emitted[key]
+            elif sk is not None and sk.is_derived:
+                # Resolve the SSA name of the sliced base that this core offset builds on.
+                base_sym_idx = sk.base_sym_idx
+                if base_sym_idx in sym_canonical:
+                    sliced_base_ssa = sym_canonical[base_sym_idx]
+                elif base_sym_idx in kernel_arg_sym_indices:
+                    # slice_offset == 0: sliced base == raw arg extract (%arg_N)
+                    ai = symbol_kinds[base_sym_idx].arg_index
+                    sliced_base_ssa = f"%arg_{ai}"
+                elif base_sym_idx in kernel_dup_canonical:
+                    canon = kernel_dup_canonical[base_sym_idx]
+                    ai = kernel_sym_to_arg_idx.get(
+                        canon, symbol_kinds[base_sym_idx].arg_index
+                    )
+                    sliced_base_ssa = f"%arg_{ai}"
+                else:
+                    sliced_base_ssa = None
+                if sliced_base_ssa is not None:
+                    key_d = (sliced_base_ssa, sk.offset)
+                    if key_d not in derived_addi_emitted:
+                        offset_ssa = f"%{sliced_base_ssa[1:]}_core_offset_{sk.offset}"
+                        addi_ssa = f"%{sliced_base_ssa[1:]}_core_{sk.offset}"
                         f.write(
                             f"\t\t{offset_ssa} = arith.constant {sk.offset} : index\n"
                         )
                         f.write(
                             f"\t\t{addi_ssa} = arith.addi"
-                            f" %arg_{base_ai}, {offset_ssa} : index\n"
+                            f" {sliced_base_ssa}, {offset_ssa} : index\n"
                         )
-                        derived_addi_emitted[key] = addi_ssa
-                    sym_canonical[sym_idx] = derived_addi_emitted[key]
+                        derived_addi_emitted[key_d] = addi_ssa
+                    sym_canonical[sym_idx] = derived_addi_emitted[key_d]
                 else:
                     f.write(
                         f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n"
