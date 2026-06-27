@@ -458,17 +458,22 @@ def generate_sdsc(
             symbols.append(0)  # placeholder: dim symbols have no HBM byte value
     n_dim_syms = len(dim_symbol_kinds)
 
-    # local_symbols maps base HBM byte offset -> globally-unique negative symbol id.
+    # local_symbols maps address key -> globally-unique negative symbol id.
     # symbol_id_offset ensures ids are unique across all SDSCs in the bundle.
     # For tiled tensors the base is the iteration-0 address (tiled dims contribute 0);
     # for non-tiled tensors it is the full per-core address (as before).
+    #
+    # Keys: plain int for kernel tensors (the sentinel arg_index value on the
+    # symbolic path, or a real HBM address on the non-symbolic path); a tuple
+    # ("pool", int) for pool-allocated tensors.  The tuple namespace prevents
+    # collision between kernel sentinel 0 (arg_index=0) and pool offset 0.
     #
     # NOTE: no cross-SDSC deduplication — each call to offset_as_symbol within
     # this SDSC gets its own sequential ID and appends to symbols.  Two SDSCs
     # that happen to share a base address will emit two separate arith.constant
     # declarations in bundle.mlir.  This keeps symbol IDs contiguous with the
     # symbols list indices: symbols[abs(id)-1] is always the value for id.
-    local_symbols: dict[int, int] = {}
+    local_symbols: dict = {}
     # Parallel to local_symbols (insertion order): one SymbolKind per registered symbol.
     local_symbol_kind: list[SymbolKind] = []
 
@@ -493,14 +498,17 @@ def generate_sdsc(
     if use_symbols:
 
         def offset_as_symbol(s, kind: SymbolKind):
-            if s not in local_symbols:
+            # Pool tensors use a ("pool", offset) key to avoid colliding with
+            # kernel sentinel values (e.g. arg_index=0 sentinel 0 == pool offset 0).
+            key = ("pool", s) if kind.is_pool else s
+            if key not in local_symbols:
                 # Address symbols start after dim symbols in the ID counter.
-                local_symbols[s] = -(
+                local_symbols[key] = -(
                     symbol_id_offset + n_dim_syms + len(local_symbols) + 1
                 )
                 symbols.append(s)
                 local_symbol_kind.append(kind)
-            return local_symbols[s]
+            return local_symbols[key]
 
         # Compute per-tensor, per-level affine strides and register base addresses.
         # affine_strides[i] is a list of dicts, one per loop-nesting level
@@ -627,6 +635,7 @@ def generate_sdsc(
                     for c in range(sdsc_spec.num_cores)
                 }
             nb = num_bytes(tensor.data_format)
+            is_pool_tensor = tensor.arg_index < 0 and "pool" in tensor.allocation
             core0_addr = (
                 tensor.start_address
                 + core_idx_to_slice_offset(
@@ -639,10 +648,15 @@ def generate_sdsc(
                 addr = tensor.start_address + core_idx_to_slice_offset(
                     tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
                 ) * nb
-                # c>0 kernel tensors where addr==core0_addr were not registered
-                # separately; fall back to the core-0 address entry.
-                lookup = addr if addr != core0_addr or c == 0 else core0_addr
-                result[f"[{c}, 0, 0]"] = str(local_symbols[lookup])
+                if is_pool_tensor:
+                    key = ("pool", addr)
+                elif c > 0 and addr == core0_addr:
+                    # c>0 kernel tensors where addr==core0_addr were not registered
+                    # separately; fall back to the core-0 address entry.
+                    key = core0_addr
+                else:
+                    key = addr
+                result[f"[{c}, 0, 0]"] = str(local_symbols[key])
             return result
 
     else:
