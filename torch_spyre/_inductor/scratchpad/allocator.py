@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import math
 import time
 from abc import ABC, abstractmethod
@@ -290,6 +291,9 @@ class ScratchpadAllocator(ABC):
 
     def _log_lx_pinning(self, graph: GraphLowering) -> None:
         """Log the final LX pinning decision for every op in the graph."""
+        # Skip the per-op getattr walk unless DEBUG is on.
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
         for op in graph.operations:
             reason = self.reject_reasons.get(op.name, "lx")
             logger.debug(
@@ -494,7 +498,13 @@ def _matmul_axis_parse(
     # not enumerate every indexed symbol): output dims are in write_index, and K
     # is whatever the read index adds on top of the write.
     out_stride_sym = {int(write_index.coeff(s)): s for s in write_index.free_symbols}
-    k_sym = next(iter(read_index.free_symbols - write_index.free_symbols))
+    k_syms = read_index.free_symbols - write_index.free_symbols
+    if not k_syms:
+        raise ValueError(
+            f"matmul {op.get_name()}: read index adds no reduction symbol over "
+            f"the write index (read={read_index}, write={write_index})"
+        )
+    k_sym = next(iter(k_syms))
 
     roles: dict[str, tuple[sympy.Symbol, int, int]] = {}
     possible_roles = ["N", "M", "B"]
@@ -719,7 +729,8 @@ def _enum_split_options(
     # overriding a matmul's split to chase pinning regressed kernel time ~2.5x
     # (mlp-linear-kn.t, SENCORES=32; PT-util 66%→33%). Exclude future
     # compute-bound ops here too.
-    if is_output_splits_empty or not is_computed_buf or is_reduction or is_matmul:
+    # is_matmul implies is_reduction, so it's covered by the is_reduction term.
+    if is_output_splits_empty or not is_computed_buf or is_reduction:
         return [seed]
 
     # Recover seed's per-symbol form to mutate the slicing.
@@ -808,7 +819,9 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
             _enum_split_options(op, matmul_bases, matmul_roles) for op in ops
         ]
         t1 = time.perf_counter()
-        best_chosen, timings = self._search(graph, ops, options_per_op)
+        best_chosen, timings, search_cache, search_lifetimes = self._search(
+            graph, ops, options_per_op
+        )
         t_search = time.perf_counter() - t1
 
         for op, opt_idx, options in zip(ops, best_chosen, options_per_op):
@@ -838,12 +851,23 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
         # try insert clone again, as what was incompatible could be compatible now
         # TODO simplify the previous pre-opt (at the beginning of this func), we will
         # run check core-div-mismatch a few times due to clone-insertion, speed-up?
+        n_ops_before_clone = len(graph.operations)
         for p in self.pre_optimization_passes:
             p.apply_pass(graph)
 
         # Standard downstream flow on the now-fixed winning splits. Mirrors
-        # DefaultAllocator.plan_allocation past the pre-passes.
-        buffers = self._generate_buffers(graph)
+        # DefaultAllocator.plan_allocation past the pre-passes. Reuse the search's
+        # per-core-view cache + liveness only if the clone pass left the graph
+        # unchanged: a clone insertion both appends an op (shifts the
+        # position-indexed liveness) and rewrites input consumers' MemoryDep to read
+        # the clone (changes the (op, splits, dep) cache key), so on any op-count
+        # change both are stale and we rebuild from scratch (cache=lifetimes=None).
+        clone_inserted = len(graph.operations) != n_ops_before_clone
+        buffers = self._generate_buffers(
+            graph,
+            cache=None if clone_inserted else search_cache,
+            lifetimes=None if clone_inserted else search_lifetimes,
+        )
         allocation = self.layout_planning.plan_layout(buffers, log_lx_usage=True)
         for b in allocation:
             if b.address is None:
@@ -862,17 +886,20 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
         graph: GraphLowering,
         ops: list[Operation],
         options_per_op: list[list[tuple[dict, dict]]],
-    ) -> tuple[list[int], dict[str, float]]:
+    ) -> tuple[list[int], dict[str, float], dict, dict[str, list[int]]]:
         """DFS over the option cross-product, scoring each leaf via
-        _score_layout. Returns (best option index per op, timing
-        breakdown in seconds). The timing dict has keys `graph_view` and
-        `mem_usage` — the two split-dependent shared-object builds inside
-        _generate_buffers, which dominate per-leaf cost. Liveness is
-        split-invariant and computed once here, not per leaf. No early-stop
-        pruning — bounded by ≤ K^N leaves where N counts ops with >1 option
-        (most return [seed]). Per-leaf cost is one full _generate_buffers +
-        plan_layout pass; the `cache` param on _per_core_view_on_buf
-        amortizes sympy work if it ever becomes hot.
+        _score_layout. Returns (best option index per op, timing breakdown in
+        seconds, _per_core_view_on_buf cache, liveness). The timing dict has
+        keys `graph_view` and `mem_usage` — the two split-dependent
+        shared-object builds inside _generate_buffers, which dominate per-leaf
+        cost. Liveness is split-invariant and computed once here, not per leaf.
+        No early-stop pruning — bounded by ≤ K^N leaves where N counts ops with
+        >1 option (most return [seed]). Per-leaf cost is one full
+        _generate_buffers + plan_layout pass; the `cache` param on
+        _per_core_view_on_buf amortizes sympy work if it ever becomes hot. The
+        cache and liveness are returned so the final commit pass can reuse them
+        when the post-search clone pass leaves the graph unchanged (see
+        plan_allocation).
         """
         chosen: list[int] = [0] * len(ops)
         best_total: float = math.inf
@@ -924,7 +951,7 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
             op.op_it_space_splits = prev_split
 
         recurse(0)
-        return best_chosen, timings
+        return best_chosen, timings, cache, lifetimes
 
     # ------------------------------------------------------------------
     # Leaf scoring
