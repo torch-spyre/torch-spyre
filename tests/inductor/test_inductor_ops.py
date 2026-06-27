@@ -918,14 +918,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "1d_int64": (unique_randn_along_dim((64,), dtype=torch.int64),),
                 "2d_int64": (unique_randn_along_dim((67, 256), dtype=torch.int64),),
+                "3d_int64": (unique_randn_along_dim((4, 8, 16), dtype=torch.int64),),
+                "1d_float32": (unique_randn_along_dim((64,), dtype=torch.float32),),
+                "2d_float32": (unique_randn_along_dim((8, 64), dtype=torch.float32),),
             },
-            "expect_fail": [
-                "1d_float16",
-                "2d_float16",
-                "3d_float16",
-                "1d_int64",
-                "2d_int64",
-            ],
         },
         # Compare with cpu for now to avoid hitting eager mode coverage issue
         ("test_max_keepdim0", "test_reduce_keepdim0_cpu"): {
