@@ -59,7 +59,7 @@
   <!-- Graph rewrites (post-grad passes) -->
   <rect x="110" y="242" width="360" height="62" rx="4" fill="#e55b15"/>
   <text x="290" y="260" text-anchor="middle" font-size="12" font-weight="700" fill="#ffffff">Graph Rewrites</text>
-  <text x="290" y="276" text-anchor="middle" font-size="10" fill="#ffffff">convert_constant_with_graph_node — scalars → size-1 tensors</text>
+  <text x="290" y="276" text-anchor="middle" font-size="10" fill="#ffffff">recover_spyre_hints restores spyre_hint annotations</text>
   <text x="290" y="289" text-anchor="middle" font-size="10.5" fill="#ffffff">relayout_linear_weights · mm_to_bmm_pass (2D → 3D)</text>
   <text x="290" y="302" text-anchor="middle" font-size="10.5" fill="#ffe4d0">bmm_unflatten_pass</text>
   <line x1="290" y1="304" x2="290" y2="322" stroke="#374151" stroke-width="1.5" marker-end="url(#arr)"/>

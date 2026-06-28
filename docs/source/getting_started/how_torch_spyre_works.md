@@ -627,9 +627,10 @@ computation that happens in the hardware.
 **Decompositions** are FX graph rewrites that connect ATen ops to the first two layers.
 `aten.rms_norm` decomposes into `spyre::rms_norm`, which is a custom op. `aten.addmm` decomposes
 into `matmul + scale + add`, which are all native ops. A more subtle case is scalar constants.
-The Spyre hardware does not support immediate scalar constants, so
-`convert_constant_with_graph_node` rewrites the FX graph to replace every scalar with a size-1
-tensor (using `spyre::constant`) before it reaches the compiler.
+The Spyre hardware does not support immediate scalar constants, so the compiler promotes every
+scalar to a size-1 constant tensor. This runs at the LoopLevelIR level in
+`dedup_and_promote_constants`, which also deduplicates identical constants so they share one
+device buffer.
 
 **CPU fallbacks** cover the long tail. The current set is `embedding`, `arange`, `sin`, `cos`,
 `tril`, `triu`, `isin`, `normal_`, `argmax`, `bitwise_or`, `bitwise_xor`, and the int64 variants

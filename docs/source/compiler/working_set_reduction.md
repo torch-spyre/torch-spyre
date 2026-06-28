@@ -328,17 +328,17 @@ The full mechanics — how loop identity is carried through Inductor's
 flat-list pipeline, how the loop perimeter prevents cross-group fusion, how
 buffers crossing the loop boundary are classified — are documented in
 [`coarse_tiling_loops.md`](coarse_tiling_loops.md). The design rationale
-for those mechanics is in [RFC #16: Coarse
-Tiling](https://github.com/torch-spyre/RFCs/pull/16).
+for those mechanics is in [RFC 1358: Coarse
+Tiling](https://github.com/torch-spyre/rfcs/blob/main/1358-CoarseTiling/1358-CoarseTiling.md).
 
 ## Related documents
 
 - [`coarse_tiling_loops.md`](coarse_tiling_loops.md) — implementation
   reference for the transformation stage (Layer 1 IR pass, Layer 2
   scheduler wrapper, Layer 3 codegen tree).
-- [RFC #16: Coarse-Tiling Loop IR — Design
-  Rationale](https://github.com/torch-spyre/RFCs/pull/16) — *why* the
-  three-layer design has the shape it does.
+- [RFC 1358: Coarse-Tiling Loop IR Design
+  Rationale](https://github.com/torch-spyre/rfcs/blob/main/1358-CoarseTiling/1358-CoarseTiling.md),
+  which explains the reasoning behind the three-layer design.
 - [`scratchpad_planning.md`](scratchpad_planning.md) — how LX scratchpad
   allocation consumes the per-tile iteration spaces produced by WSR.
 - [`work_division_planning.md`](work_division_planning.md) — how work
