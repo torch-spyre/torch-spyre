@@ -43,7 +43,7 @@ from .temp_passes import (
     mark_direct_unit_bmm_pass,
     mm_to_bmm_pass,
 )
-from .coarse_tile import hints_to_coarse_tile_groups
+from .coarse_tile import hints_to_coarse_tile_groups, reorder_unhinted_interlopers
 from . import config
 from .propagate_hints import (
     collect_spyre_hints,
@@ -270,9 +270,10 @@ def _maybe_chunk_large_tensors(graph: GraphLowering) -> None:
         chunk_large_tensors(graph)
 
 
-@_runs(hints_to_coarse_tile_groups, coarse_tile)
+@_runs(reorder_unhinted_interlopers, hints_to_coarse_tile_groups, coarse_tile)
 def _maybe_coarse_tile(graph: GraphLowering) -> None:
     if not config.ignore_wsr_hints:
+        reorder_unhinted_interlopers(graph)
         groups = hints_to_coarse_tile_groups(graph)
         if groups:
             coarse_tile(graph, groups=groups)
