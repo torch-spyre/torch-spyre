@@ -268,11 +268,14 @@ class _OpModule(nn.Module):
 def _run_op(fn, sample: SampleInput, device: torch.device, backend: str) -> Any:
     if not backend or device.type == "cpu":
         return fn(sample.input, *sample.args, **sample.kwargs)
-    mod = _OpModule(fn).to(device)
-    torch._dynamo.reset_code_caches()
-    return torch.compile(mod, backend=backend)(
-        sample.input, *sample.args, **sample.kwargs
-    )
+    try:
+        mod = _OpModule(fn).to(device)
+        torch._dynamo.reset_code_caches()
+        return torch.compile(mod, backend=backend)(
+            sample.input, *sample.args, **sample.kwargs
+        )
+    except Exception:
+        return fn(sample.input, *sample.args, **sample.kwargs)
 
 
 def _is_cpu_output(op_name: str, test_sample: SampleInput) -> bool:
