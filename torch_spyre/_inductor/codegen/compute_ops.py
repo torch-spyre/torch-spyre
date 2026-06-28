@@ -504,12 +504,13 @@ def generate_sdsc(
     if use_symbols:
 
         def offset_as_symbol(s, kind: SymbolKind):
+            key: tuple | int
             if kind.is_pool:
                 key = ("pool", s)
             elif kind.kind == "kernel":
                 key = ("kernel", kind.arg_index)
             elif kind.kind == "kernel_slice":
-                key = ("kernel_slice", kind.arg_index)
+                key = ("kernel_slice", kind.arg_index, kind.offset)
             else:
                 # kernel_derived: s is a large per-core HBM byte address,
                 # distinct from pool offsets and sentinel values.
@@ -551,20 +552,26 @@ def generate_sdsc(
                 offset_as_symbol(
                     raw_base, SymbolKind.kernel(arg_index=tensor.arg_index)
                 )
+                # Derive the 0-based symbols[] index of the kernel symbol from its
+                # registered ID.  Must be looked up (not inferred from current
+                # len(local_symbols)) because the same arg_index may have been
+                # registered already by an earlier tensor in this SDSC, in which case
+                # the offset_as_symbol call above was a no-op.
+                kernel_sym_idx = abs(local_symbols[("kernel", tensor.arg_index)]) - 1
                 # sliced_base_sym_idx: the symbols[] index that per-core derived symbols
                 # reference.  When slice_offset_bytes == 0 the kernel sym IS the sliced
                 # base; otherwise a separate kernel_slice sym is registered next.
                 if slice_offset_bytes > 0:
-                    sliced_base_sym_idx = symbol_id_offset + n_dim_syms + len(local_symbols)
                     offset_as_symbol(
                         core0_addr,
                         SymbolKind.kernel_slice(
                             arg_index=tensor.arg_index, offset=slice_offset_bytes
                         ),
                     )
+                    slice_key = ("kernel_slice", tensor.arg_index, slice_offset_bytes)
+                    sliced_base_sym_idx = abs(local_symbols[slice_key]) - 1
                 else:
-                    # kernel sym already registered; its index is one before current len.
-                    sliced_base_sym_idx = symbol_id_offset + n_dim_syms + len(local_symbols) - 1
+                    sliced_base_sym_idx = kernel_sym_idx
             else:
                 # Pool tensor: no raw-base or slice symbol needed.
                 sliced_base_sym_idx = -1
