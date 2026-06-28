@@ -70,7 +70,9 @@ class TensorDep:
     device_coords: list[Expr] = dataclasses.field(init=False)
 
     def __post_init__(self):
-        self.device_coords = device_coordinates(self.layout.device_layout, self.dep)
+        self.device_coords = device_coordinates(
+            self.layout.device_layout, self.dep, None
+        )
 
 
 # Per-symbol (max_size, granularity) bucket metadata for symbolic iteration vars.

@@ -222,7 +222,7 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         if y_buf_tmp is not None and isinstance(
             y_buf_tmp.get_layout(), FixedTiledLayout
         ):
-            y_h_coords = host_coordinates(y_buf_tmp.get_layout(), y_dep)
+            y_h_coords = host_coordinates(y_buf_tmp.get_layout(), y_dep, None)
             y_host_k_dim = next(
                 (
                     i

@@ -12,13 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Tests for propagate_named_dims — the pass that annotates each op's output
-# with semantic named dim labels (B, H, Lq, etc.) by propagating them from
-# annotated graph inputs through the op graph.
+# Tests for propagate_named_dims and the dim_info mechanism.
 #
-# Each test compiles a small function, intercepts the pass via patching, and
-# asserts that the graph output buffer carries the expected named dims.
-# No coarse tiling hints are used — these tests cover propagation only.
+# These tests verify that named dim labels (B, H, Lq, etc.) are correctly
+# propagated. They do not exercise the Spyre backend — functions are compiled
+# and the pass is intercepted via patching before any backend codegen runs.
 
 import collections
 import math
@@ -1047,6 +1045,7 @@ def test_broadcast_expand_middle_dim():
 # -------- Indirect-access (gather) tests --------
 
 _GM, _GN, _GP = 128, 256, 32
+_GQ = 192
 _GA, _GB, _GC = 64, 8, 64
 
 
@@ -1118,4 +1117,22 @@ def test_index_select_2d():
         named_dims={"M": _GM, "N": _GN, "P": _GP},
         tensor_dims={x: ["M", "N"], i: ["P"]},
         expected_propagated_dims=["P", "N"],
+    )
+
+
+def test_gather_2d_index():
+    """x[i]: x[M,N] gathered by 2-D index i[P,Q]. Output is [P,Q,N]; the
+    gathered M dim has a 2-D indirect index (0 loop vars); inner N propagates."""
+    x = torch.randn(_GM, _GN, dtype=torch.float16, device=DEVICE)
+    i = torch.randint(0, _GM, (_GP, _GQ), dtype=torch.int32, device=DEVICE)
+
+    def fn(x, i):
+        return x[i]
+
+    _run_and_capture(
+        fn,
+        [x, i],
+        named_dims={"M": _GM, "N": _GN, "P": _GP, "Q": _GQ},
+        tensor_dims={x: ["M", "N"], i: ["P", "Q"]},
+        expected_propagated_dims=["P", "Q", "N"],
     )

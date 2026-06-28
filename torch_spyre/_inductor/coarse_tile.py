@@ -369,7 +369,7 @@ def _reduction_tiling_is_on_stick_dim(op: ComputedBuffer, red_dim_idx: int) -> b
         return False
     # device_coordinates[-1] is the within-stick coordinate expression.
     # If red_sym appears in its free symbols, the reduction is on the stick dim.
-    stick_coord = device_coordinates(in_buf.layout.device_layout, in_dep)[-1]
+    stick_coord = device_coordinates(in_buf.layout.device_layout, in_dep, None)[-1]
     return red_sym in stick_coord.free_symbols
 
 
