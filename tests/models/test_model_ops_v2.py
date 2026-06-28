@@ -302,7 +302,7 @@ def _get_global_dtype_precision() -> dict:
 # ---------------------------------------------------------------------------
 # TestSpyreModelOps
 #
-# TorchTestBase (spyre_test_base_common.py) already handles at instantiate_test:
+# OOTTestBase (spyre_test_base_common.py) already handles at instantiate_test:
 #   - mode (xfail/skip/mandatory_success)
 #   - tags : pytest marks
 #   - unlisted_test_mode
