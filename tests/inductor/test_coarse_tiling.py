@@ -324,6 +324,7 @@ def _make_sdsc_spec(
         allocation=allocation,
         start_address=start_address,
         backGap={},
+        arg_index=0,
     )
     return SDSCSpec(
         opfunc="add",
@@ -1483,6 +1484,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             allocation={"hbm": 0x1000},
             start_address=0x1000,
             backGap={},
+            arg_index=0,
         )
         sdsc_spec = SDSCSpec(
             opfunc="add",
