@@ -76,8 +76,8 @@ on:
         default: ''
 
 concurrency:
-  group: integration-tests-${{ (inputs.pr_url_hash != '' && inputs.pr_url_hash) || inputs.triggering_repo }}-${{ inputs.triggering_sha || github.run_id
-    }}
+  group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.html_url) || (github.event_name == 'workflow_dispatch'
+    && inputs.pr_url_hash != '' && inputs.pr_url_hash) || github.ref }}
   cancel-in-progress: true
 
 permissions:
