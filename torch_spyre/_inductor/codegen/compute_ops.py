@@ -606,6 +606,11 @@ def generate_sdsc(
                         if tensor.arg_index < 0:
                             offset_as_symbol(addr, SymbolKind.pool())
                         elif addr != core0_addr:
+                            # Only register a derived symbol when the core has a
+                            # distinct address from core 0.  When addr == core0_addr
+                            # (e.g. a non-split tensor where all cores share one
+                            # address) the sliced-base symbol already covers it and
+                            # we must not create a duplicate registration.
                             offset_as_symbol(
                                 addr,
                                 _derived_kind(
