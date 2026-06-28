@@ -9,7 +9,7 @@ Responsibilities:
   - build_match_sets: compile a {class_name -> MatchSet} dict
 """
 
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set
 
 import regex as re
 import torch
@@ -55,7 +55,7 @@ class MatchSet:
 
     def __init__(self):
         self.exact: Set[str] = set()
-        self.patterns: Set[str] = set()
+        self.patterns: List[re.Pattern] = []
 
     @classmethod
     def from_iterable(cls, items) -> "MatchSet":
@@ -64,13 +64,13 @@ class MatchSet:
             if re.match(r"\w+$", item):
                 ms.exact.add(item)
             else:
-                ms.patterns.add(item)
+                ms.patterns.append(re.compile(item))
         return ms
 
     def matches(self, name: str) -> bool:
         if name in self.exact:
             return True
-        return any(re.match(pattern, name) for pattern in self.patterns)
+        return any(pattern.match(name) for pattern in self.patterns)
 
 
 def build_match_sets(d: Dict[str, set]) -> Dict[str, "MatchSet"]:
