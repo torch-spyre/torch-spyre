@@ -58,14 +58,14 @@ cases:
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1024, 3, 14, 14]
           stride: [588, 196, 14, 1]
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
       - value: null
       - value: (14, 14)
       - value: (0, 0)
