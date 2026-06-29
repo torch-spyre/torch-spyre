@@ -136,7 +136,9 @@ class ScratchpadAllocator(ABC):
             # If the op is tagged as pointwise by pytorch upstream
             # allow all inputs. Does not work for all ops
             return reads
-        return get_op_pointwise_inputs(op.data)
+        if hasattr(op, "data"):
+            return get_op_pointwise_inputs(op)
+        return []
 
     def _filter_ops(
         self,
