@@ -14,8 +14,7 @@
 
 
 import math
-from typing import Any
-
+from typing import Any, Optional
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import Operation, IRNode, Pointwise
@@ -46,6 +45,14 @@ OP_OUTPUT_GOOD_FOR_LX_REUSE = frozenset(
         "mean",
         "add",
         "rsqrt",
+        "neg",
+        "mm",
+        "bmm",
+        "batched_matmul",
+        "div",
+        "realdiv",
+        "expand",
+        "silu",
     }
 )
 
@@ -55,6 +62,11 @@ OP_GOOD_FOR_LX_INPLACE = frozenset(
         "sub",
         "add",
         "rsqrt",
+        "neg",
+        "div",
+        "realdiv",
+        "mul",
+        "silu",
     }
 )
 
@@ -107,7 +119,10 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
     return liveness
 
 
-def mem_usage_by_buf(graph: GraphLowering | GraphView) -> dict:
+def mem_usage_by_buf(
+    graph: GraphLowering | GraphView,
+    cache: Optional[dict] = None,
+) -> dict:
     """
     Get a summary of memory usage of each operation.
     Includes detailed info of individual buf, e.g. mem_usage[<buf_name>],
@@ -115,7 +130,7 @@ def mem_usage_by_buf(graph: GraphLowering | GraphView) -> dict:
     NOTE:
     if a buf is not in core_div_mismatch => it has no users => graph output
     """
-    num_cores_per_op = get_ncores_for_buffers(graph)
+    num_cores_per_op = get_ncores_for_buffers(graph, cache)
     mem_usage: dict = {}
 
     buf_names = {op.name for op in graph.operations}
@@ -198,7 +213,7 @@ def buffer_not_read_in_full(graph: GraphLowering | GraphView, buf_name: str) -> 
             try:
                 if int(dep.get_numel()) < full:
                     return True
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, AttributeError):
                 return True
     return False
 
@@ -244,12 +259,20 @@ def _op_num_cores(op: Operation) -> int:
     return math.prod([s for p in splits for s in p.values()])
 
 
-def get_ncores_for_buffers(graph: GraphLowering | GraphView) -> dict[str, int]:
+def get_ncores_for_buffers(
+    graph: GraphLowering | GraphView,
+    cache: Optional[dict] = None,
+) -> dict[str, int]:
     """
     Return a dictionary mapping buffer names to the number of cores
     used by all the operations that uses the buffer.
     If there is a core division mismatch return -1 instead of the
     number of cores.
+
+    Pass an optional `cache` dict to memoize `_per_core_view_on_buf`
+    results across calls (e.g. across co-opt search leaves). Safe to
+    share only within a single graph, since the cache key includes the
+    op name and `dep` (which carries the buffer name).
     """
     result: dict[str, int] = {}
     using_multicore = config.sencores > 1
@@ -266,7 +289,7 @@ def get_ncores_for_buffers(graph: GraphLowering | GraphView) -> dict[str, int]:
             ref_view = None
             mismatch = False
             for op, dep in users:
-                view, flag, _ = _per_core_view_on_buf(op, dep, buf_name)
+                view, flag, _ = _per_core_view_on_buf(op, dep, buf_name, cache)
                 if ref_view is None:
                     ref_view = view
                 if (flag and dep in op_read_writes(op).writes) or (view != ref_view):

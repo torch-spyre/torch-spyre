@@ -52,6 +52,7 @@ def generate_bundle(
     kernel_name: str,
     output_dir: str,
     specs: Sequence,
+    use_symbols: bool | None = None,
     unroll_loops: bool | None = None,
     symbolic_args: bool | None = None,
 ):
@@ -59,6 +60,11 @@ def generate_bundle(
 
     ``specs`` is a list of ``OpSpec | LoopSpec`` entries (nested ``LoopSpec``
     entries are supported).
+
+    ``use_symbols`` controls whether HBM tensor addresses are emitted as
+    runtime symbols (``%sym_N`` constants) in ``bundle.mlir`` with
+    ``affine.apply`` indirection.  When ``None`` (the default) the value is
+    read from ``config.bundle_hbm_symbols``.
 
     ``unroll_loops`` controls whether ``LoopSpec`` nodes are fully unrolled
     into flat ``OpSpec`` nodes before bundle generation.  When ``None`` (the
@@ -72,16 +78,20 @@ def generate_bundle(
     and produce ``scf.for`` loops in the generated ``bundle.mlir``.
 
     ``symbolic_args`` controls the function signature of ``@sdsc_bundle``.
-    When ``False`` (default), HBM addresses are baked as concrete integers and
-    ``sdsc_execute`` has no operands.  When ``True``, addresses are emitted as
-    runtime symbols with ``!sdscbundle.input_arg<index>`` parameters.  When
+    When ``False`` (default), ``sdsc_execute`` has no operands.
+    When ``True``, addresses are emitted as ``!sdscbundle.input_arg<index>``
+    parameters; this also forces ``use_symbols=True`` implicitly.  When
     ``None``, the value is read from ``config.bundle_symbolic_args``.
     """
+    if use_symbols is None:
+        use_symbols = _spyre_config.bundle_hbm_symbols
     if unroll_loops is None:
         unroll_loops = _spyre_config.unroll_loops
     if symbolic_args is None:
         symbolic_args = _spyre_config.bundle_symbolic_args
-    use_symbols = symbolic_args
+    # symbolic_args requires symbol emission — if it is set, ensure use_symbols is too.
+    if symbolic_args:
+        use_symbols = True
 
     specs_list: list = unroll_loop_specs(list(specs)) if unroll_loops else list(specs)
 
@@ -134,14 +144,12 @@ def generate_bundle(
 
     # Build a per-symbol kind list from compiled entries (symbolic_args path only).
     symbol_kinds: list[SymbolKind] = []
-    if symbolic_args:
+    if symbolic_args and use_symbols:
         for _, _, _, local_kinds in compiled:
             symbol_kinds.extend(local_kinds)
 
     # Determine whether a pool parameter is needed (any pool symbol present).
-    has_pool = (
-        symbolic_args and bool(symbol_kinds) and any(sk.is_pool for sk in symbol_kinds)
-    )
+    has_pool = symbolic_args and use_symbols and any(sk.is_pool for sk in symbol_kinds)
     # Indices of kernel-base symbols that become input_arg parameters.
     # Deduplicated by address value: multiple SDSCs may register the same kernel arg
     # address independently (no cross-SDSC dedup in generate_sdsc), so we keep only
@@ -150,7 +158,7 @@ def generate_bundle(
     # kernel_dup_canonical: maps duplicate kernel sym_idx → canonical sym_idx.
     kernel_arg_sym_indices: list[int] = []
     kernel_dup_canonical: dict[int, int] = {}  # duplicate sym_idx → canonical sym_idx
-    if symbolic_args:
+    if symbolic_args and use_symbols:
         seen_kernel_addr: dict[int, int] = {}  # address → canonical sym_idx
         for i, kind_i in enumerate(symbol_kinds):
             if kind_i.kind == "kernel":
@@ -180,7 +188,7 @@ def generate_bundle(
         #   - one !sdscbundle.input_arg<index> param per kernel tensor arg, with a
         #     descriptive formal name %arg_{arg_index}_base_addr; the short form
         #     %arg_{arg_index} is used in the body after input_arg_extract
-        if symbolic_args and (has_pool or kernel_arg_sym_indices):
+        if symbolic_args and use_symbols and (has_pool or kernel_arg_sym_indices):
             params = []
             if has_pool:
                 params.append("%pool_base_addr: !sdscbundle.input_arg<index>")

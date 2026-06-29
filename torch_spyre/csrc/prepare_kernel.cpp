@@ -272,16 +272,32 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
   std::string job_bin_ptr_str = cmd["job_bin_ptr"].get<std::string>();
   uint64_t job_bin_ptr = std::stoull(job_bin_ptr_str);
 
-  auto job_bin_addr =
-      compute_offset_address(job_allocation_.at(0), job_bin_ptr);
+  // job_bin_ptr is the segment-7 virtual address where the program's
+  // instructions begin (after the program-correction region). Validate it is in
+  // segment 7 and derive the offset of that entry point within the program
+  // allocation (0 when the binary starts at the allocation base).
+  TORCH_CHECK(
+      job_bin_ptr >= prog_offset_base && job_bin_ptr < prog_offset_limit,
+      "job_bin_ptr 0x", std::hex, job_bin_ptr,
+      " is out of program segment bounds [0x", prog_offset_base, ", 0x",
+      prog_offset_limit, ")");
+  uint64_t bootstrap_offset = job_bin_ptr - prog_offset_base;
 
-  // Verify the resulting binary address is populated
-  TORCH_CHECK(job_bin_addr.total_size() > 0,
-              "ComputeOnDevice binary address must be populated (size > 0)");
+  // Hand flex the program's FULL allocation as a non-owning descriptor over the
+  // same chunk (the owning CompositeAddress stays in job_allocation_, which is
+  // later moved into the JobPlan and outlives this step). flex bounds the
+  // segment-7 xlat to its total_size() -- the real deeptools Allocate footprint
+  // -- instead of the 16GB SEGMENT_SIZE. The size grows automatically if/when
+  // deeptools grows the Allocate, requiring no further change here.
+  TORCH_CHECK(job_allocation_.at(0).chunks().size() == 1,
+              "job_allocation must have 1 chunk");
+  TORCH_CHECK(
+      job_allocation_.at(0).total_size() > 0,
+      "ComputeOnDevice program allocation must be populated (size > 0)");
+  flex::CompositeAddress program_address(job_allocation_.at(0).chunks()[0]);
 
-  // Create RuntimeOperationCompute with the allocated program address
-  return std::make_unique<JobPlanStepCompute>(std::move(job_bin_addr),
-                                              bind_io_addresses_, job_bin_ptr);
+  return std::make_unique<JobPlanStepCompute>(
+      std::move(program_address), bind_io_addresses_, bootstrap_offset);
 }
 
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHost(

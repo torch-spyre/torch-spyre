@@ -65,6 +65,15 @@
 
 set -euo pipefail
 
+# Resolve the tests/ directory from this script's own location so that
+# oot_framework is importable as a module even before TORCH_DEVICE_ROOT is
+# resolved later. This is needed for the multi-config merge step below.
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_SCRIPT_TESTS_DIR="$(dirname "$_SCRIPT_DIR")"
+case ":${PYTHONPATH:-}:" in
+    *":$_SCRIPT_TESTS_DIR:"*) ;;
+    *) export PYTHONPATH="$_SCRIPT_TESTS_DIR:${PYTHONPATH:-}" ;;
+esac
 
 if [[ $# -lt 1 ]]; then
     echo "Usage: $0 <config.yaml | config_dir/> [config2.yaml ...] [extra pytest args...]" >&2
@@ -1443,6 +1452,31 @@ _add_suite_counts() {
 }
 
 # ---------------------------------------------------------------------------
+# Per-file result tracking — always collected (not just multi-config).
+# _FILE_SUMMARY_LABELS[i]  : display name (basename of original test file)
+# _FILE_SUMMARY_STATUS[i]  : PASS | FAIL | SIGNAL | NOTEST | ERROR
+# _FILE_SUMMARY_COUNTS[i]  : "passed failed error skipped xfailed xpassed time"
+# _ALL_FAILED_TESTS[]      : accumulated failed test node IDs, one per entry
+# ---------------------------------------------------------------------------
+_FILE_SUMMARY_LABELS=()
+_FILE_SUMMARY_STATUS=()
+_FILE_SUMMARY_COUNTS=()
+_ALL_FAILED_TESTS=()
+
+# _extract_failed_tests <output_file>
+# Prints one failed test node ID per line from pytest short summary section.
+_extract_failed_tests() {
+    local _f="$1"
+    [[ -f "$_f" ]] || return
+    grep -E '^FAILED ' "$_f" \
+        | sed 's/^FAILED //' \
+        | sed 's/ -.*//' \
+        | sed 's/^\[TAGS[^]]*\] //' \
+        | sed 's/__oot_wrapper//' \
+        | grep '::'
+}
+
+# ---------------------------------------------------------------------------
 # _parse_pytest_summary_line <output_file>
 #
 # Reads the captured pytest output file, finds the terminal summary line
@@ -1638,6 +1672,9 @@ _run_xdist_fallback() {
             echo "[torch_oot_device_tests_run]          Install with: pip install pytest-xdist" >&2
             echo "[torch_oot_device_tests_run]          Skipping remaining tests in: $_orig" >&2
             [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+            _FILE_SUMMARY_LABELS+=("$(basename "$_orig") [signal/no-xdist]")
+            _FILE_SUMMARY_STATUS+=("SIGNAL")
+            _FILE_SUMMARY_COUNTS+=("0 0 0 0 0 0 0")
             return
         fi
     fi
@@ -1656,10 +1693,32 @@ _run_xdist_fallback() {
         echo "[torch_oot_device_tests_run] WARNING: xdist fallback subshell exited abnormally for $_orig" >&2
     fi
 
-    # Accumulate per-suite counts from xdist output (multi-config only).
-    if [[ ${#YAML_CONFIGS[@]} -ge 2 && -n "$_suite_lbl" && -f "$_xdist_out_tmp" ]]; then
+    # Track per-file results and collect failed test names from xdist run.
+    _xdist_display="$(basename "$_orig")"
+    if [[ -f "$_xdist_out_tmp" ]]; then
         read -r _sp _sf _se _ss _sxf _sxp _st <<< "$(_parse_pytest_summary_line "$_xdist_out_tmp")"
-        _add_suite_counts "$_suite_lbl" "${_sp:-0}" "${_sf:-0}" "${_se:-0}" "${_ss:-0}" "${_sxf:-0}" "${_sxp:-0}" "${_st:-0}"
+        # Accumulate per-suite counts (multi-config).
+        if [[ ${#YAML_CONFIGS[@]} -ge 2 && -n "$_suite_lbl" ]]; then
+            _add_suite_counts "$_suite_lbl" "${_sp:-0}" "${_sf:-0}" "${_se:-0}" "${_ss:-0}" "${_sxf:-0}" "${_sxp:-0}" "${_st:-0}"
+        fi
+        # Record per-file result for end-of-run summary.
+        case $_xexit in
+            0) _xfstatus="PASS" ;;
+            1) _xfstatus="FAIL" ;;
+            5) _xfstatus="NOTEST" ;;
+            *) _xfstatus="SIGNAL" ;;
+        esac
+        _FILE_SUMMARY_LABELS+=("${_xdist_display} [xdist]")
+        _FILE_SUMMARY_STATUS+=("$_xfstatus")
+        _FILE_SUMMARY_COUNTS+=("${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}")
+        # Collect failed test names.
+        while IFS= read -r _fn; do
+            [[ -n "$_fn" ]] && _ALL_FAILED_TESTS+=("$_fn")
+        done < <(_extract_failed_tests "$_xdist_out_tmp")
+    else
+        _FILE_SUMMARY_LABELS+=("${_xdist_display} [signal]")
+        _FILE_SUMMARY_STATUS+=("SIGNAL")
+        _FILE_SUMMARY_COUNTS+=("0 0 0 0 0 0 0")
     fi
     rm -f "$_xdist_out_tmp"
 
@@ -1877,22 +1936,27 @@ _run_parallel_across_cards() {
     local -a _card_exit_files=()
     local -a _card_shard_list_files=()
     local -a _card_counts_files=()
+    local -a _card_summary_files=()
 
     for (( _k=0; _k<_n_cards; _k++ )); do
         local _card_exit_tmp="/tmp/_spyre_card_exit_${$}_${_k}.tmp"
         local _card_shard_list="/tmp/_spyre_card_shards_${$}_${_k}.tmp"
         local _card_counts_file="/tmp/_spyre_card_counts_${$}_${_k}.tmp"
+        local _card_summary_file="/tmp/_spyre_card_summary_${$}_${_k}.tmp"
         _card_exit_files+=("$_card_exit_tmp")
         _card_shard_list_files+=("$_card_shard_list")
         _card_counts_files+=("$_card_counts_file")
+        _card_summary_files+=("$_card_summary_file")
         : > "$_card_shard_list"
         : > "$_card_counts_file"
+        : > "$_card_summary_file"
 
         local _subshell_card="$_k"
         local _subshell_id_file="${_card_id_files[$_k]}"
         local _subshell_exit_tmp="$_card_exit_tmp"
         local _subshell_shard_list="$_card_shard_list"
         local _subshell_counts_file="$_card_counts_file"
+        local _subshell_summary_file="$_card_summary_file"
 
         (
             set +euo pipefail
@@ -1993,11 +2057,29 @@ _run_parallel_across_cards() {
                     echo "[torch_oot_device_tests_run] ERROR: pytest subshell exited abnormally for $original_file" >&2
                 fi
 
-                # Accumulate per-suite counts (multi-config only, clean runs).
-                if [[ ${#YAML_CONFIGS[@]} -ge 2 && -f "$_par_out_tmp" && $_exit -lt 128 ]]; then
-                    _p_suite_label="${_FILE_YAML_LABEL[$_fidx]:-unknown}"
+                # Track per-file results and collect failed test names.
+                _p_file_display="$(basename "$original_file")"
+                if [[ -f "$_par_out_tmp" && $_exit -lt 128 ]]; then
                     read -r _sp _sf _se _ss _sxf _sxp _st <<< "$(_parse_pytest_summary_line "$_par_out_tmp")"
-                    echo "${_p_suite_label} ${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}" >> "$_subshell_counts_file"
+                    # Accumulate per-suite counts (multi-config).
+                    if [[ ${#YAML_CONFIGS[@]} -ge 2 ]]; then
+                        _p_suite_label="${_FILE_YAML_LABEL[$_fidx]:-unknown}"
+                        echo "${_p_suite_label} ${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}" >> "$_subshell_counts_file"
+                    fi
+                    # Record per-file result for end-of-run summary.
+                    case $_exit in
+                        0) _pfstatus="PASS" ;;
+                        1) _pfstatus="FAIL" ;;
+                        5) _pfstatus="NOTEST" ;;
+                        *) _pfstatus="ERROR" ;;
+                    esac
+                    echo "FILE_RESULT ${_p_file_display} ${_pfstatus} ${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}" >> "$_subshell_summary_file"
+                    # Collect failed test names.
+                    while IFS= read -r _pfn; do
+                        [[ -n "$_pfn" ]] && echo "FAILED_TEST ${_pfn}" >> "$_subshell_summary_file"
+                    done < <(_extract_failed_tests "$_par_out_tmp")
+                elif [[ $_exit -ge 128 ]]; then
+                    echo "FILE_RESULT ${_p_file_display} SIGNAL 0 0 0 0 0 0 0" >> "$_subshell_summary_file"
                 fi
                 rm -f "$_par_out_tmp"
 
@@ -2060,7 +2142,22 @@ _run_parallel_across_cards() {
 
     # -----------------------------------------------------------------------
     # Step 4: wait for all card subshells; collect exit codes and XML shards.
+    #
+    # Per-file results are aggregated across cards: a single test file may have
+    # its tests split round-robin across N cards, so each card writes its own
+    # FILE_RESULT entry.  The associative arrays below accumulate those slices
+    # and produce one consolidated row per file in the final summary.
     # -----------------------------------------------------------------------
+    local -A _par_agg_p=()
+    local -A _par_agg_f=()
+    local -A _par_agg_e=()
+    local -A _par_agg_s=()
+    local -A _par_agg_xf=()
+    local -A _par_agg_xp=()
+    local -A _par_agg_t=()
+    local -A _par_agg_status=()
+    local -a _par_agg_order=()
+
     echo "[torch_oot_device_tests_run] Waiting for all card jobs to finish..."
     for (( _k=0; _k<_n_cards; _k++ )); do
         wait "${_card_pids[$_k]}" || true
@@ -2102,7 +2199,66 @@ _run_parallel_across_cards() {
             rm -f "$_counts_file"
         fi
 
+        # Read per-file results and failed test names written by the card subshell.
+        # FILE_RESULT entries are accumulated into _par_agg_* rather than written
+        # directly to _FILE_SUMMARY_* so that slices from different cards for the
+        # same file are merged into one consolidated row.
+        local _summary_file="${_card_summary_files[$_k]}"
+        if [[ -f "$_summary_file" ]]; then
+            while IFS= read -r _sline; do
+                [[ -z "$_sline" ]] && continue
+                _stype="${_sline%% *}"
+                _srest="${_sline#* }"
+                if [[ "$_stype" == "FILE_RESULT" ]]; then
+                    read -r _slbl _sstatus _sp _sf _se _ss _sxf _sxp _st <<< "$_srest"
+                    _slbl="${_slbl:-unknown}"
+                    # First time we see this file: initialise aggregation slots.
+                    if [[ -z "${_par_agg_status[$_slbl]+set}" ]]; then
+                        _par_agg_order+=("$_slbl")
+                        _par_agg_p[$_slbl]=0
+                        _par_agg_f[$_slbl]=0
+                        _par_agg_e[$_slbl]=0
+                        _par_agg_s[$_slbl]=0
+                        _par_agg_xf[$_slbl]=0
+                        _par_agg_xp[$_slbl]=0
+                        _par_agg_t[$_slbl]="0"
+                        _par_agg_status[$_slbl]="NOTEST"
+                    fi
+                    # Sum counts across card slices.
+                    _par_agg_p[$_slbl]=$(( ${_par_agg_p[$_slbl]} + ${_sp:-0} ))
+                    _par_agg_f[$_slbl]=$(( ${_par_agg_f[$_slbl]} + ${_sf:-0} ))
+                    _par_agg_e[$_slbl]=$(( ${_par_agg_e[$_slbl]} + ${_se:-0} ))
+                    _par_agg_s[$_slbl]=$(( ${_par_agg_s[$_slbl]} + ${_ss:-0} ))
+                    _par_agg_xf[$_slbl]=$(( ${_par_agg_xf[$_slbl]} + ${_sxf:-0} ))
+                    _par_agg_xp[$_slbl]=$(( ${_par_agg_xp[$_slbl]} + ${_sxp:-0} ))
+                    _par_agg_t[$_slbl]=$(python3 -c "print('%.2f' % (${_par_agg_t[$_slbl]:-0} + ${_st:-0}))" 2>/dev/null || echo "${_par_agg_t[$_slbl]}")
+                    # Merge status: SIGNAL > FAIL > ERROR > PASS > NOTEST
+                    case "$_sstatus" in
+                        SIGNAL) _par_agg_status[$_slbl]="SIGNAL" ;;
+                        FAIL)   [[ "${_par_agg_status[$_slbl]}" != "SIGNAL" ]] && \
+                                    _par_agg_status[$_slbl]="FAIL" ;;
+                        ERROR)  [[ "${_par_agg_status[$_slbl]}" != "SIGNAL" && \
+                                    "${_par_agg_status[$_slbl]}" != "FAIL" ]] && \
+                                    _par_agg_status[$_slbl]="ERROR" ;;
+                        PASS)   [[ "${_par_agg_status[$_slbl]}" == "NOTEST" ]] && \
+                                    _par_agg_status[$_slbl]="PASS" ;;
+                    esac
+                elif [[ "$_stype" == "FAILED_TEST" ]]; then
+                    _ALL_FAILED_TESTS+=("$_srest")
+                fi
+            done < "$_summary_file"
+            rm -f "$_summary_file"
+        fi
+
         rm -f "${_card_id_files[$_k]}"
+    done
+
+    # Populate _FILE_SUMMARY_* from the aggregated per-file results (one row per
+    # unique file, counts summed across all card slices).
+    for _slbl in "${_par_agg_order[@]+"${_par_agg_order[@]}"}"; do
+        _FILE_SUMMARY_LABELS+=("$_slbl")
+        _FILE_SUMMARY_STATUS+=("${_par_agg_status[$_slbl]}")
+        _FILE_SUMMARY_COUNTS+=("${_par_agg_p[$_slbl]} ${_par_agg_f[$_slbl]} ${_par_agg_e[$_slbl]} ${_par_agg_s[$_slbl]} ${_par_agg_xf[$_slbl]} ${_par_agg_xp[$_slbl]} ${_par_agg_t[$_slbl]}")
     done
 }
 
@@ -2237,11 +2393,29 @@ for i in "${!RUN_FILES[@]}"; do
         echo "[torch_oot_device_tests_run] ERROR: pytest subshell exited abnormally (segfault or signal?) for $original_file" >&2
     fi
 
-    # Accumulate per-suite counts from pytest terminal output (multi-config only).
-    if [[ ${#YAML_CONFIGS[@]} -ge 2 && -f "$_OUT_TMP" && $_exit -lt 128 ]]; then
-        _suite_label="${_FILE_YAML_LABEL[$i]:-unknown}"
+    # Track per-file results and collect failed test names (always).
+    _file_display="$(basename "$original_file")"
+    if [[ -f "$_OUT_TMP" && $_exit -lt 128 ]]; then
         read -r _sp _sf _se _ss _sxf _sxp _st <<< "$(_parse_pytest_summary_line "$_OUT_TMP")"
-        _add_suite_counts "$_suite_label" "${_sp:-0}" "${_sf:-0}" "${_se:-0}" "${_ss:-0}" "${_sxf:-0}" "${_sxp:-0}" "${_st:-0}"
+        # Accumulate per-suite counts (multi-config).
+        if [[ ${#YAML_CONFIGS[@]} -ge 2 ]]; then
+            _suite_label="${_FILE_YAML_LABEL[$i]:-unknown}"
+            _add_suite_counts "$_suite_label" "${_sp:-0}" "${_sf:-0}" "${_se:-0}" "${_ss:-0}" "${_sxf:-0}" "${_sxp:-0}" "${_st:-0}"
+        fi
+        # Record per-file result for end-of-run summary.
+        case $_exit in
+            0) _fstatus="PASS" ;;
+            1) _fstatus="FAIL" ;;
+            5) _fstatus="NOTEST" ;;
+            *) _fstatus="ERROR" ;;
+        esac
+        _FILE_SUMMARY_LABELS+=("$_file_display")
+        _FILE_SUMMARY_STATUS+=("$_fstatus")
+        _FILE_SUMMARY_COUNTS+=("${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}")
+        # Collect failed test names.
+        while IFS= read -r _fn; do
+            [[ -n "$_fn" ]] && _ALL_FAILED_TESTS+=("$_fn")
+        done < <(_extract_failed_tests "$_OUT_TMP")
     fi
     rm -f "$_OUT_TMP"
 
@@ -2392,6 +2566,58 @@ if [[ ${#YAML_CONFIGS[@]} -ge 2 ]]; then
             printf "  %-52s  %s\n" "$_lbl" "$_summary"
         done
     fi
+    echo "========================================================================"
+fi
+
+# ---------------------------------------------------------------------------
+# Per-file result summary — always printed.
+# ---------------------------------------------------------------------------
+echo ""
+echo "========================================================================"
+echo "[torch_oot_device_tests_run] Per-file result summary:"
+echo "========================================================================"
+if [[ ${#_FILE_SUMMARY_LABELS[@]} -eq 0 ]]; then
+    echo "  (no file results recorded)"
+else
+    for _fi in "${!_FILE_SUMMARY_LABELS[@]}"; do
+        _flbl="${_FILE_SUMMARY_LABELS[$_fi]}"
+        _fstat="${_FILE_SUMMARY_STATUS[$_fi]}"
+        read -r _fp _ff _fe _fs _fxf _fxp _ft <<< "${_FILE_SUMMARY_COUNTS[$_fi]}"
+        _fparts=()
+        [[ "${_fp:-0}"  -gt 0 ]] && _fparts+=("${_fp} passed")
+        [[ "${_ff:-0}"  -gt 0 ]] && _fparts+=("${_ff} failed")
+        [[ "${_fe:-0}"  -gt 0 ]] && _fparts+=("${_fe} error")
+        [[ "${_fs:-0}"  -gt 0 ]] && _fparts+=("${_fs} skipped")
+        [[ "${_fxf:-0}" -gt 0 ]] && _fparts+=("${_fxf} xfailed")
+        [[ "${_fxp:-0}" -gt 0 ]] && _fparts+=("${_fxp} xpassed")
+        if [[ ${#_fparts[@]} -eq 0 ]]; then
+            case "$_fstat" in
+                NOTEST) _fsummary="no tests collected" ;;
+                SIGNAL) _fsummary="signal/crash (see above)" ;;
+                *)      _fsummary="0 tests" ;;
+            esac
+        else
+            _fsummary="$(IFS=', '; echo "${_fparts[*]}")"
+            if [[ -n "${_ft:-}" && "$_ft" != "0" ]]; then
+                _fsummary="${_fsummary} in ${_ft}s"
+            fi
+        fi
+        printf "  %-8s  %-52s  %s\n" "$_fstat" "$_flbl" "$_fsummary"
+    done
+fi
+echo "========================================================================"
+
+# ---------------------------------------------------------------------------
+# Failed test names — printed when any failures were recorded.
+# ---------------------------------------------------------------------------
+if [[ ${#_ALL_FAILED_TESTS[@]} -gt 0 ]]; then
+    echo ""
+    echo "========================================================================"
+    echo "[torch_oot_device_tests_run] Failed tests (${#_ALL_FAILED_TESTS[@]}):"
+    echo "========================================================================"
+    for _failed in "${_ALL_FAILED_TESTS[@]}"; do
+        echo "  $_failed"
+    done
     echo "========================================================================"
 fi
 

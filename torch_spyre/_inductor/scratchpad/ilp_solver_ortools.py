@@ -183,7 +183,7 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
         self._bottom_justify = bottom_justify
 
     def plan_layout(
-        self, buffers: list[CoreDivisionBuffer]
+        self, buffers: list[CoreDivisionBuffer], log_lx_usage: bool = False
     ) -> list[CoreDivisionBuffer]:
         if not buffers:
             return []
@@ -230,6 +230,9 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
         solver.parameters.num_search_workers = os.cpu_count() or 1
         # Fixed seed so a given worker configuration is reproducible run-to-run.
         solver.parameters.random_seed = 0
+
+        # TODO: Update objective to a maxmin optimization to optimize overall
+        # throughput.
 
         # Two-phase lexicographic objective: residency is the hard priority and
         # core division is chosen only in service of it.
