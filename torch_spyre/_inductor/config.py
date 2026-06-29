@@ -90,7 +90,7 @@ bundle_hbm_symbols: bool = os.environ.get("BUNDLE_HBM_SYMBOLS", "1") == "1"
 # When True, addresses are emitted as runtime symbols with
 # !sdscbundle.input_arg<index> parameters and input_arg_extract ops.
 # Requires bundle_hbm_symbols=True to have any effect.
-bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "0") == "1"
+bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 
 # When True (default), LoopSpec nodes are fully unrolled into flat OpSpecs
 # before generate_bundle runs.  Set to False to pass LoopSpecs through intact

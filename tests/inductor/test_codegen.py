@@ -206,7 +206,6 @@ class TestSpyreConfig(InductorTestCase):
             )
         self.assertIn("symbolic stick dim", str(cm.exception))
 
-
     def test_inplace_op_run_call_deduplicates_args(self):
         """An inplace op (x *= 2) must not pass the same tensor twice to .run().
 
