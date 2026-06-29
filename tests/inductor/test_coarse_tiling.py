@@ -3850,6 +3850,22 @@ class TestReorderUnhintedInterlopers(unittest.TestCase):
         c = _make_rui_op("c", hint_ids=(0,))
         self.assertEqual(self._run([a, u1, b, u2, c]), ["u2", "a", "b", "c", "u1"])
 
+    def test_two_interlopers_both_move_after(self):
+        # [H(a), U1(reads a), U2(reads a), H(b), H(c)]
+        # U1 and U2 both read 'a' so neither can move before the run.
+        # Both have no dependents in the remaining hinted ops so both can
+        # move after.  After U1 moves after c, U2 is encountered next; it
+        # also reads a (blocked from moving before) and can move after c.
+        # Verifies the chained move-after path for consecutive interlopers.
+        a = _make_rui_op("a", hint_ids=(0,))
+        u1 = _make_rui_op("u1", reads=("a",))
+        u2 = _make_rui_op("u2", reads=("a",))
+        b = _make_rui_op("b", hint_ids=(0,))
+        c = _make_rui_op("c", hint_ids=(0,))
+        # u1 is processed first and moves after c; u2 is processed next and
+        # also moves after c (now at index 3), landing between c and u1.
+        self.assertEqual(self._run([a, u1, u2, b, c]), ["a", "b", "c", "u2", "u1"])
+
     def test_mutating_interloper_blocked(self):
         # x mutates buffer 'a' produced by a hinted op; x cannot legally move
         # before the run (would run before 'a' is produced) and b reads x so
