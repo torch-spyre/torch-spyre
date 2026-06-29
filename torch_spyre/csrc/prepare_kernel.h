@@ -155,11 +155,14 @@ class JobPlanBuilder {
 
   /// Translate the job execution plan to a JobPlan
   std::unique_ptr<JobPlan> translateJobExecPlan();
-  /// Translate a single command from the execution plan to a JobPlanStep
-  std::unique_ptr<JobPlanStep> translateCommand(const nlohmann::json& cmd);
+  /// Translate a single command from the execution plan to a JobPlanStep.
+  /// step_idx is the command's position within JobExecPlan; threaded through
+  /// so compute steps can disambiguate their profiler kernel name.
+  std::unique_ptr<JobPlanStep> translateCommand(const nlohmann::json& cmd,
+                                                size_t step_idx);
   /// Translate a ComputeOnDevice command to a JobPlanStepCompute
   std::unique_ptr<JobPlanStep> translateComputeOnDevice(
-      const nlohmann::json& cmd);
+      const nlohmann::json& cmd, size_t step_idx);
   /// Translate a ComputeOnHost command to a JobPlanStepHostCompute
   std::unique_ptr<JobPlanStep> translateComputeOnHost(
       const nlohmann::json& cmd);

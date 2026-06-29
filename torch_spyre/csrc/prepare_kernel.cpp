@@ -265,12 +265,30 @@ void JobPlanBuilder::executeJobPreparationPlan() {
 }
 
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
-    const nlohmann::json& cmd) {
+    const nlohmann::json& cmd, size_t step_idx) {
   TORCH_CHECK(cmd.contains("job_bin_ptr"),
               "ComputeOnDevice command missing 'job_bin_ptr' property");
 
   std::string job_bin_ptr_str = cmd["job_bin_ptr"].get<std::string>();
   uint64_t job_bin_ptr = std::stoull(job_bin_ptr_str);
+
+  // Kernel name surfaces in profiler events (PendingRequest::node_name →
+  // aiupti activity name, FLEX JSON CBName). Prefer an explicit name from
+  // SpyreCode if present; otherwise fall back to
+  // "<sdsc_dir>/<inner_dir>/bundle.mlir#<step_idx>" — the last two components
+  // of spyrecode_dir_ plus bundle.mlir, which is enough to identify the SDSC
+  // in the trace without dragging the full /tmp/torchinductor_*/... prefix.
+  // The step index disambiguates multi-compute plans.
+  std::string name;
+  if (cmd.contains("name") && cmd["name"].is_string()) {
+    name = cmd["name"].get<std::string>();
+  } else {
+    auto inner = spyrecode_dir_.filename();  // spyreCodeDir
+    auto sdsc =
+        spyrecode_dir_.parent_path().filename();  // sdsc_fused_..._vx...
+    name = (sdsc / inner / "bundle.mlir").string() + "#" +
+           std::to_string(step_idx);
+  }
 
   // job_bin_ptr is the segment-7 virtual address where the program's
   // instructions begin (after the program-correction region). Validate it is in
@@ -297,7 +315,8 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
   flex::CompositeAddress program_address(job_allocation_.at(0).chunks()[0]);
 
   return std::make_unique<JobPlanStepCompute>(
-      std::move(program_address), bind_io_addresses_, bootstrap_offset);
+      std::move(program_address), bind_io_addresses_, bootstrap_offset,
+      std::move(name));
 }
 
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHost(
@@ -447,7 +466,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
 }
 
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateCommand(
-    const nlohmann::json& cmd) {
+    const nlohmann::json& cmd, size_t step_idx) {
   TORCH_CHECK(cmd.contains("command") && cmd["command"].is_string(),
               "SpyreCode command missing 'command' field");
 
@@ -458,7 +477,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateCommand(
 
   switch (command_type) {
     case SpyreCodeCommandType::ComputeOnDevice:
-      return translateComputeOnDevice(properties);
+      return translateComputeOnDevice(properties, step_idx);
 
     case SpyreCodeCommandType::ComputeOnHost:
       return translateComputeOnHost(properties);
@@ -486,9 +505,9 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
 
   // Parse each command in the JobExecPlan and create JobPlanSteps
   std::vector<std::unique_ptr<JobPlanStep>> steps;
-  for (const auto& command : job_exec_plan) {
+  for (size_t i = 0; i < job_exec_plan.size(); ++i) {
     try {
-      steps.push_back(translateCommand(command));
+      steps.push_back(translateCommand(job_exec_plan[i], i));
     }
     catch (const std::exception& e) {
       TORCH_CHECK(false, "Failed to parse SpyreCode command: ", e.what());
