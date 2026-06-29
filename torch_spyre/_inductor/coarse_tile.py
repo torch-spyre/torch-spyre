@@ -137,6 +137,12 @@ def _no_dep_conflict(op: ComputedBuffer, others: list[Operation]) -> bool:
 
     A conflict exists if any op in others reads or mutates a buffer written by op,
     or if op reads or mutates a buffer written by any op in others.
+
+    op_needs intentionally includes op.get_mutation_names() alongside read names.
+    This covers both RAW (op reads a buffer that other writes) and WAW (op mutates
+    a buffer that other also writes) hazards.  The WAW case is conservative: two
+    ops mutating the same buffer cannot be reordered safely regardless of direction,
+    so conflating them here is deliberate.
     """
     op_written = _written_names(op)
     op_needs = op.get_read_names() | set(op.get_mutation_names())
@@ -160,6 +166,9 @@ def _can_move_before(
 
     Legal iff no data-flow conflict exists between op and ops[start..end-1].
     """
+    # Defensive: _no_dep_conflict requires a ComputedBuffer; the sole caller
+    # (reorder_unhinted_interlopers) already filters for this, but guard here
+    # in case the function is called from a future context.
     if not isinstance(op, ComputedBuffer):
         return False
     return _no_dep_conflict(op, ops[start:end])
@@ -175,6 +184,7 @@ def _can_move_after(
 
     Legal iff no data-flow conflict exists between op and ops[start+1..end-1].
     """
+    # Defensive: same rationale as _can_move_before.
     if not isinstance(op, ComputedBuffer):
         return False
     return _no_dep_conflict(op, ops[start + 1 : end])
@@ -183,11 +193,34 @@ def _can_move_after(
 def reorder_unhinted_interlopers(graph: GraphLowering) -> None:
     """Move unhinted ComputedBuffer ops that interrupt hint-group runs.
 
-    ``hints_to_coarse_tile_groups`` breaks a run whenever it encounters a
-    ComputedBuffer with no hints (or a different hint key).  If such an op
-    could legally be repositioned — either just before the current run's
-    start or just after the last same-key op in the remainder — move it so
-    the run remains unbroken.
+    ``hints_to_coarse_tile_groups`` treats unhinted ops as run-breakers.
+    This pass attempts to move each such op either just before the run it
+    splits or just after the last same-key op in the remainder, so the run
+    becomes contiguous.
+
+    Algorithm — two-cursor scan over ops:
+
+    Outer cursor i: start of the next candidate run.  Advances to j when
+    the inner loop exits.
+
+    Inner cursor j: walks forward from i+1 building the run.  For each
+    op at ops[j]:
+      - Same hint key → absorb into run; j += 1.
+      - Non-ComputedBuffer or differently-hinted → hard stop; break.
+      - Unhinted ComputedBuffer (interloper) → one of three outcomes:
+          (a) Move before: insert at run_start, run_start += 1, j stays
+              (the rotate shifts subsequent ops left so ops[j] is fresh).
+          (b) Move after: pop(j), insert at run_end-1, j stays.
+          (c) Neither legal → RuntimeError.
+        run_end is the index one past the *last* same-key op in ops[j+1:],
+        found by scanning backward.  Using the last op (not just the next)
+        ensures the move-after target span covers the full remaining run,
+        which matters when interlopers further right would otherwise still
+        split the run.
+
+    When the inner loop exits, j points to the first op that could not be
+    absorbed — a hard-stop or end-of-list.  Advancing i to j (not i+1)
+    is correct because everything before j has already been processed.
 
     A move is legal when it introduces no new data-flow violation:
     no op in the skipped range reads or mutates the moved op's written
@@ -197,9 +230,9 @@ def reorder_unhinted_interlopers(graph: GraphLowering) -> None:
     When both directions are legal the op is moved before the run (closer
     to its original position).
 
-    Raises ``RuntimeError`` if an interloper cannot be moved in either
-    direction (data-flow dependencies anchor it between hinted ops that share
-    the same hint key).
+    Raises RuntimeError if an interloper cannot be moved in either
+    direction (data-flow dependencies anchor it between hinted ops that
+    share the same hint key).
     """
     ops = graph.operations
     i = 0
@@ -210,8 +243,6 @@ def reorder_unhinted_interlopers(graph: GraphLowering) -> None:
             i += 1
             continue
 
-        # Collect the maximal run of ComputedBuffer ops sharing key,
-        # attempting to reorder unhinted interlopers out of the way.
         run_start = i
         j = i + 1
         while j < len(ops):
@@ -220,40 +251,30 @@ def reorder_unhinted_interlopers(graph: GraphLowering) -> None:
             if ckey == key:
                 j += 1
                 continue
-            # candidate does not belong to the run.
             if not isinstance(candidate, ComputedBuffer) or ckey is not None:
-                # Non-ComputedBuffer or differently-hinted op — cannot reorder.
                 break
             # candidate is an unhinted ComputedBuffer interloper.
-            # Find the last same-key op anywhere after j (the full move-after
-            # target span).  run_end is one past that op so _can_move_after
-            # validates the entire range candidate would skip over.
+            # Scan backward for the last same-key op; run_end is one past it.
+            # O(n) per interloper → O(n²) overall; acceptable for small graphs.
             run_end = None
             for k in range(len(ops) - 1, j, -1):
                 if _hint_key(ops[k]) == key:
                     run_end = k + 1
                     break
-            # If no hinted op with this key exists anywhere after j the
-            # candidate is a trailing consumer, not a true interloper — end
-            # the run silently.
+            # No same-key op exists after j: trailing consumer, not an
+            # interloper — end the run silently.
             if run_end is None:
                 break
-            # Hinted ops follow: candidate genuinely splits the run.  Try to
-            # move it before the run start first (preferred: stays closer to
-            # its original position).
             if _can_move_before(candidate, ops, run_start, j):
                 ops.insert(run_start, ops.pop(j))
-                run_start += 1
-                # j is unchanged: after the rotate, ops[j] is the next op.
+                run_start += 1  # skip past the op we just inserted before the run
                 continue
             if _can_move_after(candidate, ops, j, run_end):
                 # pop(j) shifts everything after j left by one, so the last
                 # same-key op (formerly run_end-1) is now at run_end-2.
                 # Insert at run_end-1 to land just after that last hinted op.
                 ops.insert(run_end - 1, ops.pop(j))
-                # j is unchanged: ops[j] is now the next unexamined op.
                 continue
-            # The interloper cannot be moved in either direction.
             run_ops = [ops[k].get_name() for k in range(run_start, j)]
             raise RuntimeError(
                 f"Cannot reorder unhinted op '{candidate.get_name()}': "
