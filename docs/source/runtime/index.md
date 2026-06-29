@@ -58,7 +58,7 @@ The count itself comes from `flex::getNumDevices`.
 |------|---------------|
 | `csrc/module.cpp` | pybind11 entry point for the `_C` extension module. Device registration itself happens in `torch_spyre/__init__.py::_autoload()`. |
 | `csrc/spyre_tensor_impl.cpp` | `SpyreTensorImpl`, the device tensor backing store. |
-| `csrc/spyre_mem.cpp` | Device memory allocation and DMA, including graph-free DMA and FlexAllocator support. |
+| `csrc/spyre_mem.cpp` | Device tensor factory ops (`spyre_empty*`, `resize_`) and host↔device copy: builds the `DataConversionInfo` (DCI) descriptors via `generate_dci` that drive `copyAsync` transfers between host memory and LPDDR5. |
 | `csrc/spyre_allocator.cpp` | `SpyreAllocator`, which bridges PyTorch's `c10::Allocator` to `flex::FlexAllocator`. |
 | `csrc/spyre_storage_impl.cpp` | `SpyreStorageImpl`, the storage object backing `SpyreTensorImpl`. |
 | `csrc/spyre_views.cpp` | Tensor view and striding support on device, including `_reshape_alias`. |
@@ -246,9 +246,9 @@ Cross-card collective communication is exposed through the standard PyTorch
 
 Torch-Spyre registers a `c10d::Backend` named `spyreccl`. The class is
 `SpyreCCLBackend` in `csrc/distributed/spyre_ccl.{cpp,hpp}`, registered with the
-process-group machinery via `createSpyreCCLBackend` (called from
-`torch_spyre/__init__.py:237` when the user invokes
-`init_process_group(backend="spyreccl")`). The constant
+process-group machinery via `createSpyreCCLBackend`, wired up in
+`_create_spyre_ccl_backend` in `torch_spyre/__init__.py` when the user invokes
+`init_process_group(backend="spyreccl")`. The constant
 `DISTRIBUTED_BACKEND_NAME = "spyreccl"` is defined in `torch_spyre/constants.py`.
 
 Standard usage looks like any other PyTorch distributed setup:

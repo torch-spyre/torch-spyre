@@ -45,7 +45,7 @@ Test sub-suites:
 | `LX_PLANNING=1` | Enable LX scratchpad memory planning |
 | `TORCH_LOGS="+inductor"` | Verbose Inductor logging |
 | `TORCH_COMPILE_DEBUG=1` | Dump Inductor debug artifacts |
-| `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress float32→float16 warnings |
+| `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 downcast warnings |
 
 ## Spyre Hardware Basics
 
