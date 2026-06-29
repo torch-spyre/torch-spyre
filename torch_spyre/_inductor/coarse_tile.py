@@ -659,14 +659,12 @@ def _validate_reduction_tiling(op: ComputedBuffer) -> None:
 
     Supported:
       - A single level that tiles only a non-stick reduction dim.
-      - A single level that tiles the K (reduction) dim of a BATCH_MATMUL_OP.
-        K is the stick dim for operand x, but each tile's output is a full
-        [M, N] matrix so no partial-stick sparsity occurs.
+      - A single level that tiles the stick (innermost) reduction dim, including
+        the K dim of BATCH_MATMUL_OP and scalar reductions over dim=-1.
       - Multiple nesting levels where outer level(s) tile output dims and the
         innermost level tiles a reduction dim (e.g. outer M + inner K for mm).
 
     Deferred (raises RuntimeError):
-      - Reduction tiling on the stick dimension (except BATCH_MATMUL_OP above).
       - Mixed output+reduction tiling at the same nesting level.
       - Multiple reduction range indices tiled at one level.
     """
@@ -700,17 +698,6 @@ def _validate_reduction_tiling(op: ComputedBuffer) -> None:
                 f"reduction dims {red_dims} (tiling more than one reduction "
                 "dim per level is not yet implemented — Stage 2)."
             )
-        for red_dim_idx in red_dims:
-            if (
-                data.reduction_type != BATCH_MATMUL_OP
-                and _reduction_tiling_is_on_stick_dim(op, red_dim_idx)
-            ):
-                raise RuntimeError(
-                    f"coarse_tile: op {op.get_name()!r} level {i} tiles "
-                    f"reduction dim {red_dim_idx} which is the stick dimension "
-                    "of the primary input (stick-dim reduction tiling is not "
-                    "yet implemented — Stage 2)."
-                )
 
 
 def _propagate_tiled_op(

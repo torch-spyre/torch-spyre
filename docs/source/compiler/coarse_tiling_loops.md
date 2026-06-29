@@ -632,7 +632,7 @@ existing storage in-place.  The full buffer's address is encoded in the
 unified treatment that always inserted a copy would handle all three cases
 correctly but waste a copy op here.
 
-#### Reduction tiling: Stage 1 (non-stick reduction dims)
+#### Reduction tiling: stick and non-stick reduction dims
 
 When a `Reduction` op has a non-empty `loop_tiled_reduction_dims`
 (i.e. the hint named a reduction dimension), `_propagate_tiled_reduction_op`
@@ -701,21 +701,21 @@ Identity values and combine operators by `reduction_type`:
 Before running propagation, the pass calls `_validate_reduction_tiling(op)`,
 which raises `RuntimeError` for configurations not yet implemented:
 
-- **Stick-dim reduction** — if the tiled reduction index corresponds to the
-  within-stick dimension of the primary input (detected via
-  `device_coordinates`), except for `BATCH_MATMUL_OP` whose tile output is
-  always a full `[M, N]` matrix.
 - **Mixed output+reduction at the same nesting level** — `loop_tiled_dims[i]`
   and `loop_tiled_reduction_dims[i]` are both non-empty for some level `i`.
 - **Multiple reduction indices at one level** — `len(loop_tiled_reduction_dims[i]) > 1`.
 
+Stick-dim reduction tiling is fully supported: tiling the innermost (stick)
+dimension of the input (e.g. `x.sum(dim=-1)` on a `[B, D]` tensor where D
+maps to the stick, or K-tiling for `BATCH_MATMUL_OP`) uses the same
+fill-initialize + per-tile combine pattern.  The output accumulator for a
+scalar stick-dim reduction has shape `data.ranges` (e.g. `[B]`) — the stick
+dim has been collapsed — and `_resize_device_layout` handles this "stick
+eliminated" case correctly.
+
 Nested tiling where outer level(s) tile output dims and the innermost level
 tiles a reduction dim (e.g. outer-B + inner-K for bmm) is fully supported
 and handled by the two-buffer pattern described above.
-
-**Not yet implemented:** Stick-dim reduction tiling (except `BATCH_MATMUL_OP`)
-requires handling column-vector output addressing when the tiling dimension is
-the innermost (stick) dimension of the input.
 
 ## Layer 2 — `CountedLoopSchedulerNode`
 
