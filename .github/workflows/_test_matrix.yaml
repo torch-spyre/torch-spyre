@@ -215,6 +215,13 @@ jobs:
             config: torch_spyre_tests/inductor/test_work_division_hint_config.yaml
           - name: Inductor Tensor Transpose
             config: torch_spyre_tests/inductor/test_inductor_transpose_edge_config.yaml
+          # ---- Indirect Access tests ----
+          - name: Indirect Access Gather
+            config: torch_spyre_tests/inductor/test_indirect_access_gather_config.yaml
+          - name: Indirect Access Scatter
+            config: torch_spyre_tests/inductor/test_indirect_access_scatter_config.yaml
+          - name: Indirect Access Internals
+            config: torch_spyre_tests/inductor/test_indirect_access_internals_config.yaml
           # ---- Tensor tests ----
           - name: Tensor Coordinates
             config: torch_spyre_tests/tensors/test_coordinates_config.yaml
