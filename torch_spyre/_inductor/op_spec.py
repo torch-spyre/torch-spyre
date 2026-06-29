@@ -77,6 +77,11 @@ class OpSpec:
             ``tiled_symbols[0]`` lists the symbols tiled by the innermost enclosing
             loop; ``tiled_symbols[1]`` lists those tiled by the next-outer loop; etc.
             Empty for ops not inside any loop.
+            **Invariant:** every enclosing loop level must have an entry, even if
+            empty (``[]``).  An empty entry means the op is loop-invariant at that
+            level.  This keeps level indices aligned with nesting depth so that
+            ``compile_op_spec``'s reversal maps each level to the correct
+            ``loop_var_depth`` index in ``_collect_affine_maps``.
             The unroller reads ``tiled_symbols[0]`` at each level and removes it
             from the list after processing, leaving outer-level entries intact.
             The bundle path (compile_op_spec / generate_sdsc) reverses this list to

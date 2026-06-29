@@ -424,9 +424,11 @@ def _collect_affine_maps(
                 for level_idx, level_strides in enumerate(per_level_strides):
                     if not level_strides:
                         continue
-                    if level_idx >= len(loop_var_depth):
-                        # Level not enclosed by any loop (e.g. non-tiled op).
-                        continue
+                    assert level_idx < len(loop_var_depth), (
+                        f"affine_strides has {len(per_level_strides)} levels but "
+                        f"only {len(loop_var_depth)} enclosing loop(s); "
+                        "create_op_spec built more tiled_syms levels than LoopSpec ancestors"
+                    )
                     lv = loop_var_depth[level_idx]
                     for stride in level_strides.values():
                         stride_vals.append(stride)

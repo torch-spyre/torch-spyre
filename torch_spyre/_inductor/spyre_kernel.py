@@ -582,6 +582,11 @@ class SpyreKernel(Kernel[CSEVariable]):
         raw_tiled_red_dims: list[list[int]] = (
             li.loop_tiled_reduction_dims if li is not None else []
         )
+        # CoarseTileInfo always constructs loop_tiled_dims and
+        # loop_tiled_reduction_dims with the same length (one sublist per
+        # nesting level), so max() is just a safety net; in practice both
+        # lists have the same length and the per-level loop below never
+        # silently drops an entry from the shorter one.
         n_levels = max(len(raw_tiled_dims), len(raw_tiled_red_dims))
         it_space_keys = list(it_space.keys())
 
