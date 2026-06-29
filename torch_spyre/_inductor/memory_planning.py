@@ -233,7 +233,12 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     live_ranges = _compute_live_ranges(nodes, intermediates)
 
     # Sort by start step so the allocator processes tensors in execution order.
-    sorted_bufs = sorted(live_ranges.items(), key=lambda kv: kv[1][0])
+    # Tie-break on (end_step, name) for determinism:
+    def _alloc_sort_key(item: tuple[str, tuple[int, int]]) -> tuple[int, int, str]:
+        name, (start, end) = item
+        return (start, end, name)
+
+    sorted_bufs = sorted(live_ranges.items(), key=_alloc_sort_key)
 
     allocator = Allocator(SEGMENT_SIZE)
 
