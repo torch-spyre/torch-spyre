@@ -182,8 +182,8 @@ class MemoryPlanSolver(ABC, Generic[_BufferT]):
 
     @abstractmethod
     def plan_layout(
-        self, buffers: list[LifetimeBoundBuffer], log_lx_usage: bool = False
-    ) -> list[LifetimeBoundBuffer]:
+        self, buffers: list[_BufferT], log_lx_usage: bool = False
+    ) -> list[_BufferT]:
         """
         Utilizes an implementation defined algorithm to determine
         if and where buffers should be placed in scratchpad memory based

@@ -183,7 +183,7 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
         self._bottom_justify = bottom_justify
 
     def plan_layout(
-        self, buffers: list[CoreDivisionBuffer]
+        self, buffers: list[CoreDivisionBuffer], log_lx_usage: bool = False
     ) -> list[CoreDivisionBuffer]:
         if not buffers:
             return []

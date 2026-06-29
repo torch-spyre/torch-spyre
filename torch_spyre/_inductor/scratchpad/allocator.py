@@ -1059,7 +1059,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # Greedy fallback for when CP-SAT is unavailable or finds no plan.
         self._fallback = DefaultAllocator(layout_planning=GreedyLayoutSolver(size))
 
-        self.layout_planning: Optional[MemoryPlanSolver]
+        self.layout_planning: Optional[MemoryPlanSolver[CoreDivisionBuffer]]
         try:
             # Imported lazily so this module (and the greedy path) load even when
             # ortools is absent: CpSatLayoutSolver.__init__ raises ImportError
@@ -1204,11 +1204,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         graph: GraphLowering,
         divisions: dict[str, list[CoreDivision]],
     ) -> list[CoreDivisionBuffer]:
-        in_place = self._determine_in_place(graph)
+        in_place = self._determine_in_place_division_invariant(graph)
         buffers = self._build_cd_bound_buffers(graph, in_place, divisions)
         return buffers
 
-    def _determine_in_place(self, graph: GraphLowering) -> dict[str, list[str]]:
+    def _determine_in_place_division_invariant(
+        self, graph: GraphLowering
+    ) -> dict[str, list[str]]:
         """Co-opt in-place candidates: keep only the *division-invariant*
         preconditions here and defer the division-dependent ones to the solver.
 
