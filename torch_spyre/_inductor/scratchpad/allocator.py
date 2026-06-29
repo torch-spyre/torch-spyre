@@ -31,7 +31,6 @@ from torch._inductor.ir import (
     ExternKernel,
 )
 from torch._inductor.graph import GraphLowering
-from torch._inductor.dependencies import ReadWrites
 
 from torch_spyre._inductor.pass_utils import (
     apply_splits_from_index_coeff,
@@ -143,9 +142,8 @@ class ScratchpadAllocator(ABC):
         self,
         graph: GraphLowering,
         cache: Optional[dict] = None,
-        rw_cache: Optional[dict[str, ReadWrites]] = None,
     ) -> list[Operation]:
-        core_div_mismatch = get_ncores_for_buffers(graph, cache, rw_cache)
+        core_div_mismatch = get_ncores_for_buffers(graph, cache)
         drop_list = set()
 
         # filter out by permitted operations
@@ -303,21 +301,20 @@ class ScratchpadAllocator(ABC):
         cache: Optional[dict] = None,
         timings: Optional[dict[str, float]] = None,
         lifetimes: Optional[dict[str, list[int]]] = None,
-        rw_cache: Optional[dict[str, ReadWrites]] = None,
     ) -> list[Operation]:
         # Build graph_view + mem_usage once and share; both helpers below treat
         # them read-only. `lifetimes` is split-invariant, so the co-opt search
-        # passes it in (computed here only for the single-shot path). `rw_cache`
-        # (split-invariant {op name: ReadWrites}) is likewise threaded in so the
-        # per-leaf core-div check doesn't re-trace get_read_writes() per op.
+        # passes it in (computed here only for the single-shot path).
+        # get_read_writes() is memoized per op by `op_read_writes`, so the
+        # per-leaf core-div check doesn't re-trace it across leaves.
         #
         # TODO: graph_view + mem_usage still rebuilt per leaf; only their
         #   split-dependent part is the (cached) core-div check, so the rest
         #   could be hoisted out of the per-leaf path too.
         t0 = time.perf_counter()
-        graph_view = GraphView(graph, lambda g: self._filter_ops(g, cache, rw_cache))
+        graph_view = GraphView(graph, lambda g: self._filter_ops(g, cache))
         t1 = time.perf_counter()
-        mem_usage = mem_usage_by_buf(graph_view, cache, rw_cache)
+        mem_usage = mem_usage_by_buf(graph_view, cache)
         t2 = time.perf_counter()
         if timings is not None:
             timings["graph_view"] += t1 - t0
@@ -959,12 +956,8 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
         # on every call and is NOT memoized upstream, yet its result is
         # split-invariant (the symbolic deps don't depend on op_it_space_splits).
         # The per-leaf _filter_ops/get_ncores path calls it for every op, so across
-        # ~K^N leaves it dominates. Compute it once and thread it through as rw_cache
-        # (same pattern as `cache`/`lifetimes`). Scoped to the search — the graph
-        # mutates again in the commit pass, so it must not outlive the search.
-        rw_cache: dict[str, ReadWrites] = {
-            op.get_name(): op.get_read_writes() for op in graph.operations
-        }
+        # ~K^N leaves it would dominate — but `op_read_writes` memoizes it per op
+        # instance (split-invariant), so the first leaf warms the cache for all.
 
         # Liveness depends only on graph structure (not op.op_it_space_splits),
         # so compute it once for the whole search instead of per leaf.
@@ -981,7 +974,7 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
             nonlocal best_total, best_chosen
             if op_idx == len(ops):
                 hbm = self._score_layout(
-                    graph, buf_total_bytes, cache, timings, lifetimes, rw_cache
+                    graph, buf_total_bytes, cache, timings, lifetimes
                 )
                 if hbm < best_total:
                     best_total = hbm
@@ -1016,7 +1009,6 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
         cache: Optional[dict] = None,
         timings: Optional[dict[str, float]] = None,
         lifetimes: Optional[dict[str, list[int]]] = None,
-        rw_cache: Optional[dict[str, ReadWrites]] = None,
     ) -> int:
         """HBM bytes under the current split assignment: total device
         bytes of every buffer the solver couldn't pin. Non-committing
@@ -1024,11 +1016,9 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
 
         If `timings` is provided, _generate_buffers accumulates its
         `graph_view` / `mem_usage` sub-step seconds into it. `lifetimes`
-        (split-invariant) is forwarded to avoid recomputing it per leaf;
-        `rw_cache` ({op name: ReadWrites}, also split-invariant) avoids
-        re-tracing get_read_writes() per leaf.
+        (split-invariant) is forwarded to avoid recomputing it per leaf.
         """
-        buffers = self._generate_buffers(graph, cache, timings, lifetimes, rw_cache)
+        buffers = self._generate_buffers(graph, cache, timings, lifetimes)
         allocation = self.layout_planning.plan_layout(buffers)
         pinned_names = {b.name for b in allocation if b.address is not None}
 
