@@ -741,11 +741,23 @@ def generate_sdsc(
     is_avgpool = sdsc_spec.opfunc == AVGPOOL2D_OP
 
     def _tensor_layout_dims(layout_key: str) -> list:
-        """Return the layout dim_order for a tensor, filtering ki/kj for pool ops."""
+        """Return the layout dim_order for a layout label, filtering ki/kj for pool ops."""
         dims = sdsc_spec.layouts[layout_key]["dim_order"]
         if is_avgpool:
             return [d for d in dims if str(d) not in ("ki", "kj")]
         return dims
+
+    def _tensor_sched_layout_dims(dim_order: list) -> list:
+        """Return a tensor's own dim_order for scheduleTree_, filtering ki/kj for pool.
+
+        scheduleTree_ layoutDimOrder_ must use the per-tensor dim_order, NOT the
+        layout-canonical order.  Multiple tensors may share a layout label (same
+        symbol Counter, different ordering), so sdsc_spec.layouts[label]["dim_order"]
+        is only correct for the tensor that created that label.
+        """
+        if is_avgpool:
+            return [d for d in dim_order if str(d) not in ("ki", "kj")]
+        return dim_order
 
     if is_avgpool:
         _kH = int(sdsc_spec.pool_params.get("kernel_h", 1))
@@ -1007,7 +1019,9 @@ def generate_sdsc(
                                     ),
                                     "layoutDimOrder_": [
                                         str(dim)
-                                        for dim in _tensor_layout_dims(tensor.layout)
+                                        for dim in _tensor_sched_layout_dims(
+                                            tensor.dim_order
+                                        )
                                     ],
                                     "maxDimSizes_": [
                                         tensor.max_dim_sizes[dim]
