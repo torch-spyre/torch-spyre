@@ -647,7 +647,8 @@ def enumerate_work_division_candidates(
     A split (``dict[Symbol, int]``, same form as :func:`apply_splits`) is
     permissible iff: each per-dim factor divides its dim's size,
     ``prod(factors) <= max_cores``, every tensor's per-core span
-    ``<= MAX_SPAN_BYTES``, and at most one reduction (K) dim is split. A factor
+    ``<= MAX_SPAN_BYTES``, at most one reduction (K) dim is split, and no
+    *padded* reduction stick dim is split across cores (see below). A factor
     of ``1`` means the dim is unsplit; the all-ones single-core split is
     included when it is itself permissible.
 
@@ -697,6 +698,25 @@ def enumerate_work_division_candidates(
         if math.prod(splits.values()) > max_cores:  # core budget
             return False
         if sum(1 for v in reduction_vars if splits[v] > 1) > 1:  # <= 1 K-split
+            return False
+        # A padded reduction stick dim -- one whose element extent is not a
+        # multiple of its stick size, so the trailing stick is partly pad --
+        # cannot be split across cores: the backend cannot apply coordinate
+        # masking for the pad region on a dim split across cores (DtException,
+        # ddcv1.cpp). The greedy/default division never makes this split (it
+        # parallelizes an output dim instead); only the co-optimizing solver,
+        # which can reward reduction parallelism, offers it. Drop those
+        # candidates so the dim stays core-local. This does NOT force HBM --
+        # the buffer can still be LX-pinned and other dims parallelized -- and
+        # the all-ones split is always still permissible, so the op never loses
+        # a fallback division. ``stick_vars`` maps each stick var to its
+        # elements-per-stick; ``it_space[v]`` is that dim's element extent.
+        if any(
+            v in stick_vars
+            and splits[v] > 1
+            and concretize_expr(it_space[v]) % stick_vars[v] != 0
+            for v in reduction_vars
+        ):
             return False
         if any(  # per-core span <= MAX_SPAN_BYTES, on element-valued it_space
             get_per_core_span(td, splits, it_space, symbol_meta) > MAX_SPAN_BYTES
