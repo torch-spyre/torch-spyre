@@ -104,6 +104,10 @@ class SDSCSpec:
     args: list[SDSCArgs]
     constants: dict[str, Any]
     coordinate_masking: dict[Symbol, Any]
+    # maps SDSC dim name -> (pytorch_sym_name, granularity, max_val)
+    symbolic_dims: dict[str, tuple[str, int, int]] = dataclasses.field(
+        default_factory=dict
+    )
     indirect_access_indices: list[int] = dataclasses.field(default_factory=list)
 
     def __str__(self) -> str:
@@ -593,6 +597,21 @@ def _concretize_for_sdsc(expr: Expr) -> int:
     return int(expr)
 
 
+def _resolve_sdsc_size(expr: Expr, symbolic_dim_bounds: dict) -> int:
+    """Resolve an iteration-space size for SDSC generation.
+
+    For symbolic dims, reads the max from symbolic_dim_bounds (computed at
+    codegen time from ShapeEnv, serialized as plain ints into the generated
+    file) so this works during the reload phase when ShapeEnv is gone.
+    Falls back to _concretize_for_sdsc for concrete expressions.
+    """
+    if hasattr(expr, "free_symbols") and expr.free_symbols:
+        sym_name = str(next(iter(expr.free_symbols)))
+        if sym_name in symbolic_dim_bounds:
+            return symbolic_dim_bounds[sym_name][0]  # max
+    return _concretize_for_sdsc(expr)
+
+
 def _ref_arg(op_spec):
     if op_spec.is_reduction:
         return op_spec.args[0]
@@ -687,10 +706,23 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         ", ".join(f"{k} -> {v}" for k, v in symbol_mapping.items()),
     )
 
+    # For symbolic dims, use the max from symbolic_dim_bounds as the iteration-space size
+    # so the emitted SDSC JSON is generated max sizes baked in, not symbols.
     sdsc_iteration_space = {
-        symbol_mapping[sym]: _concretize_for_sdsc(size)
+        symbol_mapping[sym]: _resolve_sdsc_size(size, op_spec.symbolic_dim_bounds)
         for sym, (size, _) in op_spec.iteration_space.items()
     }
+
+    # Build the SDSC dim name -> (pytorch_sym_name, granularity, max_val) map
+    # for any iteration-space dims.
+    # This drives symbolicDimInfo_ and dimToSymbolMapping_ in the generated JSON.
+    symbolic_dims: dict[str, tuple[str, int, int]] = {}
+    for sym, (size_expr, _) in op_spec.iteration_space.items():
+        sdsc_dim_name = str(symbol_mapping[sym])
+        sym_str = str(size_expr)
+        if sym_str in op_spec.symbolic_dim_bounds:
+            max_val, granularity = op_spec.symbolic_dim_bounds[sym_str]
+            symbolic_dims[sdsc_dim_name] = (sym_str, granularity, max_val)
 
     dim_splits = {
         symbol_mapping[dim]: value[-1] for dim, value in op_spec.iteration_space.items()
@@ -844,6 +876,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             args=args,
             constants=constants,
             coordinate_masking=coordinate_masking,
+            symbolic_dims=symbolic_dims,
             indirect_access_indices=indirect_access_indices,
         ),
         symbol_mapping,
