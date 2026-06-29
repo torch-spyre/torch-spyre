@@ -199,6 +199,27 @@ def _resolve_config() -> Dict[str, LogLevel]:
     torch_logs_config = _parse_torch_logs()
     config.update(torch_logs_config)
 
+    # When a user explicitly configures a parent component, propagate that
+    # level to any more-specific defaults that would otherwise shadow it.
+    # For example, TORCH_LOGS='+spyre.inductor' should override the default
+    # WARNING entry for 'spyre.inductor.codegen' so that child loggers like
+    # 'spyre.inductor.codegen.superdsc' resolve to the user-specified level.
+    explicit_sources = {
+        "TORCH_LOGS",
+        "legacy:SPYRE_INDUCTOR_LOG",
+        "legacy:TORCH_SPYRE_DEBUG",
+    }
+    for component in list(config):
+        if _config_source.get(component, "default") not in explicit_sources:
+            # Check if a less-specific ancestor was explicitly configured
+            parts = component.split(".")
+            for i in range(len(parts) - 1, 0, -1):
+                parent = ".".join(parts[:i])
+                if _config_source.get(parent, "default") in explicit_sources:
+                    config[component] = config[parent]
+                    _config_source[component] = _config_source[parent]
+                    break
+
     for component in config:
         if component not in _config_source:
             _config_source[component] = "default"
