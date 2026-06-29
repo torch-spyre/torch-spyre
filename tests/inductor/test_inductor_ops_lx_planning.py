@@ -231,7 +231,6 @@ _COMMON_REDUCTION_FAILURES = [
     "test_flatten_4d_large_full",
     "test_flatten_4d_leading",
     "test_flatten_4d_trailing",
-    "test_full_value_1",
     "test_pointwise_binary_op_div_67x71x256_67x71x256",
     "test_t_2d_contiguous_4096x49280",
     "test_transpose_2d_large_dim_0_2",
@@ -287,42 +286,17 @@ _GREEDY_ONLY_REDUCTION_FAILURES = [
     "test_transpose_2d_large_dim_0_1_nopad",
 ]
 
-# Fail only under the CP-SAT co-optimizing allocator. Its co-optimized core
-# division splits a padded reduction dim across cores (the *_pad_2d_dim_1
-# family), which the backend can't coordinate-mask (DtException, ddcv1.cpp:3427)
-# -- a backend limitation triggered by the division choice, not an allocator
-# coherence bug. mm_67x67 is the same backend partial-stick limit on a pinned
-# matmul output.
+# Fail only under the CP-SAT co-optimizing allocator. mm_67x67 is a backend
+# partial-stick limit on a pinned matmul output. (The *_pad_2d_dim_1 reduction
+# family used to fail here too -- CP-SAT split a padded reduction dim across
+# cores, which the backend can't coordinate-mask, DtException ddcv1.cpp:3427.
+# That is now fixed: enumerate_work_division_candidates no longer offers such a
+# division, so the family passes under cpsat -- see work_division.valid_split.)
 _CPSAT_ONLY_POINTWISE_FAILURES = [
-    "test_aminmax_keepdim0_aminmax_pad_2d_dim_1",
-    "test_aminmax_keepdim1_aminmax_pad_2d_dim_1",
-    "test_min_keepdim0_min_pad_2d_dim_1",
-    "test_min_keepdim1_min_pad_2d_dim_1",
     "test_mm_mm_67x67_67x67",
-    "test_reduce_keepdim0_amax_pad_2d_dim_1",
-    "test_reduce_keepdim0_amin_pad_2d_dim_1",
-    "test_reduce_keepdim0_mean_pad_2d_dim_1",
-    "test_reduce_keepdim0_sum_pad_2d_dim_1",
-    "test_reduce_keepdim1_amax_pad_2d_dim_1",
-    "test_reduce_keepdim1_amin_pad_2d_dim_1",
-    "test_reduce_keepdim1_mean_pad_2d_dim_1",
-    "test_reduce_keepdim1_sum_pad_2d_dim_1",
 ]
 
-_CPSAT_ONLY_REDUCTION_FAILURES = [
-    "test_aminmax_keepdim0_aminmax_pad_2d_dim_1",
-    "test_aminmax_keepdim1_aminmax_pad_2d_dim_1",
-    "test_min_keepdim0_min_pad_2d_dim_1",
-    "test_min_keepdim1_min_pad_2d_dim_1",
-    "test_reduce_keepdim0_amax_pad_2d_dim_1",
-    "test_reduce_keepdim0_amin_pad_2d_dim_1",
-    "test_reduce_keepdim0_mean_pad_2d_dim_1",
-    "test_reduce_keepdim0_sum_pad_2d_dim_1",
-    "test_reduce_keepdim1_amax_pad_2d_dim_1",
-    "test_reduce_keepdim1_amin_pad_2d_dim_1",
-    "test_reduce_keepdim1_mean_pad_2d_dim_1",
-    "test_reduce_keepdim1_sum_pad_2d_dim_1",
-]
+_CPSAT_ONLY_REDUCTION_FAILURES: list[str] = []
 
 # The joint core-division + LX-placement allocator (CoOptimizingAllocator) is
 # selected by layout_solver == "cpsat" (OR-Tools CP-SAT). The _CPSAT_ONLY_* /
