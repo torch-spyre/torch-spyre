@@ -69,15 +69,15 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
       tensor_allocs.push_back(address);
     }
   }
-  flex::ComputeParams params(&binary_address_, std::move(tensor_allocs), "",
-                             bootstrap_addr_);
+  flex::ComputeParams params(&program_address_, std::move(tensor_allocs), "",
+                             bootstrap_offset_);
   params.pipeline_barrier = pipeline_barrier_;
   stream.launchCompute(&params);
 }
 
 void JobPlanStepCompute::write(std::ostream& os) const {
   os << "  Device Compute\n";
-  os << "    Binary address: " << binary_address_ << "\n";
+  os << "    Program address: " << program_address_ << "\n";
   os << "    Bind I/O addresses: " << (bind_io_addresses_ ? "yes" : "no")
      << "\n";
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")

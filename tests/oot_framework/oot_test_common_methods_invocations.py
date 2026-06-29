@@ -2,7 +2,7 @@
 Utility functions for the OOT test framework.
 
 This module contains helper functions for creating module input generators
-and other test utilities that are used by TorchTestBase.
+and other test utilities that are used by OOTTestBase.
 """
 
 from typing import Any, Callable

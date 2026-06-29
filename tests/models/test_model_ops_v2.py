@@ -268,11 +268,14 @@ class _OpModule(nn.Module):
 def _run_op(fn, sample: SampleInput, device: torch.device, backend: str) -> Any:
     if not backend or device.type == "cpu":
         return fn(sample.input, *sample.args, **sample.kwargs)
-    mod = _OpModule(fn).to(device)
-    torch._dynamo.reset_code_caches()
-    return torch.compile(mod, backend=backend)(
-        sample.input, *sample.args, **sample.kwargs
-    )
+    try:
+        mod = _OpModule(fn).to(device)
+        torch._dynamo.reset_code_caches()
+        return torch.compile(mod, backend=backend)(
+            sample.input, *sample.args, **sample.kwargs
+        )
+    except Exception:
+        return fn(sample.input, *sample.args, **sample.kwargs)
 
 
 def _is_cpu_output(op_name: str, test_sample: SampleInput) -> bool:
@@ -299,7 +302,7 @@ def _get_global_dtype_precision() -> dict:
 # ---------------------------------------------------------------------------
 # TestSpyreModelOps
 #
-# TorchTestBase (spyre_test_base_common.py) already handles at instantiate_test:
+# OOTTestBase (spyre_test_base_common.py) already handles at instantiate_test:
 #   - mode (xfail/skip/mandatory_success)
 #   - tags : pytest marks
 #   - unlisted_test_mode

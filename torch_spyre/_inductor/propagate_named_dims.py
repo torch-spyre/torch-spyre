@@ -36,6 +36,7 @@ from .errors import Unsupported
 from .pass_utils import (
     host_coordinates,
     device_coordinates,
+    indirect_sizes_from_op,
     op_out_coords,
     find_reduction_var,
 )
@@ -135,7 +136,7 @@ def _consume_names(remaining: list[str], layout_size: int) -> list[str]:
     return []
 
 
-def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
+def compute_input_named_dims(dep: MemoryDep, op=None, ind_sizes=None) -> dict:
     """Map loop vars to named dim names for a single input dep."""
     dpi = _get_dim_prop_info(dep)
     buf_named_dims = dpi.named_dims if dpi is not None else None
@@ -150,7 +151,7 @@ def compute_input_named_dims(dep: MemoryDep, op=None) -> dict:
     layout = _get_layout(dep)
     if layout is None:
         return {}
-    coords = host_coordinates(layout, dep)
+    coords = host_coordinates(layout, dep, ind_sizes)
     remaining = list(buf_named_dims)
     result: dict[sympy.Symbol, list[str]] = {}
     for i, coord in enumerate(coords):
@@ -234,8 +235,9 @@ def get_input_named_dims(inputs: list, op=None) -> dict:
     Real names win over _untracked_ placeholders when both inputs cover the same sym.
     """
     loop_var_dims: dict[sympy.Symbol, list[str]] = {}
+    ind_sizes = indirect_sizes_from_op(op)
     for inp in inputs:
-        new = compute_input_named_dims(inp, op)
+        new = compute_input_named_dims(inp, op, ind_sizes=ind_sizes)
         for sym, names in new.items():
             if sym not in loop_var_dims or all(
                 n.startswith("_untracked_") for n in loop_var_dims[sym]
@@ -285,7 +287,7 @@ def _compute_named_dims(op, inputs):
     )
 
 
-def _log_dep_debug(label: str, dep: MemoryDep) -> None:
+def _log_dep_debug(label: str, dep: MemoryDep, ind_sizes=None) -> None:
     buf = _get_buffer(dep)
     layout = (
         buf.get_layout() if buf is not None and hasattr(buf, "get_layout") else None
@@ -297,11 +299,13 @@ def _log_dep_debug(label: str, dep: MemoryDep) -> None:
         logger.debug(
             f"    host_size={list(layout.size)}  host_stride={list(layout.stride)}"
         )
-        logger.debug(f"    host_coordinates={host_coordinates(layout, dep)}")
+        logger.debug(f"    host_coordinates={host_coordinates(layout, dep, ind_sizes)}")
     stl = getattr(buf, "layout", None) if buf is not None else None
     if isinstance(stl, SpyreTensorLayout):
         logger.debug(f"    device_size={stl.device_size}  stride_map={stl.stride_map}")
-        logger.debug(f"    device_coordinates={device_coordinates(stl, dep)}")
+        logger.debug(
+            f"    device_coordinates={device_coordinates(stl, dep, ind_sizes)}"
+        )
     logger.debug(f"    index={dep.index}  ranges={dict(dep.ranges)}")
 
 
@@ -419,11 +423,12 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
             rw = op.get_read_writes()
             inputs = [d for d in rw.reads if isinstance(d, MemoryDep)]
             if logger.isEnabledFor(logging.DEBUG):
+                ind_sizes = indirect_sizes_from_op(op)
                 for dep in inputs:
-                    _log_dep_debug("input", dep)
+                    _log_dep_debug("input", dep, ind_sizes)
                 for dep in rw.writes:
                     if isinstance(dep, MemoryDep):
-                        _log_dep_debug("output", dep)
+                        _log_dep_debug("output", dep, ind_sizes)
             if isinstance(op.data, (Pointwise, Reduction)):
                 _compute_named_dims(op, inputs)
             else:

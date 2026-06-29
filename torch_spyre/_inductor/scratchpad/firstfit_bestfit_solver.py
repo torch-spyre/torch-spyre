@@ -175,7 +175,7 @@ class FirstFitLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         return None
 
     def plan_layout(
-        self, buffers: list[LifetimeBoundBuffer]
+        self, buffers: list[LifetimeBoundBuffer], log_lx_usage: bool = False
     ) -> list[LifetimeBoundBuffer]:
         if not buffers:
             return []
