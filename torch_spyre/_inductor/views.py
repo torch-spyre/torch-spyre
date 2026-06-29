@@ -496,8 +496,28 @@ def align_tensors(
     # sorting, math.gcd, and integer division that require concrete ints.
     # Coordinate *expressions* remain symbolic (they reference loop variable
     # Symbols, not range values).
-    # TODO(issue#1373): make align_tensors symbolic-aware so concretization can
-    #              be removed.
+
+    # Save original (possibly symbolic) range expressions before concretizing.
+    # The algorithm below requires concrete ints for sorting and integer division,
+    # but we must propagate symbolic expressions forward so downstream passes
+    # (work_division, SDSC codegen) see the symbols to extract fields, not size_hints.
+    orig_ranges = {var: val[0] for var, val in iteration_space.items()}
+    # local import: pass_utils imports compute_coordinates/matching_dim from
+    # this module, so importing at module scope would create a cycle.
+    from .pass_utils import finite_upper_or_none
+
+    def _bounded_or_hint(expr, hint):
+        """Return ``expr`` unless it's an unbounded symbolic expression.
+
+        Auto-dynamic symbols (Dynamo promoting an int on retrace, with no
+        finite max and are not symbolic dims ) carry no bound downstream passes
+        (work_division, SDSC codegen) can size buffers/loops with. Fall back to
+        the concretized ``hint`` instead of propagating an unbounded symbol.
+        """
+        if hasattr(expr, "free_symbols") and expr.free_symbols:
+            if finite_upper_or_none(expr) is None:
+                return hint
+        return expr
 
     repeat_info: dict = getattr(V.graph, "_repeat_info", {})
 
@@ -607,6 +627,14 @@ def align_tensors(
         else:
             # no splits keep existing var, range, and work division
             # may happen with a single stick since the stick size is omitted
+            # downstream passes receive the symbolic expression, not the concretized
+            # hint -- unless the symbol is unbounded, see _bounded_or_hint.
+            # Synthetic vars (z0, z1, …) are introduced by normalize_coordinates
+            # for restored size-1 dims and are not in orig_ranges; fall back to
+            # the concretized value (always 1) for those.
+            new_var_ranges[var] = _bounded_or_hint(
+                orig_ranges.get(var, var_ranges[var]), var_ranges[var]
+            )
             # var can be a loop var or an indirect symbol
             if var in var_ranges:
                 new_var_ranges[var] = var_ranges[var]
@@ -619,7 +647,6 @@ def align_tensors(
             new_op_it_space_splits[var] = (
                 op_it_space_splits[var] if var in op_it_space_splits else 1
             )
-
     # create new tensors with new sizes and coordinate expressions matching new vars
     new_tensors = []
     for j, terms in enumerate(all_terms):
@@ -715,6 +742,19 @@ def align_tensors(
                         t["coordinates"][i] = stick_dim_var // t["size"][-1]
                         t["coordinates"][-1] = stick_dim_var % t["size"][-1]
                         break
+    # Restore original symbolic expressions wherever the algorithm left the
+    # concretized value unchanged (i.e. no splits were applied to that dim).
+    # Only restore when the symbol carries a finite bound (e.g. the user
+    # passed mark_dynamic(max=...)) -- downstream passes (work_division,
+    # SDSC codegen) need a bound to size buffers/loops. Auto-dynamic symbols
+    # (Dynamo promoting an int on retrace, with no finite max) have no such
+    # bound, so fall back to the concretized size-hint instead of
+    # propagating an unbounded symbol. See work_division.py's symbol_meta
+    # for the same distinction.
+    for var, orig_expr in orig_ranges.items():
+        if var not in new_var_ranges or new_var_ranges[var] != var_ranges[var]:
+            continue
+        new_var_ranges[var] = _bounded_or_hint(orig_expr, var_ranges[var])
 
     # Iteration space should only contain loop variables, not indirect symbols.
     # Filter out any indirect symbols that were added during normalization.

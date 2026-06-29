@@ -128,7 +128,7 @@ def _user_min_or_none(expr: Expr) -> Optional[int]:
     return None if lower == _SHAPE_ENV_DEFAULT_LOWER else lower
 
 
-def _finite_upper_or_none(expr: Expr) -> Optional[int]:
+def finite_upper_or_none(expr: Expr) -> Optional[int]:
     """Return the ShapeEnv finite upper bound for ``expr``, or ``None``.
     A bound is usable iff it is a positive concrete
     ``sympy.Integer``; ``sympy.oo``, non-integers, and non-positive
@@ -151,11 +151,6 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
     Callers must only invoke this for symbolic ``expr``. See #2284,
     #2287, #2288, #2289 for the full design.
 
-    Wiring: this helper has no call sites yet. The pointwise
-    work-division PR (#2499) will plug it into the ``size_hint`` call
-    sites in ``work_division.py`` and ``codegen/superdsc.py``,
-    alongside ``compute_max_size``.
-
     Deferred: when the symbolic dim is the stick dim of its tensor the
     granularity also needs to be a multiple of ``elems_per_stick(dtype)``.
     Handled in a follow-up once the stick-dim symbolic path is enabled.
@@ -172,7 +167,7 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
     # mark_dynamic(max=...). The granularity is then only as trustworthy
     # as that hint -- warn the user so they can pin it explicitly with
     # mark_dynamic(max=...).
-    if _finite_upper_or_none(expr) is None:
+    if finite_upper_or_none(expr) is None:
         warnings.warn(
             f"max for symbolic dim {expr} came from size_hint, not from "
             f"mark_dynamic(max=...). Proceeding with max={max_size} as a "
@@ -262,9 +257,6 @@ def compute_max_size(expr: Union[Expr, int]) -> int:
     back to ``size_hint`` when no finite upper bound exists.
 
     Needed for dynamic shape support.
-
-    # TODO: To be used in size_hint call-sites in superdsc.py and work_division.py
-    #       to get the maxSize in SDSC and work planning respectively
     """
     if isinstance(expr, int):
         return expr
@@ -272,10 +264,31 @@ def compute_max_size(expr: Union[Expr, int]) -> int:
         return int(expr)
     if not (hasattr(expr, "free_symbols") and expr.free_symbols):
         return int(expr)
-    bound = _finite_upper_or_none(expr)
+    bound = finite_upper_or_none(expr)
     if bound is not None:
         return bound
     return V.graph.sizevars.size_hint(expr)
+
+
+def compute_symbolic_bounds(expr: Union[Expr, int]) -> "tuple[int, int] | None":
+    """Return (max_size, granularity) bounds for a symbolic expression from ShapeEnv.
+
+    Returns None for concrete expressions (no free symbols).
+    max_size is the computed maximum size,
+    granularity from compute_granularity.
+    """
+    if isinstance(expr, (int, sympy.Integer)):
+        return None
+    if not (hasattr(expr, "free_symbols") and expr.free_symbols):
+        return None
+    shape_env = V.graph.sizevars.shape_env
+    if shape_env is None:
+        return None
+
+    max_size = compute_max_size(expr)
+    granularity = compute_granularity(expr, max_size)
+
+    return (max_size, granularity)
 
 
 def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
