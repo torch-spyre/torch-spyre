@@ -1396,37 +1396,71 @@ def _stamp_group(
 
 
 def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: list[int]):
-    """Return a new SpyreTensorLayout when *tiling* an existing buffer in-place.
+    """Derive a new SpyreTensorLayout for a resized host buffer.
 
-    This function handles the ``_divide_ranges`` case: the buffer is the *same*
-    physical allocation; coarse tiling just narrows the iteration range for each
-    loop iteration.  ``device_size`` entries are updated to reflect the smaller
-    per-tile extents.  ``stride_map`` entries are updated only for contiguous
-    host dims (where the physical stride follows from the host extent); for
-    non-contiguous (transposed / col-major) dims the stride is unchanged.
+    Used in two directions:
 
-    Classification of device dims (from ``get_generic_stick_layout``):
+    * **shrink** (``_divide_ranges``): the buffer is the same physical
+      allocation; coarse tiling narrows the per-tile iteration range.
+      ``device_size`` entries for non-stick dims shrink to reflect the smaller
+      per-tile extents.
+    * **grow** (``_allocate_full_buffer``): a full-sized scatter-target buffer
+      is allocated to match a per-tile source.  ``device_size`` entries grow
+      back to the full extent.  The stick orientation (transposed vs row-major,
+      ``element_arrangement``) is propagated verbatim so both buffers agree on
+      physical layout and scatter-copy address arithmetic is correct.
+
+    ``stride_map`` semantics: a value of ``-1`` means "this device dimension has
+    extent 1 and is never stepped through; its stride is undefined."  When
+    growing back from a singleton (``orig_sm[j] == -1``), the stride is
+    recomputed from the new host stride (the rescue arm in Passes 2–4).  For
+    non-contiguous (transposed / col-major) dims, the *physical* stride on
+    device is invariant to resizing, so it is left unchanged.
+
+    Device-dim classification (as produced by ``get_generic_stick_layout``):
 
     * **inner stick** (always ``j == ndev-1``) — ``device_size`` is always
-      ``elems_per_stick``; left unchanged.
-    * **non-stick dim** — matched to a host dim ``p`` by
-      ``device_size[j] == old_host_size[p]``.  When two host dims share the same
-      size, ``stride_map[j]`` is used as a tiebreaker against the expected
-      contiguous host stride.  ``device_size`` updated to ``new_host_size[p]``.
-      ``stride_map`` updated to the new contiguous host stride iff the current
-      ``stride_map`` equals the old contiguous host stride; otherwise unchanged
-      (the physical stride is non-contiguous and invariant to tiling).
-    * **stick tile-count** — the remaining non-singleton device dim(s) not
-      classified as non-stick.  ``device_size`` updated to
-      ``ceil(new_host_size[p*] / eps)``.  ``stride_map`` updated iff the stick
-      host dim is contiguous (same rule as for non-stick dims).
-    * **singleton** (``device_size == 1``) — never exercised; left as-is.
+      ``elems_per_stick``; left unchanged.  ``stride_map`` updated only if the
+      stick host dim is contiguous or was a singleton.
+    * **non-stick dim** — one device dim per non-stick host dim.  Matched to
+      host dim ``p`` by size (``device_size[j] == old_host_size[p]``), with
+      ``stride_map[j]`` used as a tiebreaker when two host dims share the same
+      size.  ``device_size`` updated to ``new_host_size[p]``.  ``stride_map``
+      updated iff ``orig_sm[j] == old_hs[p]`` (contiguous) or ``== -1``
+      (was a singleton being grown).
+    * **stick tile-count** — ``ceil(old_host_size[p*] / eps)`` device elements
+      spanning the stick host dim ``p*``.  Updated to
+      ``ceil(new_host_size[p*] / eps)``.  Same stride-update rule as non-stick.
+    * **singleton** (``device_size == 1, stride_map == -1``) — either a sparse
+      placeholder (no corresponding host dim) or a non-stick dim tiled to
+      extent 1.  Left as-is when there is no host dim to match; matched by
+      size-1 to a host dim of size 1 when one exists (grow path from singleton).
 
-    ``p*`` (the stick host dim) is identified by elimination: the host dim NOT
-    matched by any non-stick device dim.
+    ``p*`` (the stick host dim) is identified by elimination: the unique host
+    dim *not* matched as a non-stick dim.  When a reduction collapses the stick
+    axis, all host dims are matched as non-stick and ``pstar`` is ``None``; in
+    that case Passes 3 and 4 are skipped (tile-count and inner-stick entries are
+    frozen at their collapsed values).
+
+    Multi-pass algorithm:
+
+    * **Pass 1**: match non-inner-stick device dims to host dims by size.
+      Size-1 dims match only to host dims of size 1.  Size > 1 dims match by
+      ``device_size == old_host_size[p]``, with stride as tiebreaker when sizes
+      collide.  Unmatched dims are candidates for tile-count.
+    * **Pass 1b**: fix tile-count / size collisions.  When
+      ``ceil(old_host_size[p*] / eps) == old_host_size[q]`` for some non-stick
+      dim ``q``, the tile-count dim and dim ``q`` have the same size and Pass 1
+      may have provisionally claimed the tile-count dim as a non-stick dim.
+      Pass 1b corrects this after ``p*`` is provisionally known: a provisional
+      match is reclassified as tile-count when its stride also mismatches the
+      expected contiguous non-stick stride.
+    * **Pass 2**: update non-stick dims (``matched_host``).
+    * **Pass 3**: validate and update tile-count dims (``unmatched_j``).
+    * **Pass 4**: update inner stick (``j == ndev-1``).
 
     ``device_dtype`` and ``element_arrangement`` are copied verbatim from
-    *orig_stl*, preserving EXX2/QFP8/DL16 layouts.
+    ``orig_stl``, preserving EXX2/QFP8/DL16 layouts.
 
     Raises ``RuntimeError`` if any non-stick device dim matches ambiguously, or
     if the stick host dim cannot be uniquely determined by elimination.
@@ -1445,20 +1479,7 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
     new_ds = list(orig_ds)
     new_sm = list(orig_sm)
 
-    # Pass 1: match non-inner-stick device dims to host dims.
-    # Two match strategies by device_size:
-    #
-    # * Size-1 device dims (device_size==1): stride_map is -1 (either a sparse
-    #   placeholder or a non-stick dim that was tiled to extent 1).  Match by
-    #   size alone — if exactly one host dim has size 1, claim it.  If zero or
-    #   multiple, push to unmatched_j.
-    #
-    # * Size > 1 device dims: primary key is device_size[j] == old_host_size[p].
-    #   When size is ambiguous (multiple host dims share it), use
-    #   stride_map[j] == contiguous_stride[p] as a tiebreaker.  When exactly one
-    #   host dim has the right size, accept it provisionally; if that provisional
-    #   match turns out to be a tile-count collision (detected in Pass 1b below),
-    #   it will be moved to unmatched_j.
+    # Pass 1: see docstring.
     matched_host = {}  # j → p (non-stick matches, provisional for size>1)
     unmatched_j = []  # device dims not matched → tile-count / placeholder
 
@@ -1468,11 +1489,12 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
             size1_cands = [p for p in range(ndim) if old_host_size[p] == 1]
             if len(size1_cands) == 1:
                 matched_host[j] = size1_cands[0]
-            # else: sparse placeholder (no host dim of size 1) — skip silently.
+            # else: sparse placeholder with no host counterpart — skip silently.
         else:
             size_cands = [p for p in range(ndim) if old_host_size[p] == dsz]
             if len(size_cands) == 1:
-                matched_host[j] = size_cands[0]  # provisional
+                # provisional; may be reclassified as tile-count in Pass 1b
+                matched_host[j] = size_cands[0]
             elif len(size_cands) > 1:
                 stride_cands = [p for p in size_cands if old_hs[p] == orig_sm[j]]
                 if len(stride_cands) == 1:
@@ -1482,15 +1504,7 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
             else:
                 unmatched_j.append(j)  # no size match → tile-count
 
-    # Identify pstar by elimination: the host dim not claimed by any non-stick
-    # device dim match.  Prefer non-singleton host dims first (the stick normally
-    # has size > 1); fall back to singleton host dims only when every unmatched
-    # candidate is a singleton (e.g. a 1-element stick host dim).
-    #
-    # Special case: if all host dims were matched as non-stick dims, the stick
-    # dimension has been eliminated (e.g. reduction output).  In that case
-    # pstar is None and Passes 3 and 4 are skipped — tile-count and inner-stick
-    # device dims retain their existing (frozen) values.
+    # Provisional pstar by elimination (before Pass 1b corrections).
     def _find_pstar(matched):
         matched_p = set(matched.values())
         unmatched_all = [p for p in range(ndim) if p not in matched_p]
@@ -1505,11 +1519,7 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
 
     pstar_provisional, _ = _find_pstar(matched_host)
 
-    # Pass 1b: fix provisional size-only matches that are actually tile-count dims.
-    # If a provisionally-matched device dim j has orig_sm[j] != old_hs[p]
-    # (stride mismatch — non-contiguous OR tile-count collision) and its size
-    # equals ceil(old_host_size[pstar_provisional] / eps), it is the tile-count
-    # dim, not a non-stick dim.  Move it to unmatched_j.
+    # Pass 1b: reclassify tile-count/size collisions; see docstring.
     if pstar_provisional is not None:
         expected_tc = -(-old_host_size[pstar_provisional] // eps)
         for j in list(matched_host):
@@ -1518,13 +1528,13 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
                 del matched_host[j]
                 unmatched_j.append(j)
 
-    # Re-derive pstar after corrections.
+    # Final pstar after Pass 1b corrections.
     matched_p = set(matched_host.values())
     unmatched_all = [p for p in range(ndim) if p not in matched_p]
     pstar: int | None
     if not unmatched_all:
-        # Stick host dim eliminated (reduction output): no tile-count or
-        # inner-stick entries to update.
+        # Reduction output: stick dim eliminated, pstar=None.
+        # unmatched_j must be empty — no device dims should be unclaimed.
         if unmatched_j:
             raise RuntimeError(
                 f"_resize_device_layout: stick host dim is absent from "
@@ -1548,26 +1558,23 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
             )
         pstar = pstar_cands[0]
 
-    # Pass 2: update device_size and (if contiguous) stride_map for non-stick dims.
+    # Pass 2: update non-stick dims.
     for j, p in matched_host.items():
         new_ds[j] = new_host_size[p]
         if new_host_size[p] == 1:
             new_sm[j] = -1
         elif orig_sm[j] == old_hs[p] or orig_sm[j] == -1:
-            # Dim p is contiguous, or was a singleton (-1): update stride.
             new_sm[j] = new_hs[p]
-        # else: non-contiguous stride; leave new_sm[j] = orig_sm[j] (unchanged).
+        # else: non-contiguous stride; physical layout is invariant — leave unchanged.
 
-    # Passes 3 and 4 require pstar.  When the stick dim was eliminated (reduction
-    # output), pstar is None and the tile-count / inner-stick entries are frozen.
-    if pstar is None:
+    if pstar is None:  # reduction output: tile-count / inner-stick entries frozen
         return SpyreTensorLayout(
             new_ds, new_sm, orig_stl.device_dtype, orig_stl.element_arrangement
         )
 
-    # Pass 3: update tile-count device dims (unmatched non-singleton dims).
+    # Pass 3: update tile-count dims (unmatched_j — all must equal expected tile-count).
     for j in unmatched_j:
-        expected_tc = -(-old_host_size[pstar] // eps)  # ceil
+        expected_tc = -(-old_host_size[pstar] // eps)  # ceil division
         if orig_ds[j] != expected_tc:
             raise RuntimeError(
                 f"_resize_device_layout: device dim {j} "
@@ -1577,24 +1584,21 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
                 f"(old_host_size={old_host_size}) in {orig_stl!r}. "
                 f"This layout is not supported by the device-native reconstruction."
             )
-        new_ds[j] = -(-new_host_size[pstar] // eps)  # ceil
-        # Update stride_map if the stick host dim is contiguous.
+        new_ds[j] = -(-new_host_size[pstar] // eps)  # ceil division
         if new_host_size[pstar] == 1:
             new_sm[j] = -1
         elif orig_sm[j] == eps * old_hs[pstar] or orig_sm[j] == -1:
-            # stick host dim is contiguous (stride_map == eps * contiguous_stride[p*])
-            # or was a singleton (-1); update to eps * new contiguous stride.
+            # tile-count stride = eps * contiguous stride of the stick host dim
             new_sm[j] = eps * new_hs[pstar]
-        # else: non-contiguous; leave stride unchanged.
+        # else: non-contiguous stick; physical stride invariant.
 
-    # Pass 4: inner stick (j == ndev-1) — update stride only.
+    # Pass 4: inner stick (j == ndev-1) — device_size is always eps, update stride only.
     j = ndev - 1
     if new_host_size[pstar] == 1:
         new_sm[j] = -1
     elif orig_sm[j] == old_hs[pstar] or orig_sm[j] == -1:
-        # Contiguous stick, or was a singleton (-1): update inner-stick stride.
         new_sm[j] = new_hs[pstar]
-    # else: non-contiguous stick; leave stride unchanged.
+    # else: non-contiguous stick; physical stride invariant.
 
     return SpyreTensorLayout(
         new_ds, new_sm, orig_stl.device_dtype, orig_stl.element_arrangement
