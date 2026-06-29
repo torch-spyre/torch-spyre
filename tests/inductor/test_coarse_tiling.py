@@ -690,6 +690,197 @@ class TestDivideRanges(unittest.TestCase):
         self.assertFalse(hasattr(red, _LOOPS_FREE_SYMS_KEY))
         self.assertFalse(hasattr(red, _REDUCTION_FREE_SYMS_KEY))
 
+    # ------------------------------------------------------------------
+    # Device-layout reconstruction tests (FixedTiledLayout path)
+    # ------------------------------------------------------------------
+
+    def _make_ftl_op(self, host_size, dim_order, dtype=torch.float16, elem_arr=None):
+        """Build a ComputedBuffer with a FixedTiledLayout for testing _divide_ranges.
+
+        Returns (op, layout) where layout.device_layout is a SpyreTensorLayout
+        constructed from (host_size, contiguous_strides, dtype, dim_order, elem_arr).
+        """
+        from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise
+
+        from torch_spyre._C import ElementArrangement, SpyreTensorLayout
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        if elem_arr is None:
+            elem_arr = ElementArrangement.STANDARD
+
+        strides = [int(s) for s in FlexibleLayout.contiguous_strides(host_size)]
+        device_layout = SpyreTensorLayout(
+            host_size, strides, dtype, dim_order, elem_arr
+        )
+        layout = FixedTiledLayout(
+            torch.device("cpu"),
+            dtype,
+            [Integer(s) for s in host_size],
+            [Integer(s) for s in strides],
+            device_layout,
+        )
+        pw = Pointwise(
+            device=torch.device("cpu"),
+            dtype=dtype,
+            inner_fn=lambda index: sympy.Integer(1),
+            ranges=[Integer(s) for s in host_size],
+        )
+        op = ComputedBuffer(name="buf0", layout=layout, data=pw)
+        return op, layout
+
+    def test_divide_ranges_transposed_stick_preserved(self):
+        """Tiling a non-stick dim of a transposed-stick layout rebuilds
+        device_layout correctly (headline regression from code review)."""
+        from torch._inductor.ir import FlexibleLayout
+
+        from torch_spyre._C import SpyreTensorLayout
+
+        # [256, 128] with stick on dim0: dim_order=[1, 0].  This is the layout
+        # produced for a transposed Linear weight (model_utils.py restickify).
+        op, layout = self._make_ftl_op([256, 128], dim_order=[1, 0])
+
+        # Tile non-stick dim1 by 2: [256, 128] -> [256, 64].
+        _divide_ranges(op, Integer(2), tiled_dims=[1])
+
+        # Expected: from-scratch SpyreTensorLayout([256, 64], ..., [1, 0]).
+        expected_strides = [
+            int(s) for s in FlexibleLayout.contiguous_strides([256, 64])
+        ]
+        expected = SpyreTensorLayout([256, 64], expected_strides, torch.float16, [1, 0])
+
+        self.assertEqual(layout.device_layout, expected)
+
+        # Also assert it differs from the buggy heuristic result.
+        buggy = SpyreTensorLayout(
+            [1, 256, 64],
+            [64, 64, 1],
+            expected.device_dtype,
+            expected.element_arrangement,
+        )
+        self.assertNotEqual(layout.device_layout, buggy)
+
+    def test_divide_ranges_preserves_element_arrangement(self):
+        """element_arrangement is copied verbatim — not silently reset to STANDARD."""
+        from torch._inductor.ir import FlexibleLayout
+
+        from torch_spyre._C import ElementArrangement, SpyreTensorLayout
+
+        op, layout = self._make_ftl_op(
+            [256, 128], dim_order=[1, 0], elem_arr=ElementArrangement.EXX2
+        )
+
+        _divide_ranges(op, Integer(2), tiled_dims=[1])
+
+        self.assertEqual(
+            layout.device_layout.element_arrangement, ElementArrangement.EXX2
+        )
+
+        # Confirm the rebuilt layout also has the right shape.
+        expected_strides = [
+            int(s) for s in FlexibleLayout.contiguous_strides([256, 64])
+        ]
+        expected = SpyreTensorLayout(
+            [256, 64], expected_strides, torch.float16, [1, 0], ElementArrangement.EXX2
+        )
+        self.assertEqual(layout.device_layout, expected)
+
+    def test_divide_ranges_stride_collision(self):
+        """Tiling an outer dim when stride_map has two entries with the same
+        value (device_size tiebreak case) produces the correct device_layout."""
+        from torch._inductor.ir import FlexibleLayout
+
+        from torch_spyre._C import SpyreTensorLayout
+
+        # [2, 2, 2, 16] contiguous, stick on dim3 (last).  host_stride[0]=64
+        # equals 64*host_stride[3], so the stick tile-count and a non-stick dim
+        # share a stride_map value; stride check must break the tie.
+        op, layout = self._make_ftl_op([2, 2, 2, 16], dim_order=[0, 1, 2, 3])
+
+        # Tile dim0: [2,2,2,16] -> [1,2,2,16].
+        _divide_ranges(op, Integer(2), tiled_dims=[0])
+
+        expected_strides = [
+            int(s) for s in FlexibleLayout.contiguous_strides([1, 2, 2, 16])
+        ]
+        expected = SpyreTensorLayout(
+            [1, 2, 2, 16], expected_strides, torch.float16, [0, 1, 2, 3]
+        )
+        self.assertEqual(layout.device_layout, expected)
+
+    def test_divide_ranges_tile_count_size_collision(self):
+        """Tile-count device_size equals a non-stick host dim size — the stride
+        check (not size alone) must classify it correctly.
+
+        [2, 128] with stick on dim1: tile-count device_size = ceil(128/64) = 2,
+        which equals old_host_size[0] = 2.  Without the stride check, Pass 1
+        misclassifies the tile-count dim as non-stick and never updates it."""
+        from torch._inductor.ir import FlexibleLayout
+
+        from torch_spyre._C import SpyreTensorLayout
+
+        op, layout = self._make_ftl_op([2, 128], dim_order=[0, 1])
+
+        # Tile dim0: [2, 128] -> [1, 128].
+        _divide_ranges(op, Integer(2), tiled_dims=[0])
+
+        expected_strides = [int(s) for s in FlexibleLayout.contiguous_strides([1, 128])]
+        expected = SpyreTensorLayout([1, 128], expected_strides, torch.float16, [0, 1])
+        self.assertEqual(layout.device_layout, expected)
+
+    def test_resize_device_layout_grow_from_singleton(self):
+        """_allocate_full_buffer grow path: a device dim tiled to size 1
+        (stride_map != -1) must be grown back on the full-buffer allocation.
+
+        [1, 128] grow dim0 -> [4, 128]: the size-1 non-stick device dim must
+        update to device_size=4, not remain frozen at 1."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.coarse_tile import _resize_device_layout
+
+        # Per-tile buffer is [1, 128] — dim0 was tiled to extent 1.
+        # device_size=[2, 1, 64], stride_map=[64, -1, 1].
+        stl = SpyreTensorLayout([1, 128], [128, 1], torch.float16, [0, 1])
+        result = _resize_device_layout(stl, [1, 128], [4, 128])
+
+        expected = SpyreTensorLayout([4, 128], [128, 1], torch.float16, [0, 1])
+        self.assertEqual(result, expected)
+
+    def test_resize_device_layout_raises_on_unsupported(self):
+        """_resize_device_layout raises RuntimeError when the stick host dim
+        cannot be uniquely identified from stride_map[-1].
+
+        This guards against unsupported layouts (e.g. future multi-host-dim
+        sticks) rather than silently producing a wrong result.
+        """
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.coarse_tile import _resize_device_layout
+
+        # Build a real [2, 2] STL (stick on dim1, stride_map[-1] == 1).
+        # Then call the helper with a synthetic old_host_size=[1, 1] whose
+        # contiguous strides are both 1 — two dims share stride_map[-1], so
+        # p* cannot be identified uniquely.
+        stl = SpyreTensorLayout([2, 2], [2, 1], torch.float16, [0, 1])
+        with self.assertRaises(RuntimeError):
+            _resize_device_layout(stl, [1, 1], [1, 1])
+
+    def test_resize_device_layout_reduction_output(self):
+        """Reduction output: stick host dim has been eliminated, so old_host_size
+        has no unmatched dim.  _resize_device_layout must handle this gracefully
+        by leaving the tile-count and inner-stick entries frozen."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.coarse_tile import _resize_device_layout
+
+        # [128] reduction output: SpyreTensorLayout([128], [1], fp16, [0]).
+        # device_size=[1, 128, 64], stride_map=[-1, 1, -1] — tile-count dim is
+        # frozen at 1 (stick collapsed), inner stick frozen at -1.
+        stl = SpyreTensorLayout([128], [1], torch.float16, [0])
+        # Tile the non-stick dim: [128] -> [64].
+        result = _resize_device_layout(stl, [128], [64])
+
+        # Non-stick device dim (j=1, size 128) updates to size 64, stride 1.
+        # Tile-count (j=0, size 1) and inner stick (j=2, size 64) are frozen.
+        expected = SpyreTensorLayout([64], [1], torch.float16, [0])
+        self.assertEqual(result, expected)
+
 
 def _mock_op_out_coords(op):
     """Return pre-built coords stored on op by _make_hinted_op, or empty list."""
