@@ -213,7 +213,7 @@ def buffer_not_read_in_full(graph: GraphLowering | GraphView, buf_name: str) -> 
             try:
                 if int(dep.get_numel()) < full:
                     return True
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, AttributeError):
                 return True
     return False
 
