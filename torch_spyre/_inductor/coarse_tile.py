@@ -615,47 +615,8 @@ def insert_tiling_propagation(
             _propagate_tiled_op(op, operations)
 
 
-def _reduction_tiling_is_on_stick_dim(op: ComputedBuffer, red_dim_idx: int) -> bool:
-    """Return True if red_dim_idx in reduction_ranges corresponds to the stick dim.
-
-    Uses device_coordinates to find the within-stick coordinate for the primary
-    input, then checks whether the reduction symbol for red_dim_idx appears in
-    that coordinate's free symbols — the same technique used in propagate_layouts.
-    """
-    from .ir import FixedTiledLayout
-    from .pass_utils import device_coordinates
-
-    data = op.data
-    assert isinstance(data, Reduction)
-    try:
-        rw = op.get_read_writes()
-        out_dep = next(iter(rw.writes))
-    except (StopIteration, AttributeError, TypeError):
-        # StopIteration: mocked ops in unit tests have empty rw.writes.
-        # AttributeError/TypeError: guard against partially constructed mocks.
-        return False
-    out_syms = set(out_dep.index.free_symbols)
-    in_dep = next((d for d in rw.reads if hasattr(d, "index")), None)
-    if in_dep is None:
-        return False
-    # reduction_syms: symbols in in_dep.ranges that are absent from the output index,
-    # in dep.ranges order (which matches reduction_ranges order).
-    reduction_syms = [s for s in in_dep.ranges if s not in out_syms]
-    if red_dim_idx >= len(reduction_syms):
-        return False
-    red_sym = reduction_syms[red_dim_idx]
-
-    in_buf = V.graph.get_buffer(in_dep.name)
-    if in_buf is None or not isinstance(in_buf.layout, FixedTiledLayout):
-        return False
-    # device_coordinates[-1] is the within-stick coordinate expression.
-    # If red_sym appears in its free symbols, the reduction is on the stick dim.
-    stick_coord = device_coordinates(in_buf.layout.device_layout, in_dep, None)[-1]
-    return red_sym in stick_coord.free_symbols
-
-
 def _validate_reduction_tiling(op: ComputedBuffer) -> None:
-    """Raise RuntimeError for Reduction tiling configurations not yet implemented.
+    """Raise RuntimeError for unsupported Reduction tiling configurations.
 
     Supported:
       - A single level that tiles only a non-stick reduction dim.
@@ -1467,9 +1428,9 @@ def _stamp_group(
                     # NOTE: _divide_reduction_ranges mutates data.reduction_ranges
                     # before _validate_reduction_tiling runs in the later
                     # insert_tiling_propagation pass.  If validation raises (e.g.
-                    # stick-dim tiling, Stage 2), the mutated ranges are never
-                    # observed: the RuntimeError propagates uncaught through the
-                    # pass runner and aborts compilation.
+                    # mixed output+reduction at one level), the mutated ranges are
+                    # never observed: the RuntimeError propagates uncaught through
+                    # the pass runner and aborts compilation.
                     _divide_reduction_ranges(
                         op, count, [rpos] if rpos is not None else []
                     )

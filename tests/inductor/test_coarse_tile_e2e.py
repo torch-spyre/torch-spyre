@@ -1123,6 +1123,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"D": 4}):
                 return x.sum(dim=-1)
 
+        # atol=0.05: fp16 sum over 512 elements scaled by 0.1 accumulates ~0.05 error.
         compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=0.05, rtol=0.05)
 
     def test_hint_tiled_reduction_matmul_loopspec(self):
