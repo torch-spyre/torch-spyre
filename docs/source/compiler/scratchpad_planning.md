@@ -13,8 +13,12 @@ First-fit and best-fit are available as opt-ins.
 
 Co-optimization with work distribution is opt-in.
 `config.co_optimizing_lx_planning` (`CO_OPTIMIZING_LX_PLANNING=1`)
-defaults to off. The proof-of-concept handles only single-output-dim
-flips today.
+defaults to off. It enlarges each op's set of candidate splits — pointwise
+dim-flips, the matmuls' tilings offered to neighbours, cross-matmul split
+transfer, a shared batch-major `B/M` tiling for matmuls and reductions —
+then searches the cross-product for the assignment that minimizes HBM
+traffic. The seed (work-division's choice) is always retained, so the
+result is never worse than work division alone.
 :::
 
 **Quick navigation:**
@@ -278,6 +282,32 @@ scratchpad_planning(graph, allocator=DefaultAllocator())
 5. **Post-passes.** Currently empty. Reserved for solver-driven graph
    mutations (output cloning, op re-ordering).
 
+### Per-core size and core-division mismatch
+
+A buffer's LX footprint is its **per-core** size, not its total size: a
+buffer split across `N` cores only needs `total / N` bytes on each core's
+scratchpad. `get_ncores_for_buffers` (in `utils.py`) decides that `N` for
+each buffer and is the gate for whether a buffer is even eligible.
+
+- **Sizing is writer-authoritative.** The op that *writes* a buffer
+  determines how the data is physically spread across cores, so the
+  divisor is the writer's core count — not the maximum over all users. A
+  reader on more cores only touches its own (smaller) slice of that
+  residency. (Earlier code used `max()` over users, which under-sized a
+  buffer whose writer ran on fewer cores than a consumer — e.g. a 1-core
+  producer feeding a 32-core matmul — and wrongly pinned an over-large
+  buffer to a single core's LX.) Graph inputs have no in-graph writer and
+  fall back to the readers' (matching) count.
+- **Mismatch detection compares per-core views.** Two ops agree on a
+  buffer only if their `PerCoreView` (`_per_core_view_on_buf` in
+  `pass_utils.py`) — which device dim each core's slice occupies, and the
+  core→slice mapping — matches. A genuine single-core "owns the whole
+  buffer" access is encoded distinctly from a multi-core broadcast that
+  also touches the whole buffer, so the two never compare equal by
+  accident. A writer/reader core-count disagreement, a partial-sum
+  (K-split-reduction) writer, or any unrepresentable geometry yields
+  `core_div_mismatch` (`-1`) and disqualifies the buffer from LX.
+
 ### Codegen integration
 
 Once `layout.allocation["lx"]` is set:
@@ -349,17 +379,66 @@ combination by counting HBM bytes the solver could not pin, and commits
 the winning assignment back before the standard allocator flow.
 :::
 
-The current POC (`v1`) only considers dim-flipping. When an op's seed
-split has a single output-dim split factor, it generates variants that
-move that factor onto each compatible alternative output dim.
-Reduction-axis splits and multi-dim splits are skipped for now. The
-search is bounded by `DEFAULT_VARIANT_CAP = 6` per op and uses DFS over
-the cross-product with no early-stop pruning, so the search stays
-compatible with future non-greedy solvers that can reach interior states.
+Each op's candidate list is built by `_enum_split_options`, dispatching
+on op type. The seed (work division's choice) is always option 0 and is
+always retained, so the worst case matches work division. Every non-seed
+candidate is deduped by canonical key and filtered through
+`_split_fits_sticks`, which rejects factors that overflow a stickified
+dim's stick count (those would abort the SuperDSC bundler) or that land on
+a collapsed/broadcast dim.
+
+**Pointwise ops** get their seed, dim-flip variants (move the seed's
+single output-dim factor onto each compatible alternative output dim,
+bounded by `DEFAULT_VARIANT_CAP = 6`), and the matmul tilings from the
+shared pool (below). Adopting a neighbouring matmul's tiling makes the
+op's per-core view match the matmul's, so the shared buffer pins to LX
+*and* the op runs at the matmul's high-utilization shape.
+
+**Matmul splits are not overridden onto a single dim — but neighbours'
+tilings and a batch-major split are offered.** Concentrating a balanced
+`M/4×N/8` split onto one dim (`M/32`) pins the matmul output and the
+surrounding chain to LX but is a poor matmul shape: on `mlp-linear-kn.t`
+(SENCORES=32) it regressed kernel time ~2.5× as process-engine
+utilization fell from 66% to 33%. So the rule remains **prioritize compute
+utilization for compute-bound ops** — the seed split is never flipped onto
+one dim. Instead, `_check_and_add_matmul_option` offers each matmul its
+seed plus (a) every *other* matmul's split transferred into this op's
+coordinates by axis role (so two matmuls whose work-division splits
+disagree can find a consistent assignment), and (b) a factored batch-major
+`B/M` split. All of these are full-core splits, so compute utilization is
+preserved.
+
+**Batch-major `B/M` tiling reconciles attention.** Two attention matmuls
+(`Q·Kᵀ` and `scores·V`) contract different axes, so neither can adopt the
+other's `N`/`K` tiling — but both keep the batch (`B`) and `M` output
+axes. `_factored_bm_splits` emits a single full-core `B/b · M/m` split
+(largest batch factor that fits, from `(8, 4, 2)` with `m = ncores / b`),
+valid for both matmuls and divisible into both stick-count extents. This
+shared tiling is also offered to the **softmax reductions** (`max`/`sum`)
+in their own output coordinates via `_reduction_bm_axes` — reductions are
+otherwise left on their seed, but offering them the `B/M` split lets the
+whole softmax chain between the two matmuls reconcile to one tiling. On
+`mha_4h` (SENCORES=32) this converges both matmuls and the entire
+softmax chain on `B/4·M/8`, pinning the scores matrix and the chain to LX.
+Reductions are not given dim-flip variants (their reduced axis is fixed),
+and any candidate that fails to reconcile a shared buffer's per-core view
+self-eliminates during scoring.
+
+The shared matmul-tiling pool is collected once by
+`_find_distinct_matmul_splits`: each distinct matmul seed split plus each
+matmul's factored `B/M` split, deduped. This pool seeds both the pointwise
+candidate lists and the cross-matmul transfer.
+
+On `mlp-linear-kn.t` (SENCORES=32) the pointwise-seeding path lifted
+process-engine utilization from ~66% to ~79% and cut fused kernel time by
+~17% (about 2× faster than the sendnn reference).
 
 The leaf-scoring function is intentionally cheap and solver-agnostic. It
 runs the full `_generate_buffers + plan_layout` pass on the candidate
 splits and counts the HBM bytes of every buffer the solver could not pin.
+Repeated `_per_core_view_on_buf` work is memoized across leaves, and the
+split-invariant liveness / filtered-op-view / mem-usage computations are
+hoisted out of the per-leaf path.
 
 ## Current limitations
 
@@ -374,15 +453,35 @@ best-fit mitigate this by sorting all buffers up front before placing.
 `find_free_block` can locate holes between allocations but cannot
 compact the address space. Allocate/deallocate cycles fragment LX.
 
-### Co-optimization is a POC
+### Co-optimization is still limited
 
 `StrategyBCoOptimizingAllocator` implements the joint
-work-division + LX planning idea, but the current variant generator only
-flips a single output-dim split. Productionisation needs richer variant
-generation (multi-dim splits, fewer-cores, reduction-axis), a
-performance model that balances compute throughput against memory
-traffic so we do not trade away compute parallelism for trivial LX wins,
-and coverage when the `coarse_tiling` pass also drives split decisions.
+work-division + LX planning idea. It searches pointwise dim-flips, the
+matmuls' tilings offered to neighbours, cross-matmul split transfer, and a
+shared batch-major `B/M` split for matmuls and reductions. It still never
+flips a matmul's split onto a single dim (to protect compute
+utilization). Remaining gaps:
+
+- **The search is exhaustive and per-leaf cost is high.** It scores the
+  full cross-product of candidates with no pruning; each leaf rebuilds the
+  filtered op view. Adding the reduction `B/M` option makes `mha_4h`
+  converge fully on `B/4·M/8` but pushes the search into the tens of
+  seconds (the per-leaf graph-view rebuild dominates). Hoisting the
+  split-invariant work out of the per-leaf path, or pruning the tree, is
+  needed before this is on by default.
+- **Not every producer reconciles.** A matmul input whose producer is a
+  plain pointwise op (e.g. an attention `Q·scale` multiply) is not yet
+  offered a split matching how the matmul reads it, so that producer can
+  stay in HBM where the sendnn reference keeps it on LX.
+- **No performance model.** The "honor compute-bound ops, search the
+  rest" rule is still a heuristic; the trade between compute throughput
+  and memory traffic is not scored.
+- **No coarse-tiling integration** when that pass also drives split
+  decisions.
+
+The factored-`B/M` and cross-matmul transfer code is marked TEMP/TODO:
+the intent is for work division to assign consistent splits directly, at
+which point these compensating options can be removed.
 
 ### No cross-core ring utilization
 
@@ -433,13 +532,26 @@ Two non-greedy solver families are being prototyped on top of the same
 
 ### Richer co-optimization
 
-The current dim-flipping variant generator is a starting point. Planned
-extensions:
+Current state: pointwise dim-flips, matmul-tiling seeding, cross-matmul
+split transfer, and a shared batch-major `B/M` split offered to matmuls
+and softmax reductions. Planned extensions:
 
-- multi-dim splits, fewer-cores variants, reduction-axis splits;
-- a performance model that balances compute throughput against memory
-  traffic so we do not trade away parallelism for trivial LX wins;
-- joint operation with the `coarse_tiling` pass when that pass also
+- **Make the search affordable.** Hoist the split-invariant graph-view /
+  mem-usage build out of the per-leaf path (or prune the cross-product)
+  so the exhaustive search does not run into tens of seconds once
+  reductions also carry options.
+- **Offer matmul-input producers a matching split.** A plain pointwise
+  producer feeding a matmul should be able to adopt the split the matmul
+  reads it with, so that producer pins to LX (closing the gap with the
+  sendnn reference, which keeps both attention pre-multiplies on LX).
+- **Replace the "honor compute-bound ops, search the rest" heuristic**
+  with a performance model that scores compute throughput against memory
+  traffic, so matmul (and other compute-bound) splits can be searched too
+  when the trade actually pays off.
+- **Remove the compensating options** once work division assigns
+  consistent splits directly (the factored-`B/M` and cross-matmul
+  transfer code is marked TEMP/TODO for exactly this).
+- **Joint operation with the `coarse_tiling` pass** when that pass also
   drives split decisions.
 
 ### Solver-driven graph mutations

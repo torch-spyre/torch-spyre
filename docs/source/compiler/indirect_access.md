@@ -9,7 +9,7 @@ value loaded at runtime from a separate index tensor.
 - [What is indirect access?](#what-is-indirect-access)
 - [How Inductor represents indirect access](#how-inductor-represents-indirect-access)
 - [The challenge: coordinates that depend on runtime values](#the-challenge-coordinates-that-depend-on-runtime-values)
-- [Solution: IndirectAccess and device coordinates](#solution-indirectaccess-and-device-coordinates)
+- [Solution: range and substitution for indirect symbols](#solution-range-and-substitution-for-indirect-symbols)
 - [Pipeline walkthrough](#pipeline-walkthrough)
 - [Stick compatibility for index tensors](#stick-compatibility-for-index-tensors)
 - [Op spec layout](#op-spec-layout)
@@ -64,9 +64,42 @@ crash, silently skip the symbol, or produce wrong layout decisions.
 
 ---
 
-## Solution: IndirectAccess and device coordinates
+## Solution: range and substitution for indirect symbols
 
-The PR introduces `IndirectAccess`, a sympy `Function` subclass defined in
+`compute_coordinates` needs two things to handle an indirect symbol correctly:
+its **range** (to place it in the right device dimension) and a **substitution**
+(to replace the opaque symbol with a named expression for later stages).
+These are handled by two separate optional parameters.
+
+### Range for indirect symbols: `indirect_sizes`
+
+`compute_coordinates` accepts an optional `indirect_sizes: dict[Symbol, int]`
+parameter.  When a free symbol in the index is not in `var_ranges`,
+the function looks it up here to get its range.
+
+Indirect symbols have no entry in `dep.ranges` — their range is the `size`
+argument passed to `ops.indirect_indexing()` at lowering time, baked into the
+`inner_fn` closure and not visible in the printed IR.  How `indirect_sizes` is
+built differs between pipeline stages:
+
+| Stage | Symbol name | Source |
+|---|---|---|
+| Pre-scheduler (`propagate_layouts`) | `tmp0`, `tmp1`, … (Inductor-assigned) | `indirect_sizes_from_op(op)` in `pass_utils.py` — re-executes `inner_fn` via `_IndirectIndexFinder`, which intercepts `indirect_indexing()` calls and captures the size argument |
+| Post-scheduler (`SpyreKernel`) | `indirect0`, `indirect1`, … (Spyre-assigned) | `SpyreKernel.indirect_sizes` — populated by `SpyreKernelOpsHandler.indirect_indexing()` during kernel body execution; passed to `compute_coordinates` from `create_tensor_arg` |
+
+If `indirect_sizes=None` is passed — as is the case for structural callers that
+only check stick compatibility or layout shape — the indirect symbol is silently
+skipped and its contribution is left as zero in the output coordinates. If
+`indirect_sizes` is a dict but does not contain a symbol that appears in the
+index, `Unsupported` is raised immediately rather than producing silently wrong
+coordinates.
+
+### Naming indirect symbols: `IndirectAccess`
+
+Once `tmp0` is placed in the correct device dimension, the coordinate
+expression still contains the raw symbol.  Later stages and the backend need
+to know which buffer supplies the runtime value.  The solution is
+`IndirectAccess`, a sympy `Function` subclass defined in
 [`op_spec.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/op_spec.py):
 
 ```python
@@ -79,7 +112,7 @@ at the current iteration point"*.  It is an opaque sympy atom that survives
 `sympify` round-trips and can be carried through arithmetic expressions without
 being evaluated.
 
-### Building the substitution dict
+#### Building the substitution dict
 
 Two helpers in
 [`pass_utils.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/pass_utils.py)
@@ -94,16 +127,16 @@ the pipeline stage:
 Both return the same dict shape, so every downstream caller sees a uniform
 interface regardless of when it runs.
 
-### Applying the substitution
+#### Applying the substitution
 
 `compute_coordinates` (in
 [`views.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/views.py))
-accepts an optional `indirect_load_subs` parameter.  After computing the
+accepts an optional `indirect_access_subs` parameter.  After computing the
 coordinate expressions in the normal way it applies the substitution:
 
 ```python
-if indirect_load_subs:
-    coordinates = [c.xreplace(indirect_load_subs) for c in coordinates]
+if indirect_access_subs:
+    coordinates = [c.xreplace(indirect_access_subs) for c in coordinates]
 ```
 
 This replaces `tmp0` with `IndirectAccess('arg1_1')` in the affected coordinate,
@@ -112,23 +145,6 @@ giving a gather-aware expression that all later stages can handle.
 The `device_coordinates` wrapper in `pass_utils.py` forwards the parameter
 to `compute_coordinates`, so callers in `propagate_layouts.py` and
 `spyre_kernel.py` only need to pass the dict through one function.
-
-### Range inference for indirect symbols
-
-Before the substitution is applied, `compute_coordinates` needs a *range* for
-`tmp0` to know which layout dimension it addresses.  Indirect symbols have no
-entry in `dep.ranges`, so the range is inferred from the tensor layout: the
-code finds the dimension whose stride equals the coefficient of `tmp0` in the
-index expression:
-
-```python
-term = index.xreplace({v: 0 for v in vars - {var}})
-coeff = int(term.xreplace({var: 1}))
-inferred = next(
-    (sz for st, sz in zip(stride, size) if int(st) == coeff and int(sz) > 1),
-    None,
-)
-```
 
 ---
 
@@ -139,9 +155,10 @@ through the following stages.
 
 ### 1. propagate_layouts (pre-scheduler)
 
-`compute_layouts` is called for the `Pointwise` node.
-`indirect_access_subs_from_op` re-executes `inner_fn` via `_IndirectIndexFinder`
-and returns `{tmp0: IndirectAccess(Symbol('arg1_1'))}`.
+`compute_layouts` is called for the `Pointwise` node.  Both
+`indirect_sizes_from_op` and `indirect_access_subs_from_op` re-execute `inner_fn`
+via `_IndirectIndexFinder` to recover the size and the source buffer name for
+`tmp0`.
 
 The resulting device coordinates (logged when `TORCH_LOGS="+inductor"` is set)
 show the substitution explicitly:
@@ -159,18 +176,19 @@ unchanged.
 ### 2. SpyreKernel codegen (post-scheduler)
 
 `SpyreKernelOpsHandler.indirect_indexing()` intercepts the `indirect_indexing`
-call during `inner_fn` execution and stores the source `TensorAccess` in
-`SpyreKernel.indirect_vars`:
+call during `inner_fn` execution and stores both the source `TensorAccess` and
+the size:
 
 ```python
 sym = sympy_index_symbol(f"indirect{self.kernel._indirect_var_count}")
 self.kernel._indirect_var_count += 1
 self.kernel.indirect_vars[sym] = index_var   # TensorAccess for arg1_1
+self.kernel.indirect_sizes[sym] = int(size)
 ```
 
-`indirect_access_subs_from_kernel(self.indirect_vars)` then converts this to
-`{sym: IndirectAccess(Symbol('arg1_1'))}` — the same shape as the pre-scheduler
-dict, so `create_tensor_arg` can use it directly.
+`indirect_access_subs_from_kernel(self.indirect_vars)` converts `indirect_vars`
+to `{sym: IndirectAccess(Symbol('arg1_1'))}`, and `self.indirect_sizes` is
+passed directly — both go to `compute_coordinates` from `create_tensor_arg`.
 
 ### 3. Op spec generation
 

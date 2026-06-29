@@ -296,7 +296,7 @@ def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
 def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
     """Return host coordinates for the output dep of a ComputedBuffer."""
     output_dep = next(iter(op.get_read_writes().writes))
-    return host_coordinates(op.get_layout(), output_dep)
+    return host_coordinates(op.get_layout(), output_dep, indirect_sizes_from_op(op))
 
 
 def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
@@ -344,11 +344,41 @@ def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
     return names
 
 
-def indirect_index_dep_names(op: ComputedBuffer) -> set[str]:
-    """Return names of deps whose loaded values are used as indices in loads or stores."""
-    names = {expr.base.name for expr in _build_indirect_load_subs(op).values()}
+def indirect_info_from_op(
+    op: "ComputedBuffer | None",
+) -> "tuple[set[str], dict[sympy.Symbol, sympy.Expr], dict[sympy.Symbol, int] | None]":
+    """Return (dep_names, access_subs, sizes) for a ComputedBuffer in one inner_fn pass.
+
+    Pass op=None when there is no ComputedBuffer (e.g. structural callers that only
+    check stick compatibility or layout shape). Returns (set(), {}, None), where
+    sizes=None tells compute_coordinates to skip unknown symbols silently rather than
+    raising Unsupported. None is returned when op has no indirect reads. If indirect
+    reads exist but none resolve to a known buffer (unexpected), sizes={} is returned;
+    in normalize_coordinates this still produces opaque-Term fallback (same as None),
+    but in compute_coordinates an unknown symbol would raise Unsupported.
+    """
+    if op is None:
+        return set(), {}, None
+    subs, sizes = _build_indirect_load_subs(op)
+    names: set[str] = {expr.base.name for expr in subs.values()}
     names |= _find_scatter_index_buf_names(op)
-    return names
+    access_subs = {
+        sym: IndirectAccess(sympy.Symbol(expr.base.name)) for sym, expr in subs.items()
+    }
+    return names, access_subs, sizes
+
+
+def indirect_sizes_from_op(
+    op: "ComputedBuffer | None",
+) -> "dict[sympy.Symbol, int] | None":
+    """Build {indirect_sym → size} for a ComputedBuffer (pre-scheduler).
+
+    Returns the valid index range for each indirect symbol, captured from the
+    size argument of indirect_indexing() during inner_fn re-execution.
+    Pass op=None when there is no ComputedBuffer; returns None.
+    """
+    _, _, sizes = indirect_info_from_op(op)
+    return sizes
 
 
 class _LoadSentinel:
@@ -359,12 +389,11 @@ class _LoadSentinel:
 
 
 class _IndirectIndexFinder:
-    """Re-executes inner_fn to discover which buffer's load feeds each indirect load.
+    """Re-executes inner_fn to map each indirect load to its index buffer and valid range.
 
-    load() returns a _LoadSentinel carrying the buffer name.
-    indirect_indexing() receives that sentinel and records which buffer was
-    used as the index, so the next load() call can record the relationship.
-    All other ops delegate to MockHandler.
+    Inductor bakes the index range into the inner_fn closure as the size argument to
+    ops.indirect_indexing() — invisible in printed IR, only accessible by re-execution.
+    This handler intercepts those calls to recover both the source buffer name and the size.
     """
 
     def __init__(self):
@@ -372,12 +401,21 @@ class _IndirectIndexFinder:
 
         self._mock = MockHandler()
         self._pending_indirect_index_buf: str | None = None
+        self._pending_indirect_index_size: int | None = None
         self.indirect_index_by_buf: dict[str, str] = {}
+        self.indirect_index_size_by_buf: dict[str, int] = {}
 
     def load(self, name: str, index):
         if self._pending_indirect_index_buf is not None:
+            if self._pending_indirect_index_size is None:
+                raise Unsupported(
+                    f"indirect_indexing() set pending buf {self._pending_indirect_index_buf!r} "
+                    "but did not set pending size; single-slot protocol violated"
+                )
             self.indirect_index_by_buf[name] = self._pending_indirect_index_buf
+            self.indirect_index_size_by_buf[name] = self._pending_indirect_index_size
             self._pending_indirect_index_buf = None
+            self._pending_indirect_index_size = None
         return _LoadSentinel(name)
 
     def indirect_indexing(self, index_var, size, check=True, wrap_neg=True):
@@ -385,28 +423,40 @@ class _IndirectIndexFinder:
         # lowering always emits indirect_indexing() directly before the
         # consuming load(), so the single slot is never overwritten in between.
         if isinstance(index_var, _LoadSentinel):
+            if self._pending_indirect_index_buf is not None:
+                raise Unsupported(
+                    f"indirect_indexing({index_var.name}) called before load() consumed "
+                    f"the previous pending slot ({self._pending_indirect_index_buf}); "
+                    "chained indirect indexing is not supported"
+                )
             self._pending_indirect_index_buf = index_var.name
+            self._pending_indirect_index_size = int(size)
         return sympy.S.Zero
 
     def __getattr__(self, attr):
         return getattr(self._mock, attr)
 
 
-def _find_indirect_index_bufs(op: ComputedBuffer) -> dict[str, str]:
-    """Re-execute inner_fn and return {data_buf: indirect_index_buf} mapping."""
+def _find_indirect_index_bufs(
+    op: ComputedBuffer,
+) -> "tuple[dict[str, str], dict[str, int]]":
+    """Re-execute inner_fn and return ({data_buf: index_buf}, {data_buf: size}) mappings."""
     from torch._inductor.virtualized import V as _V
 
     finder = _IndirectIndexFinder()
     with _V.set_ops_handler(finder):
         op.data.inner_fn(*op.data.inner_fn_args())
-    return finder.indirect_index_by_buf
+    return finder.indirect_index_by_buf, finder.indirect_index_size_by_buf
 
 
-def _build_indirect_load_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr]:
-    """Map indirect symbols in MemoryDep.index to IndexedBase[source_index] exprs.
+def _build_indirect_load_subs(
+    op: ComputedBuffer,
+) -> "tuple[dict[sympy.Symbol, sympy.Expr], dict[sympy.Symbol, int] | None]":
+    """Map indirect symbols to (IndexedBase subs, sizes).
 
     Pre-scheduler only: re-executes inner_fn via _IndirectIndexFinder to learn
-    which buffer's load produced each indirect index.
+    which buffer's load produced each indirect index and what size it carries.
+    Returns ({sym: IndexedBase[...]}, {sym: size}).
     """
     from sympy import IndexedBase
 
@@ -417,10 +467,11 @@ def _build_indirect_load_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Ex
         if isinstance(d, MemoryDep) and isinstance(d.index, sympy.Basic)
     ]
     if not any(d.is_indirect() for d in reads):
-        return {}
-    indirect_index_buf_map = _find_indirect_index_bufs(op)
+        return {}, None
+    indirect_index_buf_map, indirect_index_size_map = _find_indirect_index_bufs(op)
     dep_by_name = {d.name: d for d in reads}
-    result = {}
+    subs = {}
+    sizes = {}
     for d in reads:
         if not d.is_indirect():
             continue
@@ -428,12 +479,15 @@ def _build_indirect_load_subs(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Ex
         if indirect_index_buf is None:
             continue
         indirect_index_dep = dep_by_name[indirect_index_buf]
-        for sym in d.index.free_symbols:
-            if sym not in d.ranges:
-                result[sym] = IndexedBase(indirect_index_dep.name)[
-                    indirect_index_dep.index
-                ]
-    return result
+        size = indirect_index_size_map.get(d.name)
+        indirect_syms = [s for s in d.index.free_symbols if s not in d.ranges]
+        if len(indirect_syms) > 1:
+            raise Unsupported(f"multiple indirect symbols in {d.name}: {indirect_syms}")
+        for sym in indirect_syms:
+            subs[sym] = IndexedBase(indirect_index_dep.name)[indirect_index_dep.index]
+            if size is not None:
+                sizes[sym] = size
+    return subs, sizes
 
 
 def indirect_access_subs_from_op(
@@ -445,11 +499,13 @@ def indirect_access_subs_from_op(
     Re-executes inner_fn via _IndirectIndexFinder to discover which buffer's
     load produced each indirect index. The resulting subs can be passed to
     device_coordinates() to replace indirect symbols with IndirectAccess(name).
+
+    Note: internally calls indirect_info_from_op(), re-executing inner_fn. If you
+    already have the result of indirect_info_from_op(), use the access_subs field
+    directly rather than calling this function.
     """
-    raw = _build_indirect_load_subs(op)
-    return {
-        sym: IndirectAccess(sympy.Symbol(expr.base.name)) for sym, expr in raw.items()
-    }
+    _, access_subs, _ = indirect_info_from_op(op)
+    return access_subs
 
 
 def indirect_access_subs_from_kernel(
@@ -468,7 +524,23 @@ def indirect_access_subs_from_kernel(
     }
 
 
-def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
+def host_coordinates(
+    layout: FixedLayout,
+    dep: MemoryDep,
+    indirect_sizes: "dict[sympy.Symbol, int] | None",
+) -> list[sympy.Expr]:
+    """Compute host-space coordinate expressions for a tensor access.
+
+    Args:
+        layout: Host layout of the tensor being accessed.
+        dep: Memory dependency describing the access index and loop ranges.
+        indirect_sizes: {indirect_sym → size} from indirect_sizes_from_op(), or
+            None for structural callers (stick-compatibility checks, layout
+            matching) where indirect coordinates are irrelevant.
+
+    Returns:
+        One coordinate expression per host dimension.
+    """
     # Concretize size/stride so compute_coordinates can use plain ``<``/``>``
     # comparisons.  var_ranges and index stay symbolic so the *output*
     # coordinate expressions remain symbolic.
@@ -477,7 +549,9 @@ def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
     concrete_size = [concretize_expr(s) for s in layout.size]
     concrete_stride = [concretize_expr(s) for s in layout.stride]
     index = concretize_index(dep.index, set(dep.ranges.keys()))
-    return compute_coordinates(concrete_size, concrete_stride, dep.ranges, index)
+    return compute_coordinates(
+        concrete_size, concrete_stride, dep.ranges, index, indirect_sizes=indirect_sizes
+    )
 
 
 def identify_matmul_inputs(
@@ -589,14 +663,20 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
 def device_coordinates(
     stl: SpyreTensorLayout,
     dep: MemoryDep,
-    indirect_load_subs: "dict[sympy.Symbol, sympy.Expr] | None" = None,
+    indirect_sizes: "dict[sympy.Symbol, int] | None",
 ) -> list[sympy.Expr]:
-    """Compute device-space coordinates for a tensor access.
+    """Compute device-space coordinate expressions for a tensor access.
 
-    indirect_load_subs: optional {indirect_sym → IndirectAccess(name)} mapping produced by
-        indirect_access_subs_from_op() (pre-scheduler) or indirect_access_subs_from_kernel()
-        (post-scheduler). When provided, indirect symbols in the coordinates are
-        replaced with IndirectAccess expressions, giving indirect-aware coordinates.
+    Args:
+        stl: Device layout (SpyreTensorLayout) of the tensor being accessed.
+        dep: Memory dependency describing the access index and loop ranges.
+        indirect_sizes: {indirect_sym → size} from indirect_sizes_from_op(), or
+            None for structural callers (stick-compatibility checks, layout
+            matching) where indirect coordinates are irrelevant.
+
+    Returns:
+        One coordinate expression per device dimension; the last element is
+        the stick expression.
     """
     # device_size and stride_map come from the C++ SpyreTensorLayout and are
     # already concrete, so no concretization is needed here.
@@ -606,7 +686,7 @@ def device_coordinates(
         stl.stride_map,
         dep.ranges,
         index,
-        indirect_load_subs,
+        indirect_sizes,
     )
     _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
     return coords
@@ -874,17 +954,18 @@ def compute_restickify_needed(
       (True, stl)     — restickify needed, stl is the target STL for the restickified input
       (True, None)    — restickify needed but infeasible
     """
-    if op is not None and in_dep.name in indirect_index_dep_names(op):
+    ind_names, _, ind_sizes = indirect_info_from_op(op)
+    if in_dep.name in ind_names:
         return False, None
-    idc = device_coordinates(in_stl, in_dep)
-    out_idc = device_coordinates(out_stl, out_dep)
+    idc = device_coordinates(in_stl, in_dep, ind_sizes)
+    out_idc = device_coordinates(out_stl, out_dep, ind_sizes)
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
     # Input stick with an offset always needs restickify to remove the offset.
     in_stick_offset_free = is_stick_expr_offset_free(idc[-1], in_stl.elems_per_stick())
     if in_stick_offset_free and stick_compatible([idc, out_idc]):
         return False, None
-    ic = host_coordinates(in_host, in_dep)
+    ic = host_coordinates(in_host, in_dep, ind_sizes)
     target_stick = out_idc[-1]
 
     if target_stick == sympy.S.Zero and not in_stick_offset_free:
@@ -1218,14 +1299,20 @@ def _per_core_view_on_buf(
          by device-dim so it's independent of op-local symbol names.
 
     Pass an optional `cache` dict to memoize results across calls,
-    keyed by (op.op_it_space_splits, dep, buf_name).
+    keyed by (op name, op.op_it_space_splits, dep). op name is required:
+    the result also depends on op-derived write_index / read_index /
+    iter_space, so two ops sharing the same (splits, dep) — e.g. a matmul
+    producer and a pointwise consumer of the same buffer — must not alias
+    the same cache entry. buf_name is omitted because the sole caller
+    (get_ncores_for_buffers) always passes buf_name == dep.name, so the
+    frozen MemoryDep `dep` already carries it.
     """
     coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
     if cache is not None:
         # dicts aren't hashable; freeze each into a frozenset of items so
         # the key is hashable and order-independent.
         out, red = coeff_splits
-        key = (frozenset(out.items()), frozenset(red.items()), dep, buf_name)
+        key = (op.get_name(), frozenset(out.items()), frozenset(red.items()), dep)
         hit = cache.get(key)
         if hit is not None:
             return hit
@@ -1237,7 +1324,24 @@ def _per_core_view_on_buf(
     rw = op.get_read_writes()
     empty_view = (PerCoreView(work_slice_dims=(), core_to_slot=()), False)
     if not any(n > 1 for d in coeff_splits for n in d.values()):
-        result = empty_view
+        # Single-core (unsplit) op owns the WHOLE buffer on one core. Encode as
+        # explicit all-factor-1 dims so it does NOT alias the broadcast empty_view
+        # a multi-core op yields when its splits all contract on this buffer (Step
+        # 2). Otherwise a 1-core producer and its 32-core consumers compare equal,
+        # the buffer is sized per-consumer-core (under-counted), and a too-large
+        # buffer gets wrongly LX-pinned. Real sliced views always carry a factor>1.
+        buf_layout = V.graph.get_buffer(buf_name).layout
+        if not isinstance(buf_layout, FixedTiledLayout):
+            result = empty_view
+        else:
+            ndims = len(buf_layout.device_layout.device_size)
+            result = (
+                PerCoreView(
+                    work_slice_dims=tuple((i, 1) for i in range(ndims)),
+                    core_to_slot=(),
+                ),
+                False,
+            )
         if cache is not None:
             cache[key] = result
         return result
