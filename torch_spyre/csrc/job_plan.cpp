@@ -29,9 +29,12 @@ namespace spyre {
 
 void JobPlanStepH2D::construct(LaunchContext&,
                                const SpyreStream& stream) const {
-  flex::DmaParams params(host_address_, /*to_device=*/true, &device_address_);
-  params.pipeline_barrier = pipeline_barrier_;
-  stream.launchH2D(&params);
+  auto* params =
+      flex::createDmaParams(host_address_, device_address_.total_size(),
+                            /*to_device=*/true, &device_address_);
+  params->pipeline_barrier = pipeline_barrier_;
+  stream.launchH2D(params);
+  flex::destroyDmaParams(params);
 }
 
 void JobPlanStepH2D::write(std::ostream& os) const {
@@ -44,9 +47,12 @@ void JobPlanStepH2D::write(std::ostream& os) const {
 
 void JobPlanStepD2H::construct(LaunchContext&,
                                const SpyreStream& stream) const {
-  flex::DmaParams params(host_address_, /*to_device=*/false, &device_address_);
-  params.pipeline_barrier = pipeline_barrier_;
-  stream.launchD2H(&params);
+  auto* params =
+      flex::createDmaParams(host_address_, device_address_.total_size(),
+                            /*to_device=*/false, &device_address_);
+  params->pipeline_barrier = pipeline_barrier_;
+  stream.launchD2H(params);
+  flex::destroyDmaParams(params);
 }
 
 void JobPlanStepD2H::write(std::ostream& os) const {
@@ -69,14 +75,16 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
       tensor_allocs.push_back(address);
     }
   }
-  flex::ComputeParams params(&program_address_, std::move(tensor_allocs), "",
-                             bootstrap_offset_);
-  params.pipeline_barrier = pipeline_barrier_;
-  stream.launchCompute(&params);
+  auto* params = flex::createComputeParams(
+      &program_address_, std::move(tensor_allocs), name_, bootstrap_offset_);
+  params->pipeline_barrier = pipeline_barrier_;
+  stream.launchCompute(params);
+  flex::destroyComputeParams(params);
 }
 
 void JobPlanStepCompute::write(std::ostream& os) const {
   os << "  Device Compute\n";
+  os << "    Name: " << (name_.empty() ? "(unnamed)" : name_) << "\n";
   os << "    Program address: " << program_address_ << "\n";
   os << "    Bind I/O addresses: " << (bind_io_addresses_ ? "yes" : "no")
      << "\n";
@@ -102,9 +110,10 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
                                        const SpyreStream& stream) const {
   // Helper lambda to build HostCallbackParams and launch on the stream
   auto launch_host_callback = [this, &stream](auto&& callback) {
-    flex::HostCallbackParams params(std::forward<decltype(callback)>(callback),
-                                    nullptr, pipeline_barrier_);
-    stream.launchHostCallback(&params);
+    auto* params = flex::createHostCallbackParams(
+        std::forward<decltype(callback)>(callback), nullptr, pipeline_barrier_);
+    stream.launchHostCallback(params);
+    flex::destroyHostCallbackParams(params);
   };
 
   // Case 1: input_buffer_ is provided

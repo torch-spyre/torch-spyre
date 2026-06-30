@@ -33,12 +33,20 @@ class SymbolKind:
                                              global ``symbols`` list of the kernel base symbol.
       - ``pool()``:                          pool-allocated tensor address;
                                              emitted as ``arith.addi %pool, value``.
+      - ``dimension(gran, max, sym)``:       dynamic iteration-space dim size from
+                                             mark_dynamic; carried in SDSC JSON as a
+                                             ``dimToSymbolMapping_`` entry.  Registered
+                                             before address symbols so their negative IDs
+                                             never collide with address symbol IDs.
     """
 
     kind: str
     base_sym_idx: int = -1
     offset: int = 0
     arg_index: int = -1
+    granularity: int = 0
+    max_value: int = 0
+    pytorch_sym: str = ""
 
     @classmethod
     def kernel(cls, arg_index: int) -> "SymbolKind":
@@ -59,6 +67,17 @@ class SymbolKind:
     def pool(cls) -> "SymbolKind":
         return cls(kind="pool")
 
+    @classmethod
+    def dimension(
+        cls, granularity: int, max_value: int, pytorch_sym: str
+    ) -> "SymbolKind":
+        return cls(
+            kind="dimension",
+            granularity=granularity,
+            max_value=max_value,
+            pytorch_sym=pytorch_sym,
+        )
+
     @property
     def is_derived(self) -> bool:
         return self.kind == "kernel_derived"
@@ -66,6 +85,10 @@ class SymbolKind:
     @property
     def is_pool(self) -> bool:
         return self.kind == "pool"
+
+    @property
+    def is_dimension(self) -> bool:
+        return self.kind == "dimension"
 
 
 def core_idx_to_slice_offset(
@@ -256,6 +279,23 @@ def gen_coord_info_value(
     )
 
 
+def _per_core_symbolic_dim_info(symbolic_dims: dict, work_slices: dict) -> dict:
+    """Per-core ``symbolicDimInfo_`` block: granularity_/maxSize_ divided by
+    each dim's work_slices.
+
+    Shared by the ``ss_`` and ``el_`` sub-dicts of ``dataStageParam_``, which
+    must stay byte-for-byte identical -- factored out so the two never drift.
+    """
+    info = {}
+    for dim_name, (_, granularity, max_val) in symbolic_dims.items():
+        wk_slices = work_slices[Symbol(dim_name)]
+        info[dim_name] = {
+            "maxSize_": max_val // wk_slices,
+            "granularity_": max(1, granularity // wk_slices),
+        }
+    return info
+
+
 def _tiled_byte_stride(tensor, tiled_sym, iteration_space) -> int:
     """Byte stride per loop iteration for a single tiled dimension.
 
@@ -356,10 +396,13 @@ def generate_sdsc(
     - ``sdsc_json``: the JSON dict to write to ``sdsc_N.json``
     - ``base_symbol_values``: list of HBM byte offsets registered in ``symbols``;
       empty when ``use_symbols=False``
-    - ``affine_strides``: list (parallel to ``sdsc_spec.args``) of dicts
-      ``{tiled_sym: stride_bytes}`` for tiled HBM tensors; always empty when
-      ``use_symbols=False``.  Used by ``bundle.py`` to emit ``affine.apply``
-      ops inside ``scf.for`` loops.
+    - ``affine_strides``: list (parallel to ``sdsc_spec.args``) of per-level
+      stride lists.  Each element is a list of dicts, one per loop-nesting level
+      (outermost first), where each dict maps ``tiled_sym -> stride_bytes`` for
+      that level's tiled symbols.  Always ``[[]] * len(sdsc_spec.args)`` when
+      ``use_symbols=False``.  Used by ``bundle.py`` to emit ``affine.apply`` ops
+      inside ``scf.for`` loops, with one stride per level mapped to the correct
+      loop variable.
     - ``symbol_kinds``: list of ``SymbolKind`` parallel to ``base_symbol_values``;
       empty when ``use_symbols=False``.  Classifies each symbol as a kernel base
       address, per-core derived address, or pool-allocated address.
@@ -372,6 +415,7 @@ def generate_sdsc(
     IDs in the JSON and their values appended to ``symbols``, enabling
     ``affine.apply`` address computation in ``bundle.mlir`` for tiled loops.
     """
+    # tiled_symbols is list[list[Symbol]], outermost-first per nesting level.
     if tiled_symbols is None:
         tiled_symbols = []
 
@@ -383,6 +427,23 @@ def generate_sdsc(
         }
         for c in range(sdsc_spec.num_cores)
     }
+    symbolic_dims = sdsc_spec.symbolic_dims or {}
+
+    # Register dimension symbols BEFORE address symbols so their IDs never collide.
+    # IDs are laid out as: -(offset+1)..-(offset+n_dim) for dim symbols, then
+    # -(offset+n_dim+1)..-(offset+n_dim+k) for address symbols.
+    # Dim symbols carry no HBM byte value; 0 is appended to `symbols` as a placeholder.
+    dim_local_symbols: dict[str, int] = {}  # pytorch_sym_name -> negative symbol ID
+    dim_symbol_kinds: list[SymbolKind] = []
+    for sdsc_dim, (pytorch_sym, granularity, max_value) in symbolic_dims.items():
+        if pytorch_sym not in dim_local_symbols:
+            sym_id = -(symbol_id_offset + len(dim_symbol_kinds) + 1)
+            dim_local_symbols[pytorch_sym] = sym_id
+            dim_symbol_kinds.append(
+                SymbolKind.dimension(granularity, max_value, pytorch_sym)
+            )
+            symbols.append(0)  # placeholder: dim symbols have no HBM byte value
+    n_dim_syms = len(dim_symbol_kinds)
 
     # local_symbols maps base HBM byte offset -> globally-unique negative symbol id.
     # symbol_id_offset ensures ids are unique across all SDSCs in the bundle.
@@ -422,27 +483,45 @@ def generate_sdsc(
 
         def offset_as_symbol(s, kind: SymbolKind):
             if s not in local_symbols:
-                local_symbols[s] = -(symbol_id_offset + len(local_symbols) + 1)
+                # Address symbols start after dim symbols in the ID counter.
+                local_symbols[s] = -(
+                    symbol_id_offset + n_dim_syms + len(local_symbols) + 1
+                )
                 symbols.append(s)
                 local_symbol_kind.append(kind)
             return local_symbols[s]
 
-        # Compute per-tensor affine strides and register base addresses in symbols.
-        # affine_strides[i] is {tiled_sym: stride_bytes} for tensor i (empty if
-        # non-tiled/lx).
-        affine_strides: list[dict] = []
+        # Compute per-tensor, per-level affine strides and register base addresses.
+        # affine_strides[i] is a list of dicts, one per loop-nesting level
+        # (outermost first), where each dict maps tiled_sym -> stride_bytes for
+        # the symbols at that level that advance tensor i.  Empty list of dicts
+        # (i.e. [{}] * n_levels or []) for non-tiled / lx tensors.
+        affine_strides: list[list[dict]] = []
         for tensor in sdsc_spec.args:
             if "lx" in tensor.allocation:
-                affine_strides.append({})
+                affine_strides.append([{} for _ in tiled_symbols])
                 continue
             core0_addr = tensor.start_address + core_idx_to_slice_offset(
                 tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
             ) * num_bytes(tensor.data_format)
-            # base_sym_idx: index in global symbols[] where core-0 will be registered.
-            # Used by kernel_derived symbols to reference their base without searching.
-            base_sym_idx = symbol_id_offset + len(local_symbols)
-            tensor_tiled = [s for s in tiled_symbols if s in tensor.strides]
-            if not tensor_tiled:
+            # 0-based index in global symbols[] where this tensor's core-0 address will
+            # be registered. Offset by n_dim_syms because dim symbols occupy the first
+            # n_dim_syms slots in this SDSC's range of the shared counter.
+            base_sym_idx = symbol_id_offset + n_dim_syms + len(local_symbols)
+            # Build per-level strides: for each level, collect the symbols at that
+            # level that tile this tensor (i.e. appear in tensor.strides).
+            per_level_strides: list[dict] = []
+            any_tiled = False
+            for level_syms in tiled_symbols:
+                tensor_tiled_at_level = [s for s in level_syms if s in tensor.strides]
+                strides_for_level: dict = {}
+                for s in tensor_tiled_at_level:
+                    strides_for_level[s] = _tiled_byte_stride(
+                        tensor, s, sdsc_spec.iteration_space
+                    )
+                    any_tiled = True
+                per_level_strides.append(strides_for_level)
+            if not any_tiled:
                 # Non-tiled HBM: register per-core addresses.
                 for c in range(sdsc_spec.num_cores):
                     addr = tensor.start_address + core_idx_to_slice_offset(
@@ -454,15 +533,10 @@ def generate_sdsc(
                             c, tensor.arg_index, core0_addr, addr, base_sym_idx
                         ),
                     )
-                affine_strides.append({})
+                affine_strides.append([{} for _ in tiled_symbols])
             else:
                 # Tiled HBM: symbol value = per-core iter-0 base address.
                 # The affine map adds loop_var * tile_stride on top at runtime.
-                strides_for_tensor = {}
-                for s in tensor_tiled:
-                    strides_for_tensor[s] = _tiled_byte_stride(
-                        tensor, s, sdsc_spec.iteration_space
-                    )
                 for c in range(sdsc_spec.num_cores):
                     addr = tensor.start_address + core_idx_to_slice_offset(
                         tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
@@ -473,7 +547,7 @@ def generate_sdsc(
                             c, tensor.arg_index, core0_addr, addr, base_sym_idx
                         ),
                     )
-                affine_strides.append(strides_for_tensor)
+                affine_strides.append(per_level_strides)
 
         def _start_addr_data(tensor):
             # All per-core addresses were already registered by the per-tensor loop
@@ -494,7 +568,7 @@ def generate_sdsc(
     else:
         # use_symbols=False: bake concrete HBM addresses directly into the JSON.
         # symbols and local_symbols are not modified.
-        affine_strides = [{} for _ in sdsc_spec.args]
+        affine_strides = [[{} for _ in tiled_symbols] for _ in sdsc_spec.args]
 
         def _start_addr_data(tensor):
             if "lx" in tensor.allocation:
@@ -554,6 +628,23 @@ def generate_sdsc(
                             "maskingConstId_": 0
                             if sdsc_spec.coordinate_masking
                             else -1,
+                            # Emit dimToSymbolMapping_ only when there are symbolic dims;
+                            # the runtime uses it to bind runtime shape values to symbols.
+                            **(
+                                {
+                                    "dimToSymbolMapping_": {
+                                        sdsc_dim: [dim_local_symbols[pytorch_sym]]
+                                        for sdsc_dim, (
+                                            pytorch_sym,
+                                            granularity,
+                                            max_value,
+                                        ) in symbolic_dims.items()
+                                        if pytorch_sym in dim_local_symbols
+                                    },
+                                }
+                                if symbolic_dims
+                                else {}
+                            ),
                             "dataStageParam_": {
                                 "0": {
                                     "ss_": {
@@ -563,6 +654,17 @@ def generate_sdsc(
                                             // sdsc_spec.work_slices[dim]
                                             for dim, size in sdsc_spec.iteration_space.items()
                                         },
+                                        # Per-dim symbolic bounds (per-core slice).
+                                        # min_val / work_slices is the granularity that
+                                        # the runtime must respect when choosing a batch size.
+                                        "symbolicDimInfo_": _per_core_symbolic_dim_info(
+                                            symbolic_dims, sdsc_spec.work_slices
+                                        ),
+                                        "maxSymbolicVolume_": {},
+                                        "coreletSplit_": {},
+                                        "rowSplit_": {},
+                                        "peSfpSplit_": {},
+                                        "paddingSizes_": {},
                                     },
                                     "el_": {
                                         "name_": "core",
@@ -571,6 +673,14 @@ def generate_sdsc(
                                             // sdsc_spec.work_slices[dim]
                                             for dim, size in sdsc_spec.iteration_space.items()
                                         },
+                                        "symbolicDimInfo_": _per_core_symbolic_dim_info(
+                                            symbolic_dims, sdsc_spec.work_slices
+                                        ),
+                                        "maxSymbolicVolume_": {},
+                                        "coreletSplit_": {},
+                                        "rowSplit_": {},
+                                        "peSfpSplit_": {},
+                                        "paddingSizes_": {},
                                     },
                                 }
                             },
@@ -742,9 +852,25 @@ def generate_sdsc(
                         }
                     }
                 ],
+                # Emit top-level symbolic metadata only when symbolic dims are present.
+                # inputSymbolsAndTags_ maps symbol ID -> pytorch symbol name for the runtime.
+                **(
+                    {
+                        "datadscs_": [],
+                        "dimToSymbolMappingOpcodeCorrection_": {},
+                        "inputSymbolsAndTags_": {
+                            str(sym_id): pytorch_sym
+                            for pytorch_sym, sym_id in dim_local_symbols.items()
+                        },
+                        "symbolDefinitions_": {},
+                    }
+                    if symbolic_dims
+                    else {}
+                ),
             }
         },
-        list(local_symbols.keys()),
+        # Dim symbols occupy the first n_dim_syms slots (value 0); address symbols follow.
+        [0] * n_dim_syms + list(local_symbols.keys()),
         affine_strides,
-        local_symbol_kind,
+        dim_symbol_kinds + local_symbol_kind,
     )

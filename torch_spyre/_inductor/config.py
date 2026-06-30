@@ -62,6 +62,14 @@ ignore_work_division_hints: bool = (
 
 ignore_wsr_hints: bool = os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
 
+# Disable compiler-generated span-overflow coarse-tiling hints.  The global
+# SPYRE_INDUCTOR_IGNORE_HINTS flag also disables these so one switch can still
+# suppress all WSR/coarse-tiling hint paths.
+ignore_span_overflow_hints: bool = (
+    ignore_wsr_hints
+    or os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "0") == "1"
+)
+
 # For K-split matmuls, permute physical core IDs so the cores collaborating on a
 # K reduction land on adjacent ring positions, cutting PSUM chain hops from m*n
 # to 1. The split itself is chosen by the cost-model planner; this only reorders
