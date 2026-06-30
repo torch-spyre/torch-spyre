@@ -590,46 +590,53 @@ class SpyreKernel(Kernel[CSEVariable]):
         n_levels = max(len(raw_tiled_dims), len(raw_tiled_red_dims))
         it_space_keys = list(it_space.keys())
 
-        # Build host-range-index → iteration-space-key-index map by walking
-        # data.ranges and counting only non-unit entries.
-        host_to_it: dict[int, int] = {}
-        if hasattr(ir_node, "data") and hasattr(ir_node.data, "ranges"):
-            it_idx = 0
-            for host_idx, r in enumerate(ir_node.data.ranges):
-                if int(r) != 1:
-                    host_to_it[host_idx] = it_idx
-                    it_idx += 1
-        else:
-            # Fallback: identity mapping (no unit-size dims to skip).
-            host_to_it = {i: i for i in range(len(it_space_keys))}
+        # host_to_it and n_output_it_syms call int() on data.ranges entries,
+        # which throws on symbolic dimensions.  They are only needed when this
+        # op is inside a tiling loop, so skip the computation for non-tiled ops.
+        tiled_syms: list[list] = []
+        if n_levels > 0:
+            # Build host-range-index → iteration-space-key-index map by walking
+            # data.ranges and counting only non-unit entries.  loop_tiled_dims
+            # stores *host-range* indices which include unit-size dims that the
+            # iteration space skips; this mapping corrects for that.
+            host_to_it: dict[int, int] = {}
+            if hasattr(ir_node, "data") and hasattr(ir_node.data, "ranges"):
+                it_idx = 0
+                for host_idx, r in enumerate(ir_node.data.ranges):
+                    if int(r) != 1:
+                        host_to_it[host_idx] = it_idx
+                        it_idx += 1
+            else:
+                # Fallback: identity mapping (no unit-size dims to skip).
+                host_to_it = {i: i for i in range(len(it_space_keys))}
 
-        # For reduction dims: offset is the number of non-unit output-dim ranges.
-        n_output_it_syms = sum(
-            1
-            for r in (
-                ir_node.data.ranges
-                if hasattr(ir_node, "data") and hasattr(ir_node.data, "ranges")
-                else []
+            # For reduction dims: offset is the number of non-unit output-dim ranges.
+            n_output_it_syms = sum(
+                1
+                for r in (
+                    ir_node.data.ranges
+                    if hasattr(ir_node, "data") and hasattr(ir_node.data, "ranges")
+                    else []
+                )
+                if int(r) != 1
             )
-            if int(r) != 1
-        )
 
-        tiled_syms_per_level_outermost: list[list] = []
-        for lvl in range(n_levels):
-            level_syms: list = []
-            if lvl < len(raw_tiled_dims):
-                for d in raw_tiled_dims[lvl]:
-                    mapped = host_to_it.get(d)
-                    if mapped is not None and mapped < len(it_space_keys):
-                        level_syms.append(it_space_keys[mapped])
-            if lvl < len(raw_tiled_red_dims):
-                for r in raw_tiled_red_dims[lvl]:
-                    sym_idx = n_output_it_syms + r
-                    if sym_idx < len(it_space_keys):
-                        level_syms.append(it_space_keys[sym_idx])
-            tiled_syms_per_level_outermost.append(level_syms)
-        # Reverse so index 0 = innermost level.
-        tiled_syms = list(reversed(tiled_syms_per_level_outermost))
+            tiled_syms_per_level_outermost: list[list] = []
+            for lvl in range(n_levels):
+                level_syms: list = []
+                if lvl < len(raw_tiled_dims):
+                    for d in raw_tiled_dims[lvl]:
+                        mapped = host_to_it.get(d)
+                        if mapped is not None and mapped < len(it_space_keys):
+                            level_syms.append(it_space_keys[mapped])
+                if lvl < len(raw_tiled_red_dims):
+                    for r in raw_tiled_red_dims[lvl]:
+                        sym_idx = n_output_it_syms + r
+                        if sym_idx < len(it_space_keys):
+                            level_syms.append(it_space_keys[sym_idx])
+                tiled_syms_per_level_outermost.append(level_syms)
+            # Reverse so index 0 = innermost level.
+            tiled_syms = list(reversed(tiled_syms_per_level_outermost))
 
         # Collect (max, granularity) bounds for any symbolic iteration-space
         # dims. These are passed through OpSpec so SDSC codegen can emit

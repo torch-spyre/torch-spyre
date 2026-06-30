@@ -28,6 +28,7 @@ Add new tests there using spyre_hint(num_tiles_per_dim=...) annotations.
 
 import sys
 import os
+import regex as re
 
 import pytest
 import torch
@@ -912,26 +913,26 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         src = source_codes[0]
         self.assertIn("LoopSpec(", src, "Expected LoopSpec for H-tiled elementwise")
         self.assertIn("sympify('2')", src, "Expected loop count 2 for H/2 tiles")
-        # The tiled symbol must be the H iteration-space symbol.  When B=1 is
-        # present as a unit-size host dim, incorrect host→it mapping would
-        # select the Lq symbol (index 1 in iteration space) instead of H
-        # (index 0, the first non-unit dim).  We check that tiled_symbols
-        # contains exactly one symbol and that it is NOT the Lq symbol.
-        # Both Q and V have iteration-space keys [H_sym, Lq_sym, D_sym].
-        # The H symbol is always the first key (index 0).
-        import regex as re  # noqa: F401
-
+        # The tiled symbol must be the H iteration-space symbol (c0 — the first
+        # non-unit dim after skipping B=1), NOT the Lq symbol (c1).
+        # With an incorrect host-range→iteration-space mapping, host index 1 (H)
+        # would select c1 (Lq) instead of c0 (H), advancing per-tile strides by
+        # the wrong amount.
         tiled_syms_matches = re.findall(r"tiled_symbols=\[(\[.*?\])\]", src, re.DOTALL)
         self.assertTrue(
             tiled_syms_matches,
             "Expected tiled_symbols=[[...]] in generated OpSpec source",
         )
-        # Each match is the inner list literal; it must be non-empty (H is tiled).
         for match in tiled_syms_matches:
-            self.assertNotEqual(
+            self.assertIn(
+                "c0",
                 match,
-                "[]",
-                "tiled_symbols inner list should not be empty for tiled op",
+                f"tiled_symbols should contain the H symbol (c0), got: {match}",
+            )
+            self.assertNotIn(
+                "c1",
+                match,
+                f"tiled_symbols should NOT contain the Lq symbol (c1), got: {match}",
             )
 
     def test_hint_row_tiling_multi_stick_pointwise_correct(self):

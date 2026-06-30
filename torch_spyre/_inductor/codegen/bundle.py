@@ -39,7 +39,8 @@ logger = get_inductor_logger("sdsc_compile")
 #   affine_strides:     list[list[dict]] — per tensor, per loop-nesting level
 #                       (outermost first).  Each inner dict maps
 #                       tiled_sym -> stride_bytes for that level's symbols.
-#                       All-empty for non-tiled / lx tensors.
+#                       [{} for _ in tiled_symbols] for non-tiled / lx tensors
+#                       (one empty dict per level, preserving the level count).
 #   symbol_kinds:       list[SymbolKind] parallel to base_symbol_values
 _CompiledEntry = tuple[Any, list[int], list[list[dict]], list[SymbolKind]]
 
