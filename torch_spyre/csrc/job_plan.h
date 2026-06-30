@@ -29,12 +29,11 @@
 
 #include "util/spyrecode.h"
 
-// Forward declarations for flex types
-namespace flex {
-class RuntimeOperation;
-}
-
 namespace spyre {
+
+// Forward declaration: JobPlanStep::construct() submits through SpyreStream
+// rather than the raw flex::RuntimeStream handle.
+class SpyreStream;
 
 /**
  * @brief RAII wrapper for page-aligned and pinned host memory
@@ -199,27 +198,29 @@ struct LaunchContext {
  * This factory method pattern eliminates special-case branching in
  * SpyreStream::Launch.
  *
- * All RuntimeOperation objects are transient: constructed inside construct(),
- * ownership transferred to RuntimeStream via launchOperation(), and destroyed
- * when the stream completes the operation. No RuntimeOperation is cached in
- * the JobPlan.
+ * All RuntimeOperation objects are transient: constructed inside flex when
+ * construct() calls the matching SpyreStream::launchXXX(), and destroyed when
+ * the stream completes the operation. No RuntimeOperation is cached in the
+ * JobPlan.
  */
 class JobPlanStep {
  public:
   virtual ~JobPlanStep() = default;
 
   /**
-   * @brief Construct a RuntimeOperation for this step
+   * @brief Build this step's flex operation params and launch them on the
+   * stream
    *
-   * Called by SpyreStream during LaunchKernel. Produces a fully-populated
-   * RuntimeOperation using metadata stored during PrepareKernel and runtime
-   * data from the LaunchContext.
+   * Called by SpyreStream during LaunchKernel. Constructs the appropriate
+   * flex operation params from metadata stored during PrepareKernel and
+   * runtime data from the LaunchContext, then submits them via the matching
+   * SpyreStream::launchXXX(). flex owns the RuntimeOperation lifecycle.
    *
    * @param ctx Launch context containing composite addresses
-   * @return Unique pointer to the constructed RuntimeOperation
+   * @param stream SpyreStream to launch the operation on
    */
-  virtual std::unique_ptr<flex::RuntimeOperation> construct(
-      LaunchContext& ctx) const = 0;
+  virtual void construct(LaunchContext& ctx,
+                         const SpyreStream& stream) const = 0;
 
   /**
    * @brief Write step information to output stream
@@ -292,8 +293,7 @@ class JobPlanStepH2D final : public JobPlanStep {
       : host_address_(host_address),
         device_address_(std::move(device_address)) {}
 
-  std::unique_ptr<flex::RuntimeOperation> construct(
-      LaunchContext& ctx) const override;
+  void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
   void write(std::ostream& os) const override;
 
@@ -320,8 +320,7 @@ class JobPlanStepD2H final : public JobPlanStep {
       : device_address_(std::move(device_address)),
         host_address_(host_address) {}
 
-  std::unique_ptr<flex::RuntimeOperation> construct(
-      LaunchContext& ctx) const override;
+  void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
   void write(std::ostream& os) const override;
 
@@ -341,27 +340,37 @@ class JobPlanStepCompute final : public JobPlanStep {
   /**
    * @brief Construct compute step
    *
-   * @param binary_address Address of the program binary on device
-   * @param bind_io_addresses Whether to bind the compute operation
-   * @param bootstrap_addr Bootstrap address for program execution
-   * with inputs and outputs addresses
+   * @param program_address The program's FULL device allocation. flex bounds
+   * the segment-7 translation to its total_size() (the real Allocate
+   * footprint), never SEGMENT_SIZE.
+   * @param bind_io_addresses Whether to bind the compute operation with inputs
+   * and outputs addresses
+   * @param bootstrap_offset Offset within the program allocation where
+   * execution begins (0 = base; the program-correction region size when
+   * correction precedes the binary)
+   * @param name Human-readable kernel name forwarded to flex as
+   * ComputeParams::kernel_name; surfaces in profiler events
+   * (PendingRequest::node_name, aiupti activity name, FLEX JSON CBName).
+   * Empty string ("") preserves the old behavior (no name).
    */
-  explicit JobPlanStepCompute(flex::CompositeAddress binary_address,
+  explicit JobPlanStepCompute(flex::CompositeAddress program_address,
                               bool bind_io_addresses,
-                              uint64_t bootstrap_addr = flex::PROG_OFFSET_BASE)
-      : binary_address_(std::move(binary_address)),
+                              uint64_t bootstrap_offset = 0,
+                              std::string name = "")
+      : program_address_(std::move(program_address)),
         bind_io_addresses_(bind_io_addresses),
-        bootstrap_addr_(bootstrap_addr) {}
+        bootstrap_offset_(bootstrap_offset),
+        name_(std::move(name)) {}
 
-  std::unique_ptr<flex::RuntimeOperation> construct(
-      LaunchContext& ctx) const override;
+  void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
   void write(std::ostream& os) const override;
 
  private:
-  flex::CompositeAddress binary_address_;
+  flex::CompositeAddress program_address_;
   bool bind_io_addresses_;
-  uint64_t bootstrap_addr_;
+  uint64_t bootstrap_offset_;
+  std::string name_;
 };
 
 /**
@@ -400,8 +409,7 @@ class JobPlanStepHostCompute final : public JobPlanStep {
         input_buffer_(input_buffer),
         ishape_(ishape) {}
 
-  std::unique_ptr<flex::RuntimeOperation> construct(
-      LaunchContext& ctx) const override;
+  void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
   void write(std::ostream& os) const override;
 
@@ -418,8 +426,8 @@ class JobPlanStepHostCompute final : public JobPlanStep {
  * A JobPlan bundles everything needed to execute a unit of work on a stream.
  * It is produced by translating a SpyreCode's Job Execution Plan after the Job
  * Preparation Plan has been executed. flex never sees a JobPlan — SpyreStream
- * extracts the operations and submits them to RuntimeStream.launchOperation()
- * as a vector<RuntimeOperation>.
+ * translates each step into flex operation params and submits them via its
+ * typed launchXXX() methods.
  *
  * A JobPlan is self-contained: if a compute requires program correction, the
  * correction callback, the correction tensor DMA, and the device compute are
@@ -451,8 +459,10 @@ struct JobPlan {
   std::vector<std::unique_ptr<JobPlanStep>> steps;
 
   /**
-   * @brief Owning CompositeAddress of the program binary, and conditionally
-   * program correction data and spillover tensor data
+   * @brief vector of CompositeAddress with the first being the owning
+   * CompositeAddress of the program binary, and conditionally program
+   * correction data and spillover tensor data, and the rest being the
+   * non-owning CompositeAddress of each program.
    *
    * The JobPlan owns this address and is responsible for its lifetime. When the
    * JobPlan is destroyed, the memory is freed.
@@ -461,7 +471,7 @@ struct JobPlan {
    * DMA JobPlans (e.g., tensor .to(device)) that don't involve compute
    * operations.
    */
-  flex::CompositeAddress job_allocation;
+  std::vector<flex::CompositeAddress> job_allocation;
 
   /**
    * @brief Compiled tile dimensions from SpyreCode
@@ -482,6 +492,13 @@ struct JobPlan {
    */
   // TODO(jni): not safe for multi streams. Make it per-stream. See #2520.
   std::vector<HostBuffer> pinned_buffers;
+
+  /**
+   * @brief Compiled programs
+   *
+   * One entry per program.
+   */
+  std::vector<std::string> inits;
 };
 
 /**

@@ -59,7 +59,7 @@ The Spyre device is designed for enterprise AI workloads including:
 
 ## Integration with PyTorch
 
-The Spyre device is integrated with PyTorch as a custom backend device, enabling standard PyTorch models to leverage Spyre's AI acceleration capabilities. See the [Getting Started](../getting_started/installation.md) guide for setup and usage instructions. The [examples](../user_guide/examples.md) section provides annotated code examples.
+The Spyre device is integrated with PyTorch as a custom backend device, enabling standard PyTorch models to leverage Spyre's AI acceleration capabilities. See the [Getting Started](../getting_started/installation.md) guide for setup and usage instructions. The [examples](../user_guide/examples/index.md) section provides annotated code examples.
 
 IBM and the PyTorch community are collaborating to broaden Spyre's integration into the open-source AI stack, including vLLM and torchtitan. See [Expanding AI model training and inference for the open-source community](https://research.ibm.com/blog/pytorch-expanding-ai-model-training-and-inference-for-the-open-source-community) for details.
 

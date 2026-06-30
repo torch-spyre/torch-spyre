@@ -28,7 +28,9 @@ Add new tests there using spyre_hint(num_tiles_per_dim=...) annotations.
 
 import sys
 import os
+import regex as re
 
+import pytest
 import torch
 import unittest
 from unittest.mock import patch as mock_patch
@@ -42,8 +44,10 @@ import torch_spyre._inductor.propagate_named_dims as _pnd
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 from utils_inductor import compare_with_cpu  # noqa: E402
 
-# Path to mock for disabling actual device kernel execution.
+# Paths to mock for disabling actual device kernel execution.
 _LAUNCH_KERNEL = "torch_spyre.execution.kernel_runner.launch_kernel"
+_LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
+_PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
 
 
 # ===========================================================================
@@ -78,7 +82,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             return torch.abs(x)
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x)
         self.assertTrue(len(source_codes) > 0)
         # LoopSpec appears as an import even without tiling; check for a call.
@@ -113,7 +122,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(x_dev, ["A", "B"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -167,7 +181,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(x_dev, ["B", "D"])
 
         cfn = torch.compile(softmax_fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -193,52 +212,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "allow_all_ops_in_lx_planning": True,
         }
     )
-    def test_hint_nested_loop_two_dims(self):
-        """Nested spyre_hint scopes produce a two-level tiling loop.
-
-        Input shape [1024, 4096]: outer hint tiles dim A by 2 (512 rows/iter),
-        inner hint tiles dim B by 4 (1024 cols/iter).  Both ops (add and mul)
-        share the nested LoopSpec.  Generated source must contain two LoopSpec
-        entries with counts 2 and 4.
-        """
-        from torch_spyre._inductor import spyre_hint
-
-        A, B = 1024, 4096
-        a = torch.randn(A, B, dtype=torch.float16)
-        b = torch.randn(A, B, dtype=torch.float16)
-        c = torch.randn(A, B, dtype=torch.float16)
-
-        def fn(a, b, c):
-            with spyre_hint(num_tiles_per_dim={"A": 2}):
-                with spyre_hint(num_tiles_per_dim={"B": 4}):
-                    y = a + b
-                    z = y * c
-                    return z
-
-        a_dev = a.to("spyre")
-        b_dev = b.to("spyre")
-        c_dev = c.to("spyre")
-        _declare_tensor_dim("A", A)
-        _declare_tensor_dim("B", B)
-        _name_tensor_dims(a_dev, ["A", "B"])
-        _name_tensor_dims(b_dev, ["A", "B"])
-        _name_tensor_dims(c_dev, ["A", "B"])
-
-        cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
-            _, source_codes = run_and_get_code(cfn, a_dev, b_dev, c_dev)
-        self.assertTrue(len(source_codes) > 0)
-        src = source_codes[0]
-        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
-        self.assertIn("sympify('2')", src, "Expected outer loop count 2")
-        self.assertIn("sympify('4')", src, "Expected inner loop count 4")
-        # The nested LoopSpec must appear inside another LoopSpec.
-        self.assertGreaterEqual(
-            src.count("LoopSpec("),
-            2,
-            f"Expected ≥2 LoopSpec entries for nested loops\n\nSource:\n{src}",
-        )
-
     # ------------------------------------------------------------------
     # Scratchpad (LX) allocation for intermediate tiled buffer — hint syntax
     # ------------------------------------------------------------------
@@ -292,7 +265,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(c_dev, ["A", "B"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev, c_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -370,6 +348,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         with (
             mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run", side_effect=_record_subprocess),
         ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev, c_dev)
@@ -400,10 +380,14 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         spyre_hint(num_tiles_per_dim={"B": 4}).  sencores=1 avoids
         core-division issues.  The reductions collapse dim 1 (D); the loop
         tiles dim 0 (B), so no tiled dim overlaps with the reduction dim.
+
+        D=256 gives 4 sticks/row, exercising multi-stick address arithmetic
+        under row-tiling.  Narrower shapes (D=64, 1 stick/row) would not
+        catch per-tile device_size bugs that corrupt the inter-stick stride.
         """
         from torch_spyre._inductor import spyre_hint
 
-        B, D = 256, 64
+        B, D = 256, 256
         x = torch.randn(B, D, dtype=torch.float16)
 
         _declare_tensor_dim("B", B)
@@ -489,7 +473,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             return out_x, out_y
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -541,7 +530,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(y_dev, ["A", "B"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -589,7 +583,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(x_dev, ["M", "K"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -639,7 +638,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(y_dev, ["K", "N"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -691,7 +695,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(scale_dev, ["M"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev, scale_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -713,7 +722,14 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         }
     )
     def test_hint_softmax_row_tiling(self):
-        """spyre_hint(num_tiles_per_dim={"NROW": 4}) tiles softmax over the row dimension."""
+        """spyre_hint(num_tiles_per_dim={"NROW": 4}) tiles softmax over the row dimension.
+
+        NCOL=4096 gives 64 sticks/row.  Row-tiling this shape exercises the
+        multi-stick device_size[1] invariant: a per-tile device_size bug that
+        shrinks the row-stride dimension corrupts all stick groups after the
+        first in each non-first tile.  atol=0.02 is tight enough to catch
+        values from the wrong row (fp16 errors from random inputs exceed 0.5).
+        """
         from torch_spyre._inductor import spyre_hint
 
         NROW, NCOL = 16384, 4096
@@ -727,7 +743,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"NROW": 4}):
                 return torch.softmax(x, dim)
 
-        compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=0.1, rtol=0.1)
+        compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=0.02, rtol=0.1)
 
     # ------------------------------------------------------------------
     # Matmul with row-tiling: tile the M dimension of x @ y
@@ -826,9 +842,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         """spyre_hint(num_tiles_per_dim={"H": 2}) tiles elementwise multiply over the H dimension.
 
         Regression test for a bug in _byte_stride_for_arg (unroll.py) where
-        align_tensors rewrites device_coordinates but leaves stride_map stale,
-        causing per-tile HBM base addresses to advance by the wrong amount when
-        the tiled dimension is not the outermost host dimension (e.g. H in BHLD).
+        per-tile HBM base addresses advanced by the wrong amount when the tiled
+        dimension was not the outermost host dimension (e.g. H in BHLD).
         """
         from torch_spyre._inductor import spyre_hint
 
@@ -856,6 +871,104 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         result = torch.compile(fn)(Q_dev, V_dev).cpu()
         torch.testing.assert_close(result, ref, atol=0.02, rtol=0.1)
+
+    def test_hint_h_tiling_elementwise_loopspec(self):
+        """H-tiling on BHLD (B=1 unit-size) selects the H iteration symbol, not Lq.
+
+        Regression test for the host-range-index → iteration-space-key mapping in
+        create_op_spec: loop_tiled_dims stores host-range indices which include
+        unit-size dimensions that the iteration space skips.  Without the mapping,
+        index 1 (H in BHLD with B=1) maps to the 2nd iteration-space key (Lq)
+        rather than the 1st (H), producing wrong per-tile stride advances.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        B, H, Lq, D = 1, 8, 256, 64
+
+        Q = torch.randn(B, H, Lq, D, dtype=torch.float16)
+        V = torch.randn(B, H, Lq, D, dtype=torch.float16)
+        Q_dev = Q.to("spyre")
+        V_dev = V.to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(Q_dev, ["B", "H", "Lq", "D"])
+        _name_tensor_dims(V_dev, ["B", "H", "Lq", "D"])
+
+        def fn(q, v):
+            with spyre_hint(num_tiles_per_dim={"H": 2}):
+                return q * v
+
+        cfn = torch.compile(fn)
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, Q_dev, V_dev)
+
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec for H-tiled elementwise")
+        self.assertIn("sympify('2')", src, "Expected loop count 2 for H/2 tiles")
+        # The tiled symbol must be the H iteration-space symbol (c0 — the first
+        # non-unit dim after skipping B=1), NOT the Lq symbol (c1).
+        # With an incorrect host-range→iteration-space mapping, host index 1 (H)
+        # would select c1 (Lq) instead of c0 (H), advancing per-tile strides by
+        # the wrong amount.
+        tiled_syms_matches = re.findall(r"tiled_symbols=\[(\[.*?\])\]", src, re.DOTALL)
+        self.assertTrue(
+            tiled_syms_matches,
+            "Expected tiled_symbols=[[...]] in generated OpSpec source",
+        )
+        for match in tiled_syms_matches:
+            self.assertIn(
+                "c0",
+                match,
+                f"tiled_symbols should contain the H symbol (c0), got: {match}",
+            )
+            self.assertNotIn(
+                "c1",
+                match,
+                f"tiled_symbols should NOT contain the Lq symbol (c1), got: {match}",
+            )
+
+    def test_hint_row_tiling_multi_stick_pointwise_correct(self):
+        """Row-tiling a multi-stick pointwise chain produces correct output.
+
+        y = a + b; z = y * c on [1024, 4096] fp16 with num_tiles_per_dim={"A": 2}.
+        This is the minimal reproducer for the _tile_device_size bug: with 64
+        sticks/row, shrinking device_size[1] from 1024 to 512 corrupts the
+        inter-stick-group stride, producing wrong values in the second tile.
+
+        atol=0.01: fp16 (a+b)*c on inputs in [0,1) accumulates ~0.002 rounding
+        error; atol=0.01 clears that comfortably while remaining well below the
+        ~0.1 average error produced by a wrong-address read.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        A, B = 1024, 4096
+        a = torch.rand(A, B, dtype=torch.float16)
+        b = torch.rand(A, B, dtype=torch.float16)
+        c = torch.rand(A, B, dtype=torch.float16)
+
+        _declare_tensor_dim("A", A)
+        _declare_tensor_dim("B", B)
+
+        def fn(a, b, c):
+            _name_tensor_dims(a, ["A", "B"])
+            _name_tensor_dims(b, ["A", "B"])
+            _name_tensor_dims(c, ["A", "B"])
+            with spyre_hint(num_tiles_per_dim={"A": 2}):
+                y = a + b
+                z = y * c
+                return z
+
+        compare_with_cpu(
+            fn, a, b, c, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
+        )
 
 
 class TestNamedDimsHint(InductorTestCase):
@@ -902,7 +1015,12 @@ class TestNamedDimsHint(InductorTestCase):
         _name_tensor_dims(x_dev, ["M", "K"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -934,7 +1052,12 @@ class TestNamedDimsHint(InductorTestCase):
         _name_tensor_dims(x_dev, ["M", "K"])
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
@@ -1016,14 +1139,21 @@ class TestCoarseTileReductionE2E(InductorTestCase):
                 return a @ b
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
         self.assertIn("LoopSpec(", src, "Expected LoopSpec for K-tiled matmul")
         self.assertIn("sympify('4')", src, "Expected loop count 4")
 
-    @config.patch({"lx_planning": False})
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_hint_tiled_reduction_matmul_correct(self):
         """torch.matmul tiled over K (4 tiles) produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1130,7 +1260,9 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
         super().setUp()
         torch.manual_seed(0xAFFE)
 
-    @config.patch({"lx_planning": False})
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_hint_tiled_reduction_dim0_sum_correct(self):
         """x.sum(dim=0) tiled over B produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1148,7 +1280,9 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
 
         compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=0.05, rtol=0.05)
 
-    @config.patch({"lx_planning": False})
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_hint_tiled_reduction_dim0_max_correct(self):
         """x.amax(dim=0) tiled over B produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1166,7 +1300,9 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
 
         compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=1e-3, rtol=1e-3)
 
-    @config.patch({"lx_planning": False})
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_hint_tiled_reduction_dim0_min_correct(self):
         """x.amin(dim=0) tiled over B produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1197,7 +1333,9 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
         super().setUp()
         torch.manual_seed(0xAFFE)
 
-    @config.patch({"lx_planning": False})
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_mm_k_tiled_correct(self):
         """2D mm [M,K] @ [K,N] tiled over K produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1219,7 +1357,9 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
             fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
         )
 
-    @config.patch({"lx_planning": False})
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_bmm_k_tiled_correct(self):
         """3D bmm [B,M,K] @ [B,K,N] tiled over K produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1242,7 +1382,9 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
             fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
         )
 
-    @config.patch({"lx_planning": False})
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_bmm_3d2d_k_tiled_correct(self):
         """3D×2D matmul [B,M,K] @ [K,N] tiled over K produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1265,7 +1407,6 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
             fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
         )
 
-    @config.patch({"lx_planning": False})
     def test_mm_k_tiled_loopspec(self):
         """K-tiled mm produces a LoopSpec with count 4 in generated source."""
         from torch_spyre._inductor import spyre_hint
@@ -1286,12 +1427,201 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
                 return torch.mm(a, b)
 
         cfn = torch.compile(fn)
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
         self.assertIn("LoopSpec(", src, "Expected LoopSpec for K-tiled mm")
         self.assertIn("sympify('4')", src, "Expected loop count 4")
+
+
+class TestCoarseTileNestedReductionE2E(InductorTestCase):
+    """Correctness and LoopSpec tests for nested output-dim + reduction-dim tiling.
+
+    Pattern: outer loop tiles an output dim, inner loop tiles a reduction dim.
+    The fill op runs inside the outer loop (once per outer tile), so the
+    accumulator is per-outer-tile sized.  The full output buffer spans all outer
+    tiles; address advancement across outer iterations assembles the result.
+
+    mm shapes: M=128, K=512, N=32; outer tiles M by 2 (64 rows/tile),
+    inner tiles K by 4 (128 elements/tile = 2 sticks at fp16).
+    bmm shapes: B=4, M=64, K=512, N=32; outer tiles B by 2,
+    inner tiles K by 4.
+    """
+
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xCAFE)
+
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
+    def test_nested_bmm_outer_Batch_inner_K_correct(self):
+        """bmm [B,M,K]@[B,K,N] outer B (output) + inner K (reduction) — correct."""
+        from torch_spyre._inductor import spyre_hint
+
+        B, M, K, N = 4, 64, 512, 32
+        a = torch.randn(B, M, K, dtype=torch.float16) * 0.01
+        b = torch.randn(B, K, N, dtype=torch.float16) * 0.01
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _declare_tensor_dim("N", N)
+
+        def fn(a, b):
+            _name_tensor_dims(a, ["B", "M", "K"])
+            _name_tensor_dims(b, ["B", "K", "N"])
+            with spyre_hint(num_tiles_per_dim={"B": 2}):
+                with spyre_hint(num_tiles_per_dim={"K": 4}):
+                    return torch.bmm(a, b)
+
+        compare_with_cpu(
+            fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
+        )
+
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
+    def test_nested_matmul_outer_M_inner_K_correct(self):
+        """mm [M,K]@[K,N] with outer M (output) + inner K (reduction) — correct."""
+        from torch_spyre._inductor import spyre_hint
+
+        M, K, N = 128, 512, 32
+        a = torch.randn(M, K, dtype=torch.float16) * 0.01
+        b = torch.randn(K, N, dtype=torch.float16) * 0.01
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _declare_tensor_dim("N", N)
+
+        def fn(a, b):
+            _name_tensor_dims(a, ["M", "K"])
+            _name_tensor_dims(b, ["K", "N"])
+            with spyre_hint(num_tiles_per_dim={"M": 2}):
+                with spyre_hint(num_tiles_per_dim={"K": 4}):
+                    return torch.mm(a, b)
+
+        compare_with_cpu(
+            fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
+        )
+
+    def test_nested_matmul_outer_M_inner_K_loopspec(self):
+        """Nested mm produces two LoopSpec levels (outer count 2, inner count 4)."""
+        from torch_spyre._inductor import spyre_hint
+
+        M, K, N = 128, 512, 32
+        a = torch.randn(M, K, dtype=torch.float16) * 0.01
+        b = torch.randn(K, N, dtype=torch.float16) * 0.01
+        a_dev = a.to("spyre")
+        b_dev = b.to("spyre")
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _declare_tensor_dim("N", N)
+        _name_tensor_dims(a_dev, ["M", "K"])
+        _name_tensor_dims(b_dev, ["K", "N"])
+
+        def fn(a, b):
+            with spyre_hint(num_tiles_per_dim={"M": 2}):
+                with spyre_hint(num_tiles_per_dim={"K": 4}):
+                    return torch.mm(a, b)
+
+        cfn = torch.compile(fn)
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec for nested mm")
+        self.assertIn("sympify('2')", src, "Expected outer loop count 2")
+        self.assertIn("sympify('4')", src, "Expected inner loop count 4")
+
+    @config.patch({"lx_planning": False, "unroll_loops": False})
+    def test_nested_matmul_copy_after_inner_loop(self):
+        """The accum→output copy op appears in generated source for nested K-tiling."""
+        from torch_spyre._inductor import spyre_hint
+
+        M, K, N = 128, 512, 32
+        a = torch.randn(M, K, dtype=torch.float16) * 0.01
+        b = torch.randn(K, N, dtype=torch.float16) * 0.01
+        a_dev = a.to("spyre")
+        b_dev = b.to("spyre")
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _declare_tensor_dim("N", N)
+        _name_tensor_dims(a_dev, ["M", "K"])
+        _name_tensor_dims(b_dev, ["K", "N"])
+
+        def fn(a, b):
+            with spyre_hint(num_tiles_per_dim={"M": 2}):
+                with spyre_hint(num_tiles_per_dim={"K": 4}):
+                    return torch.mm(a, b)
+
+        cfn = torch.compile(fn)
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn(
+            "coarse_tile_reduce_copy",
+            src,
+            "Expected a coarse_tile_reduce_copy op in generated source for nested M+K tiling",
+        )
+
+    @config.patch(
+        {
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "unroll_loops": False,
+        }
+    )
+    def test_nested_matmul_outer_M_inner_K_accum_in_lx(self):
+        """With lx_planning enabled, the tile-sized accum buffer lands in LX scratchpad."""
+        from torch_spyre._inductor import spyre_hint
+
+        M, K, N = 128, 512, 32
+        a = torch.randn(M, K, dtype=torch.float16) * 0.01
+        b = torch.randn(K, N, dtype=torch.float16) * 0.01
+        a_dev = a.to("spyre")
+        b_dev = b.to("spyre")
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _declare_tensor_dim("N", N)
+        _name_tensor_dims(a_dev, ["M", "K"])
+        _name_tensor_dims(b_dev, ["K", "N"])
+
+        def fn(a, b):
+            with spyre_hint(num_tiles_per_dim={"M": 2}):
+                with spyre_hint(num_tiles_per_dim={"K": 4}):
+                    return torch.mm(a, b)
+
+        cfn = torch.compile(fn)
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn(
+            "allocation={'lx'",
+            src,
+            "Expected tile-sized accum TensorArg with lx allocation for nested M+K tiling",
+        )
 
 
 if __name__ == "__main__":

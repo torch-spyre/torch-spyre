@@ -55,8 +55,10 @@ class EdgeCostMap:
         in_layouts: list,
         target_layouts: list,
         target_dep: "MemoryDep",
+        op,
     ):
         self.dep = dep
+        self._op = op
         self._in_layouts = in_layouts
         self._target_layouts = target_layouts
         self._target_dep = target_dep
@@ -81,7 +83,7 @@ class EdgeCostMap:
         Cost is 0 if stick-compatible, the input element count if restickifiable, or INF if infeasible.
         """
         needed, tgt = compute_restickify_needed(
-            in_stl, self._dep_layout, self.dep, target_stl, self._target_dep
+            in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
         )
         if not needed:
             cost = 0.0
@@ -148,10 +150,10 @@ class AllSameNode(RestickNodeCost):
     """Cost node for ops that require all inputs and the output to be stick compatible (eg pointwise ops)."""
 
     @classmethod
-    def from_args(cls, args, out_layouts, out_dep):
+    def from_args(cls, args, out_layouts, out_dep, op):
         assert out_layouts, "AllSameNode.from_args: out_layouts is empty"
         edge_costs = [
-            EdgeCostMap(arg.dep, arg.layouts, out_layouts, out_dep) for arg in args
+            EdgeCostMap(arg.dep, arg.layouts, out_layouts, out_dep, op) for arg in args
         ]
         return cls(edge_costs)
 
@@ -180,10 +182,10 @@ class FixedInOutNode(RestickNodeCost):
         )
 
     @classmethod
-    def from_args(cls, args, out_stl, req_stls):
+    def from_args(cls, args, out_stl, req_stls, op):
         assert req_stls, "FixedInOutNode.from_args: req_stls is empty"
         edge_costs = [
-            EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep)
+            EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep, op)
             for arg, req in zip(args, req_stls)
         ]
         return cls(edge_costs, required_out_stl=out_stl, required_in_stls=req_stls)
@@ -237,7 +239,7 @@ def _stick_incompatibility_reason(
 
 
 def _fmt_buf(layout: Any, dep: "MemoryDep") -> str:
-    h_coords = host_coordinates(layout, dep)
+    h_coords = host_coordinates(layout, dep, None)
     return (
         f"size={list(layout.size)}  stride={list(layout.stride)}  h_coords={h_coords}"
     )
@@ -267,13 +269,15 @@ def _no_feasible_layout_error(op) -> NotImplementedError:
         lines.append(f"    {ec.dep.name}:  {_fmt_buf(host_layout, ec.dep)}")
         for j, stl in enumerate(ec._in_layouts):
             lines.append(
-                f"      STL {j}:  {_fmt_stl(device_coordinates(stl, ec.dep), stl)}"
+                f"      STL {j}:  {_fmt_stl(device_coordinates(stl, ec.dep, None), stl)}"
             )
         lines.append("")
 
     lines.append(f"  Output:  {_fmt_buf(out_layout, out_dep)}")
     for i, stl in enumerate(op.layouts):
-        lines.append(f"    STL {i}:  {_fmt_stl(device_coordinates(stl, out_dep), stl)}")
+        lines.append(
+            f"    STL {i}:  {_fmt_stl(device_coordinates(stl, out_dep, None), stl)}"
+        )
 
     analysis = []
     for i, candidate_stl in enumerate(op.layouts):
@@ -281,10 +285,10 @@ def _no_feasible_layout_error(op) -> NotImplementedError:
         if blocking_ec is None:
             analysis.append(f"    STL {i}: no blocking input identified")
         else:
-            out_stick = device_coordinates(candidate_stl, out_dep)[-1]
+            out_stick = device_coordinates(candidate_stl, out_dep, None)[-1]
             for j, in_stl in enumerate(blocking_ec._in_layouts):
                 if blocking_ec.cost(in_stl, candidate_stl) == INF:
-                    in_stick = device_coordinates(in_stl, blocking_ec.dep)[-1]
+                    in_stick = device_coordinates(in_stl, blocking_ec.dep, None)[-1]
                     reason = _stick_incompatibility_reason(in_stick, out_stick)
                     reason_str = f": {reason}" if reason else ""
                     analysis.append(

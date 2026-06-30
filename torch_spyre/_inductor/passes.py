@@ -42,9 +42,12 @@ from .temp_passes import (
     bmm_unflatten_pass,
     mark_direct_unit_bmm_pass,
     mm_to_bmm_pass,
-    convert_constant_with_graph_node,
 )
-from .coarse_tile import hints_to_coarse_tile_groups
+from .coarse_tile import (
+    hints_to_coarse_tile_groups,
+    reorder_unhinted_interlopers,
+    span_overflow_groups,
+)
 from . import config
 from .propagate_hints import (
     collect_spyre_hints,
@@ -75,6 +78,7 @@ from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
 from .chunk_large_tensors import chunk_large_tensors
 from .coarse_tile import coarse_tile
+from .split_multi_ops import split_multi_ops, validate_ops
 
 
 logger = get_inductor_logger("passes")
@@ -208,7 +212,6 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
         super().__init__(
             [
                 recover_spyre_hints,
-                convert_constant_with_graph_node,
                 mm_to_bmm_pass.apply,
                 mark_direct_unit_bmm_pass,
                 bmm_unflatten_pass.apply,
@@ -271,10 +274,22 @@ def _maybe_chunk_large_tensors(graph: GraphLowering) -> None:
         chunk_large_tensors(graph)
 
 
-@_runs(hints_to_coarse_tile_groups, coarse_tile)
+@_runs(
+    reorder_unhinted_interlopers,
+    hints_to_coarse_tile_groups,
+    span_overflow_groups,
+    coarse_tile,
+)
 def _maybe_coarse_tile(graph: GraphLowering) -> None:
-    groups = hints_to_coarse_tile_groups(graph)
+    groups = []
+    if not config.ignore_wsr_hints:
+        reorder_unhinted_interlopers(graph)
+        groups += hints_to_coarse_tile_groups(graph)
+    if not config.ignore_span_overflow_hints:
+        groups += span_overflow_groups(graph)
     if groups:
+        op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
+        groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
         coarse_tile(graph, groups=groups)
 
 
@@ -317,7 +332,9 @@ class CustomPreSchedulingPasses:
             deadcode_elimination,
             #
             # Tensor Layout (Stickification)
+            split_multi_ops,
             propagate_spyre_tensor_layouts,
+            validate_ops,
             optimize_restickify_locations,
             finalize_layouts,
             insert_restickify,

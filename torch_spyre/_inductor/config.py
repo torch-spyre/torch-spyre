@@ -17,23 +17,57 @@ import sys
 from typing import Literal
 
 from torch.utils._config_module import install_config_module
+from .logging_utils import _get_env_bool
 
 lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
 co_optimizing_lx_planning: bool = (
     os.environ.get("CO_OPTIMIZING_LX_PLANNING", "0") == "1"
 )
+hbm_planning: bool = _get_env_bool("SPYRE_INDUCTOR_MEMORY_PLAN", True)
 chunk_large_tensors: bool = os.environ.get("CHUNK_LARGE_TENSORS", "0") == "1"
 
 global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == "1"
 
 allow_all_ops_in_lx_planning: bool = False
 
+# Insert clone ops at graph input/output boundaries so those buffers can be
+# LX-pinned (see scratchpad.utils.clone_at_graph_boundaries). This path is not
+# yet correct for all op types (e.g. matmul/layernorm/split under multi-core
+# K-split) and is kept off by default. Deliberately separate from
+# allow_all_ops_in_lx_planning, which only widens *intermediate* output
+# eligibility and must not, on its own, enable boundary clone insertion.
+lx_boundary_clones: bool = os.environ.get("LX_BOUNDARY_CLONES", "0") == "1"
+
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
 
 sencores: int = int(os.getenv("SENCORES", "32"))
 
+# Symbolic-dim knobs consumed by compute_granularity in pass_utils.py.
+# The pointwise work-division PR (#2499) wires that helper into the
+# compilation pipeline; until then these knobs are read only by the
+# helper and its unit tests. See #2284, #2287 for the design.
+
+# Cap on bucket count (= max_size / granularity).
+# TODO: confirm the default with the Deeptools team.
+max_buckets: int = int(os.getenv("MAX_BUCKETS", "32"))
+
+# Soft floor on the auto-derived granularity when mark_dynamic(min=...)
+# is not provided. Keeps the picked granularity from collapsing to a
+# very small divisor when max_size has many of them.
+min_default_granularity: int = int(os.getenv("MIN_DEFAULT_GRANULARITY", "4"))
+
 ignore_work_division_hints: bool = (
     os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
+)
+
+ignore_wsr_hints: bool = os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
+
+# Disable compiler-generated span-overflow coarse-tiling hints.  The global
+# SPYRE_INDUCTOR_IGNORE_HINTS flag also disables these so one switch can still
+# suppress all WSR/coarse-tiling hint paths.
+ignore_span_overflow_hints: bool = (
+    ignore_wsr_hints
+    or os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "0") == "1"
 )
 
 # For K-split matmuls, permute physical core IDs so the cores collaborating on a
@@ -44,11 +78,19 @@ core_id_k_fast_emission: bool = (
     os.environ.get("SPYRE_CORE_ID_K_FAST_EMISSION", "1") == "1"
 )
 
+# When True, HBM tensor addresses are emitted as runtime symbols (%sym_N
+# constants) in bundle.mlir and resolved via affine.apply for tiled loops.
+# Requires backend compiler support for the sdscbundle symbol table.
+# Independent of bundle_symbolic_args: you can have symbols in the SDSC JSON
+# without exposing them as function arguments (staged adoption).
+bundle_hbm_symbols: bool = os.environ.get("BUNDLE_HBM_SYMBOLS", "1") == "1"
+
 # When False (default), HBM tensor addresses are baked as concrete integers
 # into the SDSC JSON and bundle.mlir emits sdsc_execute with no operands.
 # When True, addresses are emitted as runtime symbols with
 # !sdscbundle.input_arg<index> parameters, input_arg_extract ops, and
 # affine.apply indirection for tiled loops.
+# Requires bundle_hbm_symbols=True to have any effect.
 bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "0") == "1"
 
 # When True (default), LoopSpec nodes are fully unrolled into flat OpSpecs

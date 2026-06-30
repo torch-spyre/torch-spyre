@@ -56,7 +56,7 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         self.imports.splice(
             """
                 from sympy import sympify
-                from torch_spyre._inductor.op_spec import TensorArg, OpSpec, UnimplementedOp, LoopSpec, spyre_constant_tensor
+                from torch_spyre._inductor.op_spec import TensorArg, OpSpec, UnimplementedOp, LoopSpec, spyre_constant_tensor, IndirectAccess
                 from torch_spyre.execution.async_compile import SpyreAsyncCompile
                 from torch_spyre._C import DataFormats, SpyreTensorLayout, spyre_empty_with_layout
                 import subprocess
@@ -133,6 +133,14 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         self.writeline(
             f'{node.get_name()} = spyre_constant_tensor({value}, torch.device("{device}"), {dtype})'
         )
+
+    def _is_pool_buffer(self, buffer: BufferLike) -> bool:
+        layout = buffer.get_layout()
+        return isinstance(layout, FixedTiledLayout) and "pool" in layout.allocation
+
+    def codegen_free_buffer(self, buffer: BufferLike) -> None:
+        if not self._is_pool_buffer(buffer):
+            super().codegen_free_buffer(buffer)
 
     def make_buffer_reuse(self, old: BufferLike, new: BufferLike, delete_old: bool):
         assert old.get_dtype() == new.get_dtype()

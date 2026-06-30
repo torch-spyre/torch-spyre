@@ -201,9 +201,9 @@ void JobPlanBuilder::executeAllocate(const nlohmann::json& cmd) {
                                       std::nullopt, flex::MemoryType::Program);
   c10::DataPtr allocated_ptr = allocator.allocate(size, directive);
 
-  job_allocation_ =
+  job_allocation_.emplace_back(
       std::move(static_cast<SharedOwnerCtx*>(allocated_ptr.get_context())
-                    ->composite_addr);
+                    ->composite_addr));
 }
 
 void JobPlanBuilder::executeInitTransfer(const nlohmann::json& cmd) {
@@ -224,7 +224,7 @@ void JobPlanBuilder::executeInitTransfer(const nlohmann::json& cmd) {
   std::string binary_file = init_props["init_bin_file"].get<std::string>();
   std::filesystem::path binary_path = spyrecode_dir_ / binary_file;
 
-  std::string binary_data = read_file_to_string(binary_path);
+  inits_.emplace_back(read_file_to_string(binary_path));
 
   TORCH_CHECK(init_props.contains("dev_ptr"),
               "InitTransfer command missing 'dev_ptr' property");
@@ -238,12 +238,12 @@ void JobPlanBuilder::executeInitTransfer(const nlohmann::json& cmd) {
   std::string init_size_str = init_props["size"].get<std::string>();
   size_t init_size = std::stoull(init_size_str);
 
-  auto device_addr =
-      compute_offset_address(job_allocation_.value(), dev_ptr, init_size);
+  job_allocation_.emplace_back(
+      compute_offset_address(job_allocation_.at(0), dev_ptr, init_size));
 
   stream_.copyProgramAsync(
-      const_cast<void*>(static_cast<const void*>(binary_data.data())),
-      &device_addr);
+      const_cast<void*>(static_cast<const void*>(inits_.back().data())),
+      &job_allocation_.back());
 }
 
 void JobPlanBuilder::executeJobPreparationPlan() {
@@ -252,6 +252,9 @@ void JobPlanBuilder::executeJobPreparationPlan() {
               "JobPreparationPlan must be an array with at least 2 commands (1 "
               "Allocate and 1+ InitTransfer)");
 
+  job_allocation_.reserve(job_prep_plan.size());
+  inits_.reserve(job_prep_plan.size() - 1);
+
   // Execute Allocate command (first item)
   executeAllocate(job_prep_plan[0]);
 
@@ -259,27 +262,61 @@ void JobPlanBuilder::executeJobPreparationPlan() {
   for (size_t i = 1; i < job_prep_plan.size(); ++i) {
     executeInitTransfer(job_prep_plan[i]);
   }
-  stream_.synchronize();
 }
 
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
-    const nlohmann::json& cmd) {
+    const nlohmann::json& cmd, size_t step_idx) {
   TORCH_CHECK(cmd.contains("job_bin_ptr"),
               "ComputeOnDevice command missing 'job_bin_ptr' property");
 
   std::string job_bin_ptr_str = cmd["job_bin_ptr"].get<std::string>();
   uint64_t job_bin_ptr = std::stoull(job_bin_ptr_str);
 
-  auto job_bin_addr =
-      compute_offset_address(job_allocation_.value(), job_bin_ptr);
+  // Kernel name surfaces in profiler events (PendingRequest::node_name →
+  // aiupti activity name, FLEX JSON CBName). Prefer an explicit name from
+  // SpyreCode if present; otherwise fall back to
+  // "<sdsc_dir>/<inner_dir>/bundle.mlir#<step_idx>" — the last two components
+  // of spyrecode_dir_ plus bundle.mlir, which is enough to identify the SDSC
+  // in the trace without dragging the full /tmp/torchinductor_*/... prefix.
+  // The step index disambiguates multi-compute plans.
+  std::string name;
+  if (cmd.contains("name") && cmd["name"].is_string()) {
+    name = cmd["name"].get<std::string>();
+  } else {
+    auto inner = spyrecode_dir_.filename();  // spyreCodeDir
+    auto sdsc =
+        spyrecode_dir_.parent_path().filename();  // sdsc_fused_..._vx...
+    name = (sdsc / inner / "bundle.mlir").string() + "#" +
+           std::to_string(step_idx);
+  }
 
-  // Verify the resulting binary address is populated
-  TORCH_CHECK(job_bin_addr.total_size() > 0,
-              "ComputeOnDevice binary address must be populated (size > 0)");
+  // job_bin_ptr is the segment-7 virtual address where the program's
+  // instructions begin (after the program-correction region). Validate it is in
+  // segment 7 and derive the offset of that entry point within the program
+  // allocation (0 when the binary starts at the allocation base).
+  TORCH_CHECK(
+      job_bin_ptr >= prog_offset_base && job_bin_ptr < prog_offset_limit,
+      "job_bin_ptr 0x", std::hex, job_bin_ptr,
+      " is out of program segment bounds [0x", prog_offset_base, ", 0x",
+      prog_offset_limit, ")");
+  uint64_t bootstrap_offset = job_bin_ptr - prog_offset_base;
 
-  // Create RuntimeOperationCompute with the allocated program address
-  return std::make_unique<JobPlanStepCompute>(std::move(job_bin_addr),
-                                              bind_io_addresses_, job_bin_ptr);
+  // Hand flex the program's FULL allocation as a non-owning descriptor over the
+  // same chunk (the owning CompositeAddress stays in job_allocation_, which is
+  // later moved into the JobPlan and outlives this step). flex bounds the
+  // segment-7 xlat to its total_size() -- the real deeptools Allocate footprint
+  // -- instead of the 16GB SEGMENT_SIZE. The size grows automatically if/when
+  // deeptools grows the Allocate, requiring no further change here.
+  TORCH_CHECK(job_allocation_.at(0).chunks().size() == 1,
+              "job_allocation must have 1 chunk");
+  TORCH_CHECK(
+      job_allocation_.at(0).total_size() > 0,
+      "ComputeOnDevice program allocation must be populated (size > 0)");
+  flex::CompositeAddress program_address(job_allocation_.at(0).chunks()[0]);
+
+  return std::make_unique<JobPlanStepCompute>(
+      std::move(program_address), bind_io_addresses_, bootstrap_offset,
+      std::move(name));
 }
 
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHost(
@@ -380,7 +417,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
 
       // Compute CompositeAddress with offset
       flex::CompositeAddress comp_addr = compute_offset_address(
-          job_allocation_.value(), device_ptr, transfer_size);
+          job_allocation_.at(0), device_ptr, transfer_size);
 
       return std::make_unique<JobPlanStepH2D>(host_addr, std::move(comp_addr));
     }
@@ -414,7 +451,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
 
       // Compute CompositeAddress with offset from device_addr
       flex::CompositeAddress comp_addr = compute_offset_address(
-          job_allocation_.value(), device_ptr, transfer_size);
+          job_allocation_.at(0), device_ptr, transfer_size);
 
       return std::make_unique<JobPlanStepD2H>(std::move(comp_addr), host_addr);
     }
@@ -429,7 +466,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
 }
 
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateCommand(
-    const nlohmann::json& cmd) {
+    const nlohmann::json& cmd, size_t step_idx) {
   TORCH_CHECK(cmd.contains("command") && cmd["command"].is_string(),
               "SpyreCode command missing 'command' field");
 
@@ -440,7 +477,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateCommand(
 
   switch (command_type) {
     case SpyreCodeCommandType::ComputeOnDevice:
-      return translateComputeOnDevice(properties);
+      return translateComputeOnDevice(properties, step_idx);
 
     case SpyreCodeCommandType::ComputeOnHost:
       return translateComputeOnHost(properties);
@@ -468,9 +505,9 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
 
   // Parse each command in the JobExecPlan and create JobPlanSteps
   std::vector<std::unique_ptr<JobPlanStep>> steps;
-  for (const auto& command : job_exec_plan) {
+  for (size_t i = 0; i < job_exec_plan.size(); ++i) {
     try {
-      steps.push_back(translateCommand(command));
+      steps.push_back(translateCommand(job_exec_plan[i], i));
     }
     catch (const std::exception& e) {
       TORCH_CHECK(false, "Failed to parse SpyreCode command: ", e.what());
@@ -488,12 +525,12 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
 
   // Create and return the JobPlan
   // Use brace initialization to construct JobPlan with moved members
-  return std::make_unique<JobPlan>(JobPlan{
-      std::move(steps),                    // steps
-      std::move(job_allocation_.value()),  // job_allocation
-      {},                                  // expected_input_shapes
-      std::move(pinned_buffers)            // pinned_buffers
-  });
+  return std::make_unique<JobPlan>(
+      JobPlan{std::move(steps),            // steps
+              std::move(job_allocation_),  // job_allocation
+              {},                          // expected_input_shapes
+              std::move(pinned_buffers),   // pinned_buffers
+              std::move(inits_)});
 }
 
 JobPlanBuilder::ValidationResult JobPlanBuilder::validate(
