@@ -568,34 +568,75 @@ class SpyreKernel(Kernel[CSEVariable]):
             op, it_space_extended, args, op_info
         )
 
-        # If this op is inside a coarse-tiling loop, identify which iteration-space
-        # symbols are tiled by the enclosing loop(s).  loop_tiled_dims is a
-        # list[list[int]] (nested multi-level, outermost first).  Flatten all
-        # levels so that tiled_symbols covers every loop variable from outermost
-        # to innermost — matching the loop_vars ordering in bundle.py _emit_specs.
+        # Build per-level tiled_symbols (innermost first) for this op.
+        # loop_tiled_dims / loop_tiled_reduction_dims are lists of per-level
+        # dim-index lists, outermost first — so we build outermost-first then
+        # reverse to get innermost-first for tiled_symbols storage.
+        #
+        # IMPORTANT: loop_tiled_dims stores *host-range* indices (indices into
+        # op.data.ranges), but the iteration space skips unit-size dims.  We
+        # must map host-range index → iteration-space key index before looking
+        # up symbols.
         li = getattr(ir_node, "loop_info", None)
         raw_tiled_dims: list[list[int]] = li.loop_tiled_dims if li is not None else []
         raw_tiled_red_dims: list[list[int]] = (
             li.loop_tiled_reduction_dims if li is not None else []
         )
-        all_tiled_dims = [d for level in raw_tiled_dims for d in level]
-        all_tiled_red_dims = [d for level in raw_tiled_red_dims for d in level]
+        # CoarseTileInfo always constructs loop_tiled_dims and
+        # loop_tiled_reduction_dims with the same length (one sublist per
+        # nesting level), so max() is just a safety net; in practice both
+        # lists have the same length and the per-level loop below never
+        # silently drops an entry from the shorter one.
+        n_levels = max(len(raw_tiled_dims), len(raw_tiled_red_dims))
         it_space_keys = list(it_space.keys())
-        tiled_syms = [
-            it_space_keys[i] for i in all_tiled_dims if i < len(it_space_keys)
-        ]
-        # For reduction ops tiled over a reduction dimension, it_space (from
-        # reads.ranges) has output-dim symbols first, then reduction-dim symbols.
-        # loop_tiled_reduction_dims indices are 0-based into the reduction portion,
-        # so offset them by the number of output-space symbols.
-        if all_tiled_red_dims:
-            write_dep = next(iter(self.current_node.read_writes.writes), None)
-            n_output_syms = len(write_dep.ranges) if write_dep is not None else 0
-            tiled_syms += [
-                it_space_keys[n_output_syms + r]
-                for r in all_tiled_red_dims
-                if n_output_syms + r < len(it_space_keys)
-            ]
+
+        # host_to_it and n_output_it_syms call int() on data.ranges entries,
+        # which throws on symbolic dimensions.  They are only needed when this
+        # op is inside a tiling loop, so skip the computation for non-tiled ops.
+        tiled_syms: list[list] = []
+        if n_levels > 0:
+            # Build host-range-index → iteration-space-key-index map by walking
+            # data.ranges and counting only non-unit entries.  loop_tiled_dims
+            # stores *host-range* indices which include unit-size dims that the
+            # iteration space skips; this mapping corrects for that.
+            host_to_it: dict[int, int] = {}
+            if hasattr(ir_node, "data") and hasattr(ir_node.data, "ranges"):
+                it_idx = 0
+                for host_idx, r in enumerate(ir_node.data.ranges):
+                    if int(r) != 1:
+                        host_to_it[host_idx] = it_idx
+                        it_idx += 1
+            else:
+                # Fallback: identity mapping (no unit-size dims to skip).
+                host_to_it = {i: i for i in range(len(it_space_keys))}
+
+            # For reduction dims: offset is the number of non-unit output-dim ranges.
+            n_output_it_syms = sum(
+                1
+                for r in (
+                    ir_node.data.ranges
+                    if hasattr(ir_node, "data") and hasattr(ir_node.data, "ranges")
+                    else []
+                )
+                if int(r) != 1
+            )
+
+            tiled_syms_per_level_outermost: list[list] = []
+            for lvl in range(n_levels):
+                level_syms: list = []
+                if lvl < len(raw_tiled_dims):
+                    for d in raw_tiled_dims[lvl]:
+                        mapped = host_to_it.get(d)
+                        if mapped is not None and mapped < len(it_space_keys):
+                            level_syms.append(it_space_keys[mapped])
+                if lvl < len(raw_tiled_red_dims):
+                    for r in raw_tiled_red_dims[lvl]:
+                        sym_idx = n_output_it_syms + r
+                        if sym_idx < len(it_space_keys):
+                            level_syms.append(it_space_keys[sym_idx])
+                tiled_syms_per_level_outermost.append(level_syms)
+            # Reverse so index 0 = innermost level.
+            tiled_syms = list(reversed(tiled_syms_per_level_outermost))
 
         # Collect (max, granularity) bounds for any symbolic iteration-space
         # dims. These are passed through OpSpec so SDSC codegen can emit
@@ -821,18 +862,10 @@ class SpyreKernel(Kernel[CSEVariable]):
             ]
             self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
 
-    def wrap_op_specs_in_loop(
-        self, count: sympy.Expr, tiled_symbols: list | None = None
-    ) -> None:
+    def wrap_op_specs_in_loop(self, count: sympy.Expr) -> None:
         """Replace the current op_specs list with a single LoopSpec of the given count."""
         body = self.op_specs
-        self.op_specs = [
-            LoopSpec(
-                count=count,
-                body=body,
-                tiled_symbols=tiled_symbols if tiled_symbols is not None else [],
-            )
-        ]
+        self.op_specs = [LoopSpec(count=count, body=body)]
 
     def codegen_kernel(self):
         """Codegen the body of this kernel by pretty printing its list of OpSpecs"""
@@ -935,12 +968,6 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                 with buf.indent():
                     _codegen_op_spec_list(op_spec.body, buf, sympy_str)
                 buf.writeline("],")
-                if op_spec.tiled_symbols:
-                    buf.writeline(
-                        "tiled_symbols=["
-                        + ", ".join(sympy_str(s) for s in op_spec.tiled_symbols)
-                        + "],"
-                    )
             buf.writeline("),")
         elif isinstance(op_spec, (UnimplementedOp, OpSpecUnimplementedOp)):
             if logger.isEnabledFor(logging.DEBUG):
@@ -975,7 +1002,10 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                 if op_spec.tiled_symbols:
                     buf.writeline(
                         "tiled_symbols=["
-                        + ", ".join(sympy_str(s) for s in op_spec.tiled_symbols)
+                        + ", ".join(
+                            "[" + ", ".join(sympy_str(s) for s in level) + "]"
+                            for level in op_spec.tiled_symbols
+                        )
                         + "],"
                     )
                 buf.writeline(

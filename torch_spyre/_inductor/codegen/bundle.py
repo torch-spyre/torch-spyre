@@ -36,11 +36,13 @@ logger = get_inductor_logger("sdsc_compile")
 # Compiled SDSC entry: (json_dict, base_symbol_values, affine_strides, symbol_kinds)
 #   base_symbol_values: list[int] of base HBM byte offsets for this SDSC,
 #                       one per registered symbol ID
-#   affine_strides:     list[dict] parallel to SDSCSpec.args —
-#                       {tiled_sym: stride_bytes} for tiled HBM tensors,
-#                       empty dict for non-tiled / lx tensors
+#   affine_strides:     list[list[dict]] — per tensor, per loop-nesting level
+#                       (outermost first).  Each inner dict maps
+#                       tiled_sym -> stride_bytes for that level's symbols.
+#                       [{} for _ in tiled_symbols] for non-tiled / lx tensors
+#                       (one empty dict per level, preserving the level count).
 #   symbol_kinds:       list[SymbolKind] parallel to base_symbol_values
-_CompiledEntry = tuple[Any, list[int], list[dict], list[SymbolKind]]
+_CompiledEntry = tuple[Any, list[int], list[list[dict]], list[SymbolKind]]
 
 
 # ---------------------------------------------------------------------------
@@ -125,13 +127,16 @@ def generate_bundle(
     _collect_loop_bounds(specs_list, loop_bounds)
 
     # Affine map deduplication: stride_key -> map index (0-based).
-    # A stride_key is a tuple of (stride,) values — one per tiled loop variable
-    # that advances this tensor.  For a single-level loop with one tiled sym the
-    # key is (stride_bytes,).
+    # A stride_key is a tuple of stride values in outermost-first level order.
+    # Strides from each level are appended in level order; within a level, in
+    # symbol dict insertion order.  The corresponding loop-var indices are built
+    # from the explicit level index, so each stride is mapped to the correct
+    # loop variable regardless of nesting depth.
     #
     # affine_map_loop_var_indices: parallel to compiled, per op a list of
     # per-tensor loop-var index lists.  Each inner list records which positions
-    # in the enclosing loop_vars list correspond to the strides in stride_key.
+    # in the enclosing loop_vars list correspond to the strides in stride_key,
+    # one entry per non-zero stride in outermost-first level order.
     # _emit_specs uses this to pass only the relevant loop vars to affine.apply.
     affine_map_index: dict[tuple, int] = {}
     affine_map_loop_var_indices: list[list[list[int]]] = []
@@ -392,7 +397,13 @@ def _collect_affine_maps(
     entry per OpSpec to ``loop_var_indices_out``.  Each entry is a list of
     per-tensor index lists: ``loop_var_indices_out[op_idx][tensor_idx]`` is
     the list of loop-var positions (into the enclosing ``loop_vars`` list at
-    emit time) that correspond to the strides in the tensor's stride_key.
+    emit time) that correspond to the strides in the tensor's stride_key,
+    in outermost-first level order.
+
+    ``affine_strides[tensor_idx]`` is a list of dicts, one per loop-nesting
+    level (outermost first).  We iterate over levels explicitly and use
+    ``loop_var_depth[level_idx]`` to find the correct loop variable for each
+    level's strides — no counting from the end.
     """
     for entry in specs:
         if isinstance(entry, LoopSpec):
@@ -406,22 +417,29 @@ def _collect_affine_maps(
         elif isinstance(entry, OpSpec):
             _, _, affine_strides, _ = next(compiled_iter)
             per_tensor_lv_indices: list[list[int]] = []
-            for tensor_strides in affine_strides:
-                if not tensor_strides:
+            for per_level_strides in affine_strides:
+                # per_level_strides is list[dict], one dict per level (outermost first).
+                # Build stride_key and lv_indices by iterating levels explicitly.
+                stride_vals: list[int] = []
+                lv_idxs: list[int] = []
+                for level_idx, level_strides in enumerate(per_level_strides):
+                    if not level_strides:
+                        continue
+                    assert level_idx < len(loop_var_depth), (
+                        f"affine_strides has {len(per_level_strides)} levels but "
+                        f"only {len(loop_var_depth)} enclosing loop(s); "
+                        "create_op_spec built more tiled_syms levels than LoopSpec ancestors"
+                    )
+                    lv = loop_var_depth[level_idx]
+                    for stride in level_strides.values():
+                        stride_vals.append(stride)
+                        lv_idxs.append(lv)
+                if not stride_vals:
                     per_tensor_lv_indices.append([])
                     continue
-                # Build stride key from the tiled symbols present in this tensor,
-                # in the order they appear in affine_strides dict.
-                stride_key = tuple(tensor_strides.values())
+                stride_key = tuple(stride_vals)
                 if stride_key not in affine_map_index:
                     affine_map_index[stride_key] = len(affine_map_index)
-                # Record which loop-var positions (in the enclosing loop_vars
-                # list) correspond to each stride entry.  tiled_symbols is
-                # ordered outermost-first (see spyre_kernel.py), so a K-only
-                # tiled op at nesting depth 2 has stride_key length 1 and we
-                # want the innermost loop var — hence we take the *last*
-                # len(stride_key) entries of loop_var_depth.
-                lv_idxs = list(loop_var_depth[-len(stride_key) :])
                 per_tensor_lv_indices.append(lv_idxs)
             loop_var_indices_out.append(per_tensor_lv_indices)
 
@@ -522,23 +540,31 @@ def _emit_specs(
 
             # Build affine.apply ops for tiled tensors, tracking which
             # symbol IDs have been upgraded to per-iteration %addr_N names.
+            # affine_strides[tensor_idx] is list[dict] (per level, outermost first).
             sym_id_to_operand: dict[int, str] = {}
-            for tensor_idx, tensor_strides in enumerate(affine_strides):
-                if not tensor_strides:
+            for tensor_idx, per_level_strides in enumerate(affine_strides):
+                # Flatten per-level strides to build the stride_key in the same
+                # outermost-first order used by _collect_affine_maps.
+                flat_strides: list[int] = [
+                    stride
+                    for level_strides in per_level_strides
+                    for stride in level_strides.values()
+                ]
+                if not flat_strides:
                     continue
                 num_cores = _sdsc_num_cores(sdsc_json)
                 for c in range(num_cores):
                     base_sym_id = _get_tensor_core_sym_id(sdsc_json, tensor_idx, c)
                     if base_sym_id is None or base_sym_id in sym_id_to_operand:
                         continue
-                    stride_key = tuple(tensor_strides.values())
+                    stride_key = tuple(flat_strides)
                     map_idx = affine_map_index[stride_key]
                     addr_name = f"%addr_{addr_counter[0]}"
                     addr_counter[0] += 1
                     base_addr_name = _resolve_sym(base_sym_id)
-                    # Select only the loop vars that correspond to the strides
-                    # for this tensor (may be a subset of all enclosing loop vars
-                    # when the op is not tiled on every enclosing loop level).
+                    # lv_indices[tensor_idx] was built by _collect_affine_maps using
+                    # explicit level indexing — each entry is the loop_vars position
+                    # for the corresponding stride in stride_key.
                     lv_indices = per_tensor_lv_indices[tensor_idx]
                     apply_loop_vars = [loop_vars[i] for i in lv_indices]
                     loop_var_str = ", ".join(apply_loop_vars)
