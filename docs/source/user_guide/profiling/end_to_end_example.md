@@ -32,7 +32,7 @@ shrink. This page will be revised to the in-tree API once it ships.
 | `aiu-fms-testing-utils` | [github.com/foundation-model-stack/aiu-fms-testing-utils][aiu-fms] (`eager_spyre` branch) | `git clone -b eager_spyre <repo>.git && uv pip install -e ./aiu-fms-testing-utils` |
 | `kineto-spyre` | [github.com/IBM/kineto-spyre][kineto-spyre] | `uv pip install --no-deps <release-wheel-url-matching-your-pytorch>` (see [releases page][kineto-spyre-releases]) |
 | `aiu-trace-analyzer` (optional) | [github.com/IBM/aiu-trace-analyzer][ata] | `pip install aiu-trace-analyzer` |
-| Granite checkpoint | [huggingface.co/ibm-granite/granite-3.3-8b-instruct](https://huggingface.co/ibm-granite/granite-3.3-8b-instruct) | `huggingface-cli download ibm-granite/granite-3.3-8b-instruct --local-dir /tmp/models/granite-3.3-8b-instruct` |
+| Granite checkpoint | [huggingface.co/ibm-granite/granite-3.3-8b-instruct](https://huggingface.co/ibm-granite/granite-3.3-8b-instruct) | `hf download ibm-granite/granite-3.3-8b-instruct --local-dir /tmp/models/granite-3.3-8b-instruct` |
 
 The sample commands above are starting points; each upstream README is
 the source of truth and may require additional steps (extras, source
@@ -51,8 +51,7 @@ uv pip install -e ./aiu-fms-testing-utils
 
 # Cache HuggingFace artifacts and download the Granite checkpoint.
 export HF_HOME=/tmp/models/hf_cache
-huggingface-cli download ibm-granite/granite-3.3-8b-instruct \
-  --local-dir /tmp/models/granite-3.3-8b-instruct
+hf download ibm-granite/granite-3.3-8b-instruct --local-dir /tmp/models/granite-3.3-8b-instruct
 
 # Example kineto-spyre wheel for PyTorch 2.10.0 + Python 3.12 on x86_64
 # Linux. Pick the wheel that matches your stack from the releases page.
@@ -79,7 +78,6 @@ Save as `profile_granite.py`.
 ```python
 import time
 from statistics import mean, median
-
 import torch
 from torch.profiler import ProfilerActivity, profile
 from fms.models import get_model
@@ -87,31 +85,64 @@ from transformers import AutoTokenizer
 
 DEVICE = torch.device("spyre")
 DTYPE = torch.float16  # Spyre's default dtype
-MODEL_PATH = "/tmp/models/granite-3.3-8b-instruct"
+MODEL_PATH = "/tmp/models/granite-3/snapshots/51dd4bc2ade4059a6bd87649d68aa11e4fb2529b.3-8b-instruct"
+
+_ = torch.empty(1, dtype=torch.float16, device="spyre")
+
+print("=" * 42)
+print("Loading".center(42))
+print("=" * 42)
 
 # 1. Load Granite via FMS.
 model = get_model(
     architecture="hf_pretrained",
     model_path=MODEL_PATH,
     device_type="spyre",
-    data_type=DTYPE,
-    unfuse_weights=True,
+    data_type=torch.float16,
 ).eval().to(DEVICE)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 
-# 2. Compile through the Spyre Inductor backend.
-model.compile()
 
-# 3. Build a prefill input. Replace torch.randint with a real-prompt
-#    encoding (tokenizer(..., padding="max_length", max_length=512))
-#    for non-toy runs.
-inputs = torch.randint(
-    0, tokenizer.vocab_size, (1, 512), dtype=torch.int64,
+# 3. Example prompt
+# inputs = torch.randint(
+#     0, tokenizer.vocab_size, (1, 512), dtype=torch.int64,
+# ).to(DEVICE)
+
+inputs = tokenizer(
+    "Explain artificial intelligence to a 10 year old",
+    return_tensors="pt"
 ).to(DEVICE)
 
-# 4. Warm up — first call triggers torch.compile + kernel codegen.
+position_ids = torch.cumsum(inputs["attention_mask"], dim=1)
+
+max_seq_len = inputs["input_ids"].shape[1]
+
 with torch.no_grad():
-    model(inputs)
+    alpha = model.base_model.rot_emb.compute_freqs_cis(DEVICE, max_seq_len)
+    selected_freqs = (
+        model.base_model.rot_emb.cached_freqs[0][alpha][position_ids.cpu()]
+        .to(DEVICE)
+    )
+
+
+# Single inference to verify output before profiling
+with torch.no_grad():
+    output = model(inputs["input_ids"], selected_freqs=selected_freqs)
+    generated_token_ids = torch.argmax(output, dim=-1)[0]
+    response = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+
+print("=" * 42)
+print("Inference completed.".center(42))
+print("=" * 42)
+print(response)
+
+# Warmup — first run is always slower due to JIT/compilation
+print("=" * 42)
+print("Warming up.".center(42))
+print("=" * 42)
+for _ in range(2):
+    with torch.no_grad():
+        model(inputs["input_ids"], selected_freqs=selected_freqs)
 
 # 5. Profile a steady-state forward pass.
 N_RUNS = 5
@@ -125,7 +156,7 @@ with profile(
     for _ in range(N_RUNS):
         t0 = time.perf_counter()
         with torch.no_grad():
-            model(inputs)
+          model(inputs["input_ids"], selected_freqs=selected_freqs)
         wall_clock_ms.append((time.perf_counter() - t0) * 1000)
         prof.step()
 
@@ -134,6 +165,9 @@ with profile(
 #    them ≈ device-side work.
 cpu_per_run_ms = sum(e.self_cpu_time_total for e in prof.events()) / 1000 / N_RUNS
 
+print("=" * 42)
+print("Profiling Granite Running on Spyre".center(42))
+print("=" * 42)
 print(prof.key_averages().table(sort_by="device_time_total", row_limit=10))
 print(f"wall-clock ms: mean={mean(wall_clock_ms):.3f} median={median(wall_clock_ms):.3f}")
 print(f"profiler-derived CPU ms (per run): {cpu_per_run_ms:.3f}")
