@@ -407,7 +407,10 @@ class DefaultAllocator(ScratchpadAllocator):
         allocation = self.layout_planning.plan_layout(buffers, log_lx_usage=True)
         for b in allocation:
             if b.address is None:
-                self.reject_reasons[b.name] = "no room on scratchpad"
+                self.reject_reasons[b.name] = (
+                    f"no room on scratchpad (t={b.start_time}-{b.end_time},"
+                    f" size={b.size // 1024} KB)"
+                )
         self._push_allocation(graph, allocation)
         self._log_lx_pinning(graph)
         for p in self.post_optimization_passes:
@@ -874,7 +877,10 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
         allocation = self.layout_planning.plan_layout(buffers, log_lx_usage=True)
         for b in allocation:
             if b.address is None:
-                self.reject_reasons[b.name] = "no room on scratchpad"
+                self.reject_reasons[b.name] = (
+                    f"no room on scratchpad (t={b.start_time}-{b.end_time},"
+                    f" size={b.size // 1024} KB)"
+                )
         self._push_allocation(graph, allocation)
         self._log_lx_pinning(graph)
         for p in self.post_optimization_passes:
