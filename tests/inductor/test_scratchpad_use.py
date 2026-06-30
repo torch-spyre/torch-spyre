@@ -236,19 +236,25 @@ class _ParameterizedScratchpadMeta(type):
     pre-import.
     """
 
+    # How each axis renders into the test-id suffix. Axes not listed fall back to
+    # "<name><value>"; this keeps the curated short labels while letting new axes
+    # added to ``parameter_axes`` work without editing this method.
+    _AXIS_LABELS = {
+        "solver_method": lambda v: str(v),
+        "sencores": lambda v: f"sc{v}",
+        "co_optimization": lambda v: "coopt" if v else "nocoopt",
+        "boundary_clones": lambda v: "clones" if v else "noclones",
+    }
+
     @staticmethod
     def _combo_suffix(params: dict) -> str:
-        """Build a readable, test-id-safe suffix for one parameter combination.
-        Empty (no config axes) yields ``""`` — the test keeps its bare name."""
+        """Readable, test-id-safe suffix for one combo. Empty -> '' (bare name)."""
         if not params:
             return ""
+        labels = _ParameterizedScratchpadMeta._AXIS_LABELS
         return "_".join(
-            [
-                str(params["solver_method"]),
-                f"sc{params['sencores']}",
-                "coopt" if params["co_optimization"] else "nocoopt",
-                "clones" if params["boundary_clones"] else "noclones",
-            ]
+            labels[name](value) if name in labels else f"{name}{value}"
+            for name, value in params.items()
         )
 
     def __new__(mcs, name, bases, attrs):
