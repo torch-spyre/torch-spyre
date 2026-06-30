@@ -231,7 +231,6 @@ _COMMON_REDUCTION_FAILURES = [
     "test_flatten_4d_large_full",
     "test_flatten_4d_leading",
     "test_flatten_4d_trailing",
-    "test_pointwise_binary_op_div_67x71x256_67x71x256",
     "test_t_2d_contiguous_4096x49280",
     "test_transpose_2d_large_dim_0_2",
     "test_transpose_2d_large_dim_0_2_nopad",
