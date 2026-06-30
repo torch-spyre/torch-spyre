@@ -1070,8 +1070,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
 
     Stick-dim reduction tiling (dim=-1 on a [..., D] tensor where D maps to
     the stick) is now supported.  The loopspec tests run without hardware via
-    mock_patch + run_and_get_code.  The correctness tests require a Spyre
-    device and are skipped until issue #2748 is resolved.
+    mock_patch + run_and_get_code.
     """
 
     def setUp(self):
@@ -1106,9 +1105,6 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         self.assertIn("LoopSpec(", src, "Expected LoopSpec for D-tiled sum")
         self.assertIn("sympify('4')", src, "Expected loop count 4")
 
-    @pytest.mark.skip(
-        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
-    )
     def test_hint_tiled_reduction_sum_correct(self):
         """x.sum(dim=-1) tiled over D (4 tiles) produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1207,9 +1203,6 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         self.assertIn("LoopSpec(", src, "Expected LoopSpec for D-tiled amax")
         self.assertIn("sympify('4')", src, "Expected loop count 4")
 
-    @pytest.mark.skip(
-        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
-    )
     def test_hint_tiled_reduction_max_correct(self):
         """x.amax(dim=-1) tiled over D (4 tiles) produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1254,9 +1247,6 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         self.assertIn("LoopSpec(", src, "Expected LoopSpec for D-tiled amin")
         self.assertIn("sympify('4')", src, "Expected loop count 4")
 
-    @pytest.mark.skip(
-        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
-    )
     def test_hint_tiled_reduction_min_correct(self):
         """x.amin(dim=-1) tiled over D (4 tiles) produces correct results."""
         from torch_spyre._inductor import spyre_hint
