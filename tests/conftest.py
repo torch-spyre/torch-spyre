@@ -19,7 +19,7 @@ import pytest
 
 
 import shared_config
-from oot_framework.oot_test_utilities import _RUNTIME_TAGS
+from oot_framework.oot_test_utilities import _RUNTIME_TAGS, _RUNTIME_SHAPES
 
 
 # Attaches per-test tags to the pytest report object after each test call.
@@ -49,6 +49,10 @@ def pytest_runtest_makereport(item, call):
                 tags = getattr(fn, "_oot_method_tags", [])
         if tags:
             rep._spyre_tags = tags
+
+        shapes = _RUNTIME_SHAPES.get(method_name)
+        if shapes:
+            rep._spyre_shapes = shapes
 
         # Rewrite SKIPPED/FAILED -> XFAIL for unittest.TestCase methods marked
         # xfail by OOT config. pytest.mark.xfail is ignored by the unittest runner
@@ -87,6 +91,9 @@ def pytest_runtest_logreport(report):
         if tags:
             # Write directly to terminal
             os.write(1, f"  [TAGS = {' '.join(tags)}]\n".encode())
+        shapes = getattr(report, "_spyre_shapes", None)
+        if shapes:
+            os.write(1, f"  [INPUT SHAPES]\n{shapes}\n".encode())
 
 
 def _get_case_marks(case: dict) -> set[str]:
