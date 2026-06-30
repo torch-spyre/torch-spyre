@@ -19,9 +19,10 @@ Covers six areas, each in its own class group:
      TestIterOpSpecs, TestCodegenOpSpecListRoundtrip)
   2. coarse_tile IR pass: range rewriting, attribute stamping, nested groups
      (TestDivideRanges, TestCoarseTile, TestCoarseTileNested)
-  3. CountedLoopSchedulerNode, build_loop_scheduler_nodes, and
-     _tiled_syms_for_sched_node_at_depth
-     (TestHelpers, TestBuildLoopSchedulerNodes, TestTiledSymsForSchedNode)
+  3. CountedLoopSchedulerNode, build_loop_scheduler_nodes,
+     _tiled_syms_for_sched_node_at_depth, and spyre_fuse_nodes budget check
+     (TestHelpers, TestBuildLoopSchedulerNodes, TestTiledSymsForSchedNode,
+      TestSpyreFuseNodesLoopBudget)
   4. generate_sdsc and compile_op_spec symbol/affine-stride paths
      (TestTiledByteStride, TestGenerateSdscTiledSymbols,
       TestCompileOpSpecTwoTiledSymbols, TestCompileOpSpecSymbolMapping)
@@ -80,6 +81,7 @@ from torch_spyre._inductor.scheduler import (
     _loop_group_id,
     build_loop_scheduler_nodes,
 )
+from torch_spyre._inductor.fusion import spyre_fuse_nodes
 from torch_spyre._inductor.spyre_kernel import (
     _codegen_op_spec_list,
     _iter_op_specs,
@@ -372,7 +374,7 @@ def _make_tiled_op_spec() -> OpSpec:
         iteration_space={c0: (Integer(128), 1)},
         args=[tensor_in, tensor_out],
         op_info={},
-        tiled_symbols=[c0],
+        tiled_symbols=[[c0]],
     )
 
 
@@ -688,6 +690,197 @@ class TestDivideRanges(unittest.TestCase):
         self.assertFalse(hasattr(red, _LOOPS_FREE_SYMS_KEY))
         self.assertFalse(hasattr(red, _REDUCTION_FREE_SYMS_KEY))
 
+    # ------------------------------------------------------------------
+    # Device-layout reconstruction tests (FixedTiledLayout path)
+    # ------------------------------------------------------------------
+
+    def _make_ftl_op(self, host_size, dim_order, dtype=torch.float16, elem_arr=None):
+        """Build a ComputedBuffer with a FixedTiledLayout for testing _divide_ranges.
+
+        Returns (op, layout) where layout.device_layout is a SpyreTensorLayout
+        constructed from (host_size, contiguous_strides, dtype, dim_order, elem_arr).
+        """
+        from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise
+
+        from torch_spyre._C import ElementArrangement, SpyreTensorLayout
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        if elem_arr is None:
+            elem_arr = ElementArrangement.STANDARD
+
+        strides = [int(s) for s in FlexibleLayout.contiguous_strides(host_size)]
+        device_layout = SpyreTensorLayout(
+            host_size, strides, dtype, dim_order, elem_arr
+        )
+        layout = FixedTiledLayout(
+            torch.device("cpu"),
+            dtype,
+            [Integer(s) for s in host_size],
+            [Integer(s) for s in strides],
+            device_layout,
+        )
+        pw = Pointwise(
+            device=torch.device("cpu"),
+            dtype=dtype,
+            inner_fn=lambda index: sympy.Integer(1),
+            ranges=[Integer(s) for s in host_size],
+        )
+        op = ComputedBuffer(name="buf0", layout=layout, data=pw)
+        return op, layout
+
+    def test_divide_ranges_transposed_stick_preserved(self):
+        """Tiling a non-stick dim of a transposed-stick layout rebuilds
+        device_layout correctly (headline regression from code review)."""
+        from torch._inductor.ir import FlexibleLayout
+
+        from torch_spyre._C import SpyreTensorLayout
+
+        # [256, 128] with stick on dim0: dim_order=[1, 0].  This is the layout
+        # produced for a transposed Linear weight (model_utils.py restickify).
+        op, layout = self._make_ftl_op([256, 128], dim_order=[1, 0])
+
+        # Tile non-stick dim1 by 2: [256, 128] -> [256, 64].
+        _divide_ranges(op, Integer(2), tiled_dims=[1])
+
+        # Expected: from-scratch SpyreTensorLayout([256, 64], ..., [1, 0]).
+        expected_strides = [
+            int(s) for s in FlexibleLayout.contiguous_strides([256, 64])
+        ]
+        expected = SpyreTensorLayout([256, 64], expected_strides, torch.float16, [1, 0])
+
+        self.assertEqual(layout.device_layout, expected)
+
+        # Also assert it differs from the buggy heuristic result.
+        buggy = SpyreTensorLayout(
+            [1, 256, 64],
+            [64, 64, 1],
+            expected.device_dtype,
+            expected.element_arrangement,
+        )
+        self.assertNotEqual(layout.device_layout, buggy)
+
+    def test_divide_ranges_preserves_element_arrangement(self):
+        """element_arrangement is copied verbatim — not silently reset to STANDARD."""
+        from torch._inductor.ir import FlexibleLayout
+
+        from torch_spyre._C import ElementArrangement, SpyreTensorLayout
+
+        op, layout = self._make_ftl_op(
+            [256, 128], dim_order=[1, 0], elem_arr=ElementArrangement.EXX2
+        )
+
+        _divide_ranges(op, Integer(2), tiled_dims=[1])
+
+        self.assertEqual(
+            layout.device_layout.element_arrangement, ElementArrangement.EXX2
+        )
+
+        # Confirm the rebuilt layout also has the right shape.
+        expected_strides = [
+            int(s) for s in FlexibleLayout.contiguous_strides([256, 64])
+        ]
+        expected = SpyreTensorLayout(
+            [256, 64], expected_strides, torch.float16, [1, 0], ElementArrangement.EXX2
+        )
+        self.assertEqual(layout.device_layout, expected)
+
+    def test_divide_ranges_stride_collision(self):
+        """Tiling an outer dim when stride_map has two entries with the same
+        value (device_size tiebreak case) produces the correct device_layout."""
+        from torch._inductor.ir import FlexibleLayout
+
+        from torch_spyre._C import SpyreTensorLayout
+
+        # [2, 2, 2, 16] contiguous, stick on dim3 (last).  host_stride[0]=64
+        # equals 64*host_stride[3], so the stick tile-count and a non-stick dim
+        # share a stride_map value; stride check must break the tie.
+        op, layout = self._make_ftl_op([2, 2, 2, 16], dim_order=[0, 1, 2, 3])
+
+        # Tile dim0: [2,2,2,16] -> [1,2,2,16].
+        _divide_ranges(op, Integer(2), tiled_dims=[0])
+
+        expected_strides = [
+            int(s) for s in FlexibleLayout.contiguous_strides([1, 2, 2, 16])
+        ]
+        expected = SpyreTensorLayout(
+            [1, 2, 2, 16], expected_strides, torch.float16, [0, 1, 2, 3]
+        )
+        self.assertEqual(layout.device_layout, expected)
+
+    def test_divide_ranges_tile_count_size_collision(self):
+        """Tile-count device_size equals a non-stick host dim size — the stride
+        check (not size alone) must classify it correctly.
+
+        [2, 128] with stick on dim1: tile-count device_size = ceil(128/64) = 2,
+        which equals old_host_size[0] = 2.  Without the stride check, Pass 1
+        misclassifies the tile-count dim as non-stick and never updates it."""
+        from torch._inductor.ir import FlexibleLayout
+
+        from torch_spyre._C import SpyreTensorLayout
+
+        op, layout = self._make_ftl_op([2, 128], dim_order=[0, 1])
+
+        # Tile dim0: [2, 128] -> [1, 128].
+        _divide_ranges(op, Integer(2), tiled_dims=[0])
+
+        expected_strides = [int(s) for s in FlexibleLayout.contiguous_strides([1, 128])]
+        expected = SpyreTensorLayout([1, 128], expected_strides, torch.float16, [0, 1])
+        self.assertEqual(layout.device_layout, expected)
+
+    def test_resize_device_layout_grow_from_singleton(self):
+        """_allocate_full_buffer grow path: a device dim tiled to size 1
+        (stride_map != -1) must be grown back on the full-buffer allocation.
+
+        [1, 128] grow dim0 -> [4, 128]: the size-1 non-stick device dim must
+        update to device_size=4, not remain frozen at 1."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.coarse_tile import _resize_device_layout
+
+        # Per-tile buffer is [1, 128] — dim0 was tiled to extent 1.
+        # device_size=[2, 1, 64], stride_map=[64, -1, 1].
+        stl = SpyreTensorLayout([1, 128], [128, 1], torch.float16, [0, 1])
+        result = _resize_device_layout(stl, [1, 128], [4, 128])
+
+        expected = SpyreTensorLayout([4, 128], [128, 1], torch.float16, [0, 1])
+        self.assertEqual(result, expected)
+
+    def test_resize_device_layout_raises_on_unsupported(self):
+        """_resize_device_layout raises RuntimeError when the stick host dim
+        cannot be uniquely identified from stride_map[-1].
+
+        This guards against unsupported layouts (e.g. future multi-host-dim
+        sticks) rather than silently producing a wrong result.
+        """
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.coarse_tile import _resize_device_layout
+
+        # Build a real [2, 2] STL (stick on dim1, stride_map[-1] == 1).
+        # Then call the helper with a synthetic old_host_size=[1, 1] whose
+        # contiguous strides are both 1 — two dims share stride_map[-1], so
+        # p* cannot be identified uniquely.
+        stl = SpyreTensorLayout([2, 2], [2, 1], torch.float16, [0, 1])
+        with self.assertRaises(RuntimeError):
+            _resize_device_layout(stl, [1, 1], [1, 1])
+
+    def test_resize_device_layout_reduction_output(self):
+        """Reduction output: stick host dim has been eliminated, so old_host_size
+        has no unmatched dim.  _resize_device_layout must handle this gracefully
+        by leaving the tile-count and inner-stick entries frozen."""
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.coarse_tile import _resize_device_layout
+
+        # [128] reduction output: SpyreTensorLayout([128], [1], fp16, [0]).
+        # device_size=[1, 128, 64], stride_map=[-1, 1, -1] — tile-count dim is
+        # frozen at 1 (stick collapsed), inner stick frozen at -1.
+        stl = SpyreTensorLayout([128], [1], torch.float16, [0])
+        # Tile the non-stick dim: [128] -> [64].
+        result = _resize_device_layout(stl, [128], [64])
+
+        # Non-stick device dim (j=1, size 128) updates to size 64, stride 1.
+        # Tile-count (j=0, size 1) and inner stick (j=2, size 64) are frozen.
+        expected = SpyreTensorLayout([64], [1], torch.float16, [0])
+        self.assertEqual(result, expected)
+
 
 def _mock_op_out_coords(op):
     """Return pre-built coords stored on op by _make_hinted_op, or empty list."""
@@ -974,6 +1167,148 @@ class TestBuildLoopSchedulerNodes(unittest.TestCase):
 
 
 # ===========================================================================
+# 3b. spyre_fuse_nodes CountedLoopSchedulerNode budget check
+# ===========================================================================
+
+
+def _make_snode_with_tensors(scheduler, ir_op, name, tensor_names):
+    """Like _make_snode but read_writes returns named dependency mocks."""
+    snode = _make_snode(scheduler, ir_op, name)
+    deps = []
+    for tname in tensor_names:
+        dep = MagicMock()
+        dep.name = tname
+        deps.append(dep)
+    snode.read_writes.reads_and_writes.return_value = deps
+    return snode
+
+
+def _make_counted_loop_node(scheduler, tensor_names, name="loop0"):
+    """Return a fake CountedLoopSchedulerNode with the given tensor names."""
+    node = MagicMock(spec=CountedLoopSchedulerNode)
+    node.scheduler = scheduler
+    node.get_name.return_value = name
+    node.get_nodes.return_value = [node]
+    deps = []
+    for tname in tensor_names:
+        dep = MagicMock()
+        dep.name = tname
+        deps.append(dep)
+    node.read_writes = MagicMock()
+    node.read_writes.reads_and_writes.return_value = deps
+    return node
+
+
+class TestSpyreFuseNodesLoopBudget(unittest.TestCase):
+    def setUp(self):
+        # All tensor names count as non-intermediate.
+        self._patcher = patch(
+            "torch_spyre._inductor.fusion._is_non_intermediate",
+            side_effect=lambda name: True,
+        )
+        self._patcher.start()
+        # Cap the bundle at 2 tensors so overflow is easy to trigger.
+        self._max_patcher = patch(
+            "torch_spyre._inductor.fusion._max_bundle_tensors",
+            return_value=2,
+        )
+        self._max_patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        self._max_patcher.stop()
+
+    def test_loop_node_within_budget_no_error(self):
+        """A loop node referencing <= max_tensors: passes through without error."""
+        sched = _make_scheduler()
+        loop = _make_counted_loop_node(sched, ["t1", "t2"], "loop0")
+        result = spyre_fuse_nodes([loop])
+        self.assertEqual(len(result), 1)
+        self.assertIs(result[0], loop)
+
+    def test_loop_node_exceeds_budget_raises(self):
+        """A loop node referencing > max_tensors must raise RuntimeError."""
+        sched = _make_scheduler()
+        loop = _make_counted_loop_node(sched, ["t1", "t2", "t3"], "loop0")
+        with self.assertRaises(RuntimeError) as ctx:
+            spyre_fuse_nodes([loop])
+        self.assertIn("loop0", str(ctx.exception))
+        self.assertIn("3", str(ctx.exception))
+        self.assertIn("2", str(ctx.exception))
+
+    def test_loop_node_empty_tensors_no_error(self):
+        """A loop node with no tensors (all intermediates) is fine."""
+        sched = _make_scheduler()
+        # Override: nothing is non-intermediate for this test.
+        with patch(
+            "torch_spyre._inductor.fusion._is_non_intermediate",
+            side_effect=lambda name: False,
+        ):
+            loop = _make_counted_loop_node(sched, ["t1", "t2", "t3"], "loop0")
+            result = spyre_fuse_nodes([loop])
+        self.assertEqual(len(result), 1)
+
+    def test_plain_scheduler_node_split_unaffected(self):
+        """Plain SchedulerNode tensor-budget splits still work (no regression)."""
+        sched = _make_scheduler()
+        a = _make_snode_with_tensors(sched, _make_ir_op(), "a", ["t1", "t2"])
+        b = _make_snode_with_tensors(sched, _make_ir_op(), "b", ["t3"])
+        # a fills the 2-tensor budget; b starts a new bundle.
+        result = spyre_fuse_nodes([a, b])
+        self.assertEqual(len(result), 2)
+
+    def test_loop_node_preceded_by_scheduler_nodes(self):
+        """Loop node after plain nodes: budget check on loop node itself."""
+        sched = _make_scheduler()
+        a = _make_snode_with_tensors(sched, _make_ir_op(), "a", ["t1"])
+        loop = _make_counted_loop_node(sched, ["t2", "t3", "t4"], "loop0")
+        with self.assertRaises(RuntimeError):
+            spyre_fuse_nodes([a, loop])
+
+    def test_fallback_node_exceeds_budget_no_error(self):
+        """Non-CountedLoop nodes (e.g. FallbackKernel) bypass the budget check."""
+        from torch._inductor.scheduler import FusedSchedulerNode
+
+        sched = _make_scheduler()
+        # Build a plain FusedSchedulerNode mock (not CountedLoopSchedulerNode).
+        node = MagicMock(spec=FusedSchedulerNode)
+        node.scheduler = sched
+        node.get_name.return_value = "fallback0"
+        deps = []
+        for tname in ["t1", "t2", "t3", "t4"]:
+            dep = MagicMock()
+            dep.name = tname
+            deps.append(dep)
+        node.read_writes = MagicMock()
+        node.read_writes.reads_and_writes.return_value = deps
+        # 4 tensors > max_tensors(2), but this is not a CountedLoopSchedulerNode.
+        result = spyre_fuse_nodes([node])
+        self.assertEqual(len(result), 1)
+        self.assertIs(result[0], node)
+
+    def test_nested_loop_node_tensor_union_checked(self):
+        """Outer CountedLoopSchedulerNode's read_writes covers inner tensors.
+
+        _build_loop_group wraps inner loops first, then the outer loop.
+        FusedSchedulerNode.__init__ calls ReadWrites.merge_list on its
+        snodes, so the outer node's read_writes is already the full union
+        of all inner tensors.  This test confirms that the budget check
+        on the outer node sees all tensors from nested inner nodes.
+        """
+        sched = _make_scheduler()
+        # Simulate an outer CountedLoopSchedulerNode whose read_writes
+        # already aggregates tensors from two inner loop nodes (t1..t4).
+        # In production this aggregation is done by ReadWrites.merge_list
+        # during FusedSchedulerNode construction.
+        outer = _make_counted_loop_node(sched, ["t1", "t2", "t3", "t4"], "outer_loop")
+        # 4 unique non-intermediate tensors > max_tensors(2): must raise.
+        with self.assertRaises(RuntimeError) as ctx:
+            spyre_fuse_nodes([outer])
+        self.assertIn("outer_loop", str(ctx.exception))
+        self.assertIn("4", str(ctx.exception))
+
+
+# ===========================================================================
 # 4. generate_sdsc and compile_op_spec — symbol/affine-stride paths
 # ===========================================================================
 
@@ -1041,12 +1376,14 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=0,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
             use_symbols=True,
         )
+        # affine_strides[tensor_idx] is list[dict] (per level, outermost first).
+        # With one tiling level, affine_strides[0] = [{s: stride}].
         self.assertEqual(len(affine_strides), 1)
-        self.assertIn(s, affine_strides[0])
-        self.assertEqual(affine_strides[0][s], 64 * 128 * 2)
+        self.assertIn(s, affine_strides[0][0])
+        self.assertEqual(affine_strides[0][0][s], 64 * 128 * 2)
 
     def test_tiled_tensor_base_address_registered(self):
         s = Symbol("s")
@@ -1058,7 +1395,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=0,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
             use_symbols=True,
         )
         self.assertEqual(len(symbols), 1)
@@ -1073,7 +1410,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=0,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
             use_symbols=True,
         )
         top_val = next(iter(sdsc_json.values()))
@@ -1093,7 +1430,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbol_id_offset=0,
             tiled_symbols=[],
         )
-        self.assertEqual(affine_strides, [{}])
+        self.assertEqual(affine_strides, [[]])
 
     def test_lx_tensor_not_in_symbols(self):
         s = Symbol("s")
@@ -1107,11 +1444,12 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=0,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
         )
         self.assertEqual(symbols, [])
         self.assertEqual(local_sym_values, [])
-        self.assertEqual(affine_strides, [{}])
+        # lx tensor: one level of tiled_symbols, but lx allocation is always non-tiled.
+        self.assertEqual(affine_strides, [[{}]])
 
     def test_symbol_id_offset_applied(self):
         s = Symbol("s")
@@ -1122,7 +1460,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=5,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
             use_symbols=True,
         )
         top_val = next(iter(sdsc_json.values()))
@@ -1167,13 +1505,14 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=0,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
             use_symbols=True,
         )
         self.assertEqual(len(symbols), 2)
         self.assertEqual(symbols[0], 0x1000)
         self.assertEqual(symbols[1], 0x1000 + 128)
-        self.assertIn(s, affine_strides[0])
+        # affine_strides[0] = [{s: stride}] (one level, one tensor)
+        self.assertIn(s, affine_strides[0][0])
 
 
 class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
@@ -1208,25 +1547,34 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
             },
             args=[tensor_in, tensor_out],
             op_info={},
-            tiled_symbols=[c0, c1],
+            tiled_symbols=[[c0, c1]],
         )
 
     def test_two_tiled_symbols_produce_two_stride_entries(self):
         op_spec = self._make_3d_op_spec()
         symbols: list[int] = []
         _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
-        hbm_strides = [d for d in affine_strides if len(d) > 0]
+        # affine_strides[tensor_idx] = list[dict] (per level, outermost first).
+        # Both tensors have one tiling level with two symbols.
+        # Find tensors with non-empty strides at any level.
+        hbm_strides = [
+            per_level
+            for per_level in affine_strides
+            if any(len(d) > 0 for d in per_level)
+        ]
         self.assertGreater(len(hbm_strides), 0)
-        for tensor_strides in hbm_strides:
-            self.assertEqual(len(tensor_strides), 2)
+        for per_level in hbm_strides:
+            total_strides = sum(len(d) for d in per_level)
+            self.assertEqual(total_strides, 2)
 
     def test_two_tiled_symbols_strides_are_positive(self):
         op_spec = self._make_3d_op_spec()
         symbols: list[int] = []
         _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
-        for tensor_strides in affine_strides:
-            for sym, stride in tensor_strides.items():
-                self.assertGreater(stride, 0)
+        for per_level in affine_strides:
+            for level_strides in per_level:
+                for sym, stride in level_strides.items():
+                    self.assertGreater(stride, 0)
 
 
 class TestCompileOpSpecSymbolMapping(unittest.TestCase):
@@ -1234,7 +1582,11 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
         op_spec = _make_tiled_op_spec()
         symbols: list[int] = []
         _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
-        has_strides = any(len(d) > 0 for d in affine_strides)
+        # affine_strides[tensor_idx] = list[dict] (per level, outermost first).
+        has_strides = any(
+            any(len(level_d) > 0 for level_d in per_level)
+            for per_level in affine_strides
+        )
         self.assertTrue(
             has_strides,
             f"Expected non-empty affine_strides; got {affine_strides}.",
@@ -1282,7 +1634,6 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
             device_size=[512, 64, 1, 64],
             device_coordinates=[c0, floor(c2 / 64), Integer(0), Mod(c2, 64)],
             allocation={"hbm": 0},
-            stride_map=[4096, 64, -1, 1],
         )
         kernel_arg = TensorArg(
             is_input=True,
@@ -1291,7 +1642,6 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
             device_size=[200, 4096, 64],
             device_coordinates=[floor(c1 / 64), c2, Mod(c1, 64)],
             allocation={"hbm": 0x400000000},
-            stride_map=[64, 12800, 1],
         )
         output_arg = TensorArg(
             is_input=False,
@@ -1300,12 +1650,10 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
             device_size=[512, 200, 1, 64],
             device_coordinates=[c0, floor(c1 / 64), Integer(0), Mod(c1, 64)],
             allocation={"hbm": 0x800000000},
-            stride_map=[12800, 64, -1, 1],
         )
         for arg in (input_arg, output_arg):
             del arg.device_size[-2]
             del arg.device_coordinates[-2]
-            del arg.stride_map[-2]
         iteration_space = {
             c0: (Integer(512), 4),
             c1: (Integer(12800), 8),
@@ -1544,7 +1892,7 @@ class TestGenerateBundleMlirSnapshot(unittest.TestCase):
             "\t\t%c1 = arith.constant 1 : index\n"
             "\t\t%loop_bound_0 = arith.constant 8 : index\n"
             "\t\tscf.for %i_0 = %c0 to %loop_bound_0 step %c1 {\n"
-            '\t\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json"}\n'
+            '\t\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json", "symbol_ids"=[]}\n'
             "\t\t}\n"
             "\t\treturn\n"
             "\t}\n"
@@ -1558,7 +1906,7 @@ class TestGenerateBundleMlirSnapshot(unittest.TestCase):
         expected = (
             "module {\n"
             "\tfunc.func @sdsc_bundle() {\n"
-            '\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json"}\n'
+            '\t\tsdscbundle.sdsc_execute () {sdsc_filename="sdsc_0.json", "symbol_ids"=[]}\n'
             "\t\treturn\n"
             "\t}\n"
             "}\n"
@@ -1592,10 +1940,11 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
-            return _make_tiled_json(idx, sym_id), [0x1000], [{s: stride}], []
+            # affine_strides: list[list[dict]] — one tensor, one level, one stride.
+            return _make_tiled_json(idx, sym_id), [0x1000], [[{s: stride}]], []
 
         op = _make_minimal_op_spec("a")
-        op.tiled_symbols = [s]
+        op.tiled_symbols = [[s]]
         loop = LoopSpec(count=Integer(4), body=[op])
         mlir = self._bundle([loop], fake_compile)
 
@@ -1612,7 +1961,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x2000)
-            return _make_tiled_json(idx, sym_id), [0x2000], [{}], []
+            return _make_tiled_json(idx, sym_id), [0x2000], [[{}]], []
 
         op = _make_minimal_op_spec("b")
         loop = LoopSpec(count=Integer(2), body=[op])
@@ -1630,10 +1979,10 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x3000)
-            return _make_tiled_json(idx, sym_id), [0x3000], [{s: stride}], []
+            return _make_tiled_json(idx, sym_id), [0x3000], [[{s: stride}]], []
 
         op = _make_minimal_op_spec("c")
-        op.tiled_symbols = [s]
+        op.tiled_symbols = [[s]]
         loop = LoopSpec(count=Integer(4), body=[op])
         mlir = self._bundle([loop], fake_compile)
 
@@ -1647,10 +1996,10 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x4000)
-            return _make_tiled_json(idx, sym_id), [0x4000], [{s: 512}], []
+            return _make_tiled_json(idx, sym_id), [0x4000], [[{s: 512}]], []
 
         op = _make_minimal_op_spec("d")
-        op.tiled_symbols = [s]
+        op.tiled_symbols = [[s]]
         loop = LoopSpec(count=Integer(4), body=[op])
         mlir = self._bundle([loop], fake_compile)
 
@@ -1666,10 +2015,10 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
-            return _make_tiled_json(idx, sym_id), [0x1000], [{s: 256}], []
+            return _make_tiled_json(idx, sym_id), [0x1000], [[{s: 256}]], []
 
         op = _make_minimal_op_spec("a")
-        op.tiled_symbols = [s]
+        op.tiled_symbols = [[s]]
         loop = LoopSpec(count=Integer(4), body=[op])
         mlir = self._bundle([loop], fake_compile)
 
@@ -1719,10 +2068,12 @@ class TestGenerateBundleNestedTiling(unittest.TestCase):
         def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
+            # per_level_strides: outermost-first. Level 0 (outer) has s0 stride,
+            # level 1 (inner) has s1 stride.  One tensor, two levels.
             return (
                 _make_tiled_json(idx, sym_id),
                 [0x1000],
-                [{s0: outer_stride, s1: inner_stride}],
+                [[{s0: outer_stride}, {s1: inner_stride}]],
                 [],
             )
 
@@ -1832,7 +2183,8 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
         def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
-            return _make_tiled_json(idx, sym_id), [0x1000], [{s: 256}], []
+            # One tensor, one level (the enclosing loop), one stride.
+            return _make_tiled_json(idx, sym_id), [0x1000], [[{s: 256}]], []
 
         op = _make_minimal_op_spec("a")
         loop = LoopSpec(count=Integer(4), body=[op])
@@ -1846,7 +2198,7 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
         def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x2000)
-            return _make_tiled_json(idx, sym_id), [0x2000], [{}], []
+            return _make_tiled_json(idx, sym_id), [0x2000], [[{}]], []
 
         op = _make_minimal_op_spec("b")
         loop = LoopSpec(count=Integer(4), body=[op])
@@ -1862,7 +2214,7 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
         def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
-            return _make_tiled_json(idx, sym_id), [0x1000], [{s: 256}], []
+            return _make_tiled_json(idx, sym_id), [0x1000], [[{s: 256}]], []
 
         op = _make_minimal_op_spec("a")
         loop = LoopSpec(count=Integer(4), body=[op])
@@ -1890,14 +2242,13 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
     # --- Group 2: nested outer-B + inner-K reduction ---
     #
     # Strides match TestNestedReductionUnroll in test_unroll_loop_specs.py:
-    #   k_input: device_size=[2,64,64], stride_map=[64,64,1], 128 K-elems/tile
-    #     byte_stride = (128//64) * 64 * 2 = 256
-    #   accum_buf: device_size=[1,2,64], stride_map=[64,64,1], 2 batches/tile
-    #     byte_stride = 2 * 64 * 2 = 256
-    # Both happen to be 256; the combine's accum_buf stride is irrelevant (not
-    # tiled on K), so only K_STRIDE=256 appears in the affine map.
+    #   k_input: device_size=[2,64,64]; device_stride[0]=prod([64,64])=4096
+    #     128 K-elems/tile → 2 sticks; byte_stride = (128//64)*4096*2 = 16384
+    #   accum_buf: device_size=[1,2,64]; device_stride[1]=prod([64])=64
+    #     2 batches/tile; byte_stride = 2*64*2 = 256
+    # Only K_STRIDE appears in the affine map (accum_buf not tiled on K).
 
-    _GRP2_K_STRIDE = 256  # (128//64) * 64 * 2
+    _GRP2_K_STRIDE = 16384  # (128//64) * prod([64,64]) * 2
 
     def _fake_nested_reduction(self, k_stride):
         c_k = self._c_k
@@ -1908,10 +2259,18 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000 * (i + 1))
-            if i == 0:  # bmm: tiled on inner K var only
-                return _make_tiled_json(idx, sym_id), [0x1000], [{c_k: k_stride}], []
-            else:  # combine: accum_buf not tiled on K
-                return _make_tiled_json(idx, sym_id), [0x2000], [{}], []
+            if i == 0:
+                # bmm: tiled on inner K var only (level 1 in outer>inner nesting).
+                # per_level_strides: outermost first — outer has no K stride, inner has it.
+                return (
+                    _make_tiled_json(idx, sym_id),
+                    [0x1000],
+                    [[{}, {c_k: k_stride}]],
+                    [],
+                )
+            else:
+                # combine: accum_buf not tiled on K at any level.
+                return _make_tiled_json(idx, sym_id), [0x2000], [[{}, {}]], []
 
         return fake
 
@@ -1983,13 +2342,13 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
     # --- Group 3: tile-accum copy pattern ---
     #
     # Strides match TestNestedReductionTileAccum in test_unroll_loop_specs.py:
-    #   bmm K-input: same geometry as Group 2 → K_STRIDE = 256
-    #   accum_full (copy output): device_size=[1,128,32], stride_map=[2048,32,1]
-    #     device_coords=[c_b, c_m, c_n]; 1 tile advances c_b by 1
-    #     byte_stride = 1 * 2048 * 2 = 4096  (_OUTER_TILE_STRIDE_BYTES)
+    #   bmm K-input: same geometry as Group 2 → K_STRIDE = 16384
+    #   accum_full (copy output): device_size=[1,128,32]
+    #     device_stride[0]=prod([128,32])=4096; 1 tile advances c_b by 1
+    #     byte_stride = 1 * 4096 * 2 = 8192  (_OUTER_TILE_STRIDE_BYTES)
 
-    _GRP3_K_STRIDE = 256  # (128//64) * 64 * 2
-    _GRP3_B_STRIDE = 4096  # 1 * 2048 * 2
+    _GRP3_K_STRIDE = 16384  # (128//64) * prod([64,64]) * 2
+    _GRP3_B_STRIDE = 8192  # 1 * prod([128,32]) * 2
 
     def _fake_tile_accum(self, k_stride, b_stride):
         c_k, c_b = self._c_k, self._c_b
@@ -2000,14 +2359,23 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000 * (i + 1))
-            if i == 0:  # fill: per_tile_fixed output, not tiled
-                return _make_tiled_json(idx, sym_id), [0x1000], [{}], []
-            elif i == 1:  # bmm: K-input tiled on inner K
-                return _make_tiled_json(idx, sym_id), [0x2000], [{c_k: k_stride}], []
-            elif i == 2:  # combine: per_tile_fixed accum_tile, not tiled
-                return _make_tiled_json(idx, sym_id), [0x3000], [{}], []
-            else:  # copy: accum_full advances per outer B-tile
-                return _make_tiled_json(idx, sym_id), [0x4000], [{c_b: b_stride}], []
+            if i == 0:
+                # fill: inside outer loop only, not tiled.
+                return _make_tiled_json(idx, sym_id), [0x1000], [[{}]], []
+            elif i == 1:
+                # bmm: inside outer>inner; K-input tiled at inner level (level 1).
+                return (
+                    _make_tiled_json(idx, sym_id),
+                    [0x2000],
+                    [[{}, {c_k: k_stride}]],
+                    [],
+                )
+            elif i == 2:
+                # combine: inside outer>inner, per_tile_fixed accum_tile, not tiled.
+                return _make_tiled_json(idx, sym_id), [0x3000], [[{}, {}]], []
+            else:
+                # copy: inside outer loop only; accum_full tiled at outer level (level 0).
+                return _make_tiled_json(idx, sym_id), [0x4000], [[{c_b: b_stride}]], []
 
         return fake
 
@@ -2129,11 +2497,12 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
             sid1 = -(symbol_id_offset + 2)
             symbols.append(0x1000)
             symbols.append(0x2000)
-            # tensor 0 tiled, tensor 1 not tiled
+            # tensor 0: tiled at the enclosing loop level (level 0).
+            # tensor 1: not tiled.
             return (
                 _make_two_tensor_json(idx, sid0, sid1),
                 [0x1000, 0x2000],
-                [{s: 256}, {}],
+                [[{s: 256}], [{}]],
                 [],
             )
 
@@ -2615,48 +2984,6 @@ class TestValidateReductionTiling(unittest.TestCase):
         _validate_reduction_tiling(op)
 
 
-class TestTiledSymsForSchedNode(unittest.TestCase):
-    """Regression test for _tiled_syms_for_sched_node_at_depth.
-
-    loop_tiled_dims stores host-range indices (e.g. 1 for H in [B=1,H,Lq,D])
-    but the iteration space skips unit-size dims (B=1 dropped), so H is at
-    iteration-space index 0.  The function must map between the two.
-    """
-
-    def test_unit_batch_dim_skipped(self):
-        """[B=1,H=8,Lq=256,D=64] with loop_tiled_dims=[[1]] must return H (c0).
-
-        Without the fix, index 1 is used directly and returns c1 (Lq) instead.
-        """
-        from torch_spyre._inductor.scheduler import _tiled_syms_for_sched_node_at_depth
-        from torch._inductor.scheduler import SchedulerNode
-
-        host_ranges = [1, 8, 256, 64]
-        non_unit = [r for r in host_ranges if r != 1]
-        it_syms = [Symbol(f"c{i}") for i in range(len(non_unit))]
-        it_space = {s: Integer(r) for s, r in zip(it_syms, non_unit)}
-
-        ir_op = MagicMock()
-        ir_op.data.ranges = [Integer(r) for r in host_ranges]
-        ir_op.loop_info = CoarseTileInfo(
-            loop_group_id=(0,),
-            loop_count=[Integer(4)],
-            loop_tiled_dims=[[1]],
-        )
-
-        snode = MagicMock(spec=SchedulerNode)
-        snode.node = ir_op
-
-        with patch(
-            "torch_spyre._inductor.scheduler.iteration_space",
-            return_value=it_space,
-        ):
-            result = _tiled_syms_for_sched_node_at_depth(snode, 0)
-
-        self.assertEqual(len(result), 1)
-        self.assertEqual(str(result[0]), "c0")  # H, not c1 (Lq)
-
-
 class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
@@ -3051,7 +3378,7 @@ class TestSymbolKind(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=0,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
             use_symbols=True,
         )
         self.assertEqual(len(kinds), 2)
@@ -3322,6 +3649,230 @@ class TestReductionIdentityValues(unittest.TestCase):
         from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 
         self.assertEqual(self._identity(BATCH_MATMUL_OP), 0)
+
+
+# ===========================================================================
+# TestReorderUnhintedInterlopers
+# ===========================================================================
+
+
+def _make_rui_op(name, reads=(), hint_ids=(), mutates=()):
+    """Return a fake ComputedBuffer for reorder_unhinted_interlopers tests.
+
+    ``reads`` is an iterable of buffer names this op reads.
+    ``hint_ids`` is an iterable of hint-id integers; empty means unhinted.
+    ``mutates`` is an iterable of buffer names this op mutates in-place.
+    """
+    from torch._inductor.ir import ComputedBuffer
+    from torch_spyre._inductor.propagate_hints import DimHint
+
+    op = MagicMock(spec=ComputedBuffer)
+    op.get_name.return_value = name
+    op.get_read_names.return_value = OrderedSet(reads)
+    op.get_mutation_names.return_value = list(mutates)
+    if hint_ids:
+        op.dim_hints = [
+            DimHint(
+                dim_names=["d0"],
+                split_count=1,
+                loop_var=None,
+                is_reduction=False,
+                hint_id=hid,
+            )
+            for hid in hint_ids
+        ]
+    else:
+        op.dim_hints = []
+    return op
+
+
+def _make_rui_non_computed(name):
+    """Return a fake non-ComputedBuffer operation.
+
+    Uses an unspec'd MagicMock so isinstance(..., ComputedBuffer) is False,
+    which causes reorder_unhinted_interlopers to treat it as an immovable
+    boundary that breaks any hint-group run.
+    """
+    op = MagicMock()
+    op.get_name.return_value = name
+    return op
+
+
+class TestReorderUnhintedInterlopers(unittest.TestCase):
+    """reorder_unhinted_interlopers moves unhinted ops out of hint-group runs."""
+
+    def _run(self, ops):
+        from torch_spyre._inductor.coarse_tile import reorder_unhinted_interlopers
+
+        graph = SimpleNamespace(operations=list(ops))
+        reorder_unhinted_interlopers(graph)
+        return [op.get_name() for op in graph.operations]
+
+    def test_no_ops(self):
+        self.assertEqual(self._run([]), [])
+
+    def test_all_hinted_unchanged(self):
+        a = _make_rui_op("a", hint_ids=(0,))
+        b = _make_rui_op("b", hint_ids=(0,))
+        self.assertEqual(self._run([a, b]), ["a", "b"])
+
+    def test_all_unhinted_unchanged(self):
+        a = _make_rui_op("a")
+        b = _make_rui_op("b")
+        self.assertEqual(self._run([a, b]), ["a", "b"])
+
+    def test_interloper_moved_before_run(self):
+        # [hinted, unhinted, hinted] → [unhinted, hinted, hinted]
+        # unhinted has no data deps; move before is preferred.
+        a = _make_rui_op("a", hint_ids=(0,))
+        x = _make_rui_op("x")  # interloper
+        b = _make_rui_op("b", hint_ids=(0,))
+        self.assertEqual(self._run([a, x, b]), ["x", "a", "b"])
+
+    def test_interloper_blocked_move_before_reads_hinted(self):
+        # x reads a's output → cannot move before a; try move-after.
+        a = _make_rui_op("a", hint_ids=(0,))
+        x = _make_rui_op("x", reads=("a",))
+        b = _make_rui_op("b", hint_ids=(0,))
+        self.assertEqual(self._run([a, x, b]), ["a", "b", "x"])
+
+    def test_interloper_move_after_blocked_by_hinted_reader(self):
+        # x reads a (blocks move-before) AND b reads x (blocks move-after) → error.
+        a = _make_rui_op("a", hint_ids=(0,))
+        x = _make_rui_op("x", reads=("a",))
+        b = _make_rui_op("b", reads=("x",), hint_ids=(0,))
+        c = _make_rui_op("c", hint_ids=(0,))
+        with self.assertRaises(RuntimeError):
+            self._run([a, x, b, c])
+
+    def test_interloper_blocked_both_directions(self):
+        # x reads a (blocks move-before) AND b reads x (blocks move-after) → error.
+        a = _make_rui_op("a", hint_ids=(0,))
+        x = _make_rui_op("x_out", reads=("a",))
+        b = _make_rui_op("b", reads=("x_out",), hint_ids=(0,))
+        with self.assertRaises(RuntimeError):
+            self._run([a, x, b])
+
+    def test_non_computed_buffer_breaks_run(self):
+        # A non-ComputedBuffer between two hinted ops cannot be reordered.
+        a = _make_rui_op("a", hint_ids=(0,))
+        extern = _make_rui_non_computed("extern")
+        b = _make_rui_op("b", hint_ids=(0,))
+        self.assertEqual(self._run([a, extern, b]), ["a", "extern", "b"])
+
+    def test_differently_hinted_breaks_run(self):
+        # An op with a different hint_id is not a candidate for reordering.
+        a = _make_rui_op("a", hint_ids=(0,))
+        c = _make_rui_op("c", hint_ids=(1,))
+        b = _make_rui_op("b", hint_ids=(0,))
+        self.assertEqual(self._run([a, c, b]), ["a", "c", "b"])
+
+    def test_multiple_interlopers_all_moveable_before(self):
+        # [H, U1, U2, H] with no deps → both move before.
+        a = _make_rui_op("a", hint_ids=(0,))
+        x = _make_rui_op("x")
+        y = _make_rui_op("y")
+        b = _make_rui_op("b", hint_ids=(0,))
+        self.assertEqual(self._run([a, x, y, b]), ["x", "y", "a", "b"])
+
+    def test_multiple_interlopers_second_depends_on_first(self):
+        # y reads x → x can move before, but then y reads x which is now
+        # before the run start → y can also move before (after x).
+        a = _make_rui_op("a", hint_ids=(0,))
+        x = _make_rui_op("x")
+        y = _make_rui_op("y", reads=("x",))
+        b = _make_rui_op("b", hint_ids=(0,))
+        result = self._run([a, x, y, b])
+        # x moves before, then y (reads x, which is now before run_start)
+        # — y's reads are not produced by any op in run_start..j-1 after x moved.
+        self.assertEqual(result, ["x", "y", "a", "b"])
+
+    def test_trailing_consumer_not_error(self):
+        # Unhinted op after the run that reads run outputs — trailing consumer,
+        # not an interloper.  No hinted ops follow it so it should not raise.
+        a = _make_rui_op("a", hint_ids=(0,))
+        b = _make_rui_op("b", hint_ids=(0,))
+        x = _make_rui_op("x", reads=("a", "b"))
+        self.assertEqual(self._run([a, b, x]), ["a", "b", "x"])
+
+    def test_interloper_at_start_of_list(self):
+        # Unhinted op before any hinted op — no run started yet, nothing to do.
+        x = _make_rui_op("x")
+        a = _make_rui_op("a", hint_ids=(0,))
+        self.assertEqual(self._run([x, a]), ["x", "a"])
+
+    def test_move_after_multiple_trailing_hinted(self):
+        # [H, U, H, H] where U reads nothing and no one reads U:
+        # move-before is legal and preferred over move-after.
+        a = _make_rui_op("a", hint_ids=(0,))
+        x = _make_rui_op("x")
+        b = _make_rui_op("b", hint_ids=(0,))
+        c = _make_rui_op("c", hint_ids=(0,))
+        self.assertEqual(self._run([a, x, b, c]), ["x", "a", "b", "c"])
+
+    def test_move_after_op_follows_run(self):
+        # [H, U(reads H), H, H, V(reads U)] — move-before blocked (x reads a);
+        # move-after should land x just after c, before d.
+        # Catches the pop-then-insert off-by-one: insert must be at run_end-1
+        # not run_end after the pop shifts indices.
+        a = _make_rui_op("a", hint_ids=(0,))
+        x = _make_rui_op("x", reads=("a",))
+        b = _make_rui_op("b", hint_ids=(0,))
+        c = _make_rui_op("c", hint_ids=(0,))
+        d = _make_rui_op("d", reads=("x",))  # unhinted, reads x — after run
+        self.assertEqual(self._run([a, x, b, c, d]), ["a", "b", "c", "x", "d"])
+
+    def test_interloper_with_unhinted_gap_before_next_hinted(self):
+        # [H, U(reads H), V(unhinted), H2] — run_end must span past V to H2.
+        # Without this fix, run_end collapses to j+1=V and move-after is a
+        # silent no-op that leaves U in place with no error.
+        a = _make_rui_op("a", hint_ids=(0,))
+        x = _make_rui_op("x", reads=("a",))  # blocked from moving before
+        v = _make_rui_op("v")  # another unhinted op (no deps)
+        a2 = _make_rui_op("a2", hint_ids=(0,))
+        # v has no deps and moves before the run; x (reads a) cannot move before
+        # but can move after a2 (run_end spans past v to a2).
+        self.assertEqual(self._run([a, x, v, a2]), ["v", "a", "a2", "x"])
+
+    def test_non_contiguous_run_multiple_interlopers(self):
+        # [H, U1(reads H), H2, U2, H3] — U1 cannot move before (reads a);
+        # move-after must span to H3 (the last same-key op), not just H2.
+        # Without the fix U1 moves to between H2 and U2, still splitting [H3].
+        # With the fix: u1 moves after c (run_end spans to c); u2 then moves
+        # before the run; result is one contiguous hinted block [a, b, c].
+        a = _make_rui_op("a", hint_ids=(0,))
+        u1 = _make_rui_op("u1", reads=("a",))
+        b = _make_rui_op("b", hint_ids=(0,))
+        u2 = _make_rui_op("u2")
+        c = _make_rui_op("c", hint_ids=(0,))
+        self.assertEqual(self._run([a, u1, b, u2, c]), ["u2", "a", "b", "c", "u1"])
+
+    def test_two_interlopers_both_move_after(self):
+        # [H(a), U1(reads a), U2(reads a), H(b), H(c)]
+        # U1 and U2 both read 'a' so neither can move before the run.
+        # Both have no dependents in the remaining hinted ops so both can
+        # move after.  After U1 moves after c, U2 is encountered next; it
+        # also reads a (blocked from moving before) and can move after c.
+        # Verifies the chained move-after path for consecutive interlopers.
+        a = _make_rui_op("a", hint_ids=(0,))
+        u1 = _make_rui_op("u1", reads=("a",))
+        u2 = _make_rui_op("u2", reads=("a",))
+        b = _make_rui_op("b", hint_ids=(0,))
+        c = _make_rui_op("c", hint_ids=(0,))
+        # u1 is processed first and moves after c; u2 is processed next and
+        # also moves after c (now at index 3), landing between c and u1.
+        self.assertEqual(self._run([a, u1, u2, b, c]), ["a", "b", "c", "u2", "u1"])
+
+    def test_mutating_interloper_blocked(self):
+        # x mutates buffer 'a' produced by a hinted op; x cannot legally move
+        # before the run (would run before 'a' is produced) and b reads x so
+        # x cannot move after — should raise RuntimeError.
+        a = _make_rui_op("a", hint_ids=(0,))
+        x = _make_rui_op("x", mutates=("a",))  # mutation dep on a
+        b = _make_rui_op("b", reads=("x",), hint_ids=(0,))
+        c = _make_rui_op("c", hint_ids=(0,))
+        with self.assertRaises(RuntimeError):
+            self._run([a, x, b, c])
 
 
 if __name__ == "__main__":

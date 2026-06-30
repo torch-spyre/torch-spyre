@@ -67,14 +67,22 @@ from torch._inductor.ir import (
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
+from torch_spyre._C import SpyreTensorLayout
+
 from .constants import BATCH_MATMUL_OP
+from .errors import Unsupported
 from .logging_utils import get_inductor_logger
 from .loop_info import CoarseTileInfo
-from .propagate_hints import get_op_hints
+from .propagate_hints import DimHint, get_op_hints
 from .pass_utils import op_out_coords
+from .span_overflow_hint_analysis import plan_span_overflow_tile
+from .ir import FixedTiledLayout
 
 logger = get_inductor_logger("coarse_tile")
 hints_logger = get_inductor_logger("assign_dim_hints")
+
+
+_SPAN_OVERFLOW_HINT_ID = 10000
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +125,172 @@ def _hints_levels(ops: list[Operation]) -> list[tuple]:
     return []
 
 
+def _hint_key(op: Operation) -> frozenset | None:
+    """Return the frozenset of hint_ids on op, or None if op has no hints."""
+    if not isinstance(op, ComputedBuffer):
+        return None
+    hints = getattr(op, "dim_hints", [])
+    return frozenset(h.hint_id for h in hints) if hints else None
+
+
+def _written_names(op: ComputedBuffer) -> set[str]:
+    """Return all buffer names written by op: its output plus any mutation targets."""
+    return {op.get_name()} | set(op.get_mutation_names())
+
+
+def _no_dep_conflict(op: ComputedBuffer, others: list[Operation]) -> bool:
+    """Return True if moving op past every op in others introduces no data-flow hazard.
+
+    A conflict exists if any op in others reads or mutates a buffer written by op,
+    or if op reads or mutates a buffer written by any op in others.
+
+    op_needs intentionally includes op.get_mutation_names() alongside read names.
+    This covers both RAW (op reads a buffer that other writes) and WAW (op mutates
+    a buffer that other also writes) hazards.  The WAW case is conservative: two
+    ops mutating the same buffer cannot be reordered safely regardless of direction,
+    so conflating them here is deliberate.
+    """
+    op_written = _written_names(op)
+    op_needs = op.get_read_names() | set(op.get_mutation_names())
+    for other in others:
+        if not isinstance(other, ComputedBuffer):
+            continue
+        if op_written & other.get_read_names():
+            return False
+        if _written_names(other) & op_needs:
+            return False
+    return True
+
+
+def _can_move_before(
+    op: Operation,
+    ops: list[Operation],
+    start: int,
+    end: int,
+) -> bool:
+    """Return True if op (at ops[end]) can move to just before ops[start].
+
+    Legal iff no data-flow conflict exists between op and ops[start..end-1].
+    """
+    # Defensive: _no_dep_conflict requires a ComputedBuffer; the sole caller
+    # (reorder_unhinted_interlopers) already filters for this, but guard here
+    # in case the function is called from a future context.
+    if not isinstance(op, ComputedBuffer):
+        return False
+    return _no_dep_conflict(op, ops[start:end])
+
+
+def _can_move_after(
+    op: Operation,
+    ops: list[Operation],
+    start: int,
+    end: int,
+) -> bool:
+    """Return True if op (at ops[start]) can move to just after ops[end-1].
+
+    Legal iff no data-flow conflict exists between op and ops[start+1..end-1].
+    """
+    # Defensive: same rationale as _can_move_before.
+    if not isinstance(op, ComputedBuffer):
+        return False
+    return _no_dep_conflict(op, ops[start + 1 : end])
+
+
+def reorder_unhinted_interlopers(graph: GraphLowering) -> None:
+    """Move unhinted ComputedBuffer ops that interrupt hint-group runs.
+
+    ``hints_to_coarse_tile_groups`` treats unhinted ops as run-breakers.
+    This pass attempts to move each such op either just before the run it
+    splits or just after the last same-key op in the remainder, so the run
+    becomes contiguous.
+
+    Algorithm — two-cursor scan over ops:
+
+    Outer cursor i: start of the next candidate run.  Advances to j when
+    the inner loop exits.
+
+    Inner cursor j: walks forward from i+1 building the run.  For each
+    op at ops[j]:
+      - Same hint key → absorb into run; j += 1.
+      - Non-ComputedBuffer or differently-hinted → hard stop; break.
+      - Unhinted ComputedBuffer (interloper) → one of three outcomes:
+          (a) Move before: insert at run_start, run_start += 1, j stays
+              (the rotate shifts subsequent ops left so ops[j] is fresh).
+          (b) Move after: pop(j), insert at run_end-1, j stays.
+          (c) Neither legal → RuntimeError.
+        run_end is the index one past the *last* same-key op in ops[j+1:],
+        found by scanning backward.  Using the last op (not just the next)
+        ensures the move-after target span covers the full remaining run,
+        which matters when interlopers further right would otherwise still
+        split the run.
+
+    When the inner loop exits, j points to the first op that could not be
+    absorbed — a hard-stop or end-of-list.  Advancing i to j (not i+1)
+    is correct because everything before j has already been processed.
+
+    A move is legal when it introduces no new data-flow violation:
+    no op in the skipped range reads or mutates the moved op's written
+    buffers, and the moved op reads or mutates no buffer written in the
+    skipped range.
+
+    When both directions are legal the op is moved before the run (closer
+    to its original position).
+
+    Raises RuntimeError if an interloper cannot be moved in either
+    direction (data-flow dependencies anchor it between hinted ops that
+    share the same hint key).
+    """
+    ops = graph.operations
+    i = 0
+    while i < len(ops):
+        op = ops[i]
+        key = _hint_key(op)
+        if key is None:
+            i += 1
+            continue
+
+        run_start = i
+        j = i + 1
+        while j < len(ops):
+            candidate = ops[j]
+            ckey = _hint_key(candidate)
+            if ckey == key:
+                j += 1
+                continue
+            if not isinstance(candidate, ComputedBuffer) or ckey is not None:
+                break
+            # candidate is an unhinted ComputedBuffer interloper.
+            # Scan backward for the last same-key op; run_end is one past it.
+            # O(n) per interloper → O(n²) overall; acceptable for small graphs.
+            run_end = None
+            for k in range(len(ops) - 1, j, -1):
+                if _hint_key(ops[k]) == key:
+                    run_end = k + 1
+                    break
+            # No same-key op exists after j: trailing consumer, not an
+            # interloper — end the run silently.
+            if run_end is None:
+                break
+            if _can_move_before(candidate, ops, run_start, j):
+                ops.insert(run_start, ops.pop(j))
+                run_start += 1  # skip past the op we just inserted before the run
+                continue
+            if _can_move_after(candidate, ops, j, run_end):
+                # pop(j) shifts everything after j left by one, so the last
+                # same-key op (formerly run_end-1) is now at run_end-2.
+                # Insert at run_end-1 to land just after that last hinted op.
+                ops.insert(run_end - 1, ops.pop(j))
+                continue
+            run_ops = [ops[k].get_name() for k in range(run_start, j)]
+            raise RuntimeError(
+                f"Cannot reorder unhinted op '{candidate.get_name()}': "
+                f"data-flow deps prevent moving it before or after the "
+                f"hint-group run [{', '.join(run_ops)}] "
+                f"(hint_ids={sorted(key)})"
+            )
+        i = j
+
+
 def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
     """Build coarse_tile() groups from op.dim_hints (set by assign_dim_hints).
 
@@ -145,9 +319,7 @@ def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
 
     operations = graph.operations
     for op in operations:
-        if not isinstance(op, ComputedBuffer):
-            continue
-        key = frozenset(h.hint_id for h in getattr(op, "dim_hints", [])) or None
+        key = _hint_key(op)
 
         if key is not None and key == current_key:
             current_ops.append(op)
@@ -219,6 +391,97 @@ def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
         if pending_ungrouped:
             summary_lines.append(f"  ungrouped: [{', '.join(pending_ungrouped)}]")
         hints_logger.info("%s", "\n".join(summary_lines))
+
+    return groups
+
+
+def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
+    """Build coarse_tile() groups from automatic span-overflow plans.
+
+    This adapter converts a SpanOverflowTilePlan into the same group shape as
+    user spyre_hint annotations: ``[([op], [(hint_id, count, is_reduction)])]``.
+    Ops that already carry user hints are left for the user-hint grouping path.
+    """
+    from . import config
+
+    if config.chunk_large_tensors or config.ignore_span_overflow_hints:
+        return []
+
+    groups: list[tuple] = []
+    next_hint_id = _SPAN_OVERFLOW_HINT_ID
+
+    for op in graph.operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        if not isinstance(op.data, Pointwise):
+            continue
+        if not isinstance(op.layout, FixedTiledLayout):
+            continue
+        if getattr(op, "dim_hints", []):
+            continue
+
+        plan = plan_span_overflow_tile(op, config.sencores)
+        if plan is None:
+            continue
+
+        out_coords = op_out_coords(op)
+        hints: list[DimHint] = []
+        levels: list[tuple] = []
+        level_summary: list[tuple[int, int]] = []
+
+        planned_levels = [(plan.selected_host_dim, plan.split_count, plan.is_reduction)]
+
+        for host_dim, split_count, is_reduction in planned_levels:
+            if host_dim >= len(out_coords):
+                raise Unsupported(
+                    f"Cannot adapt span-overflow plan for {op.get_name()}: "
+                    f"host_dim={host_dim} is out of bounds for "
+                    f"{len(out_coords)} output coordinates."
+                )
+
+            coord = out_coords[host_dim]
+            free_symbols = coord.free_symbols
+            if len(free_symbols) != 1:
+                raise Unsupported(
+                    f"Cannot adapt span-overflow plan for {op.get_name()}: "
+                    f"host_dim={host_dim} output coordinate {coord} has "
+                    f"{len(free_symbols)} free symbols; expected exactly one loop var."
+                )
+
+            hint_id = next_hint_id
+            next_hint_id += 1
+            loop_var = next(iter(free_symbols))
+            hints.append(
+                DimHint(
+                    dim_names=["_span_overflow"],
+                    split_count=split_count,
+                    loop_var=loop_var,
+                    is_reduction=is_reduction,
+                    hint_id=hint_id,
+                )
+            )
+            levels.append(
+                (
+                    hint_id,
+                    sympy.Integer(split_count),
+                    is_reduction,
+                )
+            )
+            level_summary.append((host_dim, split_count))
+
+        if not levels:
+            continue
+
+        op.dim_hints = hints  # type: ignore[attr-defined]
+        groups.append(([op], levels))
+
+        logger.info(
+            "span_overflow_groups: op %s levels=%s total=%.2fGB per_core_span=%.2fMB",
+            op.get_name(),
+            level_summary,
+            plan.chunking_info.total_bytes / (1024**3),
+            plan.chunking_info.per_core_span / (1024**2),
+        )
 
     return groups
 
@@ -369,7 +632,7 @@ def _reduction_tiling_is_on_stick_dim(op: ComputedBuffer, red_dim_idx: int) -> b
         return False
     # device_coordinates[-1] is the within-stick coordinate expression.
     # If red_sym appears in its free symbols, the reduction is on the stick dim.
-    stick_coord = device_coordinates(in_buf.layout.device_layout, in_dep)[-1]
+    stick_coord = device_coordinates(in_buf.layout.device_layout, in_dep, None)[-1]
     return red_sym in stick_coord.free_symbols
 
 
@@ -663,26 +926,39 @@ def _allocate_full_buffer(
         stride = stride * s
 
     if isinstance(orig_layout, FixedTiledLayout):
-        # Rebuild SpyreTensorLayout for the full size, preserving the
-        # within-stick dimension from the original per-tile layout.
-        orig_stl = orig_layout.device_layout
-        sm_last = int(list(orig_stl.stride_map)[-1])
-        full_strides_ints = [int(s) for s in strides]
+        # Derive the full buffer's device layout from the per-tile layout by
+        # scaling device_size entries up to the full host size.  The stick
+        # orientation (dim_order / element_arrangement) is propagated verbatim
+        # from orig_layout — both buffers must agree on physical layout so the
+        # scatter copy op computes correct device addresses.
         full_size_ints = [int(s) for s in full_ranges]
-        within_stick_dim = next(
-            (i for i, s in enumerate(full_strides_ints) if s == sm_last), None
-        )
-        if within_stick_dim is None:
-            within_stick_dim = len(full_size_ints) - 1
-        ndim = len(full_size_ints)
-        dim_order = [i for i in range(ndim) if i != within_stick_dim] + [
-            within_stick_dim
-        ]
-        from torch_spyre._C import SpyreTensorLayout
-
-        device_layout = SpyreTensorLayout(
-            full_size_ints, full_strides_ints, dtype, dim_order
-        )
+        tile_size_ints = [int(s) for s in orig_layout.size]
+        try:
+            device_layout = _resize_device_layout(
+                orig_layout.device_layout,
+                tile_size_ints,
+                full_size_ints,
+            )
+        except RuntimeError:
+            # Non-standard device layout (e.g. post-restickify HBM strides that
+            # don't correspond to contiguous host strides).  Fall back to a
+            # default row-major allocation, preserving element_arrangement.
+            logger.debug(
+                "_allocate_full_buffer: _resize_device_layout could not classify "
+                "%r (tile_size=%s full_size=%s); using row-major fallback",
+                orig_layout.device_layout,
+                tile_size_ints,
+                full_size_ints,
+            )
+            ndim_full = len(full_size_ints)
+            full_strides_ints = [int(s) for s in strides]
+            device_layout = SpyreTensorLayout(
+                full_size_ints,
+                full_strides_ints,
+                dtype,
+                list(range(ndim_full)),
+                orig_layout.device_layout.element_arrangement,
+            )
     else:
         device_layout = generic_layout(full_buf)
 
@@ -977,7 +1253,6 @@ def _propagate_tiled_reduction_op(
         FixedTiledLayout,
         SpyreConstantFallback,
     )  # deferred: avoids circular import
-    from torch_spyre._C import SpyreTensorLayout  # deferred: avoids circular import
 
     scalar_op = SpyreConstantFallback(
         torch.ops.spyre.constant.default, float(identity), dtype, device
@@ -1217,6 +1492,216 @@ def _stamp_group(
         )
 
 
+def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: list[int]):
+    """Derive a new SpyreTensorLayout for a resized host buffer.
+
+    Used in two directions:
+
+    * **shrink** (``_divide_ranges``): the buffer is the same physical
+      allocation; coarse tiling narrows the per-tile iteration range.
+      ``device_size`` entries for non-stick dims shrink to reflect the smaller
+      per-tile extents.
+    * **grow** (``_allocate_full_buffer``): a full-sized scatter-target buffer
+      is allocated to match a per-tile source.  ``device_size`` entries grow
+      back to the full extent.  The stick orientation (transposed vs row-major,
+      ``element_arrangement``) is propagated verbatim so both buffers agree on
+      physical layout and scatter-copy address arithmetic is correct.
+
+    ``stride_map`` semantics: a value of ``-1`` means "this device dimension has
+    extent 1 and is never stepped through; its stride is undefined."  When
+    growing back from a singleton (``orig_sm[j] == -1``), the stride is
+    recomputed from the new host stride (the rescue arm in Passes 2–4).  For
+    non-contiguous (transposed / col-major) dims, the *physical* stride on
+    device is invariant to resizing, so it is left unchanged.
+
+    Device-dim classification (as produced by ``get_generic_stick_layout``):
+
+    * **inner stick** (always ``j == ndev-1``) — ``device_size`` is always
+      ``elems_per_stick``; left unchanged.  ``stride_map`` updated only if the
+      stick host dim is contiguous or was a singleton.
+    * **non-stick dim** — one device dim per non-stick host dim.  Matched to
+      host dim ``p`` by size (``device_size[j] == old_host_size[p]``), with
+      ``stride_map[j]`` used as a tiebreaker when two host dims share the same
+      size.  ``device_size`` updated to ``new_host_size[p]``.  ``stride_map``
+      updated iff ``orig_sm[j] == old_hs[p]`` (contiguous) or ``== -1``
+      (was a singleton being grown).
+    * **stick tile-count** — ``ceil(old_host_size[p*] / eps)`` device elements
+      spanning the stick host dim ``p*``.  Updated to
+      ``ceil(new_host_size[p*] / eps)``.  Same stride-update rule as non-stick.
+    * **singleton** (``device_size == 1, stride_map == -1``) — either a sparse
+      placeholder (no corresponding host dim) or a non-stick dim tiled to
+      extent 1.  Left as-is when there is no host dim to match; matched by
+      size-1 to a host dim of size 1 when one exists (grow path from singleton).
+
+    ``p*`` (the stick host dim) is identified by elimination: the unique host
+    dim *not* matched as a non-stick dim.  When a reduction collapses the stick
+    axis, all host dims are matched as non-stick and ``pstar`` is ``None``; in
+    that case Passes 3 and 4 are skipped (tile-count and inner-stick entries are
+    frozen at their collapsed values).
+
+    Multi-pass algorithm:
+
+    * **Pass 1**: match non-inner-stick device dims to host dims by size.
+      Size-1 dims match only to host dims of size 1.  Size > 1 dims match by
+      ``device_size == old_host_size[p]``, with stride as tiebreaker when sizes
+      collide.  Unmatched dims are candidates for tile-count.
+    * **Pass 1b**: fix tile-count / size collisions.  When
+      ``ceil(old_host_size[p*] / eps) == old_host_size[q]`` for some non-stick
+      dim ``q``, the tile-count dim and dim ``q`` have the same size and Pass 1
+      may have provisionally claimed the tile-count dim as a non-stick dim.
+      Pass 1b corrects this after ``p*`` is provisionally known: a provisional
+      match is reclassified as tile-count when its stride also mismatches the
+      expected contiguous non-stick stride.
+    * **Pass 2**: update non-stick dims (``matched_host``).
+    * **Pass 3**: validate and update tile-count dims (``unmatched_j``).
+    * **Pass 4**: update inner stick (``j == ndev-1``).
+
+    ``device_dtype`` and ``element_arrangement`` are copied verbatim from
+    ``orig_stl``, preserving EXX2/QFP8/DL16 layouts.
+
+    Raises ``RuntimeError`` if any non-stick device dim matches ambiguously, or
+    if the stick host dim cannot be uniquely determined by elimination.
+    """
+    from torch._inductor.ir import FlexibleLayout
+
+    orig_sm = list(orig_stl.stride_map)
+    orig_ds = list(orig_stl.device_size)
+    eps = orig_stl.elems_per_stick()
+    ndev = len(orig_sm)
+    ndim = len(old_host_size)
+
+    old_hs = [int(s) for s in FlexibleLayout.contiguous_strides(old_host_size)]
+    new_hs = [int(s) for s in FlexibleLayout.contiguous_strides(new_host_size)]
+
+    new_ds = list(orig_ds)
+    new_sm = list(orig_sm)
+
+    # Pass 1: see docstring.
+    matched_host = {}  # j → p (non-stick matches, provisional for size>1)
+    unmatched_j = []  # device dims not matched → tile-count / placeholder
+
+    for j in range(ndev - 1):  # j == ndev-1 is always inner stick
+        dsz = orig_ds[j]
+        if dsz == 1:
+            size1_cands = [p for p in range(ndim) if old_host_size[p] == 1]
+            if len(size1_cands) == 1:
+                matched_host[j] = size1_cands[0]
+            # else: sparse placeholder with no host counterpart — skip silently.
+        else:
+            size_cands = [p for p in range(ndim) if old_host_size[p] == dsz]
+            if len(size_cands) == 1:
+                # provisional; may be reclassified as tile-count in Pass 1b
+                matched_host[j] = size_cands[0]
+            elif len(size_cands) > 1:
+                stride_cands = [p for p in size_cands if old_hs[p] == orig_sm[j]]
+                if len(stride_cands) == 1:
+                    matched_host[j] = stride_cands[0]
+                else:
+                    unmatched_j.append(j)
+            else:
+                unmatched_j.append(j)  # no size match → tile-count
+
+    # Provisional pstar by elimination (before Pass 1b corrections).
+    def _find_pstar(matched):
+        matched_p = set(matched.values())
+        unmatched_all = [p for p in range(ndim) if p not in matched_p]
+        if not unmatched_all:
+            return None, unmatched_all
+        pstar_cands = [p for p in unmatched_all if old_host_size[p] > 1]
+        if not pstar_cands:
+            pstar_cands = unmatched_all
+        if len(pstar_cands) != 1:
+            return None, unmatched_all  # ambiguous
+        return pstar_cands[0], unmatched_all
+
+    pstar_provisional, _ = _find_pstar(matched_host)
+
+    # Pass 1b: reclassify tile-count/size collisions; see docstring.
+    if pstar_provisional is not None:
+        expected_tc = -(-old_host_size[pstar_provisional] // eps)
+        for j in list(matched_host):
+            p = matched_host[j]
+            if orig_ds[j] > 1 and orig_sm[j] != old_hs[p] and orig_ds[j] == expected_tc:
+                del matched_host[j]
+                unmatched_j.append(j)
+
+    # Final pstar after Pass 1b corrections.
+    matched_p = set(matched_host.values())
+    unmatched_all = [p for p in range(ndim) if p not in matched_p]
+    pstar: int | None
+    if not unmatched_all:
+        # Reduction output: stick dim eliminated, pstar=None.
+        # unmatched_j must be empty — no device dims should be unclaimed.
+        if unmatched_j:
+            raise RuntimeError(
+                f"_resize_device_layout: stick host dim is absent from "
+                f"old_host_size={old_host_size} but device dims {unmatched_j} "
+                f"could not be matched as non-stick dims in {orig_stl!r}. "
+                f"This layout is not supported by the device-native reconstruction."
+            )
+        pstar = None
+    else:
+        pstar_cands = [p for p in unmatched_all if old_host_size[p] > 1]
+        if not pstar_cands:
+            pstar_cands = unmatched_all
+        if len(pstar_cands) != 1:
+            raise RuntimeError(
+                f"_resize_device_layout: cannot uniquely identify the stick host dim "
+                f"by elimination in {orig_stl!r} (old_host_size={old_host_size}); "
+                f"unmatched host dims={unmatched_all} "
+                f"(non-singleton candidates={pstar_cands}), "
+                f"non-stick device dims={matched_host}. "
+                f"This layout is not supported by the device-native reconstruction."
+            )
+        pstar = pstar_cands[0]
+
+    # Pass 2: update non-stick dims.
+    for j, p in matched_host.items():
+        new_ds[j] = new_host_size[p]
+        if new_host_size[p] == 1:
+            new_sm[j] = -1
+        elif orig_sm[j] == old_hs[p] or orig_sm[j] == -1:
+            new_sm[j] = new_hs[p]
+        # else: non-contiguous stride; physical layout is invariant — leave unchanged.
+
+    if pstar is None:  # reduction output: tile-count / inner-stick entries frozen
+        return SpyreTensorLayout(
+            new_ds, new_sm, orig_stl.device_dtype, orig_stl.element_arrangement
+        )
+
+    # Pass 3: update tile-count dims (unmatched_j — all must equal expected tile-count).
+    for j in unmatched_j:
+        expected_tc = -(-old_host_size[pstar] // eps)  # ceil division
+        if orig_ds[j] != expected_tc:
+            raise RuntimeError(
+                f"_resize_device_layout: device dim {j} "
+                f"(stride_map={orig_sm[j]}, device_size={orig_ds[j]}) was not "
+                f"matched as a non-stick dim and does not equal the expected "
+                f"tile-count {expected_tc} for stick host dim {pstar} "
+                f"(old_host_size={old_host_size}) in {orig_stl!r}. "
+                f"This layout is not supported by the device-native reconstruction."
+            )
+        new_ds[j] = -(-new_host_size[pstar] // eps)  # ceil division
+        if new_host_size[pstar] == 1:
+            new_sm[j] = -1
+        elif orig_sm[j] == eps * old_hs[pstar] or orig_sm[j] == -1:
+            # tile-count stride = eps * contiguous stride of the stick host dim
+            new_sm[j] = eps * new_hs[pstar]
+        # else: non-contiguous stick; physical stride invariant.
+
+    # Pass 4: inner stick (j == ndev-1) — device_size is always eps, update stride only.
+    j = ndev - 1
+    if new_host_size[pstar] == 1:
+        new_sm[j] = -1
+    elif orig_sm[j] == old_hs[pstar] or orig_sm[j] == -1:
+        new_sm[j] = new_hs[pstar]
+    # else: non-contiguous stick; physical stride invariant.
+
+    return SpyreTensorLayout(
+        new_ds, new_sm, orig_stl.device_dtype, orig_stl.element_arrangement
+    )
+
+
 def _divide_ranges(
     op: ComputedBuffer,
     loop_count: Expr,
@@ -1299,29 +1784,21 @@ def _divide_ranges(
     _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
     _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
 
-    # Rebuild SpyreTensorLayout for the new host size, preserving the
-    # within-stick dimension.  stride_map[-1] is the element stride of the
-    # within-stick host dimension in the original layout; match it against the
-    # new contiguous strides to identify which host dim remains the stick dim.
+    # Rebuild SpyreTensorLayout for the new host size using device-native
+    # reconstruction: transform the original device layout directly without
+    # guessing a dim_order.
     if not isinstance(layout, FixedTiledLayout):
         return
-    orig_stl = layout.device_layout
-    sm_last = int(list(orig_stl.stride_map)[-1])
-    new_strides_ints = [int(s) for s in layout.stride]
+    # Capture old/new sizes as ints here, after the FixedTiledLayout guard,
+    # so symbolic-size FixedLayout tests above are not affected.
+    # layout.size is already the new (divided) size; reconstruct the old size
+    # by multiplying tiled dims back up: old[i] = new[i] * loop_count.
+    old_host_size = [int(s) for s in layout.size]
+    for i in tiled_dims:
+        old_host_size[i] = int(new_size[i] * loop_count)
     new_size_ints = [int(s) for s in new_size]
-    within_stick_dim = next(
-        (i for i, s in enumerate(new_strides_ints) if s == sm_last), None
-    )
-    if within_stick_dim is None:
-        # Fall back to last dim (covers the common contiguous fp16 case where
-        # sm_last == 1 and the last stride is also 1).
-        within_stick_dim = len(new_size_ints) - 1
-    ndim = len(new_size_ints)
-    dim_order = [i for i in range(ndim) if i != within_stick_dim] + [within_stick_dim]
-    from torch_spyre._C import SpyreTensorLayout
-
-    layout.device_layout = SpyreTensorLayout(
-        new_size_ints, new_strides_ints, layout.dtype, dim_order
+    layout.device_layout = _resize_device_layout(
+        layout.device_layout, old_host_size, new_size_ints
     )
 
 

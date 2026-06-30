@@ -274,76 +274,94 @@ Pass 3 consults to skip already-divided ops.
 ### The cost equation
 
 The cost is an estimated runtime in microseconds for a matmul running
-with a given `(b, m, n, k)` split:
+with a given `(b, m, n, k)` split. Every term is additive, with no
+multiplicative penalty:
 
 ```text
-cost(b, m, n, k) = (compute + hbm + psum + tie_break) × b^1.4
+cost(b, m, n, k) = compute + hbm + psum + shape_penalties + batch
 ```
 
-The four time terms are added together to estimate the kernel runtime.
-The batch penalty `b^1.4` multiplies the sum to penalise splitting
-batch across cores: batch items are independent and gain nothing from
-parallel execution across cores.
+`compute`, `hbm`, and `psum` model real kernel time. `shape_penalties`
+and `batch` are small additive terms that break ties between
+otherwise-equivalent splits. A split that uses zero cores or more than
+`max_cores` scores `inf`. Lower is better.
 
 :::{admonition} Advanced: cost-term details
 :class: note dropdown
 
-Each of the four time terms and the batch penalty in detail.
-
 **Compute time** is per-core work divided by per-core peak rate:
 
 ```text
-compute = (B·M·N·K / b·m·n·k) / (peak_MACs_per_core × pt_eff)
+compute = (B·M·N·K / (b·m·n·k)) / (peak_MACs_per_core × pt_eff)
 ```
 
 `pt_eff` drops below 1 when the per-core M slice is short. The PT array
-streams M in passes of 8 rows. Below the 8-pass target, pipeline
-startup and drain dominate, and effective throughput falls off as
-`sqrt(passes / 8)`.
+streams M in passes of `_PT_ROWS = 8` rows, and `pt_passes = (M/m) / 8`.
+Below the `_TARGET_PT_PASSES = 5` target, startup and drain overhead is
+amortised over too little work, so effective throughput falls off as
+`(pt_passes / 5) ** 0.25`.
 
 **HBM time** is bytes moved divided by aggregate LPDDR5 bandwidth,
 scaled by a cohort penalty:
 
 ```text
-hbm = (B·M·K + B·K·N + B·M·N) × 2 bytes / 204.8 GB/s × max(1, max(m, n) / 8)
+hbm = (B·M·K + W·K·N + B·M·N) × 2 bytes / 204.8 GB/s × cohort_penalty
 ```
 
-Each input is broadcast to the cores that split the orthogonal dim. Up
-to 8 cores share a broadcast for free. Past 8 cores, contention makes
-effective bandwidth fall off linearly with cohort size.
+`W` is `1` for a shared 2D weight and `B` for a true bmm (the weight is
+not replicated across batch). Each operand is broadcast to the cores
+that split the orthogonal dim; up to `_COHORT_LIMIT = 8` cores share a
+broadcast for free. Past that, contention makes effective bandwidth
+fall off as `cohort_penalty = (fanout / 8) ** 0.75`, where `fanout` is
+`n` for a true bmm and `max(m, n)` for a shared weight.
 
 **PSUM time** is the cost of a K-split reduction:
 
 ```text
-psum = (k − 1) × B·M·N × 1.4e-4 µs
+psum = max(0, k − 1) × (B·M·N / (b·m·n)) × psum_coeff
 ```
 
-A K-split requires `k − 1` ring hops, and every hop touches every
-output element. The term is zero when `k = 1`, which is why non-K
-splits are usually cheaper for matmuls that are not bandwidth-bound.
+A K-split spreads the reduction over `k` cores at the cost of `k − 1`
+partial-sum hops, charged per per-core output tile rather than the
+whole output. `psum_coeff` is `1.0e-3 µs` for a shared weight and
+`1.0e-4 µs` for a true bmm. The term is zero when `k = 1`, which is why
+non-K splits are usually cheaper for matmuls that are not
+bandwidth-bound.
 
-**Tie-break** weights the selection toward an m-split that matches
-the PT pipeline depth:
+**Shape and tie-break penalties** are several small additive terms that
+separate compute-equivalent splits and bias the planner away from kernel
+shapes the codegen handles poorly:
+
+- The M-lane underuse term adds `10 µs` per log2 step when the M split
+  exposes fewer M lanes than the target.
+- The M-tile underfill term adds `30 µs` per log2 step when per-core rows
+  fall below `_M_TILE_UNDERFILL_TARGET = 16`.
+- The wide-N term adds `25 µs` per log2 step when the per-core N tile
+  exceeds `_TARGET_N_TILE_ELEMS = 512` elements.
+- The value-matmul and shared-projection shape terms penalize splitting a
+  small output dim against a much larger reduction dim, using size ratios
+  rather than op names.
+- The core-underuse term adds a soft `150 µs` per log2 step below the full
+  core budget, so a lower-core split with good measured performance can
+  still win.
+
+The batch term adds a small overhead for a true-bmm batch split, because
+batch items are independent and gain nothing from being split across
+cores:
 
 ```text
-tie_break = |log2(m / m_target)| × 50 µs
+batch = log2(max(1, b)) × 10 µs        # 0 for a shared weight
 ```
 
-`m_target` is derived from `_TARGET_PT_PASSES` and the M dimension
-size. The tie-break term is small relative to the other three terms
-and only changes the choice when several splits are otherwise
-compute-equivalent.
+A shared-weight projection has no batch dim to split, so the term is
+zero.
 
-**Batch penalty.** The factor is `b^1.4`. It is multiplicative because
-batch items are independent and gain nothing from being split across
-cores. The exponent 1.4 is fit to bmm sweeps.
-
-**The constants.** Peak MAC rate per core, HBM bandwidth, cohort
-limit, PSUM cost per element, tie-break weight, and batch exponent
-are all defined at
-[`work_division.py:638–650`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py#L638).
-They are tuning knobs, not user configuration. The values are fit to
-measured Spyre behaviour and re-tuned across hardware revisions.
+The constants are defined at
+[`work_division.py:934–961`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py#L934):
+the peak MAC rate per core, HBM bandwidth, cohort limit and exponent,
+PSUM coefficients, the tie-break weights, and the batch penalty. They are
+internal tuning constants and are not user-configurable. The values are
+fit to measured Spyre behaviour and re-tuned across hardware revisions.
 :::
 
 ## Pass 3 — Work Distribution (`work_distribution`)
@@ -528,15 +546,17 @@ separate, so `spyre_hint(tiles={...})` and `spyre_hint(work_div={...})` can
 coexist in the same scope.
 
 When the work-division planner sees a resolved user hint, it validates the
-request and commits it directly instead of running the automatic priority-based
-distribution. For matmul reductions, a user hint also bypasses the analytic
-cost-model split selection; the hint takes ownership of the split decision.
-Validation checks that:
+request and commits the accepted splits directly instead of running the
+automatic priority-based distribution. Hinted dimensions are considered in user
+priority order. If adding a later split would exceed `SENCORES`, the compiler
+logs a warning and skips that split. For matmul reductions, a user hint also
+bypasses the analytic cost-model split selection; the hint takes ownership of
+the accepted split decision. Validation checks that:
 
 - every split value is a positive integer
-- the product of all requested splits does not exceed `SENCORES`
-- every split evenly divides the stick-adjusted dimension size
-- at most one reduction dimension is split
+- accepted splits do not exceed `SENCORES`
+- every accepted split evenly divides the stick-adjusted dimension size
+- at most one accepted reduction dimension is split
 
 User work-division hints are intentionally authoritative. If Pass 1
 (`span_reduction`) already committed minimum splits for the 256 MB span limit,

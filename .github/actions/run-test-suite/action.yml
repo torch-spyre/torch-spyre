@@ -4,6 +4,11 @@ description: >
   a stall watchdog, and DTLOG_LEVEL=Info on the final attempt.
 
 inputs:
+  torch_spyre_dir:
+    description: Path to the pre-cloned torch-spyre directory
+    required: false
+    type: string
+    default: torch-spyre
   suite_name:
     description: Human-readable label (used in echo/log output)
     required: true
@@ -14,10 +19,6 @@ inputs:
     description: Extra flags forwarded to run_test.sh (e.g. "-v")
     required: false
     default: ''
-  work_dir:
-    description: Directory to cd into before running (must have .venv)
-    required: false
-    default: /home/senuser/torch-spyre
   max_attempts:
     description: Total number of attempts before giving up
     required: false
@@ -42,6 +43,10 @@ inputs:
     description: Optional bash snippet run at the start of every attempt (e.g. topology reset)
     required: false
     default: ''
+  parallel:
+    description: Whether to pass --parallel to run_test.sh (disable for distributed torchrun tests)
+    required: false
+    default: 'true'
 
 runs:
   using: composite
@@ -49,6 +54,7 @@ runs:
     - name: Run ${{ inputs.suite_name }}
       shell: bash
       env:
+        TORCH_SPYRE_DIR: ${{ inputs.torch_spyre_dir }}
         MAX_ATTEMPTS: ${{ inputs.max_attempts }}
         STALL_TIMEOUT_SECS: ${{ inputs.stall_timeout_secs }}
         STALL_CHECK_INTERVAL: ${{ inputs.stall_check_interval }}
@@ -58,7 +64,11 @@ runs:
 
         source "$HOME/.bashrc"
         source /etc/profile.d/ibm-aiu-setup.sh
-        cd "${{ inputs.work_dir }}"
+
+        [[ "$TORCH_SPYRE_DIR" != /* ]] && TORCH_SPYRE_DIR="${PWD}/${TORCH_SPYRE_DIR}"
+        echo "TORCH_SPYRE_DIR $TORCH_SPYRE_DIR"
+        cd "$TORCH_SPYRE_DIR" || exit 1
+
         source .venv/bin/activate
 
         CONFIG="${{ inputs.config }}"
@@ -135,7 +145,12 @@ runs:
 
           exec {FIFO_FD}>"$FIFO"
 
-          env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" --parallel ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} \
+          _PARALLEL_FLAG=""
+          if [[ "${{ inputs.parallel }}" != "false" ]]; then
+            _PARALLEL_FLAG="--parallel"
+          fi
+
+          env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" ${_PARALLEL_FLAG} ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} \
             >&"$FIFO_FD" 2>&1 &
           TEST_PID=$!
 

@@ -14,17 +14,22 @@
 
 import logging
 import logging.handlers
+from types import SimpleNamespace
 from unittest.mock import patch as mock_patch
 
 import pytest
+from sympy import Integer, Symbol
 import torch
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code
 
 from torch_spyre._inductor import config, spyre_hint
+import torch_spyre._inductor.work_division as _wd
 import torch_spyre._inductor.propagate_named_dims as _pnd
 
 _LAUNCH_KERNEL = "torch_spyre.execution.kernel_runner.launch_kernel"
+_LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
+_PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
 
 
 _declare_tensor_dim = _pnd.declare_tensor_dim
@@ -60,6 +65,154 @@ class TestNamedWorkDivisionHint(InductorTestCase):
             any("user-hint" in msg for msg in logs),
             f"Expected user-hint work-division log, got: {logs}",
         )
+
+    def _fake_op(self, loop_var_dims):
+        return SimpleNamespace(
+            get_name=lambda: "fake_op",
+            work_div_loop_info=loop_var_dims,
+        )
+
+    def _fake_output_td(self, coord_vars):
+        return SimpleNamespace(device_coords=[*coord_vars, Integer(0)])
+
+    def test_resolve_work_div_hint_preserves_hint_order(self):
+        h = Symbol("H")
+        lq = Symbol("Lq")
+        lk = Symbol("Lk")
+        op = self._fake_op({h: ["H"], lq: ["Lq"], lk: ["Lk"]})
+
+        with mock_patch(
+            "torch_spyre._inductor.work_division.get_op_hints",
+            return_value={1: {"work_div": {"H": 4, "Lk": 8, "Lq": 8}}},
+        ):
+            splits = _wd._resolve_work_div_hint(op, {h: 64, lq: 512, lk: 512})
+
+        self.assertEqual(list(splits.items()), [(h, 4), (lk, 8), (lq, 8)])
+
+    def test_resolve_work_div_hint_filters_to_op_dims(self):
+        h = Symbol("H")
+        lk = Symbol("Lk")
+
+        def resolve(loop_var_dims, it_space):
+            op = self._fake_op(loop_var_dims)
+            with mock_patch(
+                "torch_spyre._inductor.work_division.get_op_hints",
+                return_value={1: {"work_div": {"H": 4, "Lq": 8, "Lk": 8}}},
+            ):
+                return _wd._resolve_work_div_hint(op, it_space)
+
+        self.assertEqual(
+            resolve({h: ["H"], lk: ["Lk"]}, {h: 64, lk: 512}),
+            {h: 4, lk: 8},
+        )
+        self.assertEqual(resolve({lk: ["Lk"]}, {lk: 512}), {lk: 8})
+
+    def test_apply_work_div_hint_prunes_splits_over_sencores(self):
+        h = Symbol("H")
+        lq = Symbol("Lq")
+        lk = Symbol("Lk")
+        op = self._fake_op({h: ["H"], lq: ["Lq"], lk: ["Lk"]})
+
+        splits = _wd._apply_user_hint(
+            op,
+            {h: 4, lq: 8, lk: 8},
+            {h: 64, lq: 512, lk: 512},
+            self._fake_output_td([h, lq, lk]),
+            max_cores=32,
+        )
+
+        self.assertEqual(splits, {h: 4, lq: 8})
+        logs = self._logs()
+        self.assertTrue(
+            any(
+                "skipping named dim(s)" in msg
+                and "fake_op" in msg
+                and "['Lk']" in msg
+                and "(split=8)" in msg
+                and "cores would be 256" in msg
+                and "SENCORES=32" in msg
+                for msg in logs
+            ),
+            f"Expected skipped split warning, got: {logs}",
+        )
+
+    def test_apply_work_div_hint_prunes_by_priority_order(self):
+        h = Symbol("H")
+        lq = Symbol("Lq")
+        lk = Symbol("Lk")
+        op = self._fake_op({h: ["H"], lq: ["Lq"], lk: ["Lk"]})
+
+        splits = _wd._apply_user_hint(
+            op,
+            {h: 4, lk: 8, lq: 8},
+            {h: 64, lq: 512, lk: 512},
+            self._fake_output_td([h, lq, lk]),
+            max_cores=32,
+        )
+
+        self.assertEqual(splits, {h: 4, lk: 8})
+        logs = self._logs()
+        self.assertTrue(
+            any("skipping named dim(s) ['Lq'] (split=8)" in msg for msg in logs),
+            f"Expected Lq skip warning, got: {logs}",
+        )
+
+    def test_apply_work_div_hint_invalid_split_value_raises_unit(self):
+        h = Symbol("H")
+        op = self._fake_op({h: ["H"]})
+
+        with self.assertRaisesRegex(Exception, "must be positive"):
+            _wd._apply_user_hint(
+                op,
+                {h: 0},
+                {h: 64},
+                self._fake_output_td([h]),
+                max_cores=32,
+            )
+
+    def test_apply_work_div_hint_non_divisible_split_raises_unit(self):
+        h = Symbol("H")
+        lq = Symbol("Lq")
+        op = self._fake_op({h: ["H"], lq: ["Lq"]})
+
+        with self.assertRaisesRegex(Exception, "not evenly divisible"):
+            _wd._apply_user_hint(
+                op,
+                {h: 4, lq: 7},
+                {h: 64, lq: 512},
+                self._fake_output_td([h, lq]),
+                max_cores=32,
+            )
+
+    def test_apply_work_div_hint_prunes_before_divisibility_check_unit(self):
+        h = Symbol("H")
+        lq = Symbol("Lq")
+        op = self._fake_op({h: ["H"], lq: ["Lq"]})
+
+        splits = _wd._apply_user_hint(
+            op,
+            {h: 32, lq: 7},
+            {h: 64, lq: 512},
+            self._fake_output_td([h, lq]),
+            max_cores=32,
+        )
+
+        self.assertEqual(splits, {h: 32})
+
+    def test_apply_work_div_hint_multiple_accepted_reduction_splits_raise_unit(self):
+        m = Symbol("M")
+        k = Symbol("K")
+        ell = Symbol("L")
+        op = self._fake_op({m: ["M"], k: ["K"], ell: ["L"]})
+
+        with self.assertRaisesRegex(Exception, "reduction dimensions"):
+            _wd._apply_user_hint(
+                op,
+                {k: 2, ell: 2},
+                {m: 64, k: 32, ell: 16},
+                self._fake_output_td([m]),
+                max_cores=32,
+            )
 
     @config.patch({"sencores": 8})
     def test_pointwise_work_div_hint_applied(self):
@@ -240,7 +393,12 @@ class TestNamedWorkDivisionHint(InductorTestCase):
             with spyre_hint(tiles={"M": 4}):
                 return torch.abs(x)
 
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), x)
         self.assertIn("LoopSpec(", source_codes[0])
         self.assertFalse(any("user-hint" in msg for msg in self._logs()))
@@ -265,7 +423,12 @@ class TestNamedWorkDivisionHint(InductorTestCase):
             with spyre_hint(tiles={"M": 4}, work_div={"N": 2}):
                 return torch.abs(x)
 
-        with mock_patch(_LAUNCH_KERNEL), mock_patch("subprocess.run"):
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
             _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), x)
         self.assertIn("LoopSpec(", source_codes[0])
         self._assert_user_hint_logged()
@@ -286,10 +449,11 @@ class TestNamedWorkDivisionHint(InductorTestCase):
             torch.compile(fn, dynamic=False)(x)
 
     @config.patch({"sencores": 4})
-    def test_split_product_exceeding_sencores_raises(self):
+    def test_split_product_exceeding_sencores_skips_later_hint(self):
         # N=128 (2 sticks) so N has its own stick-level device coordinate and is
-        # not misidentified as a reduction dim; total splits = 2*2*2 = 8 > sencores=4.
-        M, K, N = 128, 64, 128
+        # not misidentified as a reduction dim; total requested splits would be
+        # 2*2*2 = 8 > sencores=4, so the final split should be skipped.
+        M, K, N = 128, 128, 128
         x = torch.randn(M, K, dtype=torch.float16).to("spyre")
         y = torch.randn(K, N, dtype=torch.float16).to("spyre")
         _declare_tensor_dim("M", M)
@@ -302,8 +466,20 @@ class TestNamedWorkDivisionHint(InductorTestCase):
             with spyre_hint(work_div={"M": 2, "N": 2, "K": 2}):
                 return x @ y
 
-        with self.assertRaisesRegex(Exception, "exceeds SENCORES"):
-            torch.compile(fn, dynamic=False)(x, y)
+        run_and_get_code(torch.compile(fn, dynamic=False), x, y)
+        logs = self._logs()
+        self.assertTrue(
+            any(
+                "skipping named dim(s)" in msg
+                and "['K']" in msg
+                and "(split=2)" in msg
+                and "cores would be 8" in msg
+                and "SENCORES=4" in msg
+                for msg in logs
+            ),
+            f"Expected skipped split warning, got: {logs}",
+        )
+        self.assertFalse(any("exceeds SENCORES" in msg for msg in logs))
 
     @config.patch({"sencores": 8})
     def test_invalid_split_value_raises(self):
@@ -322,7 +498,9 @@ class TestNamedWorkDivisionHint(InductorTestCase):
 
     @config.patch({"sencores": 8})
     def test_multiple_reduction_splits_raise(self):
-        M, K, L = 64, 32, 16
+        # Keep L large enough that the failure is reduction-split validation,
+        # not stick alignment.
+        M, K, L = 64, 32, 128
         x = torch.randn(M, K, L, dtype=torch.float16).to("spyre")
         _declare_tensor_dim("M", M)
         _declare_tensor_dim("K", K)
@@ -333,7 +511,9 @@ class TestNamedWorkDivisionHint(InductorTestCase):
             with spyre_hint(work_div={"K": 2, "L": 2}):
                 return x.sum(dim=(1, 2))
 
-        with self.assertRaisesRegex(Exception, "reduction dimensions"):
+        with self.assertRaisesRegex(
+            Exception, "reduction dimensions|expected exactly 1 reduction variable"
+        ):
             torch.compile(fn, dynamic=False)(x)
 
 
