@@ -95,6 +95,7 @@ register_torch_compile_kernel(
         aten.reciprocal,
         aten.neg,
         aten.relu,
+        aten.relu_,
         aten.rsqrt,
         aten.sigmoid,
         aten._softmax,
@@ -165,6 +166,18 @@ def spyre__uniform_(self, from_=0.0, to=1.0, generator=None):
     cpu_tmp.uniform_(from_, to, generator=generator)
 
     # Copy the CPU tensor back to the spyre device
+    self.copy_(cpu_tmp)
+
+    return self
+
+
+@torch.library.register_kernel("aten::random_.from", ["spyre"])  # type:ignore
+def spyre__random_from(self, from_=0, to=1, generator=None) -> torch.Tensor:
+    # Create a new tensor on CPU.
+    cpu_tmp = torch.empty_like(self, device="cpu", memory_format=torch.preserve_format)
+
+    # Fill the CPU tensor with random values and copy to device.
+    cpu_tmp.random_(from_, to, generator=generator)
     self.copy_(cpu_tmp)
 
     return self

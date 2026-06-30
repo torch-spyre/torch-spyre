@@ -161,14 +161,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [4096, 4096]
                           stride: [4096, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/foundation-model-stack/foundation-model-stack/blob/eager_spyre/fms/modules/attention.py#L443 in forward,
                     code: queries = self.query(q)'
@@ -184,14 +184,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1024, 4096]
                           stride: [4096, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/foundation-model-stack/foundation-model-stack/blob/eager_spyre/fms/modules/attention.py#L444 in forward,
                     code: keys = self.key(k)'
@@ -725,14 +725,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [12800, 4096]
                           stride: [4096, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/foundation-model-stack/foundation-model-stack/blob/eager_spyre/fms/modules/feedforward.py#L294 in forward,
                     code: out = self.a(self.wg(x)) * self.w1(x)'
@@ -785,14 +785,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [4096, 12800]
                           stride: [12800, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/foundation-model-stack/foundation-model-stack/blob/eager_spyre/fms/modules/feedforward.py#L297 in forward,
                     code: return self.w2(out)'
@@ -2090,14 +2090,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cpu
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [49159, 4096]
                           stride: [4096, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cpu
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/foundation-model-stack/foundation-model-stack/blob/eager_spyre/fms/models/granite.py#L381 in torch_dynamo_resume_in_forward_at_380,
                     code: preds = self.head(output.to("cpu")).to("cuda")'
@@ -2216,14 +2216,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [4096, 4096]
                           stride: [4096, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/foundation-model-stack/foundation-model-stack/blob/eager_spyre/fms/modules/attention.py#L443 in forward,
                     code: queries = self.query(q)'
@@ -2239,14 +2239,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [1024, 4096]
                           stride: [4096, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/foundation-model-stack/foundation-model-stack/blob/eager_spyre/fms/modules/attention.py#L444 in forward,
                     code: keys = self.key(k)'
@@ -2785,14 +2785,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [12800, 4096]
                           stride: [4096, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/foundation-model-stack/foundation-model-stack/blob/eager_spyre/fms/modules/feedforward.py#L294 in forward,
                     code: out = self.a(self.wg(x)) * self.w1(x)'
@@ -2845,14 +2845,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [4096, 12800]
                           stride: [12800, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/foundation-model-stack/foundation-model-stack/blob/eager_spyre/fms/modules/feedforward.py#L297 in forward,
                     code: return self.w2(out)'
@@ -4150,14 +4150,14 @@ test_suite_config:
                           storage_offset: 0
                           dtype: torch.float16
                           device: cpu
-                          init: rand
+                          init: xavier
                       - tensor:
                           shape: [49159, 4096]
                           stride: [4096, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cpu
-                          init: rand
+                          init: xavier
                       - value: null
                   description: 'https://github.com/foundation-model-stack/foundation-model-stack/blob/eager_spyre/fms/models/granite.py#L381 in torch_dynamo_resume_in_forward_at_380,
                     code: preds = self.head(output.to("cpu")).to("cuda")'
@@ -13536,3 +13536,4 @@ test_suite_config:
                     dropout_p: 0.0
                     is_causal: false
                     scale: 0.0078125
+cases: []

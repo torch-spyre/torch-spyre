@@ -155,6 +155,8 @@ The IBM Spyre Accelerator chip (left) and IBM Telum II processor (right). *Image
 |---------|--------|
 | Cores | 32 AI accelerator cores |
 | Technology | 5 nm |
+| LX scratchpad | 2 MB per core (SRAM, shared between corelets) |
+| Per-core memory span | 256 MB addressable contiguous device memory |
 | Memory per card | Up to 128 GB LPDDR5 |
 | Peak performance | >300 TOPS per card |
 | Supported data types | int4, int8, fp8, fp16 |
@@ -216,7 +218,10 @@ The compiler generates two kinds of artifacts to drive this pipeline:
 - **SuperDSC** — JSON kernel descriptors that specify the computation
   performed on each tile once it arrives in scratchpad. SuperDSC is
   being superseded by KTIR, a tile-based MLIR intermediate
-  representation — see [RFC 0682](../rfcs/index.md).
+  representation. The specification is published as RFC 0682, and a
+  reference CPU interpreter is available at
+  [torch-spyre/ktir-cpu](https://github.com/torch-spyre/ktir-cpu).
+  See [the KTIR page](../compiler/ktir.md) for details.
 
 ## Execution Model
 

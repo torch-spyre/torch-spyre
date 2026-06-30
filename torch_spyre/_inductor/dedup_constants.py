@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, Operation
 from torch._inductor.virtualized import V
 
@@ -98,7 +99,7 @@ def _drop_constant(
     logger.debug("dedup_and_promote_constants: merged %s into canonical %s", D, C)
 
 
-def dedup_and_promote_constants(operations: list[Operation]) -> None:
+def dedup_and_promote_constants(graph: GraphLowering) -> None:
     """Deduplicate SpyreConstantFallback ops and move them to the head of operations.
 
     Steps:
@@ -111,6 +112,7 @@ def dedup_and_promote_constants(operations: list[Operation]) -> None:
 
     Mutates operations in place.
     """
+    operations = graph.operations
     # --- Step 1: group by identity key ---
     groups: dict[tuple, list[SpyreConstantFallback]] = {}
     for op in operations:

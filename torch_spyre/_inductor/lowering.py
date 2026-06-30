@@ -23,7 +23,13 @@ import torch._inductor.lowering as lowering
 import torch._inductor.ir as ir
 from typing import Any, Callable, Union
 
-from .constants import BATCH_MATMUL_OP, COPY_BACK_CANDIDATE_ATTR, BATCH_MATMUL_FP8_OP
+from .constants import (
+    BATCH_MATMUL_OP,
+    COPY_BACK_CANDIDATE_ATTR,
+    BATCH_MATMUL_FP8_OP,
+    SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
+    SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
+)
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import SpyreReduction, SpyreConstantFallback, SpyreEmptyFallback
@@ -43,6 +49,15 @@ _lowerings_nesting = 0
 # The specific spyre lowerings will be registered into this dictionary
 # and merged with the in-tree lowerings when needed
 spyre_lowerings: dict[Union[Callable[..., Any], str], Callable[..., Any]] = {}
+
+
+def _current_fx_custom_meta() -> dict[str, Any]:
+    node = V.get_current_node()
+    meta = getattr(node, "meta", None)
+    if not isinstance(meta, dict):
+        return {}
+    custom = meta.get("custom")
+    return custom if isinstance(custom, dict) else {}
 
 
 def register_spyre_lowering(
@@ -444,11 +459,18 @@ def lower_bmm(x, y):
     else:
         raise Unsupported(f"BMM with input shapes {x.get_size()} and {y.get_size()}")
 
+    custom_meta = _current_fx_custom_meta()
+    op_info = {}
+    if SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY in custom_meta:
+        op_info[SHARED_WEIGHT_UNIT_BMM_INFO_KEY] = custom_meta[
+            SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY
+        ]
+
     if reduction_numel == 1:
         # Reduction degenerates to a pointwise mul
         result = lowering.mul(x, y)
     else:
-        result = Reduction.create(
+        reduction_kwargs = dict(
             reduction_type=BATCH_MATMUL_OP,
             input_node=[x, y],
             device=x.get_device(),
@@ -458,6 +480,10 @@ def lower_bmm(x, y):
             ranges=ranges,
             reduction_ranges=[reduction_numel],
         )
+        if op_info:
+            result = SpyreReduction.create(op_info=op_info, **reduction_kwargs)
+        else:
+            result = Reduction.create(**reduction_kwargs)
 
     result.realize()
 
@@ -663,6 +689,22 @@ def lower_gelu(x, approximate="none"):
         device=x.get_device(),
         dtype=x.get_dtype(),
         inner_fn=lambda index: lowering.ops_wrapper(torch.ops.spyre.gelu.__name__)(
+            x.make_loader()(index)
+        ),
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw
+
+
+@register_spyre_lowering(torch.ops.spyre.silu)
+def lower_silu(x):
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=lambda index: lowering.ops_wrapper(torch.ops.spyre.silu.__name__)(
             x.make_loader()(index)
         ),
         ranges=x.get_size(),
@@ -1052,11 +1094,27 @@ def with_int64_fallback(fn, *args, convert_output=True):
         convert_output: If True, convert output back to int64.
                        Set to False for operations like div that should return float.
     """
-    if not any(x.get_dtype() == torch.int64 for x in args):
+    # Skip constants (int/float literals) that don't have get_dtype()
+    has_int64 = False
+    for x in args:
+        if isinstance(x, (int, float)):
+            continue
+        if hasattr(x, "get_dtype") and x.get_dtype() == torch.int64:
+            has_int64 = True
+            break
+
+    if not has_int64:
         return fn(*args)
 
-    args = [to_dtype(x, torch.float32) for x in args]
-    output = fn(*args)
+    # Convert args, skipping constants
+    converted_args = []
+    for x in args:
+        if isinstance(x, (int, float)):
+            converted_args.append(x)
+        else:
+            converted_args.append(to_dtype(x, torch.float32))
+
+    output = fn(*converted_args)
 
     if convert_output:
         return to_dtype(output, torch.int64)
@@ -1068,7 +1126,17 @@ def with_int64_fallback(fn, *args, convert_output=True):
     torch.ops.aten.add.Tensor,
     type_promotion_kind=None,
 )
-def lower_add(x, y):
+def lower_add(x, y, *, alpha=1):
+    if alpha != 1:
+        alpha_tensor = lower_full(
+            y.get_size(),
+            float(alpha),
+            dtype=y.get_dtype(),
+            device=y.get_device(),
+        )
+        alpha_tensor.realize()
+        y = with_int64_fallback(lowering.mul, y, alpha_tensor)
+        y.realize()
     return with_int64_fallback(lowering.add, x, y)
 
 
@@ -1084,7 +1152,17 @@ def lower_mul(x, y):
     torch.ops.aten.sub.Tensor,
     type_promotion_kind=None,
 )
-def lower_sub(x, y):
+def lower_sub(x, y, *, alpha=1):
+    if alpha != 1:
+        alpha_tensor = lower_full(
+            y.get_size(),
+            float(alpha),
+            dtype=y.get_dtype(),
+            device=y.get_device(),
+        )
+        alpha_tensor.realize()
+        y = with_int64_fallback(lowering.mul, y, alpha_tensor)
+        y.realize()
     return with_int64_fallback(lowering.sub, x, y)
 
 
@@ -1102,3 +1180,29 @@ def lower_minimum(x, y):
 )
 def lower_maximum(x, y):
     return with_int64_fallback(lowering.maximum, x, y)
+
+
+@register_spyre_lowering(torch.ops.spyre.qfp8ch)
+def lower_qfp8ch(x):
+    """
+    Lower qfp8ch operation - channel-wise FP8 format conversion.
+
+    Pointwise format conversion only (no scaling).
+    """
+
+    fn = lowering.ops_wrapper(torch.ops.spyre.qfp8ch.__name__)
+    x_loader = x.make_loader()
+
+    def inner_fn(index):
+        return fn(x_loader(index))
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=torch.float8_e4m3fn,
+        inner_fn=inner_fn,
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw

@@ -16,11 +16,12 @@ import os
 import threading
 import types
 import importlib
+import torch
 
 from .constants import DEVICE_NAME, DISTRIBUTED_BACKEND_NAME
-
 from . import memory
 from . import profiler
+
 
 _runtime_init_lock = threading.Lock()
 
@@ -56,8 +57,13 @@ class _SpyreImpl:
         with _runtime_init_lock:
             if self._initialized:
                 return
-            # Load the C++ Module
-            # put any light, once-per-process setup here
+            # Start the device runtime. This is the ONLY thing _lazy_init does:
+            # all runtime-independent setup (tensor monkey-patch, inductor backend
+            # registration, dispatch-key kernels) is applied at import time in the
+            # top-level _autoload() so it is available before the first device op.
+            # The C++ startRuntime() is std::call_once, so eager device ops trigger
+            # it independently of this Python path; this remains for callers that
+            # want explicit runtime init.
             self._C = importlib.import_module("torch_spyre._C")
             # Apply pending device index before runtime init
             pending = self._pending_device_idx
@@ -67,43 +73,65 @@ class _SpyreImpl:
             self._C.start_runtime()
             self._initialized = True
 
-            ## Run patch on import
-            from ._monkey_patch import _patch_tensor_for_spyre
-
-            _patch_tensor_for_spyre()
-
-            from torch_spyre._inductor import _autoload as ts_autoload
-
-            ts_autoload()
-
-            # Permanently register PrivateUse1 kernels for DispatchKeys
-            # so that eager-mode dispatch reaches the Spyre implementations
-            # without requiring global monkey-patching.
-            # Customops must be imported here because decompositions.py references
-            # torch.ops.spyre.* at module level (e.g. torch.ops.spyre.rms_norm).
-            import torch_spyre._inductor.customops  # noqa: F401
-            from torch_spyre._inductor.decompositions import (
-                _register_spyre_dispatchkey_kernels_permanently,
-            )
-
-            _register_spyre_dispatchkey_kernels_permanently()
-
     def _is_in_bad_fork(self) -> bool:
         return self._in_bad_fork
 
     def manual_seed(self, seed: int, device: int | None = None) -> None:
-        fn = getattr(self._C, "manual_seed", None)
-        if fn:
-            fn(int(seed), -1 if device is None else int(device))
+        self._lazy_init()
+        _C = self._C
+
+        idx = -1 if device is None else int(device)
+        default_generator = _C._get_default_generator(idx)
+        default_generator.manual_seed(seed)
 
     def manual_seed_all(self, seed: int) -> None:
+        self._lazy_init()
         _C = self._C
-        if hasattr(_C, "manual_seed_all"):
-            _C.manual_seed_all(int(seed))
-        else:
-            # Otherwise, fan out:
-            for idx in range(self.device_count()):
-                self.manual_seed(seed, device=idx)
+
+        for idx in range(self.device_count()):
+            default_generator = _C._get_default_generator(idx)
+            default_generator.manual_seed(seed)
+
+    def set_rng_state(
+        self, new_state: torch.Tensor, device: int | str | torch.device = "spyre"
+    ) -> None:
+        self._lazy_init()
+        _C = self._C
+
+        if isinstance(device, str):
+            device = torch.device(device)
+        elif isinstance(device, int):
+            device = torch.device(DEVICE_NAME, device)
+
+        idx = self.current_device() if device.index is None else device.index
+        default_generator = _C._get_default_generator(idx)
+        default_generator.set_state(new_state)
+
+    def get_rng_state(self, device: int | str | torch.device = "spyre") -> torch.Tensor:
+        self._lazy_init()
+        _C = self._C
+
+        if isinstance(device, str):
+            device = torch.device(device)
+        elif isinstance(device, int):
+            device = torch.device(DEVICE_NAME, device)
+
+        idx = self.current_device() if device.index is None else device.index
+        default_generator = _C._get_default_generator(idx)
+        return default_generator.get_state()
+
+    def initial_seed(self, device: int | str | torch.device = "spyre") -> int:
+        self._lazy_init()
+        _C = self._C
+
+        if isinstance(device, str):
+            device = torch.device(device)
+        elif isinstance(device, int):
+            device = torch.device(DEVICE_NAME, device)
+
+        idx = self.current_device() if device.index is None else device.index
+        default_generator = _C._get_default_generator(idx)
+        return default_generator.initial_seed()
 
     def is_available(self) -> bool:
         if self._is_in_bad_fork():
@@ -115,9 +143,9 @@ class _SpyreImpl:
         return self._initialized and not self._is_in_bad_fork()
 
     def device_count(self) -> int:
-        from . import _hooks
+        from . import _C
 
-        return _hooks.device_count()
+        return _C.device_count()
 
     def current_device(self) -> int:
         return getattr(self._C, "current_device", lambda: 0)()
@@ -147,6 +175,11 @@ def make_spyre_module() -> types.ModuleType:
     mod._is_in_bad_fork = lambda: impl._is_in_bad_fork()
     mod.manual_seed = lambda s: impl.manual_seed(s)
     mod.manual_seed_all = lambda s: impl.manual_seed_all(s)
+    mod.get_rng_state = lambda device=DEVICE_NAME: impl.get_rng_state(device)
+    mod.set_rng_state = lambda new_state, device=DEVICE_NAME: impl.set_rng_state(
+        new_state, device
+    )
+    mod.initial_seed = lambda device=DEVICE_NAME: impl.initial_seed(device)
     mod.is_available = lambda: impl.is_available()
     mod.is_initialized = lambda: impl.is_initialized()
     mod.device_count = lambda: impl.device_count()
@@ -221,7 +254,6 @@ def _autoload():
     _autoload._ran = True
 
     import torch  # noqa: E402
-    from . import _hooks  # noqa: F401
 
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
@@ -231,6 +263,38 @@ def _autoload():
     from torch_spyre._inductor import _light_autoload
 
     _light_autoload()
+
+    # Apply runtime-independent setup at autoload (import) time so it is in place
+    # before the first device op. None of this starts the device runtime: the
+    # C++ startRuntime() is std::call_once and self-triggers on the first real
+    # device op (e.g. an H2D copy via the stream pool). _C is not imported here
+    # at all; the monkey-patch defers its _C imports into the patched method
+    # bodies, so the .so is only loaded when a Spyre tensor is first used.
+    #
+    # The tensor monkey-patch adds to(device_layout=), device_tensor_layout(),
+    # the spyre-aware repr, torch.empty(device_layout=), and the dynamo/FxGraph
+    # cache guards. It must be available before any .to("spyre") /
+    # .to(device_layout=...) call -- including when that call is the very first
+    # mention of the device (e.g. moving model weights onto Spyre).
+    from ._monkey_patch import _patch_tensor_for_spyre
+
+    _patch_tensor_for_spyre()
+
+    # Inductor backend registration (scheduler / codegen / op-overrides).
+    from torch_spyre._inductor import _autoload as ts_inductor_autoload
+
+    ts_inductor_autoload()
+
+    # Permanently register PrivateUse1 kernels for DispatchKeys so that eager-mode
+    # dispatch reaches the Spyre implementations without global monkey-patching.
+    # Customops must be imported here because decompositions.py references
+    # torch.ops.spyre.* at module level (e.g. torch.ops.spyre.rms_norm).
+    import torch_spyre._inductor.customops  # noqa: F401
+    from torch_spyre._inductor.decompositions import (
+        _register_spyre_dispatchkey_kernels_permanently,
+    )
+
+    _register_spyre_dispatchkey_kernels_permanently()
 
     # Register the Spyre CCL distributed backend.
     # The creator function is a lazy proxy — _C is not imported until
@@ -281,6 +345,9 @@ def _autoload():
     os.environ.setdefault("TORCH_SENDNN_LOG", "CRITICAL")
     os.environ.setdefault("DT_DEEPRT_VERBOSE", "-1")
     os.environ.setdefault("DTLOG_LEVEL", "error")
+
+    # Enable spyre code with fake addresses by default
+    os.environ.setdefault("DUMP_SPYRE_CODE", "1")
 
 
 if not profiler.is_available():

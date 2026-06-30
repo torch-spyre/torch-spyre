@@ -313,7 +313,94 @@ Flag any findings and suggest replacements.
   every image file is referenced somewhere.
 - Check `intersphinx_mapping` in `conf.py` points to valid inventory URLs.
 
-## 12. Build Verification
+## 12. Knowledge Graph Explorer
+
+**Files:** `docs/source/_ext/extract_graph.py`,
+`docs/source/_ext/knowledge_graph_ext.py`,
+`docs/source/_static/js/knowledge_graph.js`,
+`docs/source/explorer/index.md`
+
+The Knowledge Graph Explorer is an interactive Cytoscape.js visualization
+auto-generated from the codebase at Sphinx build time. It has four views
+(Operations, Compiler Passes, Architecture, Configuration). The extraction
+script uses AST parsing — no runtime imports needed.
+
+### 12a. Extraction coverage
+
+Run the extraction script standalone and verify it picks up new registrations:
+
+```bash
+python3 docs/source/_ext/extract_graph.py torch_spyre
+```
+
+Check that the output counts reflect recent code changes:
+
+- **New ops:** If a new `@register_spyre_decomposition`,
+  `@register_spyre_lowering`, `@torch.library.custom_op`,
+  `register_fallback_default`, or `register_torch_compile_kernel` was added,
+  it should appear in the node count. If not, the extractor may need updating
+  (e.g., a new registration pattern or a new source file path).
+- **New passes:** If a new `Custom*Passes` class or pass function was added
+  to `torch_spyre/_inductor/passes.py`, verify it appears in the graph.
+- **New modules:** Any new `.py` file under `torch_spyre/` should appear as a
+  module node with correct import edges.
+- **New environment variables:** If a new `os.environ.get()` or `os.getenv()`
+  call was added, it should appear in the Configuration view.
+
+### 12b. Source file paths in extractors
+
+The `build_graph()` function in `extract_graph.py` has a hardcoded list of
+file paths for op-level extractors:
+
+- `torch_spyre/_inductor/decompositions.py`
+- `torch_spyre/_inductor/lowering.py`
+- `torch_spyre/_inductor/customops.py`
+- `torch_spyre/ops/fallbacks.py`
+- `torch_spyre/ops/eager.py`
+- `torch_spyre/_inductor/passes.py`
+
+If any of these files were renamed, split, or if new registration files were
+created (e.g., a second lowering file), verify the extractor list is updated.
+Also check the class extraction file list and the config extraction target.
+
+### 12c. JS view definitions
+
+If a new category of nodes is added to the extraction script (new `type`
+value), verify that:
+
+1. `docs/source/_static/js/knowledge_graph.js` has a corresponding entry in
+   `TYPE_META` with a color and label.
+2. The new type is included in the appropriate view's `types` array (or a new
+   view is added if it does not fit existing ones).
+3. Any new edge `relationship` value has a matching entry in the view's
+   `relationships` array and a style rule in `getStyles()`.
+
+### 12d. Build integration
+
+Verify the Sphinx extension still works:
+
+- `docs/source/conf.py` must have `sys.path.insert(0, os.path.abspath("_ext"))`
+  and `"knowledge_graph_ext"` in the `extensions` list.
+- `docs/source/index.rst` must have `explorer/index` in a toctree.
+- `.gitignore` must include `docs/source/_static/js/graph.json` (generated
+  artifact, not committed).
+- Cytoscape.js loads from a pinned jsDelivr CDN in `explorer/index.md`, not a
+  vendored file. To bump the version, update both the `cytoscape@<version>`
+  URL and the `integrity` SRI hash in the same `<script>` tag. Compute the
+  hash with `openssl dgst -sha384 -binary cytoscape.min.js | openssl base64 -A`.
+
+### 12e. Common maintenance scenarios
+
+| Scenario | Action |
+|----------|--------|
+| New op added with existing decorator pattern | No code change needed — extractor picks it up automatically |
+| New registration pattern introduced | Add a new extractor function in `extract_graph.py` and wire it into `build_graph()` |
+| Source file renamed or split | Update the file path in the `extractors` list in `build_graph()` |
+| New node type category | Add to `TYPE_META` in JS, add to or create a view in `VIEWS`, add edge style if needed |
+| Graph not rendering after code change | Run `extract_graph.py` standalone to check for AST parse errors |
+| Sphinx build fails on `knowledge_graph_ext` | Check that `extract_graph.py` can import cleanly (no runtime deps) |
+
+## 13. Build Verification
 
 - Run `python -m sphinx docs/source docs/build/html -W --keep-going` and
   report any warnings or errors.

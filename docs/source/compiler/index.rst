@@ -40,12 +40,14 @@ test coverage, bug classification), see :doc:`/contributing/op_enablement`.
 
    inductor_frontend
    backend
+   ktir
 
 .. toctree::
    :maxdepth: 2
    :caption: Operations
 
    adding_operations
+   indirect_access
 
 .. toctree::
    :maxdepth: 2
@@ -53,5 +55,6 @@ test coverage, bug classification), see :doc:`/contributing/op_enablement`.
    
    working_set_reduction
    coarse_tiling_loops
+   span_overflow_hint_analysis
    work_division_planning
    scratchpad_planning

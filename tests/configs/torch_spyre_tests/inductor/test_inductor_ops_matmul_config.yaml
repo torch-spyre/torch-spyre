@@ -7,7 +7,14 @@ test_suite_config:
             # k_expr: test_addmm or test_mm_ or test_bmm or test_einsum
             #         or test_matmul or test_large_matmul or test_linear
             #
-            - TestOps::test_(addmm|mm|bmm|einsum|matmul|large_matmul|linear).*
+            - TestOps::test_(addmm|mm|bmm|einsum|matmul|linear).*
           mode: mandatory_success
           tags:
             - ops__inductor-matmul
+        - names:
+            - TestOps::test_large_matmul.*
+          mode: mandatory_success
+          tags:
+            - ops__inductor-matmul
+            - slow__plat_ppc64
+            - slow__plat_s390x

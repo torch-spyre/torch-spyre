@@ -246,15 +246,41 @@ two IR levels: the FX graph (before Inductor lowering) and the
 LoopLevel IR (before codegen). Gray boxes are PyTorch-standard.
 :::
 
-Two terms appear throughout the compiler docs:
+### IR levels
 
-- **SuperDSC** is the current Spyre IR. It is JSON. One artifact per
-  scheduled kernel encodes the per-core schedule, tensor descriptors,
+The compilation flow runs through several IRs in sequence:
+
+:::{figure} ../_static/images/getting-started/ir-levels.svg
+:alt: Five IRs left-to-right with the producing pass labelled above each arrow
+:width: 100%
+:align: center
+
+Each box is a distinct IR. The pass between two boxes is named above the arrow: Dynamo, AOTAutograd, Inductor, codegen, and prepareKernel.
+:::
+
+- **SuperDSC** is the current Spyre kernel IR. It is JSON. One artifact
+  per scheduled kernel encodes the per-core schedule, tensor descriptors,
   and the compute op. Artifacts are cached through the standard
   `torch.compile` cache.
-- **KTIR** is the planned successor, an MLIR-based dialect designed as
-  a community specification for dataflow accelerators. See the
-  [KTIR RFC](https://github.com/torch-spyre/rfcs/blob/main/0682-KtirSpec/0682-KtirSpecRFC.md).
+- **KTIR** is the planned successor, an MLIR-based dialect designed as a
+  community specification for dataflow accelerators. See
+  [RFC 0682](https://github.com/torch-spyre/rfcs/blob/main/0682-KtirSpec/0682-KtirSpecRFC.md)
+  for the specification.
+- **SpyreCode** is the runtime-side contract: a `JobPlan` of ordered
+  steps (host-to-device transfers, compute, host-side program
+  correction, device-to-host transfers) that `SpyreStream::launch`
+  consumes. SpyreCode is the runtime interface that turns a compiled
+  kernel IR into device execution. See [Runtime](../runtime/index.md).
+
+### Named dimensions and tiling hints
+
+Working set reduction is driven by **named dimensions**. User code
+declares dimension names with `declare_tensor_dim`, attaches them to
+input tensors with `name_tensor_dims`, and tiles them inside a
+`with spyre_hint(tiles={...}):` scope. Hints are lexically scoped, can
+be nested, and compose by intersection of the op's iteration dimensions
+with each enclosing hint's tile dict. Full details and examples are in
+[Working Set Reduction](../compiler/working_set_reduction.md).
 
 For the full pipeline reference, see
 [Compiler Architecture](../compiler/architecture.md) and
@@ -264,13 +290,16 @@ For the full pipeline reference, see
 
 ## 8. Dtype defaults and casting
 
-Spyre's default compute dtype is `torch.float16`. fp32 inputs are
-down-cast to fp16 before reaching the device. This is correct for most
-inference workloads but can surprise users coming from CPU or GPU
-training paths. Down-cast warnings are emitted by default; set
-`TORCH_SPYRE_DOWNCAST_WARN=0` to suppress them. bfloat16, fp8 variants,
-and integer dtypes are supported in the runtime but have narrower op
-coverage on the compiled path.
+Spyre's default compute dtype is `torch.float16`, so tensors created
+without an explicit dtype are fp16. The dtype that is silently narrowed
+with a warning is **int64**: Spyre has no 64-bit integer type, so int64
+tensors are down-cast to int32, which can change values outside the
+32-bit range. The warning is emitted once by default. Set
+`TORCH_SPYRE_DOWNCAST_WARN=0` (or call
+`torch.spyre.set_downcast_warning(False)`) to suppress it. float32,
+bfloat16, fp8 variants, and other dtypes are supported in the runtime
+but have narrower op coverage on the compiled path, where explicit
+fp32↔fp16 cast ops handle conversions.
 
 If your model has a numerically sensitive layer, check the
 [supported operations](../user_guide/supported_operations.md) matrix
@@ -314,9 +343,60 @@ Constraints that show up as compile-time errors or unexpected behavior:
 | **No HW scalar immediates** | Scalar constants in the FX graph are rewritten to size-1 tensors via `spyre::constant`. |
 | **Indivisible reduction dims** | Some reduction dimensions cannot be split across cores; work distribution honors this. |
 | **Static shapes** | Dynamic shapes are work-in-progress. Shape-polymorphic models may recompile per shape. |
-| **Per-core memory limit** | Each core's tensor footprint must fit its addressable device memory range (separate from the 2 MB LX). |
-| **fp16 default** | fp32 is down-cast to fp16 with a warning; set `TORCH_SPYRE_DOWNCAST_WARN=0` to suppress. |
+| **Per-core memory span (256 MB)** | Each core's contiguous device-memory footprint must fit within 256 MB of addressable range. Separate from the 2 MB LX scratchpad capacity. |
+| **fp16 default** | int64 is down-cast to int32 with a warning. Set `TORCH_SPYRE_DOWNCAST_WARN=0` to suppress. |
 | **`SENCORES=32`** | Default core count; lowering it for debugging changes work-division decisions. |
+
+---
+
+## 11. Streams
+
+Each Spyre device exposes asynchronous execution through stream
+primitives that match the `torch.cuda.Stream` API:
+
+```python
+import torch
+
+s = torch.spyre.Stream()
+with torch.spyre.stream(s):
+    out = compiled(x.to("spyre"))
+torch.spyre.synchronize()
+```
+
+Streams are FIFO: operations submitted to the same stream complete
+in order, while operations on different streams may execute
+concurrently when the hardware allows it. Each device keeps a fixed
+pool of streams (32 low-priority, 32 high-priority) plus a default
+stream (`stream 0`). Priority is binary, not graded.
+
+Full reference: [Runtime — Streams](../runtime/index.md).
+
+---
+
+## 12. Distributed execution
+
+Multiple Spyre cards on the same host coordinate through the
+`spyreccl` torch.distributed backend:
+
+```python
+import torch
+import torch.distributed as dist
+
+dist.init_process_group(backend="cpu:gloo,spyre:spyreccl")
+DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
+
+x = torch.zeros(1024, dtype=torch.float16, device=DEVICE)
+dist.broadcast(x, src=0)
+```
+
+The model is one-device-per-process. Each rank attaches to a single
+Spyre device. Implemented synchronous collectives include `send`,
+`recv`, `broadcast`, `barrier`, `gather`, `allgather`, `reduce`, and
+`allreduce`. The underlying transport library is closed-source IBM
+code. Only the public adapter (`SpyreCCLBackend` in
+`csrc/distributed/`) is in-tree.
+
+Full reference: [Runtime — Multi-card and distributed execution](../runtime/index.md).
 
 ---
 
