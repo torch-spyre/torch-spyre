@@ -349,8 +349,6 @@ def _autoload():
     # Enable spyre code with symbolic args by default
     os.environ.setdefault("DUMP_SPYRE_CODE", "1")
     os.environ.setdefault("BUNDLE_SYMBOLIC_ARGS", "1")
-    # Enable CB split workaround
-    os.environ.setdefault("DXP_SPLIT_CORRECTION_CB", "1")
 
 
 if not profiler.is_available():
