@@ -20,7 +20,7 @@ source to verify that LoopSpec entries appear when coarse tiling is active.
 
 No Spyre hardware is required: torch.compile() exercises the full codegen path
 and run_and_get_code() captures the generated source without executing on device.
-launch_kernel is mocked to prevent actual device execution.
+launch_jobplan is mocked to prevent actual device execution.
 
 All coarse-tiling tests use the spyre_hint API (TestCoarseTileSpyreHints).
 Add new tests there using spyre_hint(num_tiles_per_dim=...) annotations.
@@ -45,7 +45,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 from utils_inductor import compare_with_cpu  # noqa: E402
 
 # Paths to mock for disabling actual device kernel execution.
-_LAUNCH_KERNEL = "torch_spyre.execution.kernel_runner.launch_kernel"
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
 
@@ -83,7 +82,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -123,7 +121,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -182,7 +179,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(softmax_fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -266,7 +262,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -347,7 +342,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             subprocess_calls.append(args)
 
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run", side_effect=_record_subprocess),
@@ -474,7 +468,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -531,7 +524,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -584,7 +576,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -639,7 +630,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -696,7 +686,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -1016,7 +1005,6 @@ class TestNamedDimsHint(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -1053,7 +1041,6 @@ class TestNamedDimsHint(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -1140,7 +1127,6 @@ class TestCoarseTileReductionE2E(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -1410,7 +1396,6 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -1507,7 +1492,6 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -1542,7 +1526,6 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -1585,7 +1568,6 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),

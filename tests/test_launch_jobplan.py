@@ -14,7 +14,6 @@
 
 """Tests for launching simple compiled ops through JobPlan execution."""
 
-import os
 from typing import Tuple
 
 import pytest
@@ -27,13 +26,12 @@ from torch_spyre._inductor import config as _spyre_config
 
 def _run_compiled_op(op_name: str, symbolic_args: bool) -> None:
     """
-    Compile an op with DUMP_SPYRE_CODE=1 and run it on Spyre, comparing to CPU.
+    Compile an op with SpyreCode and run it on Spyre, comparing to CPU.
 
     Uses a fresh dynamo compile cache each call to ensure the kernel runner is
-    re-instantiated with the current DUMP_SPYRE_CODE env var value.  Runs
-    in-process (no subprocess) so the Spyre VFIO device opened by the test
-    session is reused rather than triggering a second exclusive open from a
-    child process.
+    re-instantiated. Runs in-process (no subprocess) so the Spyre VFIO device
+    opened by the test session is reused rather than triggering a second
+    exclusive open from a child process.
     """
     torch._dynamo.reset()
 
@@ -53,18 +51,10 @@ def _run_compiled_op(op_name: str, symbolic_args: bool) -> None:
 
     cpu_result = op_fn(*inputs)
 
-    old_val = os.environ.get("DUMP_SPYRE_CODE")
-    try:
-        os.environ["DUMP_SPYRE_CODE"] = "1"
-        with _spyre_config.patch(bundle_symbolic_args=symbolic_args):  # type: ignore[attr-defined]
-            compiled_fn = torch.compile(op_fn, backend="inductor")
-            spyre_inputs = tuple(inp.to("spyre") for inp in inputs)
-            spyre_result = compiled_fn(*spyre_inputs).cpu()
-    finally:
-        if old_val is None:
-            os.environ.pop("DUMP_SPYRE_CODE", None)
-        else:
-            os.environ["DUMP_SPYRE_CODE"] = old_val
+    with _spyre_config.patch(bundle_symbolic_args=symbolic_args):  # type: ignore[attr-defined]
+        compiled_fn = torch.compile(op_fn, backend="inductor")
+        spyre_inputs = tuple(inp.to("spyre") for inp in inputs)
+        spyre_result = compiled_fn(*spyre_inputs).cpu()
 
     torch.testing.assert_close(
         spyre_result, cpu_result, atol=0.1, rtol=0.1, equal_nan=True
