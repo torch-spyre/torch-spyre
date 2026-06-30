@@ -827,6 +827,24 @@ def test_arange_plus_xt():
     )
 
 
+# ------- Constant-fill inputs ---------
+
+
+def test_amax_full_and_amax_live_maximum():
+    """maximum(amax(full(-inf), dim=-1), amax(t, dim=-1)) — zero-stick output from
+    constant-fill reduction must be a valid candidate for the pointwise output."""
+    B, H, Lq, Lk = 1, 32, 128, 256
+    t = torch.randn((B, H, Lq, Lk), dtype=torch.float16)
+
+    def f(t):
+        full = torch.full((B, H, Lq, Lk), float("-inf"), device=t.device, dtype=t.dtype)
+        t_max = torch.amax(full, dim=-1)
+        u_max = torch.amax(t, dim=-1)
+        return torch.maximum(t_max, u_max)
+
+    _compare(f, t, optimal_cost=0)
+
+
 # ------- Unsupported stick configurations ---------
 
 
