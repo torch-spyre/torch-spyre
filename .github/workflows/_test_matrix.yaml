@@ -209,6 +209,8 @@ jobs:
             config: torch_spyre_tests/inductor/test_coarse_tiling_config.yaml
           - name: Inductor Coarse Tile E2E
             config: torch_spyre_tests/inductor/test_coarse_tile_e2e_config.yaml
+          - name: Inductor Span Overflow Hint Analysis
+            config: torch_spyre_tests/inductor/test_span_overflow_hint_analysis_config.yaml
           - name: Inductor Unroll Loop Specs
             config: torch_spyre_tests/inductor/test_unroll_loop_specs_config.yaml
           - name: Inductor Work Division Hint
