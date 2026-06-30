@@ -37,6 +37,7 @@ Ensure that you have access a pod with spyre accelerator and torch spyre and spy
 | `kineto-spyre` (not required for torch >= 2.13)| [github.com/IBM/kineto-spyre][kineto-spyre] | `uv pip install --no-deps <release-wheel-url-matching-your-pytorch>` (see [releases page][kineto-spyre-releases]) |
 | `aiu-trace-analyzer` (optional) | [github.com/IBM/aiu-trace-analyzer][ata] | `pip install aiu-trace-analyzer` |
 | Granite checkpoint | [huggingface.co/ibm-granite/granite-3.3-8b-instruct](https://huggingface.co/ibm-granite/granite-3.3-8b-instruct) | `hf download ibm-granite/granite-3.3-8b-instruct --local-dir /tmp/models/granite-3.3-8b-instruct` |
+| Granite checkpoint | [huggingface.co/ibm-granite/granite-3.3-8b-instruct](https://huggingface.co/ibm-granite/granite-3.3-8b-instruct) | `hf download ibm-granite/granite-3.3-8b-instruct --local-dir /tmp/models/granite-3.3-8b-instruct` |
 
 The sample commands above are starting points; each upstream README is
 the source of truth and may require additional steps (extras, source
@@ -169,6 +170,9 @@ with profile(
 #    them ≈ device-side work.
 cpu_per_run_ms = sum(e.self_cpu_time_total for e in prof.events()) / 1000 / N_RUNS
 
+print("=" * 42)
+print("Profiling Granite Running on Spyre".center(42))
+print("=" * 42)
 print("=" * 42)
 print("Profiling Granite Running on Spyre".center(42))
 print("=" * 42)
