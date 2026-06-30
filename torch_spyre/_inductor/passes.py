@@ -43,7 +43,11 @@ from .temp_passes import (
     mark_direct_unit_bmm_pass,
     mm_to_bmm_pass,
 )
-from .coarse_tile import hints_to_coarse_tile_groups, reorder_unhinted_interlopers
+from .coarse_tile import (
+    hints_to_coarse_tile_groups,
+    reorder_unhinted_interlopers,
+    span_overflow_groups,
+)
 from . import config
 from .propagate_hints import (
     collect_spyre_hints,
@@ -270,13 +274,23 @@ def _maybe_chunk_large_tensors(graph: GraphLowering) -> None:
         chunk_large_tensors(graph)
 
 
-@_runs(reorder_unhinted_interlopers, hints_to_coarse_tile_groups, coarse_tile)
+@_runs(
+    reorder_unhinted_interlopers,
+    hints_to_coarse_tile_groups,
+    span_overflow_groups,
+    coarse_tile,
+)
 def _maybe_coarse_tile(graph: GraphLowering) -> None:
+    groups = []
     if not config.ignore_wsr_hints:
         reorder_unhinted_interlopers(graph)
-        groups = hints_to_coarse_tile_groups(graph)
-        if groups:
-            coarse_tile(graph, groups=groups)
+        groups += hints_to_coarse_tile_groups(graph)
+    if not config.ignore_span_overflow_hints:
+        groups += span_overflow_groups(graph)
+    if groups:
+        op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
+        groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
+        coarse_tile(graph, groups=groups)
 
 
 @_runs(cost_model_matmul_division, work_distribution)

@@ -40,87 +40,6 @@ from .op_spec import LoopSpec
 logger = get_inductor_logger("scheduler")
 
 
-def _find_leaf_sched_node(node: BaseSchedulerNode):
-    """Recursively find the first leaf SchedulerNode inside a (possibly nested) node."""
-    for snode in node.get_nodes():
-        if isinstance(snode, SchedulerNode):
-            return snode
-        result = _find_leaf_sched_node(snode)
-        if result is not None:
-            return result
-    return None
-
-
-def _tiled_syms_for_sched_node_at_depth(sched_node: SchedulerNode, depth: int) -> list:
-    """Return the OpSpec iteration-space symbols tiled at ``depth``.
-
-    Uses ``loop_tiled_dims[depth]`` and ``loop_tiled_reduction_dims[depth]``
-    from the IR node and the SchedulerNode's ``iteration_space`` (which
-    produces the same symbols as ``create_op_spec`` uses to build
-    ``OpSpec.tiled_symbols``).
-
-    ``loop_tiled_dims`` stores *host-range* dimension indices (indices into
-    ``op.data.ranges``), which include unit-size batch dimensions that are
-    skipped in the iteration space.  We must map host-range indices to
-    iteration-space key indices by walking ``op.data.ranges`` and counting
-    only the non-unit entries.
-
-    For reduction-dimension tiling (``loop_tiled_reduction_dims``), the
-    reduction symbols follow the output symbols in the iteration space key
-    list (the scheduler produces keys from reads.ranges for Reduction nodes,
-    which has output dims first then reduction dims).  The offset is the
-    number of non-unit output-dim ranges; indices in
-    ``loop_tiled_reduction_dims`` are 0-based into the reduction portion.
-    """
-    ir_op = sched_node.node
-    if ir_op is None:
-        return []
-    loop_info = getattr(ir_op, "loop_info", None)
-    if loop_info is None:
-        return []
-    raw = loop_info.loop_tiled_dims
-    raw_rdims = getattr(loop_info, "loop_tiled_reduction_dims", [])
-    if not raw and not raw_rdims:
-        return []
-    dims_per_level: list[list[int]] = raw if raw else [[] for _ in raw_rdims]
-    rdims_per_level: list[list[int]] = raw_rdims if raw_rdims else [[] for _ in raw]
-    if depth >= len(dims_per_level):
-        return []
-    it_space = iteration_space(sched_node)
-    keys = list(it_space.keys())
-
-    # Build a map from host-range index → iteration-space key index.
-    # loop_tiled_dims is only stamped on ComputedBuffer ops (Pointwise/Reduction),
-    # so data.ranges is always present here.  The iteration space simply omits
-    # unit-size dims, so we walk ranges and count only non-unit entries.
-    host_to_it: dict[int, int] = {}
-    it_idx = 0
-    for host_idx, r in enumerate(ir_op.data.ranges):
-        if int(r) != 1:
-            host_to_it[host_idx] = it_idx
-            it_idx += 1
-
-    result = []
-    for d in dims_per_level[depth]:
-        mapped = host_to_it.get(d)
-        if mapped is not None and mapped < len(keys):
-            result.append(keys[mapped])
-
-    # Map reduction-dimension indices to iteration-space symbols.  For
-    # Reduction nodes the iteration space (from reads.ranges) has output-dim
-    # symbols first, then reduction-dim symbols.  The offset is the count of
-    # non-unit output-dim ranges.
-    rdims_at_depth = rdims_per_level[depth] if depth < len(rdims_per_level) else []
-    if rdims_at_depth:
-        n_output_syms = sum(1 for r in ir_op.data.ranges if int(r) != 1)
-        for rd in rdims_at_depth:
-            sym_idx = n_output_syms + rd
-            if sym_idx < len(keys):
-                result.append(keys[sym_idx])
-
-    return result
-
-
 class CountedLoopSchedulerNode(FusedSchedulerNode):
     """A group of SchedulerNodes to be executed inside a counted outer loop.
 
@@ -436,19 +355,7 @@ class SuperDSCScheduling(BaseScheduling):
                         ]
                         snode.codegen(index_vars)
 
-        # Compute per-level tiled symbols for the outer (depth=0) LoopSpec.
-        # Find a leaf SchedulerNode to read loop_tiled_dims + iteration_space.
-        outer_tiled_syms: list = []
-        for inner in inner_nodes:
-            ref = _find_leaf_sched_node(inner)
-            if ref is not None:
-                outer_tiled_syms = _tiled_syms_for_sched_node_at_depth(ref, 0)
-                break
-
-        kernel.wrap_op_specs_in_loop(
-            node.loop_count,
-            tiled_symbols=outer_tiled_syms,
-        )
+        kernel.wrap_op_specs_in_loop(node.loop_count)
 
         with V.set_kernel_handler(kernel):
             src_code = kernel.codegen_kernel()
@@ -503,24 +410,10 @@ class SuperDSCScheduling(BaseScheduling):
                     ]
                     snode.codegen(index_vars)
 
-        # Determine this level's tiled symbols using the IR's loop_tiled_dims[depth].
-        ref_sched_node = _find_leaf_sched_node(node)
-        level_syms = (
-            _tiled_syms_for_sched_node_at_depth(ref_sched_node, depth)
-            if ref_sched_node is not None
-            else []
-        )
-
         # Wrap only the newly-added op_specs entries in this inner LoopSpec.
         body = kernel.op_specs[body_start:]
         kernel.op_specs = kernel.op_specs[:body_start]
-        kernel.op_specs.append(
-            LoopSpec(
-                count=node.loop_count,
-                body=body,
-                tiled_symbols=level_syms,
-            )
-        )
+        kernel.op_specs.append(LoopSpec(count=node.loop_count, body=body))
 
     def define_kernel(self, src_code, node_schedule, kernel):
         """

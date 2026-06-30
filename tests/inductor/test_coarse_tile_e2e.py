@@ -28,6 +28,7 @@ Add new tests there using spyre_hint(num_tiles_per_dim=...) annotations.
 
 import sys
 import os
+import regex as re
 
 import pytest
 import torch
@@ -870,6 +871,69 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         result = torch.compile(fn)(Q_dev, V_dev).cpu()
         torch.testing.assert_close(result, ref, atol=0.02, rtol=0.1)
+
+    def test_hint_h_tiling_elementwise_loopspec(self):
+        """H-tiling on BHLD (B=1 unit-size) selects the H iteration symbol, not Lq.
+
+        Regression test for the host-range-index → iteration-space-key mapping in
+        create_op_spec: loop_tiled_dims stores host-range indices which include
+        unit-size dimensions that the iteration space skips.  Without the mapping,
+        index 1 (H in BHLD with B=1) maps to the 2nd iteration-space key (Lq)
+        rather than the 1st (H), producing wrong per-tile stride advances.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        B, H, Lq, D = 1, 8, 256, 64
+
+        Q = torch.randn(B, H, Lq, D, dtype=torch.float16)
+        V = torch.randn(B, H, Lq, D, dtype=torch.float16)
+        Q_dev = Q.to("spyre")
+        V_dev = V.to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(Q_dev, ["B", "H", "Lq", "D"])
+        _name_tensor_dims(V_dev, ["B", "H", "Lq", "D"])
+
+        def fn(q, v):
+            with spyre_hint(num_tiles_per_dim={"H": 2}):
+                return q * v
+
+        cfn = torch.compile(fn)
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, Q_dev, V_dev)
+
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec for H-tiled elementwise")
+        self.assertIn("sympify('2')", src, "Expected loop count 2 for H/2 tiles")
+        # The tiled symbol must be the H iteration-space symbol (c0 — the first
+        # non-unit dim after skipping B=1), NOT the Lq symbol (c1).
+        # With an incorrect host-range→iteration-space mapping, host index 1 (H)
+        # would select c1 (Lq) instead of c0 (H), advancing per-tile strides by
+        # the wrong amount.
+        tiled_syms_matches = re.findall(r"tiled_symbols=\[(\[.*?\])\]", src, re.DOTALL)
+        self.assertTrue(
+            tiled_syms_matches,
+            "Expected tiled_symbols=[[...]] in generated OpSpec source",
+        )
+        for match in tiled_syms_matches:
+            self.assertIn(
+                "c0",
+                match,
+                f"tiled_symbols should contain the H symbol (c0), got: {match}",
+            )
+            self.assertNotIn(
+                "c1",
+                match,
+                f"tiled_symbols should NOT contain the Lq symbol (c1), got: {match}",
+            )
 
     def test_hint_row_tiling_multi_stick_pointwise_correct(self):
         """Row-tiling a multi-stick pointwise chain produces correct output.

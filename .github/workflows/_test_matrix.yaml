@@ -209,12 +209,21 @@ jobs:
             config: torch_spyre_tests/inductor/test_coarse_tiling_config.yaml
           - name: Inductor Coarse Tile E2E
             config: torch_spyre_tests/inductor/test_coarse_tile_e2e_config.yaml
+          - name: Inductor Span Overflow Hint Analysis
+            config: torch_spyre_tests/inductor/test_span_overflow_hint_analysis_config.yaml
           - name: Inductor Unroll Loop Specs
             config: torch_spyre_tests/inductor/test_unroll_loop_specs_config.yaml
           - name: Inductor Work Division Hint
             config: torch_spyre_tests/inductor/test_work_division_hint_config.yaml
           - name: Inductor Tensor Transpose
             config: torch_spyre_tests/inductor/test_inductor_transpose_edge_config.yaml
+          # ---- Indirect Access tests ----
+          - name: Indirect Access Gather
+            config: torch_spyre_tests/inductor/test_indirect_access_gather_config.yaml
+          - name: Indirect Access Scatter
+            config: torch_spyre_tests/inductor/test_indirect_access_scatter_config.yaml
+          - name: Indirect Access Internals
+            config: torch_spyre_tests/inductor/test_indirect_access_internals_config.yaml
           # ---- Tensor tests ----
           - name: Tensor Coordinates
             config: torch_spyre_tests/tensors/test_coordinates_config.yaml

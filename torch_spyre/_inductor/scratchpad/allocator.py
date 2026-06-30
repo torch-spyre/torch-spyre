@@ -51,7 +51,6 @@ from torch_spyre._inductor.scratchpad.passes import (
 )
 from torch_spyre._inductor.scratchpad.utils import (
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
-    OP_GOOD_FOR_LX_INPLACE,
     clone_at_graph_boundaries,
     mem_usage_by_buf,
     calculate_liveness,
@@ -120,9 +119,6 @@ class ScratchpadAllocator(ABC):
         if target is None:
             return []
         reads = [dep.name for dep in op.get_read_writes().reads]
-        if self._get_op_name(op) in OP_GOOD_FOR_LX_INPLACE:
-            # If the op is in the whitelist, allow all inputs
-            return reads
         if torch.Tag.pointwise in target.tags:
             # If the op is tagged as pointwise by pytorch upstream
             # allow all inputs. Does not work for all ops
