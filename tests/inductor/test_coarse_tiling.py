@@ -3875,5 +3875,112 @@ class TestReorderUnhintedInterlopers(unittest.TestCase):
             self._run([a, x, b, c])
 
 
+# ===========================================================================
+# TestHintsToCoarseTileGroupsLogging
+# ===========================================================================
+
+
+def _make_htctg_op(name, hints):
+    """Return a fake ComputedBuffer for hints_to_coarse_tile_groups logging tests.
+
+    hints: list of (hint_id, dim_names, split_count, loop_var) tuples.
+    loop_var may be None to simulate an op that is broadcast on that dim.
+    """
+    from torch._inductor.ir import ComputedBuffer
+    from torch_spyre._inductor.propagate_hints import DimHint
+
+    op = MagicMock(spec=ComputedBuffer)
+    op.get_name.return_value = name
+    op.get_operation_name.return_value = name
+    op.origins = []
+    op.dim_hints = [
+        DimHint(
+            dim_names=dim_names,
+            split_count=split_count,
+            loop_var=loop_var,
+            is_reduction=False,
+            hint_id=hint_id,
+        )
+        for hint_id, dim_names, split_count, loop_var in hints
+    ]
+    return op
+
+
+def _run_htctg_and_capture_log(ops):
+    """Run hints_to_coarse_tile_groups with INFO logging and return the log text."""
+    import logging
+    import logging.handlers
+    from types import SimpleNamespace
+    from torch_spyre._inductor.coarse_tile import hints_to_coarse_tile_groups
+    import torch_spyre._inductor.coarse_tile as coarse_tile_mod
+
+    graph = SimpleNamespace(operations=list(ops))
+
+    # Temporarily force the module-level hints_logger to INFO so the logging
+    # block inside hints_to_coarse_tile_groups actually runs.
+    original_level = coarse_tile_mod.hints_logger.level
+    coarse_tile_mod.hints_logger.setLevel(logging.INFO)
+
+    handler = logging.handlers.MemoryHandler(capacity=1000, flushLevel=logging.CRITICAL)
+    coarse_tile_mod.hints_logger.addHandler(handler)
+    try:
+        hints_to_coarse_tile_groups(graph)
+        handler.flush()
+        return "\n".join(r.getMessage() for r in handler.buffer)
+    finally:
+        coarse_tile_mod.hints_logger.removeHandler(handler)
+        coarse_tile_mod.hints_logger.setLevel(original_level)
+
+
+class TestHintsToCoarseTileGroupsLogging(unittest.TestCase):
+    """The scopes= log line must list all hint dims, not just those with
+    loop_var set on the first op in the group.
+
+    Regression test for a bug where group_ops[0] had loop_var=None for a hint
+    (e.g. a restickify op that doesn't iterate over Lq), causing that hint to
+    be absent from group_levels and therefore omitted from the scopes= line.
+    """
+
+    def test_scopes_includes_all_hints_when_first_op_is_broadcast_on_second_hint(self):
+        """When group_ops[0] has loop_var=None for hint 2 (Lq), the scopes= line
+        must still include Lq — not just H."""
+        import sympy
+
+        h_sym = sympy.Symbol("c0")
+        lq_sym = sympy.Symbol("c1")
+
+        # op0: iterates over H only — loop_var=None for Lq (broadcast, like restickify)
+        op0 = _make_htctg_op(
+            "op0",
+            [
+                (1, ["H"], 8, h_sym),  # hint_id=1, H, has loop_var
+                (2, ["Lq"], 4, None),  # hint_id=2, Lq, loop_var=None → broadcast
+            ],
+        )
+        # op1: iterates over both H and Lq
+        op1 = _make_htctg_op(
+            "op1",
+            [
+                (1, ["H"], 8, h_sym),
+                (2, ["Lq"], 4, lq_sym),
+            ],
+        )
+
+        log_output = _run_htctg_and_capture_log([op0, op1])
+
+        # Find the scopes= line specifically
+        scopes_line = next(
+            (ln for ln in log_output.splitlines() if "scopes=" in ln), ""
+        )
+        self.assertIn("H", scopes_line, f"scopes= must mention H; got: {scopes_line!r}")
+        self.assertIn(
+            "Lq",
+            scopes_line,
+            f"scopes= must mention Lq even though op0 is broadcast on Lq "
+            f"(loop_var=None for hint_id=2 on group_ops[0]); "
+            f"got: {scopes_line!r}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
