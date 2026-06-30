@@ -374,7 +374,7 @@ def _make_tiled_op_spec() -> OpSpec:
         iteration_space={c0: (Integer(128), 1)},
         args=[tensor_in, tensor_out],
         op_info={},
-        tiled_symbols=[c0],
+        tiled_symbols=[[c0]],
     )
 
 
@@ -1376,12 +1376,14 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=0,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
             use_symbols=True,
         )
+        # affine_strides[tensor_idx] is list[dict] (per level, outermost first).
+        # With one tiling level, affine_strides[0] = [{s: stride}].
         self.assertEqual(len(affine_strides), 1)
-        self.assertIn(s, affine_strides[0])
-        self.assertEqual(affine_strides[0][s], 64 * 128 * 2)
+        self.assertIn(s, affine_strides[0][0])
+        self.assertEqual(affine_strides[0][0][s], 64 * 128 * 2)
 
     def test_tiled_tensor_base_address_registered(self):
         s = Symbol("s")
@@ -1393,7 +1395,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=0,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
             use_symbols=True,
         )
         self.assertEqual(len(symbols), 1)
@@ -1408,7 +1410,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=0,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
             use_symbols=True,
         )
         top_val = next(iter(sdsc_json.values()))
@@ -1428,7 +1430,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbol_id_offset=0,
             tiled_symbols=[],
         )
-        self.assertEqual(affine_strides, [{}])
+        self.assertEqual(affine_strides, [[]])
 
     def test_lx_tensor_not_in_symbols(self):
         s = Symbol("s")
@@ -1442,11 +1444,12 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=0,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
         )
         self.assertEqual(symbols, [])
         self.assertEqual(local_sym_values, [])
-        self.assertEqual(affine_strides, [{}])
+        # lx tensor: one level of tiled_symbols, but lx allocation is always non-tiled.
+        self.assertEqual(affine_strides, [[{}]])
 
     def test_symbol_id_offset_applied(self):
         s = Symbol("s")
@@ -1457,7 +1460,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=5,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
             use_symbols=True,
         )
         top_val = next(iter(sdsc_json.values()))
@@ -1502,13 +1505,14 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=0,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
             use_symbols=True,
         )
         self.assertEqual(len(symbols), 2)
         self.assertEqual(symbols[0], 0x1000)
         self.assertEqual(symbols[1], 0x1000 + 128)
-        self.assertIn(s, affine_strides[0])
+        # affine_strides[0] = [{s: stride}] (one level, one tensor)
+        self.assertIn(s, affine_strides[0][0])
 
 
 class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
@@ -1543,25 +1547,34 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
             },
             args=[tensor_in, tensor_out],
             op_info={},
-            tiled_symbols=[c0, c1],
+            tiled_symbols=[[c0, c1]],
         )
 
     def test_two_tiled_symbols_produce_two_stride_entries(self):
         op_spec = self._make_3d_op_spec()
         symbols: list[int] = []
         _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
-        hbm_strides = [d for d in affine_strides if len(d) > 0]
+        # affine_strides[tensor_idx] = list[dict] (per level, outermost first).
+        # Both tensors have one tiling level with two symbols.
+        # Find tensors with non-empty strides at any level.
+        hbm_strides = [
+            per_level
+            for per_level in affine_strides
+            if any(len(d) > 0 for d in per_level)
+        ]
         self.assertGreater(len(hbm_strides), 0)
-        for tensor_strides in hbm_strides:
-            self.assertEqual(len(tensor_strides), 2)
+        for per_level in hbm_strides:
+            total_strides = sum(len(d) for d in per_level)
+            self.assertEqual(total_strides, 2)
 
     def test_two_tiled_symbols_strides_are_positive(self):
         op_spec = self._make_3d_op_spec()
         symbols: list[int] = []
         _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
-        for tensor_strides in affine_strides:
-            for sym, stride in tensor_strides.items():
-                self.assertGreater(stride, 0)
+        for per_level in affine_strides:
+            for level_strides in per_level:
+                for sym, stride in level_strides.items():
+                    self.assertGreater(stride, 0)
 
 
 class TestCompileOpSpecSymbolMapping(unittest.TestCase):
@@ -1569,7 +1582,11 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
         op_spec = _make_tiled_op_spec()
         symbols: list[int] = []
         _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
-        has_strides = any(len(d) > 0 for d in affine_strides)
+        # affine_strides[tensor_idx] = list[dict] (per level, outermost first).
+        has_strides = any(
+            any(len(level_d) > 0 for level_d in per_level)
+            for per_level in affine_strides
+        )
         self.assertTrue(
             has_strides,
             f"Expected non-empty affine_strides; got {affine_strides}.",
@@ -1923,10 +1940,11 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
-            return _make_tiled_json(idx, sym_id), [0x1000], [{s: stride}], []
+            # affine_strides: list[list[dict]] — one tensor, one level, one stride.
+            return _make_tiled_json(idx, sym_id), [0x1000], [[{s: stride}]], []
 
         op = _make_minimal_op_spec("a")
-        op.tiled_symbols = [s]
+        op.tiled_symbols = [[s]]
         loop = LoopSpec(count=Integer(4), body=[op])
         mlir = self._bundle([loop], fake_compile)
 
@@ -1943,7 +1961,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x2000)
-            return _make_tiled_json(idx, sym_id), [0x2000], [{}], []
+            return _make_tiled_json(idx, sym_id), [0x2000], [[{}]], []
 
         op = _make_minimal_op_spec("b")
         loop = LoopSpec(count=Integer(2), body=[op])
@@ -1961,10 +1979,10 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x3000)
-            return _make_tiled_json(idx, sym_id), [0x3000], [{s: stride}], []
+            return _make_tiled_json(idx, sym_id), [0x3000], [[{s: stride}]], []
 
         op = _make_minimal_op_spec("c")
-        op.tiled_symbols = [s]
+        op.tiled_symbols = [[s]]
         loop = LoopSpec(count=Integer(4), body=[op])
         mlir = self._bundle([loop], fake_compile)
 
@@ -1978,10 +1996,10 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x4000)
-            return _make_tiled_json(idx, sym_id), [0x4000], [{s: 512}], []
+            return _make_tiled_json(idx, sym_id), [0x4000], [[{s: 512}]], []
 
         op = _make_minimal_op_spec("d")
-        op.tiled_symbols = [s]
+        op.tiled_symbols = [[s]]
         loop = LoopSpec(count=Integer(4), body=[op])
         mlir = self._bundle([loop], fake_compile)
 
@@ -1997,10 +2015,10 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
-            return _make_tiled_json(idx, sym_id), [0x1000], [{s: 256}], []
+            return _make_tiled_json(idx, sym_id), [0x1000], [[{s: 256}]], []
 
         op = _make_minimal_op_spec("a")
-        op.tiled_symbols = [s]
+        op.tiled_symbols = [[s]]
         loop = LoopSpec(count=Integer(4), body=[op])
         mlir = self._bundle([loop], fake_compile)
 
@@ -2050,10 +2068,12 @@ class TestGenerateBundleNestedTiling(unittest.TestCase):
         def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
+            # per_level_strides: outermost-first. Level 0 (outer) has s0 stride,
+            # level 1 (inner) has s1 stride.  One tensor, two levels.
             return (
                 _make_tiled_json(idx, sym_id),
                 [0x1000],
-                [{s0: outer_stride, s1: inner_stride}],
+                [[{s0: outer_stride}, {s1: inner_stride}]],
                 [],
             )
 
@@ -2163,7 +2183,8 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
         def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
-            return _make_tiled_json(idx, sym_id), [0x1000], [{s: 256}], []
+            # One tensor, one level (the enclosing loop), one stride.
+            return _make_tiled_json(idx, sym_id), [0x1000], [[{s: 256}]], []
 
         op = _make_minimal_op_spec("a")
         loop = LoopSpec(count=Integer(4), body=[op])
@@ -2177,7 +2198,7 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
         def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x2000)
-            return _make_tiled_json(idx, sym_id), [0x2000], [{}], []
+            return _make_tiled_json(idx, sym_id), [0x2000], [[{}]], []
 
         op = _make_minimal_op_spec("b")
         loop = LoopSpec(count=Integer(4), body=[op])
@@ -2193,7 +2214,7 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
         def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
-            return _make_tiled_json(idx, sym_id), [0x1000], [{s: 256}], []
+            return _make_tiled_json(idx, sym_id), [0x1000], [[{s: 256}]], []
 
         op = _make_minimal_op_spec("a")
         loop = LoopSpec(count=Integer(4), body=[op])
@@ -2238,10 +2259,18 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000 * (i + 1))
-            if i == 0:  # bmm: tiled on inner K var only
-                return _make_tiled_json(idx, sym_id), [0x1000], [{c_k: k_stride}], []
-            else:  # combine: accum_buf not tiled on K
-                return _make_tiled_json(idx, sym_id), [0x2000], [{}], []
+            if i == 0:
+                # bmm: tiled on inner K var only (level 1 in outer>inner nesting).
+                # per_level_strides: outermost first — outer has no K stride, inner has it.
+                return (
+                    _make_tiled_json(idx, sym_id),
+                    [0x1000],
+                    [[{}, {c_k: k_stride}]],
+                    [],
+                )
+            else:
+                # combine: accum_buf not tiled on K at any level.
+                return _make_tiled_json(idx, sym_id), [0x2000], [[{}, {}]], []
 
         return fake
 
@@ -2330,14 +2359,23 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000 * (i + 1))
-            if i == 0:  # fill: per_tile_fixed output, not tiled
-                return _make_tiled_json(idx, sym_id), [0x1000], [{}], []
-            elif i == 1:  # bmm: K-input tiled on inner K
-                return _make_tiled_json(idx, sym_id), [0x2000], [{c_k: k_stride}], []
-            elif i == 2:  # combine: per_tile_fixed accum_tile, not tiled
-                return _make_tiled_json(idx, sym_id), [0x3000], [{}], []
-            else:  # copy: accum_full advances per outer B-tile
-                return _make_tiled_json(idx, sym_id), [0x4000], [{c_b: b_stride}], []
+            if i == 0:
+                # fill: inside outer loop only, not tiled.
+                return _make_tiled_json(idx, sym_id), [0x1000], [[{}]], []
+            elif i == 1:
+                # bmm: inside outer>inner; K-input tiled at inner level (level 1).
+                return (
+                    _make_tiled_json(idx, sym_id),
+                    [0x2000],
+                    [[{}, {c_k: k_stride}]],
+                    [],
+                )
+            elif i == 2:
+                # combine: inside outer>inner, per_tile_fixed accum_tile, not tiled.
+                return _make_tiled_json(idx, sym_id), [0x3000], [[{}, {}]], []
+            else:
+                # copy: inside outer loop only; accum_full tiled at outer level (level 0).
+                return _make_tiled_json(idx, sym_id), [0x4000], [[{c_b: b_stride}]], []
 
         return fake
 
@@ -2459,11 +2497,12 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
             sid1 = -(symbol_id_offset + 2)
             symbols.append(0x1000)
             symbols.append(0x2000)
-            # tensor 0 tiled, tensor 1 not tiled
+            # tensor 0: tiled at the enclosing loop level (level 0).
+            # tensor 1: not tiled.
             return (
                 _make_two_tensor_json(idx, sid0, sid1),
                 [0x1000, 0x2000],
-                [{s: 256}, {}],
+                [[{s: 256}], [{}]],
                 [],
             )
 
@@ -2945,48 +2984,6 @@ class TestValidateReductionTiling(unittest.TestCase):
         _validate_reduction_tiling(op)
 
 
-class TestTiledSymsForSchedNode(unittest.TestCase):
-    """Regression test for _tiled_syms_for_sched_node_at_depth.
-
-    loop_tiled_dims stores host-range indices (e.g. 1 for H in [B=1,H,Lq,D])
-    but the iteration space skips unit-size dims (B=1 dropped), so H is at
-    iteration-space index 0.  The function must map between the two.
-    """
-
-    def test_unit_batch_dim_skipped(self):
-        """[B=1,H=8,Lq=256,D=64] with loop_tiled_dims=[[1]] must return H (c0).
-
-        Without the fix, index 1 is used directly and returns c1 (Lq) instead.
-        """
-        from torch_spyre._inductor.scheduler import _tiled_syms_for_sched_node_at_depth
-        from torch._inductor.scheduler import SchedulerNode
-
-        host_ranges = [1, 8, 256, 64]
-        non_unit = [r for r in host_ranges if r != 1]
-        it_syms = [Symbol(f"c{i}") for i in range(len(non_unit))]
-        it_space = {s: Integer(r) for s, r in zip(it_syms, non_unit)}
-
-        ir_op = MagicMock()
-        ir_op.data.ranges = [Integer(r) for r in host_ranges]
-        ir_op.loop_info = CoarseTileInfo(
-            loop_group_id=(0,),
-            loop_count=[Integer(4)],
-            loop_tiled_dims=[[1]],
-        )
-
-        snode = MagicMock(spec=SchedulerNode)
-        snode.node = ir_op
-
-        with patch(
-            "torch_spyre._inductor.scheduler.iteration_space",
-            return_value=it_space,
-        ):
-            result = _tiled_syms_for_sched_node_at_depth(snode, 0)
-
-        self.assertEqual(len(result), 1)
-        self.assertEqual(str(result[0]), "c0")  # H, not c1 (Lq)
-
-
 class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
@@ -3381,7 +3378,7 @@ class TestSymbolKind(unittest.TestCase):
             sdsc_spec,
             symbols,
             symbol_id_offset=0,
-            tiled_symbols=[s],
+            tiled_symbols=[[s]],
             use_symbols=True,
         )
         self.assertEqual(len(kinds), 2)

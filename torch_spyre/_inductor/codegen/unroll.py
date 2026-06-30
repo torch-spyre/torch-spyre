@@ -31,8 +31,12 @@ analysis):
 - ``per_tile_fixed=False``: address advances per iteration regardless of
   allocation type (hbm, pool, or lx).
 
-After unrolling, ``tiled_symbols`` is cleared on every copy so
-``generate_bundle`` treats the ops as plain non-tiled entries.
+Each ``OpSpec`` carries ``tiled_symbols: list[list[Symbol]]``, a per-level
+list of iteration-space symbols with index 0 = innermost enclosing loop.
+The unroller reads ``tiled_symbols[0]`` for each op independently, so ops
+with different iteration-space layouts in the same loop are each advanced by
+the correct stride.  After processing a level, ``tiled_symbols[0]`` is
+popped, leaving outer-level entries intact for subsequent unrolling passes.
 
 Nested ``LoopSpec`` nodes (e.g. outer K=2 / inner M=4) are unrolled
 innermost-first, yielding K×M flat copies with correct combined addresses.
@@ -147,10 +151,10 @@ def _arg_byte_strides_for_syms(
 ) -> list[dict[Symbol, int]]:
     """Return per-arg byte strides for the given tiled symbols.
 
-    ``tiled_syms`` is the list of symbols tiled by the enclosing LoopSpec being
-    unrolled.  This is passed explicitly rather than read from
-    ``op_spec.tiled_symbols`` so that outer-loop unrolling still works after
-    inner-loop unrolling has already cleared ``tiled_symbols`` on each copy.
+    ``tiled_syms`` is ``op_spec.tiled_symbols[0]`` — the innermost-level
+    symbols for this specific op.  Using per-op symbols (rather than a shared
+    loop-level list) ensures ops with different iteration-space layouts in
+    the same loop are each advanced by the correct stride.
     """
     result: list[dict[Symbol, int]] = []
     for arg in op_spec.args:
@@ -179,9 +183,15 @@ def _unroll_one(loop: LoopSpec) -> list:
 
     Nested ``LoopSpec`` nodes are unrolled innermost-first: inner loops are
     fully flattened before the outer loop iterates over them.  Each level
-    independently computes per-iteration byte strides from its own
-    ``tiled_symbols`` and ``iteration_space``, so strides accumulate
-    correctly across nesting depths without explicit offset propagation.
+    independently computes per-iteration byte strides from each OpSpec's own
+    ``tiled_symbols``, so ops with different iteration-space layouts in the
+    same loop are each advanced by the correct stride.
+
+    ``tiled_symbols`` stores one sublist per nesting level, innermost first.
+    Each unrolling pass consumes ``tiled_symbols[0]`` for its level and pops
+    it from the list, leaving outer-level sublists intact for subsequent
+    passes.  There is no shared per-LoopSpec symbol list: each op is advanced
+    using only its own iteration-space symbols for the current level.
     """
     # --- Recursively unroll any nested LoopSpecs in body first. ----------
     flat_body: list[OpSpec] = []
@@ -200,43 +210,38 @@ def _unroll_one(loop: LoopSpec) -> list:
         )
     count = int(count_expr)
 
-    # --- Determine which symbols this loop level tiles. ------------------
-    # If loop.tiled_symbols is populated (new path), use it directly.
-    # Otherwise fall back to reading tiled_symbols from the first OpSpec
-    # in the body (works for the single-level non-nested case).
-    if loop.tiled_symbols:
-        this_level_syms: list[Symbol] = loop.tiled_symbols
-    else:
-        this_level_syms = next(
-            (list(e.tiled_symbols) for e in flat_body if isinstance(e, OpSpec)),
-            [],
-        )
-
     # --- Pre-compute per-arg byte strides and tile device_sizes once. ----
+    # tiled_symbols is stored innermost-first.  This loop level consumes
+    # tiled_symbols[0] from each op, leaving outer-level entries intact.
     strides_per_op: list[list[dict[Symbol, int]]] = []
     tile_sizes_per_op: list[list[list[int] | None]] = []
+    op_syms_per_entry: list[list[Symbol]] = []
     for entry in flat_body:
         if isinstance(entry, OpSpec):
-            arg_strides = _arg_byte_strides_for_syms(entry, this_level_syms)
+            # Innermost level is tiled_symbols[0]; empty list if no tiling here.
+            op_syms = list(entry.tiled_symbols[0]) if entry.tiled_symbols else []
+            op_syms_per_entry.append(op_syms)
+            arg_strides = _arg_byte_strides_for_syms(entry, op_syms)
             strides_per_op.append(arg_strides)
             tile_sizes: list[list[int] | None] = []
             for arg, strides in zip(entry.args, arg_strides):
                 if strides:
                     tile_sizes.append(
-                        _tile_device_size(arg, this_level_syms, entry.iteration_space)
+                        _tile_device_size(arg, op_syms, entry.iteration_space)
                     )
                 else:
                     tile_sizes.append(None)
             tile_sizes_per_op.append(tile_sizes)
         else:
+            op_syms_per_entry.append([])
             strides_per_op.append([])
             tile_sizes_per_op.append([])
 
     # --- Emit count copies, advancing addresses per iteration. -----------
     result: list = []
     for i in range(count):
-        for entry, arg_strides, tile_sizes in zip(
-            flat_body, strides_per_op, tile_sizes_per_op
+        for entry, op_syms, arg_strides, tile_sizes in zip(
+            flat_body, op_syms_per_entry, strides_per_op, tile_sizes_per_op
         ):
             if not isinstance(entry, OpSpec):
                 result.append(copy.deepcopy(entry))
@@ -247,9 +252,7 @@ def _unroll_one(loop: LoopSpec) -> list:
             for arg, strides, tile_size in zip(op_copy.args, arg_strides, tile_sizes):
                 if not strides:
                     continue
-                iter_offset = sum(
-                    i * strides[s] for s in this_level_syms if s in strides
-                )
+                iter_offset = sum(i * strides[s] for s in op_syms if s in strides)
                 if iter_offset:
                     arg.allocation = dict(arg.allocation)
                     # Advance whichever allocation key is present (hbm, pool, lx).
@@ -262,8 +265,11 @@ def _unroll_one(loop: LoopSpec) -> list:
                 if tile_size is not None:
                     arg.device_size = tile_size
 
-            # Clear tiled_symbols: addresses are now concrete.
-            op_copy.tiled_symbols = []
+            # Pop the innermost level: addresses are now concrete for it.
+            # Outer-level entries (indices 1+) remain for subsequent unrolling.
+            op_copy.tiled_symbols = (
+                op_copy.tiled_symbols[1:] if op_copy.tiled_symbols else []
+            )
             result.append(op_copy)
 
     logger.debug(
