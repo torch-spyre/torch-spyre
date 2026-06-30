@@ -111,6 +111,19 @@ _DELEGATOR_TESTS = frozenset(
     }
 )
 
+# ``full`` cases whose constant is at the fp16 magnitude limit (value_1 =
+# -65472, value_2 = -65504, vs fp16 max 65504). The pointwise wrap ``(x+x)/2``
+# doubles the fill, which overflows to -inf in the CPU fp16 reference while
+# Spyre keeps it finite -- a spurious mismatch with no real coverage value for a
+# constant-fill op. Skip wrapping these; the base ``test_full_value_*`` still
+# exercises full with extreme constants.
+_WRAP_OVERFLOW_UNSAFE = frozenset(
+    {
+        "test_full_value_1",
+        "test_full_value_2",
+    }
+)
+
 
 def _copy_canonical_tests(
     src_cls, dst_cls, suffix, test_failures, inherited_test_attributes
@@ -126,7 +139,7 @@ def _copy_canonical_tests(
     for name, value in src_cls.__dict__.items():
         if not name.startswith("test_"):
             continue
-        if name in _DELEGATOR_TESTS:
+        if name in _DELEGATOR_TESTS or name in _WRAP_OVERFLOW_UNSAFE:
             continue
         if keep is not None and name not in keep:
             continue
@@ -177,7 +190,6 @@ _COMMON_POINTWISE_FAILURES = [
     "test_flatten_4d_full",
     "test_flatten_4d_large_full",
     "test_flatten_4d_trailing",
-    "test_full_value_1",
     "test_transpose_2d_large_dim_0_1",
     "test_transpose_2d_large_dim_0_1_nopad",
     "test_transpose_2d_large_dim_0_2",
