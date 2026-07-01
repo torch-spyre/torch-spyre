@@ -973,6 +973,166 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             " dropped by _hints_levels",
         )
 
+    def test_hint_mixed_output_and_reduction_loopspec(self):
+        """Lk loop level stamped correctly when Lk is output dim for some ops and
+        reduction dim for others in the same group.
+
+        Bug: _stamp_group used a group-wide is_reduction_level flag taken from
+        an arbitrary representative op.  If the flag disagreed with a given op's
+        reality, the wrong divide function was called (or not called at all),
+        so that op's ranges were not divided and it iterated over the full Lk
+        per tile.
+
+        Fix: per-op dispatch using each op's own hint_id_to_ranges_pos /
+        hint_id_to_reduction_ranges_pos lookup tables.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        H, Lq, Lk = 8, 64, 128  # Lk/2 = 64 elements = 1 stick at fp16
+        x = torch.randn(H, Lq, Lk, dtype=torch.float16)
+        x_dev = x.to("spyre")
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("Lk", Lk)
+        _name_tensor_dims(x_dev, ["H", "Lq", "Lk"])
+
+        def fn(x):
+            with spyre_hint(num_tiles_per_dim={"Lk": 2}):
+                # Op1: pointwise — Lk is an output dim
+                y = x * 2.0
+                # Op2: reduction over Lk — Lk is a reduction dim
+                s = y.sum(dim=-1)
+            return s
+
+        cfn = torch.compile(fn)
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, x_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
+        self.assertIn(
+            "count=sympify('2')",
+            src,
+            "Expected Lk loop count 2 as count= in LoopSpec — must not be dropped"
+            " when group contains mixed output/reduction ops for the same dim",
+        )
+        # The sum op's Lk reduction dim must be divided.  The bug causes the
+        # sum to receive is_reduction_level=False (taken from the pointwise op),
+        # so _divide_reduction_ranges is never called for it: the sum iterates
+        # over the full Lk (tiled_symbols inner level stays empty).  After the
+        # per-op dispatch fix, the sum gets tiled_symbols=[[sympify('c2')]] for
+        # its reduction dim.  An empty-list first entry signals the bug.
+        self.assertNotIn(
+            "tiled_symbols=[[]]",
+            src,
+            "sum op has empty tiled_symbols inner level — Lk reduction range was not"
+            " divided by _stamp_group (group-wide is_reduction_level flag bug)",
+        )
+
+    def test_hint_flash_attention_two_loop_levels(self):
+        """Flash-attention graph: both H and Lk loop levels survive into codegen.
+
+        With nested hints {B:1}/{H:4}/{Lk:2}, the generated LoopSpec must carry
+        both count=sympify('4') for H and count=sympify('2') for Lk.  Before the
+        _stamp_group per-op dispatch fix, Lk tiling was silently skipped for ops
+        where the group-wide is_reduction_level flag disagreed with the op's own
+        dim role.
+        """
+        import math
+        from torch_spyre._inductor import spyre_hint
+
+        B, H, Lq, Lk, D = 1, 8, 256, 256, 64
+        block_size = 128
+        scale = 1.0 / math.sqrt(math.sqrt(D))
+        lk_slices = Lk // block_size  # 2
+
+        queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
+        keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        values_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        queries_dev = queries_t.to("spyre")
+        keys_dev = keys_t.to("spyre")
+        values_dev = values_t.to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("Lk", Lk)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(queries_dev, ["B", "H", "Lq", "D"])
+        _name_tensor_dims(keys_dev, ["B", "H", "Lk", "D"])
+        _name_tensor_dims(values_dev, ["B", "H", "Lk", "D"])
+
+        def flash(queries, keys, values):
+            output = torch.zeros_like(queries)
+            M = torch.full(
+                (B, H, Lq),
+                float("-inf"),
+                device=queries.device,
+                dtype=torch.float16,
+            )
+            with spyre_hint(num_tiles_per_dim={"B": 1}):
+                with spyre_hint(num_tiles_per_dim={"H": 4}):
+                    with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
+                        keys_T = keys.transpose(-1, -2).contiguous()
+                        denominator = torch.zeros(
+                            (B, H, Lq), device=queries.device, dtype=torch.float16
+                        )
+                        scores = torch.matmul(queries * scale, keys_T * scale)
+                        scores = scores.transpose(-1, -2).contiguous()
+                        block_max = torch.amax(scores, dim=-2)
+                        max_running = torch.maximum(M, block_max)
+                        exp_scores = torch.exp(scores - max_running.unsqueeze(-2))
+                        correction = torch.exp(M - max_running)
+                        denominator = denominator * correction + exp_scores.sum(dim=-2)
+                        output = output * correction.unsqueeze(-1) + torch.matmul(
+                            exp_scores.transpose(-1, -2), values
+                        )
+                        M = max_running
+            return output / denominator.unsqueeze(-1)
+
+        cfn = torch.compile(flash)
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, queries_dev, keys_dev, values_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
+        self.assertIn(
+            "count=sympify('4')",
+            src,
+            "Expected H loop count 4 as count= in LoopSpec",
+        )
+        self.assertIn(
+            "count=sympify('2')",
+            src,
+            "Expected Lk loop count 2 as count= in LoopSpec — _stamp_group must"
+            " divide Lk ranges on each op using that op's own dim role",
+        )
+        # The amax (op='max') reduces over Lk.  The bug causes it to receive
+        # is_reduction_level=False at the Lk loop level (group-wide flag taken
+        # from a pointwise op), so _divide_reduction_ranges is never called:
+        # amax iterates over the full Lk per tile and its tiled_symbols inner
+        # level stays empty ("[[], ").  After the per-op dispatch fix, the amax
+        # op gets a non-empty inner tiled_symbols entry for its Lk reduction dim.
+        max_op_idx = src.find("op='max'")
+        self.assertGreater(
+            max_op_idx, 0, "Expected op='max' (amax) OpSpec in generated source"
+        )
+        self.assertNotIn(
+            "tiled_symbols=[[], ",
+            src[max_op_idx : max_op_idx + 500],
+            "amax op has empty inner tiled_symbols — Lk reduction range not divided"
+            " by _stamp_group (group-wide is_reduction_level flag bug)",
+        )
+
     def test_hint_h_tiling_elementwise(self):
         """spyre_hint(num_tiles_per_dim={"H": 2}) tiles elementwise multiply over the H dimension.
 
