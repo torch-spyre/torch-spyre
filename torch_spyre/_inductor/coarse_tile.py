@@ -120,7 +120,12 @@ def _hints_levels(ops: list[Operation]) -> list[tuple]:
     best: dict[int, DimHint] = {}
     for op in ops:
         for h in getattr(op, "dim_hints", []):
-            if h.hint_id not in best or best[h.hint_id].loop_var is None:
+            prev = best.get(h.hint_id)
+            if (
+                prev is None
+                or prev.loop_var is None
+                or (prev.split_count == 1 and h.split_count > 1)
+            ):
                 best[h.hint_id] = h
 
     levels = []
