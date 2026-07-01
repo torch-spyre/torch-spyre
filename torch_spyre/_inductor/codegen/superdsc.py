@@ -22,8 +22,6 @@ from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.constants import (
     AVGPOOL2D_OP,
-    AVGPOOL_DIM_LABELS,
-    AVGPOOL_LAYOUT_LABELS,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     OUTPUT_DIM_LABELS,
@@ -831,9 +829,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             sdsc_iteration_space[stick_sym] = int(op_spec.args[1].device_size[-3])
         else:
             stick_sym = Symbol(INPUT_DIM_LABELS[ndim])
-            sdsc_iteration_space[stick_sym] = (
-                op_spec.args[0].device_dtype.elems_per_stick()
-            )
+            sdsc_iteration_space[stick_sym] = op_spec.args[
+                0
+            ].device_dtype.elems_per_stick()
         work_slices[stick_sym] = 1
         dim_splits[stick_sym] = 1
 
@@ -919,7 +917,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         scaling_factor = pool_params_out.get("scaling_factor", 1.0)
         constants = {"nmap": scaling_factor}
     else:
-        constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
+        constants = (
+            dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
+        )
     coordinate_masking = _get_coordinate_mask(sdsc_iteration_space, args[-1], padding)
     if coordinate_masking:
         constants["samv-maskvalue"] = _get_mask_value(op_spec.op)

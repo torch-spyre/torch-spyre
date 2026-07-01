@@ -804,7 +804,9 @@ def generate_sdsc(
                     {
                         sdsc_spec.opfunc: {
                             "numCoresUsed_": sdsc_spec.num_cores,
-                            "numCoreletsUsed_": HW_POOL_CORELET_FOLD if is_avgpool else 1,
+                            "numCoreletsUsed_": HW_POOL_CORELET_FOLD
+                            if is_avgpool
+                            else 1,
                             "coreIdsUsed_": [c for c in range(sdsc_spec.num_cores)],
                             **({"target_": "sentient"} if is_avgpool else {}),
                             "N_": {
@@ -1094,7 +1096,9 @@ def generate_sdsc(
                                             str(dim): gen_coord_info_value(
                                                 size=(
                                                     (
-                                                        _H_in if str(dim) == "i" else _W_in
+                                                        _H_in
+                                                        if str(dim) == "i"
+                                                        else _W_in
                                                     )
                                                     // sdsc_spec.work_slices.get(dim, 1)
                                                     if (
@@ -1107,7 +1111,9 @@ def generate_sdsc(
                                                 )
                                                 if (tensor.scales[dim] == 1)
                                                 else 1,
-                                                nsplits=sdsc_spec.work_slices.get(dim, 1)
+                                                nsplits=sdsc_spec.work_slices.get(
+                                                    dim, 1
+                                                )
                                                 if (tensor.scales[dim] == 1)
                                                 else 1,
                                                 elems_per_stick=tensor.data_format.elems_per_stick(),
@@ -1129,7 +1135,9 @@ def generate_sdsc(
                                                     else "nopad"
                                                 ),
                                             )
-                                            for dim in _tensor_layout_dims(tensor.layout)
+                                            for dim in _tensor_layout_dims(
+                                                tensor.layout
+                                            )
                                         },
                                         "coreIdToWkSlice_": {},
                                     },
