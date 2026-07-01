@@ -6,7 +6,7 @@ test_suite_config:
       tests:
         # These tests exercise various profiling functionalities, including event tracking, memory profiling, and pattern matching.
         # They are classified as mandatory_success because they are critical for verifying the correctness and performance of the profiler on the Spyre backend.
-        # Relevant Spyre capabilities include support for multiple data types and operations, though some operations like _scaled_dot_product_fused_attention_overrideable are not found in the op_db.
+        # This test ensures the PyTorch Profiler correctly reports Conv2d → BatchNorm2d execution, even when optimizations such as fusion or bias removal occur. It verifies accurate operator traces, timings, and memory events. It also confirms that Kineto captures all relevant profiling data without omissions.
         - names:
             - TestExperimentalUtils::test_profiler_conv2d_bias_followed_by_batchnorm2d_pattern
           mode: mandatory_success

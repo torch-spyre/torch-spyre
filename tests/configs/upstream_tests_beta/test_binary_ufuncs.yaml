@@ -148,7 +148,7 @@ test_suite_config:
             - TestBinaryUfuncs::test_non_contig_expand
             - TestBinaryUfuncs::test_non_contig_index
             - TestBinaryUfuncs::test_reference_numerics
-          mode: xfail  # xfail: NotImplementedError, UNKNOWN, torch._inductor.exc.InductorError
+          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
         # These tests exercise a wide range of binary operations, including comparison, arithmetic, and logical operations, across various data types and tensor shapes.
         # They are classified as xfail on the Spyre backend due to known issues with type promotion, unsupported operations, and missing features in the backend implementation.
         # Relevant Spyre capabilities include support for bfloat16, bool, float16, float32, and int64 data types, as well as a subset of operations like add, mul, maximum, minimum, and bitwise_and. Limitations include unsupported operations like exp2, pow, and certain complex operations, as well as issues with type promotion and handling of non-finite values.
@@ -176,7 +176,7 @@ test_suite_config:
             - TestBinaryUfuncs::test_reference_numerics_small_values
             - TestBinaryUfuncs::test_remainder_fmod_large_dividend
             - TestBinaryUfuncs::test_xlogy_xlog1py_scalar_type_promotion
-          mode: xfail  # xfail: UNKNOWN
+          mode: xfail  # xfail: dxp_standalone not detected
         # These tests exercise logical and copysign operations across various dtypes and tensor behaviors.
         # They are classified as xfail due to NotImplementedError and RuntimeError, indicating missing or unsupported operators and dtypes.
         # The most relevant Spyre limitations are the lack of support for double-precision floats and certain logical operations.
@@ -207,7 +207,7 @@ test_suite_config:
         # Relevant Spyre capability: support for maximum and minimum ops across multiple dtypes.
         - names:
             - TestBinaryUfuncs::test_maximum_minimum_float
-          mode: xfail  # xfail: UNKNOWN, torch._inductor.exc.InductorError
+          mode: xfail  # xfail: torch._inductor.exc.InductorError
         # These tests exercise the `pow` operation between tensors, which is critical for various mathematical computations.
         # They are classified as `xfail` due to a `RecursionError`, indicating a limitation in the Spyre backend's handling of recursive operations.
         # The relevant Spyre capability is the support for basic arithmetic operations, but the backend struggles with deep recursion in certain tensor operations.

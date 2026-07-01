@@ -21,7 +21,7 @@ test_suite_config:
 
             - TestExecutionTrace::test_execution_trace_env_enabled_with_kineto
 
-          mode: xfail  # xfail: UNKNOWN
+          mode: xfail  # xfail: dxp_standalone not detected
         # These tests exercise PyTorch's execution trace functionality, including tensor data recording and profiling with PyTorch 2.0.
         # They are skipped because they do not interact with the torch-spyre layer, which is required for backend-specific operations.
         # Relevant Spyre capabilities include tensor operations and profiling, but these tests do not leverage those features directly.

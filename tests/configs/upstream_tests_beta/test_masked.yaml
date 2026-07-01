@@ -9,13 +9,13 @@ test_suite_config:
         # The relevant Spyre limitations are the lack of support for masked operations on sparse and strided tensors.
         - names:
             - TestMasked::test_mask_layout
-          mode: xfail  # xfail: NotImplementedError, UNKNOWN
+          mode: xfail  # xfail: NotImplementedError
         # These tests exercise masked operations like softmax, norm, and variance across various dtypes.
         # They are classified as xfail due to unsupported operations and data formats on the Spyre backend.
         # The primary limitation is the lack of support for `sum` on `DataFormats.IEEE_INT32` and certain masked ops.
         - names:
             - TestMasked::test_reference_masked
-          mode: xfail  # xfail: NotImplementedError, UNKNOWN, torch._inductor.exc.InductorError
+          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
         # These tests exercise the `where` operation with different sparse tensor formats (COO, CSR, hybrid COO) and fill values.
         # They are classified as `skip` because the `where` operation does not engage the torch-spyre layer, bypassing Spyre's capabilities.
         # The relevance is low due to Spyre's current limitations in handling sparse tensor operations directly.

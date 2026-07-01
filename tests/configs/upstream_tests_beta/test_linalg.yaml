@@ -121,7 +121,7 @@ test_suite_config:
             - TestLinalg::test_tensorsolve_errors_and_warnings
             - TestLinalg::test_triangular_solve_out_errors_and_warnings
             - TestLinalg::test_vector_norm_reduce_over_1D_vector
-          mode: xfail  # xfail: UNKNOWN
+          mode: xfail  # xfail: dxp_standalone not detected
         # These tests exercise various linear algebra operations, including matrix multiplications, decompositions, and solving systems of equations, across different data types.
         # They are classified as xfail on the Spyre backend due to missing or partially implemented operators, which are critical for these operations.
         # The most relevant Spyre capabilities or limitations include the absence of support for certain operators and data types, leading to NotImplementedErrors.
@@ -242,7 +242,7 @@ test_suite_config:
         # Relevant Spyre limitations include unsupported type conversions and missing dtype support for certain ops.
         - names:
             - TestLinalg::test_outer_type_promotion
-          mode: xfail  # xfail: RuntimeError, UNKNOWN
+          mode: xfail  # xfail: RuntimeError
         # These tests exercise various linear algebra operations, including matrix multiplications, singular value decompositions, and triangular solves, across different data types.
         # They are classified as 'skip' on the Spyre backend due to missing or unsupported features, such as the absence of CUDA-specific tunable operations or the lack of CUDA support in the current build.
         # Relevant Spyre limitations include the unavailability of certain CUDA-specific functions and the need for CUDA support to execute these tests effectively.

@@ -15,7 +15,7 @@ test_suite_config:
         # Relevant Spyre limitations include dtype support and memory profiling accuracy.
         - names:
             - TestMemoryProfilerTimeline::test_memory_timeline_no_id
-          mode: xfail  # xfail: UNKNOWN
+          mode: xfail  # xfail: dxp_standalone not detected
 
         - names:
             - TestDataFlow::test_data_flow_graph_non_op_allocations

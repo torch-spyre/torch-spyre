@@ -47,7 +47,7 @@ test_suite_config:
             - TestConvolutionNNDeviceType::test_cudnn_convolution_relu
             - TestConvolutionNNDeviceType::test_group_convTranspose_empty
             - TestConvolutionNNDeviceType::test_noncontig_conv_grad
-          mode: xfail  # xfail: UNKNOWN
+          mode: xfail  # xfail: dxp_standalone not detected
         # These tests exercise group convolution operations with empty tensors, which are not fully supported on the Spyre backend.
         # They are classified as xfail due to a RuntimeError caused by unsupported tensor shapes or dimensions.
         # The relevant Spyre limitation is the incomplete support for certain tensor operations and shapes.

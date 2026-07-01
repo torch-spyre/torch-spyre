@@ -10,8 +10,9 @@ test_suite_config:
         - names:
             - TestTorchbind::test_torchbind_compile
           mode: mandatory_success
-        # These tests exercise TorchBind functionality, including AOT compilation and constant folding.
-        # They are classified as 'skip' because they do not engage the torch-spyre layer, focusing on core PyTorch features.
+        # These tests verify that TorchBind custom C++ objects work correctly with TorchInductor and AOTInductor compilation pipelines.
+        # They ensure proper handling of compilation, execution, dynamic shapes, tracing, schema generation, and graph optimizations.
+        # The suite also validates runtime infrastructure features such as namespace resolution, memory tracking, code generation, and queue-based operations.
         # Relevant Spyre capabilities include support for various dtypes and ops, but these tests do not leverage them directly.
         - names:
             - TestTorchbind::test_torchbind_compile_symint

@@ -225,7 +225,7 @@ test_suite_config:
             - TestCommon::test_errors
             - TestCommon::test_compare_cpu
             - TestCommon::test_python_ref_executor
-          mode: xfail  # xfail: NotImplementedError, UNKNOWN, torch._inductor.exc.InductorError
+          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
         # These tests exercise a wide range of operations and dtypes, including complex and half-precision tensors.
         # They are classified as xfail due to unknown issues with the Spyre backend, likely related to unsupported or partially supported operations and dtypes.
         # Relevant Spyre limitations include incomplete support for complex dtypes, half-precision operations, and certain tensor behaviors.
@@ -235,7 +235,7 @@ test_suite_config:
             - TestFakeTensor::test_fake_crossref_backward_amp
             - TestFakeTensor::test_fake_crossref_backward_no_amp
             - TestForwardADWithScalars::test_0d_tensor_with_python_scalar
-          mode: xfail  # xfail: UNKNOWN
+          mode: xfail  # xfail: dxp_standalone not detected
         # These tests exercise various operations (e.g., add, addmm, bitwise_and) across different dtypes.
         # They are classified as xfail due to unsupported dtypes and type conversion limitations on Spyre.
         # Relevant Spyre limitations include incomplete dtype support and type conversion during tensor operations.
@@ -243,14 +243,14 @@ test_suite_config:
             - TestCommon::test_dtypes
           mode: xfail  # xfail: AssertionError, RecursionError, RuntimeError
         # These tests exercise a variety of operations and data types, including non-standard boolean values, non-contiguous tensors, and eager variant consistency.
-        # The tests are classified as xfail due to NotImplementedError, RuntimeError, UNKNOWN, and torch._inductor.exc.InductorError exceptions.
+        # The tests are classified as xfail due to NotImplementedError, RuntimeError, and torch._inductor.exc.InductorError exceptions.
         # Relevant Spyre limitations include unsupported operations, missing files, and non-contiguous memory formats.
         - names:
             - TestCommon::test_non_standard_bool_values
             - TestCommon::test_noncontiguous_samples
             - TestCommon::test_variant_consistency_eager
             - TestCompositeCompliance::test_operator
-          mode: xfail  # xfail: NotImplementedError, RuntimeError, UNKNOWN, torch._inductor.exc.InductorError
+          mode: xfail  # xfail: NotImplementedError, RuntimeError, torch._inductor.exc.InductorError
         # These tests exercise various operations (e.g., clone, cat, clamp) across different dtypes (e.g., bfloat16, bool, float16, int64).
         # They are classified as xfail due to NotImplementedError and InductorError, indicating unsupported operations or backend limitations.
         # Relevant Spyre limitations include missing support for certain ops and dtypes, and errors related to file handling and unexpected expressions.
@@ -265,7 +265,7 @@ test_suite_config:
         - names:
             - TestCompositeCompliance::test_backward
             - TestCompositeCompliance::test_forward_ad
-          mode: xfail  # xfail: NotImplementedError, UNKNOWN, ValueError, torch._inductor.exc.InductorError
+          mode: xfail  # xfail: NotImplementedError, ValueError, torch._inductor.exc.InductorError
         # These tests exercise various operations (add, addmm, bmm, etc.) with different dtypes (bool, int64, bfloat16, etc.).
         # They are classified as xfail due to Spyre's limitations in handling certain dtypes and operations, such as unsupported `requires_grad` for boolean and integral dtypes.
         # Relevant Spyre limitations include missing support for some ops (e.g., bitwise_and, random_) and dtypes (e.g., BFloat16 for bitwise_xor_cpu).
@@ -273,7 +273,7 @@ test_suite_config:
             - TestMathBits::test_neg_view
             - TestMathBits::test_conj_view
             - TestMathBits::test_neg_conj_view
-          mode: xfail  # xfail: NotImplementedError, RuntimeError, UNKNOWN, ValueError, torch._inductor.exc.InductorError
+          mode: xfail  # xfail: NotImplementedError, RuntimeError, ValueError, torch._inductor.exc.InductorError
         # These tests exercise a wide range of PyTorch operations across various data types, ensuring compatibility and correctness on the IBM Spyre AI accelerator backend.
         # They are classified as "skip" because they do not engage the torch-spyre layer, focusing instead on core PyTorch functionality and device management.
         # The most relevant Spyre capabilities include support for specific data types and operations, such as bfloat16, bool, float16, float32, int64, and a subset of PyTorch operations like add, addmm, bitwise_and, bitwise_not, bmm, cat, ceil, clamp, clamp_max, clamp_min, clone, constant_pad_nd, convolution, copy_, full, gelu, layer_norm, linear, logical_not, max, maximum, mean, min, minimum, mm, mul, new_ones, ones, rms_norm, sign, softplus, sub, topk, and where.

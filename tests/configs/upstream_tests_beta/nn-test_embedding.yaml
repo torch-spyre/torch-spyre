@@ -8,7 +8,7 @@ test_suite_config:
         # They are classified as mandatory_success due to the critical nature of embedding ops in NLP models.
         # Relevant Spyre capabilities include support for float32 and int64 dtypes, and handling of out-of-bounds indices.
         - names:
-            - TestEmbeddingNN::test_move_sparse_half_embedding # VERIFIER_GOT_IT_WRONG
+            - TestEmbeddingNN::test_move_sparse_half_embedding
             - TestEmbeddingNNDeviceType::test_embedding_bag_out_of_bounds_idx
             - TestEmbeddingNNDeviceType::test_embedding_scalar_weight_error
           mode: mandatory_success
@@ -37,7 +37,7 @@ test_suite_config:
             - TestEmbeddingNNDeviceType::test_embedding_max_norm_device
             - TestEmbeddingNNDeviceType::test_embedding_max_norm_fwd_AD
             - TestEmbeddingNNDeviceType::test_embedding_padding_idx
-          mode: xfail  # xfail: UNKNOWN
+          mode: xfail  # xfail: dxp_standalone not detected
         # These tests exercise embedding and embedding bag operations across various dtypes and tensor configurations.
         # They are classified as 'skip' on the Spyre backend because they do not engage the torch-spyre layer, indicating they bypass Spyre-specific optimizations or capabilities.
         # The most relevant Spyre limitations include unsupported dtypes like Double, which caused a failure in the test_embedding_dense_grad.

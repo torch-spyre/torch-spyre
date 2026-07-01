@@ -17,10 +17,10 @@ test_suite_config:
             - TestPoolingNNDeviceType::test_fractional_max_pool2d_backward_fails
             - TestPoolingNNDeviceType::test_max_pool2d_with_indices_backward_fails
             - TestPoolingNNDeviceType::test_max_pool_indices_corner_cases
-            - TestPoolingNNDeviceType::test_pooling_zero_stride # VERIFIER_GOT_IT_WRONG
+            - TestPoolingNNDeviceType::test_pooling_zero_stride 
           mode: mandatory_success
         - names:
-            - TestPoolingNNDeviceType::test_pool_invalid_size # VERIFIER_GOT_IT_WRONG
+            - TestPoolingNNDeviceType::test_pool_invalid_size
           mode: mandatory_success
           edits:
             dtypes:
@@ -67,7 +67,7 @@ test_suite_config:
             - TestPoolingNNDeviceType::test_pool_large_size
             - TestPoolingNNDeviceType::test_pooling_max_nhwc
             - TestPoolingNNDeviceType::test_pooling_shape
-          mode: xfail  # xfail: UNKNOWN
+          mode: xfail  # xfail: dxp_standalone not detected
         # These tests exercise pooling operations (avg_pool2d, max_pool2d) across different tensor dimensions and data types.
         # They are classified as xfail due to NotImplementedError, indicating that the Spyre backend lacks support for these specific pooling operations.
         # The relevant Spyre limitation is the absence of native support for avg_pool2d and max_pool2d_with_indices.

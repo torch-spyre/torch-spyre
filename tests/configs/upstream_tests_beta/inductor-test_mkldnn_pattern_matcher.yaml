@@ -20,7 +20,7 @@ test_suite_config:
             - TestPatternMatcherGeneric::test_conv3d_binary_broadcast_shapes
             - TestPatternMatcherGeneric::test_conv_transpose2d_unary
             - TestPatternMatcherGeneric::test_conv_transpose3d_unary
-          mode: xfail  # xfail: UNKNOWN
+          mode: xfail  # xfail: dxp_standalone not detected
         # These tests exercise 2D and 3D convolution operations with binary and unary tensor behaviors.
         # They are classified as xfail due to unsupported coordinate expressions in the Spyre backend.
         # The relevant Spyre limitation is the inability to handle complex coordinate expressions in tensor operations.
