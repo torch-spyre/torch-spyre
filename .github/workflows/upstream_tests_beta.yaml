@@ -66,16 +66,10 @@ jobs:
             config: test_linalg.yaml
           - name: NeuralNet pooling
             config: nn-test_pooling.yaml
-          - name: NeuralNet convolution
-            config: nn-test_convolution.yaml
           - name: NeuralNet embedding
             config: nn-test_embedding.yaml
           - name: NeuralNet init
             config: nn-test_init.yaml
-          # All xfail tests. Will result in zero tests collected in "no xfail" mode.
-          # Retaining the yaml for future use as new spyre capabilities are added.
-          # - name: NeuralNet lazy modules
-          #   config: nn-test_lazy_modules.yaml 
           - name: NeuralNet load state dictionary
             config: nn-test_load_state_dict.yaml
           - name: NeuralNet module hooks
@@ -94,25 +88,16 @@ jobs:
             config: test_shape_ops.yaml
           - name: Tensor creation ops
             config: test_tensor_creation_ops.yaml
-          - name: Ops
-            config: test_ops.yaml
           - name: Unary ops
             config: test_unary_ufuncs.yaml
           - name: Binary ops
             config: test_binary_ufuncs.yaml
           - name: Spectral ops
             config: test_spectral_ops.yaml
-          # All xfail tests. Will result in zero tests collected in "no xfail" mode.
-          # There are some mandatory success tests which have been commented out due a potential exclude bug.
-          # Once the bug is resolved, this config can be enabled. 
-          # - name: View ops
-          #   config: test_view_ops.yaml
+          - name: View ops
+            config: test_view_ops.yaml
           - name: Torch
             config: test_torch.yaml
-          # All xfail tests. Will result in zero tests collected in "no xfail" mode.
-          # Retaining the yaml for future use as new spyre capabilities are added.
-          # - name: Masked
-          #   config: test_masked.yaml
           - name: Sort and select
             config: test_sort_and_select.yaml
           - name: Inductor debug trace
@@ -121,22 +106,33 @@ jobs:
             config: inductor-test_exc_lowering_stack_trace.yaml
           - name: Inductor fuzzer
             config: inductor-test_fuzzer.yaml
-          # All xfail tests. Will result in zero tests collected in "no xfail" mode.
-          # Retaining the yaml for future use as new spyre capabilities are added.
-          # - name: Inductor scheduler
-          #   config: inductor-test_inductor_scheduler.yaml
           - name: Inductor mkldnn pattern matcher
             config: inductor-test_mkldnn_pattern_matcher.yaml
           - name: Inductor move constructor to gpu
             config: inductor-test_move_constructors_to_gpu.yaml
-          - name: Inductor op dtype properties
-            config: inductor-test_op_dtype_prop.yaml
           - name: Inductor pattern matcher
             config: inductor-test_pattern_matcher.yaml
           - name: Inductor scatter optimization
             config: inductor-test_scatter_optimization.yaml
           - name: Inductor torch binding
             config: inductor-test_torchbind.yaml
+          # All xfail tests. Will result in zero tests collected in "no xfail" mode.
+          # There are some mandatory success tests which have been commented out due a potential exclude bug.
+          # Once the bug is resolved, this config can be enabled. 
+          # - name: Ops
+          #   config: test_ops.yaml
+          # All xfail tests. Will result in zero tests collected in "no xfail" mode.
+          # Retaining the yaml for future use as new spyre capabilities are added.
+          # - name: NeuralNet lazy modules
+          #   config: nn-test_lazy_modules.yaml 
+          # - name: Masked
+          #   config: test_masked.yaml
+          # - name: Inductor scheduler
+          #   config: inductor-test_inductor_scheduler.yaml
+          # - name: Inductor op dtype properties
+          #   config: inductor-test_op_dtype_prop.yaml
+          # - name: NeuralNet convolution
+          #   config: nn-test_convolution.yaml
 
     steps:
       # Sparse checkout into the GHA workspace so the local composite
