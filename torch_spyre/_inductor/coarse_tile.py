@@ -104,35 +104,36 @@ def _loop_var_to_ranges_pos(out_coords: list, sym: sympy.Symbol) -> int | None:
 
 
 def _hints_levels(ops: list[Operation]) -> list[tuple]:
-    """Build (hint_id, K, is_reduction) level triples from the first hinted op.
+    """Build (hint_id, K, is_reduction) level triples by unioning across all ops.
 
-    All ops in the group share the same hint IDs and split counts.  Any op
-    with a non-None loop_var is representative.  Each op reads its own
-    loop_var from dim_hints in _stamp_group.
-
-    Returns a list of (hint_id, count, is_reduction_level) triples, outermost
-    first.  Previously this skipped is_reduction hints; it now includes them so
-    that _stamp_group can divide reduction_ranges for reduction-dim tiling.
-    Hints with split_count == 1 are dropped: tiling by 1 is a no-op.
+    All ops in the group share the same hint IDs and split counts.  For each
+    hint_id, pick the best DimHint across all ops: one with loop_var is not None
+    beats one with loop_var=None.  Hints that are broadcast at every op
+    (loop_var=None everywhere) are dropped.  Hints with split_count==1 are
+    dropped (tiling by 1 is a no-op).  Returns triples sorted by hint_id
+    ascending (outermost-first).
     """
+    best: dict[int, DimHint] = {}
     for op in ops:
-        levels = []
         for h in getattr(op, "dim_hints", []):
-            if h.loop_var is None:
-                continue
-            if h.split_count == 1:
-                hints_logger.debug(
-                    "spyre_hint on [%s]: hint_id=%d dims=%s split_count=1"
-                    " — tiling by 1 is a no-op, dropping",
-                    ", ".join(o.get_name() for o in ops),
-                    h.hint_id,
-                    h.dim_names,
-                )
-                continue
-            levels.append((h.hint_id, sympy.Integer(h.split_count), h.is_reduction))
-        if levels:
-            return levels
-    return []
+            if h.hint_id not in best or best[h.hint_id].loop_var is None:
+                best[h.hint_id] = h
+
+    levels = []
+    for h in sorted(best.values(), key=lambda x: x.hint_id):
+        if h.loop_var is None:
+            continue
+        if h.split_count == 1:
+            hints_logger.debug(
+                "spyre_hint on [%s]: hint_id=%d dims=%s split_count=1"
+                " — tiling by 1 is a no-op, dropping",
+                ", ".join(o.get_name() for o in ops),
+                h.hint_id,
+                h.dim_names,
+            )
+            continue
+        levels.append((h.hint_id, sympy.Integer(h.split_count), h.is_reduction))
+    return levels
 
 
 def _hint_key(op: Operation) -> frozenset | None:
