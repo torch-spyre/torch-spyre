@@ -649,3 +649,20 @@ def dequantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor) -> torch
 def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     # Output is FP16 with same shape as input
     return torch.empty(input.size(), dtype=torch.float16, device=input.device)
+
+
+@torch.library.custom_op("spyre::prod_dim_int", mutates_args=(), device_types="spyre")
+def prod_dim_int(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
+    pass
+
+
+@prod_dim_int.register_fake
+def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
+    if dim < 0:
+        dim += input.ndim
+    out_shape = list(input.shape)
+    if keepdim:
+        out_shape[dim] = 1
+    else:
+        out_shape = out_shape[:dim] + out_shape[dim + 1 :]
+    return torch.empty(out_shape, dtype=input.dtype, device=input.device)
