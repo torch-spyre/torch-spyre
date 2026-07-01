@@ -76,16 +76,18 @@ export SENCORES=32                 # full accelerator (1–32; default 32)
 Save as `profile_granite.py`.
 
 ```python
+import os
 import time
-from statistics import mean, median
 import torch
-from torch.profiler import ProfilerActivity, profile
+from statistics import mean, median
+from torch.profiler import profile, ProfilerActivity
 from fms.models import get_model
+from fms.utils.generation import pad_input_ids
 from transformers import AutoTokenizer
 
 DEVICE = torch.device("spyre")
 DTYPE = torch.float16  # Spyre's default dtype
-MODEL_PATH = "/tmp/models/granite-3/snapshots/51dd4bc2ade4059a6bd87649d68aa11e4fb2529b.3-8b-instruct"
+MODEL_PATH = "/tmp/models/granite-3.3-8b-instruct"
 
 _ = torch.empty(1, dtype=torch.float16, device="spyre")
 
@@ -99,7 +101,8 @@ model = get_model(
     model_path=MODEL_PATH,
     device_type="spyre",
     data_type=torch.float16,
-).eval().to(DEVICE)
+).eval()
+
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 
 
@@ -107,28 +110,31 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 # inputs = torch.randint(
 #     0, tokenizer.vocab_size, (1, 512), dtype=torch.int64,
 # ).to(DEVICE)
+raw_ids = tokenizer(
+    "Explain artificial intelligence to a 10 year old", return_tensors="pt"
+)["input_ids"].squeeze(0)
 
-inputs = tokenizer(
-    "Explain artificial intelligence to a 10 year old",
-    return_tensors="pt"
-).to(DEVICE)
+ids, kwargs = pad_input_ids(
+    [raw_ids], min_pad_length=512, pad_token_id=tokenizer.pad_token_id
+)
+position_ids = kwargs["position_ids"]
 
-position_ids = torch.cumsum(inputs["attention_mask"], dim=1)
-
-max_seq_len = inputs["input_ids"].shape[1]
+print("=" * 42)
+print("Starting inference...".center(42))
+print("=" * 42)
 
 with torch.no_grad():
-    alpha = model.base_model.rot_emb.compute_freqs_cis(DEVICE, max_seq_len)
-    selected_freqs = (
-        model.base_model.rot_emb.cached_freqs[0][alpha][position_ids.cpu()]
-        .to(DEVICE)
-    )
+    alpha = model.base_model.rot_emb.compute_freqs_cis(DEVICE, ids.shape[1])
+    selected_freqs = model.base_model.rot_emb.cached_freqs[0][alpha][position_ids].to(DEVICE)
 
 
 # Single inference to verify output before profiling
 with torch.no_grad():
-    output = model(inputs["input_ids"], selected_freqs=selected_freqs)
+    mask = kwargs["mask"].to(dtype=torch.float16).to(DEVICE)
+    output = model(ids.to(DEVICE), position_ids=position_ids.to(DEVICE), mask=mask, selected_freqs=selected_freqs)
     generated_token_ids = torch.argmax(output, dim=-1)[0]
+    print(generated_token_ids)
+    print(type(generated_token_ids))
     response = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
 
 print("=" * 42)
@@ -142,7 +148,7 @@ print("Warming up.".center(42))
 print("=" * 42)
 for _ in range(2):
     with torch.no_grad():
-        model(inputs["input_ids"], selected_freqs=selected_freqs)
+      model(ids.to(DEVICE), position_ids=position_ids.to(DEVICE), mask=mask, selected_freqs=selected_freqs)
 
 # 5. Profile a steady-state forward pass.
 N_RUNS = 5
@@ -156,7 +162,7 @@ with profile(
     for _ in range(N_RUNS):
         t0 = time.perf_counter()
         with torch.no_grad():
-          model(inputs["input_ids"], selected_freqs=selected_freqs)
+          model(ids.to(DEVICE), position_ids=position_ids.to(DEVICE), mask=mask, selected_freqs=selected_freqs)
         wall_clock_ms.append((time.perf_counter() - t0) * 1000)
         prof.step()
 
