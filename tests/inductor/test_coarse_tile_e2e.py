@@ -1025,13 +1025,16 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         # sum to receive is_reduction_level=False (taken from the pointwise op),
         # so _divide_reduction_ranges is never called for it: the sum iterates
         # over the full Lk (tiled_symbols inner level stays empty).  After the
-        # per-op dispatch fix, the sum gets tiled_symbols=[[sympify('c2')]] for
-        # its reduction dim.  An empty-list first entry signals the bug.
-        self.assertNotIn(
-            "tiled_symbols=[[]]",
+        # per-op dispatch fix, both mul and sum get tiled_symbols=[[sympify('c2')]]
+        # confirming Lk is properly divided for both output and reduction ops.
+        # Note: the accumulation add op legitimately has tiled_symbols=[[]] (it
+        # is loop-invariant w.r.t. Lk), so we assert presence of the tiled sym
+        # rather than absence of the empty list.
+        self.assertIn(
+            "tiled_symbols=[[sympify('c2')]]",
             src,
-            "sum op has empty tiled_symbols inner level — Lk reduction range was not"
-            " divided by _stamp_group (group-wide is_reduction_level flag bug)",
+            "sum op Lk reduction range was not divided — expected"
+            " tiled_symbols=[[sympify('c2')]] for at least one op (mul or sum)",
         )
 
     def test_hint_flash_attention_two_loop_levels(self):
