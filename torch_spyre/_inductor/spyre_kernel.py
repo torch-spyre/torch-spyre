@@ -424,7 +424,6 @@ class SpyreKernelOpsHandler(DefaultHandler):
             "welford_reduce",
             "welford_combine",
             "any",
-            "prod",
             "xor_sum",
         ]:
             return UnimplementedOp(reduction_type)

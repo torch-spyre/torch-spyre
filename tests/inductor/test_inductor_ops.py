@@ -4285,6 +4285,65 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d_8x6x4": (cached_randn((2, 3, 64), dtype=torch.float16), 8, 6, 4),
             },
         },
+        # TODO: torch.prod(x) (reduction over all tensor elements) is not yet
+        # supported. Once support for all torch.prod forms is implemented, we
+        # can register `prod` in CORE_REDUCTION_OPS_DICT like other reduction ops.
+        ("test_prod", "test_prod_cpu"): {
+            "param_sets": {
+                "int64_dim0": (
+                    torch.randint(2, 10, (1, 2), dtype=torch.int64),
+                    0,
+                    False,
+                ),
+                "int64_dim0_keepdim": (
+                    torch.randint(2, 10, (1, 2), dtype=torch.int64),
+                    0,
+                    True,
+                ),
+                "int64_dim1": (
+                    torch.randint(2, 10, (1, 2), dtype=torch.int64),
+                    -1,
+                    False,
+                ),
+                "int64_dim1_keepdim": (
+                    torch.randint(2, 10, (1, 2), dtype=torch.int64),
+                    -1,
+                    True,
+                ),
+                "int64_dim0_2": (
+                    torch.randint(1, 2, (64, 32), dtype=torch.int64),
+                    0,
+                    False,
+                ),
+                "int64_dim0_2_keepdim": (
+                    torch.randint(1, 2, (64, 32), dtype=torch.int64),
+                    0,
+                    True,
+                ),
+                "int64_dim1_2": (
+                    torch.randint(1, 2, (64, 32), dtype=torch.int64),
+                    -1,
+                    False,
+                ),
+                "int64_dim1_2_keepdim": (
+                    torch.randint(1, 2, (64, 32), dtype=torch.int64),
+                    -1,
+                    True,
+                ),
+                "fp16_dim0": (torch.randn((128, 64), dtype=torch.float16), 0, False),
+                "fp16_dim0_keepdim": (
+                    torch.randn((128, 64), dtype=torch.float16),
+                    0,
+                    True,
+                ),
+                "fp16_dim1": (torch.randn((128, 64), dtype=torch.float16), -1, False),
+                "fp16_dim1_keepdim": (
+                    torch.randn((128, 64), dtype=torch.float16),
+                    -1,
+                    True,
+                ),
+            },
+        },
         ("test_unfold", "test_unfold_cpu"): {
             "param_sets": {
                 # 1D: Basic cases
@@ -4920,20 +4979,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
         self.compare_with_cpu(
             lambda x: torch.any(x, dim=0, keepdim=False), x, run_eager=False
-        )
-
-    @pytest.mark.xfail(
-        reason=(
-            "Spyre compiled backend does not support torch.prod yet (stable "
-            "error signature: InductorError: AttributeError: "
-            "'UnimplementedOp' object has no attribute 'iteration_space')"
-        ),
-        strict=True,
-    )
-    def test_prod_dim0_known_xfail(self):
-        x = cached_randn((67, 256), scale=0.1)
-        self.compare_with_cpu(
-            lambda x: torch.prod(x, dim=0, keepdim=False), x, run_eager=False
         )
 
     @pytest.mark.xfail(
@@ -6096,6 +6141,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             match="Boolean value of Tensor with more than one value is ambiguous",
         ):
             compiled(x_multi.to("spyre"))
+
+    def test_prod_cpu(self, x, dim, keepdim):
+        def fn(a):
+            return torch.prod(a, dim=dim, keepdim=keepdim)
+
+        self.compare_with_cpu(fn, x, run_eager=False)
 
 
 if __name__ == "__main__":
