@@ -17,7 +17,7 @@ test_suite_config:
             - TestPoolingNNDeviceType::test_fractional_max_pool2d_backward_fails
             - TestPoolingNNDeviceType::test_max_pool2d_with_indices_backward_fails
             - TestPoolingNNDeviceType::test_max_pool_indices_corner_cases
-            - TestPoolingNNDeviceType::test_pooling_zero_stride 
+            - TestPoolingNNDeviceType::test_pooling_zero_stride
           mode: mandatory_success
         - names:
             - TestPoolingNNDeviceType::test_pool_invalid_size
