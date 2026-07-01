@@ -545,7 +545,6 @@ def test_permute_matmul():
     )
 
 
-@pytest.mark.skip(reason="Issue #2961")
 def test_view_reshape_a():
     """View/reshape with shared name for equal-size dims (A==D, both called AD).
 
@@ -585,7 +584,6 @@ def test_view_reshape_a():
     )
 
 
-@pytest.mark.skip(reason="Issue #2961")
 def test_view_reshape_b():
     """View/reshape with all unique dim sizes.
 
@@ -846,7 +844,6 @@ def test_permuted_intermediate_then_pointwise():
     )
 
 
-@pytest.mark.skip(reason="Issue #2961")
 def test_view_reshape_a_distinct_names():
     """Like test_view_reshape_a but with distinct names A/D for the equal-size dims.
 
