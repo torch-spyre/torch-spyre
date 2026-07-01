@@ -703,7 +703,7 @@ def _apply_user_hint(
 
         next_cores = cores_used * split
         if next_cores > max_cores:
-            logger.warning(
+            logger.info(
                 "work_division_hint: %s skipping named dim(s) %s (split=%s) "
                 "because cores would be %s, exceeding SENCORES=%s",
                 op_name,
