@@ -70,9 +70,9 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.max` | Y | Y | Spyre | `max.dim` via custom decomposition |
 | `torch.min` | Y | Y | Spyre | `min.dim` via custom decomposition (fp16) |
 | `torch.topk` | | Y | Spyre | Custom decomposition + custom ops (`spyre::topkvalue`, `spyre::topkindex`) |
-| `torch.linalg.vector_norm` | Y | Y | Spyre | |
+| `torch.linalg.vector_norm` | | Y | Spyre | Compiled only. Eager path registered but disabled (misroutes `ord`) |
 | **View Ops** [^views] | | | | |
-| `torch.reshape` / `torch.view` | | Y | Spyre | Includes `_reshape_alias` lowering |
+| `torch.reshape` / `torch.view` | | Y | Spyre | Includes `_reshape_alias` (a C++ device view, not an Inductor lowering) |
 | `torch.transpose` | | Y | Spyre | |
 | `torch.t` | Y | Y | Spyre | View op |
 | `torch.permute` | Y | Y | Spyre | |
@@ -83,7 +83,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.flatten` | | Y | Spyre | Compiled only (lowers via `reshape`) |
 | `torch.cat` | Y | Y | Spyre | |
 | `torch.stack` | Y | | Spyre | Eager only |
-| `torch.repeat` | Y | Y | Spyre | |
+| `torch.repeat` | | Y | Spyre | Compiled only. `repeat.out` is available as a CPU fallback |
 | `torch.unbind` | Y | Y | Spyre | |
 | `torch.Tensor.unfold` | Y | Y | Spyre | View op |
 | `torch.split` | | Y | Spyre | Compiled only (lowers via `aten.slice`) |

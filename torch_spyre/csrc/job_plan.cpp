@@ -22,16 +22,19 @@
 #include <vector>
 
 #include "spyre_allocator.h"
+#include "spyre_stream.h"
 #include "util/processSpyreCodeArtifacts.h"
 
 namespace spyre {
 
 void JobPlanStepH2D::construct(LaunchContext&,
-                               flex::RuntimeStream* flex_stream) const {
-  flex::DmaParams params(host_address_, device_address_.total_size(),
-                         /*to_device=*/true, &device_address_);
-  params.pipeline_barrier = pipeline_barrier_;
-  flex_stream->launchOperationH2D(&params);
+                               const SpyreStream& stream) const {
+  auto* params =
+      flex::createDmaParams(host_address_, device_address_.total_size(),
+                            /*to_device=*/true, &device_address_);
+  params->pipeline_barrier = pipeline_barrier_;
+  stream.launchH2D(params);
+  flex::destroyDmaParams(params);
 }
 
 void JobPlanStepH2D::write(std::ostream& os) const {
@@ -43,11 +46,13 @@ void JobPlanStepH2D::write(std::ostream& os) const {
 }
 
 void JobPlanStepD2H::construct(LaunchContext&,
-                               flex::RuntimeStream* flex_stream) const {
-  flex::DmaParams params(host_address_, device_address_.total_size(),
-                         /*to_device=*/false, &device_address_);
-  params.pipeline_barrier = pipeline_barrier_;
-  flex_stream->launchOperationD2H(&params);
+                               const SpyreStream& stream) const {
+  auto* params =
+      flex::createDmaParams(host_address_, device_address_.total_size(),
+                            /*to_device=*/false, &device_address_);
+  params->pipeline_barrier = pipeline_barrier_;
+  stream.launchD2H(params);
+  flex::destroyDmaParams(params);
 }
 
 void JobPlanStepD2H::write(std::ostream& os) const {
@@ -59,7 +64,7 @@ void JobPlanStepD2H::write(std::ostream& os) const {
 }
 
 void JobPlanStepCompute::construct(LaunchContext& ctx,
-                                   flex::RuntimeStream* flex_stream) const {
+                                   const SpyreStream& stream) const {
   std::vector<const flex::CompositeAddress*> tensor_allocs;
   if (bind_io_addresses_) {
     for (auto& tensor : ctx.inputs_outputs) {
@@ -70,15 +75,17 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
       tensor_allocs.push_back(address);
     }
   }
-  flex::ComputeParams params(&binary_address_, std::move(tensor_allocs), "",
-                             bootstrap_addr_);
-  params.pipeline_barrier = pipeline_barrier_;
-  flex_stream->launchOperationCompute(&params);
+  auto* params = flex::createComputeParams(
+      &program_address_, std::move(tensor_allocs), name_, bootstrap_offset_);
+  params->pipeline_barrier = pipeline_barrier_;
+  stream.launchCompute(params);
+  flex::destroyComputeParams(params);
 }
 
 void JobPlanStepCompute::write(std::ostream& os) const {
   os << "  Device Compute\n";
-  os << "    Binary address: " << binary_address_ << "\n";
+  os << "    Name: " << (name_.empty() ? "(unnamed)" : name_) << "\n";
+  os << "    Program address: " << program_address_ << "\n";
   os << "    Bind I/O addresses: " << (bind_io_addresses_ ? "yes" : "no")
      << "\n";
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")
@@ -100,12 +107,13 @@ static int64_t composite_address_to_dmva(
 }
 
 void JobPlanStepHostCompute::construct(LaunchContext& ctx,
-                                       flex::RuntimeStream* flex_stream) const {
+                                       const SpyreStream& stream) const {
   // Helper lambda to build HostCallbackParams and launch on the stream
-  auto launch_host_callback = [this, flex_stream](auto&& callback) {
-    flex::HostCallbackParams params(std::forward<decltype(callback)>(callback),
-                                    nullptr, pipeline_barrier_);
-    flex_stream->launchOperationHostCallback(&params);
+  auto launch_host_callback = [this, &stream](auto&& callback) {
+    auto* params = flex::createHostCallbackParams(
+        std::forward<decltype(callback)>(callback), nullptr, pipeline_barrier_);
+    stream.launchHostCallback(params);
+    flex::destroyHostCallbackParams(params);
   };
 
   // Case 1: input_buffer_ is provided

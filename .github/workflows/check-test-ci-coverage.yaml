@@ -15,6 +15,8 @@ on:
     paths:
       - tests/**/test_*.py
       - tests/configs/**
+      - tests/scripts/check_test_coverage.sh
+      - tests/oot_framework/utils/filter_configs.py
       - .github/workflows/_test_matrix.yaml
       - .github/workflows/check-test-ci-coverage.yaml
     branches: [main]
@@ -24,6 +26,8 @@ on:
     paths:
       - tests/**/test_*.py
       - tests/configs/**
+      - tests/scripts/check_test_coverage.sh
+      - tests/oot_framework/utils/filter_configs.py
       - .github/workflows/_test_matrix.yaml
       - .github/workflows/check-test-ci-coverage.yaml
   merge_group:

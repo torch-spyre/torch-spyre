@@ -609,26 +609,25 @@ def spyre__sdpa_overrideable(
     )
 
 
-## TODO(imaihal): Need to fix scalar tensor shape mismatch during Spyre-to-CPU transfer.
-## See: https://github.com/torch-spyre/torch-spyre/issues/1172
-## This will be enabled after solving this.
-# @register_spyre_decomposition([torch.ops.aten.max.default])
-# def spyre_max_default_decomp(input):
-#    """
-#    Decompose torch.max(input) with conditional CPU fallback for int64.
-#
-#    For int64 tensors, use custom op spyre::max_default_int64_fallback which has
-#    a CPU fallback registered in fallbacks.py.
-#    For other dtypes (float16, float32, etc.), use amax.
-#    """
-#    if input.dtype == torch.int64:
-#        # Use custom op with CPU fallback to avoid recursive decomposition
-#        # Returns a scalar (0D) tensor
-#        return torch.ops.spyre.max_default_int64_fallback(input)
-#    else:
-#        # Use amax for supported dtypes (can run on Spyre)
-#        # Returns a scalar (0D) tensor
-#        return torch.ops.aten.amax(input)
+@register_spyre_decomposition([torch.ops.aten.max.default])
+def spyre_max_default_decomp(input):
+    """
+    Decompose torch.max(input) with conditional CPU fallback for int64.
+
+    For int64 tensors, use custom op spyre::max_default_int64_fallback which has
+    a CPU fallback registered in fallbacks.py.
+    For other dtypes (float16, float32, etc.), use amax.
+    """
+    if input.dtype == torch.int64:
+        # Use custom op with CPU fallback to avoid recursive decomposition
+        # Returns a scalar (0D) tensor
+        return torch.ops.spyre.max_default_int64_fallback(input)
+    else:
+        # Use amax for supported dtypes (can run on Spyre)
+        # Returns a scalar (0D) tensor
+        return torch.ops.aten.amax(input)
+
+
 @register_spyre_decomposition([torch.ops.aten.max.dim])
 def spyre_max_dim_decomp(input, dim, keepdim=False):
     """
@@ -902,6 +901,31 @@ def spyre_quantize_fp8_with_scale(
     x_scaled = input * inv_scale
     x_clamped = torch.ops.spyre.clamp(x_scaled, -FP8_E4M3_MAX, FP8_E4M3_MAX)
     return torch.ops.spyre.qfp8ch(x_clamped)
+
+
+@register_spyre_decomposition([torch.ops.aten.prod.dim_int])
+def spyre_prod_dim_int(
+    input: torch.Tensor, dim: int, keepdim: bool = False
+) -> torch.Tensor:
+    # Currently, restickify does not support fp32 (int64 is also converted to fp32
+    # for now, so it is unsupported as well).
+    # Use decomposition in these cases as a safe fallback, even if restickify
+    # might not be needed in the end.
+    if input.dtype != torch.float32 and input.dtype != torch.int64:
+        return torch.ops.spyre.prod_dim_int(input, dim, keepdim)
+
+    if dim < 0:
+        dim += input.ndim
+    out_shape = list(input.shape)
+    reduce_size = out_shape.pop(dim)
+    acc = torch.ones(out_shape, dtype=input.dtype, device=input.device)
+    for i in range(reduce_size):
+        acc = acc * input.select(dim, i)
+
+    if keepdim:
+        acc = acc.unsqueeze(dim)
+
+    return acc
 
 
 ###############################################################################################

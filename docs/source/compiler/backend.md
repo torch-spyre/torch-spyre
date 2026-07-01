@@ -135,9 +135,14 @@ SuperDSC was designed to get Torch-Spyre running quickly with an IR that closely
 
 ## Invocation
 
-The front-end compiler invokes DeepTools programmatically as part of
-the `torch.compile` pipeline. The binary artifacts are cached by
-Inductor's standard compilation cache.
+DeepTools runs as an out-of-process subprocess. During scheduling, the
+generated host code calls `async_compile.sdsc(...)`
+([`execution/async_compile.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/execution/async_compile.py)),
+which runs `dxp_standalone --bundle -d <output_dir>` to turn the
+SuperDSC JSON into a device binary. Each kernel gets its own output
+directory created with `tempfile.mkdtemp` under `<cache_dir>/inductor-spyre`,
+so the bundles are stored separately from Inductor's content-addressed
+Python/Triton cache.
 
 ## Further Reading
 

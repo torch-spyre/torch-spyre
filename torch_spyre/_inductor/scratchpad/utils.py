@@ -14,8 +14,7 @@
 
 
 import math
-from typing import Any
-
+from typing import Any, Optional
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import Operation, IRNode, Pointwise
@@ -41,15 +40,14 @@ OP_OUTPUT_GOOD_FOR_LX_REUSE = frozenset(
         "mean",
         "add",
         "rsqrt",
-    }
-)
-
-OP_GOOD_FOR_LX_INPLACE = frozenset(
-    {
-        "exp",
-        "sub",
-        "add",
-        "rsqrt",
+        "neg",
+        "mm",
+        "bmm",
+        "batched_matmul",
+        "div",
+        "realdiv",
+        "expand",
+        "silu",
     }
 )
 
@@ -102,15 +100,22 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
     return liveness
 
 
-def mem_usage_by_buf(graph: GraphLowering | GraphView) -> dict:
+def mem_usage_by_buf(
+    graph: GraphLowering | GraphView,
+    cache: Optional[dict] = None,
+    rw_cache: Optional[dict] = None,
+) -> dict:
     """
     Get a summary of memory usage of each operation.
     Includes detailed info of individual buf, e.g. mem_usage[<buf_name>],
     which has "size_per_core", "size", "core_div_mismatch", "op_inputs" fields
     NOTE:
     if a buf is not in core_div_mismatch => it has no users => graph output
+
+    `rw_cache` ({op name: ReadWrites}) memoizes get_read_writes() across
+    co-opt search leaves; None recomputes it.
     """
-    num_cores_per_op = get_ncores_for_buffers(graph)
+    num_cores_per_op = get_ncores_for_buffers(graph, cache, rw_cache)
     mem_usage: dict = {}
 
     buf_names = {op.name for op in graph.operations}
@@ -122,7 +127,7 @@ def mem_usage_by_buf(graph: GraphLowering | GraphView) -> dict:
         dev_size = (
             math.prod(dev_layout.device_size[:-1]) * 128
         )  # num_sticks * bytes_per_stick
-        rw = op.get_read_writes()
+        rw = rw_cache[op.get_name()] if rw_cache is not None else op.get_read_writes()
         mem_usage[buf_name] = {
             "size": dev_size,
             "size_per_core": dev_size // num_cores,
@@ -145,6 +150,7 @@ def get_buffer_users(graph: GraphLowering | GraphView) -> dict[str, list[Operati
 
 def _get_buffer_user_deps(
     graph: GraphLowering | GraphView,
+    rw_cache: Optional[dict] = None,
 ) -> dict[str, list[tuple[Operation, MemoryDep]]]:
     """Like get_buffer_users but pairs each op with the specific dep it uses.
 
@@ -152,10 +158,13 @@ def _get_buffer_user_deps(
     one per dep. If their per-core views diverge — read at one index,
     write at another — the buffer is correctly rejected for LX, since
     that's a within-core data hazard, not just cross-op disagreement.
+
+    `rw_cache` ({op name: ReadWrites}) memoizes the split-invariant
+    get_read_writes() across co-opt search leaves; None recomputes it.
     """
     buf_user_deps: dict[str, list[tuple[Operation, MemoryDep]]] = {}
     for op in graph.operations:
-        rw = op.get_read_writes()
+        rw = rw_cache[op.get_name()] if rw_cache is not None else op.get_read_writes()
         for dep in rw.reads | rw.writes:
             buf_user_deps.setdefault(dep.name, []).append((op, dep))
     return buf_user_deps
@@ -174,35 +183,67 @@ def _op_num_cores(op: Operation) -> int:
     return math.prod([s for p in splits for s in p.values()])
 
 
-def get_ncores_for_buffers(graph: GraphLowering | GraphView) -> dict[str, int]:
+def get_ncores_for_buffers(
+    graph: GraphLowering | GraphView,
+    cache: Optional[dict] = None,
+    rw_cache: Optional[dict] = None,
+) -> dict[str, int]:
     """
     Return a dictionary mapping buffer names to the number of cores
     used by all the operations that uses the buffer.
     If there is a core division mismatch return -1 instead of the
     number of cores.
+
+    Pass an optional `cache` dict to memoize `_per_core_view_on_buf`
+    results across calls (e.g. across co-opt search leaves). Safe to
+    share only within a single graph, since the cache key includes the
+    op name and `dep` (which carries the buffer name). `rw_cache`
+    ({op name: ReadWrites}) likewise memoizes get_read_writes().
     """
     result: dict[str, int] = {}
     using_multicore = config.sencores > 1
-    buf_user_deps = _get_buffer_user_deps(graph)
+    buf_user_deps = _get_buffer_user_deps(graph, rw_cache)
     for buf_name, users in buf_user_deps.items():
         # this dict includes graph input and output
         if using_multicore and len(users) > 1:
-            # K-split-reduction producers leave partial sums on most cores;
-            # only k-last cores hold the final value. Without a broadcast
-            # codepath the buffer is not safe on LX, even if work-slice
-            # geometry happens to match. The flag is meaningful only for
-            # write-deps — a consumer reading a K-split input still gets
-            # its own valid work slice.
+            # A K-split-reduction writer leaves partial sums on most cores (only
+            # k-last cores hold the final value), so it's unsafe on LX even if
+            # geometry matches — the `flag` gate applies to write-deps only.
             ref_view = None
             mismatch = False
+            writer_cores = None
             for op, dep in users:
-                view, flag = _per_core_view_on_buf(op, dep, buf_name)
+                view, flag = _per_core_view_on_buf(op, dep, buf_name, cache)
                 if ref_view is None:
                     ref_view = view
-                if (flag and dep in op.get_read_writes().writes) or (view != ref_view):
+                op_rw = (
+                    rw_cache[op.get_name()]
+                    if rw_cache is not None
+                    else op.get_read_writes()
+                )
+                if dep in op_rw.writes:
+                    # Size by the writer's core count (the writer sets per-core
+                    # footprint size/writer_cores; readers touch only their slice),
+                    # not max() over users. One writer per buffer (it's named after
+                    # its producing op; an in-place op recurs as a reader, not a
+                    # second writer). _op_num_cores folds in K-split factors, an
+                    # unfaithful output divisor — but a K-split sets `flag` and is
+                    # rejected below, so writer_cores divides only for output splits.
+                    writer_cores = _op_num_cores(op)
+                    if flag:
+                        mismatch = True
+                        break
+                if view != ref_view:
                     mismatch = True
                     break
-            num_cores = -1 if mismatch else max(_op_num_cores(op) for op, _ in users)
+            if mismatch:
+                num_cores = -1
+            elif writer_cores is not None:
+                num_cores = writer_cores
+            else:
+                # No writer (graph input, produced outside the graph): fall back
+                # to the users' (matching) max count.
+                num_cores = max(_op_num_cores(op) for op, _ in users)
         elif using_multicore:
             num_cores = _op_num_cores(users[0][0])
         else:

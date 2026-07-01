@@ -16,6 +16,7 @@ from oot_framework.oot_test_constants import (
     _DYNAMIC_TAG_PREFIXES,
     DEFAULT_FLOATING_PRECISION,
     ENV_TEST_CONFIG,
+    ENV_TEST_TYPE,
     MODE_MANDATORY_SUCCESS,
     MODE_SKIP,
     MODE_XFAIL,
@@ -86,7 +87,7 @@ def remove_builtin_privateuse1_test_base():
     """
     Remove built-in PrivateUse1TestBase from device_type_test_bases.
 
-    This ensures only TorchTestBase handles the privateuse1 device type,
+    This ensures only OOTTestBase handles the privateuse1 device type,
     preventing nondeterministic overwrites when list(set(...)) randomizes order.
 
     Side effect: Modifies the global device_type_test_bases list in-place.
@@ -106,12 +107,12 @@ remove_builtin_privateuse1_test_base()
 
 
 # ---------------------------------------------------------------------------
-# TorchTestBase
+# OOTTestBase
 # ---------------------------------------------------------------------------
 
 
 # PrivateUse1TestBase injected via globals() by runpy
-class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F821
+class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F821
     """Base class for OOT Device PyTorch test overrides.
 
     All configuration is loaded lazily from the YAML file pointed to by
@@ -154,9 +155,9 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         # causing subsequent instantiate_device_type_tests calls to generate class
         # names like TestOldViewOpsSPYRE instead of TestOldViewOpsPRIVATEUSE1,
         # which then get filtered out by PYTORCH_TESTING_DEVICE_ONLY_FOR=privateuse1.
-        # Reset TorchTestBase.device_type to "privateuse1" so subsequent
+        # Reset OOTTestBase.device_type to "privateuse1" so subsequent
         # calls generate the correct class name.
-        TorchTestBase.device_type = "privateuse1"
+        OOTTestBase.device_type = "privateuse1"
 
     # ------------------------------------------------------------------
     # Config loading  (called once per test run via instantiate_test)
@@ -369,6 +370,21 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
             effective_mode = entry.mode  # always set, default is mandatory_success
         else:
             effective_mode = cls.UNLISTED_TEST_MODE  # only for truly unlisted tests
+
+        # per-test label filter — skip if this entry's labels don't include the
+        # active TEST_TYPE.  Empty labels means "no restriction; run whenever the
+        # suite runs" so the check is a no-op for unlabelled entries.
+        # suite_<group> values are structural (handled by filter_configs.py at the
+        # config-file level) and are ignored here.
+        if entry is not None and entry.labels:
+            test_type = os.environ.get(ENV_TEST_TYPE, "full")
+            if (
+                test_type
+                and test_type != "full"
+                and not test_type.startswith("suite_")
+                and test_type not in entry.labels
+            ):
+                return False, f"Excluded by TEST_TYPE={test_type!r}", False, False
 
         # dtype filtering — extract dtype from method_name and check against supported
         dtype_str = extract_dtype_from_name(method_name)
@@ -812,4 +828,4 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
                     pass
 
 
-TEST_CLASS = TorchTestBase
+TEST_CLASS = OOTTestBase

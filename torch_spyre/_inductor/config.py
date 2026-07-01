@@ -60,6 +60,16 @@ ignore_work_division_hints: bool = (
     os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
 )
 
+ignore_wsr_hints: bool = os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
+
+# Disable compiler-generated span-overflow coarse-tiling hints.  The global
+# SPYRE_INDUCTOR_IGNORE_HINTS flag also disables these so one switch can still
+# suppress all WSR/coarse-tiling hint paths.
+ignore_span_overflow_hints: bool = (
+    ignore_wsr_hints
+    or os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "0") == "1"
+)
+
 # For K-split matmuls, permute physical core IDs so the cores collaborating on a
 # K reduction land on adjacent ring positions, cutting PSUM chain hops from m*n
 # to 1. The split itself is chosen by the cost-model planner; this only reorders
@@ -68,11 +78,19 @@ core_id_k_fast_emission: bool = (
     os.environ.get("SPYRE_CORE_ID_K_FAST_EMISSION", "1") == "1"
 )
 
+# When True, HBM tensor addresses are emitted as runtime symbols (%sym_N
+# constants) in bundle.mlir and resolved via affine.apply for tiled loops.
+# Requires backend compiler support for the sdscbundle symbol table.
+# Independent of bundle_symbolic_args: you can have symbols in the SDSC JSON
+# without exposing them as function arguments (staged adoption).
+bundle_hbm_symbols: bool = os.environ.get("BUNDLE_HBM_SYMBOLS", "1") == "1"
+
 # When False (default), HBM tensor addresses are baked as concrete integers
 # into the SDSC JSON and bundle.mlir emits sdsc_execute with no operands.
 # When True, addresses are emitted as runtime symbols with
 # !sdscbundle.input_arg<index> parameters, input_arg_extract ops, and
 # affine.apply indirection for tiled loops.
+# Requires bundle_hbm_symbols=True to have any effect.
 bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "0") == "1"
 
 # When True (default), LoopSpec nodes are fully unrolled into flat OpSpecs

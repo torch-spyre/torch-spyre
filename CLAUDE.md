@@ -45,7 +45,7 @@ Test sub-suites:
 | `LX_PLANNING=1` | Enable LX scratchpad memory planning |
 | `TORCH_LOGS="+inductor"` | Verbose Inductor logging |
 | `TORCH_COMPILE_DEBUG=1` | Dump Inductor debug artifacts |
-| `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress float32→float16 warnings |
+| `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 downcast warnings |
 
 ## Spyre Hardware Basics
 
@@ -63,6 +63,18 @@ See `docs/source/` for detailed architecture documentation:
 - `docs/source/user_guide/tensors_and_layouts.md` — tiled tensor layout specification
 - `docs/source/compiler/adding_operations.md` — how to add new operations
 - `docs/source/compiler/work_division_planning.md` — multi-core work division
+
+## Compiler Pass Conventions
+
+**Modifying `ComputedBuffer.inner_fn`: wrap, never reconstruct.**
+Use a `WrapperHandler` subclass (see `WrapperHandler` in
+`torch._inductor.ops_handler`) to intercept specific ops and install it
+with `V.set_ops_handler(handler)` inside the original `inner_fn`. Do NOT
+rebuild `inner_fn` from scratch by re-creating index expressions — those
+expressions are symbolic and become stale as soon as the pass runs,
+causing silent wrong-code bugs (see issue #2797). Canonical examples of the
+correct pattern: `NameSwapHandler` in `insert_restickify.py`,
+`_SplitOpsHandler`/`_IntermediateOpHandler` in `split_multi_ops.py`.
 
 ## Skills
 
