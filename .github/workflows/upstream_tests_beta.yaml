@@ -167,7 +167,7 @@ jobs:
         with:
           suite_name: ${{ matrix.suite.name }}
           config: tests/configs/upstream_tests/${{ matrix.suite.config }}
-          extra_test_flags: -v -m "not xfail"
+          extra_test_flags: -v
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
 
