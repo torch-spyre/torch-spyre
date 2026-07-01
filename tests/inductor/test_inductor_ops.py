@@ -194,11 +194,6 @@ SPYRE_MODE_SUPPORT_OVERRIDES_BY_OP = {
         "eager": False,
         "reason": "Spyre eager aten::amin.out is not supported yet (issue #1708)",
     },
-    torch.amax: {
-        "compiled": True,
-        "eager": False,
-        "reason": "Spyre eager aten::amax.out is not supported yet (issue #1708)",
-    },
     torch.min: {
         "compiled": True,
         "eager": False,
