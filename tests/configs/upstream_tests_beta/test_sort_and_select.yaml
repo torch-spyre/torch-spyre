@@ -1,76 +1,75 @@
 test_suite_config:
 
   files:
-    - path: ${TORCH_ROOT}/test/test_shape_ops.py
+    - path: ${TORCH_ROOT}/test/test_sort_and_select.py
       unlisted_test_mode: skip
       tests:
-        # These tests exercise error handling for shape ops like clamp, fliplr, flipud, and unfold.
-        # They are mandatory_success because Spyre's inductor backend raises InductorError for unsupported meta ops.
-        # Spyre's capability to run these tests relies on PyTorch's CPU fallback for error checking.
+        # These tests exercise the `isin` and `topk` operations across different devices and dtypes.
+        # They are classified as `mandatory_success` due to the expected RuntimeError for `isin` with mismatched devices.
+        # The relevant Spyre capability is handling device-specific errors for tensor operations.
         - names:
-            - TestShapeOps::test_clamp_raises_arg_errors
-            - TestShapeOps::test_fliplr_invalid
-            - TestShapeOps::test_flipud_invalid
-            - TestShapeOps::test_unfold_errors
+            - TestSortAndSelect::test_isin_different_devices
+            - TestSortAndSelect::test_topk_arguments
           mode: mandatory_success
-        # These tests exercise sparse_dim and dense_dim methods on tensors of various shapes and dtypes. The int64 dtype fails because Spyre lacks support for the aten::random_.from operator used in integer tensor creation. The mandatory_success classification reflects that the test passes for float32 but fails for int64 due to this missing operator.
+        # These tests exercise the `isin` and `topk` operations across various dtypes and tensor dimensions.
+        # They are classified as `xfail` due to unsupported dtype casting and comparison errors on the Spyre backend.
+        # Relevant Spyre limitations include dtype handling and tensor comparison capabilities.
         - names:
-            - TestShapeOps::test_sparse_dense_dim
-          mode: mandatory_success
-          edits:
-            dtypes:
-              exclude:
-                - name: int64
-        # These tests exercise shape-manipulating ops like clamp, diag, diagonal, and rot90 across various dtypes.
-        # They are xfailed due to missing dxp_standalone tool and unsupported Spyre layout transformations.
-        # Spyre lacks support for complex stick expressions and restickify operations needed for these shape ops.
+            - TestSortAndSelect::test_isin
+            - TestSortAndSelect::test_isin_different_dtypes
+            - TestSortAndSelect::test_topk_4d
+          mode: xfail  # xfail: RuntimeError
+        # These tests exercise various sorting and selection operations (e.g., `kthvalue`, `sort`, `topk`, `unique_consecutive`, `unique_dim`) across different data types.
+        # They are classified as `xfail` on the Spyre backend due to the unimplemented `aten::kthvalue.values`, `aten::sort.values_stable`, `aten::topk.values`, and `aten::unique_consecutive` operators.
+        # The most relevant Spyre capabilities are its support for `bfloat16`, `bool`, `float16`, `float32`, and `int64` data types, but it lacks support for these specific sorting and selection operations.
         - names:
-            - TestShapeOps::test_clamp
-            - TestShapeOps::test_clamp_propagates_nans
-            - TestShapeOps::test_diag
-            - TestShapeOps::test_diagonal
-            - TestShapeOps::test_rot90
-          mode: xfail  # xfail: torch._inductor.exc.InductorError
-        # These tests exercise the diagonal op on multi-dimensional float32 tensors, including non-contiguous cases.
-        # They are xfail due to a missing .numpy() method for Spyre device tensors, causing a TypeError.
-        # The Spyre backend lacks direct tensor-to-numpy conversion, requiring explicit CPU copying.
-        - names:
-            - TestShapeOps::test_diagonal_multidim
-          mode: xfail  # xfail: TypeError
-        # These tests exercise shape manipulation ops like flip, movedim, and trace across various dtypes.
-        # They are xfailed due to missing Spyre support for complex index expressions and reduction ops like sum.
-        # The failures highlight Spyre's limited support for non-linear memory access patterns and certain data formats.
-        - names:
-            - TestShapeOps::test_flip
-            - TestShapeOps::test_movedim
-            - TestShapeOps::test_movedim_invalid
-            - TestShapeOps::test_trace
-          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
-        # These tests exercise shape manipulation ops like flip, nonzero, and unfold across various dtypes.
-        # They are xfail due to missing Spyre kernel implementations for aten::flip, aten::nonzero, and aten::unfold.
-        # The failures highlight Spyre's limited support for view-like and indexing operations on the device.
-        - names:
-            - TestShapeOps::test_flip_errors
-            - TestShapeOps::test_flip_numpy
-            - TestShapeOps::test_fliplr
-            - TestShapeOps::test_flipud
-            - TestShapeOps::test_nonzero
-            - TestShapeOps::test_nonzero_astuple_out
-            - TestShapeOps::test_nonzero_discontiguous
-            - TestShapeOps::test_nonzero_no_warning
-            - TestShapeOps::test_unfold_all_devices_and_dtypes
-            - TestShapeOps::test_unfold_backward_errors
-            - TestShapeOps::test_unfold_scalars
+            - TestSortAndSelect::test_kthvalue_scalar
+            - TestSortAndSelect::test_msort
+            - TestSortAndSelect::test_sort
+            - TestSortAndSelect::test_sort_discontiguous
+            - TestSortAndSelect::test_sort_expanded_tensor
+            - TestSortAndSelect::test_sort_large_slice
+            - TestSortAndSelect::test_sort_restride
+            - TestSortAndSelect::test_stable_sort
+            - TestSortAndSelect::test_topk
+            - TestSortAndSelect::test_topk_integral
+            - TestSortAndSelect::test_topk_noncontiguous_gpu
+            - TestSortAndSelect::test_topk_nonfinite
+            - TestSortAndSelect::test_topk_zero
+            - TestSortAndSelect::test_unique_consecutive
+            - TestSortAndSelect::test_unique_dim
           mode: xfail  # xfail: NotImplementedError
-        # These tests exercise shape operations like flip, nonzero, tolist, and unbind across various dtypes and tensor sizes.
-        # They are classified as skip because they do not engage the torch-spyre layer, often due to unsupported dtypes or host-side operations.
-        # Spyre's limited dtype support and lack of certain shape op implementations are most relevant here.
+        # These tests exercise sorting and selecting operations across various dtypes.
+        # They are classified as xfail due to unknown issues with the Spyre backend.
+        # Relevant Spyre limitations include incomplete support for certain dtypes and ops.
         - names:
-            - TestShapeOps::test_flip_large_tensor
-            - TestShapeOps::test_flip_unsupported_dtype
-            - TestShapeOps::test_nonzero_non_diff
-            - TestShapeOps::test_tolist
-            - TestShapeOps::test_unbind
+            - TestSortAndSelect::test_sort_1d_output_discontiguous
+            - TestSortAndSelect::test_stable_sort_against_numpy
+            - TestSortAndSelect::test_topk_1d_output_discontiguous
+          mode: xfail  # xfail: dxp_standalone not detected
+        # These tests exercise sorting and unique operations across various dtypes, including overflow handling.
+        # They are classified as xfail due to unsupported stick expressions and missing 'dxp_standalone' executable.
+        # Relevant Spyre limitations include unsupported stick expressions and lack of certain runtime components.
+        - names:
+            - TestSortAndSelect::test_sort_overflow
+            - TestSortAndSelect::test_unique
+          mode: xfail  # xfail: torch._inductor.exc.InductorError
+        # These tests exercise the `topk` operation with lower precision dtypes (`bfloat16` and `float16`).
+        # They are classified as `xfail` due to the Spyre backend not supporting the `aten::sort.values_stable` operator for these dtypes.
+        # The relevant Spyre limitation is the lack of support for certain sorting operations with lower precision tensors.
+        - names:
+            - TestSortAndSelect::test_topk_lower_precision
+          mode: xfail  # xfail: NotImplementedError
+        # These tests exercise sorting and selection operations across various dtypes and tensor configurations.
+        # They are skipped because they do not invoke the torch-spyre layer, which is required for backend-specific optimizations.
+        # Relevant Spyre limitations include lack of support for complex dtypes and certain tensor configurations.
+        - names:
+            - TestSortAndSelect::test_complex_unsupported_cpu
+            - TestSortAndSelect::test_sort_1d_parallel
+            - TestSortAndSelect::test_sort_discontiguous_slow
+            - TestSortAndSelect::test_sort_large
+            - TestSortAndSelect::test_sort_stable_none
+            - TestSortAndSelect::test_topk_quantized_scalar_input
           mode: skip  # does not engage the torch-spyre layer
 
   global:
