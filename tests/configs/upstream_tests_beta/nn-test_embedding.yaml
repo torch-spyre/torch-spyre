@@ -1,76 +1,72 @@
 test_suite_config:
 
   files:
-    - path: ${TORCH_ROOT}/test/test_shape_ops.py
+    - path: ${TORCH_ROOT}/test/nn/test_embedding.py
       unlisted_test_mode: skip
       tests:
-        # These tests exercise error handling for shape ops like clamp, fliplr, flipud, and unfold.
-        # They are mandatory_success because Spyre's inductor backend raises InductorError for unsupported meta ops.
-        # Spyre's capability to run these tests relies on PyTorch's CPU fallback for error checking.
+        # These tests exercise embedding operations with various modes and data types, including out-of-bounds index handling.
+        # They are classified as mandatory_success due to the critical nature of embedding ops in NLP models.
+        # Relevant Spyre capabilities include support for float32 and int64 dtypes, and handling of out-of-bounds indices.
         - names:
-            - TestShapeOps::test_clamp_raises_arg_errors
-            - TestShapeOps::test_fliplr_invalid
-            - TestShapeOps::test_flipud_invalid
-            - TestShapeOps::test_unfold_errors
+            - TestEmbeddingNN::test_move_sparse_half_embedding
+            - TestEmbeddingNNDeviceType::test_embedding_bag_out_of_bounds_idx
+            - TestEmbeddingNNDeviceType::test_embedding_scalar_weight_error
           mode: mandatory_success
-        # These tests exercise sparse_dim and dense_dim methods on tensors of various shapes and dtypes. The int64 dtype fails because Spyre lacks support for the aten::random_.from operator used in integer tensor creation. The mandatory_success classification reflects that the test passes for float32 but fails for int64 due to this missing operator.
+        # These tests exercise various aspects of the `EmbeddingBag` operation, including different data types, tensor behaviors, and edge cases.
+        # They are classified as `xfail` on the Spyre backend due to unsupported data types, missing features, and unexpected stick expressions.
+        # The most relevant Spyre capabilities or limitations include unsupported data types like `Double` and `bfloat16`, and unsupported stick expressions in the backend.
         - names:
-            - TestShapeOps::test_sparse_dense_dim
-          mode: mandatory_success
-          edits:
-            dtypes:
-              exclude:
-                - name: int64
-        # These tests exercise shape-manipulating ops like clamp, diag, diagonal, and rot90 across various dtypes.
-        # They are xfailed due to missing dxp_standalone tool and unsupported Spyre layout transformations.
-        # Spyre lacks support for complex stick expressions and restickify operations needed for these shape ops.
+            - TestEmbeddingNNDeviceType::test_EmbeddingBag_empty_per_sample_weights_and_offsets
+            - TestEmbeddingNNDeviceType::test_EmbeddingBag_per_sample_weights_and_new_offsets
+            - TestEmbeddingNNDeviceType::test_EmbeddingBag_per_sample_weights_and_no_offsets
+            - TestEmbeddingNNDeviceType::test_EmbeddingBag_per_sample_weights_and_offsets
+            - TestEmbeddingNNDeviceType::test_EmbeddingBag_per_sample_weights_failures
+            - TestEmbeddingNNDeviceType::test_embedding_backward_atomic_accumulate_kernel
+            - TestEmbeddingNNDeviceType::test_embedding_backward_atomic_accumulate_kernel_with_padding_idx
+            - TestEmbeddingNNDeviceType::test_embedding_backward_large_batch_overflow
+            - TestEmbeddingNNDeviceType::test_embedding_bag_1D_padding_idx
+            - TestEmbeddingNNDeviceType::test_embedding_bag_2D_padding_idx
+            - TestEmbeddingNNDeviceType::test_embedding_bag_bfloat16
+            - TestEmbeddingNNDeviceType::test_embedding_bag_device
+            - TestEmbeddingNNDeviceType::test_embedding_bag_dimension_errors
+            - TestEmbeddingNNDeviceType::test_embedding_bag_empty_input
+            - TestEmbeddingNNDeviceType::test_embedding_bag_half
+            - TestEmbeddingNNDeviceType::test_embedding_bag_non_contiguous_weight
+            - TestEmbeddingNNDeviceType::test_embedding_bag_per_sample_weights_grad
+            - TestEmbeddingNNDeviceType::test_embedding_max_norm_backward
+            - TestEmbeddingNNDeviceType::test_embedding_max_norm_device
+            - TestEmbeddingNNDeviceType::test_embedding_max_norm_fwd_AD
+            - TestEmbeddingNNDeviceType::test_embedding_padding_idx
+          mode: xfail  # xfail: dxp_standalone not detected
+        # These tests exercise embedding and embedding bag operations across various dtypes and tensor configurations.
+        # They are classified as 'skip' on the Spyre backend because they do not engage the torch-spyre layer, indicating they bypass Spyre-specific optimizations or capabilities.
+        # The most relevant Spyre limitations include unsupported dtypes like Double, which caused a failure in the test_embedding_dense_grad.
         - names:
-            - TestShapeOps::test_clamp
-            - TestShapeOps::test_clamp_propagates_nans
-            - TestShapeOps::test_diag
-            - TestShapeOps::test_diagonal
-            - TestShapeOps::test_rot90
-          mode: xfail  # xfail: torch._inductor.exc.InductorError
-        # These tests exercise the diagonal op on multi-dimensional float32 tensors, including non-contiguous cases.
-        # They are xfail due to a missing .numpy() method for Spyre device tensors, causing a TypeError.
-        # The Spyre backend lacks direct tensor-to-numpy conversion, requiring explicit CPU copying.
-        - names:
-            - TestShapeOps::test_diagonal_multidim
-          mode: xfail  # xfail: TypeError
-        # These tests exercise shape manipulation ops like flip, movedim, and trace across various dtypes.
-        # They are xfailed due to missing Spyre support for complex index expressions and reduction ops like sum.
-        # The failures highlight Spyre's limited support for non-linear memory access patterns and certain data formats.
-        - names:
-            - TestShapeOps::test_flip
-            - TestShapeOps::test_movedim
-            - TestShapeOps::test_movedim_invalid
-            - TestShapeOps::test_trace
-          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
-        # These tests exercise shape manipulation ops like flip, nonzero, and unfold across various dtypes.
-        # They are xfail due to missing Spyre kernel implementations for aten::flip, aten::nonzero, and aten::unfold.
-        # The failures highlight Spyre's limited support for view-like and indexing operations on the device.
-        - names:
-            - TestShapeOps::test_flip_errors
-            - TestShapeOps::test_flip_numpy
-            - TestShapeOps::test_fliplr
-            - TestShapeOps::test_flipud
-            - TestShapeOps::test_nonzero
-            - TestShapeOps::test_nonzero_astuple_out
-            - TestShapeOps::test_nonzero_discontiguous
-            - TestShapeOps::test_nonzero_no_warning
-            - TestShapeOps::test_unfold_all_devices_and_dtypes
-            - TestShapeOps::test_unfold_backward_errors
-            - TestShapeOps::test_unfold_scalars
-          mode: xfail  # xfail: NotImplementedError
-        # These tests exercise shape operations like flip, nonzero, tolist, and unbind across various dtypes and tensor sizes.
-        # They are classified as skip because they do not engage the torch-spyre layer, often due to unsupported dtypes or host-side operations.
-        # Spyre's limited dtype support and lack of certain shape op implementations are most relevant here.
-        - names:
-            - TestShapeOps::test_flip_large_tensor
-            - TestShapeOps::test_flip_unsupported_dtype
-            - TestShapeOps::test_nonzero_non_diff
-            - TestShapeOps::test_tolist
-            - TestShapeOps::test_unbind
+            - TestEmbeddingNN::test_embedding_bag_from_pretrained
+            - TestEmbeddingNN::test_embedding_bag_from_pretrained_padding_idx
+            - TestEmbeddingNN::test_embedding_bag_functional
+            - TestEmbeddingNN::test_embedding_bag_padding_idx_error
+            - TestEmbeddingNN::test_embedding_from_pretrained
+            - TestEmbeddingNN::test_embedding_from_pretrained_float32
+            - TestEmbeddingNN::test_embedding_from_pretrained_float64
+            - TestEmbeddingNN::test_embedding_from_pretrained_int16
+            - TestEmbeddingNN::test_embedding_from_pretrained_int32
+            - TestEmbeddingNN::test_embedding_from_pretrained_int64
+            - TestEmbeddingNN::test_embedding_from_pretrained_int8
+            - TestEmbeddingNN::test_embedding_from_pretrained_options
+            - TestEmbeddingNN::test_embedding_from_pretrained_padding_idx
+            - TestEmbeddingNN::test_embedding_from_pretrained_uint8
+            - TestEmbeddingNN::test_embedding_functional
+            - TestEmbeddingNN::test_embedding_max_norm
+            - TestEmbeddingNN::test_embedding_max_norm_unsorted_repeating_indices
+            - TestEmbeddingNN::test_embedding_sparse_basic
+            - TestEmbeddingNN::test_embedding_sparse_empty_tensor
+            - TestEmbeddingNN::test_embeddingbag_2d_include_last_offset
+            - TestEmbeddingNN::test_embeddingbag_from_pretrained
+            - TestEmbeddingNN::test_embeddingbag_from_pretrained_options
+            - TestEmbeddingNN::test_embeddingbag_include_last_offset
+            - TestEmbeddingNN::test_large_tensors
+            - TestEmbeddingNNDeviceType::test_embedding_dense_grad
           mode: skip  # does not engage the torch-spyre layer
 
   global:
