@@ -151,5 +151,5 @@ jobs:
           cd "$TORCH_SPYRE_DIR"
           source .venv/bin/activate
           echo 'Running ${{ matrix.suite.name }} upstream tests...'
-          bash tests/run_test.sh "tests/configs/upstream_tests_beta/${{ matrix.suite.config }}" -v
+          bash tests/run_test.sh "tests/configs/upstream_tests_beta/${{ matrix.suite.config }}" -v  -m "not xfail"
           echo '${{ matrix.suite.name }} upstream tests done'
