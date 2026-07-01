@@ -675,7 +675,19 @@ def _multi_arg_pointwise_layouts(
         }
         # Sort stick exprs for determinism
         for stick_expr in sorted(offset_free_stick_exprs, key=iter_var_id):
-            _try_stick_dim(_pick_stick_dim(stick_expr, out_coords))
+            stick_dim = _pick_stick_dim(stick_expr, out_coords)
+            # A stick expr that does not survive to any output dim
+            # (_pick_stick_dim -> -1) must NOT be handed to _try_stick_dim:
+            # _compute_dim_order(-1, ...) would append a phantom trailing dim,
+            # raising the rank by one (rank-6 -> rank-7) and tripping the C++
+            # dim_map cap in spyre_tensor_impl.cpp. These non-surviving -1s are
+            # exactly the broadcast/constant (0) stick exprs that PR #2948
+            # re-admitted by dropping the `!= 0` filter. Skip them; the
+            # alt_stick_dim fallback and the Unsupported raise below correctly
+            # handle the "no surviving candidate" case. (#2961)
+            if stick_dim == -1:
+                continue
+            _try_stick_dim(stick_dim)
 
     # Try alternative layouts if no valid layouts found
     if not results:
