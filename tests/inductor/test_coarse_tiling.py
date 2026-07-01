@@ -2961,26 +2961,25 @@ class TestValidateReductionTiling(unittest.TestCase):
         ):
             _validate_reduction_tiling(op)
 
-    def test_batchmatmul_k_tiling_allowed(self):
-        """BATCH_MATMUL_OP tiling on the stick (K) dim is allowed — no Stage 2 error."""
+    def test_stick_dim_reduction_tiling_allowed(self):
+        """Tiling a reduction over the stick dimension is now supported."""
         from torch._inductor.ir import ComputedBuffer, Reduction
         from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
-        from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 
         data = MagicMock(spec=Reduction)
-        data.ranges = [Integer(64), Integer(32)]  # [M, N]
-        data.reduction_ranges = [Integer(512)]  # [K]
-        data.reduction_type = BATCH_MATMUL_OP
+        data.ranges = [Integer(64)]  # [B] output
+        data.reduction_ranges = [Integer(512)]  # [D] stick dim
+        data.reduction_type = "sum"
         op = MagicMock(spec=ComputedBuffer)
         op.data = data
-        op.get_name.return_value = "test_matmul"
+        op.get_name.return_value = "test_sum"
         op.loop_info = CoarseTileInfo(
             loop_group_id=(0,),
             loop_count=[Integer(4)],
             loop_tiled_dims=[[]],
             loop_tiled_reduction_dims=[[0]],
         )
-        # Must not raise: BATCH_MATMUL_OP is exempt from the stick-dim guard.
+        # Must not raise: stick-dim reduction tiling is now supported.
         _validate_reduction_tiling(op)
 
 
