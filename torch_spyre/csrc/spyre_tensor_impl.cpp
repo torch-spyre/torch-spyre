@@ -71,6 +71,14 @@ auto get_generic_stick_layout(std::vector<int32_t> host_dim_order)
                  host_dim_order[4], host_dim_order[5], host_dim_order[0],
                  host_dim_order[5]};
       break;
+    case 7:
+      TORCH_CHECK(host_dim_order[6] == -1,
+                  "7-element dim_order is only valid for sparse-stick (last "
+                  "entry must be -1)");
+      dim_map = {host_dim_order[1], host_dim_order[2], host_dim_order[3],
+                 host_dim_order[4], host_dim_order[5], host_dim_order[6],
+                 host_dim_order[0], host_dim_order[6]};
+      break;
     default:
       std::stringstream ss;
       ss << "Unsupported tensor rank: " << std::to_string(rank);
