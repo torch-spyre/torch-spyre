@@ -419,6 +419,19 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
         op_name = _extract_op_name_from_method(
             method_name, base_test_name, _OOT_DEVICE_TYPE
         )
+
+        # Op exclusion check (edits.ops.exclude).
+        # op_name may include a variant suffix (e.g. "addmm_decomposed" for the
+        # "addmm" OpInfo with variant_test_name="decomposed"), so we check both
+        # an exact match and a "<excluded>_" prefix match to catch all variants
+        # of an excluded op with a single exclude entry.
+        if op_name and entry is not None:
+            excluded_ops = entry.edits.ops.excluded_op_names()
+            if op_name in excluded_ops or any(
+                op_name.startswith(exc + "_") for exc in excluded_ops
+            ):
+                return False, f"Excluded op: {op_name}", False, False
+
         if effective_mode == MODE_MANDATORY_SUCCESS:
             op_cfg = cls.SUPPORTED_OPS_CONFIG.get(op_name) if op_name else None
             if op_cfg is not None and op_cfg.force_xfail:

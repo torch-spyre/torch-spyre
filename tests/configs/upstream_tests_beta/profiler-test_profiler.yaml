@@ -1,0 +1,341 @@
+test_suite_config:
+
+  files:
+    - path: ${TORCH_ROOT}/test/profiler/test_profiler.py
+      unlisted_test_mode: skip
+      tests:
+        # These tests exercise various profiling functionalities, including event tracking, memory profiling, and pattern matching.
+        # They are classified as mandatory_success because they are critical for verifying the correctness and performance of the profiler on the Spyre backend.
+        # This test ensures the PyTorch Profiler correctly reports Conv2d → BatchNorm2d execution, even when optimizations such as fusion or bias removal occur. It verifies accurate operator traces, timings, and memory events. It also confirms that Kineto captures all relevant profiling data without omissions.
+        - names:
+            - TestExperimentalUtils::test_profiler_conv2d_bias_followed_by_batchnorm2d_pattern
+          mode: mandatory_success
+        # These tests exercise various profiling functionalities, including event tracking, memory usage, and performance metrics.
+        # They are classified as 'skip' on the Spyre backend due to unsupported operations and missing features in the Spyre op database.
+        # Relevant Spyre limitations include missing support for certain ops like 'convolution' and 'copy_', and the absence of CUDA-specific profiling capabilities.
+        - names:
+            - TestExperimentalUtils::test_profiler_for_loop_indexing_pattern
+            - TestExperimentalUtils::test_profiler_grad_not_set_to_none_pattern
+            - TestExperimentalUtils::test_profiler_name_pattern
+            - TestExperimentalUtils::test_profiler_optimizer_single_tensor_pattern
+            - TestExperimentalUtils::test_profiler_pattern_match_helper
+            - TestExperimentalUtils::test_profiler_pattern_matcher_json_report
+            - TestExperimentalUtils::test_profiler_synchronized_dataloader_pattern
+            - TestExperimentalUtils::test_utils_compute_queue_depth_when_no_cuda_events
+            - TestExperimentalUtils::test_utils_compute_self_time
+            - TestProfiler::test_basic_chrome_trace
+            - TestProfiler::test_concrete_inputs_profiling
+            - TestProfiler::test_concrete_inputs_profiling_toggling
+            - TestProfiler::test_forked_process
+            - TestProfiler::test_guarded_record_function_fast
+            - TestProfiler::test_is_profiler_enabled
+            - TestProfiler::test_kineto_profiler_api
+            - TestProfiler::test_kineto_profiler_multiple_steppers
+            - TestProfiler::test_lazy_build_tree
+            - TestProfiler::test_memory_profiler
+            - TestProfiler::test_nested_tensor_with_shapes
+            - TestProfiler::test_profiler_correlation_id
+            - TestProfiler::test_profiler_metadata
+            - TestProfiler::test_profiler_op_event_kwargs
+            - TestProfiler::test_profiler_op_event_kwargs_list_of_strings
+            - TestProfiler::test_profiler_time_scale
+            - TestProfiler::test_profiler_type
+            - TestProfiler::test_public_api_post_processing_timeout_large
+            - TestProfiler::test_public_api_post_processing_timeout_none
+            - TestProfiler::test_public_api_post_processing_timeout_zero
+            - TestProfiler::test_record_function_fast
+            - TestProfiler::test_schedule_function_count
+            - TestProfiler::test_user_annotation
+            - TestExperimentalUtils::test_bfs
+            - TestExperimentalUtils::test_dfs
+            - TestExperimentalUtils::test_expose_kineto_event_metadata
+            - TestExperimentalUtils::test_fuzz_symbolize
+            - TestExperimentalUtils::test_profiler_debug_autotuner
+            - TestExperimentalUtils::test_profiler_extra_cuda_copy_pattern
+            - TestExperimentalUtils::test_profiler_extra_cuda_copy_pattern_benchmark
+            - TestExperimentalUtils::test_profiler_fp32_matmul_pattern
+            - TestExperimentalUtils::test_profiler_matmul_dim_fp16_pattern
+            - TestExperimentalUtils::test_profiler_overload_names
+            - TestExperimentalUtils::test_utils_compute_idle_time
+            - TestExperimentalUtils::test_utils_compute_queue_depth
+            - TestExperimentalUtils::test_utils_get_optimizable_events
+            - TestExperimentalUtils::test_utils_intervals_overlap
+            - TestProfilerCUDA::test_cudagraph_profiling_workaround
+            - TestProfilerCUDA::test_custom_module_input_op_ids
+            - TestProfilerCUDA::test_mem_leak
+            - TestProfilerITT::test_custom_module_input_op_ids
+            - TestProfiler::test_basic_profile
+            - TestProfiler::test_cpu_annotation_overlap
+            - TestProfiler::test_disable_external_correlation
+            - TestProfiler::test_dynamic_toggle
+            - TestProfiler::test_event_list
+            - TestProfiler::test_experimental_config_pickle
+            - TestProfiler::test_export_stacks
+            - TestProfiler::test_flops
+            - TestProfiler::test_high_level_trace
+            - TestProfiler::test_kineto
+            - TestProfiler::test_kineto_multigpu
+            - TestProfiler::test_kineto_profiler_with_environment_variable
+            - TestProfiler::test_module_hierarchy
+            - TestProfiler::test_oom_tracing
+            - TestProfiler::test_override_time_units
+            - TestProfiler::test_parse_kineto_results_timeout_fails
+            - TestProfiler::test_parse_kineto_results_timeout_large
+            - TestProfiler::test_parse_kineto_results_timeout_none
+            - TestProfiler::test_parse_kineto_results_timeout_zero
+            - TestProfiler::test_profile_all_threads
+            - TestProfiler::test_profiler_cuda_sync_events
+            - TestProfiler::test_profiler_disable_fwd_bwd_link
+            - TestProfiler::test_profiler_fwd_bwd_link
+            - TestProfiler::test_profiler_op_event_args
+            - TestProfiler::test_profiler_strides
+            - TestProfiler::test_profiler_tracing
+            - TestProfiler::test_public_api_post_processing_timeout_fails
+            - TestProfiler::test_python_gc_event
+            - TestProfiler::test_skip_first_wait
+            - TestProfiler::test_source
+            - TestProfiler::test_tensorboard_trace_handler
+          mode: skip  # does not engage the torch-spyre layer
+
+  global:
+    supported_dtypes:
+      - name: bfloat16
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype
