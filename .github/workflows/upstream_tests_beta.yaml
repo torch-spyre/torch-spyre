@@ -72,8 +72,10 @@ jobs:
             config: nn-test_embedding.yaml
           - name: NeuralNet init
             config: nn-test_init.yaml
-          - name: NeuralNet lazy modules
-            config: nn-test_lazy_modules.yaml
+          # All xfail tests. Will result in zero tests collected in "no xfail" mode.
+          # Retaining the yaml for future use as new spyre capabilities are added.
+          # - name: NeuralNet lazy modules
+          #   config: nn-test_lazy_modules.yaml 
           - name: NeuralNet load state dictionary
             config: nn-test_load_state_dict.yaml
           - name: NeuralNet module hooks
@@ -104,8 +106,10 @@ jobs:
             config: test_view_ops.yaml
           - name: Torch
             config: test_torch.yaml
-          - name: Masked
-            config: test_masked.yaml
+          # All xfail tests. Will result in zero tests collected in "no xfail" mode.
+          # Retaining the yaml for future use as new spyre capabilities are added.
+          # - name: Masked
+          #   config: test_masked.yaml
           - name: Sort and select
             config: test_sort_and_select.yaml
           - name: Inductor debug trace
