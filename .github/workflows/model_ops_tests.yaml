@@ -119,6 +119,14 @@ jobs:
           extra_test_flags: -v
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
+          pre_run: |
+            # Clear the cached AIU setup guard and stale topo.json before
+            # every attempt so a card left in a bad state by a killed
+            # (stalled) previous attempt gets re-discovered cleanly instead
+            # of carrying stale state into the retry.
+            unset _IBM_AIU_SETUP
+            rm -rf /tmp/etc/ibm/spyre/topo.json
+            source /etc/profile.d/ibm-aiu-setup.sh
 
       # ---------------------------------------------------------------------------
       # Upload the JUnit XML as a GHA artifact so it can be downloaded and
