@@ -187,6 +187,7 @@ def get_ncores_for_buffers(
     graph: GraphLowering | GraphView,
     cache: Optional[dict] = None,
     rw_cache: Optional[dict] = None,
+    reject_reasons_out: Optional[dict[str, str]] = None,
 ) -> dict[str, int]:
     """
     Return a dictionary mapping buffer names to the number of cores
@@ -199,6 +200,9 @@ def get_ncores_for_buffers(
     share only within a single graph, since the cache key includes the
     op name and `dep` (which carries the buffer name). `rw_cache`
     ({op name: ReadWrites}) likewise memoizes get_read_writes().
+
+    Pass an optional `reject_reasons_out` dict to receive detailed
+    reasons for core division mismatches (keyed by buffer name).
     """
     result: dict[str, int] = {}
     using_multicore = config.sencores > 1
@@ -210,12 +214,14 @@ def get_ncores_for_buffers(
             # k-last cores hold the final value), so it's unsafe on LX even if
             # geometry matches — the `flag` gate applies to write-deps only.
             ref_view = None
-            mismatch = False
+            ref_op_name = None
+            mismatch_reason = None
             writer_cores = None
             for op, dep in users:
                 view, flag = _per_core_view_on_buf(op, dep, buf_name, cache)
                 if ref_view is None:
                     ref_view = view
+                    ref_op_name = op.get_name()
                 op_rw = (
                     rw_cache[op.get_name()]
                     if rw_cache is not None
@@ -231,13 +237,17 @@ def get_ncores_for_buffers(
                     # rejected below, so writer_cores divides only for output splits.
                     writer_cores = _op_num_cores(op)
                     if flag:
-                        mismatch = True
+                        mismatch_reason = f"K-split writer '{op.get_name()}'"
                         break
                 if view != ref_view:
-                    mismatch = True
+                    mismatch_reason = (
+                        f"op '{ref_op_name}' ref {ref_view} != '{op.get_name()}' {view}"
+                    )
                     break
-            if mismatch:
+            if mismatch_reason is not None:
                 num_cores = -1
+                if reject_reasons_out is not None:
+                    reject_reasons_out[buf_name] = mismatch_reason
             elif writer_cores is not None:
                 num_cores = writer_cores
             else:

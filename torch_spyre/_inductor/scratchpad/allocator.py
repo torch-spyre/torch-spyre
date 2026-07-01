@@ -170,7 +170,10 @@ class ScratchpadAllocator(ABC):
         cache: Optional[dict] = None,
         rw_cache: Optional[dict[str, ReadWrites]] = None,
     ) -> list[Operation]:
-        core_div_mismatch = get_ncores_for_buffers(graph, cache, rw_cache)
+        core_div_reasons: dict[str, str] = {}
+        core_div_mismatch = get_ncores_for_buffers(
+            graph, cache, rw_cache, core_div_reasons
+        )
         drop_list = set()
 
         # filter out by permitted operations
@@ -183,7 +186,8 @@ class ScratchpadAllocator(ABC):
         for key, mismatch in core_div_mismatch.items():
             if mismatch == -1:
                 drop_list.add(key)
-                self.reject_reasons[key] = "core div mismatch"
+                reason = core_div_reasons.get(key, "core div mismatch")
+                self.reject_reasons[key] = f"core div mismatch: {reason}"
 
         if not clone_at_graph_boundaries():
             # Without clone support, graph outputs cannot be LX-pinned: the caller
@@ -233,7 +237,10 @@ class ScratchpadAllocator(ABC):
             )
 
         if cloning_allowed:
-            ncores = get_ncores_for_buffers(graph, cache)
+            core_div_reasons: dict[str, str] = {}
+            ncores = get_ncores_for_buffers(
+                graph, cache, reject_reasons_out=core_div_reasons
+            )
             for input_name in graph.graph_input_names:
                 uses = lifetimes[input_name]
                 if len(uses) <= 1:
@@ -246,6 +253,8 @@ class ScratchpadAllocator(ABC):
                     continue
                 num_cores = ncores.get(input_name, -1)
                 if num_cores < 0:
+                    reason = core_div_reasons.get(input_name, "core div mismatch")
+                    self.reject_reasons[input_name] = f"core div mismatch: {reason}"
                     continue  # core division mismatch across consumers
                 if _would_produce_lx_back_gap(graph, input_name, uses):
                     self.reject_reasons[input_name] = "lx back gap"
