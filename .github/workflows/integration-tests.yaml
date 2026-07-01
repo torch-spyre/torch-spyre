@@ -74,6 +74,13 @@ on:
         required: false
         type: string
         default: ''
+      test_type:
+        description: >-
+          Suite subset to run: smoke | core | full | suite_<group> | <label>.
+          Default: full (every config).
+        required: false
+        type: string
+        default: full
 
 concurrency:
   group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.html_url) || (github.event_name == 'workflow_dispatch'
@@ -123,6 +130,7 @@ jobs:
       rpm_location: ${{ inputs.rpm_location || '' }}
       rpm_names: ${{ inputs.rpm_names || '' }}
       build_torch_spyre: ${{ inputs.build_torch_spyre == true }}
+      test_type: ${{ inputs.test_type || 'full' }}
 
   # ----------------------------------------------------------------------------------
   # Fan-in gate job which is similar to run-spyre-unit-tests in torch_spyre_tests.yaml

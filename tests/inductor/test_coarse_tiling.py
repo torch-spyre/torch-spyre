@@ -2961,26 +2961,25 @@ class TestValidateReductionTiling(unittest.TestCase):
         ):
             _validate_reduction_tiling(op)
 
-    def test_batchmatmul_k_tiling_allowed(self):
-        """BATCH_MATMUL_OP tiling on the stick (K) dim is allowed — no Stage 2 error."""
+    def test_stick_dim_reduction_tiling_allowed(self):
+        """Tiling a reduction over the stick dimension is now supported."""
         from torch._inductor.ir import ComputedBuffer, Reduction
         from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
-        from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 
         data = MagicMock(spec=Reduction)
-        data.ranges = [Integer(64), Integer(32)]  # [M, N]
-        data.reduction_ranges = [Integer(512)]  # [K]
-        data.reduction_type = BATCH_MATMUL_OP
+        data.ranges = [Integer(64)]  # [B] output
+        data.reduction_ranges = [Integer(512)]  # [D] stick dim
+        data.reduction_type = "sum"
         op = MagicMock(spec=ComputedBuffer)
         op.data = data
-        op.get_name.return_value = "test_matmul"
+        op.get_name.return_value = "test_sum"
         op.loop_info = CoarseTileInfo(
             loop_group_id=(0,),
             loop_count=[Integer(4)],
             loop_tiled_dims=[[]],
             loop_tiled_reduction_dims=[[0]],
         )
-        # Must not raise: BATCH_MATMUL_OP is exempt from the stick-dim guard.
+        # Must not raise: stick-dim reduction tiling is now supported.
         _validate_reduction_tiling(op)
 
 
@@ -3873,6 +3872,115 @@ class TestReorderUnhintedInterlopers(unittest.TestCase):
         c = _make_rui_op("c", hint_ids=(0,))
         with self.assertRaises(RuntimeError):
             self._run([a, x, b, c])
+
+
+# ===========================================================================
+# TestHintsLevels
+# ===========================================================================
+
+
+class TestHintsLevels(unittest.TestCase):
+    """_hints_levels must drop size-1 split_count hints as no-ops."""
+
+    def _make_op(self, hints):
+        """Return a fake ComputedBuffer with the given DimHint list.
+
+        hints: list of (hint_id, split_count, loop_var) tuples.
+        """
+        from torch._inductor.ir import ComputedBuffer
+        from torch_spyre._inductor.propagate_hints import DimHint
+
+        op = MagicMock(spec=ComputedBuffer)
+        op.get_name.return_value = "buf0"
+        op.dim_hints = [
+            DimHint(
+                dim_names=[f"dim{i}"],
+                split_count=sc,
+                loop_var=lv,
+                is_reduction=False,
+                hint_id=hid,
+            )
+            for i, (hid, sc, lv) in enumerate(hints)
+        ]
+        return op
+
+    def test_size1_hint_dropped(self):
+        """A single hint with split_count=1 produces an empty levels list."""
+        import sympy
+        from torch_spyre._inductor.coarse_tile import _hints_levels
+
+        op = self._make_op([(0, 1, sympy.Symbol("c0"))])
+        self.assertEqual(_hints_levels([op]), [])
+
+    def test_size1_hint_dropped_with_debug_log(self):
+        """A size-1 hint emits a debug log message when dropped."""
+        import logging
+        import logging.handlers
+        import sympy
+        import torch_spyre._inductor.coarse_tile as ct_mod
+        from torch_spyre._inductor.coarse_tile import _hints_levels
+
+        op = self._make_op([(7, 1, sympy.Symbol("c0"))])
+
+        original_level = ct_mod.hints_logger.level
+        ct_mod.hints_logger.setLevel(logging.DEBUG)
+        handler = logging.handlers.MemoryHandler(
+            capacity=100, flushLevel=logging.CRITICAL
+        )
+        ct_mod.hints_logger.addHandler(handler)
+        try:
+            result = _hints_levels([op])
+            handler.flush()
+            messages = [r.getMessage() for r in handler.buffer]
+        finally:
+            ct_mod.hints_logger.removeHandler(handler)
+            ct_mod.hints_logger.setLevel(original_level)
+
+        self.assertEqual(result, [])
+        self.assertTrue(
+            any("split_count=1" in m and "no-op" in m for m in messages),
+            f"Expected a 'split_count=1 … no-op' debug message; got: {messages}",
+        )
+
+    def test_nonunit_hint_kept(self):
+        """A hint with split_count > 1 is retained normally."""
+        import sympy
+        from torch_spyre._inductor.coarse_tile import _hints_levels
+
+        c0 = sympy.Symbol("c0")
+        op = self._make_op([(3, 4, c0)])
+        levels = _hints_levels([op])
+        self.assertEqual(len(levels), 1)
+        hint_id, count, is_reduction = levels[0]
+        self.assertEqual(hint_id, 3)
+        self.assertEqual(count, sympy.Integer(4))
+        self.assertFalse(is_reduction)
+
+    def test_mixed_hints_drops_only_size1(self):
+        """When one hint is size-1 and another is size>1, only the size>1 survives."""
+        import sympy
+        from torch_spyre._inductor.coarse_tile import _hints_levels
+
+        c0, c1 = sympy.Symbol("c0"), sympy.Symbol("c1")
+        op = self._make_op([(0, 1, c0), (1, 8, c1)])
+        levels = _hints_levels([op])
+        self.assertEqual(len(levels), 1)
+        hint_id, count, _ = levels[0]
+        self.assertEqual(hint_id, 1)
+        self.assertEqual(count, sympy.Integer(8))
+
+    def test_all_size1_hints_dropped_falls_through_to_next_op(self):
+        """If every hint on op0 is size-1, _hints_levels tries op1 next."""
+        import sympy
+        from torch_spyre._inductor.coarse_tile import _hints_levels
+
+        c0 = sympy.Symbol("c0")
+        op0 = self._make_op([(0, 1, c0)])
+        op1 = self._make_op([(0, 4, c0)])
+        levels = _hints_levels([op0, op1])
+        self.assertEqual(len(levels), 1)
+        _, count, _ = levels[0]
+        self.assertEqual(count, sympy.Integer(4))
 
 
 # ===========================================================================

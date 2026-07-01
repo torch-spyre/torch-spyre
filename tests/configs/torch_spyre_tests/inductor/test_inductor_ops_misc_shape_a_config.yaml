@@ -8,6 +8,7 @@
 # shape group, assign it to whichever shard keeps the jobs balanced.
 
 test_suite_config:
+  labels: [core, full]
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
       unlisted_test_mode: skip
