@@ -162,6 +162,7 @@ with profile(
         t0 = time.perf_counter()
         with torch.no_grad():
           model(ids.to(DEVICE), position_ids=position_ids.to(DEVICE), mask=mask, selected_freqs=selected_freqs)
+          model(ids.to(DEVICE), position_ids=position_ids.to(DEVICE), mask=mask, selected_freqs=selected_freqs)
         wall_clock_ms.append((time.perf_counter() - t0) * 1000)
         prof.step()
 
