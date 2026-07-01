@@ -239,17 +239,17 @@ test_suite_config:
             - TestReductions::test_reference_masked_masked_var
             - TestReductions::test_tensor_compare_ops_argmax_argmix_kthvalue_dim_empty
             - TestReductions::test_warn_invalid_degrees_of_freedom
-          mode: xfail  # xfail: UNKNOWN
+          mode: xfail  #  # xfail: dxp_standalone not detected
         # These tests exercise reduction operations like sum, prod, all, any, and count_nonzero across bfloat16, float16, float32, bool, and int64 dtypes. They are xfail due to missing aten::random_.from support and Spyre's inductor limitation with unexpected stick expressions like 2*d0. The failures highlight missing random tensor initialization and constraints on dimension expressions in the Spyre backend.
         - names:
             - TestReductions::test_identity
-          mode: xfail  # xfail: NotImplementedError, UNKNOWN, torch._inductor.exc.InductorError
+          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
         # These tests exercise the nanmean reduction op with nan_policy='omit' across bfloat16, float16, and float32 dtypes.
         # They are xfail due to an Inductor error from an unsupported stick expression in the generated kernel.
         # This reveals a limitation in Spyre's codegen for handling certain tensor dimension expressions in reduction patterns.
         - names:
             - TestReductions::test_nan_policy_omit_nanmean
-          mode: xfail  # xfail: UNKNOWN, torch._inductor.exc.InductorError
+          mode: xfail  # xfail: torch._inductor.exc.InductorError
         # These tests exercise reduction operations like sum, mean, var, std, logsumexp, prod, cumsum, and cumprod across various dtypes and tensor shapes.
         # They are classified as skip because the torch-spyre layer does not support many of these reduction ops, particularly logsumexp and complex reductions.
         # Spyre's limited op support for reductions and missing bfloat16/float16 handling for large tensors are the relevant limitations.

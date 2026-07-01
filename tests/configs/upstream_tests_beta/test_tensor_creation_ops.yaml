@@ -95,7 +95,7 @@ test_suite_config:
         # # The primary limitation is the lack of support for this operator in the Spyre backend.
         # - names:
         #     - TestAsArray::test_alias_from_dlpack
-        #   mode: xfail  # xfail: NotImplementedError, UNKNOWN
+        #   mode: xfail  # xfail: NotImplementedError
         # These tests exercise tensor aliasing and DLPack tensor conversion across various dtypes.
         # They are classified as xfail due to missing support for 'aten::random_.from' and incorrect SpyreTensorLayout.
         # Relevant Spyre limitations include incomplete operator coverage and tensor layout validation.
@@ -222,7 +222,7 @@ test_suite_config:
             - TestTensorCreation::test_meshgrid_ij_indexing_is_default
             - TestTensorCreation::test_tensor_ctor_device_inference
             - TestTensorCreation::test_torch_complex_same_dtype_error
-          mode: xfail  # xfail: UNKNOWN
+          mode: xfail   # xfail: dxp_standalone not detected
         # # These tests exercise the `meshgrid` operation with various indexing options and tensor shapes.
         # # They are classified as xfail due to multiple sub-assertion failures in comparing PyTorch and NumPy results.
         # # The relevant Spyre capability is the `meshgrid` operation, which currently fails to match NumPy's behavior.

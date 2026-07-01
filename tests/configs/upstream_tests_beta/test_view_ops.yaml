@@ -177,7 +177,7 @@ test_suite_config:
         # Spyre currently lacks capabilities for complex dtypes and view-based tensor manipulations.
         - names:
             - TestOldViewOps::test_resize_as_all_dtypes_and_devices
-          mode: xfail  # xfail: UNKNOWN
+          mode: xfail   # xfail: dxp_standalone not detected
         # These tests exercise tensor transpose operations like T, H, mT, mH, and adjoint across multiple dtypes. They are xfail due to missing support for the aten::random_.from operator needed for tensor initialization. The Spyre backend currently lacks random tensor generation capabilities required by the test's make_tensor function.
         - names:
             - TestOldViewOps::test_transposes
@@ -187,7 +187,7 @@ test_suite_config:
         # The failures highlight Spyre's lack of random tensor generation for test input creation.
         # - names:
         #     - TestViewOps::test_view_dtype_new
-        #   mode: xfail  # xfail: NotImplementedError, UNKNOWN
+        #   mode: xfail  # xfail: NotImplementedError
         # These tests exercise view operations like chunk, narrow, split, unsqueeze, and as_strided gradients.
         # They are classified as skip because they do not engage the torch-spyre layer and run on CPU.
         # Spyre's view operation support is limited, and these tests rely on CPU-only tensor manipulations.

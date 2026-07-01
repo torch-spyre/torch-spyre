@@ -125,7 +125,7 @@ test_suite_config:
             - TestTorchDeviceType::test_storage_meta_from_tensor
             - TestTorchDeviceType::test_where_scalar_handcrafted_values
             - TestTorchDeviceType::test_item
-          mode: xfail  # xfail: UNKNOWN
+          mode: xfail   # xfail: dxp_standalone not detected
         # These tests exercise various tensor operations and dtypes, including clamp, copy_, diff, gradient, and put_accumulate.
         # They are classified as xfail due to NotImplementedError and InductorError, indicating unsupported ops or dtypes.
         # Relevant Spyre limitations include missing support for certain dtypes and ops, such as random_ and dxp_standalone.
@@ -214,7 +214,7 @@ test_suite_config:
         # Relevant Spyre limitations include missing support for certain tensor operations and file system dependencies.
         - names:
             - TestTorchDeviceType::test_broadcast
-          mode: skip  # xfail: NotImplementedError, RuntimeError, UNKNOWN, torch._inductor.exc.InductorError
+          mode: skip  # xfail: NotImplementedError, RuntimeError, torch._inductor.exc.InductorError
         # These tests exercise a variety of operations and tensor behaviors, including non-contiguous tensors, gradient scaling, and cumulative operations.
         # They are classified as xfail due to unsupported operations, missing features, or errors related to the Spyre backend.
         # Relevant Spyre limitations include unsupported mutation operations, missing standalone executables, and unsupported data formats.
@@ -254,31 +254,31 @@ test_suite_config:
         # Relevant Spyre limitations include unsupported dtypes and operations, as well as handling of large constants.
         - names:
             - TestTorchDeviceType::test_deterministic_empty
-          mode: skip  # xfail: NotImplementedError, UNKNOWN, torch._inductor.exc.InductorError
+          mode: skip  # xfail: NotImplementedError, torch._inductor.exc.InductorError
         # These tests exercise deterministic resizing across various dtypes, including bfloat16, bool, float16, float32, and int64.
         # They are classified as xfail due to the Spyre backend's lack of support for the 'aten::set_.source_Storage' operator.
         # The primary limitation is the unimplemented operator, affecting dtype-specific tensor manipulations.
         - names:
             - TestTorchDeviceType::test_deterministic_resize
-          mode: skip  # xfail: NotImplementedError, UNKNOWN
+          mode: skip  # xfail: NotImplementedError
         # These tests exercise tensor creation from storage across various dtypes.
         # They are classified as xfail due to missing support for 'aten::random_.from' and shape determination issues.
         # Relevant Spyre limitations include incomplete support for certain tensor operations and dtype-specific errors.
         - names:
             - TestTorchDeviceType::test_tensor_from_storage
-          mode: skip  # xfail: NotImplementedError, UNKNOWN, ValueError
+          mode: skip  # xfail: NotImplementedError, ValueError
         # These tests verify tensor storage types across various dtypes, including unsupported ones like int64.
         # They are classified as xfail due to Spyre's lack of support for certain dtypes and ops, causing AssertionErrors and NotImplementedErrors.
         # The primary limitation is Spyre's incomplete support for all dtypes and ops required by PyTorch's tensor storage tests.
         - names:
             - TestTorchDeviceType::test_tensor_storage_type
-          mode: skip  # xfail: AssertionError, NotImplementedError, UNKNOWN
+          mode: skip  # xfail: AssertionError, NotImplementedError
         # These tests verify the behavior of typed storage metadata across various dtypes.
         # They are classified as xfail due to consistent AssertionErrors indicating discrepancies in storage size.
         # The relevant Spyre limitation is the inability to accurately compute storage metadata for certain dtypes.
         - names:
             - TestTorchDeviceType::test_typed_storage_meta
-          mode: skip  # xfail: AssertionError, UNKNOWN
+          mode: skip  # xfail: AssertionError
         - names:
             - TestDevicePrecision::test_multidevice_serialization
             - TestDevicePrecision::test_type_conversions_same_device

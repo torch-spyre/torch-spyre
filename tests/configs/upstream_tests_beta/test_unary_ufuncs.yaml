@@ -52,7 +52,7 @@ test_suite_config:
             - TestUnaryUfuncs::test_non_contig
             - TestUnaryUfuncs::test_non_contig_expand
             - TestUnaryUfuncs::test_non_contig_index
-          mode: xfail  # xfail: NotImplementedError, UNKNOWN, torch._inductor.exc.InductorError
+          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
         # These tests exercise unary operations (bitwise_not, ceil, logical_not, sign) across various dtypes (bfloat16, bool, float16, int64).
         # They are classified as xfail due to unsupported tensor ranks and dtype-specific operations on the Spyre backend.
         # Relevant Spyre limitations include unsupported tensor ranks and lack of support for certain dtype-specific operations.
@@ -62,13 +62,13 @@ test_suite_config:
             - TestUnaryUfuncs::test_mvlgamma_inplace_integer_error
             - TestUnaryUfuncs::test_mvlgamma_integer_promotion
             - TestUnaryUfuncs::test_reference_numerics_extremal
-          mode: xfail  # xfail: UNKNOWN
+          mode: xfail   # xfail: dxp_standalone not detected
         # These tests exercise unary operations like acos, log, and sqrt across dtypes bfloat16, float16, and float32.
         # They are classified as xfail due to missing 'dxp_standalone' file, causing FileNotFoundError.
         # Relevant Spyre limitations include incomplete support for certain unary ops and dtypes.
         - names:
             - TestUnaryUfuncs::test_float_domains
-          mode: xfail  # xfail: UNKNOWN, torch._inductor.exc.InductorError
+          mode: xfail  # xfail: torch._inductor.exc.InductorError
         # These tests exercise various unary operations and their edge cases, including `frexp`, `hardshrink`, `hardsigmoid`, and `nonzero`, across different dtypes.
         # They are classified as xfail due to the Spyre backend not supporting these operations, resulting in `NotImplementedError`.
         # The most relevant Spyre limitations are the lack of support for these specific unary operations and their backward passes.

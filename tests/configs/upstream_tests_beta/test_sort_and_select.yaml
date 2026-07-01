@@ -46,7 +46,7 @@ test_suite_config:
             - TestSortAndSelect::test_sort_1d_output_discontiguous
             - TestSortAndSelect::test_stable_sort_against_numpy
             - TestSortAndSelect::test_topk_1d_output_discontiguous
-          mode: xfail  # xfail: UNKNOWN
+          mode: xfail  # xfail: dxp_standalone not detected
         # These tests exercise sorting and unique operations across various dtypes, including overflow handling.
         # They are classified as xfail due to unsupported stick expressions and missing 'dxp_standalone' executable.
         # Relevant Spyre limitations include unsupported stick expressions and lack of certain runtime components.
@@ -59,7 +59,7 @@ test_suite_config:
         # The relevant Spyre limitation is the lack of support for certain sorting operations with lower precision tensors.
         - names:
             - TestSortAndSelect::test_topk_lower_precision
-          mode: xfail  # xfail: NotImplementedError, UNKNOWN
+          mode: xfail  # xfail: NotImplementedError
         # These tests exercise sorting and selection operations across various dtypes and tensor configurations.
         # They are skipped because they do not invoke the torch-spyre layer, which is required for backend-specific optimizations.
         # Relevant Spyre limitations include lack of support for complex dtypes and certain tensor configurations.

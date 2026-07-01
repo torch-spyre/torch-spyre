@@ -9,7 +9,7 @@ test_suite_config:
         # The relevant Spyre limitation is the unsupported `batchmatmul` operation for `float32` dtypes.
         - names:
             - TestScheduler::test_disable_get_estimated_runtime_logging
-          mode: xfail  # xfail: UNKNOWN
+          mode: xfail  # xfail: due to dxp_standalone
         # These tests exercise atomic operations, fusion policies, and tensor operations without engaging the torch-spyre layer.
         # They are classified as 'skip' because they do not interact with the Spyre backend, focusing on CPU-based operations.
         # Relevant Spyre limitations include the absence of CUDA support and the need for torch-spyre layer engagement.
