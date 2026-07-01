@@ -873,8 +873,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
         self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
-        self.assertIn("sympify('2')", src, "Expected A loop count 2 in LoopSpec")
-        self.assertIn("sympify('4')", src, "Expected B loop count 4 in LoopSpec")
+        self.assertIn(
+            "count=sympify('2')", src, "Expected A loop count 2 as count= in LoopSpec"
+        )
+        self.assertIn(
+            "count=sympify('4')", src, "Expected B loop count 4 as count= in LoopSpec"
+        )
 
     @config.patch(
         {
