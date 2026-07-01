@@ -1,76 +1,28 @@
 test_suite_config:
 
   files:
-    - path: ${TORCH_ROOT}/test/test_shape_ops.py
+    - path: ${TORCH_ROOT}/test/profiler/test_profiler_tree.py
       unlisted_test_mode: skip
       tests:
-        # These tests exercise error handling for shape ops like clamp, fliplr, flipud, and unfold.
-        # They are mandatory_success because Spyre's inductor backend raises InductorError for unsupported meta ops.
-        # Spyre's capability to run these tests relies on PyTorch's CPU fallback for error checking.
+        # These tests exercise PyTorch's profiler functionality, including memory tracking, record functions, and stack traces with modules and torch functions.
+        # They are classified as mandatory_success because they do not interact with the torch-spyre layer, ensuring compatibility with standard PyTorch behavior.
+        # The relevant Spyre capability is its support for standard PyTorch profiling without engaging the custom backend.
         - names:
-            - TestShapeOps::test_clamp_raises_arg_errors
-            - TestShapeOps::test_fliplr_invalid
-            - TestShapeOps::test_flipud_invalid
-            - TestShapeOps::test_unfold_errors
+            - TestProfilerTree::test_profiler_experimental_tree
           mode: mandatory_success
-        # These tests exercise sparse_dim and dense_dim methods on tensors of various shapes and dtypes. The int64 dtype fails because Spyre lacks support for the aten::random_.from operator used in integer tensor creation. The mandatory_success classification reflects that the test passes for float32 but fails for int64 due to this missing operator.
+        # These tests exercise CUDA-specific profiler functionalities, including detailed tree profiling, stream handling, and memory tracking.
+        # They are classified as 'skip' because they do not engage the torch-spyre layer, which is required for backend-specific profiling.
+        # The relevant Spyre capability is the lack of direct integration with CUDA-specific profiler features.
         - names:
-            - TestShapeOps::test_sparse_dense_dim
-          mode: mandatory_success
-          edits:
-            dtypes:
-              exclude:
-                - name: int64
-        # These tests exercise shape-manipulating ops like clamp, diag, diagonal, and rot90 across various dtypes.
-        # They are xfailed due to missing dxp_standalone tool and unsupported Spyre layout transformations.
-        # Spyre lacks support for complex stick expressions and restickify operations needed for these shape ops.
-        - names:
-            - TestShapeOps::test_clamp
-            - TestShapeOps::test_clamp_propagates_nans
-            - TestShapeOps::test_diag
-            - TestShapeOps::test_diagonal
-            - TestShapeOps::test_rot90
-          mode: xfail  # xfail: torch._inductor.exc.InductorError
-        # These tests exercise the diagonal op on multi-dimensional float32 tensors, including non-contiguous cases.
-        # They are xfail due to a missing .numpy() method for Spyre device tensors, causing a TypeError.
-        # The Spyre backend lacks direct tensor-to-numpy conversion, requiring explicit CPU copying.
-        - names:
-            - TestShapeOps::test_diagonal_multidim
-          mode: xfail  # xfail: TypeError
-        # These tests exercise shape manipulation ops like flip, movedim, and trace across various dtypes.
-        # They are xfailed due to missing Spyre support for complex index expressions and reduction ops like sum.
-        # The failures highlight Spyre's limited support for non-linear memory access patterns and certain data formats.
-        - names:
-            - TestShapeOps::test_flip
-            - TestShapeOps::test_movedim
-            - TestShapeOps::test_movedim_invalid
-            - TestShapeOps::test_trace
-          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
-        # These tests exercise shape manipulation ops like flip, nonzero, and unfold across various dtypes.
-        # They are xfail due to missing Spyre kernel implementations for aten::flip, aten::nonzero, and aten::unfold.
-        # The failures highlight Spyre's limited support for view-like and indexing operations on the device.
-        - names:
-            - TestShapeOps::test_flip_errors
-            - TestShapeOps::test_flip_numpy
-            - TestShapeOps::test_fliplr
-            - TestShapeOps::test_flipud
-            - TestShapeOps::test_nonzero
-            - TestShapeOps::test_nonzero_astuple_out
-            - TestShapeOps::test_nonzero_discontiguous
-            - TestShapeOps::test_nonzero_no_warning
-            - TestShapeOps::test_unfold_all_devices_and_dtypes
-            - TestShapeOps::test_unfold_backward_errors
-            - TestShapeOps::test_unfold_scalars
-          mode: xfail  # xfail: NotImplementedError
-        # These tests exercise shape operations like flip, nonzero, tolist, and unbind across various dtypes and tensor sizes.
-        # They are classified as skip because they do not engage the torch-spyre layer, often due to unsupported dtypes or host-side operations.
-        # Spyre's limited dtype support and lack of certain shape op implementations are most relevant here.
-        - names:
-            - TestShapeOps::test_flip_large_tensor
-            - TestShapeOps::test_flip_unsupported_dtype
-            - TestShapeOps::test_nonzero_non_diff
-            - TestShapeOps::test_tolist
-            - TestShapeOps::test_unbind
+            - TestProfilerTree::test_profiler_experimental_tree_with_memory
+            - TestProfilerTree::test_profiler_experimental_tree_with_record_function
+            - TestProfilerTree::test_profiler_experimental_tree_with_stack_and_modules
+            - TestProfilerTree::test_profiler_experimental_tree_with_stack_and_torch_dispatch
+            - TestProfilerTree::test_profiler_experimental_tree_with_stack_and_torch_function
+            - TestProfilerTree::test_profiler_experimental_tree_cuda
+            - TestProfilerTree::test_profiler_experimental_tree_cuda_detailed
+            - TestProfilerTree::test_profiler_experimental_tree_cuda_with_stream
+            - TestProfilerTree::test_profiler_experimental_tree_with_memory_and_stack
           mode: skip  # does not engage the torch-spyre layer
 
   global:
