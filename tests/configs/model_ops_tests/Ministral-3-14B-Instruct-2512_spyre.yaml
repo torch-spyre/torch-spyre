@@ -278,13 +278,13 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L335 in
                     forward, code: emb = torch.cat((freqs, freqs), dim=-1)'
                   tags:
                     - constant
                     - torch.cat.1_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.cos
                   sample_inputs_func:
                     args:
@@ -339,12 +339,12 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      dtype: torch.float16
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L339 in
                     forward, code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
                   tags:
                     - torch.to.2_spyre
-                  kwargs:
-                    dtype: torch.float16
                 - name: torch._C._log_api_usage_once
                   sample_inputs_func:
                     args:
@@ -397,13 +397,13 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: -1
+                    kwargs:
+                      keepdim: true
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L207 in
                     forward, code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
                   tags:
                     - constant
                     - torch.mean.1_spyre
-                  kwargs:
-                    keepdim: true
                 - name: torch.add
                   sample_inputs_func:
                     args:
@@ -687,13 +687,13 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L39 in
                     rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - constant
                     - torch.cat.2_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.mul
                   sample_inputs_func:
                     args:
@@ -803,13 +803,13 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L39 in
                     rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - constant
                     - torch.cat.3_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.mul
                   sample_inputs_func:
                     args:
@@ -987,14 +987,14 @@ test_suite_config:
                   sample_inputs_func:
                     args:
                       - value: (1, 8, 2048, 128)
+                    kwargs:
+                      dtype: torch.float16
+                      device: cuda:0
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/cache_utils.py#L290 in lazy_initialization, code:
                     self.keys = torch.zeros('
                   tags:
                     - constant
                     - torch.zeros.1_spyre
-                  kwargs:
-                    dtype: torch.float16
-                    device: cuda:0
                 - name: torch.index_copy_
                   sample_inputs_func:
                     args:
@@ -1103,14 +1103,14 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      dropout_p: 0.0
+                      scale: 0.08838834764831845
+                      is_causal: false
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L92 in sdpa_attention_forward,
                     code: attn_output = torch.nn.functional.scaled_dot_product_attention('
                   tags:
                     - torch.nn.functional.scaled_dot_product_attention.1_spyre
-                  kwargs:
-                    dropout_p: 0.0
-                    scale: 0.08838834764831845
-                    is_causal: false
                 - name: torch.transpose
                   sample_inputs_func:
                     args:
@@ -1466,13 +1466,13 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L335 in
                     forward, code: emb = torch.cat((freqs, freqs), dim=-1)'
                   tags:
                     - constant
                     - torch.cat.4_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.cos
                   sample_inputs_func:
                     args:
@@ -1527,12 +1527,12 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      dtype: torch.float16
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L339 in
                     forward, code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
                   tags:
                     - torch.to.6_spyre
-                  kwargs:
-                    dtype: torch.float16
                 - name: torch.to
                   sample_inputs_func:
                     args:
@@ -1576,13 +1576,13 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: -1
+                    kwargs:
+                      keepdim: true
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L207 in
                     forward, code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
                   tags:
                     - constant
                     - torch.mean.2_spyre
-                  kwargs:
-                    keepdim: true
                 - name: torch.add
                   sample_inputs_func:
                     args:
@@ -1866,13 +1866,13 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L39 in
                     rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - constant
                     - torch.cat.5_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.mul
                   sample_inputs_func:
                     args:
@@ -1982,13 +1982,13 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/ministral3/modeling_ministral3.py#L39 in
                     rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - constant
                     - torch.cat.6_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.mul
                   sample_inputs_func:
                     args:
@@ -2250,14 +2250,14 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      dropout_p: 0.0
+                      scale: 0.08838834764831845
+                      is_causal: false
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L92 in sdpa_attention_forward,
                     code: attn_output = torch.nn.functional.scaled_dot_product_attention('
                   tags:
                     - torch.nn.functional.scaled_dot_product_attention.2_spyre
-                  kwargs:
-                    dropout_p: 0.0
-                    scale: 0.08838834764831845
-                    is_causal: false
                 - name: torch.transpose
                   sample_inputs_func:
                     args:
