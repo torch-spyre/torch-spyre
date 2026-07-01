@@ -67,6 +67,10 @@ class NameSwapHandler(WrapperHandler):
     """
     Wrapper to patch a node's inner_fn to use new buffer names after inserting
     nodes upstream that change the input buffers.
+
+    This is the canonical example of the correct WrapperHandler wrapping
+    pattern for compiler passes. See CLAUDE.md "Compiler Pass Conventions"
+    and issue #2797.
     """
 
     def __init__(self, inner, name_map: dict[str, str]):
