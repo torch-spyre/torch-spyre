@@ -9,8 +9,6 @@ on:
       - docs/**
       - README.md
       - .github/workflows/config_integrity_checker.yaml
-  merge_group:
-    types: [checks_requested]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
