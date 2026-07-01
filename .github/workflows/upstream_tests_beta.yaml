@@ -8,6 +8,7 @@ on:
       - tests/docs/**
       - docs/**
       - README.md
+      - .github/workflows/config_integrity_checker.yaml
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -42,33 +43,87 @@ jobs:
     # To add a new upstream test suite, append an entry here:
     #   - name: <human-readable label shown in the GHA UI>
     #     config: <filename inside tests/configs/>
+    #
+    # The JUnit XML report is automatically named after the config file, e.g.:
+    #   test_view_ops_config.yaml  ->  test_view_ops_config.xml
     # ---------------------------------------------------------------------------
     strategy:
       fail-fast: false   # run all suites even if one fails
       matrix:
         suite:
-          - name: Binary ops
-            config: test_binary_ufuncs.yaml
           - name: Indexing
             config: test_indexing.yaml
           - name: Linear algebra
             config: test_linalg.yaml
-          - name: NeuralNet test embedding
-            config: test_nn_test_embedding.yaml
-          - name: NeuralNet lazy modules
-            config: test_nn_test_lazy_modules.yaml
           - name: NeuralNet pooling
-            config: test_nn_test_pooling.yaml
+            config: nn-test_pooling.yaml
+          - name: NeuralNet embedding
+            config: nn-test_embedding.yaml
+          - name: NeuralNet init
+            config: nn-test_init.yaml
+          - name: NeuralNet load state dictionary
+            config: nn-test_load_state_dict.yaml
+          - name: NeuralNet module hooks
+            config: nn-test_module_hooks.yaml
+          - name: Profiler execution trace
+            config: profiler-test_execution_trace.yaml
+          - name: Profiler memory
+            config: profiler-test_memory_profiler.yaml
+          - name: Profiler torch tidy
+            config: profiler-test_torch_tidy.yaml
+          - name: Profiler
+            config: profiler-test_profiler.yaml
           - name: Reductions
             config: test_reductions.yaml
           - name: Shape ops
             config: test_shape_ops.yaml
           - name: Tensor creation ops
             config: test_tensor_creation_ops.yaml
-          - name: Torch
-            config: test_torch.yaml
           - name: Unary ops
             config: test_unary_ufuncs.yaml
+          - name: Binary ops
+            config: test_binary_ufuncs.yaml
+          - name: Spectral ops
+            config: test_spectral_ops.yaml
+          - name: View ops
+            config: test_view_ops.yaml
+          - name: Torch
+            config: test_torch.yaml
+          - name: Sort and select
+            config: test_sort_and_select.yaml
+          - name: Inductor debug trace
+            config: inductor-test_debug_trace.yaml
+          - name: Inductor execution lowering stack trace
+            config: inductor-test_exc_lowering_stack_trace.yaml
+          - name: Inductor fuzzer
+            config: inductor-test_fuzzer.yaml
+          - name: Inductor mkldnn pattern matcher
+            config: inductor-test_mkldnn_pattern_matcher.yaml
+          - name: Inductor move constructor to gpu
+            config: inductor-test_move_constructors_to_gpu.yaml
+          - name: Inductor pattern matcher
+            config: inductor-test_pattern_matcher.yaml
+          - name: Inductor scatter optimization
+            config: inductor-test_scatter_optimization.yaml
+          - name: Inductor torch binding
+            config: inductor-test_torchbind.yaml
+          # All xfail tests. Will result in zero tests collected in "no xfail" mode.
+          # There are some mandatory success tests which have been commented out due a potential exclude bug.
+          # Once the bug is resolved, this config can be enabled. 
+          # - name: Ops
+          #   config: test_ops.yaml
+          # All xfail tests. Will result in zero tests collected in "no xfail" mode.
+          # Retaining the yaml for future use as new spyre capabilities are added.
+          # - name: NeuralNet lazy modules
+          #   config: nn-test_lazy_modules.yaml 
+          # - name: Masked
+          #   config: test_masked.yaml
+          # - name: Inductor scheduler
+          #   config: inductor-test_inductor_scheduler.yaml
+          # - name: Inductor op dtype properties
+          #   config: inductor-test_op_dtype_prop.yaml
+          # - name: NeuralNet convolution
+          #   config: nn-test_convolution.yaml
 
     steps:
       # Sparse checkout into the GHA workspace so the local composite
@@ -92,16 +147,41 @@ jobs:
       - uses: ./.github/actions/checkout-pytorch
 
       - uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
 
       - uses: ./.github/actions/build-torch-spyre
 
-      - name: Run ${{ matrix.suite.name }} upstream beta test suite
+      - name: Derive report paths
         run: |
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
-          echo "TORCH_SPYRE_DIR $TORCH_SPYRE_DIR"
-          cd "$TORCH_SPYRE_DIR"
-          source .venv/bin/activate
-          echo 'Running ${{ matrix.suite.name }} upstream tests...'
-          bash tests/run_test.sh "tests/configs/upstream_tests_beta/${{ matrix.suite.config }}" -v
-          echo '${{ matrix.suite.name }} upstream tests done'
+          REPORT_NAME="${{ matrix.suite.config }}"; REPORT_NAME="${REPORT_NAME%.yaml}.xml"
+          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
+          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+
+      - name: Run ${{ matrix.suite.name }} tests
+        uses: ./.github/actions/run-test-suite
+        with:
+          suite_name: ${{ matrix.suite.name }}
+          config: tests/configs/upstream_tests_beta/${{ matrix.suite.config }}
+          extra_test_flags: -v -m "not xfail"
+          junit_xml_path: ${{ env.REPORT_PATH }}
+          report_name: ${{ env.REPORT_NAME }}
+
+      # ---------------------------------------------------------------------------
+      # Upload the JUnit XML as a GHA artifact so it can be downloaded and
+      # ingested by the Spyre dashboard.
+      #
+      # if: always() ensures the report is uploaded even when tests fail —
+      # a failed run is exactly when you most want the dashboard to show results.
+      #
+      # Artifact name matches the report filename so multiple matrix jobs don't
+      # overwrite each other (each config produces a distinct name).
+      # ---------------------------------------------------------------------------
+      - name: Upload JUnit XML report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.REPORT_NAME }}
+          path: ${{ env.REPORT_PATH }}
+          if-no-files-found: warn   # warn (not fail) if pytest itself crashed
+          retention-days: 90 # for now keep it for 90 days until we push to COS
