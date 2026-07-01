@@ -736,6 +736,7 @@ class TestEntry(BaseModel):
     names: List[str]
     mode: str = MODE_MANDATORY_SUCCESS
     tags: List[str] = []
+    labels: List[str] = []
     edits: TestEdits = TestEdits()
 
     @field_validator("names", mode="before")
@@ -1008,10 +1009,11 @@ class GlobalConfig(BaseModel):
 
 
 class TestsBlock(BaseModel):
-    """Holds the inner YAML keys: files and global."""
+    """Holds the inner YAML keys: files, global, and suite-level metadata."""
 
     files: List[FileEntry]
     global_config: GlobalConfig = GlobalConfig()
+    labels: List[str] = ["full"]
 
     @model_validator(mode="before")
     @classmethod
