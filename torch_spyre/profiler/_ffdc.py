@@ -35,7 +35,8 @@ import tempfile
 import time
 import traceback
 import platform
-import regex as re
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as _FutureTimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -65,6 +66,11 @@ REQUIRED_FIELDS = [
 # Maximum number of FFDC report files to keep in the output directory.
 # Oldest reports (by modification time) are deleted first.
 _MAX_REPORTS = 50
+
+# Maximum wall-clock seconds to spend searching for compiler artifacts.
+# rglob scans can stall on slow or frozen filesystem mounts; this bounds
+# the delay before the original exception is re-raised.
+_ARTIFACT_SEARCH_TIMEOUT_S = 2.0
 
 
 def _prune_old_reports(out_dir: Path, keep: int) -> None:
@@ -219,7 +225,17 @@ def _collect_hardware_state() -> dict:
         import torch
 
         if hasattr(torch, "spyre"):
-            state["spyre_available"] = torch.spyre.is_available()
+            # Run the hardware probe without wait=True shutdown: exiting a
+            # `with ThreadPoolExecutor` block calls shutdown(wait=True), which
+            # would block until the thread finishes and defeat the timeout.
+            _hw_pool = ThreadPoolExecutor(max_workers=1)
+            _hw_future = _hw_pool.submit(torch.spyre.is_available)
+            _hw_pool.shutdown(wait=False)
+            try:
+                state["spyre_available"] = _hw_future.result(timeout=1.0)
+            except _FutureTimeoutError:
+                state["note"] = "hardware probe timed out"
+                return state
             if not state["spyre_available"]:
                 state["note"] = "hardware state unavailable without Spyre access"
     except Exception:
@@ -294,7 +310,17 @@ def collect(
     # --- artifacts ---
     artifacts: dict = {}
     try:
-        artifacts = _collect_artifacts()
+        # Use shutdown(wait=False) so a stalled rglob on a frozen mount does
+        # not block past _ARTIFACT_SEARCH_TIMEOUT_S.  A `with` block would call
+        # shutdown(wait=True) on exit, defeating the timeout.
+        _art_pool = ThreadPoolExecutor(max_workers=1)
+        _art_future = _art_pool.submit(_collect_artifacts)
+        _art_pool.shutdown(wait=False)
+        try:
+            artifacts = _art_future.result(timeout=_ARTIFACT_SEARCH_TIMEOUT_S)
+        except _FutureTimeoutError:
+            artifacts = {"searched": False, "error": "artifact search timed out"}
+            collector_errors.append("artifacts: timed out")
     except Exception as e:
         artifacts = {"searched": False, "error": str(e)}
         collector_errors.append(f"artifacts: {e}")
@@ -316,18 +342,18 @@ def collect(
     elapsed_ms = round((time.monotonic() - t0) * 1000, 2)
 
     # --- validate required fields ---
+    # Derive flat from REQUIRED_FIELDS programmatically so adding a new entry
+    # there never silently skews completeness_pct due to a missing .get() call.
+    _nested = {
+        "metadata": metadata,
+        "failure": failure,
+        "environment": environment,
+        "artifacts": artifacts,
+    }
     flat = {
-        "metadata.timestamp": metadata.get("timestamp"),
-        "metadata.torch_version": metadata.get("torch_version"),
-        "metadata.python_version": metadata.get("python_version"),
-        "failure.category": failure.get("category"),
-        "failure.exception_type": failure.get("exception_type"),
-        "failure.message": failure.get("message"),
-        "failure.traceback": failure.get("traceback"),
-        "environment.TORCH_COMPILE_DEBUG": environment.get("TORCH_COMPILE_DEBUG"),
-        "environment.TORCH_SPYRE_DEBUG": environment.get("TORCH_SPYRE_DEBUG"),
-        "environment.SPYRE_INDUCTOR_LOG": environment.get("SPYRE_INDUCTOR_LOG"),
-        "artifacts.searched": artifacts.get("searched"),
+        field: _nested.get(section, {}).get(key)
+        for field in REQUIRED_FIELDS
+        for section, key in [field.split(".", 1)]
     }
     missing_fields = [k for k, v in flat.items() if v is None]
 
@@ -357,7 +383,10 @@ def collect(
         out_dir = Path(output_dir) if output_dir else _default_output_dir()
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
-        report_path = out_dir / f"ffdc_{failure_category}_{ts}_{os.getpid()}.json"
+        safe_category = "".join(
+            c if c.isalnum() or c in "_-" else "_" for c in failure_category
+        )[:32]
+        report_path = out_dir / f"ffdc_{safe_category}_{ts}_{os.getpid()}.json"
         with open(report_path, "w") as f:
             json.dump(report, f, indent=2, default=str)
         report["_report_path"] = str(report_path)
@@ -387,18 +416,18 @@ def get_diagnostic_report(
     search_dir = Path(output_dir) if output_dir else _default_output_dir()
     if not search_dir.exists():
         return None
-    # Sort by the timestamp embedded in the filename, not by the full filename.
-    # Filenames are ffdc_{category}_{ts}_{pid}.json — sorting by the full name
-    # groups by category first, so a stale "unknown" report would rank above a
-    # fresh "compile" report.  Sorting by st_mtime fails on filesystems with
-    # 1-second mtime resolution (rapid writes in the same second are misordered).
-    # Extracting the %Y%m%dT%H%M%S_%f timestamp gives microsecond precision
-    # and is independent of category ordering.
-    _ts_re = re.compile(r"_(\d{8}T\d{6}_\d{6})_\d+\.json$")
 
+    # Sort by the timestamp embedded in the filename, not by the full filename.
+    # Filenames are ffdc_{category}_{YYYYMMDDTHHMMSS}_{microseconds}_{pid}.json.
+    # Sorting by the full name groups by category first, so a stale "unknown"
+    # report would outrank a fresh "compile" report.  Sorting by st_mtime fails
+    # on filesystems with 1-second resolution (same-second writes are misordered).
+    # rsplit from the right handles category names that contain underscores
+    # (e.g. runtime_launch): stem.rsplit('_', 3) yields
+    # [category_prefix, YYYYMMDDTHHMMSS, microseconds, pid].
     def _ts_key(p: Path) -> str:
-        m = _ts_re.search(p.name)
-        return m.group(1) if m else ""
+        parts = p.stem.rsplit("_", 3)
+        return f"{parts[1]}_{parts[2]}" if len(parts) == 4 else ""
 
     reports = sorted(
         search_dir.glob("ffdc_*.json"),

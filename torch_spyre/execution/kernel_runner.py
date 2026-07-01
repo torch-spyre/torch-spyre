@@ -16,11 +16,6 @@ import os
 import torch
 from torch_spyre._C import launch_kernel, prepare_kernel, launch_jobplan
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre.profiler._ffdc import (
-    CATEGORY_RUNTIME_LAUNCH,
-    CATEGORY_UNIMPLEMENTED,
-    collect as _ffdc_collect,
-)
 
 logger = get_inductor_logger("kernel_runner")
 
@@ -38,13 +33,18 @@ class SpyreUnimplementedRunner:
             )
         except RuntimeError as exc:
             try:
+                from torch_spyre.profiler._ffdc import (
+                    CATEGORY_UNIMPLEMENTED,
+                    collect as _ffdc_collect,
+                )
+
                 _ffdc_collect(
                     exc,
                     failure_category=CATEGORY_UNIMPLEMENTED,
                     kernel_name=self.kernel_name,
                 )
             except Exception:
-                pass
+                logger.debug("FFDC collection failed", exc_info=True)
             raise
 
 
@@ -53,7 +53,7 @@ class SpyreSDSCKernelRunner:
         self.kernel_name = name
         self.code_dir = code_dir
         self.jobplan = None
-        dump_spyre_code = os.environ.get("DUMP_SPYRE_CODE", "1")
+        dump_spyre_code = os.environ.get("DUMP_SPYRE_CODE", "0")
         if dump_spyre_code.isdigit() and int(dump_spyre_code) != 0:
             self.jobplan = prepare_kernel(code_dir + "/spyreCodeDir")
 
@@ -68,6 +68,11 @@ class SpyreSDSCKernelRunner:
                     launch_kernel(self.code_dir, args)
             except Exception as exc:
                 try:
+                    from torch_spyre.profiler._ffdc import (
+                        CATEGORY_RUNTIME_LAUNCH,
+                        collect as _ffdc_collect,
+                    )
+
                     _ffdc_collect(
                         exc,
                         failure_category=CATEGORY_RUNTIME_LAUNCH,
@@ -75,5 +80,5 @@ class SpyreSDSCKernelRunner:
                         code_dir=self.code_dir,
                     )
                 except Exception:
-                    pass
+                    logger.debug("FFDC collection failed", exc_info=True)
                 raise

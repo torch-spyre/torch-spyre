@@ -23,6 +23,7 @@ from torch_spyre.profiler._ffdc import (
     CATEGORY_UNKNOWN,
     _MAX_REPORTS,
     _prune_old_reports,
+    REQUIRED_FIELDS,
     collect,
     get_diagnostic_report,
 )
@@ -111,6 +112,7 @@ class TestFfdcCollect:
             )
         assert report is not None
         assert report["_report_path"] is None
+        assert report["collector"]["success"] is False
 
     def test_category_constants_match_report(self):
         for category in (
@@ -135,13 +137,25 @@ class TestFfdcCollect:
         assert fname.startswith("ffdc_compile_")
         assert ".json" in fname
 
-    def test_required_fields_coverage(self):
-        try:
-            raise ValueError("x")
-        except ValueError as exc:
-            report = self._collect_to_tmpdir(exc, failure_category=CATEGORY_UNKNOWN)
+    def test_completeness_pct_reflects_missing_fields(self):
+        # Without an exception, failure.exception_type and failure.traceback are
+        # None, so they appear in missing_fields.  This verifies that
+        # completeness_pct is driven by REQUIRED_FIELDS programmatically:
+        # any drift between the two would show up here as a wrong percentage.
+        with tempfile.TemporaryDirectory() as tmp:
+            report = collect(None, failure_category=CATEGORY_UNKNOWN, output_dir=tmp)
 
-        assert report["collector"]["missing_fields"] == []
+        missing = report["collector"]["missing_fields"]
+        assert "failure.exception_type" in missing
+        assert "failure.traceback" in missing
+        # REQUIRED_FIELDS has 11 entries; exc=None leaves exception_type and
+        # traceback as None (2 missing, 9 present).
+        # round(100 * 9 / 11, 1) == 81.8  — hardcoded to catch formula regressions.
+        assert len(REQUIRED_FIELDS) == 11, (
+            "Update the expected_pct below if REQUIRED_FIELDS changes"
+        )
+        assert report["collector"]["completeness_pct"] == 81.8
+        assert report["collector"]["completeness_pct"] < 100.0
 
     def test_metadata_fields_present(self):
         try:

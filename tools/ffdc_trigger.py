@@ -27,6 +27,7 @@ Run from repo root with:
 import glob
 import json
 import os
+import time
 from typing import Any
 
 import torch  # noqa: F401 — ensures torch_spyre._C loads via real extension
@@ -46,16 +47,29 @@ def _newest(pattern):
     return max(matches, key=os.path.getmtime) if matches else None
 
 
+def _newest_since(pattern, since_ts):
+    matches = [
+        m for m in glob.glob(pattern, recursive=True) if os.path.getmtime(m) > since_ts
+    ]
+    return max(matches, key=os.path.getmtime) if matches else None
+
+
 def main():
     print("\n=== FFDC Real Trigger ===\n")
     reports = []
 
     # ── Scenario A: runtime_launch failure ──────────────────────────────────────
+    # Clear DUMP_SPYRE_CODE so SpyreSDSCKernelRunner.__init__ skips
+    # prepare_kernel() — the trigger exercises the launch_kernel() failure
+    # path, not the prepare_kernel() path.
+    os.environ.pop("DUMP_SPYRE_CODE", None)
+
     print("Scenario A: SpyreSDSCKernelRunner.run() → launch_kernel() raises")
     runner = SpyreSDSCKernelRunner(
         name="test_kernel_add",
         code_dir="/tmp/fake_spyre_code_dir",
     )
+    t0 = time.time()
     try:
         runner.run()
     except RuntimeError as e:
@@ -65,7 +79,7 @@ def main():
             "Expected RuntimeError from runner.run() but none was raised"
         )
 
-    report_path = _newest(str(FFDC_OUT / "ffdc_runtime_launch_*.json"))
+    report_path = _newest_since(str(FFDC_OUT / "ffdc_runtime_launch_*.json"), t0)
     if report_path:
         with open(report_path) as f:
             report = json.load(f)
@@ -86,6 +100,7 @@ def main():
         name="test_kernel_fft",
         op="aten::fft_fft",
     )
+    t0 = time.time()
     try:
         urunner.run()
     except RuntimeError as e:
@@ -95,7 +110,9 @@ def main():
             "Expected RuntimeError from urunner.run() but none was raised"
         )
 
-    report_path_u: Any | None = _newest(str(FFDC_OUT / "ffdc_unimplemented_*.json"))
+    report_path_u: Any | None = _newest_since(
+        str(FFDC_OUT / "ffdc_unimplemented_*.json"), t0
+    )
     if report_path_u:
         with open(report_path_u) as f:
             report_u = json.load(f)
