@@ -114,9 +114,9 @@ def main():
         print(f"\n[{cat}]")
         print(f"  failure.exception_type : {r['failure']['exception_type']}")
         print(f"  failure.message        : {r['failure']['message'][:80]}")
-        print(
-            f"  failure.traceback_lines: {len(r['failure']['traceback'].splitlines())}"
-        )
+        tb = r["failure"]["traceback"]
+        tb_str = tb if isinstance(tb, str) else "".join(tb)
+        print(f"  failure.traceback_lines: {len(tb_str.splitlines())}")
         print(f"  metadata.torch_version : {r['metadata'].get('torch_version', 'N/A')}")
         print(
             f"  metadata.torch_spyre_version : {r['metadata'].get('torch_spyre_version', 'N/A')}"

@@ -35,6 +35,7 @@ import tempfile
 import time
 import traceback
 import platform
+import regex as re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -386,9 +387,22 @@ def get_diagnostic_report(
     search_dir = Path(output_dir) if output_dir else _default_output_dir()
     if not search_dir.exists():
         return None
+    # Sort by the timestamp embedded in the filename, not by the full filename.
+    # Filenames are ffdc_{category}_{ts}_{pid}.json — sorting by the full name
+    # groups by category first, so a stale "unknown" report would rank above a
+    # fresh "compile" report.  Sorting by st_mtime fails on filesystems with
+    # 1-second mtime resolution (rapid writes in the same second are misordered).
+    # Extracting the %Y%m%dT%H%M%S_%f timestamp gives microsecond precision
+    # and is independent of category ordering.
+    _ts_re = re.compile(r"_(\d{8}T\d{6}_\d{6})_\d+\.json$")
+
+    def _ts_key(p: Path) -> str:
+        m = _ts_re.search(p.name)
+        return m.group(1) if m else ""
+
     reports = sorted(
         search_dir.glob("ffdc_*.json"),
-        key=lambda p: p.stat().st_mtime,
+        key=_ts_key,
         reverse=True,
     )
     if not reports:
