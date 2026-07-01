@@ -770,10 +770,8 @@ def generate_sdsc(
         _j = int(sdsc_spec.iteration_space.get(Symbol("j"), 1))
         _H_in = (_i - 1) * _sH + _kH  # padded input height (H_in + 2*pH)
         _W_in = (_j - 1) * _sW + _kW  # padded input width  (W_in + 2*pW)
-        _kij = _kH * _kW
-        _ij = _i * _j
     else:
-        _pH = _pW = _sH = _sW = _H_in = _W_in = _kij = _ij = 0
+        _pH = _pW = _sH = _sW = _H_in = _W_in = 0
 
     return (
         {
@@ -789,7 +787,6 @@ def generate_sdsc(
                     "factor_": HW_POOL_CORELET_FOLD if is_avgpool else 1,
                     "label_": "corelet",
                 },
-                **({"target_": "sentient"} if is_avgpool else {}),
                 "numCoresUsed_": sdsc_spec.num_cores,
                 "coreIdToDsc_": {str(c): 0 for c in range(sdsc_spec.num_cores)},
                 "numWkSlicesPerDim_": {
@@ -808,7 +805,6 @@ def generate_sdsc(
                             if is_avgpool
                             else 1,
                             "coreIdsUsed_": [c for c in range(sdsc_spec.num_cores)],
-                            **({"target_": "sentient"} if is_avgpool else {}),
                             "N_": {
                                 "name_": "n",
                                 **{
@@ -817,33 +813,10 @@ def generate_sdsc(
                                 },
                                 **(
                                     {
-                                        "in_": -1,
-                                        "x_": -1,
-                                        "x1_": -1,
-                                        "y_": -1,
-                                        "r_": -1,
-                                        "c_": -1,
-                                        "ij_": _ij,
-                                        "rc_": -1,
-                                        "kij_": _kij,
-                                        "sij_": -1,
-                                        "zij_": -1,
-                                        "si_": -1,
-                                        "sj_": -1,
-                                        "zi_": -1,
-                                        "zj_": -1,
-                                        "symbolicDimInfo_": {},
-                                        "maxSymbolicVolume_": {},
-                                        "coreletSplit_": {},
-                                        "rowSplit_": {},
-                                        "peSfpSplit_": {},
                                         "paddingSizes_": {
                                             "i": {
                                                 "padFront_": _pH,
                                                 "padBack_": _pH,
-                                                "unneededPad_": 0,
-                                                "unneededPadFront_": 0,
-                                                "unneededPadBack_": 0,
                                                 "totalSize_": _H_in,
                                                 "stride_": _sH,
                                                 "dilation_": 1,
@@ -852,9 +825,6 @@ def generate_sdsc(
                                             "j": {
                                                 "padFront_": _pW,
                                                 "padBack_": _pW,
-                                                "unneededPad_": 0,
-                                                "unneededPadFront_": 0,
-                                                "unneededPadBack_": 0,
                                                 "totalSize_": _W_in,
                                                 "stride_": _sW,
                                                 "dilation_": 1,
@@ -915,9 +885,6 @@ def generate_sdsc(
                                                     "i": {
                                                         "padFront_": _pH,
                                                         "padBack_": _pH,
-                                                        "unneededPad_": 0,
-                                                        "unneededPadFront_": 0,
-                                                        "unneededPadBack_": 0,
                                                         "totalSize_": _H_in,
                                                         "stride_": _sH,
                                                         "dilation_": 1,
@@ -926,9 +893,6 @@ def generate_sdsc(
                                                     "j": {
                                                         "padFront_": _pW,
                                                         "padBack_": _pW,
-                                                        "unneededPad_": 0,
-                                                        "unneededPadFront_": 0,
-                                                        "unneededPadBack_": 0,
                                                         "totalSize_": _W_in,
                                                         "stride_": _sW,
                                                         "dilation_": 1,
@@ -960,9 +924,6 @@ def generate_sdsc(
                                                     "i": {
                                                         "padFront_": _pH,
                                                         "padBack_": _pH,
-                                                        "unneededPad_": 0,
-                                                        "unneededPadFront_": 0,
-                                                        "unneededPadBack_": 0,
                                                         "totalSize_": _H_in,
                                                         "stride_": _sH,
                                                         "dilation_": 1,
@@ -971,9 +932,6 @@ def generate_sdsc(
                                                     "j": {
                                                         "padFront_": _pW,
                                                         "padBack_": _pW,
-                                                        "unneededPad_": 0,
-                                                        "unneededPadFront_": 0,
-                                                        "unneededPadBack_": 0,
                                                         "totalSize_": _W_in,
                                                         "stride_": _sW,
                                                         "dilation_": 1,
@@ -1149,31 +1107,10 @@ def generate_sdsc(
                                     "ldsIdx_": i,
                                     "dsName_": f"Tensor{i}",
                                     "dsType_": tensor.layout,
-                                    **(
-                                        {
-                                            "segment_": "input"
-                                            if i < sdsc_spec.num_inputs
-                                            else "output"
-                                        }
-                                        if is_avgpool
-                                        else {}
-                                    ),
                                     "scale_": [
                                         tensor.scales[dim]
                                         for dim in _tensor_layout_dims(tensor.layout)
                                     ],
-                                    **(
-                                        {
-                                            "density_": [
-                                                1
-                                                for _ in _tensor_layout_dims(
-                                                    tensor.layout
-                                                )
-                                            ]
-                                        }
-                                        if is_avgpool
-                                        else {}
-                                    ),
                                     "wordLength": num_bytes(tensor.data_format),
                                     "dataFormat_": tensor.data_format.name,
                                     # Index tensors must reside in HBM; the Spyre
@@ -1190,8 +1127,6 @@ def generate_sdsc(
                                                     if i < sdsc_spec.num_inputs
                                                     else 0,
                                                     "isZeroPadded": 0,
-                                                    "zpadGapFront": [0, 0],
-                                                    "gapPerDim": {},
                                                     "dsOffset": 0,
                                                     "allocateNode_": f"allocate-Tensor{i}_hbm",
                                                 }
@@ -1207,8 +1142,6 @@ def generate_sdsc(
                                                     if i < sdsc_spec.num_inputs
                                                     else 0,
                                                     "isZeroPadded": 0,
-                                                    "zpadGapFront": [0, 0],
-                                                    "gapPerDim": {},
                                                     "dsOffset": 0,
                                                     "allocateNode_": "",
                                                 }
