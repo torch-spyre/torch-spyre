@@ -3875,5 +3875,221 @@ class TestReorderUnhintedInterlopers(unittest.TestCase):
             self._run([a, x, b, c])
 
 
+# ===========================================================================
+# TestHintsLevels
+# ===========================================================================
+
+
+class TestHintsLevels(unittest.TestCase):
+    """_hints_levels must drop size-1 split_count hints as no-ops."""
+
+    def _make_op(self, hints):
+        """Return a fake ComputedBuffer with the given DimHint list.
+
+        hints: list of (hint_id, split_count, loop_var) tuples.
+        """
+        from torch._inductor.ir import ComputedBuffer
+        from torch_spyre._inductor.propagate_hints import DimHint
+
+        op = MagicMock(spec=ComputedBuffer)
+        op.get_name.return_value = "buf0"
+        op.dim_hints = [
+            DimHint(
+                dim_names=[f"dim{i}"],
+                split_count=sc,
+                loop_var=lv,
+                is_reduction=False,
+                hint_id=hid,
+            )
+            for i, (hid, sc, lv) in enumerate(hints)
+        ]
+        return op
+
+    def test_size1_hint_dropped(self):
+        """A single hint with split_count=1 produces an empty levels list."""
+        import sympy
+        from torch_spyre._inductor.coarse_tile import _hints_levels
+
+        op = self._make_op([(0, 1, sympy.Symbol("c0"))])
+        self.assertEqual(_hints_levels([op]), [])
+
+    def test_size1_hint_dropped_with_debug_log(self):
+        """A size-1 hint emits a debug log message when dropped."""
+        import logging
+        import logging.handlers
+        import sympy
+        import torch_spyre._inductor.coarse_tile as ct_mod
+        from torch_spyre._inductor.coarse_tile import _hints_levels
+
+        op = self._make_op([(7, 1, sympy.Symbol("c0"))])
+
+        original_level = ct_mod.hints_logger.level
+        ct_mod.hints_logger.setLevel(logging.DEBUG)
+        handler = logging.handlers.MemoryHandler(
+            capacity=100, flushLevel=logging.CRITICAL
+        )
+        ct_mod.hints_logger.addHandler(handler)
+        try:
+            result = _hints_levels([op])
+            handler.flush()
+            messages = [r.getMessage() for r in handler.buffer]
+        finally:
+            ct_mod.hints_logger.removeHandler(handler)
+            ct_mod.hints_logger.setLevel(original_level)
+
+        self.assertEqual(result, [])
+        self.assertTrue(
+            any("split_count=1" in m and "no-op" in m for m in messages),
+            f"Expected a 'split_count=1 … no-op' debug message; got: {messages}",
+        )
+
+    def test_nonunit_hint_kept(self):
+        """A hint with split_count > 1 is retained normally."""
+        import sympy
+        from torch_spyre._inductor.coarse_tile import _hints_levels
+
+        c0 = sympy.Symbol("c0")
+        op = self._make_op([(3, 4, c0)])
+        levels = _hints_levels([op])
+        self.assertEqual(len(levels), 1)
+        hint_id, count, is_reduction = levels[0]
+        self.assertEqual(hint_id, 3)
+        self.assertEqual(count, sympy.Integer(4))
+        self.assertFalse(is_reduction)
+
+    def test_mixed_hints_drops_only_size1(self):
+        """When one hint is size-1 and another is size>1, only the size>1 survives."""
+        import sympy
+        from torch_spyre._inductor.coarse_tile import _hints_levels
+
+        c0, c1 = sympy.Symbol("c0"), sympy.Symbol("c1")
+        op = self._make_op([(0, 1, c0), (1, 8, c1)])
+        levels = _hints_levels([op])
+        self.assertEqual(len(levels), 1)
+        hint_id, count, _ = levels[0]
+        self.assertEqual(hint_id, 1)
+        self.assertEqual(count, sympy.Integer(8))
+
+    def test_all_size1_hints_dropped_falls_through_to_next_op(self):
+        """If every hint on op0 is size-1, _hints_levels tries op1 next."""
+        import sympy
+        from torch_spyre._inductor.coarse_tile import _hints_levels
+
+        c0 = sympy.Symbol("c0")
+        op0 = self._make_op([(0, 1, c0)])
+        op1 = self._make_op([(0, 4, c0)])
+        levels = _hints_levels([op0, op1])
+        self.assertEqual(len(levels), 1)
+        _, count, _ = levels[0]
+        self.assertEqual(count, sympy.Integer(4))
+
+
+# ===========================================================================
+# TestHintsToCoarseTileGroupsLogging
+# ===========================================================================
+
+
+def _make_htctg_op(name, hints):
+    """Return a fake ComputedBuffer for hints_to_coarse_tile_groups logging tests.
+
+    hints: list of (hint_id, dim_names, split_count, loop_var) tuples.
+    loop_var may be None to simulate an op that is broadcast on that dim.
+    """
+    from torch._inductor.ir import ComputedBuffer
+    from torch_spyre._inductor.propagate_hints import DimHint
+
+    op = MagicMock(spec=ComputedBuffer)
+    op.get_name.return_value = name
+    op.get_operation_name.return_value = name
+    op.origins = []
+    op.dim_hints = [
+        DimHint(
+            dim_names=dim_names,
+            split_count=split_count,
+            loop_var=loop_var,
+            is_reduction=False,
+            hint_id=hint_id,
+        )
+        for hint_id, dim_names, split_count, loop_var in hints
+    ]
+    return op
+
+
+def _run_htctg_and_capture_log(ops):
+    """Run hints_to_coarse_tile_groups with INFO logging and return the log text."""
+    import logging
+    import logging.handlers
+    from types import SimpleNamespace
+    from torch_spyre._inductor.coarse_tile import hints_to_coarse_tile_groups
+    import torch_spyre._inductor.coarse_tile as coarse_tile_mod
+
+    graph = SimpleNamespace(operations=list(ops))
+
+    # Temporarily force the module-level hints_logger to INFO so the logging
+    # block inside hints_to_coarse_tile_groups actually runs.
+    original_level = coarse_tile_mod.hints_logger.level
+    coarse_tile_mod.hints_logger.setLevel(logging.INFO)
+
+    handler = logging.handlers.MemoryHandler(capacity=1000, flushLevel=logging.CRITICAL)
+    coarse_tile_mod.hints_logger.addHandler(handler)
+    try:
+        hints_to_coarse_tile_groups(graph)
+        handler.flush()
+        return "\n".join(r.getMessage() for r in handler.buffer)
+    finally:
+        coarse_tile_mod.hints_logger.removeHandler(handler)
+        coarse_tile_mod.hints_logger.setLevel(original_level)
+
+
+class TestHintsToCoarseTileGroupsLogging(unittest.TestCase):
+    """The scopes= log line must list all hint dims, not just those with
+    loop_var set on the first op in the group.
+
+    Regression test for a bug where group_ops[0] had loop_var=None for a hint
+    (e.g. a restickify op that doesn't iterate over Lq), causing that hint to
+    be absent from group_levels and therefore omitted from the scopes= line.
+    """
+
+    def test_scopes_includes_all_hints_when_first_op_is_broadcast_on_second_hint(self):
+        """When group_ops[0] has loop_var=None for hint 2 (Lq), the scopes= line
+        must still include Lq — not just H."""
+        import sympy
+
+        h_sym = sympy.Symbol("c0")
+        lq_sym = sympy.Symbol("c1")
+
+        # op0: iterates over H only — loop_var=None for Lq (broadcast, like restickify)
+        op0 = _make_htctg_op(
+            "op0",
+            [
+                (1, ["H"], 8, h_sym),  # hint_id=1, H, has loop_var
+                (2, ["Lq"], 4, None),  # hint_id=2, Lq, loop_var=None → broadcast
+            ],
+        )
+        # op1: iterates over both H and Lq
+        op1 = _make_htctg_op(
+            "op1",
+            [
+                (1, ["H"], 8, h_sym),
+                (2, ["Lq"], 4, lq_sym),
+            ],
+        )
+
+        log_output = _run_htctg_and_capture_log([op0, op1])
+
+        # Find the scopes= line specifically
+        scopes_line = next(
+            (ln for ln in log_output.splitlines() if "scopes=" in ln), ""
+        )
+        self.assertIn("H", scopes_line, f"scopes= must mention H; got: {scopes_line!r}")
+        self.assertIn(
+            "Lq",
+            scopes_line,
+            f"scopes= must mention Lq even though op0 is broadcast on Lq "
+            f"(loop_var=None for hint_id=2 on group_ops[0]); "
+            f"got: {scopes_line!r}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

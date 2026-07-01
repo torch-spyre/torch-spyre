@@ -201,6 +201,22 @@ while IFS= read -r -d '' wf; do
   fi
 done < <(find "$WORKFLOWS_DIR" \( -name "*.yml" -o -name "*.yaml" \) -print0 2>/dev/null | sort -z)
 
+# ── Dynamic-matrix coverage ───────────────────────────────────────────────────
+# Workflows that call filter_configs.py with --config-dir cover ALL configs
+# under that directory dynamically at runtime, without listing them literally
+# in YAML.  Detect these invocations and mark the directory as covered.
+
+declare -A DYNAMIC_CONFIG_DIRS
+
+while IFS= read -r -d '' wf; do
+  while IFS= read -r dir_val; do
+    [[ -z "$dir_val" ]] && continue
+    DYNAMIC_CONFIG_DIRS["$dir_val"]=1
+    info "Dynamic coverage via filter_configs.py: $dir_val  (${wf#${REPO_ROOT}/})"
+  done < <(grep -oE -- '--config-dir[[:space:]]+[^[:space:]\\]+' "$wf" 2>/dev/null \
+             | sed 's/--config-dir[[:space:]]*//')
+done < <(find "$WORKFLOWS_DIR" \( -name "*.yml" -o -name "*.yaml" \) -print0 2>/dev/null | sort -z)
+
 echo ""
 
 # --------------- Walk every test_*.py and check coverage ---------------
@@ -243,8 +259,22 @@ for test_abs in "${ALL_TEST_FILES[@]}"; do
     #   torch_spyre_tests:  config: torch_spyre_tests/inductor/test_foo_config.yaml
     #   module_tests:       config: granite_3_3_8b_instruct_spyre.yaml   (bare name)
     #   model_ops_tests:    config: gpt_oss_20b_spyre.yaml               (bare name)
+    # Also accept configs that live under a directory covered dynamically by a
+    # filter_configs.py --config-dir invocation in any workflow.
+    _is_covered=0
     if grep -qF "$config_rel" "$WORKFLOW_TMPFILE" 2>/dev/null || \
        grep -qF "$config_basename" "$WORKFLOW_TMPFILE" 2>/dev/null; then
+      _is_covered=1
+    else
+      for dyn_dir in "${!DYNAMIC_CONFIG_DIRS[@]}"; do
+        if [[ "tests/configs/${config_rel}" == "${dyn_dir}/"* ]]; then
+          _is_covered=1
+          break
+        fi
+      done
+    fi
+
+    if [[ $_is_covered -eq 1 ]]; then
       ok "tests/${test_rel}"
     else
       error "tests/${test_rel}"

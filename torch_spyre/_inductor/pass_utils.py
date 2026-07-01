@@ -1022,6 +1022,8 @@ def replace_computed_buffer_body(
 
     Returns the replacement ComputedBuffer.
     """
+    # Always wrap the original inner_fn via WrapperHandler; never rebuild
+    # index expressions from scratch (they go stale — see issue #2797).
     new_buf = ComputedBuffer(
         name=op.get_name(),
         layout=op.layout,

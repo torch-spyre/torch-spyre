@@ -1,0 +1,11 @@
+# CI runner requirements for test suites that need non-default hardware.
+#
+# Keys are config paths relative to tests/configs/torch_spyre_tests/.
+# Values are the runner label to use instead of the default (spyre_pf_x1).
+#
+# This file is read by filter_configs.py (--runner-map) when building the
+# dynamic CI matrix so that hardware requirements stay in CI config rather
+# than inside the test suite config files themselves.
+
+inductor/test_inductor_ops_misc_shape_a_config.yaml: spyre_pf_x2
+inductor/test_ops_lx_planning_config.yaml: spyre_pf_x4

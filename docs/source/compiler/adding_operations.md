@@ -66,3 +66,33 @@ unsupported cases to a CPU fallback. The pattern is:
 Canonical examples are `spyre::max_dim_int64_fallback` and
 `spyre::min_dim_int64_fallback`, which fall back to CPU for int64 reductions
 while the fp16/fp32 cases run natively on Spyre via decomposition.
+
+## Modifying existing kernels: wrap, never reconstruct
+
+When a compiler pass needs to alter how an existing `ComputedBuffer` computes
+its values, always wrap the original `inner_fn` using a `WrapperHandler`
+subclass — never attempt to rebuild `inner_fn` from scratch.
+
+**Why:** `inner_fn` index expressions are symbolic; they are bound to the
+specific `sympy` objects created during lowering. Rebuilding the function from
+scratch produces fresh symbolic expressions that are structurally similar but
+not the same objects, causing silent wrong-code bugs that are hard to detect
+(see issue [#2797](https://github.com/torch-spyre/torch-spyre/issues/2797)).
+
+**Correct pattern:**
+
+```python
+class _MyHandler(WrapperHandler):
+    def load(self, name, index):
+        # intercept specific loads; delegate everything else
+        return super().load(self._name_map.get(name, name), index)
+
+def new_inner_fn(*args, _orig=orig_inner):
+    with V.set_ops_handler(_MyHandler(V.ops, ...)):
+        return _orig(*args)
+```
+
+Canonical implementations: `NameSwapHandler` in
+[insert_restickify.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/insert_restickify.py),
+`_SplitOpsHandler` and `_IntermediateOpHandler` in
+[split_multi_ops.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/split_multi_ops.py).

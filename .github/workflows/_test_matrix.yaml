@@ -77,6 +77,15 @@ on:
         required: false
         type: boolean
         default: true
+      test_type:
+        description: >-
+          Suite subset to run: smoke | core | full | suite_<group> | <label>.
+          Selects configs whose test_suite_config.labels array contains this
+          value, or (for suite_<group>) whose path sits under that directory.
+          Default: full (every config).
+        required: false
+        type: string
+        default: full
 
 defaults:
   run:
@@ -84,10 +93,46 @@ defaults:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Job 1: test matrix
+  # Job 0: generate filtered test matrix
+  #
+  # Reads test_suite_config.labels from every YAML under
+  # tests/configs/torch_spyre_tests/ and emits a JSON matrix containing only
+  # the configs that match inputs.test_type.  The test job below consumes this
+  # output via fromJSON so that only the requested subset of runners starts.
+  # ---------------------------------------------------------------------------
+  generate_matrix:
+    name: Generate test matrix (${{ inputs.test_type || 'full' }})
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.filter.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
+          sparse-checkout: |
+            tests/configs/torch_spyre_tests
+            tests/oot_framework/utils/filter_configs.py
+            .github/runner_overrides.yaml
+          sparse-checkout-cone-mode: false
+
+      - name: Filter configs by TEST_TYPE
+        id: filter
+        run: |
+          pip install pyyaml --quiet
+          matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
+            --config-dir tests/configs/torch_spyre_tests \
+            --test-type "${{ inputs.test_type || 'full' }}" \
+            --runner-map .github/runner_overrides.yaml \
+            --format matrix-json)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Job 1: test matrix  (dynamic — driven by generate_matrix output)
   # ---------------------------------------------------------------------------
   test:
     name: ${{ matrix.suite.name }}
+    needs: generate_matrix
     runs-on:
       - x86_64
       - ${{ matrix.suite.runner || 'spyre_pf_x1' }}
@@ -98,145 +143,11 @@ jobs:
       # GitHub Actions sets CI=true which causes pytest inductor tests to fail.
       # Explicitly clear it.
       CI: ''
+      TORCH_SPYRE_TEST_TYPE: ${{ inputs.test_type || 'full' }}
 
     strategy:
       fail-fast: false
-      matrix:
-        suite:
-          # ---- torch_spyre_tests ----
-          - name: Test Device Enum
-            config: torch_spyre_tests/test_device_enum_config.yaml
-          - name: Test Fallbacks
-            config: torch_spyre_tests/test_fallbacks_config.yaml
-          - name: Test Modules
-            config: torch_spyre_tests/test_modules_config.yaml
-          - name: Test Regex
-            config: torch_spyre_tests/test_regex_config.yaml
-          - name: Test Spyre
-            config: torch_spyre_tests/test_spyre_config.yaml
-          - name: Test Execution Trace
-            config: torch_spyre_tests/test_execution_trace_config.yaml
-          - name: Test Spyre Lazy Silent
-            config: torch_spyre_tests/test_spyre_lazy_silent_config.yaml
-          - name: Test Spyre Lazy Init
-            config: torch_spyre_tests/test_spyre_lazy_init_config.yaml
-          - name: Test Stream
-            config: torch_spyre_tests/test_stream_config.yaml
-          - name: Test Spyre Profiler
-            config: torch_spyre_tests/test_spyre_profiler_config.yaml
-          - name: Test Prepare Kernel
-            config: torch_spyre_tests/test_prepare_kernel_config.yaml
-          - name: Test Allocator E2E
-            config: torch_spyre_tests/test_allocator_e2e_config.yaml
-          - name: Test Launch Jobplan
-            config: torch_spyre_tests/test_launch_jobplan_config.yaml
-          - name: Test logging patterns
-            config: torch_spyre_tests/test_logging_patterns_config.yaml
-          # ---- Inductor tests ----
-          - name: Inductor Building Blocks
-            config: torch_spyre_tests/inductor/test_building_blocks_config.yaml
-          - name: Inductor Codegen
-            config: torch_spyre_tests/inductor/test_codegen_config.yaml
-          - name: Inductor Copy Back Elision
-            config: torch_spyre_tests/inductor/test_copy_back_elision_config.yaml
-          - name: Inductor Decomp
-            config: torch_spyre_tests/inductor/test_decomp_config.yaml
-          - name: Inductor Fallback Kernel Shapes
-            config: torch_spyre_tests/inductor/test_fallback_kernel_shapes_config.yaml
-          - name: Inductor FX Passes
-            config: torch_spyre_tests/inductor/test_inductor_fx_passes_config.yaml
-          - name: Inductor Normalization Scalars
-            config: torch_spyre_tests/inductor/test_normalization_scalars_config.yaml
-          - name: Inductor Ops Matmul
-            config: torch_spyre_tests/inductor/test_inductor_ops_matmul_config.yaml
-          - name: Inductor Ops Reductions Keepdim Multidim0
-            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_multidim0_config.yaml
-          - name: Inductor Ops Reductions Keepdim Multidim1
-            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_multidim1_config.yaml
-          - name: Inductor Ops Reductions Keepdim Singledim0
-            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_singledim0_config.yaml
-          - name: Inductor Ops Reductions Keepdim Singledim1
-            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_singledim1_config.yaml
-          - name: Inductor Ops Reductions Keepdim Index Norm Eager
-            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_keepdim_index_norm_eager_config.yaml
-          - name: Inductor Ops Reductions Scalar
-            config: torch_spyre_tests/inductor/test_inductor_ops_reduction_scalar_config.yaml
-          - name: Inductor Ops Pointwise
-            config: torch_spyre_tests/inductor/test_inductor_ops_pointwise_config.yaml
-          - name: Inductor Ops Misc Shape A
-            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_a_config.yaml
-            runner: spyre_pf_x2
-          - name: Inductor Ops Misc Shape B
-            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_b_config.yaml
-          - name: Inductor Ops Misc Shape C
-            config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_c_config.yaml
-          - name: Inductor Ops Misc Compute A
-            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_a_config.yaml
-          - name: Inductor Ops Misc Compute B
-            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_b_config.yaml
-          - name: Inductor Ops Misc Compute C
-            config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_c_config.yaml
-          - name: Inductor Ops FP8
-            config: torch_spyre_tests/inductor/test_inductor_ops_fp8_config.yaml
-          - name: Inductor Ops LX Planning
-            config: torch_spyre_tests/inductor/test_ops_lx_planning_config.yaml
-            runner: spyre_pf_x4
-          - name: Inductor Scalar
-            config: torch_spyre_tests/inductor/test_inductor_scalar_config.yaml
-          - name: Inductor Logging
-            config: torch_spyre_tests/inductor/test_logging_config.yaml
-          - name: Inductor Dedup Constants
-            config: torch_spyre_tests/inductor/test_dedup_constants_config.yaml
-          - name: Inductor Padding
-            config: torch_spyre_tests/inductor/test_padding_config.yaml
-          - name: Inductor Overwrite
-            config: torch_spyre_tests/inductor/test_overwrite.yaml
-          - name: Inductor Propagate Named Dims
-            config: torch_spyre_tests/inductor/test_propagate_named_dims_config.yaml
-          - name: Inductor Restickify
-            config: torch_spyre_tests/inductor/test_restickify_config.yaml
-          - name: Inductor Scratchpad Patterns
-            config: torch_spyre_tests/inductor/test_scratchpad_patterns_config.yaml
-          - name: Inductor Scratchpad Use
-            config: torch_spyre_tests/inductor/test_scratchpad_use_config.yaml
-          - name: Inductor Dtype Scalars
-            config: torch_spyre_tests/inductor/test_dtype_scalars_config.yaml
-          - name: Inductor Cache
-            config: torch_spyre_tests/inductor/test_cache_config.yaml
-          - name: Inductor Scratchpad Solver
-            config: torch_spyre_tests/inductor/test_scratchpad_solver_config.yaml
-          - name: Inductor Coarse Tiling
-            config: torch_spyre_tests/inductor/test_coarse_tiling_config.yaml
-          - name: Inductor Coarse Tile E2E
-            config: torch_spyre_tests/inductor/test_coarse_tile_e2e_config.yaml
-          - name: Inductor Span Overflow Hint Analysis
-            config: torch_spyre_tests/inductor/test_span_overflow_hint_analysis_config.yaml
-          - name: Inductor Unroll Loop Specs
-            config: torch_spyre_tests/inductor/test_unroll_loop_specs_config.yaml
-          - name: Inductor Work Division Hint
-            config: torch_spyre_tests/inductor/test_work_division_hint_config.yaml
-          - name: Inductor Tensor Transpose
-            config: torch_spyre_tests/inductor/test_inductor_transpose_edge_config.yaml
-          # ---- Indirect Access tests ----
-          - name: Indirect Access Gather
-            config: torch_spyre_tests/inductor/test_indirect_access_gather_config.yaml
-          - name: Indirect Access Scatter
-            config: torch_spyre_tests/inductor/test_indirect_access_scatter_config.yaml
-          - name: Indirect Access Internals
-            config: torch_spyre_tests/inductor/test_indirect_access_internals_config.yaml
-          # ---- Tensor tests ----
-          - name: Tensor Coordinates
-            config: torch_spyre_tests/tensors/test_coordinates_config.yaml
-          - name: Tensor It Space Splits
-            config: torch_spyre_tests/tensors/test_it_space_splits_config.yaml
-          - name: Tensor Layout
-            config: torch_spyre_tests/tensors/test_tensor_layout_config.yaml
-          - name: Tensor Resize
-            config: torch_spyre_tests/tensors/test_resize_config.yaml
-          - name: Tensor Memory Format
-            config: torch_spyre_tests/tensors/test_memory_format_config.yaml
-          - name: Tensor Model Loading Layout
-            config: torch_spyre_tests/tensors/test_model_utils_config.yaml
+      matrix: ${{ fromJSON(needs.generate_matrix.outputs.matrix) }}
 
     steps:
       - name: Checkout composite actions
@@ -275,7 +186,7 @@ jobs:
         uses: ./.github/actions/run-test-suite
         with:
           suite_name: ${{ matrix.suite.name }}
-          config: tests/configs/${{ matrix.suite.config }}
+          config: tests/configs/torch_spyre_tests/${{ matrix.suite.config }}
           extra_test_flags: ${{ inputs.extra_test_flags }}
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
@@ -297,9 +208,20 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Job 2: Multi-Spyre test matrix
+  #
+  # Only runs for test_type values that include the distributed suite:
+  #   full              — includes everything
+  #   suite_distributed — targets the distributed_tests/ directory directly
+  #   (empty)           — same as full
+  # For smoke / core / suite_<other> the distributed job is skipped entirely
+  # so no x2 runners are allocated.
   # ---------------------------------------------------------------------------
   test_multi_spyre:
     name: ${{ matrix.suite.name }}
+    if: >-
+      inputs.test_type == '' ||
+      inputs.test_type == 'full' ||
+      inputs.test_type == 'suite_distributed'
     runs-on:
       - x86_64
       - spyre_pf_x2
@@ -389,7 +311,7 @@ jobs:
   report_empty_suites:
     name: Report empty test suites
     runs-on: ubuntu-latest
-    needs: [test, test_multi_spyre]
+    needs: [generate_matrix, test, test_multi_spyre]
     if: always()
 
     steps:

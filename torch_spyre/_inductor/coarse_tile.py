@@ -73,7 +73,7 @@ from .constants import BATCH_MATMUL_OP
 from .errors import Unsupported
 from .logging_utils import get_inductor_logger
 from .loop_info import CoarseTileInfo
-from .propagate_hints import DimHint, get_op_hints
+from .propagate_hints import DimHint
 from .pass_utils import op_out_coords
 from .span_overflow_hint_analysis import plan_span_overflow_tile
 from .ir import FixedTiledLayout
@@ -113,13 +113,23 @@ def _hints_levels(ops: list[Operation]) -> list[tuple]:
     Returns a list of (hint_id, count, is_reduction_level) triples, outermost
     first.  Previously this skipped is_reduction hints; it now includes them so
     that _stamp_group can divide reduction_ranges for reduction-dim tiling.
+    Hints with split_count == 1 are dropped: tiling by 1 is a no-op.
     """
     for op in ops:
-        levels = [
-            (h.hint_id, sympy.Integer(h.split_count), h.is_reduction)
-            for h in getattr(op, "dim_hints", [])
-            if h.loop_var is not None
-        ]
+        levels = []
+        for h in getattr(op, "dim_hints", []):
+            if h.loop_var is None:
+                continue
+            if h.split_count == 1:
+                hints_logger.debug(
+                    "spyre_hint on [%s]: hint_id=%d dims=%s split_count=1"
+                    " — tiling by 1 is a no-op, dropping",
+                    ", ".join(o.get_name() for o in ops),
+                    h.hint_id,
+                    h.dim_names,
+                )
+                continue
+            levels.append((h.hint_id, sympy.Integer(h.split_count), h.is_reduction))
         if levels:
             return levels
     return []
@@ -337,13 +347,21 @@ def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
         # Pre-compute hint descriptions per group — get_op_hints is called once per
         # group rather than once per op in the group.
         group_hint_descs: dict[int, str] = {}
-        for g_idx, (group_ops, group_levels) in enumerate(groups):
-            spec_op = group_ops[0]
-            op_hints = get_op_hints(spec_op)
+        for g_idx, (group_ops, _group_levels) in enumerate(groups):
+            # Collect all DimHints across the group, keyed by hint_id.
+            # Prefer a hint whose loop_var is not None (op actually iterates
+            # that dim) over a broadcast hint (loop_var=None), so that the
+            # representative name/count reflects a real iteration.
+            best: dict[int, "DimHint"] = {}
+            for gop in group_ops:
+                for h in getattr(gop, "dim_hints", []):
+                    if h.hint_id not in best or best[h.hint_id].loop_var is None:
+                        best[h.hint_id] = h
             descs = [
-                f"hint_{hint_id}={op_hints[hint_id]}"
-                for hint_id, *_ in group_levels
-                if hint_id in op_hints
+                f"hint_{h.hint_id}={{'tiles': {{"
+                + ", ".join(f"'{n}': {h.split_count}" for n in h.dim_names)
+                + "}}"
+                for h in sorted(best.values(), key=lambda x: x.hint_id)
             ]
             group_hint_descs[g_idx] = ", ".join(descs)
 
