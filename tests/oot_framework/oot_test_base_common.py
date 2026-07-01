@@ -16,6 +16,7 @@ from oot_framework.oot_test_constants import (
     _DYNAMIC_TAG_PREFIXES,
     DEFAULT_FLOATING_PRECISION,
     ENV_TEST_CONFIG,
+    ENV_TEST_TYPE,
     MODE_MANDATORY_SUCCESS,
     MODE_SKIP,
     MODE_XFAIL,
@@ -369,6 +370,21 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
             effective_mode = entry.mode  # always set, default is mandatory_success
         else:
             effective_mode = cls.UNLISTED_TEST_MODE  # only for truly unlisted tests
+
+        # per-test label filter — skip if this entry's labels don't include the
+        # active TEST_TYPE.  Empty labels means "no restriction; run whenever the
+        # suite runs" so the check is a no-op for unlabelled entries.
+        # suite_<group> values are structural (handled by filter_configs.py at the
+        # config-file level) and are ignored here.
+        if entry is not None and entry.labels:
+            test_type = os.environ.get(ENV_TEST_TYPE, "full")
+            if (
+                test_type
+                and test_type != "full"
+                and not test_type.startswith("suite_")
+                and test_type not in entry.labels
+            ):
+                return False, f"Excluded by TEST_TYPE={test_type!r}", False, False
 
         # dtype filtering — extract dtype from method_name and check against supported
         dtype_str = extract_dtype_from_name(method_name)

@@ -9,6 +9,7 @@
 # directory and launches them with: torchrun --nproc-per-node $AIU_WORLD_SIZE
 
 test_suite_config:
+  labels: [full]
   files:
     # SpyreCCL Backend Availability Test
     - path: ${TORCH_DEVICE_ROOT}/tests/distributed/spyreccl_backend.py

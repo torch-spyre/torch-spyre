@@ -50,6 +50,13 @@ on:
         required: false
         type: string
         default: ''
+      test_type:
+        description: >-
+          Suite subset to run: smoke | core | full | suite_<group> | <label>.
+          Default: full (every config).
+        required: false
+        type: string
+        default: full
 
 concurrency:
   group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.html_url) || (github.event_name == 'workflow_dispatch'
@@ -131,6 +138,7 @@ jobs:
       rpm_location: ${{ inputs.rpm_location || '' }}
       rpm_names: ${{ inputs.rpm_names || '' }}
       build_torch_spyre: ${{ inputs.build_torch_spyre == true }}
+      test_type: ${{ inputs.test_type || 'full' }}
 
   # ---------------------------------------------------------------------------
   # Job 3: run-spyre-unit-tests (required check gate)
