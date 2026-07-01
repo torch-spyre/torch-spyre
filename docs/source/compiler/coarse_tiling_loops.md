@@ -33,7 +33,7 @@ what constraints forced each choice — see the companion RFC
 - [Small Example](#small-example)
 - [Layer 1 — IR pass & `coarse_tile()` API](#layer-1--pre-scheduling-ir-pass)
   - [`reorder_unhinted_interlopers`](#reorder_unhinted_interlopers-pre-grouping-pass)
-  - [Groups derivation and placement](#groups-derivation-and-placement-in-custompreschedlingpasses)
+  - [Groups derivation and placement](#groups-derivation-and-placement-in-custompreschedulingpasses)
 - [Layer 2 — `CountedLoopSchedulerNode`](#layer-2--countedloopschedulernode)
 - [Layer 3 — `LoopSpec` & codegen](#layer-3--loopspec-and-codegen)
 - [Key files](#key-files)
