@@ -102,8 +102,11 @@ jobs:
             config: test_binary_ufuncs.yaml
           - name: Spectral ops
             config: test_spectral_ops.yaml
-          - name: View ops
-            config: test_view_ops.yaml
+          # All xfail tests. Will result in zero tests collected in "no xfail" mode.
+          # There are some mandatory success tests which have been commented out due a potential exclude bug.
+          # Once the bug is resolved, this config can be enabled. 
+          # - name: View ops
+          #   config: test_view_ops.yaml
           - name: Torch
             config: test_torch.yaml
           # All xfail tests. Will result in zero tests collected in "no xfail" mode.
