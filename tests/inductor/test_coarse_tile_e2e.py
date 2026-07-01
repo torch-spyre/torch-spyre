@@ -826,6 +826,149 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
+    @config.patch(
+        {
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_mixed_coverage_loopspec(self):
+        """Union-across-ops: B level not dropped when first op has no B dimension.
+
+        Two ops share a group under nested hints {A:2}/{B:4}.
+        Op1 is x.abs() with shape [A, D] — iterates A, has loop_var=None for B.
+        Op2 is abs_x + y with shape [A, B, D] — iterates both A and B.
+        The old _hints_levels returned early at Op1 and dropped the B level.
+        The fixed version unions across all ops and finds loop_var for B from Op2.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        A, B, D = 128, 8, 64
+        x = torch.randn(A, D, dtype=torch.float16)
+        y = torch.randn(A, B, D, dtype=torch.float16)
+        x_dev = x.to("spyre")
+        y_dev = y.to("spyre")
+        _declare_tensor_dim("A", A)
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(x_dev, ["A", "D"])
+        _name_tensor_dims(y_dev, ["A", "B", "D"])
+
+        def fn(x, y):
+            with spyre_hint(num_tiles_per_dim={"A": 2}):
+                with spyre_hint(num_tiles_per_dim={"B": 4}):
+                    # abs_x has shape [A, D], unsqueeze to [A, 1, D] for broadcast
+                    abs_x = torch.abs(x).unsqueeze(1)
+                    return abs_x + y
+
+        cfn = torch.compile(fn)
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, x_dev, y_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
+        self.assertIn("sympify('2')", src, "Expected A loop count 2 in LoopSpec")
+        self.assertIn("sympify('4')", src, "Expected B loop count 4 in LoopSpec")
+
+    @config.patch(
+        {
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_flash_attention_loopspec(self):
+        """Lk loop level not dropped when Lk-broadcast ops appear first in group.
+
+        Flash-attention-style code with nested hints {B:1}/{H:4}/{Lk:2}.
+        Ops like amax/exp/sum have shape [B,H,Lq] — no Lk dimension — and
+        appear before Lk-iterating ops in topological order.  The old
+        _hints_levels returned early from one of those ops and dropped Lk.
+        The fixed version unions loop_var assignments and finds Lk from a
+        later op in the group.
+        """
+        import math
+        from torch_spyre._inductor import spyre_hint
+
+        B, H, Lq, Lk, D = 1, 8, 256, 256, 64
+        block_size = 128
+        scale = 1.0 / math.sqrt(math.sqrt(D))
+        lk_slices = Lk // block_size  # 2
+
+        queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
+        keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        values_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        queries_dev = queries_t.to("spyre")
+        keys_dev = keys_t.to("spyre")
+        values_dev = values_t.to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("Lk", Lk)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(queries_dev, ["B", "H", "Lq", "D"])
+        _name_tensor_dims(keys_dev, ["B", "H", "Lk", "D"])
+        _name_tensor_dims(values_dev, ["B", "H", "Lk", "D"])
+
+        def flash(queries, keys, values):
+            output = torch.zeros_like(queries)
+            M = torch.full(
+                (B, H, Lq),
+                float("-inf"),
+                device=queries.device,
+                dtype=torch.float16,
+            )
+            with spyre_hint(num_tiles_per_dim={"B": 1}):
+                with spyre_hint(num_tiles_per_dim={"H": 4}):
+                    with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
+                        keys_T = keys.transpose(-1, -2).contiguous()
+                        denominator = torch.zeros(
+                            (B, H, Lq),
+                            device=queries.device,
+                            dtype=torch.float16,
+                        )
+                        scores = torch.matmul(queries * scale, keys_T * scale)
+                        scores = scores.transpose(-1, -2).contiguous()
+                        block_max = torch.amax(scores, dim=-2)
+                        max_running = torch.maximum(M, block_max)
+                        exp_scores = torch.exp(scores - max_running.unsqueeze(-2))
+                        correction = torch.exp(M - max_running)
+                        denominator = denominator * correction + exp_scores.sum(dim=-2)
+                        output = output * correction.unsqueeze(-1) + torch.matmul(
+                            exp_scores.transpose(-1, -2), values
+                        )
+                        M = max_running
+            return output / denominator.unsqueeze(-1)
+
+        cfn = torch.compile(flash)
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, queries_dev, keys_dev, values_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
+        self.assertIn(
+            "count=sympify('4')",
+            src,
+            "Expected H loop count 4 — hint_H must appear as count= in LoopSpec",
+        )
+        self.assertIn(
+            "count=sympify('2')",
+            src,
+            "Expected Lk loop count 2 as count= in LoopSpec — hint_Lk must not be"
+            " dropped by _hints_levels",
+        )
+
     def test_hint_h_tiling_elementwise(self):
         """spyre_hint(num_tiles_per_dim={"H": 2}) tiles elementwise multiply over the H dimension.
 
