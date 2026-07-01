@@ -113,13 +113,23 @@ def _hints_levels(ops: list[Operation]) -> list[tuple]:
     Returns a list of (hint_id, count, is_reduction_level) triples, outermost
     first.  Previously this skipped is_reduction hints; it now includes them so
     that _stamp_group can divide reduction_ranges for reduction-dim tiling.
+    Hints with split_count == 1 are dropped: tiling by 1 is a no-op.
     """
     for op in ops:
-        levels = [
-            (h.hint_id, sympy.Integer(h.split_count), h.is_reduction)
-            for h in getattr(op, "dim_hints", [])
-            if h.loop_var is not None
-        ]
+        levels = []
+        for h in getattr(op, "dim_hints", []):
+            if h.loop_var is None:
+                continue
+            if h.split_count == 1:
+                hints_logger.debug(
+                    "spyre_hint on [%s]: hint_id=%d dims=%s split_count=1"
+                    " — tiling by 1 is a no-op, dropping",
+                    ", ".join(o.get_name() for o in ops),
+                    h.hint_id,
+                    h.dim_names,
+                )
+                continue
+            levels.append((h.hint_id, sympy.Integer(h.split_count), h.is_reduction))
         if levels:
             return levels
     return []
