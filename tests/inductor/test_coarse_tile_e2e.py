@@ -30,7 +30,6 @@ import sys
 import os
 import regex as re
 
-import pytest
 import torch
 import unittest
 from unittest.mock import patch as mock_patch
@@ -1361,9 +1360,6 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
             fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
         )
 
-    @pytest.mark.skip(
-        "Passes in isolation but fails when run as part of the full suite (device state interaction)"
-    )
     def test_bmm_k_tiled_correct(self):
         """3D bmm [B,M,K] @ [B,K,N] tiled over K produces correct results."""
         from torch_spyre._inductor import spyre_hint
