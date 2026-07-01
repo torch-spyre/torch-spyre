@@ -121,8 +121,10 @@ jobs:
             config: inductor-test_exc_lowering_stack_trace.yaml
           - name: Inductor fuzzer
             config: inductor-test_fuzzer.yaml
-          - name: Inductor scheduler
-            config: inductor-test_inductor_scheduler.yaml
+          # All xfail tests. Will result in zero tests collected in "no xfail" mode.
+          # Retaining the yaml for future use as new spyre capabilities are added.
+          # - name: Inductor scheduler
+          #   config: inductor-test_inductor_scheduler.yaml
           - name: Inductor mkldnn pattern matcher
             config: inductor-test_mkldnn_pattern_matcher.yaml
           - name: Inductor move constructor to gpu
