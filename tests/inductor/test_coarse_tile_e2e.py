@@ -67,6 +67,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     def setUp(self):
         super().setUp()
         torch.manual_seed(0xAFFE)
+        _pnd.reset()
 
     # ------------------------------------------------------------------
     # Baseline: no hints -> no tiling
