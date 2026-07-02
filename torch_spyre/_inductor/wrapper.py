@@ -25,6 +25,7 @@ from torch._inductor.utils import ValueWithLineMap
 from torch._inductor.virtualized import V
 from torch._inductor.sizevars import SizeVarAllocator
 
+from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .constants import SEGMENT_SIZE
 
@@ -168,10 +169,11 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         offset_increment = new_offset - old_offset
         # Static-shape paths only: a symbolic offset would render a bare
         # sympy expression into the generated source below.
-        assert not getattr(offset_increment, "free_symbols", None), (
-            f"symbolic storage_offset not supported in buffer-reuse codegen: "
-            f"{offset_increment!r}"
-        )
+        if getattr(offset_increment, "free_symbols", None):
+            raise Unsupported(
+                f"symbolic storage_offset not supported in buffer-reuse codegen: "
+                f"{offset_increment!r}"
+            )
         reinterpret_view = f"reinterpret_tensor_with_layout({old_name}, {new.get_size()}, {new.get_stride()}, {offset_increment}, {new_stl!r})"
         return f"{self.declare}{new_name} = {reinterpret_view}{del_line}  {self.comment} reuse"
 

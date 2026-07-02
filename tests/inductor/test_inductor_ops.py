@@ -4205,8 +4205,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     lambda t: t.transpose(0, 1)[1:, :, :],
                     cached_randn((5, 3, 128), differentiation="ph_3d_t01_sliced"),
                 ),
-                # Non-stick dim offset whose base row length (100) isn't a
-                # multiple of elem_in_stick (64).
+            },
+        },
+        # Non-stick dim offset whose base row length (100) isn't a multiple
+        # of elem_in_stick (64). Flat offset 100 decomposes to a device
+        # stick coordinate of Mod(i1,64)+36 -- genuinely not stick-aligned,
+        # since the device layout pads each row's tail to a partial stick
+        # rather than the row itself landing on a stick boundary. Needs
+        # padding-aware device-coordinate construction (#1756) to support;
+        # confirmed via repro_ani300_all_shapes.py against every other shape
+        # in the group above, which all remain unaffected. Dedicated test
+        # (not folded into the ops_dict cross-product above) so the exact
+        # rejection reason can be pinned, matching
+        # test_storage_offset_placeholder_stick_dim_rejected below.
+        (
+            "test_storage_offset_placeholder_nonstick_row",
+            "test_storage_offset_placeholder_nonstick_row_rejected",
+        ): {
+            "param_sets": {
                 "2d_offset_dim0_nonstick_multiple": (
                     lambda t: t[1:, :],
                     cached_randn((4, 100), differentiation="ph_2d_offset0_nonstick"),
@@ -4627,6 +4643,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         dev_view = slicer(base.clone().to("spyre"))
 
         with pytest.raises(Exception, match="Unsupported"):
+            _compile_and_run(fn, [dev_view], "spyre", compile=True)
+
+    def test_storage_offset_placeholder_nonstick_row_rejected(self, slicer, base):
+        # Non-stick dim offset whose base row length isn't a multiple of
+        # elem_in_stick: padding-aware device-coordinate construction not
+        # yet implemented (#1756), so compile must raise rather than
+        # silently miscompute. No eager arm: compile=False skips the
+        # Inductor pass entirely, so it can't exercise this check.
+        def fn(x):
+            return x + x
+
+        dev_view = slicer(base.clone().to("spyre"))
+
+        with pytest.raises(
+            Exception, match="non-stick-aligned device stick coordinate"
+        ):
             _compile_and_run(fn, [dev_view], "spyre", compile=True)
 
     def test_storage_offset_placeholder_vs_internal_equivalence(self):

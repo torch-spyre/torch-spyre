@@ -70,7 +70,7 @@ from .pass_utils import (
     iter_var_id,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
-from .views import matching_dim
+from .views import compute_coordinates, matching_dim
 
 # ---------------------------------------------------------------------------
 # TODO(issue#1371): once SpyreTensorLayout is migrated to c10::SymInt, all
@@ -1011,7 +1011,7 @@ def _eager_view_input_layout(
     #   --------------|------------|--------|-------------------------------
     #   x[1:]         | y          | y      | size/stride <- base; offset
     #   x[:6]         | y          | n      | size/stride <- base
-    #   x[1:].t()     | n          | y      | keep view size/stride; offset
+    #   x.t()[1:]     | n          | y      | keep view size/stride; offset
     #   x.t()         | n          | n      | no rewrite
     #
     # Sub-region requires stride preserved AND size differs. A pure
@@ -1026,27 +1026,6 @@ def _eager_view_input_layout(
     if not (is_sub_region or storage_offset != 0):
         return None
 
-    elem_in_stick = get_elem_in_stick(ptl.dtype)
-    # storage_offset is a flat host offset, not a device stick coordinate.
-    # A placeholder's default device layout treats base's last dim as the
-    # stick dim and pads each "row" to a whole number of sticks, so any
-    # offset landing on a row boundary (a multiple of base's last-dim size)
-    # is always device-stick-aligned, regardless of whether the row length
-    # itself is a multiple of elem_in_stick. Only the remainder within a
-    # row -- the offset actually landing partway into the stick dim --
-    # needs to be checked against elem_in_stick.
-    # TODO: unaligned stick-dim offsets need alt-layout retargeting;
-    # currently rejected to avoid silent miscompute downstream.
-    last_dim_size = concretize_expr(base.size(-1))
-    stick_local_offset = storage_offset % last_dim_size
-    if stick_local_offset % elem_in_stick != 0:
-        raise Unsupported(
-            f"graph input {name} has stick-dim unaligned "
-            f"storage_offset={storage_offset} (offset {stick_local_offset} "
-            f"within the stick dim is not a multiple of {elem_in_stick}); "
-            f"not yet supported"
-        )
-
     if is_sub_region:
         # Offset (via make_indexer) + dep.ranges recover the view extent.
         new_size = list(base.size())
@@ -1055,6 +1034,32 @@ def _eager_view_input_layout(
         # Keep the view's permuted size/stride, just attach the offset.
         new_size = list(real_input.size())
         new_stride = list(real_input.stride())
+
+    # Verify the offset is device-stick-aligned by computing the real
+    # device stick coordinate for a full read of this view, via the same
+    # device_coordinates()/is_stick_expr_offset_free() machinery
+    # compute_layouts() uses everywhere else (see _check_supported_input_sticks,
+    # _single_arg_op_layout). A flat host-offset heuristic can't see per-row
+    # stick padding -- a row boundary can be device-stick-aligned even when
+    # the row length itself isn't a multiple of elem_in_stick -- so the check
+    # has to happen in device space, not host space.
+    # TODO: unaligned stick-dim offsets need alt-layout retargeting;
+    # currently rejected to avoid silent miscompute downstream.
+    stl = real_input.device_tensor_layout()
+    elem_in_stick = get_elem_in_stick(ptl.dtype)
+    rank = len(real_input.shape)
+    ivars = sympy.symbols(f"_offset_check_i0:{rank}", integer=True, nonnegative=True)
+    var_ranges = {v: s for v, s in zip(ivars, real_input.shape)}
+    flat_index = storage_offset + sum(new_stride[d] * ivars[d] for d in range(rank))
+    stick_expr = compute_coordinates(
+        list(stl.device_size), list(stl.stride_map), var_ranges, flat_index
+    )[-1]
+    if not is_stick_expr_offset_free(stick_expr, elem_in_stick):
+        raise Unsupported(
+            f"graph input {name} has a non-stick-aligned device stick "
+            f"coordinate ({stick_expr}) at storage_offset={storage_offset}; "
+            f"not yet supported"
+        )
 
     return FixedLayout(
         device=ptl.device,
