@@ -120,9 +120,9 @@ features.
 
 ---
 
-## launch\_kernel Runtime Failure
+## launch\_jobplan Runtime Failure
 
-**Error:** Errors from `_C.launch_kernel()` or segfaults during execution
+**Error:** Errors from `_C.launch_jobplan()` or segfaults during execution
 
 **Cause:** The compiled binary is valid but runtime state is incorrect
 (wrong tensor sizes, misaligned memory, missing constants).

@@ -65,7 +65,6 @@ from torch_spyre._inductor.span_overflow_hint_analysis import (
 import torch_spyre._inductor.propagate_named_dims as _pnd
 
 
-_LAUNCH_KERNEL = "torch_spyre.execution.kernel_runner.launch_kernel"
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
 
@@ -578,7 +577,6 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
 
         cfn = torch.compile(fn, dynamic=False)
         with (
-            patch(_LAUNCH_KERNEL),
             patch(_LAUNCH_JOBPLAN),
             patch(_PREPARE_KERNEL),
             patch("subprocess.run"),
@@ -622,7 +620,6 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         _pnd.name_tensor_dims(y, ["SO_B", "SO_H", "SO_L", "SO_D"])
 
         with (
-            patch(_LAUNCH_KERNEL),
             patch(_LAUNCH_JOBPLAN),
             patch(_PREPARE_KERNEL),
             patch("subprocess.run"),

@@ -36,32 +36,6 @@ namespace spyre {
 class JobPlan;
 
 class SpyreStream;
-struct KernelArtifacts {
-  std::vector<uint8_t> init_bin;  // Program binary from init.txt
-  c10::DataPtr device_alloc;
-  uint64_t program_size;  // (bytes)
-
-  std::string bundle_mlir_path;  // Path to bundle.mlir
-};
-
-std::ostream& operator<<(std::ostream& os, const KernelArtifacts& k);
-
-/**
- * @brief Read hex-encoded init.txt file (production-tested approach)
- *
- * Based on deeptools/dip/dip.cpp:runReverseDip() but ~10x faster
- * Each line: 256 hex chars = 128 bytes
- */
-std::vector<uint8_t> readHexEncodedFile(const std::string& filepath);
-
-std::string get_init_path(const std::string& code_dir);
-
-std::string get_pagi_path(const std::string& code_dir);
-
-KernelArtifacts& getOrLoadArtifacts(const std::string& code_dir,
-                                    const SpyreStream& stream);
-void launchKernel(const std::string& code_dir,
-                  const std::vector<at::Tensor>& args);
 
 // Launch a JobPlan on an explicit stream. The whole plan is submitted to this
 // single stream, preserving cross-step ordering.
@@ -73,7 +47,5 @@ void launchJobPlan(const JobPlan& job_plan, const std::vector<at::Tensor>& args,
 // explicitly into the launch path.
 void launchJobPlan(const JobPlan& job_plan,
                    const std::vector<at::Tensor>& args);
-
-void clearArtifactCache();
 
 }  // namespace spyre
