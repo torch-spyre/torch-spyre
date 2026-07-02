@@ -241,6 +241,10 @@ jobs:
             config: distributed_tests/test_barrier.yaml
           - name: Test Multi-Spyre Broadcast
             config: distributed_tests/test_broadcast.yaml
+          - name: Test Multi-Spyre Gather
+            config: distributed_tests/test_gather.yaml
+          - name: Test Multi-Spyre Allgather
+            config: distributed_tests/test_allgather.yaml
 
     steps:
       - name: Checkout composite actions

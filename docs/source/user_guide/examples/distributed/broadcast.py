@@ -19,18 +19,40 @@ DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
 C10D_BACKEND = "spyreccl"
 
 
-def run_test(expected_tensor, comm_rank, comm_size):
-    """Run a broadcast test with the given expected tensor."""
+def run_test(shape, comm_rank, comm_size):
+    """Run a broadcast test with the given tensor shape.
+
+    Args:
+        shape: Either an integer (for 1D tensor) or tuple (for multi-dimensional tensor)
+        comm_rank: Rank of the current process
+        comm_size: Total number of processes
+    """
     global DEVICE
-    if 0 != comm_rank:
-        x = torch.ones_like(expected_tensor)
+
+    # Determine total number of elements
+    if isinstance(shape, int):
+        num_elements = shape
+        tensor_shape = (shape,)
     else:
-        x = expected_tensor
+        num_elements = 1
+        for dim in shape:
+            num_elements *= dim
+        tensor_shape = shape
+
+    # Root rank creates contiguous range [0..num_elements-1]
+    # Non-root ranks create zeros (will be overwritten by broadcast)
+    if comm_rank == 0:
+        x = torch.arange(0, num_elements, dtype=torch.float16).reshape(tensor_shape)
+    else:
+        x = torch.zeros(tensor_shape, dtype=torch.float16)
 
     # Send input tensor to Spyre device
     print("-" * 70)
     print(f"[{comm_rank} of {comm_size}] Tensor Input: {x.shape}")
-    print(f"[{comm_rank} of {comm_size}] {x[:10]}")
+    if x.dim() == 1:
+        print(f"[{comm_rank} of {comm_size}] {x[:10]}")
+    else:
+        print(f"[{comm_rank} of {comm_size}] {x.flatten()[:10]}")
     x_device = x.to(DEVICE)
 
     # Broadcast with the collective library
@@ -39,15 +61,23 @@ def run_test(expected_tensor, comm_rank, comm_size):
 
     result = x_device.to("cpu")
     print(f"[{comm_rank} of {comm_size}] Tensor after collective")
-    print(f"[{comm_rank} of {comm_size}] {result[:10]}")
+    if result.dim() == 1:
+        print(f"[{comm_rank} of {comm_size}] {result[:10]} .. {result[-10:]}")
+    else:
+        print(
+            f"[{comm_rank} of {comm_size}] {result.flatten()[:10]} .. {result.flatten()[-10:]}"
+        )
 
-    # Check the result
+    # Check the result - should match root's original tensor
+    expected_tensor = torch.arange(0, num_elements, dtype=torch.float16).reshape(
+        tensor_shape
+    )
     if torch.allclose(result, expected_tensor):
         print(f"[{comm_rank} of {comm_size}] Tensor is correct")
     else:
         raise RuntimeError(
             f"[{comm_rank} of {comm_size}] Tensor is incorrect: "
-            f"expected {expected_tensor[:10]} but got {result[:10]}"
+            f"expected {expected_tensor.flatten()[:10]} but got {result.flatten()[:10]}"
         )
 
 
@@ -68,12 +98,8 @@ if __name__ == "__main__":
     comm_size = dist.get_world_size()
     comm_rank = dist.get_rank()
 
-    exp_result = torch.zeros(128, dtype=torch.float16)
-    exp_result.fill_(2.0)
-    run_test(exp_result, comm_rank, comm_size)
-
-    exp_result2 = torch.zeros(512, 1024, dtype=torch.float16)
-    exp_result2.fill_(4.0)
-    run_test(exp_result2, comm_rank, comm_size)
+    run_test(128, comm_rank, comm_size)
 
     dist.destroy_process_group()
+
+# Made with Bob
