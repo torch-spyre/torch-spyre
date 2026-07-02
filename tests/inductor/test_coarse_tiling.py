@@ -1388,8 +1388,9 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
 
     def test_tiled_tensor_base_address_registered(self):
         s = Symbol("s")
-        start = 0x2000
-        sdsc_spec = _make_sdsc_spec(s, start_address=start)
+        # On the symbolic path start_address is set to arg_index (0) as a sentinel.
+        # The raw base stored in symbols[] is the sentinel, not a real HBM address.
+        sdsc_spec = _make_sdsc_spec(s, start_address=0)
         symbols: list[int] = []
         generate_sdsc(
             0,
@@ -1400,7 +1401,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             use_symbols=True,
         )
         self.assertEqual(len(symbols), 1)
-        self.assertEqual(symbols[0], start)
+        self.assertEqual(symbols[0], 0)  # kernel sentinel = arg_index = 0
 
     def test_tiled_tensor_json_stores_symbol_id(self):
         s = Symbol("s")
@@ -1473,6 +1474,9 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
     def test_multi_core_tiled_per_core_symbols(self):
         s = Symbol("s")
         core_id = Symbol("core_id")
+        # On the symbolic path start_address = arg_index (0) as a sentinel; the
+        # loop unroller advances it by tile_offset_bytes for later tiles.  For tile 0
+        # start_address == arg_index == 0.
         tensor = SDSCArgs(
             layout="A",
             dim_order=[s],
@@ -1481,8 +1485,8 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             strides={s: 128},
             offsets={s: 0},
             max_dim_sizes={s: -1},
-            allocation={"hbm": 0x1000},
-            start_address=0x1000,
+            allocation={"hbm": 0},
+            start_address=0,
             backGap={},
             arg_index=0,
         )
@@ -1511,8 +1515,10 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             use_symbols=True,
         )
         self.assertEqual(len(symbols), 2)
-        self.assertEqual(symbols[0], 0x1000)
-        self.assertEqual(symbols[1], 0x1000 + 128)
+        self.assertEqual(symbols[0], 0)  # kernel sentinel = arg_index = 0
+        self.assertEqual(
+            symbols[1], 0 + 128
+        )  # core-1 derived = sentinel + per-core stride
         # affine_strides[0] = [{s: stride}] (one level, one tensor)
         self.assertIn(s, affine_strides[0][0])
 
@@ -3367,6 +3373,7 @@ class TestSymbolKind(unittest.TestCase):
 
         # Mirror the existing TestGenerateSdscTiledSymbols multi-core test but
         # with arg_index=0 to exercise the kernel/kernel_derived kind path.
+        # Use sym-path sentinel convention: start_address = arg_index = 0 for tile 0.
         tensor = SDSCArgs(
             layout="A",
             dim_order=[s],
@@ -3375,8 +3382,8 @@ class TestSymbolKind(unittest.TestCase):
             strides={s: 128},
             offsets={s: 0},
             max_dim_sizes={s: -1},
-            allocation={"hbm": 0x1000},
-            start_address=0x1000,
+            allocation={"hbm": 0},
+            start_address=0,
             backGap={},
             arg_index=0,  # kernel arg → kinds should be kernel + kernel_derived
         )
