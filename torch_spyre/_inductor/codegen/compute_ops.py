@@ -554,9 +554,7 @@ def generate_sdsc(
                 # unroller.  We always register the raw kernel symbol keyed by arg_index so
                 # that bundle.py emits exactly one !sdscbundle.input_arg parameter per logical
                 # tensor, regardless of how many tiles reference it.
-                raw_base = (
-                    tensor.arg_index
-                )  # raw sentinel; large HBM addr on nosym path
+                raw_base = tensor.arg_index  # sentinel value for this arg
                 offset_as_symbol(
                     raw_base, SymbolKind.kernel(arg_index=tensor.arg_index)
                 )
@@ -566,15 +564,9 @@ def generate_sdsc(
                 # registered already by an earlier tensor in this SDSC, in which case
                 # the offset_as_symbol call above was a no-op.
                 kernel_sym_idx = abs(local_symbols[("kernel", tensor.arg_index)]) - 1
-                # tile_offset_bytes: on the symbolic path the loop unroller advances
-                # arg.allocation['hbm'] by i*stride for tile i, so start_address encodes
-                # arg_index + tile_offset.  On the nosym path start_address is the real
-                # HBM address and arg_index is a small integer — we skip this calculation
-                # by only accounting for the difference when it is non-negative and less
-                # than the start address (i.e. start_address ≥ arg_index always holds on
-                # both paths, but on nosym the difference would be the full HBM address).
-                # We detect the sym path via start_address == arg_index + non_negative_offset
-                # where the full difference is the tile_offset_bytes (could be 0 for tile 0).
+                # tile_offset_bytes: the loop unroller advances arg.allocation['hbm']
+                # by i*stride for tile i, so start_address = arg_index + tile_offset.
+                # tile_offset_bytes == 0 for tile 0, positive for later tiles.
                 tile_offset_bytes = tensor.start_address - tensor.arg_index
                 # total_slice_offset: combine the loop-unroll tile offset with any
                 # device-coordinate compile-time slice offset (e.g. from z0+3 expressions).

@@ -1516,9 +1516,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
         )
         self.assertEqual(len(symbols), 2)
         self.assertEqual(symbols[0], 0)  # kernel sentinel = arg_index = 0
-        self.assertEqual(
-            symbols[1], 0 + 128
-        )  # core-1 derived = sentinel + per-core stride
+        self.assertEqual(symbols[1], 128)  # core-1 derived = sentinel + per-core stride
         # affine_strides[0] = [{s: stride}] (one level, one tensor)
         self.assertIn(s, affine_strides[0][0])
 
