@@ -925,12 +925,23 @@ class SpyreKernel(Kernel[CSEVariable]):
         buf.writeline("]")
         return buf.getvalue()
 
+    def _kernel_uses_pool(self) -> bool:
+        """Return True if any op in this kernel references a pool-allocated tensor."""
+        from torch_spyre._inductor.op_spec import TensorArg
+
+        return any(
+            "pool" in arg.allocation
+            for op in _iter_op_specs(self.op_specs)
+            for arg in op.args
+            if isinstance(arg, TensorArg)
+        )
+
     def call_kernel(self, name: str, node=None):
         """Codegen a call to this kernel"""
         wrapper = V.graph.wrapper_code
         call_args = []
 
-        if getattr(V.graph, "pool_size", 0) > 0:
+        if self._kernel_uses_pool():
             call_args.append("_pool")
 
         # Add remaining kernel arguments, deduplicating tensors that appear as
