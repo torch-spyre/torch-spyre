@@ -724,14 +724,18 @@ def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
         # The iteration space of a Pointwise is that of its output
         return next(iter(n.read_writes.writes)).ranges.copy()
     elif isinstance(n.node.data, Reduction):
-        # Output dims from the write dep; reduction dims appended from read deps.
+        # Output dims from the write dep; reduction dims appended from the single
+        # read dep. Assert single-input: multi-input Reductions would introduce
+        # duplicate symbols and produce a spurious iteration dimension.
         result = next(iter(n.read_writes.writes)).ranges.copy()
-        for dep in n.read_writes.reads:
-            if isinstance(dep, StarDep):
-                continue
-            for sym, size in dep.ranges.items():
-                if sym not in result:
-                    result[sym] = size
+        real_reads = [d for d in n.read_writes.reads if not isinstance(d, StarDep)]
+        assert len(real_reads) == 1, (
+            f"iteration_space assumes single-input Reduction, "
+            f"got {len(real_reads)} read deps"
+        )
+        for sym, size in real_reads[0].ranges.items():
+            if sym not in result:
+                result[sym] = size
         return result
     else:
         raise Unsupported("Unexpected node type")
@@ -744,14 +748,18 @@ def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr
     if isinstance(op.data, Pointwise):
         return next(iter(rw.writes)).ranges.copy()
     elif isinstance(op.data, Reduction):
-        # Output dims from write dep; reduction dims appended from read deps.
+        # Output dims from write dep; reduction dims appended from the single
+        # read dep. Assert single-input: multi-input Reductions would introduce
+        # duplicate symbols and produce a spurious iteration dimension.
         result = next(iter(rw.writes)).ranges.copy()
-        for dep in rw.reads:
-            if isinstance(dep, StarDep):
-                continue
-            for sym, size in dep.ranges.items():
-                if sym not in result:
-                    result[sym] = size
+        real_reads = [d for d in rw.reads if not isinstance(d, StarDep)]
+        assert len(real_reads) == 1, (
+            f"iteration_space_from_op assumes single-input Reduction, "
+            f"got {len(real_reads)} read deps"
+        )
+        for sym, size in real_reads[0].ranges.items():
+            if sym not in result:
+                result[sym] = size
         return result
     else:
         raise Unsupported("Unexpected node type")
