@@ -560,7 +560,7 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
 
     The prescribed-allocation tests encode the *desired* plan, which is the one
     StrategyB produces. These plans are brittle and are not unique but are
-    plans which achieve desirable performance. New plans should be profiled 
+    plans which achieve desirable performance. New plans should be profiled
     before making these test more permissive.
 
     It extends :class:`BaseTestScratchpadUsage` for the shared helpers
