@@ -713,6 +713,7 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
                 "buf8": ("LX", 131072, (((64, 32),), ())),
                 "buf9": ("HBM", 131072, (((256, 32),), ())),
                 "buf10": ("HBM", 128, ((), ())),
+                # buf11 is eliminated in dedup_and_promote_constants
                 "buf12": ("HBM", 131072, (((64, 4), (16384, 4)), ())),
             },
         )
