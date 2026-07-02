@@ -33,15 +33,18 @@ logger = get_inductor_logger("sdsc_compile")
 # Types
 # ---------------------------------------------------------------------------
 
-# Compiled SDSC entry: (json_dict, base_symbol_values, affine_strides, symbol_kinds)
-#   base_symbol_values: list[int] of base HBM byte offsets for this SDSC,
-#                       one per registered symbol ID
-#   affine_strides:     list[list[dict]] — per tensor, per loop-nesting level
-#                       (outermost first).  Each inner dict maps
-#                       tiled_sym -> stride_bytes for that level's symbols.
-#                       [{} for _ in tiled_symbols] for non-tiled / lx tensors
-#                       (one empty dict per level, preserving the level count).
-#   symbol_kinds:       list[SymbolKind] parallel to base_symbol_values
+# Compiled SDSC entry: (json_dict, symbol_values, affine_strides, symbol_kinds)
+#   symbol_values:  list[int] of registered symbol values for this SDSC,
+#                   one per symbol ID.  Values are HBM byte addresses for
+#                   derived/pool symbols; arg_index sentinels for kernel
+#                   symbols on the symbolic-args path.  Only len() is used
+#                   by bundle.py; individual values are resolved via symbols[].
+#   affine_strides: list[list[dict]] — per tensor, per loop-nesting level
+#                   (outermost first).  Each inner dict maps
+#                   tiled_sym -> stride_bytes for that level's symbols.
+#                   [{} for _ in tiled_symbols] for non-tiled / lx tensors
+#                   (one empty dict per level, preserving the level count).
+#   symbol_kinds:   list[SymbolKind] parallel to symbol_values
 _CompiledEntry = tuple[Any, list[int], list[list[dict]], list[SymbolKind]]
 
 
@@ -80,7 +83,7 @@ def generate_bundle(
     and produce ``scf.for`` loops in the generated ``bundle.mlir``.
 
     ``symbolic_args`` controls the function signature of ``@sdsc_bundle``.
-    When ``False`` (default), ``sdsc_execute`` has no operands.
+    When ``False`` (non-default override), ``sdsc_execute`` has no operands.
     When ``True``, addresses are emitted as ``!sdscbundle.input_arg<index>``
     parameters; this also forces ``use_symbols=True`` implicitly.  When
     ``None``, the value is read from ``config.bundle_symbolic_args``.

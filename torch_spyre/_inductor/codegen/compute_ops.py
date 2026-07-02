@@ -676,23 +676,24 @@ def generate_sdsc(
                 }
             nb = num_bytes(tensor.data_format)
             is_pool_tensor = tensor.arg_index < 0 and "pool" in tensor.allocation
-            # Hoist per-tensor compile-time offset computation so it is not
+            # Hoist kernel-tensor compile-time offsets so they are not
             # duplicated across the c==0 and c>0 branches.
-            slice_offset_bytes = sum(tensor.offsets.values()) * nb
-            tile_offset_bytes = tensor.start_address - tensor.arg_index
-            total_slice_offset = tile_offset_bytes + slice_offset_bytes
-            c0_slice_key: tuple | int = (
-                ("kernel_slice", tensor.arg_index, total_slice_offset)
-                if total_slice_offset > 0
-                else ("kernel", tensor.arg_index)
-            )
-            core0_addr_lookup = (
-                tensor.start_address
-                + core_idx_to_slice_offset(
-                    tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
+            if not is_pool_tensor:
+                slice_offset_bytes = sum(tensor.offsets.values()) * nb
+                tile_offset_bytes = tensor.start_address - tensor.arg_index
+                total_slice_offset = tile_offset_bytes + slice_offset_bytes
+                c0_slice_key: tuple | int = (
+                    ("kernel_slice", tensor.arg_index, total_slice_offset)
+                    if total_slice_offset > 0
+                    else ("kernel", tensor.arg_index)
                 )
-                * nb
-            )
+                core0_addr_lookup = (
+                    tensor.start_address
+                    + core_idx_to_slice_offset(
+                        tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
+                    )
+                    * nb
+                )
             result = {}
             for c in range(sdsc_spec.num_cores):
                 addr = (

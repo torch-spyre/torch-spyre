@@ -3287,6 +3287,10 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         self.assertEqual(
             mlir.count("!sdscbundle.input_arg<index>"), 2
         )  # param + extract
+        # Both sdsc_execute ops reference the canonical extracted name %arg_0
+        execute_lines = [ln for ln in mlir.splitlines() if "sdsc_execute" in ln]
+        self.assertEqual(execute_lines[0].split("(")[1].split(")")[0], "%arg_0")
+        self.assertEqual(execute_lines[1].split("(")[1].split(")")[0], "%arg_0")
 
     def test_pool_offset_constants_deduped(self):
         """Pool symbols with the same offset share one arith.addi SSA variable."""
