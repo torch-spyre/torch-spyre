@@ -172,13 +172,19 @@ def _candidate_output_stls(
     c_size: list,
     c_stride: list,
     stick_size: int,
+    skip_stick_expr: sympy.Expr,
 ) -> list[SpyreTensorLayout]:
-    """Enumerate candidate output STLs by trying each non-last dim as the stick.
+    """Enumerate candidate output STLs by trying each dim as the stick.
 
-    Skips any candidate whose resulting device stick expression has an offset.
+    Skip the dim that already produces an unsupported stick.
     """
+    out_coords = host_coordinates(output, output_dep, None)
+    skip_dim = _pick_stick_dim(skip_stick_expr, out_coords)
+
     result = []
-    for alt_stick_dim in range(len(output.size) - 1):
+    for alt_stick_dim in range(len(output.size)):
+        if alt_stick_dim == skip_dim:
+            continue
         if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
             # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
             continue
@@ -354,7 +360,9 @@ def _single_arg_op_layout(
     )
     if out_stl is not None:
         return [out_stl]
-    return _candidate_output_stls(output, output_dep, c_size, c_stride, stick_size)
+    return _candidate_output_stls(
+        output, output_dep, c_size, c_stride, stick_size, stick_expr
+    )
 
 
 def _clone_layout(
@@ -409,7 +417,7 @@ def _clone_layout(
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     required_in_stl = None
     for candidate in _candidate_output_stls(
-        output, output_dep, c_size, c_stride, stick_size
+        output, output_dep, c_size, c_stride, stick_size, stick_expr
     ):
         target_stick = device_coordinates(candidate, output_dep, None)[-1]
         target_stl = compute_restickify_target_layout(
@@ -897,6 +905,34 @@ def _target_device_layout(target, name: str):
     return next(iter(layouts))
 
 
+def _find_alt_target_stl(
+    target_layout: FixedLayout,
+    target_stl: SpyreTensorLayout,
+    output_dep: MemoryDep,
+) -> SpyreTensorLayout | None:
+    """
+    Find an alternative SpyreTensorLayout with an offset-free stick expression
+    for a mutation target. Returns None if the current layout is already valid,
+    or raises Unsupported if no valid alternative exists.
+    """
+    stick_size = get_elem_in_stick(target_layout.dtype)
+    write_stick = device_coordinates(target_stl, output_dep, None)[-1]
+    if is_stick_expr_offset_free(write_stick, stick_size):
+        return None
+
+    c_size = [concretize_expr(s) for s in target_layout.size]
+    c_stride = [concretize_expr(s) for s in target_layout.stride]
+    candidates = _candidate_output_stls(
+        target_layout, output_dep, c_size, c_stride, stick_size, write_stick
+    )
+    if not candidates:
+        raise Unsupported(
+            f"no offset-free alternative stick dim for mutation target "
+            f"(write stick {write_stick!r}, size={target_layout.size})"
+        )
+    return candidates[0]
+
+
 def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
     """Commit safe lowering-marked copy-back candidates.
 
@@ -1017,6 +1053,10 @@ def propagate_spyre_tensor_layouts(
                     raise Unsupported(f"graph input {name} does not have a FixedLayout")
                 tb.layouts = [stl]
 
+    # Alt layout each graph input has been forced to by a mutation write, so a
+    # second write can detect a conflicting alt.
+    forced_mutation_alts: dict[str, SpyreTensorLayout] = {}
+
     # Operations are in topological order (guaranteed by GraphLowering).
     # Visit them and use the input SpyreTensorLayouts and the operation being
     # performed to compute the set of possible output SpyreTensorLayouts.
@@ -1029,15 +1069,41 @@ def propagate_spyre_tensor_layouts(
                 target = op.layout.target
                 while isinstance(target, ReinterpretView):
                     target = target.data
-                target_stl = _target_device_layout(
-                    target,
-                    target.get_name() if hasattr(target, "get_name") else "",
-                )
+                target_name = target.get_name() if hasattr(target, "get_name") else ""
+                target_stl = _target_device_layout(target, target_name)
                 if target_stl is None:
                     continue
                 rw = op.get_read_writes()
                 output_dep = next(iter(rw.writes))
                 args = _get_prop_args(rw.reads)
+
+                # Find an alternative layout if the write has an unsupported stick
+                # expression (e.g. offset like v+32). Force the optimizer to use
+                # this layout for the mutation target.
+                target_layout = target.get_layout()
+                if isinstance(target_layout, FixedLayout):
+                    alt_stl = _find_alt_target_stl(
+                        target_layout, target_stl, output_dep
+                    )
+                    if alt_stl is not None:
+                        graph_input = V.graph.graph_inputs.get(target_name)
+                        assert graph_input is not None
+                        # A graph input holds only one device layout, so two
+                        # writes needing different alts cannot both be expressed.
+                        # TODO: support this by chaining relayouts between writes
+                        # through temp buffers.
+                        prior_alt = forced_mutation_alts.get(target_name)
+                        if prior_alt is not None and prior_alt != alt_stl:
+                            raise Unsupported(
+                                f"multiple mutations to graph input {target_name} "
+                                f"require conflicting alternative layouts "
+                                f"({prior_alt!r} vs {alt_stl!r}); chaining "
+                                f"relayouts between writes is not yet supported"
+                            )
+                        forced_mutation_alts[target_name] = alt_stl
+                        graph_input.layouts = [alt_stl]
+                        op._restickify_plan = (target_name, target_stl, alt_stl)
+                        target_stl = alt_stl
                 op.layouts = [target_stl]
                 op.restick_cost_fn = AllSameNode.from_args(
                     args, [target_stl], output_dep, op
