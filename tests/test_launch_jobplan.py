@@ -53,18 +53,27 @@ def _run_compiled_op(op_name: str, symbolic_args: bool) -> None:
 
     cpu_result = op_fn(*inputs)
 
-    old_val = os.environ.get("DUMP_SPYRE_CODE")
+    old_dump = os.environ.get("DUMP_SPYRE_CODE")
+    old_sym = os.environ.get("BUNDLE_SYMBOLIC_ARGS")
     try:
         os.environ["DUMP_SPYRE_CODE"] = "1"
+        # Keep the C++ prepare_kernel env var in sync with the Python config
+        # patch: prepare_kernel reads BUNDLE_SYMBOLIC_ARGS directly from the
+        # process environment, so patching only the Python config is insufficient.
+        os.environ["BUNDLE_SYMBOLIC_ARGS"] = "1" if symbolic_args else "0"
         with _spyre_config.patch(bundle_symbolic_args=symbolic_args):  # type: ignore[attr-defined]
             compiled_fn = torch.compile(op_fn, backend="inductor")
             spyre_inputs = tuple(inp.to("spyre") for inp in inputs)
             spyre_result = compiled_fn(*spyre_inputs).cpu()
     finally:
-        if old_val is None:
+        if old_dump is None:
             os.environ.pop("DUMP_SPYRE_CODE", None)
         else:
-            os.environ["DUMP_SPYRE_CODE"] = old_val
+            os.environ["DUMP_SPYRE_CODE"] = old_dump
+        if old_sym is None:
+            os.environ.pop("BUNDLE_SYMBOLIC_ARGS", None)
+        else:
+            os.environ["BUNDLE_SYMBOLIC_ARGS"] = old_sym
 
     torch.testing.assert_close(
         spyre_result, cpu_result, atol=0.1, rtol=0.1, equal_nan=True
@@ -72,22 +81,28 @@ def _run_compiled_op(op_name: str, symbolic_args: bool) -> None:
 
 
 class TestLaunchJobPlan(TestCase):
-    """Test suite for JobPlan-backed compiled op execution."""
+    """Test suite for JobPlan-backed compiled op execution.
+
+    Each op is exercised twice: once with symbolic_args=True (the default since
+    BUNDLE_SYMBOLIC_ARGS=1 was made the process default) and once with
+    symbolic_args=False (the non-default override path, retained as a regression
+    guard for users who explicitly disable symbolic args).
+    """
 
     def test_abs_matches_cpu_no_symbols(self):
-        """Run compiled abs op without symbolic args and compare to CPU."""
+        """abs with symbolic_args=False (non-default override path)."""
         _run_compiled_op("abs", symbolic_args=False)
 
     def test_abs_matches_cpu_with_symbols(self):
-        """Run compiled abs op with symbolic args and compare to CPU."""
+        """abs with symbolic_args=True (default path)."""
         _run_compiled_op("abs", symbolic_args=True)
 
     def test_mul_matches_cpu_no_symbols(self):
-        """Run compiled mul op without symbolic args and compare to CPU."""
+        """mul with symbolic_args=False (non-default override path)."""
         _run_compiled_op("mul", symbolic_args=False)
 
     def test_mul_matches_cpu_with_symbols(self):
-        """Run compiled mul op with symbolic args and compare to CPU."""
+        """mul with symbolic_args=True (default path)."""
         _run_compiled_op("mul", symbolic_args=True)
 
 
