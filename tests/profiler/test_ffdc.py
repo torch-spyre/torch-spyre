@@ -16,6 +16,13 @@ import json
 import tempfile
 from pathlib import Path
 
+import pytest
+import torch
+import torch_spyre  # noqa: F401
+
+from torch_spyre import make_spyre_module  # type: ignore[attr-defined]
+from torch_spyre.constants import DEVICE_NAME
+from torch_spyre.profiler import get_diagnostic_report as profiler_get_diagnostic_report
 from torch_spyre.profiler._ffdc import (
     CATEGORY_COMPILE,
     CATEGORY_RUNTIME_LAUNCH,
@@ -27,6 +34,13 @@ from torch_spyre.profiler._ffdc import (
     collect,
     get_diagnostic_report,
 )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def register_torch_spyre_public_api():
+    if not hasattr(torch, "spyre"):
+        torch.utils.rename_privateuse1_backend(DEVICE_NAME)
+        torch._register_device_module(DEVICE_NAME, make_spyre_module())
 
 
 class TestFfdcCollect:
@@ -137,6 +151,25 @@ class TestFfdcCollect:
         assert fname.startswith("ffdc_compile_")
         assert ".json" in fname
 
+    def test_collect_filename_parses_for_timestamp_sort_key(self):
+        try:
+            raise ValueError("x")
+        except ValueError as exc:
+            with tempfile.TemporaryDirectory() as tmp:
+                report = collect(
+                    exc, failure_category=CATEGORY_RUNTIME_LAUNCH, output_dir=tmp
+                )
+                path = Path(report["_report_path"])
+
+        parts = path.stem.rsplit("_", 3)
+        assert len(parts) == 4
+        assert parts[0] == "ffdc_runtime_launch"
+        assert parts[1].startswith("20") and "T" in parts[1]
+        assert parts[2].isdigit()
+        assert parts[3].isdigit()
+        sort_key = f"{parts[1]}_{parts[2]}"
+        assert len(sort_key) > 0
+
     def test_completeness_pct_reflects_missing_fields(self):
         # Without an exception, failure.exception_type and failure.traceback are
         # None, so they appear in missing_fields.  This verifies that
@@ -215,6 +248,39 @@ class TestFfdcCollect:
             assert result is not None
             assert "failure" in result
             assert result["failure"]["category"] == CATEGORY_RUNTIME_LAUNCH
+            assert result["_report_path"].endswith(".json")
+
+    def test_get_diagnostic_report_skips_corrupted_newest_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            corrupt = d / "ffdc_compile_20250101T000002_000000_1.json"
+            valid = d / "ffdc_unknown_20250101T000001_000000_1.json"
+            corrupt.write_text("{not valid json")
+            valid.write_text('{"failure": {"category": "unknown"}}')
+
+            result = get_diagnostic_report(output_dir=tmp)
+            assert result is not None
+            assert result["failure"]["category"] == "unknown"
+            assert result["_report_path"] == str(valid)
+
+    def test_get_diagnostic_report_returns_none_when_all_corrupted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "ffdc_unknown_20250101T000000_000000_1.json").write_text("{bad json")
+
+            assert get_diagnostic_report(output_dir=tmp) is None
+
+    def test_get_diagnostic_report_includes_report_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                raise RuntimeError("path test")
+            except RuntimeError as exc:
+                collect(exc, failure_category=CATEGORY_COMPILE, output_dir=tmp)
+
+            result = get_diagnostic_report(output_dir=tmp)
+            assert result is not None
+            assert Path(result["_report_path"]).is_file()
+            assert result["_report_path"].startswith(tmp)
 
     def test_get_diagnostic_report_returns_latest_across_categories(self):
         # A fresh compile report must win over a stale unknown report.
@@ -279,3 +345,29 @@ class TestFfdcCollect:
             except ValueError as exc:
                 collect(exc, failure_category=CATEGORY_UNKNOWN, output_dir=tmp)
             assert len(list(d.glob("ffdc_*.json"))) <= _MAX_REPORTS
+
+
+class TestFfdcPublicApi:
+    def test_torch_spyre_exposes_get_diagnostic_report(self):
+        assert hasattr(torch.spyre, "get_diagnostic_report")
+        assert callable(torch.spyre.get_diagnostic_report)
+
+    def test_profiler_package_reexports_get_diagnostic_report(self):
+        assert profiler_get_diagnostic_report is not None
+        assert callable(profiler_get_diagnostic_report)
+
+    def test_torch_spyre_get_diagnostic_report_returns_none_when_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assert torch.spyre.get_diagnostic_report(output_dir=tmp) is None
+
+    def test_torch_spyre_get_diagnostic_report_returns_latest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                raise RuntimeError("public api")
+            except RuntimeError as exc:
+                collect(exc, failure_category=CATEGORY_RUNTIME_LAUNCH, output_dir=tmp)
+
+            result = torch.spyre.get_diagnostic_report(output_dir=tmp)
+            assert result is not None
+            assert result["failure"]["category"] == CATEGORY_RUNTIME_LAUNCH
+            assert result["_report_path"].endswith(".json")

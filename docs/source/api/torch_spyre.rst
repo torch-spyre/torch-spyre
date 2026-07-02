@@ -286,6 +286,43 @@ Profiler
    :doc:`../user_guide/profiling/index` for the current state and the
    profiling tooling that is available in the meantime.
 
+FFDC (First Failure Data Capture)
+---------------------------------
+
+.. function:: torch.spyre.get_diagnostic_report(output_dir=None) -> dict | None
+
+   Return the most recent FFDC diagnostic report written by the torch-spyre
+   failure hooks, or ``None`` if no report exists.
+
+   Reports are JSON documents capturing exception metadata, compiler artifact
+   paths, runtime context, hardware availability, and collector completeness.
+   The returned dict also includes ``_report_path`` with the absolute path of
+   the loaded report file.
+
+   :param output_dir: Directory to search. If ``None``, uses the default
+       Inductor cache location
+       (``~/.cache/torch/inductor/torch-spyre/ffdc_reports``, respecting
+       ``TORCHINDUCTOR_CACHE_DIR``), falling back to the system temp directory
+       when the cache is unavailable.
+   :type output_dir: str, optional
+
+   .. code-block:: python
+
+      import torch
+      import torch_spyre
+
+      try:
+          compiled = torch.compile(model, backend="spyre")
+          compiled(inputs)
+      except Exception:
+          report = torch.spyre.get_diagnostic_report()
+          if report is not None:
+              print(report["failure"]["category"])
+              print(report["_report_path"])
+
+   The same function is also available as
+   ``torch_spyre.profiler.get_diagnostic_report``.
+
 Tensor Operations
 -----------------
 

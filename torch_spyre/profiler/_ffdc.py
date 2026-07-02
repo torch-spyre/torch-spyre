@@ -411,7 +411,9 @@ def get_diagnostic_report(
             ``TORCHINDUCTOR_CACHE_DIR``), with a fallback to the system temp dir.
 
     Returns:
-        Parsed JSON dict of the most recent report, or None.
+        Parsed JSON dict of the most recent readable report, or None. The
+        returned dict includes ``_report_path`` with the absolute path of the
+        loaded file. Corrupted or unreadable report files are skipped.
     """
     search_dir = Path(output_dir) if output_dir else _default_output_dir()
     if not search_dir.exists():
@@ -423,8 +425,10 @@ def get_diagnostic_report(
     # report would outrank a fresh "compile" report.  Sorting by st_mtime fails
     # on filesystems with 1-second resolution (same-second writes are misordered).
     # rsplit from the right handles category names that contain underscores
-    # (e.g. runtime_launch): stem.rsplit('_', 3) yields
-    # [category_prefix, YYYYMMDDTHHMMSS, microseconds, pid].
+    # (e.g. runtime_launch).  maxsplit=3 produces four segments:
+    # [category_prefix, YYYYMMDDTHHMMSS, microseconds, pid].  The timestamp's
+    # internal underscore (between seconds and microseconds) is the third split
+    # from the right, not an extra delimiter.
     def _ts_key(p: Path) -> str:
         parts = p.stem.rsplit("_", 3)
         return f"{parts[1]}_{parts[2]}" if len(parts) == 4 else ""
@@ -434,7 +438,14 @@ def get_diagnostic_report(
         key=_ts_key,
         reverse=True,
     )
-    if not reports:
-        return None
-    with open(reports[0]) as f:
-        return json.load(f)
+    for report_path in reports:
+        try:
+            with open(report_path) as f:
+                report = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(report, dict):
+            continue
+        report["_report_path"] = str(report_path)
+        return report
+    return None

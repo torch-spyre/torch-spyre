@@ -24,10 +24,7 @@ Run from repo root with:
     TORCH_COMPILE_DEBUG=1 python3 tools/ffdc_trigger.py
 """
 
-import glob
-import json
 import os
-import time
 from typing import Any
 
 import torch  # noqa: F401 — ensures torch_spyre._C loads via real extension
@@ -37,26 +34,29 @@ from torch_spyre.execution.kernel_runner import (
     SpyreSDSCKernelRunner,
     SpyreUnimplementedRunner,
 )
-from torch_spyre.profiler._ffdc import _default_output_dir
-
-FFDC_OUT = _default_output_dir()
 
 
-def _newest(pattern):
-    matches = glob.glob(pattern, recursive=True)
-    return max(matches, key=os.path.getmtime) if matches else None
+def _print_collector(report: dict[str, Any]) -> None:
+    c = report["collector"]
+    print(
+        f"  completeness={c['completeness_pct']}%  "
+        f"latency={c['capture_latency_ms']}ms  "
+        f"missing={c['missing_fields']}"
+    )
 
 
-def _newest_since(pattern, since_ts):
-    matches = [
-        m for m in glob.glob(pattern, recursive=True) if os.path.getmtime(m) > since_ts
-    ]
-    return max(matches, key=os.path.getmtime) if matches else None
+def _load_report(expected_category: str) -> dict[str, Any] | None:
+    report = torch.spyre.get_diagnostic_report()
+    if report is None:
+        return None
+    if report["failure"]["category"] != expected_category:
+        return None
+    return report
 
 
 def main():
     print("\n=== FFDC Real Trigger ===\n")
-    reports = []
+    reports: list[tuple[str, dict[str, Any]]] = []
 
     # ── Scenario A: runtime_launch failure ──────────────────────────────────────
     # Clear DUMP_SPYRE_CODE so SpyreSDSCKernelRunner.__init__ skips
@@ -69,7 +69,6 @@ def main():
         name="test_kernel_add",
         code_dir="/tmp/fake_spyre_code_dir",
     )
-    t0 = time.time()
     try:
         runner.run()
     except RuntimeError as e:
@@ -79,18 +78,13 @@ def main():
             "Expected RuntimeError from runner.run() but none was raised"
         )
 
-    report_path = _newest_since(str(FFDC_OUT / "ffdc_runtime_launch_*.json"), t0)
-    if report_path:
-        with open(report_path) as f:
-            report = json.load(f)
+    report = _load_report("runtime_launch")
+    if report is not None:
         reports.append(("runtime_launch", report))
-        print(f"  Report written: {report_path}")
-        c = report["collector"]
-        print(
-            f"  completeness={c['completeness_pct']}%  latency={c['capture_latency_ms']}ms  missing={c['missing_fields']}"
-        )
+        print(f"  Report written: {report['_report_path']}")
+        _print_collector(report)
     else:
-        print("  [WARN] No report found — check FFDC output_dir")
+        print("  [WARN] No runtime_launch report found — check FFDC output_dir")
 
     # ── Scenario B: unimplemented op failure ────────────────────────────────────
     print(
@@ -100,7 +94,6 @@ def main():
         name="test_kernel_fft",
         op="aten::fft_fft",
     )
-    t0 = time.time()
     try:
         urunner.run()
     except RuntimeError as e:
@@ -110,20 +103,13 @@ def main():
             "Expected RuntimeError from urunner.run() but none was raised"
         )
 
-    report_path_u: Any | None = _newest_since(
-        str(FFDC_OUT / "ffdc_unimplemented_*.json"), t0
-    )
-    if report_path_u:
-        with open(report_path_u) as f:
-            report_u = json.load(f)
+    report_u = _load_report("unimplemented")
+    if report_u is not None:
         reports.append(("unimplemented", report_u))
-        print(f"  Report written: {report_path_u}")
-        c = report_u["collector"]
-        print(
-            f"  completeness={c['completeness_pct']}%  latency={c['capture_latency_ms']}ms  missing={c['missing_fields']}"
-        )
+        print(f"  Report written: {report_u['_report_path']}")
+        _print_collector(report_u)
     else:
-        print("  [WARN] No report found — check FFDC output_dir")
+        print("  [WARN] No unimplemented report found — check FFDC output_dir")
 
     # ── Summary ─────────────────────────────────────────────────────────────────
     print("\n=== Captured Report Fields ===")
