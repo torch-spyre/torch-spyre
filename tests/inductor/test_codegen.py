@@ -210,8 +210,9 @@ class TestSpyreConfig(InductorTestCase):
         """An inplace op (x *= 2) must not pass the same tensor twice to .run().
 
         With symbolic args, the MLIR bundle emits one input_arg param per unique
-        tensor.  Passing arg0_1 twice causes a "Number of inputs mismatches"
-        error in processComputeOnHostCommand at launch time.
+        tensor.  Passing arg0_1 twice would cause a "Number of inputs mismatches"
+        error at launch time.  This test verifies the generated .run() call
+        contains no duplicate tensor arguments.
         """
 
         def fn(x):

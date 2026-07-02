@@ -479,7 +479,7 @@ def generate_sdsc(
     # that happen to share a base address will emit two separate arith.constant
     # declarations in bundle.mlir.  This keeps symbol IDs contiguous with the
     # symbols list indices: symbols[abs(id)-1] is always the value for id.
-    local_symbols: dict = {}
+    local_symbols: dict[tuple | int, int] = {}
     # Parallel to local_symbols (insertion order): one SymbolKind per registered symbol.
     local_symbol_kind: list[SymbolKind] = []
 
@@ -684,6 +684,23 @@ def generate_sdsc(
                 }
             nb = num_bytes(tensor.data_format)
             is_pool_tensor = tensor.arg_index < 0 and "pool" in tensor.allocation
+            # Hoist per-tensor compile-time offset computation so it is not
+            # duplicated across the c==0 and c>0 branches.
+            slice_offset_bytes = sum(tensor.offsets.values()) * nb
+            tile_offset_bytes = tensor.start_address - tensor.arg_index
+            total_slice_offset = tile_offset_bytes + slice_offset_bytes
+            c0_slice_key: tuple | int = (
+                ("kernel_slice", tensor.arg_index, total_slice_offset)
+                if total_slice_offset > 0
+                else ("kernel", tensor.arg_index)
+            )
+            core0_addr_lookup = (
+                tensor.start_address
+                + core_idx_to_slice_offset(
+                    tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
+                )
+                * nb
+            )
             result = {}
             for c in range(sdsc_spec.num_cores):
                 addr = (
@@ -694,44 +711,14 @@ def generate_sdsc(
                     * nb
                 )
                 if is_pool_tensor:
-                    key = ("pool", addr)
+                    key: tuple | int = ("pool", addr)
                 elif c == 0:
-                    # c==0: either ("kernel", arg_index) when no total slice offset,
-                    # or ("kernel_slice", arg_index, offset_bytes) when a compile-time
-                    # offset was added.  total_slice_offset combines the loop-unroll
-                    # tile offset (tensor.start_address - tensor.arg_index on sym path)
-                    # with any device-coordinate slice offset from tensor.offsets.
-                    slice_offset_bytes = sum(tensor.offsets.values()) * nb
-                    tile_offset_bytes = tensor.start_address - tensor.arg_index
-                    total_slice_offset = tile_offset_bytes + slice_offset_bytes
-                    key = (
-                        ("kernel_slice", tensor.arg_index, total_slice_offset)
-                        if total_slice_offset > 0
-                        else ("kernel", tensor.arg_index)
-                    )
+                    key = c0_slice_key
                 else:
-                    # c>0: per-core derived address (large HBM byte value).
-                    # When addr == core0_addr (non-split tensor, all cores share
-                    # one address), no derived symbol was registered — reuse the
-                    # sliced-base key used for c==0.
-                    slice_offset_bytes = sum(tensor.offsets.values()) * nb
-                    tile_offset_bytes = tensor.start_address - tensor.arg_index
-                    total_slice_offset = tile_offset_bytes + slice_offset_bytes
-                    core0_addr_lookup = (
-                        tensor.start_address
-                        + core_idx_to_slice_offset(
-                            tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
-                        )
-                        * nb
-                    )
-                    if addr == core0_addr_lookup:
-                        key = (
-                            ("kernel_slice", tensor.arg_index, total_slice_offset)
-                            if total_slice_offset > 0
-                            else ("kernel", tensor.arg_index)
-                        )
-                    else:
-                        key = addr
+                    # c>0: per-core derived address.  When addr == core0_addr
+                    # (non-split tensor, all cores share one address) no derived
+                    # symbol was registered — reuse the c==0 sliced-base key.
+                    key = c0_slice_key if addr == core0_addr_lookup else addr
                 result[f"[{c}, 0, 0]"] = str(local_symbols[key])
             return result
 
