@@ -346,6 +346,9 @@ def _autoload():
     os.environ.setdefault("DT_DEEPRT_VERBOSE", "-1")
     os.environ.setdefault("DTLOG_LEVEL", "error")
 
+    # Enable spyre code with symbolic args by default
+    os.environ.setdefault("BUNDLE_SYMBOLIC_ARGS", "1")
+
 
 if not profiler.is_available():
     profiler = None

@@ -23,14 +23,23 @@ from sympy import Symbol
 class SymbolKind:
     """Classifies a symbol registered in the bundle symbol table.
 
-    Three variants (constructed via class methods):
-      - ``kernel(arg_index)``:               base HBM address of a kernel tensor arg;
+    Four variants (constructed via class methods):
+      - ``kernel(arg_index)``:               raw HBM base address of a kernel tensor arg;
                                              emitted as a ``!sdscbundle.input_arg`` param
-                                             named ``%arg_{arg_index}``.
-      - ``kernel_derived(idx, off, arg_i)``: per-core derived address = base + offset;
-                                             emitted as ``arith.addi %arg_{arg_i}, off``.
+                                             named ``%arg_{arg_index}``.  Value =
+                                             ``tensor.start_address``.
+      - ``kernel_slice(arg_i, slice_off)``:  sliced base = raw base + compile-time slice
+                                             offset (from device_coordinates like ``z0+3``).
+                                             Emitted as ``arith.addi %arg_{arg_i},
+                                             {slice_off}``.  ``slice_off`` is in bytes.
+                                             Only present when ``slice_off > 0``;
+                                             when ``slice_off == 0`` the ``kernel`` symbol
+                                             itself serves as the sliced base.
+      - ``kernel_derived(idx, off, arg_i)``: per-core derived address = sliced_base + offset;
+                                             emitted as ``arith.addi <sliced_base_ssa>, off``.
                                              ``base_sym_idx`` is the 0-based index into the
-                                             global ``symbols`` list of the kernel base symbol.
+                                             global ``symbols`` list of the sliced-base symbol
+                                             (either a ``kernel`` or ``kernel_slice`` entry).
       - ``pool()``:                          pool-allocated tensor address;
                                              emitted as ``arith.addi %pool, value``.
       - ``dimension(gran, max, sym)``:       dynamic iteration-space dim size from
@@ -51,6 +60,10 @@ class SymbolKind:
     @classmethod
     def kernel(cls, arg_index: int) -> "SymbolKind":
         return cls(kind="kernel", arg_index=arg_index)
+
+    @classmethod
+    def kernel_slice(cls, arg_index: int, offset: int) -> "SymbolKind":
+        return cls(kind="kernel_slice", arg_index=arg_index, offset=offset)
 
     @classmethod
     def kernel_derived(
@@ -445,36 +458,45 @@ def generate_sdsc(
             symbols.append(0)  # placeholder: dim symbols have no HBM byte value
     n_dim_syms = len(dim_symbol_kinds)
 
-    # local_symbols maps base HBM byte offset -> globally-unique negative symbol id.
+    # local_symbols maps address key -> globally-unique negative symbol id.
     # symbol_id_offset ensures ids are unique across all SDSCs in the bundle.
     # For tiled tensors the base is the iteration-0 address (tiled dims contribute 0);
     # for non-tiled tensors it is the full per-core address (as before).
+    #
+    # Keys use explicit namespacing to prevent any possibility of collision:
+    #   ("kernel", arg_index)       — raw HBM base for kernel tensor arg_index
+    #   ("kernel_slice", arg_index) — sliced base (raw + compile-time offset)
+    #   int addr                    — per-core derived address (c>0 kernel tensors,
+    #                                 always large HBM byte addresses)
+    #   ("pool", int offset)        — pool-allocated tensor compile-time offset
+    #
+    # On the symbolic path, kernel sentinels are arg_index integers (0, 1, 2...).
+    # Keying by ("kernel", arg_index) rather than the sentinel value itself ensures
+    # no collision with pool offset 0 or any future sentinel scheme.
     #
     # NOTE: no cross-SDSC deduplication — each call to offset_as_symbol within
     # this SDSC gets its own sequential ID and appends to symbols.  Two SDSCs
     # that happen to share a base address will emit two separate arith.constant
     # declarations in bundle.mlir.  This keeps symbol IDs contiguous with the
     # symbols list indices: symbols[abs(id)-1] is always the value for id.
-    local_symbols: dict[int, int] = {}
+    local_symbols: dict[tuple | int, int] = {}
     # Parallel to local_symbols (insertion order): one SymbolKind per registered symbol.
     local_symbol_kind: list[SymbolKind] = []
 
-    def _per_core_kind(
-        c: int, arg_index: int, core0_addr: int, addr: int, base_sym_idx: int
+    def _derived_kind(
+        arg_index: int,
+        core0_addr: int,
+        addr: int,
+        sliced_base_sym_idx: int,
     ) -> SymbolKind:
-        """Return the SymbolKind for a per-core HBM address.
+        """Return the SymbolKind for a per-core (c>0) HBM address.
 
-        Core 0 of a kernel arg (arg_index >= 0) is the input_arg base; subsequent
-        cores are derived from it.  ``base_sym_idx`` is the 0-based index into the
-        global ``symbols`` list where the core-0 symbol was (or will be) registered.
-        Pool tensors (arg_index < 0) always use SymbolKind.pool().
+        Core 0 is handled by the caller (either ``kernel`` or ``kernel_slice``).
+        ``sliced_base_sym_idx`` is the 0-based index in ``symbols`` of the
+        sliced-base symbol (``kernel`` or ``kernel_slice``) for this tensor.
         """
-        if arg_index < 0:
-            return SymbolKind.pool()
-        if c == 0:
-            return SymbolKind.kernel(arg_index=arg_index)
         return SymbolKind.kernel_derived(
-            base_sym_idx=base_sym_idx,
+            base_sym_idx=sliced_base_sym_idx,
             offset=addr - core0_addr,
             arg_index=arg_index,
         )
@@ -482,14 +504,25 @@ def generate_sdsc(
     if use_symbols:
 
         def offset_as_symbol(s, kind: SymbolKind):
-            if s not in local_symbols:
+            key: tuple | int
+            if kind.is_pool:
+                key = ("pool", s)
+            elif kind.kind == "kernel":
+                key = ("kernel", kind.arg_index)
+            elif kind.kind == "kernel_slice":
+                key = ("kernel_slice", kind.arg_index, kind.offset)
+            else:
+                # kernel_derived: s is a large per-core HBM byte address,
+                # distinct from pool offsets and sentinel values.
+                key = s
+            if key not in local_symbols:
                 # Address symbols start after dim symbols in the ID counter.
-                local_symbols[s] = -(
+                local_symbols[key] = -(
                     symbol_id_offset + n_dim_syms + len(local_symbols) + 1
                 )
                 symbols.append(s)
                 local_symbol_kind.append(kind)
-            return local_symbols[s]
+            return local_symbols[key]
 
         # Compute per-tensor, per-level affine strides and register base addresses.
         # affine_strides[i] is a list of dicts, one per loop-nesting level
@@ -501,13 +534,62 @@ def generate_sdsc(
             if "lx" in tensor.allocation:
                 affine_strides.append([{} for _ in tiled_symbols])
                 continue
-            core0_addr = tensor.start_address + core_idx_to_slice_offset(
-                tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
-            ) * num_bytes(tensor.data_format)
-            # 0-based index in global symbols[] where this tensor's core-0 address will
-            # be registered. Offset by n_dim_syms because dim symbols occupy the first
-            # n_dim_syms slots in this SDSC's range of the shared counter.
-            base_sym_idx = symbol_id_offset + n_dim_syms + len(local_symbols)
+            nb = num_bytes(tensor.data_format)
+            slice_offset_bytes = sum(tensor.offsets.values()) * nb
+            # core0_addr: compile-time address for core 0 including the tensor's
+            # slice offset (device_coordinate constant terms, e.g. z0+3 → 3 rows).
+            core0_addr = (
+                tensor.start_address
+                + core_idx_to_slice_offset(
+                    tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
+                )
+                * nb
+            )
+            if tensor.arg_index >= 0:
+                # Kernel tensors: register the raw base address first so bundle.py
+                # can emit the input_arg function parameter.
+                #
+                # On the symbolic path, tensor.start_address = arg_index + tile_offset_bytes,
+                # where tile_offset_bytes is the per-tile byte advance added by the loop
+                # unroller.  We always register the raw kernel symbol keyed by arg_index so
+                # that bundle.py emits exactly one !sdscbundle.input_arg parameter per logical
+                # tensor, regardless of how many tiles reference it.
+                raw_base = tensor.arg_index  # sentinel value for this arg
+                offset_as_symbol(
+                    raw_base, SymbolKind.kernel(arg_index=tensor.arg_index)
+                )
+                # Derive the 0-based symbols[] index of the kernel symbol from its
+                # registered ID.  Must be looked up (not inferred from current
+                # len(local_symbols)) because the same arg_index may have been
+                # registered already by an earlier tensor in this SDSC, in which case
+                # the offset_as_symbol call above was a no-op.
+                kernel_sym_idx = abs(local_symbols[("kernel", tensor.arg_index)]) - 1
+                # tile_offset_bytes: the loop unroller advances arg.allocation['hbm']
+                # by i*stride for tile i, so start_address = arg_index + tile_offset.
+                # tile_offset_bytes == 0 for tile 0, positive for later tiles.
+                tile_offset_bytes = tensor.start_address - tensor.arg_index
+                # total_slice_offset: combine the loop-unroll tile offset with any
+                # device-coordinate compile-time slice offset (e.g. from z0+3 expressions).
+                # This is the total compile-time offset above the raw %arg_N base that the
+                # sliced-base SSA value represents in bundle.mlir.
+                total_slice_offset = tile_offset_bytes + slice_offset_bytes
+                # sliced_base_sym_idx: the symbols[] index that per-core derived symbols
+                # reference.  When total_slice_offset == 0 the kernel sym IS the sliced
+                # base; otherwise a kernel_slice sym is registered for the combined offset.
+                if total_slice_offset > 0:
+                    offset_as_symbol(
+                        core0_addr,
+                        SymbolKind.kernel_slice(
+                            arg_index=tensor.arg_index, offset=total_slice_offset
+                        ),
+                    )
+                    slice_key = ("kernel_slice", tensor.arg_index, total_slice_offset)
+                    sliced_base_sym_idx = abs(local_symbols[slice_key]) - 1
+                else:
+                    sliced_base_sym_idx = kernel_sym_idx
+            else:
+                # Pool tensor: no raw-base or slice symbol needed.
+                sliced_base_sym_idx = -1
             # Build per-level strides: for each level, collect the symbols at that
             # level that tile this tensor (i.e. appear in tensor.strides).
             per_level_strides: list[dict] = []
@@ -524,45 +606,113 @@ def generate_sdsc(
             if not any_tiled:
                 # Non-tiled HBM: register per-core addresses.
                 for c in range(sdsc_spec.num_cores):
-                    addr = tensor.start_address + core_idx_to_slice_offset(
-                        tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
-                    ) * num_bytes(tensor.data_format)
-                    offset_as_symbol(
-                        addr,
-                        _per_core_kind(
-                            c, tensor.arg_index, core0_addr, addr, base_sym_idx
-                        ),
+                    addr = (
+                        tensor.start_address
+                        + core_idx_to_slice_offset(
+                            tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
+                        )
+                        * nb
                     )
+                    if c == 0:
+                        if tensor.arg_index < 0:
+                            offset_as_symbol(addr, SymbolKind.pool())
+                        # kernel / kernel_slice already registered above; skip c==0
+                    else:
+                        if tensor.arg_index < 0:
+                            offset_as_symbol(addr, SymbolKind.pool())
+                        elif addr != core0_addr:
+                            # Only register a derived symbol when the core has a
+                            # distinct address from core 0.  When addr == core0_addr
+                            # (e.g. a non-split tensor where all cores share one
+                            # address) the sliced-base symbol already covers it and
+                            # we must not create a duplicate registration.
+                            offset_as_symbol(
+                                addr,
+                                _derived_kind(
+                                    tensor.arg_index,
+                                    core0_addr,
+                                    addr,
+                                    sliced_base_sym_idx,
+                                ),
+                            )
                 affine_strides.append([{} for _ in tiled_symbols])
             else:
                 # Tiled HBM: symbol value = per-core iter-0 base address.
                 # The affine map adds loop_var * tile_stride on top at runtime.
                 for c in range(sdsc_spec.num_cores):
-                    addr = tensor.start_address + core_idx_to_slice_offset(
-                        tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
-                    ) * num_bytes(tensor.data_format)
-                    offset_as_symbol(
-                        addr,
-                        _per_core_kind(
-                            c, tensor.arg_index, core0_addr, addr, base_sym_idx
-                        ),
+                    addr = (
+                        tensor.start_address
+                        + core_idx_to_slice_offset(
+                            tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
+                        )
+                        * nb
                     )
+                    if c == 0:
+                        if tensor.arg_index < 0:
+                            offset_as_symbol(addr, SymbolKind.pool())
+                        # kernel / kernel_slice already registered above; skip c==0
+                    else:
+                        if tensor.arg_index < 0:
+                            offset_as_symbol(addr, SymbolKind.pool())
+                        elif addr != core0_addr:
+                            offset_as_symbol(
+                                addr,
+                                _derived_kind(
+                                    tensor.arg_index,
+                                    core0_addr,
+                                    addr,
+                                    sliced_base_sym_idx,
+                                ),
+                            )
                 affine_strides.append(per_level_strides)
 
         def _start_addr_data(tensor):
             # All per-core addresses were already registered by the per-tensor loop
-            # above. Look them up directly rather than re-computing SymbolKind.
+            # above. Look them up using the same key scheme as offset_as_symbol.
             if "lx" in tensor.allocation:
                 return {
                     f"[{c}, 0, 0]": str(tensor.start_address)
                     for c in range(sdsc_spec.num_cores)
                 }
+            nb = num_bytes(tensor.data_format)
+            is_pool_tensor = tensor.arg_index < 0 and "pool" in tensor.allocation
+            # Hoist kernel-tensor compile-time offsets so they are not
+            # duplicated across the c==0 and c>0 branches.
+            if not is_pool_tensor:
+                slice_offset_bytes = sum(tensor.offsets.values()) * nb
+                tile_offset_bytes = tensor.start_address - tensor.arg_index
+                total_slice_offset = tile_offset_bytes + slice_offset_bytes
+                c0_slice_key: tuple | int = (
+                    ("kernel_slice", tensor.arg_index, total_slice_offset)
+                    if total_slice_offset > 0
+                    else ("kernel", tensor.arg_index)
+                )
+                core0_addr_lookup = (
+                    tensor.start_address
+                    + core_idx_to_slice_offset(
+                        tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
+                    )
+                    * nb
+                )
             result = {}
             for c in range(sdsc_spec.num_cores):
-                addr = tensor.start_address + core_idx_to_slice_offset(
-                    tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
-                ) * num_bytes(tensor.data_format)
-                result[f"[{c}, 0, 0]"] = str(local_symbols[addr])
+                addr = (
+                    tensor.start_address
+                    + core_idx_to_slice_offset(
+                        tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
+                    )
+                    * nb
+                )
+                if is_pool_tensor:
+                    key: tuple | int = ("pool", addr)
+                elif c == 0:
+                    key = c0_slice_key
+                else:
+                    # c>0: per-core derived address.  When addr == core0_addr
+                    # (non-split tensor, all cores share one address) no derived
+                    # symbol was registered — reuse the c==0 sliced-base key.
+                    key = c0_slice_key if addr == core0_addr_lookup else addr
+                result[f"[{c}, 0, 0]"] = str(local_symbols[key])
             return result
 
     else:

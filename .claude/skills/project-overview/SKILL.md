@@ -50,7 +50,7 @@ torch-spyre/
 │   ├── _monkey_patch.py         # Patches torch.Tensor for Spyre awareness
 │   ├── constants.py             # DEVICE_NAME = "spyre"
 │   ├── csrc/                    # C++ sources (pybind11 → torch_spyre._C and ._hooks)
-│   │   ├── module.cpp           # Main pybind11 module: startRuntime, launchKernel, encodeConstant
+│   │   ├── module.cpp           # Main pybind11 module: startRuntime, encodeConstant
 │   │   ├── spyre_tensor_impl.*  # SpyreTensorLayout, SpyreTensorImpl (tiled tensor layout)
 │   │   ├── spyre_mem.*          # Device memory allocation (spyre_empty_strided, etc.)
 │   │   ├── spyre_hooks.cpp      # PrivateUse1 hooks + SpyreGuardImpl (separate ._hooks module)
