@@ -1079,7 +1079,6 @@ class TestCoarseTileReductionE2E(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -1176,7 +1175,6 @@ class TestCoarseTileReductionE2E(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -1220,7 +1218,6 @@ class TestCoarseTileReductionE2E(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),

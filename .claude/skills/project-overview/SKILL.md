@@ -105,7 +105,7 @@ torch.compile(model)
   → SpyreKernel codegen (spyre_kernel.py) — LoopLevelIR → KernelSpec
   → SuperDSC generation (codegen/superdsc.py) — KernelSpec → JSON descriptor
   → dxp_standalone (backend compiler) — JSON → g2.graph.cbor binary
-  → SpyreSDSCKernelRunner — calls _C.launch_kernel() at runtime
+  → SpyreSDSCKernelRunner — calls _C.launch_jobplan() at runtime
 ```
 
 ### Key Files
@@ -131,7 +131,7 @@ torch.compile(model)
 | `temp_passes.py` | `relayout_linear_weights` — ensures weight contiguity for mm |
 | `runtime/__init__.py` | `KernelSpec`, `TensorArg`, `ConstantArg` dataclasses |
 | `runtime/async_compile.py` | `SpyreAsyncCompile` — SDSC→binary compilation |
-| `runtime/kernel_runner.py` | `SpyreSDSCKernelRunner` — kernel execution via `_C.launch_kernel` |
+| `runtime/kernel_runner.py` | `SpyreSDSCKernelRunner` — kernel execution via `_C.launch_jobplan` |
 | `codegen/superdsc.py` | `generate_sdsc()` — KernelSpec → SuperDSC JSON |
 | `codegen/compute_ops.py` | Pointwise/reduction/matmul SDSC generation |
 | `codegen/data_ops.py` | Transpose/clone/slice SDSC generation |

@@ -182,12 +182,12 @@ compiler.
 
 **File:** `torch_spyre/execution/kernel_runner.py`
 
-**What happens:** `SpyreSDSCKernelRunner` calls `_C.launch_kernel()` to
+**What happens:** `SpyreSDSCKernelRunner` calls `_C.launch_jobplan()` to
 execute the compiled binary.
 
 **Failure symptoms:**
 
-- `launch_kernel` failure
+- `launch_jobplan` failure
 - Runtime segfault
 - Wrong results (numerics)
 
