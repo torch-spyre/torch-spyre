@@ -14,6 +14,7 @@
 
 
 import dataclasses
+from collections.abc import Callable
 
 from torch_spyre._C import encode_constant, DataFormats
 from torch_spyre._inductor.constants import AVGPOOL2D_OP
@@ -398,6 +399,120 @@ def _build_indirect_access_fields(sdsc_spec, tensor, tensor_idx: int) -> dict:
     return fields
 
 
+@dataclasses.dataclass(frozen=True)
+class _PoolOverrides:
+    """All pool-op-specific SDSC fields, pre-computed once per generate_sdsc call.
+
+    Non-pool ops use _no_pool_overrides(); adding a new pool op (e.g. maxpool)
+    requires only a new factory function and one entry in _POOL_DISPATCH.
+    """
+
+    corelet_fold: int
+    n_padding: dict  # **-spread into N_; {} to omit paddingSizes_
+    dp_padding: dict  # **-spread into ss_ and el_ of dataStageParam_
+    pds_relation: dict  # **-spread into dsc top level
+    stick_repl: dict  # **-spread into each primaryDsInfo_ entry
+    filter_dims: Callable[[list], list]  # strips reduction window dims (ki/kj)
+    tensor_padding: Callable[[bool], dict]  # (is_input) -> padding_ field or {}
+    coord_size: Callable[[str, int, bool], int]  # (dim, default, is_input) -> size
+    coord_padding: Callable[[str, bool], str]  # (dim, is_input) -> padding string
+    memorg_extra: Callable[[bool, str], dict]  # (is_input, alloc_node) -> extra fields
+
+
+def _no_pool_overrides() -> _PoolOverrides:
+    return _PoolOverrides(
+        corelet_fold=1,
+        n_padding={},
+        dp_padding={"paddingSizes_": {}},
+        pds_relation={},
+        stick_repl={},
+        filter_dims=lambda dims: dims,
+        tensor_padding=lambda is_input: {},
+        coord_size=lambda dim, default, is_input: default,
+        coord_padding=lambda dim, is_input: "nopad",
+        memorg_extra=lambda is_input, alloc_node: {},
+    )
+
+
+def _avgpool_overrides(sdsc_spec) -> _PoolOverrides:
+    _kH = int(sdsc_spec.pool_params["kernel_h"])
+    _kW = int(sdsc_spec.pool_params["kernel_w"])
+    _sH = int(sdsc_spec.pool_params.get("stride_h", 1))
+    _sW = int(sdsc_spec.pool_params.get("stride_w", 1))
+    _pH = int(sdsc_spec.pool_params.get("pad_h", 0))
+    _pW = int(sdsc_spec.pool_params.get("pad_w", 0))
+    _i = int(sdsc_spec.iteration_space.get(Symbol("i"), 1))
+    _j = int(sdsc_spec.iteration_space.get(Symbol("j"), 1))
+    _H_in = (_i - 1) * _sH + _kH
+    _W_in = (_j - 1) * _sW + _kW
+
+    _psizes = {
+        "i": {
+            "padFront_": _pH,
+            "padBack_": _pH,
+            "totalSize_": _H_in,
+            "stride_": _sH,
+            "dilation_": 1,
+            "windowDim_": "ki",
+        },
+        "j": {
+            "padFront_": _pW,
+            "padBack_": _pW,
+            "totalSize_": _W_in,
+            "stride_": _sW,
+            "dilation_": 1,
+            "windowDim_": "kj",
+        },
+    }
+
+    def _coord_size(dim: str, default: int, is_input: bool) -> int:
+        if is_input and dim == "i":
+            return _H_in
+        if is_input and dim == "j":
+            return _W_in
+        return default
+
+    def _coord_padding(dim: str, is_input: bool) -> str:
+        if is_input and dim in ("i", "j"):
+            return "padded_fullspan_wunneeded"
+        return "nopad"
+
+    def _memorg_extra(is_input: bool, alloc_node: str) -> dict:
+        return {
+            "isPadded": 1 if is_input else 0,
+            "isZeroPadded": 0,
+            "dsOffset": 0,
+            "allocateNode_": alloc_node,
+        }
+
+    return _PoolOverrides(
+        corelet_fold=HW_POOL_CORELET_FOLD,
+        n_padding={"paddingSizes_": _psizes},
+        dp_padding={"paddingSizes_": _psizes},
+        pds_relation={"pdsRelation_": {"isPdsReuse": 1}},
+        stick_repl={"stickRepl_": [1]},
+        filter_dims=lambda dims: [d for d in dims if str(d) not in ("ki", "kj")],
+        tensor_padding=lambda is_input: (
+            {
+                "padding_": {
+                    "i": "padded_fullspan_wunneeded",
+                    "j": "padded_fullspan_wunneeded",
+                }
+            }
+            if is_input
+            else {}
+        ),
+        coord_size=_coord_size,
+        coord_padding=_coord_padding,
+        memorg_extra=_memorg_extra,
+    )
+
+
+_POOL_DISPATCH: dict[str, Callable] = {
+    AVGPOOL2D_OP: _avgpool_overrides,
+}
+
+
 def generate_sdsc(
     idx,
     sdsc_spec,
@@ -738,40 +853,23 @@ def generate_sdsc(
                 for c in range(sdsc_spec.num_cores)
             }
 
-    is_avgpool = sdsc_spec.opfunc == AVGPOOL2D_OP
+    pool = _POOL_DISPATCH.get(sdsc_spec.opfunc, lambda _: _no_pool_overrides())(
+        sdsc_spec
+    )
 
     def _tensor_layout_dims(layout_key: str) -> list:
-        """Return the layout dim_order for a layout label, filtering ki/kj for pool ops."""
-        dims = sdsc_spec.layouts[layout_key]["dim_order"]
-        if is_avgpool:
-            return [d for d in dims if str(d) not in ("ki", "kj")]
-        return dims
+        """Return the layout dim_order for a layout label, filtered through pool.filter_dims."""
+        return pool.filter_dims(sdsc_spec.layouts[layout_key]["dim_order"])
 
     def _tensor_sched_layout_dims(dim_order: list) -> list:
-        """Return a tensor's own dim_order for scheduleTree_, filtering ki/kj for pool.
+        """Return a tensor's own dim_order for scheduleTree_, filtered through pool.filter_dims.
 
         scheduleTree_ layoutDimOrder_ must use the per-tensor dim_order, NOT the
         layout-canonical order.  Multiple tensors may share a layout label (same
         symbol Counter, different ordering), so sdsc_spec.layouts[label]["dim_order"]
         is only correct for the tensor that created that label.
         """
-        if is_avgpool:
-            return [d for d in dim_order if str(d) not in ("ki", "kj")]
-        return dim_order
-
-    if is_avgpool:
-        _kH = int(sdsc_spec.pool_params.get("kernel_h", 1))
-        _kW = int(sdsc_spec.pool_params.get("kernel_w", 1))
-        _sH = int(sdsc_spec.pool_params.get("stride_h", 1))
-        _sW = int(sdsc_spec.pool_params.get("stride_w", 1))
-        _pH = int(sdsc_spec.pool_params.get("pad_h", 0))
-        _pW = int(sdsc_spec.pool_params.get("pad_w", 0))
-        _i = int(sdsc_spec.iteration_space.get(Symbol("i"), 1))
-        _j = int(sdsc_spec.iteration_space.get(Symbol("j"), 1))
-        _H_in = (_i - 1) * _sH + _kH  # padded input height (H_in + 2*pH)
-        _W_in = (_j - 1) * _sW + _kW  # padded input width  (W_in + 2*pW)
-    else:
-        _pH = _pW = _sH = _sW = _H_in = _W_in = 0
+        return pool.filter_dims(dim_order)
 
     return (
         {
@@ -784,7 +882,7 @@ def generate_sdsc(
                 },
                 "coreFoldProp_": {"factor_": sdsc_spec.num_cores, "label_": "core"},
                 "coreletFoldProp_": {
-                    "factor_": HW_POOL_CORELET_FOLD if is_avgpool else 1,
+                    "factor_": pool.corelet_fold,
                     "label_": "corelet",
                 },
                 "numCoresUsed_": sdsc_spec.num_cores,
@@ -801,9 +899,7 @@ def generate_sdsc(
                     {
                         sdsc_spec.opfunc: {
                             "numCoresUsed_": sdsc_spec.num_cores,
-                            "numCoreletsUsed_": HW_POOL_CORELET_FOLD
-                            if is_avgpool
-                            else 1,
+                            "numCoreletsUsed_": pool.corelet_fold,
                             "coreIdsUsed_": [c for c in range(sdsc_spec.num_cores)],
                             "N_": {
                                 "name_": "n",
@@ -811,30 +907,7 @@ def generate_sdsc(
                                     str(dim) + "_": size
                                     for dim, size in sdsc_spec.iteration_space.items()
                                 },
-                                **(
-                                    {
-                                        "paddingSizes_": {
-                                            "i": {
-                                                "padFront_": _pH,
-                                                "padBack_": _pH,
-                                                "totalSize_": _H_in,
-                                                "stride_": _sH,
-                                                "dilation_": 1,
-                                                "windowDim_": "ki",
-                                            },
-                                            "j": {
-                                                "padFront_": _pW,
-                                                "padBack_": _pW,
-                                                "totalSize_": _W_in,
-                                                "stride_": _sW,
-                                                "dilation_": 1,
-                                                "windowDim_": "kj",
-                                            },
-                                        },
-                                    }
-                                    if is_avgpool
-                                    else {}
-                                ),
+                                **pool.n_padding,
                             },
                             "coordinateMasking_": {
                                 str(dim): mask_range
@@ -879,30 +952,7 @@ def generate_sdsc(
                                         "coreletSplit_": {},
                                         "rowSplit_": {},
                                         "peSfpSplit_": {},
-                                        **(
-                                            {
-                                                "paddingSizes_": {
-                                                    "i": {
-                                                        "padFront_": _pH,
-                                                        "padBack_": _pH,
-                                                        "totalSize_": _H_in,
-                                                        "stride_": _sH,
-                                                        "dilation_": 1,
-                                                        "windowDim_": "ki",
-                                                    },
-                                                    "j": {
-                                                        "padFront_": _pW,
-                                                        "padBack_": _pW,
-                                                        "totalSize_": _W_in,
-                                                        "stride_": _sW,
-                                                        "dilation_": 1,
-                                                        "windowDim_": "kj",
-                                                    },
-                                                }
-                                            }
-                                            if is_avgpool
-                                            else {"paddingSizes_": {}}
-                                        ),
+                                        **pool.dp_padding,
                                     },
                                     "el_": {
                                         "name_": "core",
@@ -918,30 +968,7 @@ def generate_sdsc(
                                         "coreletSplit_": {},
                                         "rowSplit_": {},
                                         "peSfpSplit_": {},
-                                        **(
-                                            {
-                                                "paddingSizes_": {
-                                                    "i": {
-                                                        "padFront_": _pH,
-                                                        "padBack_": _pH,
-                                                        "totalSize_": _H_in,
-                                                        "stride_": _sH,
-                                                        "dilation_": 1,
-                                                        "windowDim_": "ki",
-                                                    },
-                                                    "j": {
-                                                        "padFront_": _pW,
-                                                        "padBack_": _pW,
-                                                        "totalSize_": _W_in,
-                                                        "stride_": _sW,
-                                                        "dilation_": 1,
-                                                        "windowDim_": "kj",
-                                                    },
-                                                }
-                                            }
-                                            if is_avgpool
-                                            else {"paddingSizes_": {}}
-                                        ),
+                                        **pool.dp_padding,
                                     },
                                 }
                             },
@@ -954,15 +981,11 @@ def generate_sdsc(
                                         str(layout_info["stick_dim_order"])
                                     ],
                                     "stickSize_": [layout_info["stick_size"]],
-                                    **({"stickRepl_": [1]} if is_avgpool else {}),
+                                    **pool.stick_repl,
                                 }
                                 for label, layout_info in sdsc_spec.layouts.items()
                             },
-                            **(
-                                {"pdsRelation_": {"isPdsReuse": 1}}
-                                if is_avgpool
-                                else {}
-                            ),
+                            **pool.pds_relation,
                             "scheduleTree_": [
                                 {
                                     "nodeType_": "allocate",
@@ -1002,25 +1025,14 @@ def generate_sdsc(
                                                 "label_": "core",
                                             },
                                             {
-                                                "factor_": HW_POOL_CORELET_FOLD
-                                                if is_avgpool
-                                                else 1,
+                                                "factor_": pool.corelet_fold,
                                                 "label_": "corelet",
                                             },
                                             {"factor_": 1, "label_": "time"},
                                         ],
                                         "data_": _start_addr_data(tensor),
                                     },
-                                    **(
-                                        {
-                                            "padding_": {
-                                                "i": "padded_fullspan_wunneeded",
-                                                "j": "padded_fullspan_wunneeded",
-                                            }
-                                        }
-                                        if is_avgpool and i < sdsc_spec.num_inputs
-                                        else {}
-                                    ),
+                                    **pool.tensor_padding(i < sdsc_spec.num_inputs),
                                     **(
                                         {
                                             "backGapCore_": {
@@ -1053,18 +1065,11 @@ def generate_sdsc(
                                         "coordInfo": {
                                             str(dim): gen_coord_info_value(
                                                 size=(
-                                                    (
-                                                        _H_in
-                                                        if str(dim) == "i"
-                                                        else _W_in
+                                                    pool.coord_size(
+                                                        str(dim),
+                                                        sdsc_spec.iteration_space[dim],
+                                                        i < sdsc_spec.num_inputs,
                                                     )
-                                                    // sdsc_spec.work_slices.get(dim, 1)
-                                                    if (
-                                                        is_avgpool
-                                                        and i < sdsc_spec.num_inputs
-                                                        and str(dim) in ("i", "j")
-                                                    )
-                                                    else sdsc_spec.iteration_space[dim]
                                                     // sdsc_spec.work_slices.get(dim, 1)
                                                 )
                                                 if (tensor.scales[dim] == 1)
@@ -1083,14 +1088,9 @@ def generate_sdsc(
                                                 is_stick_reduction=(
                                                     tensor.scales[dim] == -2
                                                 ),
-                                                padding=(
-                                                    "padded_fullspan_wunneeded"
-                                                    if (
-                                                        is_avgpool
-                                                        and i < sdsc_spec.num_inputs
-                                                        and str(dim) in ("i", "j")
-                                                    )
-                                                    else "nopad"
+                                                padding=pool.coord_padding(
+                                                    str(dim),
+                                                    i < sdsc_spec.num_inputs,
                                                 ),
                                             )
                                             for dim in _tensor_layout_dims(
@@ -1121,32 +1121,16 @@ def generate_sdsc(
                                     else {
                                         "hbm": {
                                             "isPresent": 1,
-                                            **(
-                                                {
-                                                    "isPadded": 1
-                                                    if i < sdsc_spec.num_inputs
-                                                    else 0,
-                                                    "isZeroPadded": 0,
-                                                    "dsOffset": 0,
-                                                    "allocateNode_": f"allocate-Tensor{i}_hbm",
-                                                }
-                                                if is_avgpool
-                                                else {}
+                                            **pool.memorg_extra(
+                                                i < sdsc_spec.num_inputs,
+                                                f"allocate-Tensor{i}_hbm",
                                             ),
                                         },
                                         "lx": {
                                             "isPresent": 1,
-                                            **(
-                                                {
-                                                    "isPadded": 1
-                                                    if i < sdsc_spec.num_inputs
-                                                    else 0,
-                                                    "isZeroPadded": 0,
-                                                    "dsOffset": 0,
-                                                    "allocateNode_": "",
-                                                }
-                                                if is_avgpool
-                                                else {}
+                                            **pool.memorg_extra(
+                                                i < sdsc_spec.num_inputs,
+                                                "",
                                             ),
                                         },
                                     }
@@ -1159,7 +1143,7 @@ def generate_sdsc(
                                 sdsc_spec.data_format,
                                 sdsc_spec.constants,
                                 sdsc_spec.num_cores,
-                                HW_POOL_CORELET_FOLD if is_avgpool else 1,
+                                pool.corelet_fold,
                             ),
                             "computeOp_": [
                                 {
