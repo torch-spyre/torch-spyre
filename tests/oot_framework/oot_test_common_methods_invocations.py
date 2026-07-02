@@ -29,7 +29,13 @@ def create_module_inputs_func_from_yaml(item: Any) -> Callable:
         """Generated from YAML edits.modules.include"""
         try:
             from torch.testing._internal.common_modules import ModuleInput
-            from torch.testing._internal.common_utils import FunctionInput
+
+            try:
+                # FunctionInput lives in common_modules in current torch; keep a
+                # fallback for older versions that exposed it via common_utils.
+                from torch.testing._internal.common_modules import FunctionInput
+            except ImportError:
+                from torch.testing._internal.common_utils import FunctionInput
         except ImportError:
             return []
 
@@ -126,7 +132,13 @@ def create_module_inputs_func_from_config(config: Any) -> Callable:
         """Generated module input function from YAML config."""
         try:
             from torch.testing._internal.common_modules import ModuleInput
-            from torch.testing._internal.common_utils import FunctionInput
+
+            try:
+                # FunctionInput lives in common_modules in current torch; keep a
+                # fallback for older versions that exposed it via common_utils.
+                from torch.testing._internal.common_modules import FunctionInput
+            except ImportError:
+                from torch.testing._internal.common_utils import FunctionInput
         except ImportError:
             return []
 
