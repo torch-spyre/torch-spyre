@@ -330,6 +330,19 @@ def _is_pool(op: str) -> bool:
 
 
 def _pool_dim_labels(iteration_space: dict, constants: dict) -> list[str]:
+    """Infer SDSC dimension labels (mb, i, j, out, ki, kj) from tensor sizes.
+
+    Limitation: dimension labels are inferred from tensor sizes, not carried
+    from the lowering. The output spatial dims (H_out, W_out) are identified as
+    the equal-sized pair among the non-kernel dims, so this assumes a SQUARE
+    pooling output (H_out == W_out). It further assumes N, C, H_out, and the
+    kernel extents (kH, kW) are mutually distinguishable by size. Configurations
+    that break these assumptions are unsupported and may mislabel dimensions or
+    fail to compile:
+      - non-square output (H_out != W_out),
+      - size collisions (e.g. N == H_out, C == H_out, or kH/kW == 1).
+    In practice pooling outputs are square, so this is not currently a blocker.
+    """
     kH = int(constants.get("kernel_h", 1))
     kW = int(constants.get("kernel_w", 1))
     sizes = [int(size) for size, _ in iteration_space.values()]
