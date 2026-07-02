@@ -386,7 +386,7 @@ def run_e2e(
     backend and validate the device result against the CPU reference.
 
     Unlike the capture-based helpers, this mocks nothing: it drives the full
-    `bundle -> dxp_standalone -> launch_kernel` path, exactly like the
+    `bundle -> dxp_standalone -> launch_jobplan` path, exactly like the
     standalone `tests/indirect_access/gather.py` script.  `dev_args` are the
     device tensors the kernel is invoked with; the CPU reference is computed
     from their host copies.

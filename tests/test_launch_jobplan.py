@@ -27,13 +27,12 @@ from torch_spyre._inductor import config as _spyre_config
 
 def _run_compiled_op(op_name: str, symbolic_args: bool) -> None:
     """
-    Compile an op with DUMP_SPYRE_CODE=1 and run it on Spyre, comparing to CPU.
+    Compile an op with SpyreCode and run it on Spyre, comparing to CPU.
 
     Uses a fresh dynamo compile cache each call to ensure the kernel runner is
-    re-instantiated with the current DUMP_SPYRE_CODE env var value.  Runs
-    in-process (no subprocess) so the Spyre VFIO device opened by the test
-    session is reused rather than triggering a second exclusive open from a
-    child process.
+    re-instantiated. Runs in-process (no subprocess) so the Spyre VFIO device
+    opened by the test session is reused rather than triggering a second
+    exclusive open from a child process.
     """
     torch._dynamo.reset()
 
@@ -53,10 +52,8 @@ def _run_compiled_op(op_name: str, symbolic_args: bool) -> None:
 
     cpu_result = op_fn(*inputs)
 
-    old_dump = os.environ.get("DUMP_SPYRE_CODE")
     old_sym = os.environ.get("BUNDLE_SYMBOLIC_ARGS")
     try:
-        os.environ["DUMP_SPYRE_CODE"] = "1"
         # Keep the C++ prepare_kernel env var in sync with the Python config
         # patch: prepare_kernel reads BUNDLE_SYMBOLIC_ARGS directly from the
         # process environment, so patching only the Python config is insufficient.
@@ -66,10 +63,6 @@ def _run_compiled_op(op_name: str, symbolic_args: bool) -> None:
             spyre_inputs = tuple(inp.to("spyre") for inp in inputs)
             spyre_result = compiled_fn(*spyre_inputs).cpu()
     finally:
-        if old_dump is None:
-            os.environ.pop("DUMP_SPYRE_CODE", None)
-        else:
-            os.environ["DUMP_SPYRE_CODE"] = old_dump
         if old_sym is None:
             os.environ.pop("BUNDLE_SYMBOLIC_ARGS", None)
         else:

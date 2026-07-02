@@ -210,25 +210,6 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
   }
 }
 
-void SpyreStream::executeProgramAsync(
-    const KernelArtifacts& arts, const std::vector<at::Tensor>& args) const {
-  // NOTE: Maybe it's better/faster if we know the exact number of arguments
-  // as it is tracked inside KerntlArtifacts
-  std::vector<const flex::CompositeAddress*> tensor_allocs;
-  for (size_t i = 0; i < args.size(); ++i) {
-    auto* ctx = static_cast<SharedOwnerCtx*>(
-        args[i].storage().data_ptr().get_context());
-    tensor_allocs.push_back(&ctx->composite_addr);
-  }
-
-  // Program
-  auto* ctx = static_cast<SharedOwnerCtx*>(arts.device_alloc.get_context());
-  auto* params = flex::createComputeParams(
-      &ctx->composite_addr, std::move(tensor_allocs), arts.bundle_mlir_path);
-  launchCompute(params);
-  flex::destroyComputeParams(params);
-}
-
 void SpyreStream::launchH2D(flex::DmaParams* params) const {
   resolveRuntimeHandle()->launchOperationH2D(params);
 }
