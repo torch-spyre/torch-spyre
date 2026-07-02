@@ -30,8 +30,8 @@ to innermost.  For a single-level group this is a 1-element list ``[K]``.
 
 Entry point::
 
-    groups = hints_to_coarse_tile_groups(operations)
-    coarse_tile(operations, groups)
+    groups = hints_to_coarse_tile_groups(graph)
+    coarse_tile(graph, groups)
 
 ``groups`` is a list of ``(ops, levels)`` tuples where ``levels`` is a list of
 ``(hint_id, count, is_reduction_level)`` triples, outermost first.  Each op
