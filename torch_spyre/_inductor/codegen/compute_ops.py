@@ -548,7 +548,15 @@ def generate_sdsc(
             if tensor.arg_index >= 0:
                 # Kernel tensors: register the raw base address first so bundle.py
                 # can emit the input_arg function parameter.
-                raw_base = tensor.start_address
+                #
+                # On the symbolic path, tensor.start_address = arg_index + tile_offset_bytes,
+                # where tile_offset_bytes is the per-tile byte advance added by the loop
+                # unroller.  We always register the raw kernel symbol keyed by arg_index so
+                # that bundle.py emits exactly one !sdscbundle.input_arg parameter per logical
+                # tensor, regardless of how many tiles reference it.
+                raw_base = (
+                    tensor.arg_index
+                )  # raw sentinel; large HBM addr on nosym path
                 offset_as_symbol(
                     raw_base, SymbolKind.kernel(arg_index=tensor.arg_index)
                 )
@@ -558,17 +566,32 @@ def generate_sdsc(
                 # registered already by an earlier tensor in this SDSC, in which case
                 # the offset_as_symbol call above was a no-op.
                 kernel_sym_idx = abs(local_symbols[("kernel", tensor.arg_index)]) - 1
+                # tile_offset_bytes: on the symbolic path the loop unroller advances
+                # arg.allocation['hbm'] by i*stride for tile i, so start_address encodes
+                # arg_index + tile_offset.  On the nosym path start_address is the real
+                # HBM address and arg_index is a small integer — we skip this calculation
+                # by only accounting for the difference when it is non-negative and less
+                # than the start address (i.e. start_address ≥ arg_index always holds on
+                # both paths, but on nosym the difference would be the full HBM address).
+                # We detect the sym path via start_address == arg_index + non_negative_offset
+                # where the full difference is the tile_offset_bytes (could be 0 for tile 0).
+                tile_offset_bytes = tensor.start_address - tensor.arg_index
+                # total_slice_offset: combine the loop-unroll tile offset with any
+                # device-coordinate compile-time slice offset (e.g. from z0+3 expressions).
+                # This is the total compile-time offset above the raw %arg_N base that the
+                # sliced-base SSA value represents in bundle.mlir.
+                total_slice_offset = tile_offset_bytes + slice_offset_bytes
                 # sliced_base_sym_idx: the symbols[] index that per-core derived symbols
-                # reference.  When slice_offset_bytes == 0 the kernel sym IS the sliced
-                # base; otherwise a separate kernel_slice sym is registered next.
-                if slice_offset_bytes > 0:
+                # reference.  When total_slice_offset == 0 the kernel sym IS the sliced
+                # base; otherwise a kernel_slice sym is registered for the combined offset.
+                if total_slice_offset > 0:
                     offset_as_symbol(
                         core0_addr,
                         SymbolKind.kernel_slice(
-                            arg_index=tensor.arg_index, offset=slice_offset_bytes
+                            arg_index=tensor.arg_index, offset=total_slice_offset
                         ),
                     )
-                    slice_key = ("kernel_slice", tensor.arg_index, slice_offset_bytes)
+                    slice_key = ("kernel_slice", tensor.arg_index, total_slice_offset)
                     sliced_base_sym_idx = abs(local_symbols[slice_key]) - 1
                 else:
                     sliced_base_sym_idx = kernel_sym_idx
@@ -673,14 +696,17 @@ def generate_sdsc(
                 if is_pool_tensor:
                     key = ("pool", addr)
                 elif c == 0:
-                    # c==0: either ("kernel", arg_index) when no slice offset,
-                    # or ("kernel_slice", arg_index, offset_bytes) when a
-                    # compile-time offset was added.  Multiple slices of the same
-                    # arg at different offsets are distinguished by offset_bytes.
+                    # c==0: either ("kernel", arg_index) when no total slice offset,
+                    # or ("kernel_slice", arg_index, offset_bytes) when a compile-time
+                    # offset was added.  total_slice_offset combines the loop-unroll
+                    # tile offset (tensor.start_address - tensor.arg_index on sym path)
+                    # with any device-coordinate slice offset from tensor.offsets.
                     slice_offset_bytes = sum(tensor.offsets.values()) * nb
+                    tile_offset_bytes = tensor.start_address - tensor.arg_index
+                    total_slice_offset = tile_offset_bytes + slice_offset_bytes
                     key = (
-                        ("kernel_slice", tensor.arg_index, slice_offset_bytes)
-                        if slice_offset_bytes > 0
+                        ("kernel_slice", tensor.arg_index, total_slice_offset)
+                        if total_slice_offset > 0
                         else ("kernel", tensor.arg_index)
                     )
                 else:
@@ -689,6 +715,8 @@ def generate_sdsc(
                     # one address), no derived symbol was registered — reuse the
                     # sliced-base key used for c==0.
                     slice_offset_bytes = sum(tensor.offsets.values()) * nb
+                    tile_offset_bytes = tensor.start_address - tensor.arg_index
+                    total_slice_offset = tile_offset_bytes + slice_offset_bytes
                     core0_addr_lookup = (
                         tensor.start_address
                         + core_idx_to_slice_offset(
@@ -698,8 +726,8 @@ def generate_sdsc(
                     )
                     if addr == core0_addr_lookup:
                         key = (
-                            ("kernel_slice", tensor.arg_index, slice_offset_bytes)
-                            if slice_offset_bytes > 0
+                            ("kernel_slice", tensor.arg_index, total_slice_offset)
+                            if total_slice_offset > 0
                             else ("kernel", tensor.arg_index)
                         )
                     else:
