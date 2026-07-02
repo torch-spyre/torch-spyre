@@ -309,13 +309,13 @@ laid out in device memory.
 Compilation
 -----------
 
-Spyre models are compiled using ``torch.compile`` with the ``"spyre"``
-backend:
+Spyre models are compiled using ``torch.compile``. Inductor routes to
+the Spyre backend automatically when the model is on a Spyre device:
 
 .. code-block:: python
 
    model = MyModel().to("spyre")
-   compiled = torch.compile(model, backend="spyre")
+   compiled = torch.compile(model)
    output = compiled(inputs)
 
 See :doc:`../user_guide/running_models` for details and
