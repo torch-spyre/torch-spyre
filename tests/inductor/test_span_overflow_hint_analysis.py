@@ -507,6 +507,9 @@ class TestSpanOverflowLargeShapeContract(InductorTestCase):
                     self.assertEqual(manual_groups[0][1][0][1], sympy.Integer(5))
                     self.assertEqual(auto_groups[0][1][0][1], sympy.Integer(5))
                     self.assertEqual(manual_groups[0][1][0][1], sympy.Integer(5))
+                    # Span-overflow tiling is always an output dim (never reduction).
+                    self.assertFalse(auto_op.dim_hints[0].is_reduction)
+                    self.assertFalse(manual_op.dim_hints[0].is_reduction)
                     self.assertEqual(auto_op.dim_hints[0].loop_var, sympy.Symbol("h"))
                     self.assertEqual(manual_op.dim_hints[0].loop_var, sympy.Symbol("h"))
 
