@@ -891,11 +891,13 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         """Lk loop level not dropped when Lk-broadcast ops appear first in group.
 
         Flash-attention-style code with nested hints {B:1}/{H:4}/{Lk:2}.
-        Ops like amax/exp/sum have shape [B,H,Lq] — no Lk dimension — and
-        appear before Lk-iterating ops in topological order.  The old
-        _hints_levels returned early from one of those ops and dropped Lk.
-        The fixed version unions loop_var assignments and finds Lk from a
-        later op in the group.
+        The B=1 hint tiles by 1 and is optimised away (no loop generated),
+        leaving two effective loop levels: H and Lk.  Ops like amax/exp/sum
+        have shape [B,H,Lq] — no Lk dimension — and appear before
+        Lk-iterating ops in topological order.  The old _hints_levels
+        returned early from one of those ops and dropped Lk.  The fixed
+        version unions loop_var assignments and finds Lk from a later op
+        in the group.
         """
         import math
         from torch_spyre._inductor import spyre_hint
@@ -1040,11 +1042,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     def test_hint_flash_attention_two_loop_levels(self):
         """Flash-attention graph: both H and Lk loop levels survive into codegen.
 
-        With nested hints {B:1}/{H:4}/{Lk:2}, the generated LoopSpec must carry
-        both count=sympify('4') for H and count=sympify('2') for Lk.  Before the
-        _stamp_group per-op dispatch fix, Lk tiling was silently skipped for ops
-        where the group-wide is_reduction_level flag disagreed with the op's own
-        dim role.
+        Nested hints {B:1}/{H:4}/{Lk:2} — B=1 tiles by 1 and is optimised
+        away (no loop generated), leaving two effective loop levels: H and Lk.
+        The generated LoopSpec must carry both count=sympify('4') for H and
+        count=sympify('2') for Lk.  Before the _stamp_group per-op dispatch
+        fix, Lk tiling was silently skipped for ops where the group-wide
+        is_reduction_level flag disagreed with the op's own dim role.
         """
         import math
         from torch_spyre._inductor import spyre_hint
