@@ -1,0 +1,367 @@
+test_suite_config:
+
+  files:
+    - path: ${TORCH_ROOT}/test/nn/test_convolution.py
+      unlisted_test_mode: skip
+      tests:
+        # These tests exercise various convolution and transposed convolution operations across different dimensions (1D, 2D, 3D) with different data types (float16, float32, bfloat16).
+        # They are classified as xfail on the Spyre backend due to unsupported operations or missing features, such as type conversion during tensor copying, unsupported memory formats, and unimplemented convolution overrides.
+        # The most relevant Spyre capabilities or limitations include the lack of support for non-contiguous memory formats, certain type conversions, and incomplete implementation of convolution operations for non-CPU/CUDA/MKLDNN backends.
+        - names:
+            - TestConvolutionNNDeviceType::test_Conv2d_depthwise_naive_groups
+            - TestConvolutionNNDeviceType::test_Conv2d_deterministic_cudnn
+            - TestConvolutionNNDeviceType::test_Conv2d_large_workspace
+            - TestConvolutionNNDeviceType::test_Conv2d_naive_groups
+            - TestConvolutionNNDeviceType::test_Conv2d_size_1_kernel
+            - TestConvolutionNNDeviceType::test_Conv3d_depthwise_naive_groups
+            - TestConvolutionNNDeviceType::test_ConvTranspose2d_large_output_padding
+            - TestConvolutionNNDeviceType::test_ConvTranspose2d_size_1_kernel
+            - TestConvolutionNNDeviceType::test_contig_wrong_stride_cudnn
+            - TestConvolutionNNDeviceType::test_conv1d_same_padding
+            - TestConvolutionNNDeviceType::test_conv1d_same_padding_backward
+            - TestConvolutionNNDeviceType::test_conv1d_valid_padding
+            - TestConvolutionNNDeviceType::test_conv1d_valid_padding_backward
+            - TestConvolutionNNDeviceType::test_conv2d_no_grad
+            - TestConvolutionNNDeviceType::test_conv2d_same_padding
+            - TestConvolutionNNDeviceType::test_conv2d_same_padding_backward
+            - TestConvolutionNNDeviceType::test_conv2d_valid_padding
+            - TestConvolutionNNDeviceType::test_conv2d_valid_padding_backward
+            - TestConvolutionNNDeviceType::test_conv3d_cudnn_backward_broken
+            - TestConvolutionNNDeviceType::test_conv3d_cudnn_broken
+            - TestConvolutionNNDeviceType::test_conv3d_same_padding
+            - TestConvolutionNNDeviceType::test_conv3d_valid_padding
+            - TestConvolutionNNDeviceType::test_convTranspose_empty
+            - TestConvolutionNNDeviceType::test_conv_aten_invalid_output_mask
+            - TestConvolutionNNDeviceType::test_conv_backend
+            - TestConvolutionNNDeviceType::test_conv_cudnn_ndhwc
+            - TestConvolutionNNDeviceType::test_conv_cudnn_nhwc
+            - TestConvolutionNNDeviceType::test_conv_double_backward_strided_with_3D_input_and_weight
+            - TestConvolutionNNDeviceType::test_conv_empty_channel
+            - TestConvolutionNNDeviceType::test_conv_noncontig_weights
+            - TestConvolutionNNDeviceType::test_conv_noncontig_weights_and_bias
+            - TestConvolutionNNDeviceType::test_conv_thnn_nhwc
+            - TestConvolutionNNDeviceType::test_conv_transpose_with_output_size_and_no_batch_dim
+            - TestConvolutionNNDeviceType::test_convert_conv2d_weight_memory_format
+            - TestConvolutionNNDeviceType::test_convert_conv3d_weight_memory_format
+            - TestConvolutionNNDeviceType::test_cudnn_convolution_add_relu
+            - TestConvolutionNNDeviceType::test_cudnn_convolution_relu
+            - TestConvolutionNNDeviceType::test_group_convTranspose_empty
+            - TestConvolutionNNDeviceType::test_noncontig_conv_grad
+          mode: xfail  # xfail: dxp_standalone not detected
+        # These tests exercise group convolution operations with empty tensors, which are not fully supported on the Spyre backend.
+        # They are classified as xfail due to a RuntimeError caused by unsupported tensor shapes or dimensions.
+        # The relevant Spyre limitation is the incomplete support for certain tensor operations and shapes.
+        - names:
+            - TestConvolutionNNDeviceType::test_group_conv_empty
+          mode: xfail  # xfail: RuntimeError
+        - names:
+            - TestConvolutionNNDeviceType::test_ConvTranspose3d_size_1_kernel
+            - TestConvolutionNN::test_Conv1d_module_same_padding
+            - TestConvolutionNN::test_Conv2d_1x1
+            - TestConvolutionNN::test_Conv2d_OneDNN
+            - TestConvolutionNN::test_Conv2d_backward_twice
+            - TestConvolutionNN::test_Conv2d_groups_nobias
+            - TestConvolutionNN::test_Conv2d_groups_nobias_v2
+            - TestConvolutionNN::test_Conv2d_inconsistent_types
+            - TestConvolutionNN::test_Conv2d_inconsistent_types_on_GPU_with_cudnn
+            - TestConvolutionNN::test_Conv2d_inconsistent_types_on_GPU_without_cudnn
+            - TestConvolutionNN::test_Conv2d_missing_argument
+            - TestConvolutionNN::test_Conv2d_module_same_padding
+            - TestConvolutionNN::test_Conv3d_groups_nobias
+            - TestConvolutionNN::test_Conv3d_groups_wbias
+            - TestConvolutionNN::test_Conv3d_module_same_padding
+            - TestConvolutionNN::test_ConvTranspose2d_half_cublas_gemm
+            - TestConvolutionNN::test_ConvTranspose2d_output_size
+            - TestConvolutionNN::test_ConvTranspose2d_output_size_downsample_upsample
+            - TestConvolutionNN::test_ConvTranspose3d_correct_output_size
+            - TestConvolutionNN::test_conv1d_issue_120547
+            - TestConvolutionNN::test_conv2d_discontiguous_weight
+            - TestConvolutionNN::test_conv3d_issue_120406
+            - TestConvolutionNN::test_conv3d_overflow_values
+            - TestConvolutionNN::test_conv_aten_invalid_groups
+            - TestConvolutionNN::test_conv_backcompat
+            - TestConvolutionNN::test_conv_cudnn_memory_layout_dominance
+            - TestConvolutionNN::test_conv_invalid_groups
+            - TestConvolutionNN::test_conv_modules_raise_error_on_incorrect_input_size
+            - TestConvolutionNN::test_conv_padding_mode
+            - TestConvolutionNN::test_conv_shapecheck
+            - TestConvolutionNN::test_conv_tbc
+            - TestConvolutionNN::test_cudnn_non_contiguous
+            - TestConvolutionNN::test_cudnn_noncontiguous_weight
+            - TestConvolutionNN::test_cudnn_not_mutate_stride
+            - TestConvolutionNN::test_functional_grad_conv
+            - TestConvolutionNN::test_functional_grad_conv2d
+            - TestConvolutionNN::test_grad_conv1d_input
+            - TestConvolutionNN::test_grad_conv1d_weight
+            - TestConvolutionNN::test_grad_conv2d_input
+            - TestConvolutionNN::test_grad_conv2d_weight
+            - TestConvolutionNN::test_grad_conv3d_input
+            - TestConvolutionNN::test_grad_conv3d_weight
+            - TestConvolutionNN::test_grouped_conv_cudnn_nhwc_support
+            - TestConvolutionNN::test_huge_padding
+            - TestConvolutionNN::test_invalid_conv1d
+            - TestConvolutionNN::test_invalid_conv2d
+            - TestConvolutionNN::test_invalid_conv3d
+            - TestConvolutionNN::test_mismatch_shape_conv2d
+            - TestConvolutionNN::test_nnpack_conv
+            - TestConvolutionNN::test_permute_conv2d_issue_120211
+            - TestConvolutionNN::test_thnn_conv_strided_padded_dilated
+            - TestConvolutionNNDeviceType::test_conv1d_vs_scipy
+            - TestConvolutionNNDeviceType::test_conv2d_vs_scipy
+            - TestConvolutionNNDeviceType::test_conv3d_64bit_indexing
+            - TestConvolutionNNDeviceType::test_conv3d_vs_scipy
+            - TestConvolutionNNDeviceType::test_conv_contiguous_for_oneDNN
+            - TestConvolutionNNDeviceType::test_conv_cudnn_nhwc_support
+            - TestConvolutionNNDeviceType::test_conv_double_backward_groups
+            - TestConvolutionNNDeviceType::test_conv_double_backward_no_bias
+            - TestConvolutionNNDeviceType::test_conv_double_backward_stride
+            - TestConvolutionNNDeviceType::test_conv_ic1_channels_last_for_oneDNN
+            - TestConvolutionNNDeviceType::test_conv_large
+            - TestConvolutionNNDeviceType::test_conv_large_batch_1
+            - TestConvolutionNNDeviceType::test_conv_large_nosplit
+            - TestConvolutionNNDeviceType::test_conv_transposed_large
+            - TestConvolutionNNDeviceType::test_depthwise_conv_64bit_indexing
+          mode: skip  # does not engage the torch-spyre layer
+
+  global:
+    supported_dtypes:
+      - name: bfloat16
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype

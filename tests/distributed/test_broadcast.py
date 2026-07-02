@@ -44,11 +44,6 @@ except ValueError:
         allow_module_level=True,
     )
 
-# ------------
-# Temporary hack
-torch.spyre._impl._lazy_init()
-# ------------
-
 DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
 C10D_BACKEND = "spyreccl"
 
@@ -195,11 +190,11 @@ class TestBroadcast(TestCase):
             return
 
         invalid_root = self.comm_size + 10  # Invalid rank (out of bounds)
-        x = torch.ones(10, dtype=torch.float32, device=DEVICE)
-
         # This should raise an error
         with self.assertRaises(Exception):
-            dist.broadcast(x, invalid_root)
+            self._test_broadcast_helper(
+                shape=(10,), dtype=torch.float32, root=invalid_root, fill_value=1.0
+            )
 
 
 if __name__ == "__main__":

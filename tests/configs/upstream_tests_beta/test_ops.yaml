@@ -1,0 +1,532 @@
+test_suite_config:
+
+  files:
+    - path: ${TORCH_ROOT}/test/test_ops.py
+      unlisted_test_mode: skip
+      tests:
+        # These tests exercise sparse operations and Python reference errors, focusing on unsupported dtypes and tensor rank limitations.
+        # They are classified as mandatory_success because they must pass to ensure compatibility with the Spyre backend.
+        # Relevant Spyre limitations include unsupported dtypes like Double and tensor ranks exceeding 65.
+        - names:
+            - TestCommon::test_errors_sparse
+            - TestCommon::test_python_ref_errors
+            - TestCommon::test_meta_consistency_out_dtype_mismatch # excludes not working
+            - TestCommon::test_out_requires_grad_error # excludes not working
+            - TestCompositeCompliance::test_cow_input # excludes not working
+            - TestCompositeCompliance::test_view_replay # excludes not working
+            - TestFakeTensor::test_fake # excludes not working
+            - TestFakeTensor::test_fake_autocast # excludes not working
+            - TestFakeTensor::test_pointwise_ops # excludes not working
+            - TestCommon::test_errors_sparse # excludes not working
+            - TestTags::test_tags # excludes not working 
+          mode: xfail
+        # These tests exercise operations like `add`, `addmm`, `bmm`, and `clamp` with various dtypes including `bool`, `int64`, and `float16`.
+        # They are classified as `mandatory_success` because the Spyre backend must support these operations for full compatibility.
+        # The most relevant Spyre limitations are the lack of support for `requires_grad=True` with boolean and integral dtypes, and errors related to missing files or unsupported operators.
+        # - names:
+        #     - TestCompositeCompliance::test_cow_input # excludes not working
+        #   mode: mandatory_success
+        #   edits:
+        #     ops:
+        #       exclude:
+        #         - name: add
+        #         - name: addmm
+        #         - name: bitwise_and
+        #         - name: bitwise_not
+        #         - name: bmm
+        #         - name: cat
+        #         - name: ceil
+        #         - name: clamp
+        #         - name: clamp_max
+        #         - name: clamp_min
+        #         - name: clone
+        #         - name: constant_pad_nd
+        #         - name: logical_not
+        #         - name: maximum
+        #         - name: mean
+        #         - name: minimum
+        #         - name: mm
+        #         - name: mul
+        #         - name: new_ones
+        #         - name: sign
+        #         - name: sub
+        #         - name: topk
+        #         - name: where
+        #     dtypes:
+        #       exclude:
+        #         - name: bool
+        #         - name: float32
+        # These tests exercise tensor view operations and metadata consistency across various ops and dtypes.
+        # They are classified as mandatory_success due to the critical nature of view operations in tensor manipulation.
+        # Spyre's limitations in handling certain ops and dtypes, such as unsupported random ops and dtype conversions, are relevant.
+        # - names:
+        #     - TestCompositeCompliance::test_view_replay # excludes not working
+        #   mode: mandatory_success
+        #   edits:
+        #     ops:
+        #       exclude:
+        #         - name: add
+        #         - name: addmm
+        #         - name: bitwise_and
+        #         - name: bitwise_not
+        #         - name: bmm
+        #         - name: cat
+        #         - name: ceil
+        #         - name: clamp
+        #         - name: clamp_max
+        #         - name: clamp_min
+        #         - name: clone
+        #         - name: constant_pad_nd
+        #         - name: logical_not
+        #         - name: maximum
+        #         - name: mean
+        #         - name: minimum
+        #         - name: mm
+        #         - name: mul
+        #         - name: new_ones
+        #         - name: sign
+        #         - name: sub
+        #         - name: topk
+        #         - name: where
+        #     dtypes:
+        #       exclude:
+        #         - name: bfloat16
+        #         - name: float16
+        #         - name: int64
+        # These tests exercise various tensor operations (ops) and data types (dtypes) to verify compatibility with the Spyre backend.
+        # They are classified as mandatory_success because the Spyre backend must support these operations for basic functionality.
+        # Relevant Spyre limitations include unsupported memory formats and missing implementations for certain ops like 'cat', 'clamp', and 'where'.
+        # - names:
+        #     - TestFakeTensor::test_fake # excludes not working
+        #   mode: mandatory_success
+        #   edits:
+        #     ops:
+        #       exclude:
+        #         - name: cat
+        #         - name: clamp
+        #         - name: where
+        #     dtypes:
+        #       exclude:
+        #         - name: bfloat16
+        #         - name: int64
+        #         - name: bool
+        # These tests exercise autocasting behavior with various ops and dtypes, focusing on tensor operations.
+        # They are classified as mandatory_success due to Spyre's strict memory format requirements and limited operator support.
+        # Relevant Spyre limitations include unsupported 'cat', 'clamp', and 'where' ops, and restricted dtype support for 'float16' and 'float32'.
+        # - names:
+        #     - TestFakeTensor::test_fake_autocast # excludes not working
+        #   mode: mandatory_success
+        #   edits:
+        #     ops:
+        #       exclude:
+        #         - name: cat
+        #         - name: clamp
+        #         - name: where
+        #     dtypes:
+        #       exclude:
+        #         - name: bfloat16
+        #         - name: int64
+        #         - name: bool
+        # These tests exercise pointwise operations on tensors, including addition, multiplication, and logical operations.
+        # They are classified as mandatory_success because the Spyre backend must support these fundamental operations.
+        # The relevant Spyre limitations include unsupported dtypes (float16, float32) and specific ops (cat, clamp, where).
+        # - names:
+        #     - TestFakeTensor::test_pointwise_ops # excludes not working
+        #   mode: mandatory_success
+        #   edits:
+        #     ops:
+        #       exclude:
+        #         - name: cat
+        #         - name: clamp
+        #         - name: where
+        #     dtypes:
+        #       exclude:
+        #         - name: bfloat16
+        #         - name: int64
+        #         - name: bool
+        # These tests exercise the `full` and `ones` ops with various dtypes, focusing on tensor layout conversion to strided.
+        # They are classified as mandatory_success due to Spyre's support for strided layout conversion with most dtypes.
+        # Relevant Spyre limitations include unsupported type conversions during copy and missing `dxp_standalone` for float16 ops.
+        # - names:
+        #     - TestFakeTensor::test_strided_layout # excludes not working
+        #   mode: mandatory_success
+        #   edits:
+        #     ops:
+        #       exclude:
+        #         - name: add
+        #         - name: addmm
+        #         - name: bitwise_and
+        #         - name: bitwise_not
+        #         - name: bmm
+        #         - name: cat
+        #         - name: ceil
+        #         - name: clamp
+        #         - name: clamp_max
+        #         - name: clamp_min
+        #         - name: clone
+        #         - name: constant_pad_nd
+        #         - name: logical_not
+        #         - name: maximum
+        #         - name: mean
+        #         - name: minimum
+        #         - name: mm
+        #         - name: mul
+        #         - name: new_ones
+        #         - name: sign
+        #         - name: sub
+        #         - name: topk
+        #         - name: where
+        #     dtypes:
+        #       exclude:
+        #         - name: bfloat16
+        #         - name: float16
+        #         - name: int64
+        # These tests exercise a variety of operations and data types, including unsupported bitwise and reduction ops.
+        # They are classified as mandatory_success due to Spyre's limitations in handling certain operations and data types.
+        # Relevant Spyre limitations include unsupported ops like bitwise_and and topk, and memory format constraints.
+        # - names:
+        #     - TestTags::test_tags 
+        #   mode: mandatory_success
+        #   edits:
+        #     ops:
+        #       exclude:
+        #         - name: add
+        #         - name: addmm
+        #         - name: bitwise_and
+        #         - name: bitwise_not
+        #         - name: bmm
+        #         - name: cat
+        #         - name: ceil
+        #         - name: clamp
+        #         - name: clamp_max
+        #         - name: clamp_min
+        #         - name: clone
+        #         - name: constant_pad_nd
+        #         - name: logical_not
+        #         - name: maximum
+        #         - name: mean
+        #         - name: minimum
+        #         - name: mm
+        #         - name: mul
+        #         - name: new_ones
+        #         - name: sign
+        #         - name: sub
+        #         - name: topk
+        #         - name: where
+        #     dtypes:
+        #       exclude:
+        #         - name: float16
+        #         - name: float32
+        # These tests exercise a variety of operations and data types, including matrix multiplications, reductions, and tensor manipulations.
+        # They are classified as xfail due to unsupported operations and data types, as well as missing files like 'dxp_standalone'.
+        # Relevant Spyre limitations include unsupported operations like batchmatmul and reductions on certain data types, and file system dependencies.
+        - names:
+            - TestCommon::test_out_requires_grad_error
+            - TestCommon::test_errors
+            - TestCommon::test_compare_cpu
+            - TestCommon::test_python_ref_executor
+          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
+        # These tests exercise a wide range of operations and dtypes, including complex and half-precision tensors.
+        # They are classified as xfail due to unknown issues with the Spyre backend, likely related to unsupported or partially supported operations and dtypes.
+        # Relevant Spyre limitations include incomplete support for complex dtypes, half-precision operations, and certain tensor behaviors.
+        - names:
+            - TestCommon::test_complex_half_reference_testing
+            - TestCommon::test_python_ref_torch_fallback
+            - TestFakeTensor::test_fake_crossref_backward_amp
+            - TestFakeTensor::test_fake_crossref_backward_no_amp
+            - TestForwardADWithScalars::test_0d_tensor_with_python_scalar
+          mode: xfail  # xfail: dxp_standalone not detected
+        # These tests exercise various operations (e.g., add, addmm, bitwise_and) across different dtypes.
+        # They are classified as xfail due to unsupported dtypes and type conversion limitations on Spyre.
+        # Relevant Spyre limitations include incomplete dtype support and type conversion during tensor operations.
+        - names:
+            - TestCommon::test_dtypes
+          mode: xfail  # xfail: AssertionError, RecursionError, RuntimeError
+        # These tests exercise a variety of operations and data types, including non-standard boolean values, non-contiguous tensors, and eager variant consistency.
+        # The tests are classified as xfail due to NotImplementedError, RuntimeError, and torch._inductor.exc.InductorError exceptions.
+        # Relevant Spyre limitations include unsupported operations, missing files, and non-contiguous memory formats.
+        - names:
+            - TestCommon::test_non_standard_bool_values
+            - TestCommon::test_noncontiguous_samples
+            - TestCommon::test_variant_consistency_eager
+            - TestCompositeCompliance::test_operator
+          mode: xfail  # xfail: NotImplementedError, RuntimeError, torch._inductor.exc.InductorError
+        # These tests exercise various operations (e.g., clone, cat, clamp) across different dtypes (e.g., bfloat16, bool, float16, int64).
+        # They are classified as xfail due to NotImplementedError and InductorError, indicating unsupported operations or backend limitations.
+        # Relevant Spyre limitations include missing support for certain ops and dtypes, and errors related to file handling and unexpected expressions.
+        - names:
+            - TestCommon::test_numpy_ref
+            - TestCommon::test_out
+            - TestCommon::test_out_warning
+          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
+        # These tests exercise various operations (add, addmm, bmm, etc.) with different dtypes (bool, int64, bfloat16, etc.).
+        # They are classified as xfail due to unsupported dtypes (bool, int64) and missing features like `requires_grad=True`.
+        # Relevant Spyre limitations include lack of support for boolean and integral dtypes in gradient computations.
+        - names:
+            - TestCompositeCompliance::test_backward
+            - TestCompositeCompliance::test_forward_ad
+          mode: xfail  # xfail: NotImplementedError, ValueError, torch._inductor.exc.InductorError
+        # These tests exercise various operations (add, addmm, bmm, etc.) with different dtypes (bool, int64, bfloat16, etc.).
+        # They are classified as xfail due to Spyre's limitations in handling certain dtypes and operations, such as unsupported `requires_grad` for boolean and integral dtypes.
+        # Relevant Spyre limitations include missing support for some ops (e.g., bitwise_and, random_) and dtypes (e.g., BFloat16 for bitwise_xor_cpu).
+        - names:
+            - TestMathBits::test_neg_view
+            - TestMathBits::test_conj_view
+            - TestMathBits::test_neg_conj_view
+          mode: xfail  # xfail: NotImplementedError, RuntimeError, ValueError, torch._inductor.exc.InductorError
+        # These tests exercise a wide range of PyTorch operations across various data types, ensuring compatibility and correctness on the IBM Spyre AI accelerator backend.
+        # They are classified as "skip" because they do not engage the torch-spyre layer, focusing instead on core PyTorch functionality and device management.
+        # The most relevant Spyre capabilities include support for specific data types and operations, such as bfloat16, bool, float16, float32, int64, and a subset of PyTorch operations like add, addmm, bitwise_and, bitwise_not, bmm, cat, ceil, clamp, clamp_max, clamp_min, clone, constant_pad_nd, convolution, copy_, full, gelu, layer_norm, linear, logical_not, max, maximum, mean, min, minimum, mm, mul, new_ones, ones, rms_norm, sign, softplus, sub, topk, and where.
+        - names:
+            - TestCommon::test_python_ref_meta
+            - TestCommon::test_python_ref
+            - TestCommon::test_multiple_devices
+            - TestCommon::test_pointwise_tag_coverage
+            - TestCommon::test_reduction_tag_coverage
+            - TestRefsOpsInfo::test_refs_are_in_decomp_table
+            - TestRefsOpsInfo::test_refs_are_in_python_ref_db
+            - TestSelfKwarg::test_self_kwargs
+          mode: skip  # does not engage the torch-spyre layer
+
+  global:
+    supported_dtypes:
+      - name: bfloat16
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype

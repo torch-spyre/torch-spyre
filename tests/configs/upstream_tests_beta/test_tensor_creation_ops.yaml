@@ -1,10 +1,253 @@
 test_suite_config:
+
   files:
     - path: ${TORCH_ROOT}/test/test_tensor_creation_ops.py
       unlisted_test_mode: skip
       tests:
+        # These tests exercise tensor creation and manipulation operations across various dtypes and tensor behaviors.
+        # They are classified as mandatory_success because they validate core functionalities essential for tensor operations on the Spyre backend.
+        # Relevant Spyre capabilities include support for bfloat16, bool, float16, float32, and int64 dtypes, and operations like cat, clone, and new_empty_strided.
         - names:
+            - TestAsArray::test_copy_list
             - TestAsArray::test_unsupported_alias
+            - TestRandomTensorCreation::test_normal_std_error
+            - TestTensorCreation::test_arange_device_vs_cpu
+            - TestTensorCreation::test_as_strided_neg
+            - TestTensorCreation::test_cat_mem_overlap
+            - TestTensorCreation::test_cat_stack_cross_devices
+            - TestTensorCreation::test_empty_strided
+            - TestTensorCreation::test_empty_tensor_props
+            - TestTensorCreation::test_linlogspace_mem_overlap
+            - TestTensorCreation::test_new_empty_strided
+            - TestTensorCreation::test_offset_scalar_cast
+            - TestTensorCreation::test_simple_scalar_cast
+            - TestTensorCreation::test_storage_filename
+            - TestTensorCreation::test_strided_mismatched_stride_shape
+            - TestTensorCreation::test_torch_complex_floating_dtype_error
+            - TestTensorCreation::test_torch_complex_out_dtype_error
+            - TestTensorCreation::test_unpack_double
+            - TestTensorCreation::test_vander
+            - TestTensorCreation::test_zeros_dtype_layout_device_match
+          mode: mandatory_success
+        # These tests exercise the `dsplit` operation with different dtypes, focusing on tensor splitting behaviors.
+        # They are classified as `mandatory_success` because the Spyre backend must support `dsplit` for all relevant dtypes.
+        # The relevant Spyre capability is the exclusion of `int64` dtype due to backend limitations.
+        - names:
+            - TestTensorCreation::test_dsplit
+          mode: mandatory_success
+          edits:
+            dtypes:
+              exclude:
+                - name: int64
+        # These tests verify the behavior of float-to-int conversion, including handling of non-finite values.
+        # They are classified as mandatory_success due to the expected NotImplementedError and TypeError.
+        # The failure with int64 dtype highlights Spyre's current limitation in handling this specific conversion.
+        - names:
+            - TestTensorCreation::test_float_to_int_conversion_nonfinite
+          mode: mandatory_success
+          edits:
+            dtypes:
+              exclude:
+                - name: int64
+        # These tests exercise the `hsplit` operation with different dtypes, focusing on tensor splitting behaviors.
+        # They are classified as `mandatory_success` due to the expectation that `hsplit` should work across supported dtypes.
+        # The relevant Spyre capability is its support for tensor operations, but it currently lacks support for `int64` dtypes.
+        - names:
+            - TestTensorCreation::test_hsplit
+          mode: mandatory_success
+          edits:
+            dtypes:
+              exclude:
+                - name: int64
+        # These tests exercise the `vsplit` operation with different dtypes, focusing on tensor splitting behaviors.
+        # They are classified as `mandatory_success` due to the expectation that all supported dtypes should pass.
+        # The relevant Spyre limitation is the lack of support for `int64` dtype, causing `NotImplementedError`.
+        - names:
+            - TestTensorCreation::test_vsplit
+          mode: mandatory_success
+          edits:
+            dtypes:
+              exclude:
+                - name: int64
+        - names:
+            - TestTensorCreation::test_cat_trailing_dim
+            - TestAsArray::test_retain_autograd_history
+          mode: mandatory_success
+          edits:
+            dtypes:
+              exclude:
+                - name: bfloat16
+                - name: bool
+                - name: float16
+                - name: int64
+        # These tests exercise tensor aliasing and copying from buffer and numpy sources across various dtypes.
+        # They are classified as xfail due to Spyre's lack of support for direct tensor-to-numpy conversion and missing 'aten::random_.from' op.
+        # Relevant Spyre limitations include unsupported dtype conversions and missing operators for tensor manipulation.
+        - names:
+            - TestAsArray::test_alias_from_buffer
+            - TestAsArray::test_alias_from_numpy
+            - TestAsArray::test_copy_from_buffer
+            - TestAsArray::test_copy_from_numpy
+            - TestBufferProtocol::test_non_writable_buffer
+          mode: xfail  # xfail: NotImplementedError, TypeError
+        # # These tests exercise the `aten::random_.from` operator with various dtypes, including bfloat16 and int64.
+        # # They are classified as xfail due to the Spyre backend not supporting the `aten::random_.from` operator.
+        # # The primary limitation is the lack of support for this operator in the Spyre backend.
+        # - names:
+        #     - TestAsArray::test_alias_from_dlpack
+        #   mode: xfail  # xfail: NotImplementedError
+        # These tests exercise tensor aliasing and DLPack tensor conversion across various dtypes.
+        # They are classified as xfail due to missing support for 'aten::random_.from' and incorrect SpyreTensorLayout.
+        # Relevant Spyre limitations include incomplete operator coverage and tensor layout validation.
+        - names:
+            - TestAsArray::test_alias_from_tensor
+            - TestAsArray::test_copy_from_dlpack
+          mode: xfail  # xfail: NotImplementedError, RuntimeError
+        # These tests exercise tensor copying operations across various dtypes, including unsupported ones like bfloat16 and bool.
+        # They are classified as xfail due to Spyre's lack of support for certain dtypes and operators, such as 'aten::random_.from'.
+        # Relevant Spyre limitations include missing support for specific dtypes and operators, leading to NotImplementedError and InductorError.
+        - names:
+            - TestAsArray::test_copy_tensor
+          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
+        # These tests exercise tensor creation and manipulation operations across various dtypes and memory formats.
+        # They are classified as xfail due to unsupported dtypes (Double, ComplexHalf, ComplexFloat) and memory formats (ChannelsLast).
+        # Relevant Spyre limitations include incomplete dtype support and restricted memory format handling.
+        - names:
+            - TestAsArray::test_default_device
+            - TestLikeTensorCreation::test_full_like_inference
+            - TestLikeTensorCreation::test_ones_like
+            - TestLikeTensorCreation::test_zeros_like
+            - TestRandomTensorCreation::test_random_neg_values
+            - TestTensorCreation::test_arange_lowp
+            - TestTensorCreation::test_cat_out_memory_format
+            - TestTensorCreation::test_combinations
+            - TestTensorCreation::test_complex_type_conversions
+            - TestTensorCreation::test_ctor_with_numpy_array
+            - TestTensorCreation::test_fill_all_dtypes_and_devices
+            - TestTensorCreation::test_from_file
+            - TestTensorCreation::test_refs_tensor
+            - TestTensorCreation::test_tensor_from_sequence
+            - TestTensorCreation::test_torch_complex
+            - TestTensorCreation::test_torch_polar
+          mode: xfail  # xfail: RuntimeError
+        # These tests exercise various tensor creation and manipulation operations, including concatenation, stacking, and random tensor generation.
+        # They are classified as xfail due to unsupported operations and data types, as well as missing dependencies like 'dxp_standalone'.
+        # Relevant Spyre limitations include unsupported stick expressions, data formats, and missing executable files.
+        - names:
+            - TestRandomTensorCreation::test_normal
+            - TestTensorCreation::test_block_diag
+            - TestTensorCreation::test_cartesian_prod
+            - TestTensorCreation::test_cat
+            - TestTensorCreation::test_cat_all_dtypes_and_devices
+            - TestTensorCreation::test_cat_empty
+            - TestTensorCreation::test_cat_empty_legacy
+            - TestTensorCreation::test_cat_in_channels_last
+            - TestTensorCreation::test_cat_misaligned
+            - TestTensorCreation::test_cat_multi_batch
+            - TestTensorCreation::test_cat_out
+            - TestTensorCreation::test_cat_preserve_channels_last
+            - TestTensorCreation::test_cat_size1
+            - TestTensorCreation::test_diag_embed
+            - TestTensorCreation::test_diagflat
+            - TestTensorCreation::test_dstack
+            - TestTensorCreation::test_hstack_column_stack
+            - TestTensorCreation::test_vander_types
+            - TestTensorCreation::test_vstack_row_stack
+          mode: xfail  # xfail: torch._inductor.exc.InductorError
+        # These tests exercise the buffer protocol with various dtypes, including bool, float16, float32, and int64.
+        # They are classified as xfail due to NotImplementedError and TorchRuntimeError, indicating missing or unsupported ops.
+        # The relevant Spyre limitations include lack of support for 'aten::random_.from' and fake tensor operations.
+        - names:
+            - TestBufferProtocol::test_shared_buffer
+          mode: xfail  # xfail: NotImplementedError, torch._dynamo.exc.TorchRuntimeError
+        # These tests exercise various tensor creation and manipulation operations, including random number generation, concatenation, and tensor shape operations.
+        # They are classified as xfail on the Spyre backend due to missing or unimplemented operators, such as `resize_`, `random_`, and `linspace.out`.
+        # The most relevant Spyre limitations include the lack of support for certain tensor operations and the need for additional hooks to be registered and implemented.
+        - names:
+            - TestTensorCreation::test_meshgrid_vs_numpy
+            - TestLikeTensorCreation::test_rand_like
+            - TestLikeTensorCreation::test_randint_like
+            - TestLikeTensorCreation::test_randn_like
+            - TestRandomTensorCreation::test_rand
+            - TestRandomTensorCreation::test_randint_distribution
+            - TestRandomTensorCreation::test_randn
+            - TestTensorCreation::test_cat2
+            - TestTensorCreation::test_device_rounding
+            - TestTensorCreation::test_eye
+            - TestTensorCreation::test_full_out
+            - TestTensorCreation::test_large_linspace
+            - TestTensorCreation::test_linspace
+            - TestTensorCreation::test_linspace_deduction
+            - TestTensorCreation::test_linspace_vs_numpy
+            - TestTensorCreation::test_logspace
+            - TestTensorCreation::test_logspace_base2
+            - TestTensorCreation::test_logspace_deduction
+            - TestTensorCreation::test_logspace_vs_numpy
+            - TestTensorCreation::test_meshgrid_default_indexing
+            - TestTensorCreation::test_meshgrid_ij_indexing
+            - TestTensorCreation::test_meshgrid_xy_indexing
+            - TestTensorCreation::test_new_methods_requires_grad
+            - TestTensorCreation::test_ones
+            - TestTensorCreation::test_random
+            - TestTensorCreation::test_random_bool
+            - TestTensorCreation::test_random_default
+            - TestTensorCreation::test_random_from_to
+            - TestTensorCreation::test_random_from_to_bool
+            - TestTensorCreation::test_random_full_range
+            - TestTensorCreation::test_random_to
+            - TestTensorCreation::test_range
+            - TestTensorCreation::test_range_warning
+            - TestTensorCreation::test_repeat_interleave
+            - TestTensorCreation::test_roll
+            - TestTensorCreation::test_stack
+            - TestTensorCreation::test_stack_out
+            - TestTensorCreation::test_tensor_factories_empty
+            - TestTensorCreation::test_zeros
+            - TestTensorCreation::test_zeros_out
+          mode: xfail  # xfail: NotImplementedError
+        # These tests exercise tensor creation and manipulation operations, including random number generation, concatenation, and type conversion.
+        # They are classified as xfail due to unsupported data types (e.g., bfloat16, float16) and memory formats (e.g., ChannelsLast) on the Spyre backend.
+        # Relevant Spyre limitations include lack of support for certain dtypes and memory formats, as well as missing ops like dxp_standalone.
+        - names:
+            - TestRandomTensorCreation::test_uniform_from_to
+            - TestTensorCreation::test_cat_channels_last_large_inputs
+            - TestTensorCreation::test_cat_out_fast_path_dim0_dim1
+            - TestTensorCreation::test_float_to_int_conversion_finite
+            - TestTensorCreation::test_like_fn_stride_proparation_vs_tensoriterator_unary_op
+            - TestTensorCreation::test_linspace_device_vs_cpu
+            - TestTensorCreation::test_linspace_special_steps
+            - TestTensorCreation::test_linspace_vs_numpy_integral
+            - TestTensorCreation::test_logspace_device_vs_cpu
+            - TestTensorCreation::test_logspace_special_steps
+            - TestTensorCreation::test_meshgrid_ij_indexing_is_default
+            - TestTensorCreation::test_tensor_ctor_device_inference
+            - TestTensorCreation::test_torch_complex_same_dtype_error
+          mode: xfail   # xfail: dxp_standalone not detected
+        # # These tests exercise the `meshgrid` operation with various indexing options and tensor shapes.
+        # # They are classified as xfail due to multiple sub-assertion failures in comparing PyTorch and NumPy results.
+        # # The relevant Spyre capability is the `meshgrid` operation, which currently fails to match NumPy's behavior.
+        # - names:
+        #     - TestTensorCreation::test_meshgrid_vs_numpy
+        #   mode: xfail  # xfail: SubtestFailure
+        # These tests verify tensor creation on the 'privateuse1' device, expecting 'cuda' behavior.
+        # They are classified as xfail due to an AssertionError mismatching device types.
+        # Relevant Spyre limitations include device type handling and dtype downcasting warnings.
+        - names:
+            - TestTensorCreation::test_new_tensor_device
+          mode: xfail  # xfail: AssertionError
+        # These tests exercise various tensor creation and manipulation operations, including tensor copying, device handling, and dtype inference.
+        # They are classified as "skip" on the Spyre backend due to unsupported CUDA operations and missing CUDA library dependencies.
+        # Relevant Spyre limitations include lack of CUDA support and unsupported dtypes like bfloat16 and float16 for certain operations.
+        - names:
+            - TestTensorCreation::test_zeros_bounds_checking
+            - TestAsArray::test_alias_from_dlpack
+            - TestTensorCreation::test_arange
+            - TestAsArray::test_astensor_consistency
+            - TestAsArray::test_copy_from_dlpack_mult_devices
+            - TestAsArray::test_copy_from_tensor_mult_devices
+            - TestAsArray::test_device_without_index
+            - TestAsArray::test_numpy_scalars
+            - TestAsArray::test_unsupported_alias_mult_devices
             - TestBufferProtocol::test_byte_to_int
             - TestBufferProtocol::test_invalid_positional_args
             - TestBufferProtocol::test_not_a_buffer
@@ -13,28 +256,286 @@ test_suite_config:
             - TestBufferProtocol::test_with_count
             - TestBufferProtocol::test_with_count_and_offset
             - TestBufferProtocol::test_with_offset
-            - TestTensorCreation::test_cat_mem_overlap
+            - TestLikeTensorCreation::test_empty_like
+            - TestLikeTensorCreation::test_ones_like_multiple_device
+            - TestLikeTensorCreation::test_zeros_like_multiple_device
+            - TestRandomTensorCreation::test_randint
+            - TestRandomTensorCreation::test_randint_inference
+            - TestRandomTensorCreation::test_randperm
+            - TestRandomTensorCreation::test_randperm_device_compatibility
+            - TestRandomTensorCreation::test_randperm_large
+            - TestTensorCreation::test_arange_inference
+            - TestTensorCreation::test_as_tensor
+            - TestTensorCreation::test_block_diag_scipy
+            - TestTensorCreation::test_cat_big
+            - TestTensorCreation::test_cat_large_tensor
             - TestTensorCreation::test_cat_out_channels_last
             - TestTensorCreation::test_concat_empty_list_error
-            - TestTensorCreation::test_empty_strided
-            - TestTensorCreation::test_empty_tensor_props
-            - TestTensorCreation::test_linlogspace_mem_overlap
+            - TestTensorCreation::test_constructor_device_legacy
+            - TestTensorCreation::test_constructor_dtypes
+            - TestTensorCreation::test_empty_full
+            - TestTensorCreation::test_empty_overflow
+            - TestTensorCreation::test_full_inference
+            - TestTensorCreation::test_kaiser
+            - TestTensorCreation::test_kaiser_window
             - TestTensorCreation::test_meshgrid_empty
             - TestTensorCreation::test_meshgrid_inconsistent_device
             - TestTensorCreation::test_meshgrid_inconsistent_dtype
             - TestTensorCreation::test_meshgrid_non_1d_tensor
             - TestTensorCreation::test_meshgrid_unsupported_indexing
             - TestTensorCreation::test_meshgrid_warns_if_no_indexing
-            - TestTensorCreation::test_simple_scalar_cast
-            - TestTensorCreation::test_strided_mismatched_stride_shape
+            - TestTensorCreation::test_new_tensor
+            - TestTensorCreation::test_range_factories_64bit_indexing
+            - TestTensorCreation::test_signal_window_functions
+            - TestTensorCreation::test_signal_windows_functions
+            - TestTensorCreation::test_tensor_device
+            - TestTensorCreation::test_tensor_factory
+            - TestTensorCreation::test_tensor_factory_copy_var
+            - TestTensorCreation::test_tensor_factory_gpu_type
+            - TestTensorCreation::test_tensor_factory_gpu_type_inference
+            - TestTensorCreation::test_tensor_factory_type_inference
             - TestTensorCreation::test_tensor_from_non_writable_numpy
-            - TestTensorCreation::test_zeros_bounds_checking
-          mode: mandatory_success
+          mode: skip  # does not engage the torch-spyre layer
+
   global:
     supported_dtypes:
-      - name: float16
-        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
-      - name: int64
-        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
       - name: bfloat16
-        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype

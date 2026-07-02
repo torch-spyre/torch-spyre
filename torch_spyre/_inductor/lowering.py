@@ -1206,3 +1206,19 @@ def lower_qfp8ch(x):
     )
     pw.realize()
     return pw
+
+
+@register_spyre_lowering(
+    torch.ops.spyre.prod_dim_int,
+    type_promotion_kind=None,
+)
+def lower_prod_dim(x, dim, keepdim=False):
+    def _prod_dim_impl(x):
+        kwargs = lowering._make_reduction_inner(
+            x, axis=[dim], keepdims=keepdim, dtype=x.dtype, override_return_dtype=None
+        )
+        result = Reduction.create(reduction_type="prod", input_node=x, **kwargs)
+        result.realize()
+        return result
+
+    return with_int64_fallback(_prod_dim_impl, x)
