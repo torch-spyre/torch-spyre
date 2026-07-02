@@ -125,10 +125,13 @@ runs:
           echo "  Slow flag     : ${_SLOW_FLAG:-none (all tests will run)}"
           echo "  Extra flags   : ${{ inputs.extra_test_flags }}"
 
-          # On the final attempt, enable verbose DT logging for diagnostics
+          # From the first retry onward, enable verbose DT logging for
+          # diagnostics. A retry means something already went wrong (stall,
+          # hardware RAS, etc.), so every attempt after the first should be
+          # at least as diagnostic as attempt 1 — not just the final one.
           _DTLOG_PREFIX=""
-          if [[ $attempt -eq $MAX_ATTEMPTS ]]; then
-            echo "  DTLOG_LEVEL   : Info (final attempt — verbose logging enabled)"
+          if [[ $attempt -gt 1 ]]; then
+            echo "  DTLOG_LEVEL   : Info (retry attempt — verbose logging enabled)"
             _DTLOG_PREFIX="DTLOG_LEVEL=Info"
           fi
 
