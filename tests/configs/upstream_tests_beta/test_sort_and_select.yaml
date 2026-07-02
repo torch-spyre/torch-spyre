@@ -1,0 +1,316 @@
+test_suite_config:
+
+  files:
+    - path: ${TORCH_ROOT}/test/test_sort_and_select.py
+      unlisted_test_mode: skip
+      tests:
+        # These tests exercise the `isin` and `topk` operations across different devices and dtypes.
+        # They are classified as `mandatory_success` due to the expected RuntimeError for `isin` with mismatched devices.
+        # The relevant Spyre capability is handling device-specific errors for tensor operations.
+        - names:
+            - TestSortAndSelect::test_isin_different_devices
+            - TestSortAndSelect::test_topk_arguments
+          mode: mandatory_success
+        # These tests exercise the `isin` and `topk` operations across various dtypes and tensor dimensions.
+        # They are classified as `xfail` due to unsupported dtype casting and comparison errors on the Spyre backend.
+        # Relevant Spyre limitations include dtype handling and tensor comparison capabilities.
+        - names:
+            - TestSortAndSelect::test_isin
+            - TestSortAndSelect::test_isin_different_dtypes
+            - TestSortAndSelect::test_topk_4d
+          mode: xfail  # xfail: RuntimeError
+        # These tests exercise various sorting and selection operations (e.g., `kthvalue`, `sort`, `topk`, `unique_consecutive`, `unique_dim`) across different data types.
+        # They are classified as `xfail` on the Spyre backend due to the unimplemented `aten::kthvalue.values`, `aten::sort.values_stable`, `aten::topk.values`, and `aten::unique_consecutive` operators.
+        # The most relevant Spyre capabilities are its support for `bfloat16`, `bool`, `float16`, `float32`, and `int64` data types, but it lacks support for these specific sorting and selection operations.
+        - names:
+            - TestSortAndSelect::test_kthvalue_scalar
+            - TestSortAndSelect::test_msort
+            - TestSortAndSelect::test_sort
+            - TestSortAndSelect::test_sort_discontiguous
+            - TestSortAndSelect::test_sort_expanded_tensor
+            - TestSortAndSelect::test_sort_large_slice
+            - TestSortAndSelect::test_sort_restride
+            - TestSortAndSelect::test_stable_sort
+            - TestSortAndSelect::test_topk
+            - TestSortAndSelect::test_topk_integral
+            - TestSortAndSelect::test_topk_noncontiguous_gpu
+            - TestSortAndSelect::test_topk_nonfinite
+            - TestSortAndSelect::test_topk_zero
+            - TestSortAndSelect::test_unique_consecutive
+            - TestSortAndSelect::test_unique_dim
+          mode: xfail  # xfail: NotImplementedError
+        # These tests exercise sorting and selecting operations across various dtypes.
+        # They are classified as xfail due to unknown issues with the Spyre backend.
+        # Relevant Spyre limitations include incomplete support for certain dtypes and ops.
+        - names:
+            - TestSortAndSelect::test_sort_1d_output_discontiguous
+            - TestSortAndSelect::test_stable_sort_against_numpy
+            - TestSortAndSelect::test_topk_1d_output_discontiguous
+          mode: xfail  # xfail: dxp_standalone not detected
+        # These tests exercise sorting and unique operations across various dtypes, including overflow handling.
+        # They are classified as xfail due to unsupported stick expressions and missing 'dxp_standalone' executable.
+        # Relevant Spyre limitations include unsupported stick expressions and lack of certain runtime components.
+        - names:
+            - TestSortAndSelect::test_sort_overflow
+            - TestSortAndSelect::test_unique
+          mode: xfail  # xfail: torch._inductor.exc.InductorError
+        # These tests exercise the `topk` operation with lower precision dtypes (`bfloat16` and `float16`).
+        # They are classified as `xfail` due to the Spyre backend not supporting the `aten::sort.values_stable` operator for these dtypes.
+        # The relevant Spyre limitation is the lack of support for certain sorting operations with lower precision tensors.
+        - names:
+            - TestSortAndSelect::test_topk_lower_precision
+          mode: xfail  # xfail: NotImplementedError
+        # These tests exercise sorting and selection operations across various dtypes and tensor configurations.
+        # They are skipped because they do not invoke the torch-spyre layer, which is required for backend-specific optimizations.
+        # Relevant Spyre limitations include lack of support for complex dtypes and certain tensor configurations.
+        - names:
+            - TestSortAndSelect::test_complex_unsupported_cpu
+            - TestSortAndSelect::test_sort_1d_parallel
+            - TestSortAndSelect::test_sort_discontiguous_slow
+            - TestSortAndSelect::test_sort_large
+            - TestSortAndSelect::test_sort_stable_none
+            - TestSortAndSelect::test_topk_quantized_scalar_input
+          mode: skip  # does not engage the torch-spyre layer
+
+  global:
+    supported_dtypes:
+      - name: bfloat16
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype

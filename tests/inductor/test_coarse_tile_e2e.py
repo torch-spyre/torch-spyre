@@ -1068,23 +1068,17 @@ class TestNamedDimsHint(InductorTestCase):
 class TestCoarseTileReductionE2E(InductorTestCase):
     """E2E tests for coarse-tiling a reduction dimension.
 
-    Stage 1 supports tiling reductions over non-stick dimensions only.
-    Tiling a reduction over the stick dimension (dim=-1 on a [..., D] tensor
-    where D maps to the stick) raises RuntimeError — deferred to Stage 2.
-
-    The tests below verify that the appropriate error is raised for stick-dim
-    reduction tiling, and that LoopSpec is still emitted up to the point where
-    validation fires.
+    Stick-dim reduction tiling (dim=-1 on a [..., D] tensor where D maps to
+    the stick) is now supported.  The loopspec tests run without hardware via
+    mock_patch + run_and_get_code.
     """
-
-    _STAGE2_MSG = "stick-dim reduction tiling is not yet implemented — Stage 2"
 
     def setUp(self):
         super().setUp()
         torch.manual_seed(0xAFFE)
 
     def test_hint_tiled_reduction_sum_loopspec(self):
-        """x.sum(dim=-1) tiled over D raises: stick-dim reduction not yet supported."""
+        """x.sum(dim=-1) tiled over D produces a LoopSpec with count 4."""
         from torch_spyre._inductor import spyre_hint
 
         B, D = 64, 512
@@ -1098,16 +1092,25 @@ class TestCoarseTileReductionE2E(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"D": 4}):
                 return x.sum(dim=-1)
 
-        with self.assertRaisesRegex(Exception, self._STAGE2_MSG):
-            torch.compile(fn)(x_dev)
+        cfn = torch.compile(fn)
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, x_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec for D-tiled sum")
+        self.assertIn("sympify('4')", src, "Expected loop count 4")
 
-    def test_hint_tiled_reduction_sum_rejects(self):
-        """x.sum(dim=-1) with D hint rejects at compile time with Stage 2 error."""
+    def test_hint_tiled_reduction_sum_correct(self):
+        """x.sum(dim=-1) tiled over D (4 tiles) produces correct results."""
         from torch_spyre._inductor import spyre_hint
 
         B, D = 64, 512
         x = torch.randn(B, D, dtype=torch.float16) * 0.1
-        x_dev = x.to("spyre")
         _declare_tensor_dim("B", B)
         _declare_tensor_dim("D", D)
 
@@ -1116,8 +1119,8 @@ class TestCoarseTileReductionE2E(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"D": 4}):
                 return x.sum(dim=-1)
 
-        with self.assertRaisesRegex(Exception, self._STAGE2_MSG):
-            torch.compile(fn)(x_dev)
+        # atol=0.05: fp16 sum over 512 elements scaled by 0.1 accumulates ~0.05 error.
+        compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=0.05, rtol=0.05)
 
     def test_hint_tiled_reduction_matmul_loopspec(self):
         """torch.matmul tiled over K produces a LoopSpec with count 4."""
@@ -1173,7 +1176,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         )
 
     def test_hint_tiled_reduction_max_loopspec(self):
-        """x.amax(dim=-1) tiled over D raises: stick-dim reduction not yet supported."""
+        """x.amax(dim=-1) tiled over D produces a LoopSpec with count 4."""
         from torch_spyre._inductor import spyre_hint
 
         B, D = 64, 512
@@ -1187,16 +1190,25 @@ class TestCoarseTileReductionE2E(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"D": 4}):
                 return x.amax(dim=-1)
 
-        with self.assertRaisesRegex(Exception, self._STAGE2_MSG):
-            torch.compile(fn)(x_dev)
+        cfn = torch.compile(fn)
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, x_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec for D-tiled amax")
+        self.assertIn("sympify('4')", src, "Expected loop count 4")
 
-    def test_hint_tiled_reduction_max_rejects(self):
-        """x.amax(dim=-1) with D hint rejects at compile time with Stage 2 error."""
+    def test_hint_tiled_reduction_max_correct(self):
+        """x.amax(dim=-1) tiled over D (4 tiles) produces correct results."""
         from torch_spyre._inductor import spyre_hint
 
         B, D = 64, 512
         x = torch.randn(B, D, dtype=torch.float16)
-        x_dev = x.to("spyre")
         _declare_tensor_dim("B", B)
         _declare_tensor_dim("D", D)
 
@@ -1205,11 +1217,10 @@ class TestCoarseTileReductionE2E(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"D": 4}):
                 return x.amax(dim=-1)
 
-        with self.assertRaisesRegex(Exception, self._STAGE2_MSG):
-            torch.compile(fn)(x_dev)
+        compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=1e-3, rtol=1e-3)
 
     def test_hint_tiled_reduction_min_loopspec(self):
-        """x.amin(dim=-1) tiled over D raises: stick-dim reduction not yet supported."""
+        """x.amin(dim=-1) tiled over D produces a LoopSpec with count 4."""
         from torch_spyre._inductor import spyre_hint
 
         B, D = 64, 512
@@ -1223,16 +1234,25 @@ class TestCoarseTileReductionE2E(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"D": 4}):
                 return x.amin(dim=-1)
 
-        with self.assertRaisesRegex(Exception, self._STAGE2_MSG):
-            torch.compile(fn)(x_dev)
+        cfn = torch.compile(fn)
+        with (
+            mock_patch(_LAUNCH_KERNEL),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, x_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec for D-tiled amin")
+        self.assertIn("sympify('4')", src, "Expected loop count 4")
 
-    def test_hint_tiled_reduction_min_rejects(self):
-        """x.amin(dim=-1) with D hint rejects at compile time with Stage 2 error."""
+    def test_hint_tiled_reduction_min_correct(self):
+        """x.amin(dim=-1) tiled over D (4 tiles) produces correct results."""
         from torch_spyre._inductor import spyre_hint
 
         B, D = 64, 512
         x = torch.randn(B, D, dtype=torch.float16)
-        x_dev = x.to("spyre")
         _declare_tensor_dim("B", B)
         _declare_tensor_dim("D", D)
 
@@ -1241,8 +1261,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"D": 4}):
                 return x.amin(dim=-1)
 
-        with self.assertRaisesRegex(Exception, self._STAGE2_MSG):
-            torch.compile(fn)(x_dev)
+        compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=1e-3, rtol=1e-3)
 
 
 class TestCoarseTileReductionDim0E2E(InductorTestCase):

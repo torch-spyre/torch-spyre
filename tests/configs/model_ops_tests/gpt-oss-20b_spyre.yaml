@@ -365,13 +365,13 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: -1
+                    kwargs:
+                      keepdim: true
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L60 in forward,
                     code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
                   tags:
                     - constant
                     - torch.mean.1_spyre
-                  kwargs:
-                    keepdim: true
                 - name: torch.add
                   sample_inputs_func:
                     args:
@@ -609,13 +609,13 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: 2
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L231 in _apply_rotary_emb,
                     code: first_half, second_half = torch.chunk(x, 2, dim=-1)'
                   tags:
                     - constant
                     - torch.chunk.1_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.getitem
                   sample_inputs_func:
                     args:
@@ -732,13 +732,13 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L234 in _apply_rotary_emb,
                     code: return torch.cat((first_, second_), dim=-1)'
                   tags:
                     - constant
                     - torch.cat.1_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.chunk
                   sample_inputs_func:
                     args:
@@ -750,13 +750,13 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: 2
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L231 in _apply_rotary_emb,
                     code: first_half, second_half = torch.chunk(x, 2, dim=-1)'
                   tags:
                     - constant
                     - torch.chunk.2_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.getitem
                   sample_inputs_func:
                     args:
@@ -873,25 +873,25 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L234 in _apply_rotary_emb,
                     code: return torch.cat((first_, second_), dim=-1)'
                   tags:
                     - constant
                     - torch.cat.2_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.zeros
                   sample_inputs_func:
                     args:
                       - value: (1, 8, 128, 64)
+                    kwargs:
+                      dtype: torch.float16
+                      device: cuda:0
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/cache_utils.py#L290 in lazy_initialization, code:
                     self.keys = torch.zeros('
                   tags:
                     - constant
                     - torch.zeros.1_spyre
-                  kwargs:
-                    dtype: torch.float16
-                    device: cuda:0
                 - name: torch.index_copy_
                   sample_inputs_func:
                     args:
@@ -1134,12 +1134,12 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L262 in eager_attention_forward,
                     code: combined_logits = torch.cat([attn_weights, sinks], dim=-1)'
                   tags:
                     - torch.cat.3_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.max
                   sample_inputs_func:
                     args:
@@ -1150,13 +1150,13 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      dim: -1
+                      keepdim: true
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L267 in eager_attention_forward,
                     code: combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values'
                   tags:
                     - torch.max.1_spyre
-                  kwargs:
-                    dim: -1
-                    keepdim: true
                 - name: torch.getitem
                   sample_inputs_func:
                     args:
@@ -1206,13 +1206,13 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      dim: -1
+                      dtype: torch.float16
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L268 in eager_attention_forward,
                     code: probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)'
                   tags:
                     - torch.nn.functional.softmax.1_spyre
-                  kwargs:
-                    dim: -1
-                    dtype: torch.float16
                 - name: torch.getitem
                   sample_inputs_func:
                     args:
@@ -1239,13 +1239,13 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      p: 0.0
+                      training: false
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L270 in eager_attention_forward,
                     code: attn_weights = nn.functional.dropout(scores, p=dropout, training=module.training).to(value_states.dtype)'
                   tags:
                     - torch.nn.functional.dropout.1_spyre
-                  kwargs:
-                    p: 0.0
-                    training: false
                 - name: torch.to
                   sample_inputs_func:
                     args:
@@ -1448,13 +1448,13 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: 4
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L128 in forward,
                     code: router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (num_tokens, top_k)'
                   tags:
                     - constant
                     - torch.topk.1_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.getitem
                   sample_inputs_func:
                     args:
@@ -1483,24 +1483,24 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      dim: 1
+                      dtype: torch.float16
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L129 in forward,
                     code: router_scores = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)'
                   tags:
                     - torch.nn.functional.softmax.2_spyre
-                  kwargs:
-                    dim: 1
-                    dtype: torch.float16
                 - name: torch.arange
                   sample_inputs_func:
                     args:
                       - value: 11
+                    kwargs:
+                      device: cuda:0
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/moe.py#L115 in batched_mm_experts_forward,
                     code: token_idx = torch.arange(num_tokens, device=device).unsqueeze(1).expand(-1, num_top_k).reshape(-1)  # (S,)'
                   tags:
                     - constant
                     - torch.arange.1_spyre
-                  kwargs:
-                    device: cuda:0
                 - name: torch.unsqueeze
                   sample_inputs_func:
                     args:
@@ -1842,13 +1842,13 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      min: None
+                      max: 7.0
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L84 in _apply_gate,
                     code: gate = gate.clamp(min=None, max=self.limit)'
                   tags:
                     - torch.clamp.2_spyre
-                  kwargs:
-                    min: None
-                    max: 7.0
                 - name: torch.clamp
                   sample_inputs_func:
                     args:
@@ -1859,13 +1859,13 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      min: -7.0
+                      max: 7.0
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L85 in _apply_gate,
                     code: up = up.clamp(min=-self.limit, max=self.limit)'
                   tags:
                     - torch.clamp.3_spyre
-                  kwargs:
-                    min: -7.0
-                    max: 7.0
                 - name: torch.mul
                   sample_inputs_func:
                     args:
@@ -2086,12 +2086,12 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      dim: 1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/moe.py#L154 in batched_mm_experts_forward,
                     code: final_hidden_states = out_per_sample.view(num_tokens, num_top_k, hidden_dim).sum(dim=1)'
                   tags:
                     - torch.sum.1_spyre
-                  kwargs:
-                    dim: 1
                 - name: torch.to
                   sample_inputs_func:
                     args:
@@ -2128,14 +2128,14 @@ test_suite_config:
                   sample_inputs_func:
                     args:
                       - value: (1, 8, 2048, 64)
+                    kwargs:
+                      dtype: torch.float16
+                      device: cuda:0
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/cache_utils.py#L290 in lazy_initialization, code:
                     self.keys = torch.zeros('
                   tags:
                     - constant
                     - torch.zeros.2_spyre
-                  kwargs:
-                    dtype: torch.float16
-                    device: cuda:0
                 - name: torch.index_copy_
                   sample_inputs_func:
                     args:
@@ -2343,12 +2343,12 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L262 in eager_attention_forward,
                     code: combined_logits = torch.cat([attn_weights, sinks], dim=-1)'
                   tags:
                     - torch.cat.4_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.max
                   sample_inputs_func:
                     args:
@@ -2359,13 +2359,13 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      dim: -1
+                      keepdim: true
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L267 in eager_attention_forward,
                     code: combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values'
                   tags:
                     - torch.max.2_spyre
-                  kwargs:
-                    dim: -1
-                    keepdim: true
                 - name: torch.sub
                   sample_inputs_func:
                     args:
@@ -2397,13 +2397,13 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      dim: -1
+                      dtype: torch.float16
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L268 in eager_attention_forward,
                     code: probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)'
                   tags:
                     - torch.nn.functional.softmax.3_spyre
-                  kwargs:
-                    dim: -1
-                    dtype: torch.float16
                 - name: torch.getitem
                   sample_inputs_func:
                     args:
@@ -2430,13 +2430,13 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      p: 0.0
+                      training: false
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L270 in eager_attention_forward,
                     code: attn_weights = nn.functional.dropout(scores, p=dropout, training=module.training).to(value_states.dtype)'
                   tags:
                     - torch.nn.functional.dropout.2_spyre
-                  kwargs:
-                    p: 0.0
-                    training: false
                 - name: torch.to
                   sample_inputs_func:
                     args:
@@ -2731,13 +2731,13 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: -1
+                    kwargs:
+                      keepdim: true
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L60 in forward,
                     code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
                   tags:
                     - constant
                     - torch.mean.2_spyre
-                  kwargs:
-                    keepdim: true
                 - name: torch.add
                   sample_inputs_func:
                     args:
@@ -2975,13 +2975,13 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: 2
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L231 in _apply_rotary_emb,
                     code: first_half, second_half = torch.chunk(x, 2, dim=-1)'
                   tags:
                     - constant
                     - torch.chunk.3_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.getitem
                   sample_inputs_func:
                     args:
@@ -3098,13 +3098,13 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L234 in _apply_rotary_emb,
                     code: return torch.cat((first_, second_), dim=-1)'
                   tags:
                     - constant
                     - torch.cat.5_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.chunk
                   sample_inputs_func:
                     args:
@@ -3116,13 +3116,13 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: 2
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L231 in _apply_rotary_emb,
                     code: first_half, second_half = torch.chunk(x, 2, dim=-1)'
                   tags:
                     - constant
                     - torch.chunk.4_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.getitem
                   sample_inputs_func:
                     args:
@@ -3239,13 +3239,13 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L234 in _apply_rotary_emb,
                     code: return torch.cat((first_, second_), dim=-1)'
                   tags:
                     - constant
                     - torch.cat.6_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.index_copy_
                   sample_inputs_func:
                     args:
@@ -3384,12 +3384,12 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L262 in eager_attention_forward,
                     code: combined_logits = torch.cat([attn_weights, sinks], dim=-1)'
                   tags:
                     - torch.cat.7_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.max
                   sample_inputs_func:
                     args:
@@ -3400,13 +3400,13 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      dim: -1
+                      keepdim: true
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L267 in eager_attention_forward,
                     code: combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values'
                   tags:
                     - torch.max.3_spyre
-                  kwargs:
-                    dim: -1
-                    keepdim: true
                 - name: torch.getitem
                   sample_inputs_func:
                     args:
@@ -3456,13 +3456,13 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      dim: -1
+                      dtype: torch.float16
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L268 in eager_attention_forward,
                     code: probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)'
                   tags:
                     - torch.nn.functional.softmax.4_spyre
-                  kwargs:
-                    dim: -1
-                    dtype: torch.float16
                 - name: torch.getitem
                   sample_inputs_func:
                     args:
@@ -3489,13 +3489,13 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      p: 0.0
+                      training: false
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L270 in eager_attention_forward,
                     code: attn_weights = nn.functional.dropout(scores, p=dropout, training=module.training).to(value_states.dtype)'
                   tags:
                     - torch.nn.functional.dropout.3_spyre
-                  kwargs:
-                    p: 0.0
-                    training: false
                 - name: torch.to
                   sample_inputs_func:
                     args:
@@ -3698,13 +3698,13 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: 4
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L128 in forward,
                     code: router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (num_tokens, top_k)'
                   tags:
                     - constant
                     - torch.topk.2_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.getitem
                   sample_inputs_func:
                     args:
@@ -3733,13 +3733,13 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      dim: 1
+                      dtype: torch.float16
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L129 in forward,
                     code: router_scores = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)'
                   tags:
                     - torch.nn.functional.softmax.5_spyre
-                  kwargs:
-                    dim: 1
-                    dtype: torch.float16
                 - name: torch.unsqueeze
                   sample_inputs_func:
                     args:
@@ -4081,13 +4081,13 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      min: None
+                      max: 7.0
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L84 in _apply_gate,
                     code: gate = gate.clamp(min=None, max=self.limit)'
                   tags:
                     - torch.clamp.5_spyre
-                  kwargs:
-                    min: None
-                    max: 7.0
                 - name: torch.clamp
                   sample_inputs_func:
                     args:
@@ -4098,13 +4098,13 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      min: -7.0
+                      max: 7.0
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L85 in _apply_gate,
                     code: up = up.clamp(min=-self.limit, max=self.limit)'
                   tags:
                     - torch.clamp.6_spyre
-                  kwargs:
-                    min: -7.0
-                    max: 7.0
                 - name: torch.mul
                   sample_inputs_func:
                     args:
@@ -4325,12 +4325,12 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      dim: 1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/moe.py#L154 in batched_mm_experts_forward,
                     code: final_hidden_states = out_per_sample.view(num_tokens, num_top_k, hidden_dim).sum(dim=1)'
                   tags:
                     - torch.sum.2_spyre
-                  kwargs:
-                    dim: 1
                 - name: torch.to
                   sample_inputs_func:
                     args:
@@ -4501,12 +4501,12 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L262 in eager_attention_forward,
                     code: combined_logits = torch.cat([attn_weights, sinks], dim=-1)'
                   tags:
                     - torch.cat.8_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.max
                   sample_inputs_func:
                     args:
@@ -4517,13 +4517,13 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      dim: -1
+                      keepdim: true
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L267 in eager_attention_forward,
                     code: combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values'
                   tags:
                     - torch.max.4_spyre
-                  kwargs:
-                    dim: -1
-                    keepdim: true
                 - name: torch.sub
                   sample_inputs_func:
                     args:
@@ -4555,13 +4555,13 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      dim: -1
+                      dtype: torch.float16
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L268 in eager_attention_forward,
                     code: probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)'
                   tags:
                     - torch.nn.functional.softmax.6_spyre
-                  kwargs:
-                    dim: -1
-                    dtype: torch.float16
                 - name: torch.getitem
                   sample_inputs_func:
                     args:
@@ -4588,13 +4588,13 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      p: 0.0
+                      training: false
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/gpt_oss/modeling_gpt_oss.py#L270 in eager_attention_forward,
                     code: attn_weights = nn.functional.dropout(scores, p=dropout, training=module.training).to(value_states.dtype)'
                   tags:
                     - torch.nn.functional.dropout.4_spyre
-                  kwargs:
-                    p: 0.0
-                    training: false
                 - name: torch.to
                   sample_inputs_func:
                     args:
