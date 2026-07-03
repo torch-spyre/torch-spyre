@@ -431,8 +431,8 @@ _RUNTIME_SHAPES: Dict[str, str] = {}
 def _format_input_args_shapes(input_args: List[Any]) -> str:
     """Return a human-readable string of shape/stride info for each InputArg.
 
-    Handles InputArgTensor, InputArgTensorList, InputArgValue, and InputArgPy.
-    Falls back to a type label for unknown arg types.
+    Handles InputArgTensor, InputArgTensorList, InputArgConfig, InputArgValue,
+    and InputArgPy. Falls back to a type label for unknown arg types.
 
     Args:
         input_args: List of InputArg objects from InputsEdits.args.
@@ -447,6 +447,7 @@ def _format_input_args_shapes(input_args: List[Any]) -> str:
         from .oot_test_config_models import (
             InputArgTensor,
             InputArgTensorList,
+            InputArgConfig,
             InputArgValue,
             InputArgPy,
         )
@@ -471,6 +472,11 @@ def _format_input_args_shapes(input_args: List[Any]) -> str:
                 for s in arg.tensor_list
             )
             lines.append(f"  arg[{i}]: TensorList[{inner}]")
+        elif isinstance(arg, InputArgConfig):
+            lines.append(
+                f"  arg[{i}]: Config(config_path={arg.config_path!r}, "
+                f"config_kwargs={arg.config_kwargs!r})"
+            )
         elif isinstance(arg, InputArgValue):
             lines.append(f"  arg[{i}]: value={arg.value!r}")
         elif isinstance(arg, InputArgPy):
