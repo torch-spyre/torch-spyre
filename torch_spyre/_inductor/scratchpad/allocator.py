@@ -130,14 +130,23 @@ class ScratchpadAllocator(ABC):
         pass
 
     def _get_op_name(self, op: Any) -> str:
-        target = getattr(getattr(op, "origin_node", None), "target", None)
-        org_op_name = (
-            getattr(target, "_opname", None)
-            or getattr(target, "__name__", None)
-            or getattr(target, "name", None)
-            or str(target)
-        )
-        return org_op_name
+        # Resolve the op's short name from its origin_node target first, then
+        # fall back to each fused fx node in op.origins. origin_node is always
+        # tried first (independent of origins, which may be empty), so a plain
+        # op still resolves; the origins fallback recovers a fused op like
+        # bmm+permute, whose origin_node target has no resolvable name and would
+        # otherwise resolve to "None" and be wrongly rejected as "op not allowed".
+        name = None
+        for fx_node in (getattr(op, "origin_node", None), *getattr(op, "origins", ())):
+            target = getattr(fx_node, "target", None)
+            name = (
+                getattr(target, "_opname", None)
+                or getattr(target, "__name__", None)
+                or getattr(target, "name", None)
+            )
+            if name is not None:
+                break
+        return name if name is not None else "None"
 
     def _op_output_good_for_lx_reuse(self, op: Any) -> bool:
         return (
@@ -152,6 +161,74 @@ class ScratchpadAllocator(ABC):
                 or (config.lx_boundary_clones and self._get_op_name(op) == "clone")
             )
         )
+
+    # ------------------------------------------------------------------
+    # Aliased (in-place mutation) buffer support — NOT yet wired in.
+    #
+    # An op whose output layout is MutationLayoutSHOULDREMOVE does not own its
+    # storage: it writes in place into an existing "alias target" buffer (e.g. a
+    # flash-attention accumulator `O += ...`). Such ops are currently rejected by
+    # _op_output_good_for_lx_reuse. The helpers below let a caller instead route
+    # the op to the target's LX slot: discover the target, confirm the target's
+    # pin decision still applies to this op, and read the target's LX address.
+    # They are pure/read-only and have no callers yet — wiring them into the
+    # eligibility / allocation path is deferred (see the accumulator liveness
+    # tradeoff in the task notes).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _alias_target_buffer(op: Any) -> Any:
+        """Return the underlying buffer an in-place op mutates, or None.
+
+        For a MutationLayoutSHOULDREMOVE output, layout.get_buffer() unwraps the
+        mutation/view chain to the real storage buffer being written. Returns
+        None when `op` is not an in-place mutation (owns its own storage).
+        """
+        layout = getattr(op, "layout", None)
+        if not isinstance(layout, MutationLayoutSHOULDREMOVE):
+            return None
+        try:
+            return layout.get_buffer()
+        except (AssertionError, AttributeError):
+            return None
+
+    def _alias_pin_is_valid(self, op: Any, target: Any) -> bool:
+        """True if the target's LX pin can be reused for this in-place op.
+
+        Sanity checks that the mutation genuinely shares the target's storage
+        geometry: the op's *real* (unwrapped) layout must match the target's
+        device layout in both size and stride_map. Anything mismatched means the
+        in-place write does not map cleanly onto the target's LX slice, so the
+        pin must NOT be reused.
+        """
+        if target is None:
+            return False
+        op_layout = getattr(op, "layout", None)
+        if not isinstance(op_layout, MutationLayoutSHOULDREMOVE):
+            return False
+        real = op_layout.real_layout()
+        tgt = getattr(target, "get_layout", lambda: None)()
+        real_dev = getattr(real, "device_layout", None)
+        tgt_dev = getattr(tgt, "device_layout", None)
+        if real_dev is None or tgt_dev is None:
+            return False
+        return list(real_dev.device_size) == list(tgt_dev.device_size) and list(
+            real_dev.stride_map
+        ) == list(tgt_dev.stride_map)
+
+    @staticmethod
+    def _alias_target_lx_address(target: Any) -> "int | None":
+        """Return the target buffer's assigned LX address, or None if unpinned.
+
+        The address is stamped onto the target's layout by _set_one_allocation
+        (layout.allocation['lx']) once the solver pins it. An in-place op should
+        reuse exactly this address rather than being allocated a slot of its own.
+        """
+        if target is None:
+            return None
+        layout = getattr(target, "get_layout", lambda: None)()
+        allocation = getattr(layout, "allocation", None) or {}
+        return allocation.get("lx")
 
     def _op_inputs_good_for_lx_inplace(self, op: Any) -> list[str]:
         target = getattr(getattr(op, "origin_node", None), "target", None)
