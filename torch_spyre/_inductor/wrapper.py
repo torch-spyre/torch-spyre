@@ -94,8 +94,8 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
 
             # Add pool allocation before the first line that references `_pool`:
             #   * Typically this is the first SDSC kernel `.run(`.
-            #   * With pool-resident buffer views, e.g., through 
-            #     `reinterpret_tensor_with_layout(_pool, ...)`, a `_pool` 
+            #   * With pool-resident buffer views, e.g., through
+            #     `reinterpret_tensor_with_layout(_pool, ...)`, a `_pool`
             #     reference can appear before the first `.run(`.
             pool_alloc_code = self.allocate_pool()
             for i, line in enumerate(lines):

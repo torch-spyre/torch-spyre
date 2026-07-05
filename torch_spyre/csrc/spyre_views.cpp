@@ -161,8 +161,8 @@ at::Tensor reinterpret_tensor_with_layout(
     std::optional<c10::ScalarType> dtype) {
   auto orig_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
   SpyreTensorLayout orig_stl = orig_impl->spyre_layout;
-  auto target_dtype = dtype.has_value() ? c10::scalarTypeToTypeMeta(*dtype)
-                                        : self.dtype();
+  auto target_dtype =
+      dtype.has_value() ? c10::scalarTypeToTypeMeta(*dtype) : self.dtype();
   at::Tensor self_ = at::detail::make_tensor<SpyreTensorImpl>(
       c10::Storage(self.storage()), self.key_set(), target_dtype);
   auto* spyre_tensor_impl_ =

@@ -703,7 +703,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                                 use.node,
                                 (ExternKernelSchedulerNode, NopKernelSchedulerNode),
                             ):
-                                # Keep the buffer materialized when any downstream 
+                                # Keep the buffer materialized when any downstream
                                 # consumer is an Extern/Nop scheduler node so the wrapper
                                 # emits a Python ``reinterpret_tensor_with_layout(...)``.
                                 needs_python_handle = True
