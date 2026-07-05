@@ -24,6 +24,7 @@
 #include <c10/core/MemoryFormat.h>
 #include <c10/core/TensorOptions.h>
 #include <c10/util/ArrayRef.h>
+#include <torch/csrc/inductor/inductor_ops.h>
 #include <torch/library.h>
 #include <util/sen_data_convert.h>
 
@@ -149,6 +150,10 @@ at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
 at::Tensor reinterpret_tensor(const at::Tensor& self, c10::IntArrayRef size,
                               c10::IntArrayRef stride,
                               int64_t offset_increment) {
+  if (self.device().type() != c10::DeviceType::PrivateUse1) {
+    return torch::inductor::_reinterpret_tensor(self, size, stride,
+                                                offset_increment);
+  }
   auto orig_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
   SpyreTensorLayout stl = orig_impl->spyre_layout;
   return reinterpret_tensor_with_layout(self, size, stride, offset_increment,
@@ -160,6 +165,10 @@ at::Tensor reinterpret_tensor_with_layout(const at::Tensor& self,
                                           c10::IntArrayRef stride,
                                           int64_t offset_increment,
                                           SpyreTensorLayout stl) {
+  if (self.device().type() != c10::DeviceType::PrivateUse1) {
+    return torch::inductor::_reinterpret_tensor(self, size, stride,
+                                                offset_increment);
+  }
   auto orig_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
   SpyreTensorLayout orig_stl = orig_impl->spyre_layout;
   at::Tensor self_ = at::detail::make_tensor<SpyreTensorImpl>(
