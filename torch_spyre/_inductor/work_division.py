@@ -21,6 +21,7 @@ from .ir import SpyreConstantFallback, SpyreEmptyFallback
 
 from torch._inductor.ir import (
     ComputedBuffer,
+    DeviceCopy,
     ExternKernel,
     FallbackKernel,
     MultiOutput,
@@ -34,7 +35,7 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 
 from .errors import Unsupported
-from .constants import BATCH_MATMUL_OP, TOPK_OPS
+from .constants import BATCH_MATMUL_OP, DEVICE_NAME, TOPK_OPS
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
@@ -1309,6 +1310,8 @@ def _iter_computed_buffers(operations: list[Operation]):
         if op.is_no_op():
             pass
         elif isinstance(op, ComputedBuffer):
+            if op.get_layout().device.type != DEVICE_NAME:
+                continue
             yield op
         elif isinstance(op, FallbackKernel):
             # FallbackKernel produces 0..N trailing MultiOutputs
@@ -1319,8 +1322,9 @@ def _iter_computed_buffers(operations: list[Operation]):
         elif isinstance(op, MultiOutput):
             pass
         elif isinstance(op, ExternKernel):
-            if isinstance(op, (SpyreConstantFallback, SpyreEmptyFallback)):
-                # Work division not supported on allocation/constant kernels
+            if isinstance(op, (SpyreConstantFallback, SpyreEmptyFallback, DeviceCopy)):
+                # Work division not supported on allocation/constant kernels, nor
+                # on DeviceCopy.
                 pass
             else:
                 logger.warning(f"unhandled node type {type(op)}")

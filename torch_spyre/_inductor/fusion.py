@@ -21,7 +21,7 @@ from torch._inductor.virtualized import V
 from torch._inductor.ir import FallbackKernel
 from torch_spyre._inductor.logging_utils import _get_env_bool
 from .ir import FixedTiledLayout
-from .constants import SEGMENT_OFFSETS
+from .constants import DEVICE_NAME, SEGMENT_OFFSETS
 from .scheduler import CountedLoopSchedulerNode
 
 # TODO: Temporary hook to easily disable
@@ -40,6 +40,12 @@ def _make_fused(nodes: list[SchedulerNode]) -> BaseSchedulerNode | None:
     elif len(nodes) == 1:
         return nodes[0]
     return None
+
+
+def _is_spyre_node(node: BaseSchedulerNode) -> bool:
+    """True if the node computes on the Spyre device."""
+    device = node.get_device()
+    return device is not None and device.type == DEVICE_NAME
 
 
 def _is_non_intermediate(name: str) -> bool:
@@ -88,7 +94,7 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     cur_non_intermediate_count: int = 0
 
     for n in nodes:
-        if isinstance(n, SchedulerNode):
+        if isinstance(n, SchedulerNode) and _is_spyre_node(n):
             n_tensors = {dep.name for dep in n.read_writes.reads_and_writes()}
             new_tensors = n_tensors - cur_tensors
             new_non_intermediate = sum(
