@@ -209,7 +209,7 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         for io_name in io_names
         if (io_buf := V.graph.get_buffer(io_name)) is not None
         and not isinstance(io_buf, Symbol)
-        # Use maybe_get_layout(): None-valued args carried by FallbackKernels 
+        # Use maybe_get_layout(): None-valued args carried by FallbackKernels
         # have no layout and raise from get_layout().
         and isinstance(layout := io_buf.maybe_get_layout(), FixedTiledLayout)
     }
