@@ -155,15 +155,16 @@ at::Tensor reinterpret_tensor(const at::Tensor& self, c10::IntArrayRef size,
                                         stl);
 }
 
-at::Tensor reinterpret_tensor_with_layout(const at::Tensor& self,
-                                          c10::IntArrayRef size,
-                                          c10::IntArrayRef stride,
-                                          int64_t offset_increment,
-                                          SpyreTensorLayout stl) {
+at::Tensor reinterpret_tensor_with_layout(
+    const at::Tensor& self, c10::IntArrayRef size, c10::IntArrayRef stride,
+    int64_t offset_increment, SpyreTensorLayout stl,
+    std::optional<c10::ScalarType> dtype) {
   auto orig_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
   SpyreTensorLayout orig_stl = orig_impl->spyre_layout;
+  auto target_dtype = dtype.has_value() ? c10::scalarTypeToTypeMeta(*dtype)
+                                        : self.dtype();
   at::Tensor self_ = at::detail::make_tensor<SpyreTensorImpl>(
-      c10::Storage(self.storage()), self.key_set(), self.dtype());
+      c10::Storage(self.storage()), self.key_set(), target_dtype);
   auto* spyre_tensor_impl_ =
       static_cast<SpyreTensorImpl*>(self_.unsafeGetTensorImpl());
   spyre_tensor_impl_->set_storage_offset(self.storage_offset() +

@@ -26,7 +26,7 @@ from torch._inductor.virtualized import V
 from torch._inductor.sizevars import SizeVarAllocator
 
 from .ir import FixedTiledLayout
-from .constants import SEGMENT_SIZE
+from .constants import SEGMENT_SIZE, INTERMEDIATES_SEGMENT
 
 
 class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
@@ -92,10 +92,14 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
                     lines.insert(i, " " * indent + "del _pool")
                     break
 
-            # Add pool allocation before first kernel call (`.run(`).
+            # Add pool allocation before the first line that references `_pool`:
+            #   * Typically this is the first SDSC kernel `.run(`.
+            #   * With pool-resident buffer views, e.g., through 
+            #     `reinterpret_tensor_with_layout(_pool, ...)`, a `_pool` 
+            #     reference can appear before the first `.run(`.
             pool_alloc_code = self.allocate_pool()
             for i, line in enumerate(lines):
-                if ".run(" in line:
+                if ".run(" in line or "reinterpret_tensor_with_layout(_pool" in line:
                     indent = len(line) - len(line.lstrip())
                     lines.insert(i, " " * indent + pool_alloc_code)
                     break
@@ -115,6 +119,21 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         name = buffer.get_name()
         codegen_shape_tuple = self.codegen_python_shape_tuple(tuple(layout.size))
         codegen_stride_tuple = self.codegen_python_shape_tuple(tuple(layout.stride))
+
+        if "pool" in layout.allocation:
+            # Pool-resident: Case where the buffer survives removal.
+            # Materialize a reinterpret view into `_pool` rather than a fresh
+            # allocation.
+            byte_offset = layout.allocation["pool"] - INTERMEDIATES_SEGMENT
+            return (
+                f"{name} = reinterpret_tensor_with_layout("
+                f"_pool, "
+                f"{codegen_shape_tuple}, "
+                f"{codegen_stride_tuple}, "
+                f"{byte_offset}, "
+                f"{layout.device_layout!r}, "
+                f"dtype={layout.dtype})"
+            )
 
         out = (
             f"{name} = spyre_empty_with_layout("
