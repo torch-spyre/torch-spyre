@@ -68,7 +68,7 @@ def generate_bundle(
     ``use_symbols`` controls whether HBM tensor addresses are emitted as
     runtime symbols (``%sym_N`` constants) in ``bundle.mlir``.
     When ``None`` (the default) the value is
-    read from ``config.bundle_hbm_symbols``.
+    read from ``config.bundle_symbolic_args``.
 
     ``unroll_loops`` controls whether ``LoopSpec`` nodes are fully unrolled
     into flat ``OpSpec`` nodes before bundle generation.  When ``None`` (the
