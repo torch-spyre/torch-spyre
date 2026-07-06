@@ -4,3 +4,4 @@ test_suite_config:
     - path: ${TORCH_DEVICE_ROOT}/tests/profiler/test_execution_trace.py
       unlisted_test_mode: mandatory_success
 
+
