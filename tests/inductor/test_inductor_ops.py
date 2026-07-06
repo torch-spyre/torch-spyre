@@ -4212,12 +4212,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # stick coordinate of Mod(i1,64)+36 -- genuinely not stick-aligned,
         # since the device layout pads each row's tail to a partial stick
         # rather than the row itself landing on a stick boundary. Needs
-        # padding-aware device-coordinate construction (#1756) to support;
-        # confirmed via repro_ani300_all_shapes.py against every other shape
-        # in the group above, which all remain unaffected. Dedicated test
-        # (not folded into the ops_dict cross-product above) so the exact
-        # rejection reason can be pinned, matching
-        # test_storage_offset_placeholder_stick_dim_rejected below.
+        # padding-aware device-coordinate construction, which isn't
+        # implemented yet. Dedicated test (not folded into the ops_dict
+        # cross-product above) so the exact rejection reason can be
+        # pinned, matching test_storage_offset_placeholder_stick_dim_rejected
+        # below.
         (
             "test_storage_offset_placeholder_nonstick_row",
             "test_storage_offset_placeholder_nonstick_row_rejected",
@@ -4648,9 +4647,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_storage_offset_placeholder_nonstick_row_rejected(self, slicer, base):
         # Non-stick dim offset whose base row length isn't a multiple of
         # elem_in_stick: padding-aware device-coordinate construction not
-        # yet implemented (#1756), so compile must raise rather than
-        # silently miscompute. No eager arm: compile=False skips the
-        # Inductor pass entirely, so it can't exercise this check.
+        # yet implemented, so compile must raise rather than silently
+        # miscompute. No eager arm: compile=False skips the Inductor pass
+        # entirely, so it can't exercise this check.
         def fn(x):
             return x + x
 
