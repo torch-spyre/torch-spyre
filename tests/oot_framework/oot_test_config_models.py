@@ -334,8 +334,23 @@ class InputArgPy(BaseModel):
         return v
 
 
+class InputArgConfig(BaseModel):
+    """A HuggingFace-style config object positional argument.
+
+    Built at runtime by importing ``config_path`` and instantiating it with
+    ``config_kwargs`` (e.g. transformers module constructors that take a
+    ``PretrainedConfig``). The kwargs carry the captured model dimensions so the
+    module is built with the right shapes rather than library defaults.
+    """
+
+    config_path: str  # e.g. "transformers.models.granite...GraniteConfig"
+    config_kwargs: Dict[str, Any] = {}
+
+
 # Union type for a single element of edits.inputs.args
-InputArg = Union[InputArgTensor, InputArgTensorList, InputArgValue, InputArgPy]
+InputArg = Union[
+    InputArgTensor, InputArgTensorList, InputArgConfig, InputArgValue, InputArgPy
+]
 
 
 def _parse_input_arg(raw: Any) -> InputArg:
@@ -346,7 +361,10 @@ def _parse_input_arg(raw: Any) -> InputArg:
     - Already-parsed InputArg objects (from YAML anchor reuse like *id001)
     """
     # Handle already-parsed InputArg objects (from YAML anchors/aliases)
-    if isinstance(raw, (InputArgTensor, InputArgTensorList, InputArgValue, InputArgPy)):
+    if isinstance(
+        raw,
+        (InputArgTensor, InputArgTensorList, InputArgConfig, InputArgValue, InputArgPy),
+    ):
         return raw
 
     if not isinstance(raw, dict):
@@ -358,13 +376,18 @@ def _parse_input_arg(raw: Any) -> InputArg:
         return InputArgTensorList(
             tensor_list=[InputTensorSpec(**t) for t in raw["tensor_list"]]
         )
+    if "config_path" in keys:
+        return InputArgConfig(
+            config_path=raw["config_path"],
+            config_kwargs=raw.get("config_kwargs", {}) or {},
+        )
     if "value" in keys:
         return InputArgValue(value=raw["value"])
     if "py" in keys:
         return InputArgPy(py=raw["py"])
     raise ValueError(
         f"Each args element must contain exactly one of: "
-        f"tensor, tensor_list, value, py. Got keys: {keys}"
+        f"tensor, tensor_list, config_path, value, py. Got keys: {keys}"
     )
 
 
@@ -412,8 +435,29 @@ class InputsEdits(BaseModel):
                 ]
                 cpu_args.append(lst)
 
+            elif isinstance(arg, InputArgConfig):
+                import importlib
+
+                module_path, _, cls_name = arg.config_path.rpartition(".")
+                if not module_path:
+                    raise ValueError(
+                        f"Invalid config_path {arg.config_path!r}: expected "
+                        f"'package.module.ClassName'"
+                    )
+                config_cls = getattr(importlib.import_module(module_path), cls_name)
+                cpu_args.append(config_cls(**arg.config_kwargs))
+
             elif isinstance(arg, InputArgValue):
                 val = arg.value
+                # Reject the legacy bare "<config:PATH>" marker: it carries no
+                # config_kwargs and cannot be resolved to a correctly-shaped
+                # config. Regenerate the YAML with the config-emitting generator.
+                if isinstance(val, str) and val.startswith("<config:"):
+                    raise ValueError(
+                        f"Unresolved config marker {val!r}. Regenerate this module "
+                        f"config so the constructor arg uses 'config_path' + "
+                        f"'config_kwargs' instead of a bare '<config:...>' value."
+                    )
                 if (
                     test_device is not None
                     and op_name == "torch.to"

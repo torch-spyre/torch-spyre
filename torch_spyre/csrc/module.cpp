@@ -117,7 +117,6 @@ void startRuntime() {
 }
 
 void freeRuntime() {
-  clearArtifactCache();
   GlobalRuntime::reset();
 }
 
@@ -194,7 +193,6 @@ PYBIND11_MODULE(_C, m) {
   m.def("start_runtime", &spyre::startRuntime);
   m.def("free_runtime", &spyre::freeRuntime);
   m.def("device_count", &spyre::getVisibleDeviceCount);
-  m.def("launch_kernel", &spyre::launchKernel);
   m.def("encode_constant", &spyre::encodeConstant);
 
   py::enum_<spyre::ElementArrangement>(m, "ElementArrangement")

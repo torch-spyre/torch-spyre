@@ -66,6 +66,9 @@ _SPYRE_METADATA_ATTRS = (
     "dim_hints",
     "work_div_loop_info",
     "loop_info",
+    "_restickify_plan",
+    "_input_layout_overrides",
+    "_emit_set_layout",
 )
 
 

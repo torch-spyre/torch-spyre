@@ -52,6 +52,7 @@ from torch_spyre._inductor.scratchpad.passes import (
 )
 from torch_spyre._inductor.scratchpad.utils import (
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
+    buffer_not_read_in_full,
     clone_at_graph_boundaries,
     mem_usage_by_buf,
     calculate_liveness,
@@ -185,6 +186,21 @@ class ScratchpadAllocator(ABC):
                 drop_list.add(key)
                 self.reject_reasons[key] = "core div mismatch"
 
+        # filter out intermediates read partially (sliced / multi-offset): the
+        # single-base LX path mis-addresses such reads (see
+        # buffer_not_read_in_full / compute_ops._start_addr_data), e.g. an
+        # inner-dim slice x[:, :, 32:96] feeding a chained op. _build_bound_buffers
+        # applies the same guard to graph input/output clones; this covers the
+        # intermediate buffers. Overrides allow_all_ops_in_lx_planning by design.
+        # Only check ops still eligible above: ops already dropped include
+        # non-ComputedBuffer outputs (e.g. multi-output) whose layouts have no
+        # size for buffer_not_read_in_full to inspect.
+        drop_list.update(
+            op.name
+            for op in graph.operations
+            if op.name not in drop_list and buffer_not_read_in_full(graph, op.name)
+        )
+
         if not clone_at_graph_boundaries():
             # Without clone support, graph outputs cannot be LX-pinned: the caller
             # holds an HBM reference and there is no clone to redirect it to.
@@ -222,6 +238,13 @@ class ScratchpadAllocator(ABC):
             if _would_produce_lx_back_gap(graph, output_name, uses):
                 self.reject_reasons[output_name] = "lx back gap"
                 continue
+            if output_name in graph_output_names and buffer_not_read_in_full(
+                graph, output_name
+            ):
+                # A pinned graph output is cloned for the HBM return; if a
+                # consumer reads it partially (sliced / multi-offset), SDSC
+                # mis-addresses the single-base LX buffer. Don't pin it.
+                continue
             buffers.append(
                 LifetimeBoundBuffer(
                     output_name,
@@ -243,6 +266,13 @@ class ScratchpadAllocator(ABC):
                     # transfer anyway.
                     continue
                 if not GraphEditor.all_uses_are_rewritable(graph, uses):
+                    continue
+                if buffer_not_read_in_full(graph, input_name):
+                    # A consumer reads this input partially -- a sliced/
+                    # multi-offset read (e.g. x[:, 0:512] + x[:, 512:1024], or
+                    # x[:, :, 0:64]). The clone would be pinned to LX, which
+                    # SDSC addresses by a single base, so partial reads
+                    # mis-address and produce wrong results.
                     continue
                 num_cores = ncores.get(input_name, -1)
                 if num_cores < 0:
