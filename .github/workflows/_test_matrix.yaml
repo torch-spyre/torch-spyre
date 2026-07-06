@@ -91,6 +91,13 @@ jobs:
       # GitHub Actions sets CI=true which causes pytest inductor tests to fail.
       # Explicitly clear it.
       CI: ''
+      # Artifactory credentials forwarded into the build-torch-spyre composite
+      # action for RPM download. Composite actions cannot read secrets directly,
+      # so they must be exposed as job-level env vars.
+      ARTIFACTORY_API_KEY: ${{ secrets.ARTIFACTORY_TOKEN }}
+      ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
+      ARTIFACTORY_RPM_PATH: ${{ secrets.ARTIFACTORY_RPM_PATH }}
+      ARTIFACTORY_RPM_PATH_LIBAIUPTI: ${{ secrets.ARTIFACTORY_RPM_PATH_LIBAIUPTI }}
 
     strategy:
       fail-fast: false
@@ -287,6 +294,13 @@ jobs:
     timeout-minutes: 60
     env:
       CI: ''
+      # Artifactory credentials forwarded into the build-torch-spyre composite
+      # action for RPM download. Composite actions cannot read secrets directly,
+      # so they must be exposed as job-level env vars.
+      ARTIFACTORY_API_KEY: ${{ secrets.ARTIFACTORY_TOKEN }}
+      ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
+      ARTIFACTORY_RPM_PATH: ${{ secrets.ARTIFACTORY_RPM_PATH }}
+      ARTIFACTORY_RPM_PATH_LIBAIUPTI: ${{ secrets.ARTIFACTORY_RPM_PATH_LIBAIUPTI }}
 
     strategy:
       fail-fast: false
