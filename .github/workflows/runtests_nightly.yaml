@@ -42,6 +42,7 @@ jobs:
   # ---------------------------------------------------------------------------
   run-tests:
     uses: ./.github/workflows/_test_matrix.yaml
+    secrets: inherit
     with:
       runner_label: linux
       extra_test_flags: --cpu-compile -vvv -s

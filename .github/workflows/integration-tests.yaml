@@ -120,6 +120,7 @@ jobs:
   run-tests:
     needs: provenance
     uses: ./.github/workflows/_test_matrix.yaml
+    secrets: inherit
     with:
       runner_label: linux
       image_label: ${{ inputs.runner_label || 'image_spyre_backend' }}

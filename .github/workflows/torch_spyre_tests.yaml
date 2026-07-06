@@ -126,6 +126,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code_changed == 'true'
     uses: ./.github/workflows/_test_matrix.yaml
+    secrets: inherit
     with:
       runner_label: linux
       # Per-PR ephemeral image label when provided, else the standing set.
