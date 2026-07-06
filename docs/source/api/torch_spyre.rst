@@ -437,11 +437,11 @@ Warnings
 
 .. function:: torch_spyre._C.get_downcast_warning() -> bool
 
-   Returns whether int64 → int32 downcast warnings are enabled.
+   Returns whether float32 → float16 downcast warnings are enabled.
 
 .. function:: torch_spyre._C.set_downcast_warning(enabled)
 
-   Enable or disable int64 → int32 downcast warnings.
+   Enable or disable float32 → float16 downcast warnings.
 
    :param bool enabled: ``True`` to enable warnings, ``False`` to suppress.
 
@@ -476,17 +476,13 @@ Environment Variables
    * - ``TORCH_SPYRE_DEBUG=1``
      - Enable C++ debug logging and ``-O0`` builds
    * - ``TORCH_SPYRE_DOWNCAST_WARN=0``
-     - Suppress int64 → int32 downcast warnings
+     - Suppress float32 → float16 downcast warnings
    * - ``SPYRE_INDUCTOR_LOG=1``
-     - *Deprecated*. Use ``TORCH_LOGS='spyre.inductor:INFO'``. Enables Spyre
-       Inductor logging
+     - Enable Spyre Inductor logging
    * - ``SPYRE_INDUCTOR_LOG_LEVEL=DEBUG``
-     - *Deprecated*. Set the level in ``TORCH_LOGS`` (e.g.
-       ``spyre.inductor:DEBUG``). Sets Spyre Inductor log verbosity (DEBUG,
-       INFO, WARNING, ERROR)
+     - Set Spyre Inductor log verbosity (DEBUG, INFO, WARNING, ERROR)
    * - ``SPYRE_LOG_FILE=path``
-     - *Deprecated*. Mapped to the top-level ``spyre`` logger file handler.
-       Redirects Spyre Inductor logs to a file
+     - Redirect Spyre Inductor logs to a file
    * - ``TORCH_SENDNN_LOG``
      - SendNN library logging level (default: ``CRITICAL``)
    * - ``DT_DEEPRT_VERBOSE``
@@ -511,8 +507,6 @@ Environment Variables
        ``scratchpad_planning`` pass)
    * - ``CO_OPTIMIZING_LX_PLANNING``
      - Use the co-optimizing LX allocator strategy (default ``0``)
-   * - ``SPYRE_INDUCTOR_MEMORY_PLAN``
-     - Enable HBM / device-buffer memory planning (default ``1``)
    * - ``CHUNK_LARGE_TENSORS``
      - Run the ``chunk_large_tensors`` pass to split tensors that exceed
        the per-core span (default ``0``)
@@ -537,9 +531,7 @@ Environment Variables
    * - ``MIN_DEFAULT_GRANULARITY``
      - Minimum default granularity for work division (default ``4``)
    * - ``SPYRE_INDUCTOR_IGNORE_HINTS``
-     - Ignore ``spyre_hint`` annotations: both ``work_div={...}``
-       work-division hints and hint-based working-set reduction (default
-       ``0``)
+     - Ignore ``spyre_hint(work_div={...})`` annotations (default ``0``)
 
 **Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
 

@@ -22,18 +22,6 @@ TEST_FILE ?=
 _TEST_FILE_ARG := $(if $(TEST_FILE),--test-file $(TEST_FILE),)
 
 # ---------------------------------------------------------------------------
-# Developer tooling
-# ---------------------------------------------------------------------------
-
-.PHONY: setup
-setup: ## Reinstall torch-spyre into the active venv (uv sync --all-extras --reinstall-package torch-spyre)
-	uv sync --all-extras --active --inexact --reinstall-package torch-spyre -v
-
-.PHONY: precommit
-precommit: ## Run all pre-commit hooks against every file
-	pre-commit run --all-files
-
-# ---------------------------------------------------------------------------
 # Test suites
 # ---------------------------------------------------------------------------
 

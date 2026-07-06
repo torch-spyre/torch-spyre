@@ -31,18 +31,11 @@ on:
         type: string
         default: image_spyre_backend
 
-      # Flags appended to every `bash tests/run_test.sh <config>` call for the test job
+      # Flags appended to every `bash tests/run_test.sh <config>` call
       extra_test_flags:
-        description: Extra flags passed to run_test.sh for the test job (e.g. "-v" or "--cpu-compile -vvv -s")
+        description: Extra flags passed to run_test.sh (e.g. "-v" or "--cpu-compile -vvv -s")
         required: true
         type: string
-
-      # Flags appended to every `bash tests/run_test.sh <config>` call for the test_multi_spyre job
-      extra_test_flags_multi_spyre:
-        description: Extra flags passed to run_test.sh for the test_multi_spyre job (e.g. "-v")
-        required: false
-        type: string
-        default: ''
 
       # Whether to run checkout-pytorch (nightly only)
       checkout_pytorch:
@@ -141,8 +134,6 @@ jobs:
             config: torch_spyre_tests/inductor/test_copy_back_elision_config.yaml
           - name: Inductor Decomp
             config: torch_spyre_tests/inductor/test_decomp_config.yaml
-          - name: Inductor Fallback Kernel Shapes
-            config: torch_spyre_tests/inductor/test_fallback_kernel_shapes_config.yaml
           - name: Inductor FX Passes
             config: torch_spyre_tests/inductor/test_inductor_fx_passes_config.yaml
           - name: Inductor Normalization Scalars
@@ -165,7 +156,7 @@ jobs:
             config: torch_spyre_tests/inductor/test_inductor_ops_pointwise_config.yaml
           - name: Inductor Ops Misc Shape A
             config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_a_config.yaml
-            runner: spyre_pf_x2
+            runner: spyre_pf_x4
           - name: Inductor Ops Misc Shape B
             config: torch_spyre_tests/inductor/test_inductor_ops_misc_shape_b_config.yaml
           - name: Inductor Ops Misc Shape C
@@ -176,6 +167,7 @@ jobs:
             config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_b_config.yaml
           - name: Inductor Ops Misc Compute C
             config: torch_spyre_tests/inductor/test_inductor_ops_misc_compute_c_config.yaml
+            runner: spyre_pf_x4
           - name: Inductor Ops FP8
             config: torch_spyre_tests/inductor/test_inductor_ops_fp8_config.yaml
           - name: Inductor Ops LX Planning
@@ -191,8 +183,6 @@ jobs:
             config: torch_spyre_tests/inductor/test_padding_config.yaml
           - name: Inductor Overwrite
             config: torch_spyre_tests/inductor/test_overwrite.yaml
-          - name: Inductor Propagate Named Dims
-            config: torch_spyre_tests/inductor/test_propagate_named_dims_config.yaml
           - name: Inductor Restickify
             config: torch_spyre_tests/inductor/test_restickify_config.yaml
           - name: Inductor Scratchpad Patterns
@@ -213,8 +203,6 @@ jobs:
             config: torch_spyre_tests/inductor/test_unroll_loop_specs_config.yaml
           - name: Inductor Work Division Hint
             config: torch_spyre_tests/inductor/test_work_division_hint_config.yaml
-          - name: Inductor Tensor Transpose
-            config: torch_spyre_tests/inductor/test_inductor_transpose_edge_config.yaml
           # ---- Tensor tests ----
           - name: Tensor Coordinates
             config: torch_spyre_tests/tensors/test_coordinates_config.yaml
@@ -348,8 +336,7 @@ jobs:
         with:
           suite_name: ${{ matrix.suite.name }}
           config: tests/configs/${{ matrix.suite.config }}
-          extra_test_flags: ${{ inputs.extra_test_flags_multi_spyre }}
-          parallel: 'false'
+          extra_test_flags: ${{ inputs.extra_test_flags }}
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
           pre_run: |
@@ -369,104 +356,3 @@ jobs:
           path: ${{ env.REPORT_PATH }}
           if-no-files-found: warn
           retention-days: 10
-
-  # ---------------------------------------------------------------------------
-  # Job 3: Report test suites that ran zero tests
-  #
-  # Runs after both matrix jobs (even if they fail) and checks every uploaded
-  # JUnit XML artifact for a zero-test result.  Issues ::warning:: annotations
-  # and writes a step summary table (does NOT fail the workflow).
-  # ---------------------------------------------------------------------------
-  report_empty_suites:
-    name: Report empty test suites
-    runs-on: ubuntu-latest
-    needs: [test, test_multi_spyre]
-    if: always()
-
-    steps:
-      - name: Download all XML artifacts
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p xml_artifacts
-          ARTIFACTS=$(gh api \
-            "/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
-            --jq '[.artifacts[] | select(.name | endswith(".xml")) | {id: .id, name: .name}]')
-
-          ARTIFACTS="$ARTIFACTS" python3 <<'PYEOF'
-          import json, os, subprocess
-          artifacts = json.loads(os.environ['ARTIFACTS'])
-          repo = "${{ github.repository }}"
-          for a in artifacts:
-              zip_path = f"xml_artifacts/{a['name']}.zip"
-              result = subprocess.run(
-                  ["gh", "api", f"/repos/{repo}/actions/artifacts/{a['id']}/zip"],
-                  capture_output=True, check=True,
-                  env={**os.environ},
-              )
-              with open(zip_path, "wb") as f:
-                  f.write(result.stdout)
-              subprocess.run(
-                  ["unzip", "-q", "-o", zip_path, "-d", "xml_artifacts/"],
-                  check=True,
-              )
-          print(f"Downloaded {len(artifacts)} artifact(s).")
-          PYEOF
-
-      - name: Check for empty suites
-        run: |
-          python3 <<'PYEOF'
-          import os
-          import sys
-          from pathlib import Path
-          from xml.etree import ElementTree as ET
-
-          xml_dir = Path("xml_artifacts")
-          xml_files = sorted(xml_dir.glob("**/*.xml"))
-
-          empty = []
-          for xml_file in xml_files:
-              try:
-                  tree = ET.parse(xml_file)
-                  root = tree.getroot()
-                  # Handle both <testsuite> and <testsuites><testsuite ...> forms
-                  # Count <testcase> elements directly — the tests= attribute
-                  # is unreliable when pytest-xdist produced the XML (it writes
-                  # tests="0" in the suite header even when cases are present).
-                  total_tests = len(root.findall(".//testcase"))
-                  if total_tests == 0:
-                      empty.append(xml_file.stem)
-              except ET.ParseError as e:
-                  print(f"::warning::Could not parse {xml_file.name}: {e}")
-
-          # Build step summary
-          lines = []
-          if empty:
-              lines.append("### Empty test suites detected\n")
-              lines.append(
-                  "The following suite(s) uploaded a JUnit XML report with **0 tests**:\n"
-              )
-              lines.append("| Artifact |")
-              lines.append("|---|")
-              for name in empty:
-                  lines.append(f"| `{name}` |")
-              lines.append("")
-              lines.append(
-                  "> **Note:** This is a warning only — the workflow is not failed."
-              )
-          else:
-              lines.append("### Empty suite check: all suites ran at least one test.")
-
-          summary = "\n".join(lines)
-          print(summary)
-          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "")
-          if summary_path:
-              with open(summary_path, "a") as f:
-                  f.write(summary + "\n")
-
-          # Emit ::warning:: annotations for each empty suite
-          for name in empty:
-              print(f"::warning title=Empty test suite::{name} reported 0 tests collected")
-
-          sys.exit(0)
-          PYEOF
