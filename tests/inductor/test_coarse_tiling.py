@@ -456,6 +456,8 @@ class TestCoarseTileInfo(unittest.TestCase):
 
 
 class TestRetileLoadIndexFromStrides(unittest.TestCase):
+    """Unit tests for converting stale full-buffer load indexes to tile indexes."""
+
     def test_rewrites_stale_full_stride_to_tile_stride(self):
         c0, c1 = sympy.symbols("c0 c1")
         rewrites = _stride_rewrite_map(
@@ -498,6 +500,8 @@ class TestRetileLoadIndexFromStrides(unittest.TestCase):
 
 
 class TestShouldPatchRetiledLoadIndexes(unittest.TestCase):
+    """Unit tests for selecting exact-loop consumers of retiled buffers."""
+
     def test_requires_exact_loop_group_id(self):
         op = _make_inside_consumer_op("consumer", "retiled", loop_group_id=(0,))
 
@@ -521,6 +525,8 @@ class TestShouldPatchRetiledLoadIndexes(unittest.TestCase):
 
 
 class TestReplaceGroupOp(unittest.TestCase):
+    """Unit tests for keeping coarse-tile group op references current."""
+
     def test_replaces_by_identity(self):
         old_op = _make_op(_make_pointwise([4]), "old")
         new_op = _make_op(_make_pointwise([4]), "new")

@@ -90,6 +90,8 @@ _SPAN_OVERFLOW_HINT_ID = 10000
 
 
 class _RetiledBufferInfo(NamedTuple):
+    """Host strides before and after a buffer is resized for a coarse tile."""
+
     old_stride: tuple[Expr, ...]
     new_stride: tuple[Expr, ...]
 
@@ -1355,6 +1357,8 @@ def _patch_consumers(
 
 
 def _stride_rewrite_map(info: _RetiledBufferInfo) -> dict[Expr, Expr]:
+    """Map unique stale stride coefficients to their retiled coefficients."""
+
     old_counts = Counter(sympy.simplify(s) for s in info.old_stride)
     rewrites: dict[Expr, Expr] = {}
     for old, new in zip(info.old_stride, info.new_stride):
@@ -1370,6 +1374,8 @@ def _retile_load_index_from_strides(
     index: Expr,
     rewrites: dict[Expr, Expr],
 ) -> Expr:
+    """Rewrite separable affine load-index terms from full strides to tile strides."""
+
     if not rewrites:
         return index
 
@@ -1435,6 +1441,8 @@ def _retile_load_index_from_strides(
 
 
 class _RetileLoadIndexHandler(WrapperHandler):
+    """Ops handler that retiles loads from buffers whose host strides changed."""
+
     def __init__(self, inner, rewrites_by_name: dict[str, dict[Expr, Expr]]):
         super().__init__(inner)
         self._rewrites_by_name = rewrites_by_name
@@ -1452,6 +1460,7 @@ def _should_patch_retiled_load_indexes(
     group_id: tuple[int, ...],
     retiled_names: set[str],
 ) -> bool:
+    """Return True when op is an exact-loop consumer of a retiled buffer."""
     if not isinstance(op, ComputedBuffer):
         return False
     if not isinstance(op.data, (Pointwise, Reduction)):
@@ -1465,6 +1474,7 @@ def _should_patch_retiled_load_indexes(
 def _replace_group_op(
     group_ops: list[Operation], old_op: Operation, new_op: Operation
 ) -> None:
+    """Keep the tiling group list in sync after replacing a ComputedBuffer body."""
     old_name = old_op.get_operation_name()
     for idx, group_op in enumerate(group_ops):
         if group_op is old_op or group_op.get_operation_name() == old_name:
@@ -1478,6 +1488,7 @@ def _patch_retiled_load_indexes(
     retiled_infos: dict[str, _RetiledBufferInfo],
     operations: list[Operation],
 ) -> None:
+    """Rewrite stale load indexes for consumers of buffers retiled by coarse tiling."""
     rewrites_by_name = {
         name: rewrites
         for name, info in retiled_infos.items()
