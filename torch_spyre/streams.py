@@ -13,7 +13,6 @@ __all__ = [
 ]
 
 
-
 class Stream:
     """
     Wrapper around a Spyre stream.

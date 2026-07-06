@@ -112,7 +112,6 @@ register_torch_compile_kernel(
         aten.ge,
         aten.gt,
         aten.lt,
-        aten.amax,
         aten.maximum,
         aten.minimum,
         aten.pow,

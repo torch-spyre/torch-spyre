@@ -1022,8 +1022,6 @@ def replace_computed_buffer_body(
 
     Returns the replacement ComputedBuffer.
     """
-    # Always wrap the original inner_fn via WrapperHandler; never rebuild
-    # index expressions from scratch (they go stale — see issue #2797).
     new_buf = ComputedBuffer(
         name=op.get_name(),
         layout=op.layout,
@@ -1185,9 +1183,6 @@ def lower_pad_sequence(
 
     # Step 2 — identify the within-stick host dim in the view (which may include
     # phantom leading dims) by matching the within-stick element stride.
-    # TODO: replace this sm_last heuristic with _resize_device_layout from
-    # coarse_tile.py (device-native reconstruction that handles transposed and
-    # non-contiguous layouts without guessing from stride_map[-1]).
     sm_last = int(list(orig_stl.stride_map)[-1])
     orig_host_stride = list(arg_fx_node.meta["val"].stride())
     within_stick_dim_view = next(

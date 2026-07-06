@@ -94,8 +94,7 @@ def _make_op_spec(
     hbm_base: int = _HBM_BASE,
     include_lx: bool = False,
 ) -> OpSpec:
-    # tiled_syms are all in the same (innermost) loop level.
-    level_syms = list(tiled_syms) if tiled_syms else []
+    tiled_syms = tiled_syms or []
     args = [_make_hbm_tensor_arg(hbm_base)]
     if include_lx:
         args.append(_make_lx_tensor_arg())
@@ -118,7 +117,7 @@ def _make_op_spec(
         },
         args=args,
         op_info={},
-        tiled_symbols=[level_syms] if level_syms else [],
+        tiled_symbols=list(tiled_syms),
     )
 
 
@@ -275,7 +274,7 @@ class TestUnrollLoopSpecs(unittest.TestCase):
             },
             args=[arg0, arg1],
             op_info={},
-            tiled_symbols=[[_C_ROW]],
+            tiled_symbols=[_C_ROW],
         )
         loop = LoopSpec(count=Integer(2), body=[op])
         result = unroll_loop_specs([loop])
@@ -380,12 +379,7 @@ class TestNestedReductionUnroll(unittest.TestCase):
         )
 
     def _make_bmm_op(self) -> OpSpec:
-        """Model bmm partial result: reads k_input, writes pool scratch.
-
-        tiled_symbols: innermost-first.
-          [0] = inner K-loop symbols: [c_k]
-          [1] = outer B-loop symbols: [c_b]
-        """
+        """Model bmm partial result: reads k_input, writes pool scratch."""
         return OpSpec(
             op="batchmatmul",
             is_reduction=True,
@@ -397,16 +391,13 @@ class TestNestedReductionUnroll(unittest.TestCase):
             },
             args=[self._make_k_input_arg(), self._make_pool_scratch()],
             op_info={},
-            tiled_symbols=[[self._C_K], [self._C_B]],
+            tiled_symbols=[self._C_B, self._C_K],
         )
 
     def _make_combine_op(self) -> OpSpec:
         """Model combine (add): reads pool + accum_buf, writes accum_buf.
 
         Output-only iteration space: no K symbol.
-        tiled_symbols: innermost-first.
-          [0] = inner K-loop symbols: [] (K doesn't tile combine — no c_k in iteration_space)
-          [1] = outer B-loop symbols: [c_b]
         """
         return OpSpec(
             op="add",
@@ -422,7 +413,7 @@ class TestNestedReductionUnroll(unittest.TestCase):
                 self._make_accum_arg(),  # output: accum_buf (write)
             ],
             op_info={},
-            tiled_symbols=[[], [self._C_B]],
+            tiled_symbols=[self._C_B],
         )
 
     # ------------------------------------------------------------------
@@ -438,7 +429,10 @@ class TestNestedReductionUnroll(unittest.TestCase):
     def test_combine_accum_fixed_across_k_iterations(self):
         bmm = self._make_bmm_op()
         combine = self._make_combine_op()
-        inner = LoopSpec(count=Integer(4), body=[bmm, combine])
+        # Inner K-loop: LoopSpec explicitly carries the K symbol.
+        inner = LoopSpec(
+            count=Integer(4), body=[bmm, combine], tiled_symbols=[self._C_K]
+        )
         result = unroll_loop_specs([inner])
 
         self.assertEqual(len(result), 8, f"Expected 4*2=8 ops, got {len(result)}")
@@ -463,7 +457,9 @@ class TestNestedReductionUnroll(unittest.TestCase):
     def test_pool_scratch_fixed_across_k_iterations(self):
         bmm = self._make_bmm_op()
         combine = self._make_combine_op()
-        inner = LoopSpec(count=Integer(4), body=[bmm, combine])
+        inner = LoopSpec(
+            count=Integer(4), body=[bmm, combine], tiled_symbols=[self._C_K]
+        )
         result = unroll_loop_specs([inner])
 
         for op_copy in result:
@@ -489,7 +485,9 @@ class TestNestedReductionUnroll(unittest.TestCase):
         K_TILE_BYTES = (128 // 64) * (64 * 64) * 2  # 16384
         bmm = self._make_bmm_op()
         combine = self._make_combine_op()
-        inner = LoopSpec(count=Integer(4), body=[bmm, combine])
+        inner = LoopSpec(
+            count=Integer(4), body=[bmm, combine], tiled_symbols=[self._C_K]
+        )
         result = unroll_loop_specs([inner])
 
         bmm_copies = result[::2]  # every other op is a bmm copy
@@ -528,8 +526,6 @@ class TestNestedReductionUnroll(unittest.TestCase):
         B_TILE_BYTES = 2 * 64 * 2  # 256
 
         fill_accum = self._make_accum_arg()
-        # fill is only inside the outer B-loop (not the inner K-loop).
-        # tiled_symbols[0] = innermost (outer B-loop here) = [c_b]
         fill_op = OpSpec(
             op="identity",
             is_reduction=False,
@@ -539,14 +535,18 @@ class TestNestedReductionUnroll(unittest.TestCase):
             },
             args=[fill_accum],
             op_info={},
-            tiled_symbols=[[self._C_B]],
+            tiled_symbols=[self._C_B],
         )
 
         bmm = self._make_bmm_op()
         combine = self._make_combine_op()
 
-        inner = LoopSpec(count=Integer(4), body=[bmm, combine])
-        outer = LoopSpec(count=Integer(2), body=[fill_op, inner])
+        inner = LoopSpec(
+            count=Integer(4), body=[bmm, combine], tiled_symbols=[self._C_K]
+        )
+        outer = LoopSpec(
+            count=Integer(2), body=[fill_op, inner], tiled_symbols=[self._C_B]
+        )
         result = unroll_loop_specs([outer])
 
         # Expected flat layout: 2 × (1 fill + 4 × (1 bmm + 1 combine)) = 18 ops
@@ -658,11 +658,7 @@ class TestNestedReductionTileAccum(unittest.TestCase):
         )
 
     def _make_copy_op(self) -> OpSpec:
-        """Copy: accum_tile → accum_full after inner K-loop.
-
-        Inside the outer B-loop only (not the inner K-loop).
-        tiled_symbols[0] = innermost (outer B-loop here) = [c_b]
-        """
+        """Copy: accum_tile → accum_full after inner K-loop."""
         return OpSpec(
             op="copy",
             is_reduction=False,
@@ -676,7 +672,7 @@ class TestNestedReductionTileAccum(unittest.TestCase):
                 self._make_accum_full_arg(),  # output: advances per outer B-tile
             ],
             op_info={},
-            tiled_symbols=[[self._C_B]],
+            tiled_symbols=[],
         )
 
     def _make_nested_loop(self) -> LoopSpec:
@@ -702,8 +698,6 @@ class TestNestedReductionTileAccum(unittest.TestCase):
             allocation={"hbm": 0x2000000000},
             per_tile_fixed=True,
         )
-        # bmm_partial is inside the inner K-loop only (not the outer B-loop).
-        # tiled_symbols[0] = innermost = [c_k]
         bmm_partial = OpSpec(
             op="matmul",
             is_reduction=True,
@@ -714,9 +708,8 @@ class TestNestedReductionTileAccum(unittest.TestCase):
             },
             args=[bmm_input, bmm_output],
             op_info={},
-            tiled_symbols=[[self._C_K]],
+            tiled_symbols=[self._C_K],
         )
-        # combine_op is inside the inner K-loop; no K tiling (c_k not in iteration_space).
         combine_op = OpSpec(
             op="add",
             is_reduction=False,
@@ -726,12 +719,17 @@ class TestNestedReductionTileAccum(unittest.TestCase):
             },
             args=[self._make_accum_tile_arg(), self._make_accum_tile_arg()],
             op_info={},
-            tiled_symbols=[[]],
+            tiled_symbols=[],
         )
-        inner = LoopSpec(count=Integer(4), body=[bmm_partial, combine_op])
+        inner = LoopSpec(
+            count=Integer(4),
+            body=[bmm_partial, combine_op],
+            tiled_symbols=[self._C_K],
+        )
         return LoopSpec(
             count=Integer(2),
             body=[self._make_fill_op(), inner, self._make_copy_op()],
+            tiled_symbols=[self._C_B],
         )
 
     def test_accum_tile_fixed_accum_full_advances(self):
@@ -884,7 +882,7 @@ class TestDeviceStrideFormula(unittest.TestCase):
             },
             args=[arg],
             op_info={},
-            tiled_symbols=[[c_row]],
+            tiled_symbols=[c_row],
         )
         loop = LoopSpec(count=Integer(4), body=[op])
         result = unroll_loop_specs([loop])
@@ -1214,7 +1212,7 @@ class TestTileDeviceSize(unittest.TestCase):
             },
             args=[arg],
             op_info={},
-            tiled_symbols=[[c0]],
+            tiled_symbols=[c0],
         )
         loop = LoopSpec(count=Integer(COUNT), body=[op])
         result = unroll_loop_specs([loop])

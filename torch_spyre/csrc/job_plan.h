@@ -348,19 +348,13 @@ class JobPlanStepCompute final : public JobPlanStep {
    * @param bootstrap_offset Offset within the program allocation where
    * execution begins (0 = base; the program-correction region size when
    * correction precedes the binary)
-   * @param name Human-readable kernel name forwarded to flex as
-   * ComputeParams::kernel_name; surfaces in profiler events
-   * (PendingRequest::node_name, aiupti activity name, FLEX JSON CBName).
-   * Empty string ("") preserves the old behavior (no name).
    */
   explicit JobPlanStepCompute(flex::CompositeAddress program_address,
                               bool bind_io_addresses,
-                              uint64_t bootstrap_offset = 0,
-                              std::string name = "")
+                              uint64_t bootstrap_offset = 0)
       : program_address_(std::move(program_address)),
         bind_io_addresses_(bind_io_addresses),
-        bootstrap_offset_(bootstrap_offset),
-        name_(std::move(name)) {}
+        bootstrap_offset_(bootstrap_offset) {}
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
@@ -370,7 +364,6 @@ class JobPlanStepCompute final : public JobPlanStep {
   flex::CompositeAddress program_address_;
   bool bind_io_addresses_;
   uint64_t bootstrap_offset_;
-  std::string name_;
 };
 
 /**

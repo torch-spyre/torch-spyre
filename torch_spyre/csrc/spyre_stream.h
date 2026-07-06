@@ -49,6 +49,8 @@ class SpyreStream {
   void copyAsync(const at::Tensor& src, const at::Tensor& dst) const;
   void copyProgramAsync(void* prog_cpu_ptr,
                         const flex::CompositeAddress* device_address) const;
+  void executeProgramAsync(const KernelArtifacts& arts,
+                           const std::vector<at::Tensor>& args) const;
 
   void launch(const JobPlan& plan, const std::vector<at::Tensor>& args) const;
 

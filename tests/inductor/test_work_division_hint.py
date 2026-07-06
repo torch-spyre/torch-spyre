@@ -27,6 +27,7 @@ from torch_spyre._inductor import config, spyre_hint
 import torch_spyre._inductor.work_division as _wd
 import torch_spyre._inductor.propagate_named_dims as _pnd
 
+_LAUNCH_KERNEL = "torch_spyre.execution.kernel_runner.launch_kernel"
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
 
@@ -393,6 +394,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
                 return torch.abs(x)
 
         with (
+            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -422,6 +424,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
                 return torch.abs(x)
 
         with (
+            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),

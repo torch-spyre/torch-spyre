@@ -186,7 +186,8 @@ it sets up the next two optimizations, which are large.
 
 **Stage 3, in-place ops.** When a buffer is on LX and its last reader is
 itself dying-after-this-op, the output of the next op can reuse the same
-LX address. `exp` and `sub` are flagged as `torch.Tag.pointwise`
+LX address. `exp` and `sub` are flagged
+[OP_GOOD_FOR_LX_INPLACE](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/scratchpad/utils.py)
 and therefore in-placeable. After stage 3, the only HBM access left is
 the graph input and graph output, for `3MN` bytes total, a 62% reduction.
 

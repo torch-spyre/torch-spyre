@@ -889,21 +889,19 @@ def compile_op_spec(
     symbols: list[int],
     symbol_id_offset: int = 0,
     use_symbols: bool = False,
-) -> tuple[Any, list[int], list[list[dict]], list[SymbolKind]]:
+) -> tuple[Any, list[int], list[dict], list[SymbolKind]]:
     sdsc_spec, symbol_mapping = parse_op_spec(op_spec)
     logger.debug("%s", sdsc_spec)
-    # Translate tiled_symbols from OpSpec's per-level inductor symbols (innermost-
-    # first) to the renamed SDSC symbols via the same mapping used to build
-    # sdsc_spec.  generate_sdsc expects outermost-first, so reverse.
-    tiled_symbols_per_level = [
-        [symbol_mapping[s] for s in level if s in symbol_mapping]
-        for level in reversed(op_spec.tiled_symbols)
+    # Translate tiled_symbols from OpSpec's inductor symbols to the renamed
+    # SDSC symbols via the same mapping used to build sdsc_spec.
+    tiled_symbols = [
+        symbol_mapping[s] for s in op_spec.tiled_symbols if s in symbol_mapping
     ]
     return generate_sdsc(
         idx,
         sdsc_spec,
         symbols,
         symbol_id_offset,
-        tiled_symbols=tiled_symbols_per_level,
+        tiled_symbols=tiled_symbols,
         use_symbols=use_symbols,
     )

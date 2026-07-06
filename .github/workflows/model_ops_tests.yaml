@@ -42,13 +42,6 @@ jobs:
       # due to a mix of fallbacks and decompositions.
       # Here we set it to an empty string (or we could also unset it).
       CI: ''
-      # Artifactory credentials forwarded into the build-torch-spyre composite
-      # action for RPM download. Composite actions cannot read secrets directly,
-      # so they must be exposed as job-level env vars.
-      ARTIFACTORY_API_KEY: ${{ secrets.ARTIFACTORY_TOKEN }}
-      ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
-      ARTIFACTORY_RPM_PATH: ${{ secrets.ARTIFACTORY_RPM_PATH }}
-      ARTIFACTORY_RPM_PATH_LIBAIUPTI: ${{ secrets.ARTIFACTORY_RPM_PATH_LIBAIUPTI }}
 
     # ---------------------------------------------------------------------------
     # To add a new model ops test suite, append an entry here:
@@ -74,10 +67,10 @@ jobs:
             config: granite-3.3-8b-instruct.yaml
           - name: Granite 3.3 8B Instruct Spyre
             config: granite-3.3-8b-instruct_spyre.yaml
-          - name: Granite 4.1 8B
-            config: granite-4.1-8b.yaml
-          - name: Granite 4.1 8B Spyre
-            config: granite-4.1-8b_spyre.yaml
+          # - name: Granite 4.0 H Tiny   # omitted for now
+          #   config: granite-4.0-h-tiny.yaml
+          # - name: Granite 4.0 H Tiny Spyre   # omitted for now
+          #   config: granite-4.0-h-tiny_spyre.yaml
           - name: Meta Llama 3.1 8B Instruct
             config: Meta-Llama-3.1-8B-Instruct.yaml
           - name: Meta Llama 3.1 8B Instruct Spyre
@@ -126,14 +119,6 @@ jobs:
           extra_test_flags: -v
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
-          pre_run: |
-            # Clear the cached AIU setup guard and stale topo.json before
-            # every attempt so a card left in a bad state by a killed
-            # (stalled) previous attempt gets re-discovered cleanly instead
-            # of carrying stale state into the retry.
-            unset _IBM_AIU_SETUP
-            rm -rf /tmp/etc/ibm/spyre/topo.json
-            source /etc/profile.d/ibm-aiu-setup.sh
 
       # ---------------------------------------------------------------------------
       # Upload the JUnit XML as a GHA artifact so it can be downloaded and

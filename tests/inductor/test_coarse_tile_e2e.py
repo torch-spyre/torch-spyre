@@ -20,7 +20,7 @@ source to verify that LoopSpec entries appear when coarse tiling is active.
 
 No Spyre hardware is required: torch.compile() exercises the full codegen path
 and run_and_get_code() captures the generated source without executing on device.
-launch_jobplan is mocked to prevent actual device execution.
+launch_kernel is mocked to prevent actual device execution.
 
 All coarse-tiling tests use the spyre_hint API (TestCoarseTileSpyreHints).
 Add new tests there using spyre_hint(num_tiles_per_dim=...) annotations.
@@ -28,8 +28,8 @@ Add new tests there using spyre_hint(num_tiles_per_dim=...) annotations.
 
 import sys
 import os
-import regex as re
 
+import pytest
 import torch
 import unittest
 from unittest.mock import patch as mock_patch
@@ -44,6 +44,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 from utils_inductor import compare_with_cpu  # noqa: E402
 
 # Paths to mock for disabling actual device kernel execution.
+_LAUNCH_KERNEL = "torch_spyre.execution.kernel_runner.launch_kernel"
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
 
@@ -81,6 +82,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
+            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -120,6 +122,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
+            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -178,6 +181,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(softmax_fn)
         with (
+            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -261,6 +265,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
+            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -341,6 +346,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             subprocess_calls.append(args)
 
         with (
+            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run", side_effect=_record_subprocess),
@@ -467,6 +473,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
+            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -523,6 +530,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
+            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -575,6 +583,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
+            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -629,6 +638,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
+            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -685,6 +695,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
+            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -860,68 +871,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         result = torch.compile(fn)(Q_dev, V_dev).cpu()
         torch.testing.assert_close(result, ref, atol=0.02, rtol=0.1)
 
-    def test_hint_h_tiling_elementwise_loopspec(self):
-        """H-tiling on BHLD (B=1 unit-size) selects the H iteration symbol, not Lq.
-
-        Regression test for the host-range-index → iteration-space-key mapping in
-        create_op_spec: loop_tiled_dims stores host-range indices which include
-        unit-size dimensions that the iteration space skips.  Without the mapping,
-        index 1 (H in BHLD with B=1) maps to the 2nd iteration-space key (Lq)
-        rather than the 1st (H), producing wrong per-tile stride advances.
-        """
-        from torch_spyre._inductor import spyre_hint
-
-        B, H, Lq, D = 1, 8, 256, 64
-
-        Q = torch.randn(B, H, Lq, D, dtype=torch.float16)
-        V = torch.randn(B, H, Lq, D, dtype=torch.float16)
-        Q_dev = Q.to("spyre")
-        V_dev = V.to("spyre")
-        _declare_tensor_dim("B", B)
-        _declare_tensor_dim("H", H)
-        _declare_tensor_dim("Lq", Lq)
-        _declare_tensor_dim("D", D)
-        _name_tensor_dims(Q_dev, ["B", "H", "Lq", "D"])
-        _name_tensor_dims(V_dev, ["B", "H", "Lq", "D"])
-
-        def fn(q, v):
-            with spyre_hint(num_tiles_per_dim={"H": 2}):
-                return q * v
-
-        cfn = torch.compile(fn)
-        with (
-            mock_patch(_LAUNCH_JOBPLAN),
-            mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
-        ):
-            _, source_codes = run_and_get_code(cfn, Q_dev, V_dev)
-
-        self.assertTrue(len(source_codes) > 0)
-        src = source_codes[0]
-        self.assertIn("LoopSpec(", src, "Expected LoopSpec for H-tiled elementwise")
-        self.assertIn("sympify('2')", src, "Expected loop count 2 for H/2 tiles")
-        # The tiled symbol must be the H iteration-space symbol (c0 — the first
-        # non-unit dim after skipping B=1), NOT the Lq symbol (c1).
-        # With an incorrect host-range→iteration-space mapping, host index 1 (H)
-        # would select c1 (Lq) instead of c0 (H), advancing per-tile strides by
-        # the wrong amount.
-        tiled_syms_matches = re.findall(r"tiled_symbols=\[(\[.*?\])\]", src, re.DOTALL)
-        self.assertTrue(
-            tiled_syms_matches,
-            "Expected tiled_symbols=[[...]] in generated OpSpec source",
-        )
-        for match in tiled_syms_matches:
-            self.assertIn(
-                "c0",
-                match,
-                f"tiled_symbols should contain the H symbol (c0), got: {match}",
-            )
-            self.assertNotIn(
-                "c1",
-                match,
-                f"tiled_symbols should NOT contain the Lq symbol (c1), got: {match}",
-            )
-
     def test_hint_row_tiling_multi_stick_pointwise_correct(self):
         """Row-tiling a multi-stick pointwise chain produces correct output.
 
@@ -1003,6 +952,7 @@ class TestNamedDimsHint(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
+            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -1039,6 +989,7 @@ class TestNamedDimsHint(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
+            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -1053,17 +1004,23 @@ class TestNamedDimsHint(InductorTestCase):
 class TestCoarseTileReductionE2E(InductorTestCase):
     """E2E tests for coarse-tiling a reduction dimension.
 
-    Stick-dim reduction tiling (dim=-1 on a [..., D] tensor where D maps to
-    the stick) is now supported.  The loopspec tests run without hardware via
-    mock_patch + run_and_get_code.
+    Stage 1 supports tiling reductions over non-stick dimensions only.
+    Tiling a reduction over the stick dimension (dim=-1 on a [..., D] tensor
+    where D maps to the stick) raises RuntimeError — deferred to Stage 2.
+
+    The tests below verify that the appropriate error is raised for stick-dim
+    reduction tiling, and that LoopSpec is still emitted up to the point where
+    validation fires.
     """
+
+    _STAGE2_MSG = "stick-dim reduction tiling is not yet implemented — Stage 2"
 
     def setUp(self):
         super().setUp()
         torch.manual_seed(0xAFFE)
 
     def test_hint_tiled_reduction_sum_loopspec(self):
-        """x.sum(dim=-1) tiled over D produces a LoopSpec with count 4."""
+        """x.sum(dim=-1) tiled over D raises: stick-dim reduction not yet supported."""
         from torch_spyre._inductor import spyre_hint
 
         B, D = 64, 512
@@ -1077,24 +1034,16 @@ class TestCoarseTileReductionE2E(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"D": 4}):
                 return x.sum(dim=-1)
 
-        cfn = torch.compile(fn)
-        with (
-            mock_patch(_LAUNCH_JOBPLAN),
-            mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
-        ):
-            _, source_codes = run_and_get_code(cfn, x_dev)
-        self.assertTrue(len(source_codes) > 0)
-        src = source_codes[0]
-        self.assertIn("LoopSpec(", src, "Expected LoopSpec for D-tiled sum")
-        self.assertIn("sympify('4')", src, "Expected loop count 4")
+        with self.assertRaisesRegex(Exception, self._STAGE2_MSG):
+            torch.compile(fn)(x_dev)
 
-    def test_hint_tiled_reduction_sum_correct(self):
-        """x.sum(dim=-1) tiled over D (4 tiles) produces correct results."""
+    def test_hint_tiled_reduction_sum_rejects(self):
+        """x.sum(dim=-1) with D hint rejects at compile time with Stage 2 error."""
         from torch_spyre._inductor import spyre_hint
 
         B, D = 64, 512
         x = torch.randn(B, D, dtype=torch.float16) * 0.1
+        x_dev = x.to("spyre")
         _declare_tensor_dim("B", B)
         _declare_tensor_dim("D", D)
 
@@ -1103,8 +1052,8 @@ class TestCoarseTileReductionE2E(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"D": 4}):
                 return x.sum(dim=-1)
 
-        # atol=0.05: fp16 sum over 512 elements scaled by 0.1 accumulates ~0.05 error.
-        compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=0.05, rtol=0.05)
+        with self.assertRaisesRegex(Exception, self._STAGE2_MSG):
+            torch.compile(fn)(x_dev)
 
     def test_hint_tiled_reduction_matmul_loopspec(self):
         """torch.matmul tiled over K produces a LoopSpec with count 4."""
@@ -1127,6 +1076,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
+            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -1137,6 +1087,9 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         self.assertIn("LoopSpec(", src, "Expected LoopSpec for K-tiled matmul")
         self.assertIn("sympify('4')", src, "Expected loop count 4")
 
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_hint_tiled_reduction_matmul_correct(self):
         """torch.matmul tiled over K (4 tiles) produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1159,7 +1112,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         )
 
     def test_hint_tiled_reduction_max_loopspec(self):
-        """x.amax(dim=-1) tiled over D produces a LoopSpec with count 4."""
+        """x.amax(dim=-1) tiled over D raises: stick-dim reduction not yet supported."""
         from torch_spyre._inductor import spyre_hint
 
         B, D = 64, 512
@@ -1173,24 +1126,16 @@ class TestCoarseTileReductionE2E(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"D": 4}):
                 return x.amax(dim=-1)
 
-        cfn = torch.compile(fn)
-        with (
-            mock_patch(_LAUNCH_JOBPLAN),
-            mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
-        ):
-            _, source_codes = run_and_get_code(cfn, x_dev)
-        self.assertTrue(len(source_codes) > 0)
-        src = source_codes[0]
-        self.assertIn("LoopSpec(", src, "Expected LoopSpec for D-tiled amax")
-        self.assertIn("sympify('4')", src, "Expected loop count 4")
+        with self.assertRaisesRegex(Exception, self._STAGE2_MSG):
+            torch.compile(fn)(x_dev)
 
-    def test_hint_tiled_reduction_max_correct(self):
-        """x.amax(dim=-1) tiled over D (4 tiles) produces correct results."""
+    def test_hint_tiled_reduction_max_rejects(self):
+        """x.amax(dim=-1) with D hint rejects at compile time with Stage 2 error."""
         from torch_spyre._inductor import spyre_hint
 
         B, D = 64, 512
         x = torch.randn(B, D, dtype=torch.float16)
+        x_dev = x.to("spyre")
         _declare_tensor_dim("B", B)
         _declare_tensor_dim("D", D)
 
@@ -1199,10 +1144,11 @@ class TestCoarseTileReductionE2E(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"D": 4}):
                 return x.amax(dim=-1)
 
-        compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=1e-3, rtol=1e-3)
+        with self.assertRaisesRegex(Exception, self._STAGE2_MSG):
+            torch.compile(fn)(x_dev)
 
     def test_hint_tiled_reduction_min_loopspec(self):
-        """x.amin(dim=-1) tiled over D produces a LoopSpec with count 4."""
+        """x.amin(dim=-1) tiled over D raises: stick-dim reduction not yet supported."""
         from torch_spyre._inductor import spyre_hint
 
         B, D = 64, 512
@@ -1216,24 +1162,16 @@ class TestCoarseTileReductionE2E(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"D": 4}):
                 return x.amin(dim=-1)
 
-        cfn = torch.compile(fn)
-        with (
-            mock_patch(_LAUNCH_JOBPLAN),
-            mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run"),
-        ):
-            _, source_codes = run_and_get_code(cfn, x_dev)
-        self.assertTrue(len(source_codes) > 0)
-        src = source_codes[0]
-        self.assertIn("LoopSpec(", src, "Expected LoopSpec for D-tiled amin")
-        self.assertIn("sympify('4')", src, "Expected loop count 4")
+        with self.assertRaisesRegex(Exception, self._STAGE2_MSG):
+            torch.compile(fn)(x_dev)
 
-    def test_hint_tiled_reduction_min_correct(self):
-        """x.amin(dim=-1) tiled over D (4 tiles) produces correct results."""
+    def test_hint_tiled_reduction_min_rejects(self):
+        """x.amin(dim=-1) with D hint rejects at compile time with Stage 2 error."""
         from torch_spyre._inductor import spyre_hint
 
         B, D = 64, 512
         x = torch.randn(B, D, dtype=torch.float16)
+        x_dev = x.to("spyre")
         _declare_tensor_dim("B", B)
         _declare_tensor_dim("D", D)
 
@@ -1242,7 +1180,8 @@ class TestCoarseTileReductionE2E(InductorTestCase):
             with spyre_hint(num_tiles_per_dim={"D": 4}):
                 return x.amin(dim=-1)
 
-        compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=1e-3, rtol=1e-3)
+        with self.assertRaisesRegex(Exception, self._STAGE2_MSG):
+            torch.compile(fn)(x_dev)
 
 
 class TestCoarseTileReductionDim0E2E(InductorTestCase):
@@ -1257,6 +1196,9 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
         super().setUp()
         torch.manual_seed(0xAFFE)
 
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_hint_tiled_reduction_dim0_sum_correct(self):
         """x.sum(dim=0) tiled over B produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1274,6 +1216,9 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
 
         compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=0.05, rtol=0.05)
 
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_hint_tiled_reduction_dim0_max_correct(self):
         """x.amax(dim=0) tiled over B produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1291,6 +1236,9 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
 
         compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=1e-3, rtol=1e-3)
 
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_hint_tiled_reduction_dim0_min_correct(self):
         """x.amin(dim=0) tiled over B produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1321,6 +1269,9 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
         super().setUp()
         torch.manual_seed(0xAFFE)
 
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_mm_k_tiled_correct(self):
         """2D mm [M,K] @ [K,N] tiled over K produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1342,6 +1293,9 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
             fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
         )
 
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_bmm_k_tiled_correct(self):
         """3D bmm [B,M,K] @ [B,K,N] tiled over K produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1364,6 +1318,9 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
             fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
         )
 
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_bmm_3d2d_k_tiled_correct(self):
         """3D×2D matmul [B,M,K] @ [K,N] tiled over K produces correct results."""
         from torch_spyre._inductor import spyre_hint
@@ -1407,6 +1364,7 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
+            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -1436,6 +1394,9 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         super().setUp()
         torch.manual_seed(0xCAFE)
 
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_nested_bmm_outer_Batch_inner_K_correct(self):
         """bmm [B,M,K]@[B,K,N] outer B (output) + inner K (reduction) — correct."""
         from torch_spyre._inductor import spyre_hint
@@ -1459,6 +1420,9 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
             fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
         )
 
+    @pytest.mark.skip(
+        "Issue #2748: DtException from DCC on operand dominance failure with fake symbols"
+    )
     def test_nested_matmul_outer_M_inner_K_correct(self):
         """mm [M,K]@[K,N] with outer M (output) + inner K (reduction) — correct."""
         from torch_spyre._inductor import spyre_hint
@@ -1503,6 +1467,7 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
+            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -1537,6 +1502,7 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
+            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -1579,6 +1545,7 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
+            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),

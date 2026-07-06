@@ -34,7 +34,6 @@ from torch._inductor.dependencies import ReadWrites
 from torch_spyre._inductor.pass_utils import (
     apply_splits_from_index_coeff,
     concretize_expr,
-    device_coordinates,
     iteration_space_from_op,
     splits_by_index_coeff,
 )
@@ -52,7 +51,7 @@ from torch_spyre._inductor.scratchpad.passes import (
 )
 from torch_spyre._inductor.scratchpad.utils import (
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
-    buffer_not_read_in_full,
+    OP_GOOD_FOR_LX_INPLACE,
     clone_at_graph_boundaries,
     mem_usage_by_buf,
     calculate_liveness,
@@ -68,44 +67,6 @@ from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.pass_utils import _is_matmul_op
 
 logger = get_inductor_logger("scratchpad.allocator")
-
-
-def _would_produce_lx_back_gap(
-    graph: GraphLowering,
-    buf_name: str,
-    uses: list[int],
-) -> bool:
-    """Check if pinning a buffer to LX would produce a backGapCore_.
-
-    A backGap fires when device_size[d] > it_dim_size for any device dimension d.
-    The backend supports backGap for HBM but not for LX, so buffers triggering
-    this condition must stay in HBM.
-    """
-    buf = graph.get_buffer(buf_name)
-    stl = buf.layout.device_layout
-    device_size = stl.device_size
-
-    for use_idx in uses:
-        op = graph.operations[use_idx]
-        rw = op.get_read_writes()
-        for dep in rw.reads | rw.writes:
-            if dep.name != buf_name:
-                continue
-            try:
-                coords = device_coordinates(stl, dep, None)
-            except Exception:
-                continue
-            for d, coord_expr in enumerate(coords[:-1]):
-                syms = coord_expr.free_symbols
-                if not syms:
-                    if device_size[d] > 1:
-                        return True
-                    continue
-                sym = next(iter(syms))
-                it_dim_size = int(dep.ranges[sym])
-                if device_size[d] > it_dim_size:
-                    return True
-    return False
 
 
 class ScratchpadAllocator(ABC):
@@ -159,6 +120,9 @@ class ScratchpadAllocator(ABC):
         if target is None:
             return []
         reads = [dep.name for dep in op.get_read_writes().reads]
+        if self._get_op_name(op) in OP_GOOD_FOR_LX_INPLACE:
+            # If the op is in the whitelist, allow all inputs
+            return reads
         if torch.Tag.pointwise in target.tags:
             # If the op is tagged as pointwise by pytorch upstream
             # allow all inputs. Does not work for all ops
@@ -185,21 +149,6 @@ class ScratchpadAllocator(ABC):
             if mismatch == -1:
                 drop_list.add(key)
                 self.reject_reasons[key] = "core div mismatch"
-
-        # filter out intermediates read partially (sliced / multi-offset): the
-        # single-base LX path mis-addresses such reads (see
-        # buffer_not_read_in_full / compute_ops._start_addr_data), e.g. an
-        # inner-dim slice x[:, :, 32:96] feeding a chained op. _build_bound_buffers
-        # applies the same guard to graph input/output clones; this covers the
-        # intermediate buffers. Overrides allow_all_ops_in_lx_planning by design.
-        # Only check ops still eligible above: ops already dropped include
-        # non-ComputedBuffer outputs (e.g. multi-output) whose layouts have no
-        # size for buffer_not_read_in_full to inspect.
-        drop_list.update(
-            op.name
-            for op in graph.operations
-            if op.name not in drop_list and buffer_not_read_in_full(graph, op.name)
-        )
 
         if not clone_at_graph_boundaries():
             # Without clone support, graph outputs cannot be LX-pinned: the caller
@@ -235,16 +184,6 @@ class ScratchpadAllocator(ABC):
             if output_name in graph_output_names and not cloning_allowed:
                 self.reject_reasons[output_name] = "graph output (no clone)"
                 continue  # we can only allocate graph outputs if we're allowed to clone
-            if _would_produce_lx_back_gap(graph, output_name, uses):
-                self.reject_reasons[output_name] = "lx back gap"
-                continue
-            if output_name in graph_output_names and buffer_not_read_in_full(
-                graph, output_name
-            ):
-                # A pinned graph output is cloned for the HBM return; if a
-                # consumer reads it partially (sliced / multi-offset), SDSC
-                # mis-addresses the single-base LX buffer. Don't pin it.
-                continue
             buffers.append(
                 LifetimeBoundBuffer(
                     output_name,
@@ -267,19 +206,9 @@ class ScratchpadAllocator(ABC):
                     continue
                 if not GraphEditor.all_uses_are_rewritable(graph, uses):
                     continue
-                if buffer_not_read_in_full(graph, input_name):
-                    # A consumer reads this input partially -- a sliced/
-                    # multi-offset read (e.g. x[:, 0:512] + x[:, 512:1024], or
-                    # x[:, :, 0:64]). The clone would be pinned to LX, which
-                    # SDSC addresses by a single base, so partial reads
-                    # mis-address and produce wrong results.
-                    continue
                 num_cores = ncores.get(input_name, -1)
                 if num_cores < 0:
                     continue  # core division mismatch across consumers
-                if _would_produce_lx_back_gap(graph, input_name, uses):
-                    self.reject_reasons[input_name] = "lx back gap"
-                    continue
                 buf = graph.get_buffer(input_name)
                 dev_layout = buf.layout.device_layout
                 dev_size = math.prod(dev_layout.device_size[:-1]) * 128

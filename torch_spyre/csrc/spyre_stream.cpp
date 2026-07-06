@@ -196,18 +196,33 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
 
   // Create and launch operation through SpyreStream's typed launch methods.
   if (host2device) {
-    auto* params =
-        flex::createDmaParams(cpu_ptr, device_address->total_size(),
-                              host2device, device_address, std::move(dci_ptr));
-    launchH2D(params);
-    flex::destroyDmaParams(params);
+    flex::DmaParams params(cpu_ptr, host2device, device_address,
+                           std::move(dci_ptr));
+    launchH2D(&params);
   } else {
-    auto* params =
-        flex::createDmaParams(cpu_ptr, device_address->total_size(),
-                              host2device, device_address, std::move(dci_ptr));
-    launchD2H(params);
-    flex::destroyDmaParams(params);
+    flex::DmaParams params(cpu_ptr, host2device, device_address,
+                           std::move(dci_ptr));
+    launchD2H(&params);
   }
+}
+
+void SpyreStream::executeProgramAsync(
+    const KernelArtifacts& arts, const std::vector<at::Tensor>& args) const {
+  // NOTE: Maybe it's better/faster if we know the exact number of arguments
+  // as it is tracked inside KerntlArtifacts
+  std::vector<const flex::CompositeAddress*> tensor_allocs;
+  for (size_t i = 0; i < args.size(); ++i) {
+    auto* ctx = static_cast<SharedOwnerCtx*>(
+        args[i].storage().data_ptr().get_context());
+    tensor_allocs.push_back(&ctx->composite_addr);
+  }
+
+  // Program
+  auto* ctx = static_cast<SharedOwnerCtx*>(arts.device_alloc.get_context());
+  flex::ComputeParams params(&ctx->composite_addr, std::move(tensor_allocs),
+                             arts.bundle_mlir_path);
+
+  launchCompute(&params);
 }
 
 void SpyreStream::launchH2D(flex::DmaParams* params) const {
