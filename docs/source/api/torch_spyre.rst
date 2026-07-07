@@ -309,13 +309,13 @@ laid out in device memory.
 Compilation
 -----------
 
-Spyre models are compiled using ``torch.compile`` with the ``"spyre"``
-backend:
+Spyre models are compiled using ``torch.compile``. Inductor routes to
+the Spyre backend automatically when the model is on a Spyre device:
 
 .. code-block:: python
 
    model = MyModel().to("spyre")
-   compiled = torch.compile(model, backend="spyre")
+   compiled = torch.compile(model)
    output = compiled(inputs)
 
 See :doc:`../user_guide/running_models` for details and
@@ -524,7 +524,11 @@ Environment Variables
        ``1``)
    * - ``BUNDLE_SYMBOLIC_ARGS``
      - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
-       integers (default ``0``)
+       integers (default ``1``)
+   * - ``BUNDLE_HBM_SYMBOLS``
+     - Emit HBM tensor addresses as runtime symbols in the SDSC JSON and
+       ``bundle.mlir`` (default ``1``); independent of
+       ``BUNDLE_SYMBOLIC_ARGS``
    * - ``UNROLL_LOOPS``
      - Fully unroll ``LoopSpec`` nodes into flat ``OpSpec``\s before bundle
        generation (default ``1``; set ``0`` to keep the
@@ -537,9 +541,12 @@ Environment Variables
    * - ``MIN_DEFAULT_GRANULARITY``
      - Minimum default granularity for work division (default ``4``)
    * - ``SPYRE_INDUCTOR_IGNORE_HINTS``
-     - Ignore ``spyre_hint`` annotations: both ``work_div={...}``
-       work-division hints and hint-based working-set reduction (default
-       ``0``)
+     - Ignore ``spyre_hint`` annotations: ``work_div={...}``
+       work-division hints, hint-based working-set reduction, and
+       span-overflow coarse-tiling hints (default ``0``)
+   * - ``SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS``
+     - Ignore only span-overflow coarse-tiling hints; a narrower
+       alternative to ``SPYRE_INDUCTOR_IGNORE_HINTS`` (default ``0``)
 
 **Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
 
@@ -554,7 +561,8 @@ Environment Variables
    * - ``SPYRE_DEVICES``
      - Comma-separated list of device indices to expose
    * - ``FLEX_DEVICE``
-     - Select the underlying flex runtime mode (PF / VF)
+     - Select the underlying flex runtime mode (``PF``, ``VF``, or
+       ``MOCK``)
 
 **Internal:**
 
