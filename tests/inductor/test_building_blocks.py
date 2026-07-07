@@ -212,7 +212,7 @@ class TestBuildingBlocks(unittest.TestCase):
         )
 
     def test_mixed_bundle_plain_nodes(self):
-        """Multiple pointwise ops fuse into one bundle via the refactored codegen path."""
+        """Pointwise ops fuse into one bundle via the refactored codegen path."""
 
         def fn(x, y, z):
             # Three separate pointwise ops — the scheduler should fuse them
