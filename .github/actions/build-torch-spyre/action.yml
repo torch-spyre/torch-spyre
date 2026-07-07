@@ -199,11 +199,17 @@ runs:
 
         cd "$TORCH_SPYRE_DIR"
 
-        # Clean install: wipe any stale pre-baked venv and uv cache so the
-        # C extension is compiled from scratch against the RPM headers/libs
-        # we just extracted. A dirty venv can carry cached build artefacts
-        # that were compiled against a different SDK version.
-        rm -rf .venv
+        # Clean install: wipe stale artefacts so the C extension is compiled
+        # from scratch against the RPM headers/libs extracted above.
+        #
+        # .venv      — pre-baked venv may contain objects built against a
+        #              different SDK version
+        # build/     — ninja incremental build cache; stale .o files from a
+        #              previous runner invocation cause link errors even after
+        #              the venv is wiped
+        # uv cache   — evicts any cached wheel that was built against the
+        #              wrong headers
+        rm -rf .venv build/
         uv cache clean
         uv venv
 
