@@ -26,6 +26,7 @@ from torch.utils._ordered_set import OrderedSet
 from .logging_utils import get_inductor_logger
 from .errors import Unsupported
 from .pass_utils import replace_computed_buffer_body
+from .constants import is_ea_compatible
 from torch_spyre._C import SpyreTensorLayout, ElementArrangement
 from torch_spyre.constants import DEVICE_NAME
 
@@ -654,7 +655,7 @@ def validate_ops(graph: GraphLowering) -> None:
 
         op_name = _get_op_name(op)
 
-        # Check all layouts have the same element_arrangement
+        # Check ElementArrangement compatibility
         stl_eas = [layout.element_arrangement for layout in layouts]
 
         # Skip ops with special ElementArrangement e.g. layernormnorm/scale with ElementArrangement.EXX2
@@ -663,12 +664,18 @@ def validate_ops(graph: GraphLowering) -> None:
         if op_name in skip_ops and any(ea in skip_eas for ea in stl_eas):
             continue
 
-        if len(set(stl_eas)) != 1:
+        # Valid EA patterns (see is_ea_compatible):
+        # 1. All operands share one EA.
+        # 2. Exactly one distinct non-STANDARD EA (not EXX2) mixed with STANDARD
+        #    operands (the broadcast pattern).
+        if not is_ea_compatible(stl_eas):
             args_str = ", ".join(
                 f'"{name}": {ea}' for name, ea in zip(input_names, stl_eas)
             )
             raise Unsupported(
-                f"All inputs to an op must have same element arrangement, "
+                f"Incompatible ElementArrangement in multi-arg op. "
+                f"Valid patterns: all inputs share one EA, or one non-STANDARD EA "
+                f"broadcast against STANDARD inputs. "
                 f"op: {op_name}, args: {args_str}"
             )
 
