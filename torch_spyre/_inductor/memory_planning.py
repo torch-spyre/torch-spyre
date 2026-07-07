@@ -223,8 +223,18 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
             and id(layout.allocation) not in io_alloc_ids
         )
 
+    # Buffers read by Fallback/Extern/Nop nodes must stay Python-side tensors.
+    fallback_read = {
+        dep.name
+        for node in flat_nodes
+        if isinstance(node, _kernel_arg_types)
+        for dep in node.read_writes.reads
+    }
+
     intermediates = {
-        name for name in (written & read) - io_names if _is_intermediate(name)
+        name
+        for name in (written & read) - io_names - fallback_read
+        if _is_intermediate(name)
     }
     if not intermediates:
         V.graph.pool_size = 0
