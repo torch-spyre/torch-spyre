@@ -71,7 +71,12 @@ from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.coarse_tile import (
     _LOOPS_FREE_SYMS_KEY,
     _REDUCTION_FREE_SYMS_KEY,
+    _RetiledBufferInfo,
     _divide_ranges,
+    _replace_group_op,
+    _retile_load_index_from_strides,
+    _should_patch_retiled_load_indexes,
+    _stride_rewrite_map,
     coarse_tile,
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
@@ -448,6 +453,98 @@ class TestCoarseTileInfo(unittest.TestCase):
         self.assertEqual(info.loop_group_id, (0, 0))
         self.assertEqual(info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(info.loop_tiled_dims, [[0], [1]])
+
+
+class TestRetileLoadIndexFromStrides(unittest.TestCase):
+    """Unit tests for converting stale full-buffer load indexes to tile indexes."""
+
+    def test_rewrites_stale_full_stride_to_tile_stride(self):
+        c0, c1 = sympy.symbols("c0 c1")
+        rewrites = _stride_rewrite_map(
+            _RetiledBufferInfo(
+                old_stride=(Integer(8192), Integer(2048), Integer(1)),
+                new_stride=(Integer(2048), Integer(512), Integer(1)),
+            )
+        )
+
+        result = _retile_load_index_from_strides("buf", 2048 * c0 + c1, rewrites)
+
+        self.assertEqual(simplify(result - (512 * c0 + c1)), 0)
+
+    def test_mixed_loop_variable_terms_are_not_rewritten(self):
+        c0, c1, c2 = sympy.symbols("c0 c1 c2")
+        index = c0 * c1 + 128 * c0 + c2
+        rewrites = _stride_rewrite_map(
+            _RetiledBufferInfo(
+                old_stride=(Integer(256), Integer(128), Integer(1)),
+                new_stride=(Integer(128), Integer(64), Integer(1)),
+            )
+        )
+
+        result = _retile_load_index_from_strides("buf", index, rewrites)
+
+        self.assertEqual(simplify(result - index), 0)
+
+    def test_ambiguous_old_strides_are_not_rewritten(self):
+        c0 = sympy.symbols("c0")
+        rewrites = _stride_rewrite_map(
+            _RetiledBufferInfo(
+                old_stride=(Integer(128), Integer(128), Integer(1)),
+                new_stride=(Integer(64), Integer(32), Integer(1)),
+            )
+        )
+
+        result = _retile_load_index_from_strides("buf", 128 * c0, rewrites)
+
+        self.assertEqual(simplify(result - 128 * c0), 0)
+
+
+class TestShouldPatchRetiledLoadIndexes(unittest.TestCase):
+    """Unit tests for selecting exact-loop consumers of retiled buffers."""
+
+    def test_requires_exact_loop_group_id(self):
+        op = _make_inside_consumer_op("consumer", "retiled", loop_group_id=(0,))
+
+        result = _should_patch_retiled_load_indexes(op, (0, 0), {"retiled"})
+
+        self.assertFalse(result)
+
+    def test_requires_reading_retiled_buffer(self):
+        op = _make_inside_consumer_op("consumer", "other", loop_group_id=(0, 0))
+
+        result = _should_patch_retiled_load_indexes(op, (0, 0), {"retiled"})
+
+        self.assertFalse(result)
+
+    def test_accepts_same_group_consumer_of_retiled_buffer(self):
+        op = _make_inside_consumer_op("consumer", "retiled", loop_group_id=(0, 0))
+
+        result = _should_patch_retiled_load_indexes(op, (0, 0), {"retiled"})
+
+        self.assertTrue(result)
+
+
+class TestReplaceGroupOp(unittest.TestCase):
+    """Unit tests for keeping coarse-tile group op references current."""
+
+    def test_replaces_by_identity(self):
+        old_op = _make_op(_make_pointwise([4]), "old")
+        new_op = _make_op(_make_pointwise([4]), "new")
+        group_ops = [old_op]
+
+        _replace_group_op(group_ops, old_op, new_op)
+
+        self.assertIs(group_ops[0], new_op)
+
+    def test_replaces_by_operation_name_when_identity_changed(self):
+        stale_op = _make_op(_make_pointwise([4]), "old")
+        current_op = _make_op(_make_pointwise([4]), "old")
+        new_op = _make_op(_make_pointwise([4]), "new")
+        group_ops = [stale_op]
+
+        _replace_group_op(group_ops, current_op, new_op)
+
+        self.assertIs(group_ops[0], new_op)
 
 
 # ===========================================================================

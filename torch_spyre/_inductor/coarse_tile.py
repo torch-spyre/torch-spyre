@@ -48,10 +48,14 @@ from __future__ import annotations
 
 
 import logging
+from collections import Counter
+from typing import NamedTuple
+
 import sympy
 from sympy import Expr
 
 import torch
+from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -83,6 +87,13 @@ hints_logger = get_inductor_logger("assign_dim_hints")
 
 
 _SPAN_OVERFLOW_HINT_ID = 10000
+
+
+class _RetiledBufferInfo(NamedTuple):
+    """Host strides before and after a buffer is resized for a coarse tile."""
+
+    old_stride: tuple[Expr, ...]
+    new_stride: tuple[Expr, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -567,11 +578,19 @@ def coarse_tile(
         op.get_operation_name(): i for i, op in enumerate(operations)
     }
 
+    retiled_infos_by_group: list[
+        tuple[tuple[int, ...], list[Operation], dict[str, _RetiledBufferInfo]]
+    ] = []
     for group_idx, (group_ops, levels) in enumerate(groups):
         group_id: tuple[int, ...] = (group_idx,)
-        _stamp_group(group_ops, group_id, levels, op_to_position)
+        retiled_infos = _stamp_group(group_ops, group_id, levels, op_to_position)
+        stamped_group_id = group_id + (0,) * (len(levels) - 1)
+        retiled_infos_by_group.append((stamped_group_id, group_ops, retiled_infos))
 
     insert_tiling_propagation(operations, groups)
+
+    for group_id, group_ops, retiled_infos in retiled_infos_by_group:
+        _patch_retiled_load_indexes(group_id, group_ops, retiled_infos, operations)
 
 
 # ---------------------------------------------------------------------------
@@ -1337,6 +1356,166 @@ def _patch_consumers(
         ]
 
 
+def _stride_rewrite_map(info: _RetiledBufferInfo) -> dict[Expr, Expr]:
+    """Map unique stale stride coefficients to their retiled coefficients."""
+
+    old_counts = Counter(sympy.simplify(s) for s in info.old_stride)
+    rewrites: dict[Expr, Expr] = {}
+    for old, new in zip(info.old_stride, info.new_stride):
+        old = sympy.simplify(old)
+        new = sympy.simplify(new)
+        if old_counts[old] == 1 and sympy.simplify(old - new) != 0:
+            rewrites[old] = new
+    return rewrites
+
+
+def _retile_load_index_from_strides(
+    buf_name: str,
+    index: Expr,
+    rewrites: dict[Expr, Expr],
+) -> Expr:
+    """Rewrite separable affine load-index terms from full strides to tile strides."""
+
+    if not rewrites:
+        return index
+
+    loop_vars = index.free_symbols
+    if not loop_vars:
+        return index
+
+    replacements = {var: sympy.S.Zero for var in loop_vars}
+    offset = index.xreplace(replacements)
+    projection_terms: dict[sympy.Symbol, Expr] = {}
+    for var in sorted(loop_vars, key=str):
+        other_vars = {other: sympy.S.Zero for other in loop_vars if other != var}
+        projection_terms[var] = sympy.expand(index.xreplace(other_vars) - offset)
+
+    residual = sympy.simplify(index - offset - sum(projection_terms.values()))
+    if residual != 0:
+        logger.warning(
+            "coarse_tile: refusing to retile load index for %s: index=%s has "
+            "mixed loop-variable residual %s",
+            buf_name,
+            index,
+            residual,
+        )
+        return index
+
+    adjusted_index = offset
+    changed = False
+    for var in sorted(loop_vars, key=str):
+        term = projection_terms[var]
+        coeff = term.coeff(var)
+        remainder = sympy.simplify(term - coeff * var)
+        if remainder != 0:
+            logger.warning(
+                "coarse_tile: refusing to retile load index for %s: projection "
+                "for %s is non-affine in index=%s: %s",
+                buf_name,
+                var,
+                index,
+                term,
+            )
+            return index
+
+        matches = [
+            new_coeff
+            for old_coeff, new_coeff in rewrites.items()
+            if sympy.simplify(coeff - old_coeff) == 0
+        ]
+        if len(matches) == 1:
+            adjusted_index += matches[0] * var
+            changed = True
+        else:
+            adjusted_index += term
+
+    if changed:
+        logger.debug(
+            "coarse_tile: retiled load index for %s: %s -> %s",
+            buf_name,
+            index,
+            adjusted_index,
+        )
+        return sympy.simplify(adjusted_index)
+    return index
+
+
+class _RetileLoadIndexHandler(WrapperHandler):
+    """Ops handler that retiles loads from buffers whose host strides changed."""
+
+    def __init__(self, inner, rewrites_by_name: dict[str, dict[Expr, Expr]]):
+        super().__init__(inner)
+        self._rewrites_by_name = rewrites_by_name
+
+    def load(self, name, index):
+        if name in self._rewrites_by_name:
+            index = _retile_load_index_from_strides(
+                name, index, self._rewrites_by_name[name]
+            )
+        return super().load(name, index)
+
+
+def _should_patch_retiled_load_indexes(
+    op: Operation,
+    group_id: tuple[int, ...],
+    retiled_names: set[str],
+) -> bool:
+    """Return True when op is an exact-loop consumer of a retiled buffer."""
+    if not isinstance(op, ComputedBuffer):
+        return False
+    if not isinstance(op.data, (Pointwise, Reduction)):
+        return False
+    loop_info = getattr(op, "loop_info", None)
+    if loop_info is None or loop_info.loop_group_id != group_id:
+        return False
+    return any(_reads_buffer(op, name) for name in retiled_names)
+
+
+def _replace_group_op(
+    group_ops: list[Operation], old_op: Operation, new_op: Operation
+) -> None:
+    """Keep the tiling group list in sync after replacing a ComputedBuffer body."""
+    old_name = old_op.get_operation_name()
+    for idx, group_op in enumerate(group_ops):
+        if group_op is old_op or group_op.get_operation_name() == old_name:
+            group_ops[idx] = new_op
+            return
+
+
+def _patch_retiled_load_indexes(
+    group_id: tuple[int, ...],
+    group_ops: list[Operation],
+    retiled_infos: dict[str, _RetiledBufferInfo],
+    operations: list[Operation],
+) -> None:
+    """Rewrite stale load indexes for consumers of buffers retiled by coarse tiling."""
+    rewrites_by_name = {
+        name: rewrites
+        for name, info in retiled_infos.items()
+        if (rewrites := _stride_rewrite_map(info))
+    }
+    if not rewrites_by_name:
+        return
+
+    from .pass_utils import replace_computed_buffer_body
+
+    retiled_names = set(rewrites_by_name)
+    for op in list(operations):
+        if not _should_patch_retiled_load_indexes(op, group_id, retiled_names):
+            continue
+
+        orig_inner = op.data.inner_fn
+
+        def new_inner_fn(*args, _rewrites=rewrites_by_name, _orig=orig_inner):
+            with V.set_ops_handler(_RetileLoadIndexHandler(V.ops, _rewrites)):
+                return _orig(*args)
+
+        object.__setattr__(op.data, "inner_fn", new_inner_fn)
+        new_op = replace_computed_buffer_body(op, op.data, operations)
+        _replace_group_op(group_ops, op, new_op)
+        V.graph.name_to_buffer[new_op.get_name()] = new_op
+
+
 def _patch_graph_outputs(old_name: str, new_buf: ComputedBuffer) -> None:
     """Replace references to old_name in V.graph.graph_outputs with new_buf."""
     try:
@@ -1365,7 +1544,7 @@ def _stamp_group(
     group_id: tuple[int, ...],
     levels: list[tuple],
     op_to_position: dict[str, int],
-) -> None:
+) -> dict[str, _RetiledBufferInfo]:
     """Stamp loop_group_id / loop_count / loop_tiled_dims and divide ranges.
 
     ``levels`` is a list of ``(hint_id, count, is_reduction_level)`` triples,
@@ -1380,12 +1559,13 @@ def _stamp_group(
     ``tests/inductor/test_coarse_tile_e2e.py``.
     """
     if not ops:
-        return
+        return {}
 
     _validate_contiguous(ops, op_to_position, group_id)
 
     nested_group_id: tuple[int, ...] = group_id + (0,) * (len(levels) - 1)
     counts = [count for _, count, _ in levels]
+    retiled_infos: dict[str, _RetiledBufferInfo] = {}
 
     for op in ops:
         if not isinstance(op, ComputedBuffer):
@@ -1438,7 +1618,17 @@ def _stamp_group(
                 opos = hint_id_to_ranges_pos.get(hint_id)
                 op_tiled_dims.append([opos] if opos is not None else [])
                 op_tiled_reduction_dims.append([])
-                _divide_ranges(op, count, [opos] if opos is not None else [])
+                retiled_info = _divide_ranges(
+                    op, count, [opos] if opos is not None else []
+                )
+                if retiled_info is not None:
+                    name = op.get_name()
+                    prior = retiled_infos.get(name)
+                    retiled_infos[name] = (
+                        _RetiledBufferInfo(prior.old_stride, retiled_info.new_stride)
+                        if prior is not None
+                        else retiled_info
+                    )
 
         op.loop_info = CoarseTileInfo(  # type: ignore[attr-defined]
             loop_group_id=nested_group_id,
@@ -1456,6 +1646,8 @@ def _stamp_group(
             op_tiled_dims,
             op_tiled_reduction_dims,
         )
+
+    return retiled_infos
 
 
 def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: list[int]):
@@ -1672,7 +1864,7 @@ def _divide_ranges(
     op: ComputedBuffer,
     loop_count: Expr,
     tiled_dims: list[int],
-) -> None:
+) -> _RetiledBufferInfo | None:
     """Divide the specified iteration ranges of op by loop_count.
 
     For a ``Pointwise`` the full ranges are op.data.ranges.
@@ -1690,11 +1882,11 @@ def _divide_ranges(
     """
     data = op.data
     if not isinstance(data, (Pointwise, Reduction)):
-        return
+        return None
 
     ranges = list(data.ranges)
     if not ranges:
-        return
+        return None
 
     for i in tiled_dims:
         assert 0 <= i < len(ranges), (
@@ -1736,8 +1928,9 @@ def _divide_ranges(
 
     layout = getattr(op, "layout", None)
     if not (isinstance(layout, FixedLayout) and len(layout.size) == len(ranges)):
-        return
+        return None
 
+    old_stride = tuple(layout.stride)
     new_size = list(layout.size)
     for i in tiled_dims:
         new_size[i] = ranges[i]
@@ -1749,12 +1942,17 @@ def _divide_ranges(
     # Invalidate Layout- and ComputedBuffer-level caches that read size/stride.
     _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
     _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
+    retiled_info = (
+        _RetiledBufferInfo(old_stride, tuple(layout.stride))
+        if tiled_dims and old_stride != tuple(layout.stride)
+        else None
+    )
 
     # Rebuild SpyreTensorLayout for the new host size using device-native
     # reconstruction: transform the original device layout directly without
     # guessing a dim_order.
     if not isinstance(layout, FixedTiledLayout):
-        return
+        return retiled_info
     # Capture old/new sizes as ints here, after the FixedTiledLayout guard,
     # so symbolic-size FixedLayout tests above are not affected.
     # layout.size is already the new (divided) size; reconstruct the old size
@@ -1766,6 +1964,7 @@ def _divide_ranges(
     layout.device_layout = _resize_device_layout(
         layout.device_layout, old_host_size, new_size_ints
     )
+    return retiled_info
 
 
 def _loop_var_to_reduction_ranges_pos(
