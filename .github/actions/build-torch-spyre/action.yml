@@ -258,6 +258,12 @@ runs:
 
         source .venv/bin/activate
 
+        # --no-build-isolation requires build dependencies (setuptools, torch,
+        # ninja, etc.) to already be present in the venv before setup.py runs.
+        # The [build] extra in pyproject.toml lists exactly these; installing
+        # it uses the locked versions from uv.lock rather than resolving fresh.
+        uv sync --only-group build --frozen
+
         uv sync \
           --verbose \
           --frozen \

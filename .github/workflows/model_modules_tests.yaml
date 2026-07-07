@@ -45,6 +45,13 @@ jobs:
       # due to a mix of fallbacks and decompositions.
       # Here we set it to an empty string (or we could also unset it).
       CI: ''
+      # Artifactory credentials forwarded into the build-torch-spyre composite
+      # action for RPM download. Composite actions cannot read secrets directly,
+      # so they must be exposed as job-level env vars.
+      ARTIFACTORY_API_KEY: ${{ secrets.ARTIFACTORY_TOKEN }}
+      ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
+      ARTIFACTORY_RPM_PATH: ${{ secrets.ARTIFACTORY_RPM_PATH }}
+      ARTIFACTORY_RPM_PATH_LIBAIUPTI: ${{ secrets.ARTIFACTORY_RPM_PATH_LIBAIUPTI }}
     # ---------------------------------------------------------------------------
     # To add a new module test suite, append an entry here:
     #   - name: <human-readable label shown in the GHA UI>
