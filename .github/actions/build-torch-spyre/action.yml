@@ -23,6 +23,180 @@ runs:
     - name: Install uv
       uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
 
+    - name: Setup JFrog CLI
+      uses: jfrog/setup-jfrog-cli@v4
+
+    - name: Download and extract Spyre RPM dependencies
+      shell: bash
+      env:
+        ARTIFACTORY_API_KEY: ${{ env.ARTIFACTORY_API_KEY }}
+        ARTIFACTORY_BASE_URL: ${{ env.ARTIFACTORY_BASE_URL }}
+        ARTIFACTORY_RPM_PATH: ${{ env.ARTIFACTORY_RPM_PATH }}
+        ARTIFACTORY_RPM_PATH_LIBAIUPTI: ${{ env.ARTIFACTORY_RPM_PATH_LIBAIUPTI }}
+      run: |
+        set +e
+
+        # Initialize workspace directories
+        DOWNLOAD_DIR="$HOME/rpm_downloads"
+        EXTRACTION_DIR="$HOME/rpms"
+        mkdir -p "$DOWNLOAD_DIR"
+        mkdir -p "$EXTRACTION_DIR"
+
+        # Baseline target snapshot time: June 23, 2026 at 10:39:00 UTC
+        TARGET_TIME_STR="2026-06-23 10:39:00"
+        TARGET_EPOCH=$(date -d "$TARGET_TIME_STR" +%s)
+
+        # Framework patterns mapped to clean package keys
+        declare -a PATTERNS=(
+          "ibm-spyre-comms-devel:ibm-spyre-comms-devel"
+          "ibm-senlib-headers:ibm-senlib-headers"
+          "ibm-aiu-toolbox-e2e:ibm-aiu-toolbox-e2e"
+          "ibm-libaiupti:ibm-libaiupti"
+          "ibm-spyre-comms-1:ibm-spyre-comms"
+          "ibm-flex-devel:ibm-flex-devel"
+          "ibm-flex-2:ibm-flex"
+          "ibm-deeptools-devel:ibm-deeptools-devel"
+          "ibm-senlib-dd2:ibm-senlib-dd2"
+          "ibm-senlib-core:ibm-senlib-core"
+          "ibm-deeptools-2:ibm-deeptools"
+        )
+
+        # Array to dynamically aggregate targeted deployment paths
+        declare -a DOWNLOAD_TARGETS=()
+
+        # Configure Artifactory client
+        jf c add my-artifactory-server \
+          --url="$ARTIFACTORY_BASE_URL" \
+          --access-token="$ARTIFACTORY_API_KEY" \
+          --interactive=false
+
+        echo "========================================================="
+        echo "    TIMESTAMP FILTERED RPM LOOKUP (BEFORE JUN 23 10:39)  "
+        echo "========================================================="
+
+        for item in "${PATTERNS[@]}"; do
+          pattern="${item%%:*}"
+          pkg_name="${item##*:}"
+
+          if [ "$pkg_name" = "ibm-libaiupti" ]; then
+            BASE_PATH="$ARTIFACTORY_RPM_PATH_LIBAIUPTI"
+          else
+            BASE_PATH="$ARTIFACTORY_RPM_PATH"
+          fi
+
+          echo "📦 Processing Pattern: Match [$pattern*] for package [$pkg_name]"
+
+          SEARCH_PATH="$BASE_PATH/x86_64/${pattern}*.rpm"
+          RESULT=$(jf rt search "$SEARCH_PATH" --server-id=my-artifactory-server --sort-by=created --sort-order=desc --limit=50 2>/dev/null)
+
+          if [ "$RESULT" = "[]" ] || [ -z "$RESULT" ]; then
+            SEARCH_PATH="$BASE_PATH/x86_64/**/${pattern}*.rpm"
+            RESULT=$(jf rt search "$SEARCH_PATH" --server-id=my-artifactory-server --sort-by=created --sort-order=desc --limit=50 2>/dev/null)
+          fi
+
+          if [ "$RESULT" = "[]" ] || [ -z "$RESULT" ]; then
+            echo "   ❌ STATUS: No files matching pattern found in repo path."
+            echo "---------------------------------------------------------"
+            continue
+          fi
+
+          IFS=$'\n'
+          PATHS=($(echo "$RESULT" | grep -o '"path": "[^"]*' | sed 's/"path": "//'))
+          CREATED_TIMES=($(echo "$RESULT" | grep -o '"created": "[^"]*' | sed 's/"created": "//'))
+          unset IFS
+
+          MATCHED_PATH=""
+          MATCHED_CREATED=""
+
+          for i in "${!PATHS[@]}"; do
+            raw_time="${CREATED_TIMES[$i]}"
+            file_epoch=$(date -d "$raw_time" +%s 2>/dev/null)
+
+            if [ -n "$file_epoch" ] && [ "$file_epoch" -le "$TARGET_EPOCH" ]; then
+              MATCHED_PATH="${PATHS[$i]}"
+              MATCHED_CREATED="$raw_time"
+              break
+            fi
+          done
+
+          if [ -n "$MATCHED_PATH" ]; then
+            echo "   ✅ STATUS: RESOLVED SNAPSHOT CANDIDATE"
+            echo "      📍 File: $MATCHED_PATH"
+            echo "      📅 Created: $MATCHED_CREATED"
+            DOWNLOAD_TARGETS+=("$MATCHED_PATH")
+          else
+            echo "   ❌ STATUS: Files found, but all builds are newer than cutoff window ($TARGET_TIME_STR)."
+          fi
+          echo "---------------------------------------------------------"
+        done
+
+        echo ""
+        echo "========================================================="
+        echo "          STEP 5: DOWNLOADING ALL 11 STAGED RPMS         "
+        echo "========================================================="
+        if [ ${#DOWNLOAD_TARGETS[@]} -eq 0 ]; then
+          echo "❌ Fatal Error: No snapshot candidate files resolved. Cancelling download phase."
+          exit 1
+        fi
+
+        for target in "${DOWNLOAD_TARGETS[@]}"; do
+          echo "📥 Fetching: $target"
+          jf rt dl "$target" "$DOWNLOAD_DIR/" --server-id=my-artifactory-server --flat=true
+        done
+
+        echo ""
+        echo "========================================================="
+        echo "   STEP 6: EXTRACTING FULL RPM PAYLOAD (HEADERS + .so)   "
+        echo "========================================================="
+
+        # Extract the full RPM payload preserving directory structure so that
+        # both .so files AND headers land in their proper /opt/ibm/spyre/*
+        # sub-trees. setup.py reads RUNTIME_INSTALL_DIR, SENLIB_INSTALL_DIR,
+        # etc. to build explicit -I and -L flags — we must have the headers
+        # in place, not just the .so files.
+        cd "$EXTRACTION_DIR"
+        for rpm_file in "$DOWNLOAD_DIR"/*.rpm; do
+          if [ -f "$rpm_file" ]; then
+            echo "🛠️ Unpacking: $(basename "$rpm_file")"
+            rpm2cpio "$rpm_file" | cpio -idv 2>/dev/null
+          fi
+        done
+
+        # The RPMs unpack into ./opt/ibm/spyre/{runtime,senlib,...}.
+        # Promote that tree one level so $EXTRACTION_DIR IS the spyre root:
+        #   $HOME/rpms/runtime/include/flex/flex.hpp  ✅
+        #   $HOME/rpms/senlib/include/...              ✅
+        if [ -d "$EXTRACTION_DIR/opt/ibm/spyre" ]; then
+          cp -a "$EXTRACTION_DIR/opt/ibm/spyre/." "$EXTRACTION_DIR/"
+          rm -rf "$EXTRACTION_DIR/opt" "$EXTRACTION_DIR/usr" 2>/dev/null
+          echo "✅ Spyre SDK tree promoted to: $EXTRACTION_DIR"
+        fi
+
+        # Also flatten all .so files to $EXTRACTION_DIR root for LD_LIBRARY_PATH
+        find "$EXTRACTION_DIR" -mindepth 2 -type f -name "*.so*" \
+          -exec cp -f {} "$EXTRACTION_DIR/" \;
+        echo "🚚 Flattened .so files to root of $EXTRACTION_DIR"
+
+        # Persist LD_LIBRARY_PATH for subsequent steps via GITHUB_ENV
+        echo "LD_LIBRARY_PATH=$EXTRACTION_DIR:${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+        echo "✅ Execution Environment Hook Synchronized."
+        echo "   LD_LIBRARY_PATH is now set to: $EXTRACTION_DIR:${LD_LIBRARY_PATH}"
+
+        echo ""
+        echo "========================================================="
+        echo "             VERIFICATION: LS ARTIFACT TARGETS           "
+        echo "========================================================="
+        echo "📁 Download Directory ($DOWNLOAD_DIR):"
+        ls -lh "$DOWNLOAD_DIR"
+
+        echo ""
+        echo "📁 Spyre SDK root ($EXTRACTION_DIR):"
+        ls -1 "$EXTRACTION_DIR"
+
+        echo ""
+        echo "  Header files: $(find "$EXTRACTION_DIR" -name '*.h' -o -name '*.hpp' | wc -l)"
+        echo "  Shared libs:  $(find "$EXTRACTION_DIR" -maxdepth 1 -name '*.so*' | wc -l)"
+
     - name: Build torch-spyre
       shell: bash
       env:
@@ -31,14 +205,69 @@ runs:
         source "$HOME/.bashrc"
         source /etc/profile.d/ibm-aiu-setup.sh
 
+        # Re-prepend $HOME/rpms after profile sourcing, which may reset LD_LIBRARY_PATH.
+        # This ensures the .so files extracted from the RPMs take precedence at link time.
+        export LD_LIBRARY_PATH="$HOME/rpms:${LD_LIBRARY_PATH}"
+        echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+
+        # Override the SDK install dirs that setup.py reads to find headers and
+        # libraries. ibm-aiu-setup.sh points these at /opt/ibm/spyre/* (the
+        # system-installed RPMs on the runner image). We redirect them to the
+        # RPM tree extracted from Artifactory so the C++ build uses the exact
+        # SDK version that matches the downloaded .so files.
+        SPYRE_SDK="$HOME/rpms"
+        export RUNTIME_INSTALL_DIR="$SPYRE_SDK/runtime"
+        export SENLIB_INSTALL_DIR="$SPYRE_SDK/senlib"
+        export DEEPTOOLS_INSTALL_DIR="$SPYRE_SDK/deeptools"
+        export SPYRE_COMMS_INSTALL_DIR="$SPYRE_SDK/spyre-comms"
+        export SEN_COMMON_HEADERS="$SPYRE_SDK/flex"
+        echo "RUNTIME_INSTALL_DIR=$RUNTIME_INSTALL_DIR"
+        echo "SENLIB_INSTALL_DIR=$SENLIB_INSTALL_DIR"
+        echo "DEEPTOOLS_INSTALL_DIR=$DEEPTOOLS_INSTALL_DIR"
+        echo "SPYRE_COMMS_INSTALL_DIR=$SPYRE_COMMS_INSTALL_DIR"
+        echo "SEN_COMMON_HEADERS=$SEN_COMMON_HEADERS"
+
+        # The system install places all SDK headers under a single flat
+        # /opt/ibm/spyre/*/include tree so relative includes like
+        # "common/self_doc_enum.hpp" resolve correctly. Our extracted RPM
+        # tree splits headers across subdirectories. Add every include/
+        # subdirectory found in $HOME/rpms to CMAKE_INCLUDE_PATH, which
+        # setup.py appends to INCLUDE_DIRS (line 90-92).
+        EXTRA_INCLUDES=$(find "$SPYRE_SDK" -type d -name "include" | tr '\n' ':')
+        export CMAKE_INCLUDE_PATH="${EXTRA_INCLUDES}${CMAKE_INCLUDE_PATH:-}"
+        echo "CMAKE_INCLUDE_PATH=$CMAKE_INCLUDE_PATH"
+
         [[ "$TORCH_SPYRE_DIR" != /* ]] && TORCH_SPYRE_DIR="${PWD}/${TORCH_SPYRE_DIR}"
         echo "TORCH_SPYRE_DIR $TORCH_SPYRE_DIR"
 
         cd "$TORCH_SPYRE_DIR"
+
+        # Clean install: wipe stale artefacts so the C extension is compiled
+        # from scratch against the RPM headers/libs extracted above.
+        #
+        # .venv      — pre-baked venv may contain objects built against a
+        #              different SDK version
+        # build/     — ninja incremental build cache; stale .o files from a
+        #              previous runner invocation cause link errors even after
+        #              the venv is wiped
+        # uv cache   — evicts any cached wheel that was built against the
+        #              wrong headers
+        rm -rf .venv build/
+        uv cache clean
+        uv venv
+
+        source .venv/bin/activate
+
+        # --no-build-isolation requires build dependencies (setuptools, torch,
+        # ninja, etc.) to already be present in the venv before setup.py runs.
+        # The [build] extra in pyproject.toml lists exactly these; installing
+        # it uses the locked versions from uv.lock rather than resolving fresh.
+        uv sync --only-group build --frozen
+
         uv sync \
           --verbose \
           --frozen \
-          --all-extras
-        source .venv/bin/activate
+          --all-extras \
+          --no-build-isolation
         uv pip show torch
         uv pip freeze

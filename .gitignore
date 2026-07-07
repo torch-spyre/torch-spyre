@@ -387,9 +387,6 @@ codegen/outputs
 torch_spyre/csrc/external
 torch_spyre/codegen_ops.py
 
-# generated knowledge graph data
-docs/source/_static/js/graph.json
-
 # test outputs
 test/logs/*
 test/*.txt
@@ -397,6 +394,3 @@ test/*.json
 
 .*env*
 stubs
-
-# provenance audit outputs
-provenance_capture_raw.json

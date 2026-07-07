@@ -43,10 +43,6 @@ inputs:
     description: Optional bash snippet run at the start of every attempt (e.g. topology reset)
     required: false
     default: ''
-  parallel:
-    description: Whether to pass --parallel to run_test.sh (disable for distributed torchrun tests)
-    required: false
-    default: 'true'
 
 runs:
   using: composite
@@ -125,13 +121,10 @@ runs:
           echo "  Slow flag     : ${_SLOW_FLAG:-none (all tests will run)}"
           echo "  Extra flags   : ${{ inputs.extra_test_flags }}"
 
-          # From the first retry onward, enable verbose DT logging for
-          # diagnostics. A retry means something already went wrong (stall,
-          # hardware RAS, etc.), so every attempt after the first should be
-          # at least as diagnostic as attempt 1 — not just the final one.
+          # On the final attempt, enable verbose DT logging for diagnostics
           _DTLOG_PREFIX=""
-          if [[ $attempt -gt 1 ]]; then
-            echo "  DTLOG_LEVEL   : Info (retry attempt — verbose logging enabled)"
+          if [[ $attempt -eq $MAX_ATTEMPTS ]]; then
+            echo "  DTLOG_LEVEL   : Info (final attempt — verbose logging enabled)"
             _DTLOG_PREFIX="DTLOG_LEVEL=Info"
           fi
 
@@ -148,12 +141,7 @@ runs:
 
           exec {FIFO_FD}>"$FIFO"
 
-          _PARALLEL_FLAG=""
-          if [[ "${{ inputs.parallel }}" != "false" ]]; then
-            _PARALLEL_FLAG="--parallel"
-          fi
-
-          env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" ${_PARALLEL_FLAG} ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} \
+          env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" --parallel ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} \
             >&"$FIFO_FD" 2>&1 &
           TEST_PID=$!
 
