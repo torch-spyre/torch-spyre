@@ -18,7 +18,9 @@
 # --parallel detects the number of Spyre cards from PCIDEVICE_IBM_COM_AIU_PF
 # (comma count+1) or torch.spyre.device_count(), then distributes the resolved
 # test files round-robin across cards, running each card's slice in a
-# background subshell with SPYRE_DEVICES=<card_idx>.  Falls back to serial
+# background subshell with SPYRE_DEVICES=<physical_device_id> (honouring an
+# already-set SPYRE_DEVICES list such as "1,5,7" rather than assuming
+# 0..N-1).  Falls back to serial
 # execution when only one card is detected.  JUnit XML shards from all cards
 # are merged into the single --junit-xml destination at the end.
 
@@ -1798,7 +1800,9 @@ except Exception as e:
 #
 # Collects every test node ID from ALL resolved files, distributes them
 # round-robin across N Spyre cards, and runs each card's slice in a
-# background subshell with SPYRE_DEVICES=<card_idx>.
+# background subshell with SPYRE_DEVICES=<physical_device_id> -- the actual
+# device index (e.g. from an already-set SPYRE_DEVICES list such as
+# "1,5,7"), not the 0..N-1 round-robin slot.
 #
 # Splitting at the test-ID level (not the file level) is essential: when
 # multiple configs share a single test file (e.g. all inductor shard configs
@@ -1931,12 +1935,36 @@ _run_parallel_across_cards() {
         echo "${_all_node_file_idx[$j]}:${_all_node_ids[$j]}" >> "${_card_id_files[$_k]}"
     done
 
+    # -----------------------------------------------------------------------
+    # Card-slot -> physical SPYRE_DEVICES index mapping.
+    #
+    # _n_cards is a count (e.g. 3), not a list of physical device indices.
+    # When the caller restricted visible devices with SPYRE_DEVICES (e.g.
+    # "1,5,7"), device_count() already narrows the detected count to match,
+    # but the physical indices are NOT 0..N-1 -- they are exactly the values
+    # listed. Each per-card subshell must export its real index, not its
+    # position in the round-robin loop, or it ends up targeting cards the
+    # caller never listed (e.g. card 0 when only 1,5,7 were authorized).
+    # -----------------------------------------------------------------------
+    local -a _CARD_DEVICE_IDS=()
+    if [[ -n "${SPYRE_DEVICES:-}" ]]; then
+        IFS=',' read -r -a _CARD_DEVICE_IDS <<< "${SPYRE_DEVICES}"
+    fi
+    if [[ "${#_CARD_DEVICE_IDS[@]}" -ne "$_n_cards" ]]; then
+        # No restriction (or a mismatched one) -- fall back to the natural
+        # 0..N-1 physical indexing.
+        _CARD_DEVICE_IDS=()
+        for (( _k=0; _k<_n_cards; _k++ )); do
+            _CARD_DEVICE_IDS+=("$_k")
+        done
+    fi
+
     # Print the assignment summary.
     for (( _k=0; _k<_n_cards; _k++ )); do
         local _cnt
         _cnt=$(wc -l < "${_card_id_files[$_k]}" 2>/dev/null || echo 0)
         _cnt="${_cnt// /}"   # trim whitespace
-        echo "[torch_oot_device_tests_run_parallel_info]   card ${_k} (SPYRE_DEVICES=${_k}): ${_cnt} test(s)"
+        echo "[torch_oot_device_tests_run_parallel_info]   card ${_k} (SPYRE_DEVICES=${_CARD_DEVICE_IDS[$_k]}): ${_cnt} test(s)"
     done
     echo ""
 
@@ -1967,6 +1995,7 @@ _run_parallel_across_cards() {
         : > "$_card_summary_file"
 
         local _subshell_card="$_k"
+        local _subshell_device_id="${_CARD_DEVICE_IDS[$_k]}"
         local _subshell_id_file="${_card_id_files[$_k]}"
         local _subshell_exit_tmp="$_card_exit_tmp"
         local _subshell_shard_list="$_card_shard_list"
@@ -1975,7 +2004,7 @@ _run_parallel_across_cards() {
 
         (
             set +euo pipefail
-            export SPYRE_DEVICES="${_subshell_card}"
+            export SPYRE_DEVICES="${_subshell_device_id}"
             # Isolate the Inductor / FxGraph cache per card so that concurrent
             # shutil.rmtree() calls from FxGraphCache.clear() in different card
             # subshells do not race on the same /tmp/torchinductor_*/fxgraph/
@@ -2011,7 +2040,7 @@ _run_parallel_across_cards() {
                 done <<< "${_file_to_ids[$_fidx]}"
 
                 echo "========================================================================"
-                echo "[torch_oot_device_tests_run] card ${_subshell_card} | SPYRE_DEVICES=${_subshell_card} | ${#_node_ids[@]} test(s)"
+                echo "[torch_oot_device_tests_run] card ${_subshell_card} | SPYRE_DEVICES=${_subshell_device_id} | ${#_node_ids[@]} test(s)"
                 if [[ "$run_file" != "$original_file" ]]; then
                     echo "[torch_oot_device_tests_run] Running (via OOT wrapper): $original_file"
                 else
