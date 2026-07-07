@@ -44,10 +44,23 @@ class SpyreAsyncCompile(AsyncCompile):
     """Spyre kernel compilation (`sdsc`), plus the upstream AsyncCompile.
 
     A graph mixing Spyre and CPU work emits `async_compile.cpp_pybinding(...)`
-    against this same object, so we inherit AsyncCompile for `cpp*`/`triton`/
+    against this same object, so we inherit AsyncCompile for `cpp_pybinding`/
     `wait` rather than stubbing them -- a no-op `wait()` alone can't compile a
     CPU kernel it was never given.
+
     """
+
+    def triton(self, *args, **kwargs):
+        raise NotImplementedError(
+            "SpyreAsyncCompile does not support Triton kernels; only "
+            "cpp_pybinding (CPU) and sdsc (Spyre) are validated."
+        )
+
+    def cpp(self, *args, **kwargs):
+        raise NotImplementedError(
+            "SpyreAsyncCompile does not support the cpp() path; CPU kernels "
+            "go through cpp_pybinding (cpu_backend='cpp')."
+        )
 
     def sdsc(
         self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]
