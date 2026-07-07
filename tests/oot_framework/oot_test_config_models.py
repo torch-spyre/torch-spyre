@@ -494,10 +494,19 @@ class InputsEdits(BaseModel):
         self,
         *,
         test_device: Optional[torch.device] = None,
+        seed: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Return kwargs with dtype strings resolved to torch.dtype objects.
+        """Return kwargs with tensor specs built and dtype strings resolved.
 
-        Resolution order for each string value:
+        A kwarg value may itself be a tensor spec — a dict carrying one of
+        ``tensor`` / ``tensor_list`` / ``config_path`` / ``value`` / ``py`` — just
+        like a positional arg. Those are built into real tensors/objects here via
+        the same ``_parse_input_arg`` path used for positional args. Modules such
+        as attention/rotary layers receive ``hidden_states`` / ``position_ids`` /
+        ``position_embeddings`` as kwargs, so without this they would arrive as
+        raw dicts (``'dict' object has no attribute 'shape'``).
+
+        For plain (non-spec) string values the resolution order is:
         1. dtype alias ("float16" / "torch.float16") -> torch.dtype via DTYPE_STR_MAP
         2. device key with "cuda:*" value            -> test_device
         3. ast.literal_eval fallback                 -> Python literal (tuple, int, etc.)
@@ -507,8 +516,37 @@ class InputsEdits(BaseModel):
         """
         import ast as _ast
 
+        # Tensor-spec dicts carry exactly one of these keys; anything else is a
+        # plain scalar/dtype/device value handled by the string branch below.
+        _SPEC_KEYS = {"tensor", "tensor_list", "config_path", "py"}
+
         out: Dict[str, Any] = {}
-        for k, v in self.kwargs.items():
+        for i, (k, v) in enumerate(self.kwargs.items()):
+            # Build tensor/tensor_list/config/py specs into real objects, mirroring
+            # build_cpu_args() for positional args. Use a per-key seed offset so
+            # distinct kwargs don't share identical random data.
+            if isinstance(v, dict) and (set(v.keys()) & _SPEC_KEYS):
+                arg = _parse_input_arg(v)
+                inp_seed = None if seed is None else seed + 500000 + i * 131
+                if isinstance(arg, InputArgTensor):
+                    out[k] = arg.tensor.build(seed=inp_seed)
+                elif isinstance(arg, InputArgTensorList):
+                    out[k] = [
+                        spec.build(
+                            seed=(None if inp_seed is None else inp_seed + j * 7)
+                        )
+                        for j, spec in enumerate(arg.tensor_list)
+                    ]
+                elif isinstance(arg, InputArgConfig):
+                    import importlib
+
+                    module_path, _, cls_name = arg.config_path.rpartition(".")
+                    config_cls = getattr(importlib.import_module(module_path), cls_name)
+                    out[k] = config_cls(**arg.config_kwargs)
+                elif isinstance(arg, InputArgPy):
+                    out[k] = _eval_py_literal(arg.py)
+                continue
+
             if isinstance(v, str):
                 # 1. dtype resolution
                 bare = v.removeprefix("torch.")
