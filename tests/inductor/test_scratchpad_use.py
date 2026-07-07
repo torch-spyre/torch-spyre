@@ -846,9 +846,8 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
     def test_swiglu_prescribed_allocation(self):
         """A single SwiGLU layer: two parallel ``nn.Linear`` projections (each a
         ``mm`` GEMM plus a bias add) feeding ``silu(gate) * up``. The lowered
-        graph is nine buffers:
+        graph is eight buffers:
 
-          - buf8 -- restickified input ``x`` (shared by both GEMMs)
           - buf6, buf7 -- restickified gate/up weights
           - buf0 -- gate GEMM (``mm``, a Reduction), the input to SiLU
           - buf1 -- gate + bias
@@ -861,14 +860,21 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
         resident in LX (buf0-buf4), each taking an 8x4 split across two axes
         (``((1, 8), (1024, 4))``); the output (buf5) spills to HBM. The two
         weight buffers (buf6, buf7) spill to HBM with a 2x16 split
-        (``((1, 2), (256, 16))``), while the restickified input (buf8) stays
-        resident in LX (4-way split of the stride-256 axis, ``((256, 4),)``).
+        (``((1, 2), (256, 16))``).
+
+        The shared input ``x`` is *not* LX-pinned: both GEMMs split it 8-way
+        along their free (N) dimension, which ``x`` does not have, so each
+        consumer's per-core view of ``x`` (a 4-way split of the shared M axis)
+        covers fewer cores than the GEMM runs. That is a broadcast read of a
+        per-core scratchpad buffer, which the single-base LX path cannot serve,
+        so the broadcast-read guard in ``get_ncores_for_buffers`` keeps ``x`` in
+        HBM. See ``test_shared_activation_into_matmuls_not_lx_pinned`` for the
+        divergence this prevents.
         """
         self._assert_prescribed_allocation(
             *self._swiglu(),
             {
                 "buf6": ("HBM", 524288, (((1, 2), (256, 16)), ())),
-                "buf8": ("LX", 65536, (((256, 4),), ())),
                 "buf0": ("LX", 262144, (((1, 8), (1024, 4)), ())),
                 "buf1": ("LX", 262144, (((1, 8), (1024, 4)), ())),
                 "buf2": ("LX", 262144, (((1, 8), (1024, 4)), ())),
@@ -878,7 +884,6 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
                 "buf5": ("HBM", 262144, (((1, 8), (1024, 4)), ())),
             },
         )
-
 
 class TestIntermediatePartialReadNotPinned(BaseTestScratchpadUsage):
     """An *intermediate* buffer read partially (sliced) must not be LX-pinned.
