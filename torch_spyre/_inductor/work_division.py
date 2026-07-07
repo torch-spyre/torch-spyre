@@ -1310,7 +1310,8 @@ def _iter_computed_buffers(operations: list[Operation]):
         if op.is_no_op():
             pass
         elif isinstance(op, ComputedBuffer):
-            if op.get_layout().device.type != DEVICE_NAME:
+            layout = op.maybe_get_layout()
+            if layout is None or layout.device.type != DEVICE_NAME:
                 continue
             yield op
         elif isinstance(op, FallbackKernel):

@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Regression tests for the three FallbackKernel output shapes.
+"""Regression tests for FallbackKernel lowering on the Spyre device.
 
-`FallbackKernel.create` in upstream PyTorch produces three shapes
-(see torch/_inductor/ir.py):
+Covers the three `FallbackKernel.create` output shapes (upstream
+torch/_inductor/ir.py):
 
   shape 1 (single tensor)  -> MultiOutputLayout + 1 trailing MultiOutput
   shape 2 (tuple of N)     -> MultiOutputLayout + N trailing MultiOutputs
@@ -29,13 +29,23 @@ non-intermediate counter. Shape 3 raised RuntimeError, shape 2 emitted
 propagation, and shape 3 separately tripped fusion via the NoneLayout
 MutationOutput sentinels that void fallbacks register.
 
-These tests exercise all three shapes end-to-end through `torch.compile(...,
-backend="inductor")` on the Spyre device to guard against regressions.
+Plus a traced spyre -> cpu -> spyre round-trip via plain `.to()`
+(TestTracedDeviceCopy). A `.to()` that Dynamo can trace lowers to an
+in-graph `DeviceCopy`, and the CPU compute it feeds used to trip the
+Spyre passes: propagate_layouts assigned a Spyre layout to the host-side
+buffers, work_division computed core assignments for those non-Spyre
+ops, spyre_fuse_nodes pulled them into Spyre bundles, and the CPU
+`ComputedBuffer`s were emitted through `async_compile.cpp_pybinding` —
+a method the old no-op `SpyreAsyncCompile` stub did not provide.
+
+All tests run end-to-end through `torch.compile(..., backend="inductor")`
+on the Spyre device to guard against regressions.
 """
 
 import unittest
 
 import torch
+import torch.nn.functional as F
 
 
 DEVICE = "spyre"
@@ -153,6 +163,31 @@ class TestFallbackKernelShape3Void(unittest.TestCase):
         out = compiled(x).cpu()
         # zeros + x + 1 = 6.0
         torch.testing.assert_close(out, torch.full((4,), 6.0, dtype=DTYPE))
+
+
+class TestTracedDeviceCopy(unittest.TestCase):
+    """A traced spyre -> cpu -> spyre round-trip must not crash.
+
+    A plain `.to()` that Dynamo can trace lowers to an in-graph
+    `DeviceCopy`, so the schedule mixes Spyre and CPU nodes -- which used
+    to break the Spyre passes (propagate_layouts, work_division,
+    spyre_fuse_nodes) and the `SpyreAsyncCompile` stub. Sibling to the
+    custom-op test in the `reinterpret_device_fix` branch.
+    """
+
+    def test_cpu_slice_roundtrip_compiles(self):
+        def fn(x):
+            x_cpu = x.to("cpu")
+            d = x_cpu.shape[-1] // 2
+            x1 = x_cpu[..., :d].to(DEVICE)
+            x2 = x_cpu[..., d:].to(DEVICE)
+            return F.silu(x1) * x2
+
+        x = torch.randn(16, 256, dtype=DTYPE, device=DEVICE)
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
+        out = compiled(x)
+        self.assertEqual(out.device.type, DEVICE)
+        torch.testing.assert_close(out.cpu(), fn(x).cpu(), atol=0.1, rtol=0.1)
 
 
 if __name__ == "__main__":

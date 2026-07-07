@@ -41,7 +41,13 @@ def get_output_dir(kernel_name: str):
 
 
 class SpyreAsyncCompile(AsyncCompile):
-    """Spyre kernel compilation, plus the upstream AsyncCompile."""
+    """Spyre kernel compilation (`sdsc`), plus the upstream AsyncCompile.
+
+    A graph mixing Spyre and CPU work emits `async_compile.cpp_pybinding(...)`
+    against this same object, so we inherit AsyncCompile for `cpp*`/`triton`/
+    `wait` rather than stubbing them -- a no-op `wait()` alone can't compile a
+    CPU kernel it was never given.
+    """
 
     def sdsc(
         self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]

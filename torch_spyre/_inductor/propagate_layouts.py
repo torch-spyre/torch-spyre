@@ -1067,7 +1067,8 @@ def propagate_spyre_tensor_layouts(
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ComputedBuffer):
-            if op.get_layout().device.type != (DEVICE_NAME):
+            layout = op.maybe_get_layout()
+            if layout is None or layout.device.type != DEVICE_NAME:
                 continue
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                 target = op.layout.target
@@ -1156,7 +1157,7 @@ def propagate_spyre_tensor_layouts(
             # spyre -> cpu: the output is a host tensor and carries no Spyre
             #     layout. Leave `.layouts` unset.
             # cpu -> spyre: the output is a fresh on-device buffer with no
-            #     inherited tiling, so give it a new device layout..
+            #     inherited tiling, so give it a new device layout.
             if op.get_layout().device.type == DEVICE_NAME:
                 op.layouts = [generic_layout(op)]
                 op.restick_cost_fn = AnyInNode.from_args()
