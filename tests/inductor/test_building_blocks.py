@@ -211,7 +211,7 @@ class TestBuildingBlocks(unittest.TestCase):
             rtol=0.1,
         )
 
-    def test_mixed_bundle_plain_nodes(self):
+    def test_refactored_plain_bundle_codegen(self):
         """Pointwise ops fuse into one bundle via the refactored codegen path."""
 
         def fn(x, y, z):

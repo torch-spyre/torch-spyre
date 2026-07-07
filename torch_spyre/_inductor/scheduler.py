@@ -189,8 +189,8 @@ def build_loop_scheduler_nodes(
     Running before Inductor's fusion pass ensures CountedLoopSchedulerNodes are
     visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return False),
     so loop groups survive Inductor fusion intact.  spyre_fuse_nodes is separately
-    protected because it only fuses plain SchedulerNodes (isinstance check), causing
-    CountedLoopSchedulerNodes to force a bundle boundary.
+    aware of CountedLoopSchedulerNodes: they are accumulated alongside plain
+    SchedulerNodes and may share a bundle with adjacent ops.
     """
     result = _build_loop_group(nodes, depth=0)
 
