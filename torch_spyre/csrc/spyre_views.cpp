@@ -150,6 +150,8 @@ at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
 at::Tensor reinterpret_tensor(const at::Tensor& self, c10::IntArrayRef size,
                               c10::IntArrayRef stride,
                               int64_t offset_increment) {
+  // For in-tree devices (e.g. CPU tensors carried by FallbackKernels), there is
+  // no SpyreTensorImpl to reinterpret, so defer to the stock Inductor helper.
   if (self.device().type() != c10::DeviceType::PrivateUse1) {
     return torch::inductor::_reinterpret_tensor(self, size, stride,
                                                 offset_increment);
@@ -165,6 +167,8 @@ at::Tensor reinterpret_tensor_with_layout(const at::Tensor& self,
                                           c10::IntArrayRef stride,
                                           int64_t offset_increment,
                                           SpyreTensorLayout stl) {
+  // Purely defensive: If a non-Spyre tensor ever arrives, fall back to the
+  // stock Inductor helper.
   if (self.device().type() != c10::DeviceType::PrivateUse1) {
     return torch::inductor::_reinterpret_tensor(self, size, stride,
                                                 offset_increment);

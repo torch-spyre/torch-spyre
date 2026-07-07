@@ -97,7 +97,7 @@ def _align_up(n: int, alignment: int) -> int:
 def _compute_size_bytes(name: str) -> int:
     """Return the stick-aligned device size in bytes for buffer `name`."""
     buf = V.graph.get_buffer(name)
-    layout = buf.get_layout()
+    layout = buf.maybe_get_layout()
     assert isinstance(layout, FixedTiledLayout), (
         f"memory_planning: expected FixedTiledLayout for {name}, got {type(layout)}"
     )
@@ -263,7 +263,7 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
 
         # Assign HBM address directly to layout.allocation.
         buf = V.graph.get_buffer(name)
-        layout = buf.get_layout()
+        layout = buf.maybe_get_layout()
         assert isinstance(layout, FixedTiledLayout)
         layout.allocation["pool"] = INTERMEDIATES_SEGMENT + offset
 
