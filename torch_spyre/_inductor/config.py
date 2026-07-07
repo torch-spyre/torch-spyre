@@ -38,12 +38,6 @@ allow_all_ops_in_lx_planning: bool = False
 # eligibility and must not, on its own, enable boundary clone insertion.
 lx_boundary_clones: bool = os.environ.get("LX_BOUNDARY_CLONES", "0") == "1"
 
-# LX-pin in-place mutation ops (MutationLayoutSHOULDREMOVE, e.g. an accumulator
-# `O += ...`) by routing them to their alias target's LX slot. Off by default:
-# experiment flag (the loop-carried target can evict the working set — a
-# tradeoff the solver doesn't weigh yet). See ScratchpadAllocator._alias_*.
-lx_alias_inplace: bool = os.environ.get("LX_ALIAS_INPLACE", "0") == "1"
-
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
 
 sencores: int = int(os.getenv("SENCORES", "32"))

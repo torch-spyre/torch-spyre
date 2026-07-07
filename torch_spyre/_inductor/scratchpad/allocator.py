@@ -53,7 +53,6 @@ from torch_spyre._inductor.scratchpad.passes import (
 from torch_spyre._inductor.scratchpad.utils import (
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
     clone_at_graph_boundaries,
-    effective_device_layout,
     mem_usage_by_buf,
     calculate_liveness,
     get_ncores_for_buffers,
@@ -153,13 +152,7 @@ class ScratchpadAllocator(ABC):
         if not isinstance(op, ComputedBuffer):
             return False
         if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-            # In-place mutation ops own no storage; normally ineligible. When
-            # lx_alias_inplace is on, allow one whose alias target resolves with
-            # a matching layout — it will be routed to the target's LX slot
-            # (experiment flag; see _alias_* helpers).
-            return config.lx_alias_inplace and self._alias_pin_is_valid(
-                op, self._alias_target_buffer(op)
-            )
+            return False
         return (
             config.allow_all_ops_in_lx_planning
             or (self._get_op_name(op) in OP_OUTPUT_GOOD_FOR_LX_REUSE)
@@ -168,88 +161,6 @@ class ScratchpadAllocator(ABC):
             # and the inserted clones would not land in LX.
             or (config.lx_boundary_clones and self._get_op_name(op) == "clone")
         )
-
-    def _is_alias_inplace_op(self, op: Any) -> bool:
-        """True for an LX-alias in-place mutation op (config.lx_alias_inplace).
-
-        Such an op is pinned by *reusing its alias target's* LX slot rather than
-        being allocated one of its own, so it is excluded from the solver's
-        buffer list and stamped directly (see _stamp_alias_inplace_ops).
-        """
-        return (
-            config.lx_alias_inplace
-            and isinstance(op, ComputedBuffer)
-            and isinstance(op.layout, MutationLayoutSHOULDREMOVE)
-            and self._alias_pin_is_valid(op, self._alias_target_buffer(op))
-        )
-
-    # ------------------------------------------------------------------
-    # Aliased (in-place mutation) buffer support — NOT yet wired in.
-    #
-    # An op whose output layout is MutationLayoutSHOULDREMOVE does not own its
-    # storage: it writes in place into an existing "alias target" buffer (e.g. a
-    # flash-attention accumulator `O += ...`). Such ops are currently rejected by
-    # _op_output_good_for_lx_reuse. The helpers below let a caller instead route
-    # the op to the target's LX slot: discover the target, confirm the target's
-    # pin decision still applies to this op, and read the target's LX address.
-    # They are pure/read-only and have no callers yet — wiring them into the
-    # eligibility / allocation path is deferred (see the accumulator liveness
-    # tradeoff in the task notes).
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _alias_target_buffer(op: Any) -> Any:
-        """Return the underlying buffer an in-place op mutates, or None.
-
-        For a MutationLayoutSHOULDREMOVE output, layout.get_buffer() unwraps the
-        mutation/view chain to the real storage buffer being written. Returns
-        None when `op` is not an in-place mutation (owns its own storage).
-        """
-        layout = getattr(op, "layout", None)
-        if not isinstance(layout, MutationLayoutSHOULDREMOVE):
-            return None
-        try:
-            return layout.get_buffer()
-        except (AssertionError, AttributeError):
-            return None
-
-    def _alias_pin_is_valid(self, op: Any, target: Any) -> bool:
-        """True if the target's LX pin can be reused for this in-place op.
-
-        Sanity checks that the mutation genuinely shares the target's storage
-        geometry: the op's *real* (unwrapped) layout must match the target's
-        device layout in both size and stride_map. Anything mismatched means the
-        in-place write does not map cleanly onto the target's LX slice, so the
-        pin must NOT be reused.
-        """
-        if target is None:
-            return False
-        op_layout = getattr(op, "layout", None)
-        if not isinstance(op_layout, MutationLayoutSHOULDREMOVE):
-            return False
-        real = op_layout.real_layout()
-        tgt = getattr(target, "get_layout", lambda: None)()
-        real_dev = getattr(real, "device_layout", None)
-        tgt_dev = getattr(tgt, "device_layout", None)
-        if real_dev is None or tgt_dev is None:
-            return False
-        return list(real_dev.device_size) == list(tgt_dev.device_size) and list(
-            real_dev.stride_map
-        ) == list(tgt_dev.stride_map)
-
-    @staticmethod
-    def _alias_target_lx_address(target: Any) -> "int | None":
-        """Return the target buffer's assigned LX address, or None if unpinned.
-
-        The address is stamped onto the target's layout by _set_one_allocation
-        (layout.allocation['lx']) once the solver pins it. An in-place op should
-        reuse exactly this address rather than being allocated a slot of its own.
-        """
-        if target is None:
-            return None
-        layout = getattr(target, "get_layout", lambda: None)()
-        allocation = getattr(layout, "allocation", None) or {}
-        return allocation.get("lx")
 
     def _op_inputs_good_for_lx_inplace(self, op: Any) -> list[str]:
         target = getattr(getattr(op, "origin_node", None), "target", None)
@@ -312,10 +223,6 @@ class ScratchpadAllocator(ABC):
         cloning_allowed = clone_at_graph_boundaries()
         for output_name, info in mem_usage.items():
             uses = lifetimes[output_name]
-            if self._is_alias_inplace_op(graph.get_buffer(output_name)):
-                # Reuses its alias target's slot; not solver-allocated. Stamped
-                # directly after allocation (see _stamp_alias_inplace_ops).
-                continue
             if len(uses) <= 1:
                 self.reject_reasons[output_name] = "single use"
                 continue  # output is not read (only the write, or never touched)
@@ -393,11 +300,11 @@ class ScratchpadAllocator(ABC):
             if not in_place_allowed[buf_name]:
                 continue
             out_start = lifetimes[buf_name][0]
-            out_ten_layout = effective_device_layout(graph.get_buffer(buf_name))
+            out_ten_layout = graph.get_buffer(buf_name).get_layout().device_layout
             out_size = info["size_per_core"]
             for input_buf in info["op_inputs"]:
                 in_end = lifetimes[input_buf][-1]  # inclusive last use
-                in_ten_layout = effective_device_layout(graph.get_buffer(input_buf))
+                in_ten_layout = graph.get_buffer(input_buf).get_layout().device_layout
                 in_size = mem_usage[input_buf]["size_per_core"]
                 inp_i_size_match = out_size == in_size
                 inp_i_lay_match = out_ten_layout == in_ten_layout
@@ -509,32 +416,6 @@ class ScratchpadAllocator(ABC):
         layout = buf.get_layout()
         layout.allocation["lx"] = address
 
-    def _stamp_alias_inplace_ops(self, graph: GraphLowering) -> None:
-        """Route each LX-alias in-place op to its target's assigned LX slot.
-
-        Runs after _push_allocation, so alias targets that the solver pinned have
-        their address stamped. An eligible mutation op (excluded from the solver's
-        buffer list in _build_bound_buffers) reuses that same address rather than
-        owning a slot. If the target went unpinned, the op is simply left unpinned.
-        Gated by config.lx_alias_inplace via _is_alias_inplace_op.
-        """
-        for op in graph.operations:
-            if not self._is_alias_inplace_op(op):
-                continue
-            target = self._alias_target_buffer(op)
-            address = self._alias_target_lx_address(target)
-            if address is not None:
-                self._set_one_allocation(op, address)
-            else:
-                # Target was not pinned, so there is no slot to alias onto. Record
-                # a reject reason: the op was excluded from the solver, so without
-                # this it would fall through _log_lx_pinning's default and falsely
-                # report "→ lx" despite carrying no LX address.
-                target_name = target.get_name() if target is not None else "None"
-                self.reject_reasons[op.name] = (
-                    f"alias target ({target_name}) not pinned"
-                )
-
 
 class DefaultAllocator(ScratchpadAllocator):
     def __init__(
@@ -594,7 +475,6 @@ class DefaultAllocator(ScratchpadAllocator):
                     f" size={b.size // 1024} KB)"
                 )
         self._push_allocation(graph, allocation)
-        self._stamp_alias_inplace_ops(graph)
         self._log_lx_pinning(graph)
         for p in self.post_optimization_passes:
             p.apply_pass(graph)
@@ -1065,7 +945,6 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
                     f" size={b.size // 1024} KB)"
                 )
         self._push_allocation(graph, allocation)
-        self._stamp_alias_inplace_ops(graph)
         self._log_lx_pinning(graph)
         for p in self.post_optimization_passes:
             p.apply_pass(graph)
