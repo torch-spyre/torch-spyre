@@ -14,9 +14,11 @@
 
 """Loop unrolling for coarse-tiling LoopSpec trees.
 
-When ``bundle_hbm_symbols=False`` the backend compiler does not support
-``scf.for`` loops in ``bundle.mlir``.  This module provides
-``unroll_loop_specs``, which fully unrolls a ``list[OpSpec | LoopSpec]`` tree
+This module implements full loop unrolling to enable exeuction
+of programs containing ``LoopSpec`` nodes while the backend compiler support
+for  ``scf.for`` loops in ``bundle.mlir`` is under development.
+
+When ``unroll_loop_specs`` a ``list[OpSpec | LoopSpec]`` tree will be fully unrolled
 into a flat list of ``OpSpec`` entries with concrete per-iteration addresses
 baked into each ``TensorArg.allocation`` derived from ``device_coordinates``
 and ``device_size`` — so args with different tile sizes or layouts each get

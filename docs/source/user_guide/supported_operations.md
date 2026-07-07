@@ -65,12 +65,16 @@ see [Adding Operations](../compiler/adding_operations.md).
 | **Reduction** | | | | |
 | `torch.sum` | Y | Y | Spyre | |
 | `torch.mean` | Y | Y | Spyre | |
-| `torch.amax` | | Y | Spyre | Compiled only (no eager dispatch) |
-| `torch.amin` | | Y | Spyre | Compiled only (no eager dispatch) |
+| `torch.amax` | Y | Y | Spyre | |
+| `torch.amin` | | Y | Spyre | Custom decomposition |
+| `torch.aminmax` | | Y | Spyre | Decomposes to `amax` + `amin` |
+| `torch.prod` | | Y | Spyre | Requires `dim` argument; custom decomposition + lowering |
 | `torch.max` | Y | Y | Spyre | `max.dim` via custom decomposition |
 | `torch.min` | Y | Y | Spyre | `min.dim` via custom decomposition (fp16) |
 | `torch.topk` | | Y | Spyre | Custom decomposition + custom ops (`spyre::topkvalue`, `spyre::topkindex`) |
-| `torch.linalg.vector_norm` | | Y | Spyre | Compiled only. Eager path registered but disabled (misroutes `ord`) |
+| `torch.linalg.vector_norm` | Y | Y | Spyre | |
+| `torch.linalg.norm` | | Y | Spyre | Compiled only |
+| `torch.linalg.matrix_norm` | | Y | Spyre | Compiled only |
 | **View Ops** [^views] | | | | |
 | `torch.reshape` / `torch.view` | | Y | Spyre | Includes `_reshape_alias` (a C++ device view, not an Inductor lowering) |
 | `torch.transpose` | | Y | Spyre | |
@@ -95,7 +99,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.zeros` | Y | Y | Spyre | Eager via `aten::zero_` (`ops/eager.py`) |
 | `torch.empty_like` | Y | Y | Spyre | |
 | `torch.full` | Y | Y | Spyre | Custom decomposition |
-| `torch.nn.functional.pad` / `torch.constant_pad_nd` | | Y | Spyre | Custom decomposition |
+| `torch.nn.functional.pad` / `torch.constant_pad_nd` | Y | Y | Spyre | Custom lowering |
 | **In-place / Initialization** | | | | |
 | `torch.Tensor.fill_` | | Y | Spyre | Compiled only; eager kernel registered but not yet stable |
 | `torch.Tensor.normal_` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
@@ -117,6 +121,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.argmax` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.argmin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.cumsum` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
+| `torch.any` | Y | | CPU fallback | `all_out` overload only; runs on CPU |
 | `torch.index_copy` | Y | | CPU fallback | Eager only; runs on CPU |
 
 > **Column key:**
@@ -125,7 +130,9 @@ see [Adding Operations](../compiler/adding_operations.md).
 >   tensor without `torch.compile`. Eager ops are registered via
 >   `torch_spyre/ops/eager.py`, `torch_spyre/ops/fallbacks.py` and
 >   select decompositions.
-> - **Compiled** — supported when using `torch.compile(model, backend="spyre")`.
+> - **Compiled** — supported when using `torch.compile(model)` with the
+>   model on a Spyre device (Inductor routes to the Spyre backend
+>   automatically).
 > - **Execution** — whether the op runs natively on the Spyre accelerator
 >   or falls back to CPU. CPU fallback ops are automatically handled by
 >   the compiler — a warning is emitted when fallback occurs.
