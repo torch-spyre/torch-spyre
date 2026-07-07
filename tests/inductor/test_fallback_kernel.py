@@ -176,21 +176,13 @@ class TestFallbackKernelShape3Void(unittest.TestCase):
 
 
 class TestFallbackKernelPoolResidentArg(unittest.TestCase):
-    """FallbackKernel consuming a pool-resident intermediate.
-
-    When a skip-connection intermediate lands in the intermediates pool, the
-    wrapper materializes it as a ``reinterpret_tensor_with_layout(_pool, ...)``
-    view for the fallback to consume. The pool storage is uint8, so the view
-    must carry an explicit ``dtype=`` or the fallback reads it as uint8 and the
-    result dtype is silently corrupted. Two chained norms with residual adds
-    force exactly that layout, for both fresh-output and in-place fallbacks.
-    """
+    """FallbackKernel consuming an intermediate buffer keeps the correct dtype."""
 
     def test_fresh_output_arg_keeps_dtype(self):
         def fn(x):
             residual = x
             x = torch.ops.test_fk_pool.norm(x, residual)
-            x = residual + x  # pool-resident intermediate
+            x = residual + x  # pool-eligible intermediate, read by fallback
             residual = x
             x = torch.ops.test_fk_pool.norm(x, residual)
             return residual + x
@@ -205,7 +197,7 @@ class TestFallbackKernelPoolResidentArg(unittest.TestCase):
         def fn(x):
             residual = x.clone()
             torch.ops.test_fk_pool.norm_inplace(x, residual)  # x mutated
-            x = residual + x  # pool-resident intermediate
+            x = residual + x  # pool-eligible intermediate, read by fallback
             residual = x.clone()
             torch.ops.test_fk_pool.norm_inplace(x, residual)  # x mutated
             return residual + x

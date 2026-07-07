@@ -677,39 +677,15 @@ class SpyreKernel(Kernel[CSEVariable]):
 
     def remove_kernel_local_buffers(self) -> None:
         """Remove buffers that have a scratchpad or temporary allocation from the kernel's arg list."""
-        from torch._inductor.scheduler import (
-            ExternKernelSchedulerNode,
-            NopKernelSchedulerNode,
-        )
-
-        scheduler = getattr(V.graph, "scheduler", None)
         for name in list(self.store_buffer_names):
             buf = V.graph.get_buffer(name)
             if buf is None:
                 continue
             layout = buf.get_layout()
-            if not isinstance(layout, FixedTiledLayout):
-                continue
-            if "lx" in layout.allocation:
+            if isinstance(layout, FixedTiledLayout) and (
+                "lx" in layout.allocation or "pool" in layout.allocation
+            ):
                 self.remove_buffer(name)
-                continue
-            if "pool" in layout.allocation:
-                needs_python_handle = False
-                if scheduler is not None:
-                    sched_buf = getattr(scheduler, "name_to_buf", {}).get(name)
-                    if sched_buf is not None:
-                        for use in sched_buf.users:
-                            if isinstance(
-                                use.node,
-                                (ExternKernelSchedulerNode, NopKernelSchedulerNode),
-                            ):
-                                # Keep the buffer materialized when any downstream
-                                # consumer is an Extern/Nop scheduler node so the wrapper
-                                # emits a Python ``reinterpret_tensor_with_layout(...)``.
-                                needs_python_handle = True
-                                break
-                if not needs_python_handle:
-                    self.remove_buffer(name)
 
     def load(self, name: str, index: sympy.Expr):
         """Codegen a load from an InputBuffer"""
