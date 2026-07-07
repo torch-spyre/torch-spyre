@@ -227,6 +227,16 @@ runs:
         echo "SPYRE_COMMS_INSTALL_DIR=$SPYRE_COMMS_INSTALL_DIR"
         echo "SEN_COMMON_HEADERS=$SEN_COMMON_HEADERS"
 
+        # The system install places all SDK headers under a single flat
+        # /opt/ibm/spyre/*/include tree so relative includes like
+        # "common/self_doc_enum.hpp" resolve correctly. Our extracted RPM
+        # tree splits headers across subdirectories. Add every include/
+        # subdirectory found in $HOME/rpms to CMAKE_INCLUDE_PATH, which
+        # setup.py appends to INCLUDE_DIRS (line 90-92).
+        EXTRA_INCLUDES=$(find "$SPYRE_SDK" -type d -name "include" | tr '\n' ':')
+        export CMAKE_INCLUDE_PATH="${EXTRA_INCLUDES}${CMAKE_INCLUDE_PATH:-}"
+        echo "CMAKE_INCLUDE_PATH=$CMAKE_INCLUDE_PATH"
+
         [[ "$TORCH_SPYRE_DIR" != /* ]] && TORCH_SPYRE_DIR="${PWD}/${TORCH_SPYRE_DIR}"
         echo "TORCH_SPYRE_DIR $TORCH_SPYRE_DIR"
 
