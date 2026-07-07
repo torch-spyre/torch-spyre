@@ -210,3 +210,20 @@ class TestBuildingBlocks(unittest.TestCase):
             atol=0.1,
             rtol=0.1,
         )
+
+    def test_mixed_bundle_plain_nodes(self):
+        """Multiple pointwise ops fuse into one bundle via the refactored codegen path."""
+
+        def fn(x, y, z):
+            # Three separate pointwise ops — the scheduler should fuse them
+            # into one FusedSchedulerNode, exercising _codegen_into_kernel.
+            a = x + y
+            b = a * z
+            return b - x
+
+        T, D = 128, 64
+        x = torch.randn(T, D, dtype=torch.float16)
+        y = torch.randn(T, D, dtype=torch.float16)
+        z = torch.randn(T, D, dtype=torch.float16)
+
+        compare_with_cpu(fn, x, y, z, run_eager=False)
