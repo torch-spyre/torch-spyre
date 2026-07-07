@@ -1744,13 +1744,13 @@ _run_xdist_fallback() {
 #   1. PCIDEVICE_IBM_COM_AIU_PF: contains a comma-separated list of PCI bus IDs per card.
 #      Card count = number of commas + 1.
 #   2. torch.spyre.device_count(): runtime query via the flex driver.
-#      flex::getNumDevices() (see spyre_device_enum.cpp) already narrows the
-#      count to AIU_WORLD_SIZE / SPYRE_DEVICES when either is set. If the
-#      caller has restricted visible devices via one of those vars, that
-#      restriction is honoured here rather than cleared -- clearing it would
-#      let --parallel spread tests across cards the caller never authorized
-#      for this run. Only clear both vars (to discover the raw hardware
-#      count) when neither is already set.
+#      Inherits AIU_WORLD_SIZE / SPYRE_DEVICES from the environment as-is.
+#      flex::getNumDevices() (see spyre_device_enum.cpp) already narrows its
+#      count to those vars when either is set, so if the caller has
+#      restricted visible devices that restriction is naturally honoured
+#      here. Clearing them before the probe (as this used to do) would let
+#      --parallel spread tests across cards the caller never authorized for
+#      this run.
 #   3. Falls back to 1 (serial) if neither source yields > 0. On failure, the
 #      probe's stderr is surfaced so import/runtime errors are diagnosable
 #      instead of silently downgrading to serial execution.
@@ -1764,19 +1764,12 @@ _detect_spyre_card_count() {
         return
     fi
 
-    # Only override the env for the probe when the caller hasn't already
-    # constrained visible devices -- see comment above.
-    local -a _env_override=()
-    if [[ -z "${SPYRE_DEVICES:-}" && -z "${AIU_WORLD_SIZE:-}" ]]; then
-        _env_override=(env -u AIU_WORLD_SIZE -u SPYRE_DEVICES)
-    fi
-
     local _count _probe_err
     _probe_err="/tmp/_spyre_card_probe_err_${$}.tmp"
     _count=$(
-        "${_env_override[@]+"${_env_override[@]}"}" python3 -c "
+        python3 -c "
 import sys
-import torch_spyre, torch
+import torch
 try:
     print(torch.spyre.device_count())
 except Exception as e:
