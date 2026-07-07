@@ -885,6 +885,7 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
             },
         )
 
+
 class TestIntermediatePartialReadNotPinned(BaseTestScratchpadUsage):
     """An *intermediate* buffer read partially (sliced) must not be LX-pinned.
 
