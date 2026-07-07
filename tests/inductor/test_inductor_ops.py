@@ -4809,24 +4809,40 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        # Non-stick dim offset whose base row length (100) isn't a multiple
-        # of elem_in_stick (64). Flat offset 100 decomposes to a device
-        # stick coordinate of Mod(i1,64)+36 -- genuinely not stick-aligned,
-        # since the device layout pads each row's tail to a partial stick
-        # rather than the row itself landing on a stick boundary. Needs
-        # padding-aware device-coordinate construction, which isn't
-        # implemented yet. Dedicated test (not folded into the ops_dict
-        # cross-product above) so the exact rejection reason can be
-        # pinned, matching test_storage_offset_placeholder_stick_dim_rejected
-        # below.
+        # Offset on a non-stick dim of a PADDED base -- row width 100 is not a
+        # multiple of elem_in_stick, so each row pads to two sticks and the flat
+        # offset 100 is a whole row. compute_coordinates now decomposes that
+        # positionally, keeping the stick coordinate offset-free; before the fix
+        # it leaked Mod(i1,64)+36 and the placeholder was rejected outright.
+        #
+        # Deliberately narrower than the group above -- compiled only, and only
+        # layout-preserving ops -- because two unrelated defects still bound
+        # this shape on current main. Neither is caused by the offset:
+        #   - eager: every eager op on an offset view is cloned via
+        #     spyre::copy_from_d2d, which rejects on the flat-offset heuristic
+        #     `offset % elems_per_stick != 0` (100 % 64 = 36). Same
+        #     padding-blind assumption this fix removes, in another location.
+        #   - exp (and other ops that re-select the output layout): miscomputes
+        #     or fails to compile on any padded-row fp16 tensor, including
+        #     UNSLICED ones with no offset at all. Measured: (3,100) unsliced
+        #     fails identically to (4,100)[1:, :], in both core counts.
+        # x + x stays correct because it reuses the input layout verbatim.
         (
-            "test_storage_offset_placeholder_nonstick_row",
-            "test_storage_offset_placeholder_nonstick_row_rejected",
+            "test_storage_offset_placeholder_padded_row",
+            "test_storage_offset_placeholder_compiled_only",
         ): {
+            "ops_dict": {"add": lambda x: x + x},
             "param_sets": {
                 "2d_offset_dim0_nonstick_multiple": (
                     lambda t: t[1:, :],
                     cached_randn((4, 100), differentiation="ph_2d_offset0_nonstick"),
+                ),
+                # Same padded row, but dim0 IS a multiple of elem_in_stick, so
+                # the leaked residual would have looked resolvable by a stick
+                # move rather than rejected outright.
+                "2d_offset_dim0_nonstick_multiple_alt_dim": (
+                    lambda t: t[1:, :],
+                    cached_randn((64, 100), differentiation="ph_2d_offset0_nsalt"),
                 ),
             },
         },
@@ -5527,6 +5543,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 f"{(result.float() - expected).abs().max().item()}"
             )
 
+    def test_storage_offset_placeholder_compiled_only(self, op, slicer, base):
+        # Same as test_storage_offset_placeholder, minus the eager arm: eager
+        # materializes an offset view through spyre::copy_from_d2d, which
+        # rejects any storage_offset that is not a whole number of sticks --
+        # unrelated to whether the offset itself decomposes correctly.
+        cpu_view = slicer(base.clone())
+        expected = op(cpu_view).float()
+
+        dev_view = slicer(base.clone().to("spyre"))
+        result = _compile_and_run(op, [dev_view], "spyre", compile=True)
+        assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+            f"max abs diff: {(result.float() - expected).abs().max().item()}"
+        )
+
     def test_storage_offset_placeholder_stick_dim_rejected(self, slicer, base):
         # Stick-dim placeholder offset: alt-layout retargeting not yet
         # implemented (#2750), so compile must raise rather than silently
@@ -5538,22 +5568,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         dev_view = slicer(base.clone().to("spyre"))
 
         with pytest.raises(Exception, match="Unsupported"):
-            _compile_and_run(fn, [dev_view], "spyre", compile=True)
-
-    def test_storage_offset_placeholder_nonstick_row_rejected(self, slicer, base):
-        # Non-stick dim offset whose base row length isn't a multiple of
-        # elem_in_stick: padding-aware device-coordinate construction not
-        # yet implemented, so compile must raise rather than silently
-        # miscompute. No eager arm: compile=False skips the Inductor pass
-        # entirely, so it can't exercise this check.
-        def fn(x):
-            return x + x
-
-        dev_view = slicer(base.clone().to("spyre"))
-
-        with pytest.raises(
-            Exception, match="non-stick-aligned device stick coordinate"
-        ):
             _compile_and_run(fn, [dev_view], "spyre", compile=True)
 
     def test_storage_offset_placeholder_vs_internal_equivalence(self):

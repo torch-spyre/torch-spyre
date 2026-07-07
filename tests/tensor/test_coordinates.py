@@ -216,6 +216,71 @@ class TestCoordinates(TestCase):
         )
         self.assertEqual(cx, [p1, p2 // 64 + 2, p0, p2 % 64])
 
+    def test_offset_across_padded_row_stays_stick_offset_free(self):
+        # Regression for the padding-aware-offset bug: a graph-input placeholder
+        # sliced off the leading (non-stick) dimension of a base whose row width
+        # is NOT a multiple of elem_in_stick.
+        #
+        # base=(4, 100) fp16 (elem_in_stick=64): each row pads 100 -> 128 (two
+        # sticks), so the on-device layout is device_size=[2, 4, 64] with
+        # stride_map=[64, 100, 1] (stick-outer, row, stick-inner). For base[1:, :]
+        # the host storage_offset is 100 == exactly one row.
+        #
+        # p0 is the row var (range 3), p1 the column var (range 100). The offset
+        # is a whole row, so it must land entirely on the row coordinate and the
+        # stick coordinate must stay offset-free (p1 % 64):
+        #     correct: [p1 // 64, p0 + 1, p1 % 64]
+        # Today compute_coordinates decomposes the host offset against the raw
+        # unpadded row stride (100) with no notion of per-row padding, so 100 % 64
+        # leaks a residual onto the stick coordinate:
+        #     current (buggy): [p1 // 64, p0 + 1, p1 % 64 + 36]
+        cx = compute_coordinates(
+            [2, 4, 64],
+            [64, 100, 1],
+            {p0: 3, p1: 100},
+            100 + 100 * p0 + p1,
+        )
+        self.assertEqual(cx, [p1 // 64, p0 + 1, p1 % 64])
+
+        # Multi-row offset: base=(5,100)[2:, :], offset 200 == two rows.
+        cx = compute_coordinates(
+            [2, 5, 64],
+            [64, 100, 1],
+            {p0: 3, p1: 100},
+            200 + 100 * p0 + p1,
+        )
+        self.assertEqual(cx, [p1 // 64, p0 + 2, p1 % 64])
+
+        # Wider padding: base=(4,130) pads 130 -> 192 (three sticks); [1:, :].
+        cx = compute_coordinates(
+            [3, 4, 64],
+            [64, 130, 1],
+            {p0: 3, p1: 130},
+            130 + 130 * p0 + p1,
+        )
+        self.assertEqual(cx, [p1 // 64, p0 + 1, p1 % 64])
+
+        # Multi-dim padded base: (3,3,100)[1:, :, :], offset 300 == one block.
+        cx = compute_coordinates(
+            [2, 3, 3, 64],
+            [64, 300, 100, 1],
+            {p0: 2, p1: 3, p2: 100},
+            300 + 300 * p0 + 100 * p1 + p2,
+        )
+        self.assertEqual(cx, [p2 // 64, p0 + 1, p1, p2 % 64])
+
+        # Offset on a MIDDLE (non-outermost) dim: base=(3,5,100)[:, 2:, :],
+        # offset 200 == two rows of the middle dim, outer dim untouched.
+        # p0 = outer dim var (range 3), p1 = middle dim var (range 3, the
+        # post-slice remainder), p2 = column var (range 100).
+        cx = compute_coordinates(
+            [2, 3, 5, 64],
+            [64, 500, 100, 1],
+            {p0: 3, p1: 3, p2: 100},
+            200 + 500 * p0 + 100 * p1 + p2,
+        )
+        self.assertEqual(cx, [p2 // 64, p0, p1 + 2, p2 % 64])
+
 
 class TestUnrepresentableStickCandidates(TestCase):
     """Cover the skip-unrepresentable-candidate behavior added for the
