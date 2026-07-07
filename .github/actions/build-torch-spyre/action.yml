@@ -198,10 +198,20 @@ runs:
         echo "TORCH_SPYRE_DIR $TORCH_SPYRE_DIR"
 
         cd "$TORCH_SPYRE_DIR"
+
+        # Clean install: wipe any stale pre-baked venv and uv cache so the
+        # C extension is compiled from scratch against the RPM headers/libs
+        # we just extracted. A dirty venv can carry cached build artefacts
+        # that were compiled against a different SDK version.
+        rm -rf .venv
+        uv cache clean
+        uv venv
+
+        source .venv/bin/activate
+
         uv sync \
           --verbose \
           --frozen \
           --all-extras
-        source .venv/bin/activate
         uv pip show torch
         uv pip freeze
