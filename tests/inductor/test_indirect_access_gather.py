@@ -644,7 +644,7 @@ class TestGather(IndirectAccessTestCase):
 
         All hardware/toolchain touchpoints are stubbed so no device is needed:
         subprocess.run (the dxp_standalone --bundle step that produces
-        spyreCodeDir), launch_kernel / launch_jobplan (device execution), and
+        spyreCodeDir), launch_jobplan (device execution), and
         prepare_kernel (reads spyreCodeDir; only invoked when DUMP_SPYRE_CODE is
         set). Stubbing prepare_kernel + launch_jobplan exercises the
         DUMP_SPYRE_CODE=1 code path harmlessly, so the test passes whether or not
@@ -658,7 +658,6 @@ class TestGather(IndirectAccessTestCase):
         x, i = self._xi(P=3, two_d=True)
         with (
             patch("subprocess.run"),
-            patch(f"{kr}.launch_kernel"),
             patch(f"{kr}.launch_jobplan"),
             patch(f"{kr}.prepare_kernel"),
         ):
