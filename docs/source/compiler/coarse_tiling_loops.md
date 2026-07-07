@@ -226,7 +226,7 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                                 sympify('c1'): (sympify('1024'), 1),
                             },
                             op_info={},
-                            tiled_symbols=[sympify('c0'), sympify('c1')],
+                            tiled_symbols=[[sympify('c1')], [sympify('c0')]],
                             args=[
                                 TensorArg(              # input a
                                     is_input=True, arg_index=0,
@@ -271,7 +271,7 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                                 sympify('c1'): (sympify('1024'), 1),
                             },
                             op_info={},
-                            tiled_symbols=[sympify('c0'), sympify('c1')],
+                            tiled_symbols=[[sympify('c1')], [sympify('c0')]],
                             args=[
                                 TensorArg(              # input y (LX scratchpad)
                                     is_input=True, arg_index=-1,
@@ -320,8 +320,9 @@ Key observations:
 
 - `c0` and `c1` are Inductor's iteration-space symbols for the two dimensions.
   `iteration_space` reflects the per-inner-iteration tile size `[512, 1024]`.
-- `tiled_symbols=[c0, c1]` records — outermost first — which symbols correspond
-  to the tiled dimensions: `c0` drives the outer `scf.for`, `c1` the inner one.
+- `tiled_symbols=[[c1], [c0]]` records — innermost first — which symbols
+  correspond to the tiled dimensions: `c1` is tiled by the inner loop,
+  `c0` by the outer loop.
 - The intermediate tensor `y` (output of `add`, input to `mul`) has
   `allocation={'lx': 0}` — it lives in LX scratchpad memory at address 0.
   Its `device_size=[16, 512, 64]` reflects the per-tile shape `[512, 1024]`.
@@ -428,9 +429,10 @@ key.  `loop_tiled_dims` is the bridge between the pre-scheduling pass (which
 operates on positional `data.ranges` indices) and the codegen phase (which
 uses named sympy Symbols) — it is read by `create_op_spec` to identify, by
 index, which scheduler-level symbols correspond to the tiled output dimensions
-and should be recorded in `OpSpec.tiled_symbols`.  All levels are flattened
-(outermost first) so that `tiled_symbols` covers every loop variable for the
-op.  Using a list-of-lists of indices (rather than a count or a flag) allows
+and should be recorded in `OpSpec.tiled_symbols`.  Each loop level gets its
+own sublist (innermost first) so that `tiled_symbols` covers every loop
+variable for the op.  Using a list-of-lists of indices (rather than a count
+or a flag) allows
 different ops in the same loop to tile non-contiguous or differently
 positioned dimensions of their respective iteration spaces.
 
@@ -935,7 +937,6 @@ bug in the tiling pass.  The post-fusion pass asserts contiguity.
 class LoopSpec:
     count: sympy.Expr
     body: list[OpSpec | UnimplementedOp | LoopSpec]
-    tiled_symbols: list[Symbol] = field(default_factory=list)
 
 @dataclasses.dataclass
 class OpSpec:
@@ -944,7 +945,7 @@ class OpSpec:
     iteration_space: dict[Symbol, tuple[Expr, int]]
     args: Sequence[TensorArg]
     op_info: dict[str, Any]
-    tiled_symbols: list[Symbol] = field(default_factory=list)
+    tiled_symbols: list[list[Symbol]] = field(default_factory=list)
 ```
 
 `LoopSpec` is a peer of `OpSpec` and `UnimplementedOp` in the list that
@@ -955,22 +956,19 @@ belong to the inner `OpSpec`s.
 The `body` type is recursive: a `LoopSpec` body may itself contain
 `LoopSpec` entries, representing nested counted loops.
 
-`LoopSpec.tiled_symbols` carries the loop-level tiling information: the
-iteration-space symbols divided by `count` at this loop level.  It is
-populated by `_codegen_counted_loop` and `_codegen_loop_body` using
-`_tiled_syms_for_sched_node_at_depth` — a helper that maps
-`loop_info.loop_tiled_dims[depth]` (host-range indices) to iteration-space
-symbol keys, accounting for unit-size batch dimensions that the scheduler
-skips.
-The `bundle.py` and `compile_op_spec` paths use `LoopSpec.tiled_symbols`
-to compute per-iteration HBM address offsets.
+`OpSpec.tiled_symbols` is a `list[list[Symbol]]` containing per-loop-level
+iteration-space symbols, **innermost first**.  `tiled_symbols[0]` lists
+the symbols tiled by the innermost enclosing loop; `tiled_symbols[1]`
+lists those tiled by the next-outer loop; and so on.  It is **empty for
+ops not inside a `LoopSpec`**.  Every enclosing loop level has an entry
+(even if empty `[]`) so that level indices stay aligned with nesting
+depth.  Two ops in the same loop group can have different `tiled_symbols`
+if work division or stickification places the batch dimension at
+different positions in each op's iteration space.
 
-`OpSpec.tiled_symbols` provides per-op tiling information (present for
-legacy / fallback paths): all iteration-space symbols divided by any
-enclosing loop, listed **outermost first**.  It is **empty for ops not
-inside a `LoopSpec`**.  Two ops in the same loop group can have different
-`tiled_symbols` if work division or stickification places the batch
-dimension at different positions in each op's iteration space.
+The `bundle.py` and `compile_op_spec` paths reverse `tiled_symbols` to
+outermost-first order and build per-level `affine.apply` stride maps,
+mapping each level's strides to the correct loop variable by index.
 
 ### Nested loops and the `loop_group_id` tree
 
@@ -1075,7 +1073,7 @@ def _codegen_counted_loop(self, node: CountedLoopSchedulerNode) -> None:
             break
 
     # Wrap the collected inner specs in a LoopSpec
-    kernel.wrap_op_specs_in_loop(node.loop_count, tiled_symbols=outer_tiled_syms)
+    kernel.wrap_op_specs_in_loop(node.loop_count)
 
     with V.set_kernel_handler(kernel):
         src_code = kernel.codegen_kernel()
@@ -1105,32 +1103,30 @@ A `LoopSpec` entry is serialized as:
 ```python
 LoopSpec(
     count=sympify('K'),
-    tiled_symbols=[sympify('c0')],       # the symbol tiled at this loop level
     body=[
         OpSpec(
             ...,
-            tiled_symbols=[sympify('c0')],   # per-op; emitted only when non-empty
+            tiled_symbols=[[sympify('c0')]],   # one level: innermost
         ),
         LoopSpec(          # nested loop
             count=sympify('J'),
-            tiled_symbols=[sympify('c1')],   # symbol tiled at inner level
             body=[
-                OpSpec(..., tiled_symbols=[sympify('c0'), sympify('c1')]),
+                OpSpec(..., tiled_symbols=[[sympify('c1')], [sympify('c0')]]),
+                # tiled_symbols[0] = innermost loop symbols
+                # tiled_symbols[1] = outer loop symbols
             ],
         ),
     ],
 )
 ```
 
-`LoopSpec.tiled_symbols` is populated by `_codegen_counted_loop` (depth 0)
-and `_codegen_loop_body` (deeper levels) via
-`_tiled_syms_for_sched_node_at_depth`.  `OpSpec.tiled_symbols` is populated
-by `SpyreKernel.create_op_spec`: it reads `loop_info.loop_tiled_dims` (a
-`list[list[int]]`) from the `ir.Operation` (stamped by `coarse_tile()`),
-flattens all levels outermost-first, and selects the symbols at those indices
-from the scheduler-level `iteration_space` dict.  `MemoryDep.ranges`
-preserves the `data.ranges` ordering, so this positional correspondence is
-stable across the pre-scheduling to codegen boundary.
+`OpSpec.tiled_symbols` is populated by `SpyreKernel.create_op_spec`: it
+reads `loop_info.loop_tiled_dims` (a `list[list[int]]`) from the
+`ir.Operation` (stamped by `coarse_tile()`), and for each loop level
+selects the symbols at those indices from the scheduler-level
+`iteration_space` dict.  The result is stored innermost-first.
+`MemoryDep.ranges` preserves the `data.ranges` ordering, so this positional
+correspondence is stable across the pre-scheduling to codegen boundary.
 
 For reduction-dim tiling, `create_op_spec` also consults
 `loop_info.loop_tiled_reduction_dims`.  For a `Reduction` op,
@@ -1265,9 +1261,9 @@ this.
 
 **`tiled_symbols` populated iff inside a loop**: `OpSpec.tiled_symbols` is
 non-empty exactly when the op was codegen'd inside a `CountedLoopSchedulerNode`.
-Its elements are the flattened (outermost-first) per-level tiled dims from
-`loop_info.loop_tiled_dims` on the corresponding `ir.Operation`, selected from
-the scheduler-level `iteration_space` keys.
+It is a `list[list[Symbol]]` (innermost first) derived from the per-level
+tiled dims in `loop_info.loop_tiled_dims` on the corresponding
+`ir.Operation`, selected from the scheduler-level `iteration_space` keys.
 
 **Pass ordering**: coarse tiling must run after stickify/padding and
 before `span_reduction`, `cost_model_matmul_division`, `work_distribution`,

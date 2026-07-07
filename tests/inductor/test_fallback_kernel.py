@@ -89,6 +89,26 @@ if not _ns_has_op("test_fk_s3", "inplace_add"):
     _LIB_S3._register_fake("inplace_add", lambda x, out: None)
 
 
+_LIB_POOL = torch.library.Library("test_fk_pool", "FRAGMENT")
+if not _ns_has_op("test_fk_pool", "norm"):
+    _LIB_POOL.define("norm(Tensor x, Tensor residual) -> Tensor")
+    _LIB_POOL.impl(
+        "norm", lambda x, r: (x + r) * 0.5, dispatch_key="CompositeExplicitAutograd"
+    )
+    _LIB_POOL._register_fake("norm", lambda x, r: torch.empty_like(x))
+
+if not _ns_has_op("test_fk_pool", "norm_inplace"):
+    _LIB_POOL.define("norm_inplace(Tensor(a!) x, Tensor residual) -> ()")
+
+    def _norm_inplace_impl(x, r):
+        x.copy_((x + r) * 0.5)
+
+    _LIB_POOL.impl(
+        "norm_inplace", _norm_inplace_impl, dispatch_key="CompositeExplicitAutograd"
+    )
+    _LIB_POOL._register_fake("norm_inplace", lambda x, r: None)
+
+
 class TestFallbackKernelShape1Single(unittest.TestCase):
     """Shape 1: op(...) -> Tensor.
 
@@ -153,6 +173,40 @@ class TestFallbackKernelShape3Void(unittest.TestCase):
         out = compiled(x).cpu()
         # zeros + x + 1 = 6.0
         torch.testing.assert_close(out, torch.full((4,), 6.0, dtype=DTYPE))
+
+
+class TestFallbackKernelPoolResidentArg(unittest.TestCase):
+    """FallbackKernel consuming an intermediate buffer keeps the correct dtype."""
+
+    def test_fresh_output_arg_keeps_dtype(self):
+        def fn(x):
+            residual = x
+            x = torch.ops.test_fk_pool.norm(x, residual)
+            x = residual + x  # pool-eligible intermediate, read by fallback
+            residual = x
+            x = torch.ops.test_fk_pool.norm(x, residual)
+            return residual + x
+
+        x = torch.randn(16, 4096, dtype=DTYPE)
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
+        out = compiled(x.to(DEVICE))
+        self.assertEqual(out.dtype, DTYPE)
+        torch.testing.assert_close(out.cpu(), fn(x), atol=0.1, rtol=0.1)
+
+    def test_inplace_arg_keeps_dtype(self):
+        def fn(x):
+            residual = x.clone()
+            torch.ops.test_fk_pool.norm_inplace(x, residual)  # x mutated
+            x = residual + x  # pool-eligible intermediate, read by fallback
+            residual = x.clone()
+            torch.ops.test_fk_pool.norm_inplace(x, residual)  # x mutated
+            return residual + x
+
+        x = torch.randn(16, 4096, dtype=DTYPE)
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
+        out = compiled(x.clone().to(DEVICE))
+        self.assertEqual(out.dtype, DTYPE)
+        torch.testing.assert_close(out.cpu(), fn(x.clone()), atol=0.1, rtol=0.1)
 
 
 if __name__ == "__main__":
