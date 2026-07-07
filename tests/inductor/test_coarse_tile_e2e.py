@@ -873,7 +873,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -963,7 +962,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(flash)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -1017,7 +1015,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(fn)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
@@ -1114,7 +1111,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         cfn = torch.compile(flash)
         with (
-            mock_patch(_LAUNCH_KERNEL),
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
