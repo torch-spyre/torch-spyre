@@ -261,6 +261,7 @@ runs:
         uv sync \
           --verbose \
           --frozen \
-          --all-extras
+          --all-extras \
+          --no-build-isolation
         uv pip show torch
         uv pip freeze
