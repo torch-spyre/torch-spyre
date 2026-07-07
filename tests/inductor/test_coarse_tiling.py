@@ -1342,12 +1342,12 @@ class TestSpyreFuseNodesLoopFusion(unittest.TestCase):
         self.assertIsInstance(result[0], FusedSchedulerNode)
 
     def test_fallback_still_forces_boundary(self):
-        """A FallbackKernel between two fusable nodes creates two bundles."""
-        from torch._inductor.ir import FallbackKernel
+        """An ExternKernelSchedulerNode between two fusable nodes creates two bundles."""
+        from torch._inductor.scheduler import ExternKernelSchedulerNode
 
         sched = _make_scheduler()
         plain_a = _make_snode(sched, _make_ir_op(), "plain_a")
-        fallback = MagicMock(spec=FallbackKernel)
+        fallback = MagicMock(spec=ExternKernelSchedulerNode)
         fallback.scheduler = sched
         fallback.get_name.return_value = "fallback0"
         plain_b = _make_snode(sched, _make_ir_op(), "plain_b")
