@@ -146,24 +146,36 @@ runs:
 
         echo ""
         echo "========================================================="
-        echo "      STEP 6: EXTRACTING .so RUNTIME DEPENDENCIES        "
+        echo "   STEP 6: EXTRACTING FULL RPM PAYLOAD (HEADERS + .so)   "
         echo "========================================================="
-        cd "$EXTRACTION_DIR"
 
-        # Extract .so files from all RPMs
+        # Extract the full RPM payload preserving directory structure so that
+        # both .so files AND headers land in their proper /opt/ibm/spyre/*
+        # sub-trees. setup.py reads RUNTIME_INSTALL_DIR, SENLIB_INSTALL_DIR,
+        # etc. to build explicit -I and -L flags — we must have the headers
+        # in place, not just the .so files.
+        cd "$EXTRACTION_DIR"
         for rpm_file in "$DOWNLOAD_DIR"/*.rpm; do
           if [ -f "$rpm_file" ]; then
-            echo "🛠️ Unpacking Shared Objects from: $(basename "$rpm_file")"
-            rpm2cpio "$rpm_file" | cpio -idv "*.so*" 2>/dev/null
+            echo "🛠️ Unpacking: $(basename "$rpm_file")"
+            rpm2cpio "$rpm_file" | cpio -idv 2>/dev/null
           fi
         done
 
-        # Flatten libraries: move all deeply nested .so files straight to $EXTRACTION_DIR
-        echo "🚚 Relocating shared objects directly to root of $EXTRACTION_DIR..."
-        find "$EXTRACTION_DIR" -type f -name "*.so*" -exec mv -f {} "$EXTRACTION_DIR/" \;
+        # The RPMs unpack into ./opt/ibm/spyre/{runtime,senlib,...}.
+        # Promote that tree one level so $EXTRACTION_DIR IS the spyre root:
+        #   $HOME/rpms/runtime/include/flex/flex.hpp  ✅
+        #   $HOME/rpms/senlib/include/...              ✅
+        if [ -d "$EXTRACTION_DIR/opt/ibm/spyre" ]; then
+          cp -a "$EXTRACTION_DIR/opt/ibm/spyre/." "$EXTRACTION_DIR/"
+          rm -rf "$EXTRACTION_DIR/opt" "$EXTRACTION_DIR/usr" 2>/dev/null
+          echo "✅ Spyre SDK tree promoted to: $EXTRACTION_DIR"
+        fi
 
-        # Purge empty payload folders left behind by cpio
-        rm -rf "$EXTRACTION_DIR/opt" "$EXTRACTION_DIR/usr" 2>/dev/null
+        # Also flatten all .so files to $EXTRACTION_DIR root for LD_LIBRARY_PATH
+        find "$EXTRACTION_DIR" -mindepth 2 -type f -name "*.so*" \
+          -exec cp -f {} "$EXTRACTION_DIR/" \;
+        echo "🚚 Flattened .so files to root of $EXTRACTION_DIR"
 
         # Persist LD_LIBRARY_PATH for subsequent steps via GITHUB_ENV
         echo "LD_LIBRARY_PATH=$EXTRACTION_DIR:${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
@@ -174,12 +186,16 @@ runs:
         echo "========================================================="
         echo "             VERIFICATION: LS ARTIFACT TARGETS           "
         echo "========================================================="
-        echo "📁 Contents of Download Directory ($DOWNLOAD_DIR):"
+        echo "📁 Download Directory ($DOWNLOAD_DIR):"
         ls -lh "$DOWNLOAD_DIR"
 
         echo ""
-        echo "📁 Flattened Shared Object Library Space ($EXTRACTION_DIR):"
-        ls -lh "$EXTRACTION_DIR"
+        echo "📁 Spyre SDK root ($EXTRACTION_DIR):"
+        ls -1 "$EXTRACTION_DIR"
+
+        echo ""
+        echo "  Header files: $(find "$EXTRACTION_DIR" -name '*.h' -o -name '*.hpp' | wc -l)"
+        echo "  Shared libs:  $(find "$EXTRACTION_DIR" -maxdepth 1 -name '*.so*' | wc -l)"
 
     - name: Build torch-spyre
       shell: bash
@@ -193,6 +209,23 @@ runs:
         # This ensures the .so files extracted from the RPMs take precedence at link time.
         export LD_LIBRARY_PATH="$HOME/rpms:${LD_LIBRARY_PATH}"
         echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+
+        # Override the SDK install dirs that setup.py reads to find headers and
+        # libraries. ibm-aiu-setup.sh points these at /opt/ibm/spyre/* (the
+        # system-installed RPMs on the runner image). We redirect them to the
+        # RPM tree extracted from Artifactory so the C++ build uses the exact
+        # SDK version that matches the downloaded .so files.
+        SPYRE_SDK="$HOME/rpms"
+        export RUNTIME_INSTALL_DIR="$SPYRE_SDK/runtime"
+        export SENLIB_INSTALL_DIR="$SPYRE_SDK/senlib"
+        export DEEPTOOLS_INSTALL_DIR="$SPYRE_SDK/deeptools"
+        export SPYRE_COMMS_INSTALL_DIR="$SPYRE_SDK/spyre-comms"
+        export SEN_COMMON_HEADERS="$SPYRE_SDK/flex"
+        echo "RUNTIME_INSTALL_DIR=$RUNTIME_INSTALL_DIR"
+        echo "SENLIB_INSTALL_DIR=$SENLIB_INSTALL_DIR"
+        echo "DEEPTOOLS_INSTALL_DIR=$DEEPTOOLS_INSTALL_DIR"
+        echo "SPYRE_COMMS_INSTALL_DIR=$SPYRE_COMMS_INSTALL_DIR"
+        echo "SEN_COMMON_HEADERS=$SEN_COMMON_HEADERS"
 
         [[ "$TORCH_SPYRE_DIR" != /* ]] && TORCH_SPYRE_DIR="${PWD}/${TORCH_SPYRE_DIR}"
         echo "TORCH_SPYRE_DIR $TORCH_SPYRE_DIR"
