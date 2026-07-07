@@ -17,7 +17,7 @@
 from dataclasses import dataclass, astuple
 import math
 import sympy
-from typing import Optional, Sequence, Dict, Tuple, Callable
+from typing import Optional, Sequence, Dict, Tuple, Callable, cast
 from torch.utils._sympy.functions import ModularIndexing, FloorDiv
 
 from torch._inductor.virtualized import V
@@ -437,10 +437,19 @@ def normalize_coordinates(
         split_dim_terms = []
 
         cum_size = 1
+        # Save original numerators before the loop resets them to 1.
+        # dim_terms[i].num is the flat-index step for variable i.  The
+        # device-dimension range for variable i equals the ratio of
+        # consecutive steps: original_nums[i+1] // original_nums[i].
+        # Using dim_terms[i+1].num directly (which has already been reset
+        # to 1 for lower terms) would give the next variable's raw step,
+        # producing inflated dim_sizes and spurious backGaps when 3+ vars
+        # share a single flat device dimension (e.g. ho*96+kh*24+wo*4+kw).
+        original_nums: list[sympy.Expr] = [cast(sympy.Expr, t.num) for t in dim_terms]
         # for all terms but the last
         for i in range(0, len(dim_terms) - 1):
-            # set dim_size to numerator of next term
-            dim_terms[i].dim_size = dim_terms[i + 1].num
+            # range of variable i = step[i+1] / step[i]
+            dim_terms[i].dim_size = original_nums[i + 1] // original_nums[i]
             # set numerator of next term to 1
             dim_terms[i + 1].num = 1
             # compute cumulative dim_size of all terms up to current term
