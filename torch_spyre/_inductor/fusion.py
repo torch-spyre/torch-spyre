@@ -18,9 +18,12 @@ from torch._inductor.scheduler import (
     SchedulerNode,
 )
 from . import config
+from .scheduler import CountedLoopSchedulerNode
 
 
-def _make_fused(nodes: list[SchedulerNode]) -> BaseSchedulerNode | None:
+def _make_fused(
+    nodes: list[SchedulerNode | CountedLoopSchedulerNode],
+) -> BaseSchedulerNode | None:
     if len(nodes) > 1:
         return FusedSchedulerNode(nodes[0].scheduler, nodes)
     elif len(nodes) == 1:
@@ -42,10 +45,10 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         return nodes
 
     fused_nodes: list[BaseSchedulerNode] = []
-    cur_nodes: list[SchedulerNode] = []
+    cur_nodes: list[SchedulerNode | CountedLoopSchedulerNode] = []
 
     for n in nodes:
-        if isinstance(n, SchedulerNode):
+        if isinstance(n, (SchedulerNode, CountedLoopSchedulerNode)):
             cur_nodes.append(n)
         else:
             # Other node types (eg Fallback nodes) force a bundle boundary.
