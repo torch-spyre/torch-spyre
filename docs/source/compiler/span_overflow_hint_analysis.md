@@ -82,7 +82,8 @@ if not config.ignore_wsr_hints:
 if not config.ignore_span_overflow_hints:
     groups += span_overflow_groups(graph)
 if groups:
-    groups.sort(key=graph_order)
+    op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
+    groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
     coarse_tile(graph, groups=groups)
 ```
 

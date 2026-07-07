@@ -30,6 +30,7 @@ from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
 from torch._inductor.virtualized import V
 
+
 from .constants import (
     SPYRE_FP32_OPS,
     BATCH_MATMUL_OP,
@@ -39,6 +40,7 @@ from .constants import (
     SEGMENT_OFFSETS,
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
+from . import config as _spyre_config
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .pass_utils import (
@@ -495,6 +497,14 @@ class SpyreKernel(Kernel[CSEVariable]):
         # can correctly isolate each loop variable's contribution.
 
         index = concretize_index(tensor.index, set(it_space.keys()))
+
+        # insert_post_mutation_restickify may override the input layout for this input tensor.
+        # Restore it here because the tensor data was uploaded as orig_stl.
+        if is_input:
+            overrides = getattr(self.current_node.node, "_input_layout_overrides", {})
+            if (layout := overrides.get(name)) is not None:
+                tensor.layout = layout
+
         device_coords = compute_coordinates(
             tensor.layout.device_layout.device_size,
             tensor.layout.device_layout.stride_map,
@@ -705,21 +715,25 @@ class SpyreKernel(Kernel[CSEVariable]):
         value: RValue,
         mode: StoreMode = None,
     ) -> None:
-        buf = V.graph.get_buffer(name)
+        # mutation_real_name maps mutation aliases to their real destination buffer. Resolve that here,
+        # and mark the buf name as removed so the wrapper does not allocate it separately.
+        real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
+        if real_dst_name != name:
+            V.graph.removed_buffers.add(name)
+        buf = V.graph.get_buffer(real_dst_name)
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
-            raise Unsupported(f"{name} does not have FixedTiledLayout")
+            raise Unsupported(f"{real_dst_name} does not have FixedTiledLayout")
         # Pool buffers are intermediates whose address is baked into the TensorArg
         # allocation dict; registering them as outputs would overflow SEGMENT_OFFSETS.
         # (lx buffers are already excluded from spyre_kernel_args in _tensor_arg.)
         if "pool" not in layout.allocation:
+            # Pass the alias here, not real_dst_name: args.output resolves the
+            # mutation alias internally. (load() passes the pre-resolved real
+            # name to args.input, which does not resolve.)
             _ = self.args.output(name)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        dst = TensorAccess(name, index, layout)
-        real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
-        if real_dst_name != name:
-            # Skip allocating an output buffer; this name is an alias to another buffer
-            V.graph.removed_buffers.add(name)
+        dst = TensorAccess(real_dst_name, index, layout)
         op_info: dict[str, Any] = {}
         if logger.isEnabledFor(logging.DEBUG):
             value_type = type(value).__name__
@@ -890,11 +904,19 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         for name, tensor_arg in self.spyre_kernel_args:
             tensor_arg.arg_index = actuals.index(name)
-            tensor_arg.allocation["hbm"] = SEGMENT_OFFSETS[
-                tensor_arg.arg_index + 1
-                if has_pool_allocations
-                else tensor_arg.arg_index
-            ]
+            if _spyre_config.bundle_symbolic_args:
+                # On the symbolic path the HBM address is provided at runtime
+                # via input_arg_extract; start_address is never used as a
+                # literal address.  Use the arg_index itself as a small,
+                # positive, human-readable sentinel that is clearly not a
+                # real HBM address (which are O(16 GB) apart).
+                tensor_arg.allocation["hbm"] = tensor_arg.arg_index
+            else:
+                tensor_arg.allocation["hbm"] = SEGMENT_OFFSETS[
+                    tensor_arg.arg_index + 1
+                    if has_pool_allocations
+                    else tensor_arg.arg_index
+                ]
 
         buf = IndentedBuffer()
         buf.writeline("[")
@@ -903,19 +925,48 @@ class SpyreKernel(Kernel[CSEVariable]):
         buf.writeline("]")
         return buf.getvalue()
 
+    def _kernel_uses_pool(self) -> bool:
+        """Return True if any op in this kernel references a pool-allocated tensor."""
+        from torch_spyre._inductor.op_spec import TensorArg
+
+        return any(
+            "pool" in arg.allocation
+            for op in _iter_op_specs(self.op_specs)
+            for arg in op.args
+            if isinstance(arg, TensorArg)
+        )
+
     def call_kernel(self, name: str, node=None):
         """Codegen a call to this kernel"""
         wrapper = V.graph.wrapper_code
         call_args = []
 
-        if getattr(V.graph, "pool_size", 0) > 0:
+        if self._kernel_uses_pool():
             call_args.append("_pool")
 
-        # Add remaining kernel arguments
-        call_args.extend(self.args.python_argdefs()[1])
+        # Add remaining kernel arguments, deduplicating tensors that appear as
+        # both input and output (e.g. in-place ops like x *= 2).  With symbolic
+        # args the MLIR bundle emits one !sdscbundle.input_arg<index> per unique
+        # arg_index; passing the same tensor twice would cause a runtime
+        # "Number of inputs mismatches" error in processComputeOnHostCommand.
+        seen: set[str] = set()
+        for arg in self.args.python_argdefs()[1]:
+            if arg not in seen:
+                seen.add(arg)
+                call_args.append(arg)
 
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
+
+    def emit_layout_restores(self, restores) -> None:
+        """Emit set_spyre_tensor_layout wrapper calls after this kernel's run.
+
+        The scheduler selects and dedups the restores; this kernel just writes
+        them into the wrapper alongside its own call, using the same wrapper.
+        """
+        wrapper = V.graph.wrapper_code
+        for target_name, alt_stl in restores:
+            wrapper.writeline(f"set_spyre_tensor_layout({target_name}, {alt_stl!r})")
 
 
 def _indirect_syms_used(

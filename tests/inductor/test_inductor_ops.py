@@ -194,11 +194,6 @@ SPYRE_MODE_SUPPORT_OVERRIDES_BY_OP = {
         "eager": False,
         "reason": "Spyre eager aten::amin.out is not supported yet (issue #1708)",
     },
-    torch.amax: {
-        "compiled": True,
-        "eager": False,
-        "reason": "Spyre eager aten::amax.out is not supported yet (issue #1708)",
-    },
     torch.min: {
         "compiled": True,
         "eager": False,
@@ -2985,6 +2980,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "add1": lambda _, x: torch.add(x.clone(), x),
                 "add2": lambda _, x: torch.add(x, x),
                 "to_dtype": lambda _, x: x.to(dtype=torch.bool),
+                "double_read": lambda _, x: (
+                    (x + 1) + torch.amax(x, dim=-1, keepdim=True)
+                ),
             },
             "param_sets": {
                 "2d64": (1, 32, 96, cached_randn((128, 256))),
@@ -3041,6 +3039,105 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d128_0": (2, 32, 160, cached_randn((128, 3, 256))),
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
+            },
+        },
+        ("test_slice_stick_mutation", "test_slice_cpu"): {
+            "ops_dict": {
+                "input": lambda _, x, y: x.copy_(y)._base,
+                "square": lambda _, x, y: x.copy_(y.square())._base,
+                "ones": lambda _, x, _y: x.copy_(torch.ones_like(x))._base,
+                "arange": lambda _, x, _y: (
+                    x.copy_(
+                        torch.arange(
+                            x.shape[-1], dtype=x.dtype, device=x.device
+                        ).repeat(*x.shape[:-1], 1)
+                    )._base
+                ),
+                "double_read": lambda _, x, y: (
+                    z := x.copy_(y)._base,
+                    (z + 1) + torch.amax(z, dim=-1, keepdim=True),
+                )[-1],
+            },
+            "param_sets": {
+                "2d64": (1, 32, 96, cached_randn((128, 256)), cached_randn((128, 64))),
+                "2d128": (
+                    1,
+                    1,
+                    129,
+                    cached_randn((128, 256)),
+                    cached_randn((128, 128)),
+                ),
+                "3d64_0": (
+                    2,
+                    32,
+                    96,
+                    cached_randn((128, 3, 256)),
+                    cached_randn((128, 3, 64)),
+                ),
+                "3d64_1": (
+                    2,
+                    32,
+                    96,
+                    cached_randn((2, 192, 256)),
+                    cached_randn((2, 192, 64)),
+                ),
+                "3d64_01": (
+                    2,
+                    32,
+                    96,
+                    cached_randn((128, 192, 256)),
+                    cached_randn((128, 192, 64)),
+                ),
+                "3d128_0": (
+                    2,
+                    1,
+                    129,
+                    cached_randn((128, 3, 256)),
+                    cached_randn((128, 3, 128)),
+                ),
+                "3d128_1": (
+                    2,
+                    1,
+                    129,
+                    cached_randn((2, 192, 256)),
+                    cached_randn((2, 192, 128)),
+                ),
+                "3d128_01": (
+                    2,
+                    1,
+                    129,
+                    cached_randn((128, 192, 256)),
+                    cached_randn((128, 192, 128)),
+                ),
+            },
+        },
+        (
+            "test_slice_stick_mutation_layout_update",
+            "test_slice_stick_mutation_layout_update_cpu",
+        ): {
+            "param_sets": {
+                "2d64": (1, 32, 96, cached_randn((128, 256)), cached_randn((128, 64))),
+                "2d128": (
+                    1,
+                    1,
+                    129,
+                    cached_randn((128, 256)),
+                    cached_randn((128, 128)),
+                ),
+                "3d64_2": (
+                    2,
+                    32,
+                    96,
+                    cached_randn((128, 192, 256)),
+                    cached_randn((128, 192, 64)),
+                ),
+                "3d128_2": (
+                    2,
+                    1,
+                    129,
+                    cached_randn((128, 192, 256)),
+                    cached_randn((128, 192, 128)),
+                ),
             },
         },
         ("test_slice_synthetic_dims", "test_slice_synthetic_dims_cpu"): {
@@ -5731,16 +5828,69 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
 
-    def test_slice_cpu(self, op, dim, start, end, x):
-        def fn(x):
+    @pytest.mark.filterwarnings(
+        "ignore:aten.arange.*:torch_spyre.ops.fallbacks.FallbackWarning"
+    )
+    def test_slice_cpu(self, op, dim, start, end, x, *args):
+        def fn(x, *args):
             if dim == 0:
-                return op(dim, x[start:end])
+                return op(dim, x[start:end], *args)
             elif dim == 1:
-                return op(dim, x[:, start:end])
+                return op(dim, x[:, start:end], *args)
             elif dim == 2:
-                return op(dim, x[:, :, start:end])
+                return op(dim, x[:, :, start:end], *args)
 
-        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
+        self.compare_with_cpu(fn, x, *args, clone_inputs=True, run_eager=False)
+
+    def test_slice_stick_mutation_layout_update_cpu(self, dim, start, end, x, y):
+        """Test that device_tensor_layout() updates to alt STL after slice-mutation."""
+
+        def fn(x, y):
+            if dim == 1:
+                z = x[:, start:end].copy_(y)
+            elif dim == 2:
+                z = x[:, :, start:end].copy_(y)
+            return y + z
+
+        x_spyre = x.clone().to("spyre")
+        y_spyre = y.clone().to("spyre")
+        pre = x_spyre.device_tensor_layout()
+
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True, dynamic=False)
+        compiled(x_spyre, y_spyre)
+
+        post = x_spyre.device_tensor_layout()
+        self.assertNotEqual(
+            (list(pre.device_size), list(pre.stride_map)),
+            (list(post.device_size), list(post.stride_map)),
+            msg=(
+                "device_tensor_layout was not updated after slice mutation; "
+                "set_spyre_tensor_layout did not run. "
+                f"pre={pre}, post={post}"
+            ),
+        )
+
+        expected = x.clone()
+        if dim == 1:
+            expected[:, start:end].copy_(y)
+        elif dim == 2:
+            expected[:, :, start:end].copy_(y)
+        torch.testing.assert_close(x_spyre.cpu(), expected, atol=0.1, rtol=0.1)
+
+    def test_slice_stick_mutation_no_alt_dim_raises(self):
+        """Test that offset-stick slice mutation raises Unsupported when no alt dim is divisible by stick_size."""
+
+        def fn(x, y):
+            x[:, 32:96].copy_(y)
+            return x.clone()
+
+        x = torch.randn(63, 128, dtype=torch.float16, device="spyre")
+        y = torch.randn(63, 64, dtype=torch.float16, device="spyre")
+
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True, dynamic=False)
+        with pytest.raises(Exception) as exc_info:
+            compiled(x, y)
+        assert "no offset-free alternative stick dim" in str(exc_info.value)
 
     def test_slice_synthetic_dims_cpu(self, x):
         def fn(x):

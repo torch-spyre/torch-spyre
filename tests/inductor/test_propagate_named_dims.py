@@ -110,7 +110,6 @@ def _run_and_capture(
         patch.object(_passes, "propagate_named_dims", capturing_propagate),
         patch.object(_passes, "assign_dim_hints", capturing_assign),
         patch("torch_spyre.execution.kernel_runner.prepare_kernel"),
-        patch("torch_spyre.execution.kernel_runner.launch_kernel"),
         patch("torch_spyre.execution.kernel_runner.launch_jobplan"),
         patch("torch_spyre.execution.async_compile.subprocess.run"),
     ):
@@ -545,7 +544,6 @@ def test_permute_matmul():
     )
 
 
-@pytest.mark.skip(reason="Issue #2961")
 def test_view_reshape_a():
     """View/reshape with shared name for equal-size dims (A==D, both called AD).
 
@@ -585,7 +583,6 @@ def test_view_reshape_a():
     )
 
 
-@pytest.mark.skip(reason="Issue #2961")
 def test_view_reshape_b():
     """View/reshape with all unique dim sizes.
 
@@ -846,7 +843,6 @@ def test_permuted_intermediate_then_pointwise():
     )
 
 
-@pytest.mark.skip(reason="Issue #2961")
 def test_view_reshape_a_distinct_names():
     """Like test_view_reshape_a but with distinct names A/D for the equal-size dims.
 
