@@ -524,7 +524,7 @@ Environment Variables
        ``1``)
    * - ``BUNDLE_SYMBOLIC_ARGS``
      - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
-       integers (default ``0``)
+       integers (default ``1``)
    * - ``UNROLL_LOOPS``
      - Fully unroll ``LoopSpec`` nodes into flat ``OpSpec``\s before bundle
        generation (default ``1``; set ``0`` to keep the

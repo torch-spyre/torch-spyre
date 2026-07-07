@@ -20,7 +20,7 @@ Covers six areas, each in its own class group:
   2. coarse_tile IR pass: range rewriting, attribute stamping, nested groups
      (TestDivideRanges, TestCoarseTile, TestCoarseTileNested)
   3. CountedLoopSchedulerNode, build_loop_scheduler_nodes,
-     _tiled_syms_for_sched_node_at_depth, and spyre_fuse_nodes budget check
+     and _tiled_syms_for_sched_node_at_depth
      (TestHelpers, TestBuildLoopSchedulerNodes, TestTiledSymsForSchedNode)
   4. generate_sdsc and compile_op_spec symbol/affine-stride paths
      (TestTiledByteStride, TestGenerateSdscTiledSymbols,

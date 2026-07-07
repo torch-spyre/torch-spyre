@@ -36,7 +36,9 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     if len(nodes) == 0:
         return nodes
     if not config.bundle_symbolic_args:
-        # If symbolic_args are disabled, we also disable fusion
+        # Without symbolic args, tensor addresses are baked-in constants from
+        # SEGMENT_OFFSETS, which has a fixed number of slots.  Fusing ops could
+        # exceed that slot count, so disable fusion when symbolic args are off.
         return nodes
 
     fused_nodes: list[BaseSchedulerNode] = []
