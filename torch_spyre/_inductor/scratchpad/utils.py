@@ -17,7 +17,12 @@ import math
 from typing import Any, Optional
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import Operation, IRNode, Pointwise
+from torch._inductor.ir import (
+    MutationLayoutSHOULDREMOVE,
+    Operation,
+    IRNode,
+    Pointwise,
+)
 from torch._inductor.virtualized import V
 from torch._inductor.ops_handler import WrapperHandler
 
@@ -101,6 +106,22 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
     return liveness
 
 
+def effective_device_layout(buf: Any) -> Any:
+    """The device layout to size/compare a buffer by.
+
+    For an in-place mutation output (MutationLayoutSHOULDREMOVE) the buffer's own
+    `layout` is a wrapper around the loop-carried target storage; the meaningful
+    geometry is `real_layout()` (the per-iteration write). For everything else it
+    is the layout as-is. Only consulted for LX-alias handling, which is gated by
+    config.lx_alias_inplace — with the flag off, mutation outputs are rejected
+    upstream so this branch never changes a decision.
+    """
+    layout = buf.get_layout()
+    if config.lx_alias_inplace and isinstance(layout, MutationLayoutSHOULDREMOVE):
+        return layout.real_layout().device_layout
+    return layout.device_layout
+
+
 def mem_usage_by_buf(
     graph: GraphLowering | GraphView,
     cache: Optional[dict] = None,
@@ -124,7 +145,7 @@ def mem_usage_by_buf(
         buf_name = op.name
         buf = graph.get_buffer(buf_name)
         num_cores = num_cores_per_op.get(buf_name, -1)
-        dev_layout = buf.layout.device_layout
+        dev_layout = effective_device_layout(buf)
         dev_size = (
             math.prod(dev_layout.device_size[:-1]) * 128
         )  # num_sticks * bytes_per_stick

@@ -53,6 +53,7 @@ from torch_spyre._inductor.scratchpad.passes import (
 from torch_spyre._inductor.scratchpad.utils import (
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
     clone_at_graph_boundaries,
+    effective_device_layout,
     mem_usage_by_buf,
     calculate_liveness,
     get_ncores_for_buffers,
@@ -149,17 +150,37 @@ class ScratchpadAllocator(ABC):
         return name if name is not None else "None"
 
     def _op_output_good_for_lx_reuse(self, op: Any) -> bool:
-        return (
-            isinstance(op, ComputedBuffer)
-            and not isinstance(op.layout, MutationLayoutSHOULDREMOVE)
-            and (
-                config.allow_all_ops_in_lx_planning
-                or (self._get_op_name(op) in OP_OUTPUT_GOOD_FOR_LX_REUSE)
-                # Clones are only pinned when the boundary-clone path is on; they
-                # are never in the whitelist, so without this they'd be ineligible
-                # and the inserted clones would not land in LX.
-                or (config.lx_boundary_clones and self._get_op_name(op) == "clone")
+        if not isinstance(op, ComputedBuffer):
+            return False
+        if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+            # In-place mutation ops own no storage; normally ineligible. When
+            # lx_alias_inplace is on, allow one whose alias target resolves with
+            # a matching layout — it will be routed to the target's LX slot
+            # (experiment flag; see _alias_* helpers).
+            return config.lx_alias_inplace and self._alias_pin_is_valid(
+                op, self._alias_target_buffer(op)
             )
+        return (
+            config.allow_all_ops_in_lx_planning
+            or (self._get_op_name(op) in OP_OUTPUT_GOOD_FOR_LX_REUSE)
+            # Clones are only pinned when the boundary-clone path is on; they
+            # are never in the whitelist, so without this they'd be ineligible
+            # and the inserted clones would not land in LX.
+            or (config.lx_boundary_clones and self._get_op_name(op) == "clone")
+        )
+
+    def _is_alias_inplace_op(self, op: Any) -> bool:
+        """True for an LX-alias in-place mutation op (config.lx_alias_inplace).
+
+        Such an op is pinned by *reusing its alias target's* LX slot rather than
+        being allocated one of its own, so it is excluded from the solver's
+        buffer list and stamped directly (see _stamp_alias_inplace_ops).
+        """
+        return (
+            config.lx_alias_inplace
+            and isinstance(op, ComputedBuffer)
+            and isinstance(op.layout, MutationLayoutSHOULDREMOVE)
+            and self._alias_pin_is_valid(op, self._alias_target_buffer(op))
         )
 
     # ------------------------------------------------------------------
@@ -291,6 +312,10 @@ class ScratchpadAllocator(ABC):
         cloning_allowed = clone_at_graph_boundaries()
         for output_name, info in mem_usage.items():
             uses = lifetimes[output_name]
+            if self._is_alias_inplace_op(graph.get_buffer(output_name)):
+                # Reuses its alias target's slot; not solver-allocated. Stamped
+                # directly after allocation (see _stamp_alias_inplace_ops).
+                continue
             if len(uses) <= 1:
                 self.reject_reasons[output_name] = "single use"
                 continue  # output is not read (only the write, or never touched)
@@ -368,11 +393,11 @@ class ScratchpadAllocator(ABC):
             if not in_place_allowed[buf_name]:
                 continue
             out_start = lifetimes[buf_name][0]
-            out_ten_layout = graph.get_buffer(buf_name).layout.device_layout
+            out_ten_layout = effective_device_layout(graph.get_buffer(buf_name))
             out_size = info["size_per_core"]
             for input_buf in info["op_inputs"]:
                 in_end = lifetimes[input_buf][-1]  # inclusive last use
-                in_ten_layout = graph.get_buffer(input_buf).layout.device_layout
+                in_ten_layout = effective_device_layout(graph.get_buffer(input_buf))
                 in_size = mem_usage[input_buf]["size_per_core"]
                 inp_i_size_match = out_size == in_size
                 inp_i_lay_match = out_ten_layout == in_ten_layout
@@ -484,6 +509,32 @@ class ScratchpadAllocator(ABC):
         layout = buf.get_layout()
         layout.allocation["lx"] = address
 
+    def _stamp_alias_inplace_ops(self, graph: GraphLowering) -> None:
+        """Route each LX-alias in-place op to its target's assigned LX slot.
+
+        Runs after _push_allocation, so alias targets that the solver pinned have
+        their address stamped. An eligible mutation op (excluded from the solver's
+        buffer list in _build_bound_buffers) reuses that same address rather than
+        owning a slot. If the target went unpinned, the op is simply left unpinned.
+        Gated by config.lx_alias_inplace via _is_alias_inplace_op.
+        """
+        for op in graph.operations:
+            if not self._is_alias_inplace_op(op):
+                continue
+            target = self._alias_target_buffer(op)
+            address = self._alias_target_lx_address(target)
+            if address is not None:
+                self._set_one_allocation(op, address)
+            else:
+                # Target was not pinned, so there is no slot to alias onto. Record
+                # a reject reason: the op was excluded from the solver, so without
+                # this it would fall through _log_lx_pinning's default and falsely
+                # report "→ lx" despite carrying no LX address.
+                target_name = target.get_name() if target is not None else "None"
+                self.reject_reasons[op.name] = (
+                    f"alias target ({target_name}) not pinned"
+                )
+
 
 class DefaultAllocator(ScratchpadAllocator):
     def __init__(
@@ -543,6 +594,7 @@ class DefaultAllocator(ScratchpadAllocator):
                     f" size={b.size // 1024} KB)"
                 )
         self._push_allocation(graph, allocation)
+        self._stamp_alias_inplace_ops(graph)
         self._log_lx_pinning(graph)
         for p in self.post_optimization_passes:
             p.apply_pass(graph)
@@ -1013,6 +1065,7 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
                     f" size={b.size // 1024} KB)"
                 )
         self._push_allocation(graph, allocation)
+        self._stamp_alias_inplace_ops(graph)
         self._log_lx_pinning(graph)
         for p in self.post_optimization_passes:
             p.apply_pass(graph)

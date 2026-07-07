@@ -685,6 +685,34 @@ def _multi_arg_pointwise_layouts(
                 continue
             _try_stick_dim(alt_stick_dim)
 
+    # LX in-place: offer a same-frame input's device order as a candidate, placed
+    # FIRST so the beam's stable cost-tie-break commits it over the logically-
+    # rebuilt (possibly transposed) order. The transpose is free per the restickify
+    # cost model but defeats the positional in-place check (allocator.py
+    # _determine_in_place). Broadcast/sliced inputs fail the per-arg guard.
+    for arg in args:
+        if (
+            arg.layout.size != output.size
+            or arg.dep.index != output_dep.index
+            or not same_device_size(arg.layout.dtype, output.dtype)
+        ):
+            continue
+        for src_stl in arg.layouts:
+            candidate = SpyreTensorLayout(
+                src_stl.device_size,
+                src_stl.stride_map,
+                get_device_dtype(output.dtype),
+            )
+            # Stick must be offset-free; per-input feasibility is left to
+            # AllSameNode (INF-costs incompatible). Skip if offset or duplicate.
+            out_coord = device_coordinates(candidate, output_dep, ind_sizes)
+            key = (tuple(candidate.device_size), tuple(candidate.stride_map))
+            if not is_stick_expr_offset_free(out_coord[-1], stick_size) or key in {
+                (tuple(r.device_size), tuple(r.stride_map)) for r in results
+            }:
+                continue
+            results.insert(0, candidate)
+
     if not results:
         raise Unsupported(
             f"Multi-arg pointwise ({op.get_name()}): no supported output layout found "
