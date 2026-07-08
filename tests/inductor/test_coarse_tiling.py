@@ -1013,7 +1013,7 @@ class TestCoarseTile(unittest.TestCase):
         op_computed = _make_hinted_op(data, "op0", hints=((0, 0),))
         coarse_tile(
             _graph([op_extern, op_computed]),
-            [([op_extern, op_computed], [(0, Integer(2), False)])],
+            [([op_extern, op_computed], [(0, Integer(2))])],
         )
         self.assertEqual(op_computed.loop_info.loop_group_id, (0,))
         self.assertEqual(data.ranges[0], Integer(8))
@@ -1023,7 +1023,7 @@ class TestCoarseTile(unittest.TestCase):
         n = Symbol("N", positive=True)
         data = _make_pointwise([n])
         op = _make_hinted_op(data, "op0", hints=((0, 0),))
-        coarse_tile(_graph([op]), [([op], [(0, k, False)])])
+        coarse_tile(_graph([op]), [([op], [(0, k)])])
         self.assertEqual(op.loop_info.loop_count, [k])
         self.assertEqual(simplify(data.ranges[0] - n / k), 0)
 
@@ -1035,9 +1035,7 @@ class TestCoarseTile(unittest.TestCase):
         op1 = _make_hinted_op(d1, "op1", hints=((0, 0),))
         op2 = _make_hinted_op(d2, "op2", hints=((0, 0),))
         with self.assertRaises(RuntimeError):
-            coarse_tile(
-                _graph([op0, op1, op2]), [([op0, op2], [(0, Integer(4), False)])]
-            )
+            coarse_tile(_graph([op0, op1, op2]), [([op0, op2], [(0, Integer(4))])])
 
     def test_op_not_in_operations_raises(self):
         data = _make_pointwise([Integer(32)])
@@ -1046,11 +1044,11 @@ class TestCoarseTile(unittest.TestCase):
             _make_pointwise([Integer(8)]), "unknown", hints=((0, 0),)
         )
         with self.assertRaises(RuntimeError):
-            coarse_tile(_graph([op_known]), [([op_unknown], [(0, Integer(2), False)])])
+            coarse_tile(_graph([op_known]), [([op_unknown], [(0, Integer(2))])])
 
 
 class TestCoarseTileNested(unittest.TestCase):
-    """Verify that the nested group format [(hint_id, K1, is_reduction), ...] works."""
+    """Verify that the nested group format [(hint_id, K1), ...] works."""
 
     def setUp(self):
         self._patch = patch(
@@ -1065,9 +1063,7 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_spec_stamps_list_attributes(self):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile(
-            _graph([op]), [([op], [(1, Integer(4), False), (2, Integer(2), False)])]
-        )
+        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
         self.assertEqual(op.loop_info.loop_group_id, (0, 0))
         self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [1]])
@@ -1075,18 +1071,14 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_spec_divides_ranges_both_levels(self):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile(
-            _graph([op]), [([op], [(1, Integer(4), False), (2, Integer(2), False)])]
-        )
+        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
         self.assertEqual(data.ranges[0], Integer(64))
         self.assertEqual(data.ranges[1], Integer(64))
 
     def test_nested_spec_outer_only_divides_outer_dim(self):
         data = _make_pointwise([Integer(32), Integer(64), Integer(16)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile(
-            _graph([op]), [([op], [(1, Integer(4), False), (2, Integer(8), False)])]
-        )
+        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(8))])])
         self.assertEqual(data.ranges[0], Integer(8))
         self.assertEqual(data.ranges[1], Integer(8))
         self.assertEqual(data.ranges[2], Integer(16))
@@ -1100,8 +1092,8 @@ class TestCoarseTileNested(unittest.TestCase):
         coarse_tile(
             _graph([op0, op1]),
             [
-                ([op0], [(1, Integer(4), False)]),
-                ([op1], [(2, Integer(4), False), (3, Integer(2), False)]),
+                ([op0], [(1, Integer(4))]),
+                ([op1], [(2, Integer(4)), (3, Integer(2))]),
             ],
         )
         self.assertEqual(op0.loop_info.loop_group_id, (0,))
@@ -1118,9 +1110,7 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_same_dim_different_counts(self):
         data = _make_pointwise([Integer(256)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 0)))
-        coarse_tile(
-            _graph([op]), [([op], [(1, Integer(4), False), (2, Integer(2), False)])]
-        )
+        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
         self.assertEqual(data.ranges[0], Integer(32))
         self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [0]])
@@ -4081,10 +4071,9 @@ class TestHintsLevels(unittest.TestCase):
         op = self._make_op([(3, 4, c0)])
         levels = _hints_levels([op])
         self.assertEqual(len(levels), 1)
-        hint_id, count, is_reduction = levels[0]
+        hint_id, count = levels[0]
         self.assertEqual(hint_id, 3)
         self.assertEqual(count, sympy.Integer(4))
-        self.assertFalse(is_reduction)
 
     def test_mixed_hints_drops_only_size1(self):
         """When one hint is size-1 and another is size>1, only the size>1 survives."""
@@ -4095,7 +4084,7 @@ class TestHintsLevels(unittest.TestCase):
         op = self._make_op([(0, 1, c0), (1, 8, c1)])
         levels = _hints_levels([op])
         self.assertEqual(len(levels), 1)
-        hint_id, count, _ = levels[0]
+        hint_id, count = levels[0]
         self.assertEqual(hint_id, 1)
         self.assertEqual(count, sympy.Integer(8))
 
@@ -4109,7 +4098,7 @@ class TestHintsLevels(unittest.TestCase):
         op1 = self._make_op([(0, 4, c0)])
         levels = _hints_levels([op0, op1])
         self.assertEqual(len(levels), 1)
-        _, count, _ = levels[0]
+        _, count = levels[0]
         self.assertEqual(count, sympy.Integer(4))
 
 

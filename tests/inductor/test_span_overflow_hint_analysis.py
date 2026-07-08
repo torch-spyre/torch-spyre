@@ -142,7 +142,7 @@ def _manual_h_hint_group(op, hint_id=1, split_count=_E2E_SPLIT_COUNT):
         hint_id=hint_id,
     )
     op.dim_hints = [hint]
-    return [([op], [(hint_id, sympy.Integer(split_count), False)])]
+    return [([op], [(hint_id, sympy.Integer(split_count))])]
 
 
 def _scheduler_node_for_op(op, name):
@@ -196,11 +196,10 @@ class TestSpanOverflowGroups(InductorTestCase):
         ops_list, levels = groups[0]
         self.assertEqual(ops_list, [op])
         self.assertEqual(len(levels), 1)
-        hint_id, count, is_reduction_level = levels[0]
+        hint_id, count = levels[0]
         self.assertEqual(hint_id, _SPAN_OVERFLOW_HINT_ID)
         self.assertIsInstance(count, sympy.Integer)
         self.assertEqual(count, sympy.Integer(_E2E_SPLIT_COUNT))
-        self.assertFalse(is_reduction_level)
         self.assertEqual(hint_id, op.dim_hints[0].hint_id)
 
     def test_two_overflow_ops_produce_two_groups(self):
@@ -243,7 +242,7 @@ class TestSpanOverflowGroups(InductorTestCase):
             groups = _run_span_overflow_groups(op)
 
         _, levels = groups[0]
-        _, level_count, _ = levels[0]
+        _, level_count = levels[0]
         self.assertEqual(op.dim_hints[0].split_count, int(level_count))
 
     def test_non_fixed_tiled_layout_skipped(self):
@@ -435,7 +434,6 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         group_ops, levels = groups[0]
         self.assertEqual(group_ops, [op])
         self.assertEqual(levels[0][1], sympy.Integer(_E2E_SPLIT_COUNT))
-        self.assertEqual(levels[0][2], False)
         self.assertEqual(len(op.dim_hints), 1)
         self.assertEqual(op.dim_hints[0].split_count, _E2E_SPLIT_COUNT)
         self.assertEqual(op.dim_hints[0].loop_var, sympy.Symbol("h"))
@@ -507,8 +505,11 @@ class TestSpanOverflowLargeShapeContract(InductorTestCase):
                     self.assertEqual(len(manual_groups), 1)
                     self.assertEqual(auto_groups[0][1][0][1], sympy.Integer(5))
                     self.assertEqual(manual_groups[0][1][0][1], sympy.Integer(5))
-                    self.assertFalse(auto_groups[0][1][0][2])
-                    self.assertFalse(manual_groups[0][1][0][2])
+                    self.assertEqual(auto_groups[0][1][0][1], sympy.Integer(5))
+                    self.assertEqual(manual_groups[0][1][0][1], sympy.Integer(5))
+                    # Span-overflow tiling is always an output dim (never reduction).
+                    self.assertFalse(auto_op.dim_hints[0].is_reduction)
+                    self.assertFalse(manual_op.dim_hints[0].is_reduction)
                     self.assertEqual(auto_op.dim_hints[0].loop_var, sympy.Symbol("h"))
                     self.assertEqual(manual_op.dim_hints[0].loop_var, sympy.Symbol("h"))
 
