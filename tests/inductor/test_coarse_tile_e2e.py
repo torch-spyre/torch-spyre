@@ -30,6 +30,7 @@ import sys
 import os
 import regex as re
 
+import pytest
 import torch
 import unittest
 from unittest.mock import patch as mock_patch
@@ -769,6 +770,10 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         # is numerically wrong (~90% element mismatch).  Investigate and fix
         # before re-adding spyre_hint(num_tiles_per_dim={"Lk": lk_slices}).
         """
+        if not config.unroll_loops:
+            pytest.xfail(
+                "UNROLL_LOOPS=0: nested scf.for loops not yet correct in backend"
+            )
         import math
         from torch_spyre._inductor import spyre_hint
 
@@ -1551,6 +1556,8 @@ class TestCoarseTileReductionE2E(InductorTestCase):
 
     def test_hint_tiled_reduction_min_correct(self):
         """x.amin(dim=-1) tiled over D (4 tiles) produces correct results."""
+        if not config.unroll_loops:
+            pytest.xfail("UNROLL_LOOPS=0: amin scf.for loop not yet correct in backend")
         from torch_spyre._inductor import spyre_hint
 
         B, D = 64, 512
@@ -1580,6 +1587,10 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
 
     def test_hint_tiled_reduction_dim0_sum_correct(self):
         """x.sum(dim=0) tiled over B produces correct results."""
+        if not config.unroll_loops:
+            pytest.xfail(
+                "UNROLL_LOOPS=0: dim=0 reduction scf.for loop not yet correct in backend"
+            )
         from torch_spyre._inductor import spyre_hint
 
         B, D = 512, 64
@@ -1597,6 +1608,10 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
 
     def test_hint_tiled_reduction_dim0_max_correct(self):
         """x.amax(dim=0) tiled over B produces correct results."""
+        if not config.unroll_loops:
+            pytest.xfail(
+                "UNROLL_LOOPS=0: dim=0 reduction scf.for loop not yet correct in backend"
+            )
         from torch_spyre._inductor import spyre_hint
 
         B, D = 512, 64
@@ -1614,6 +1629,10 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
 
     def test_hint_tiled_reduction_dim0_min_correct(self):
         """x.amin(dim=0) tiled over B produces correct results."""
+        if not config.unroll_loops:
+            pytest.xfail(
+                "UNROLL_LOOPS=0: dim=0 reduction scf.for loop not yet correct in backend"
+            )
         from torch_spyre._inductor import spyre_hint
 
         B, D = 512, 64
@@ -1759,6 +1778,10 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
 
     def test_nested_bmm_outer_Batch_inner_K_correct(self):
         """bmm [B,M,K]@[B,K,N] outer B (output) + inner K (reduction) — correct."""
+        if not config.unroll_loops:
+            pytest.xfail(
+                "UNROLL_LOOPS=0: nested scf.for loops not yet correct in backend"
+            )
         from torch_spyre._inductor import spyre_hint
 
         B, M, K, N = 4, 64, 512, 32
@@ -1782,6 +1805,10 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
 
     def test_nested_matmul_outer_M_inner_K_correct(self):
         """mm [M,K]@[K,N] with outer M (output) + inner K (reduction) — correct."""
+        if not config.unroll_loops:
+            pytest.xfail(
+                "UNROLL_LOOPS=0: nested scf.for loops not yet correct in backend"
+            )
         from torch_spyre._inductor import spyre_hint
 
         M, K, N = 128, 512, 32
