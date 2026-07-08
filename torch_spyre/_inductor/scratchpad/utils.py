@@ -287,6 +287,27 @@ def get_ncores_for_buffers(
                     if flag:
                         mismatch = True
                         break
+                else:
+                    # Broadcast-read guard. `view` is how this consumer slices the
+                    # buffer; its core count is the product of the split factors.
+                    # When a consumer splits an iteration axis the buffer does not
+                    # have (e.g. a GEMM's free/N dim over a shared activation, or
+                    # its M dim over a shared weight), that split contracts out of
+                    # the view, so the view covers fewer cores than the op runs.
+                    # An LX (per-core scratchpad) buffer would then live on
+                    # view_cores cores but be read by op_cores; the cores without
+                    # a local copy read stale scratchpad -> wrong results. There is
+                    # no single-base LX broadcast, so treat it as a core-division
+                    # mismatch and keep the buffer in HBM (correct, just unpinned).
+                    # This is not writer-relative: it catches broadcast reads even
+                    # when the buffer has no in-graph writer (a graph input cloned
+                    # into LX) or when a producer's view happens to match the
+                    # broadcast footprint -- cases the `view != ref_view` check
+                    # below cannot see.
+                    view_cores = math.prod(f for _, f in view.work_slice_dims)
+                    if view_cores != _op_num_cores(op):
+                        mismatch = True
+                        break
                 if view != ref_view:
                     mismatch = True
                     break

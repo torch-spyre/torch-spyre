@@ -216,6 +216,30 @@ class BaseTestScratchpadUsage(unittest.TestCase):
         )
         return mlp, args
 
+    def _swiglu(
+        self,
+    ) -> tuple[Callable[..., torch.Tensor], tuple[torch.Tensor, ...]]:
+        """A single functional SwiGLU layer."""
+        seq_len, in_dim, hidden_dim = 128, 256, 1024
+
+        fc_gate = torch.nn.Linear(in_dim, hidden_dim).half()
+        fc_up = torch.nn.Linear(in_dim, hidden_dim).half()
+
+        def swiglu(x, w_gate, b_gate, w_up, b_up):
+            gate = torch.nn.functional.linear(x, w_gate, b_gate)
+            up = torch.nn.functional.linear(x, w_up, b_up)
+            return torch.nn.functional.silu(gate) * up
+
+        x = torch.randn(seq_len, in_dim, dtype=torch.float16).to("spyre")
+        args = (
+            x,
+            fc_gate.weight.to("spyre"),
+            fc_gate.bias.to("spyre"),
+            fc_up.weight.to("spyre"),
+            fc_up.bias.to("spyre"),
+        )
+        return swiglu, args
+
 
 class _ParameterizedScratchpadMeta(type):
     """Data-driven metaclass that expands a model list (and, optionally, a
@@ -816,6 +840,47 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
                 "buf10": ("HBM", 128, ((), ())),
                 # buf11 is eliminated in dedup_and_promote_constants
                 "buf12": ("HBM", 131072, (((64, 4), (16384, 4)), ())),
+            },
+        )
+
+    def test_swiglu_prescribed_allocation(self):
+        """A single SwiGLU layer: two parallel ``nn.Linear`` projections (each a
+        ``mm`` GEMM plus a bias add) feeding ``silu(gate) * up``. The lowered
+        graph is eight buffers:
+
+          - buf6, buf7 -- restickified gate/up weights
+          - buf0 -- gate GEMM (``mm``, a Reduction), the input to SiLU
+          - buf1 -- gate + bias
+          - buf2 -- ``silu(buf1)``
+          - buf3 -- up GEMM (``mm``, a Reduction)
+          - buf4 -- up + bias
+          - buf5 -- ``buf2 * buf4``, the layer output
+
+        With every op LX-eligible, the plan keeps the whole hidden-width chain
+        resident in LX (buf0-buf4), each taking an 8x4 split across two axes
+        (``((1, 8), (1024, 4))``); the output (buf5) spills to HBM. The two
+        weight buffers (buf6, buf7) spill to HBM with a 2x16 split
+        (``((1, 2), (256, 16))``).
+
+        The shared input ``x`` is *not* LX-pinned: both GEMMs split it 8-way
+        along their free (N) dimension, which ``x`` does not have, so each
+        consumer's per-core view of ``x`` (a 4-way split of the shared M axis)
+        covers fewer cores than the GEMM runs. That is a broadcast read of a
+        per-core scratchpad buffer, which the single-base LX path cannot serve,
+        so the broadcast-read guard in ``get_ncores_for_buffers`` keeps ``x`` in
+        HBM.
+        """
+        self._assert_prescribed_allocation(
+            *self._swiglu(),
+            {
+                "buf6": ("HBM", 524288, (((1, 2), (256, 16)), ())),
+                "buf0": ("LX", 262144, (((1, 8), (1024, 4)), ())),
+                "buf1": ("LX", 262144, (((1, 8), (1024, 4)), ())),
+                "buf2": ("LX", 262144, (((1, 8), (1024, 4)), ())),
+                "buf7": ("HBM", 524288, (((1, 2), (256, 16)), ())),
+                "buf3": ("LX", 262144, (((1, 8), (1024, 4)), ())),
+                "buf4": ("LX", 262144, (((1, 8), (1024, 4)), ())),
+                "buf5": ("HBM", 262144, (((1, 8), (1024, 4)), ())),
             },
         )
 
