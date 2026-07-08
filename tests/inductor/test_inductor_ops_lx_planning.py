@@ -147,9 +147,7 @@ INHERITED_TEST_ATTRIBUTES = [
     "_get_single_dim_reduction_invalid_dim_cases",
 ]
 
-POINTWISE_TEST_FAILURES = [
-
-]
+POINTWISE_TEST_FAILURES = []
 
 
 class _LxPlanningTwoOpTestBase(unittest.TestCase):
@@ -221,9 +219,7 @@ _copy_canonical_tests(
 )
 
 
-REDUCTION_TEST_FAILURES = [
-    
-]
+REDUCTION_TEST_FAILURES = []
 
 
 class LxPlanningTwoOpReductionTest(_LxPlanningTwoOpTestBase):
