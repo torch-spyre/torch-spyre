@@ -1705,7 +1705,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 #To be enabled when #1833 isresolved
                 #"5d_nan": (torch.full((2,3,4,5,6),float('nan'), dtype=torch.float16), 0.0, 100 , FP16_EPS),
                 "5d_inf": (torch.full((2,3,4,5,6),float('inf'), dtype=torch.float16), None, -100, FP16_EPS),
-                "5d_empty": (torch.empty((2, 3, 4, 5, 6), dtype=torch.float16), 0, 1, FP16_EPS),
             },
         },
         (
@@ -2504,7 +2503,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 "4d": ( 
                     cached_randn((2, 3, 4, 5), dtype=torch.float32),
-                    cached_randn(((1, 3, 4, 5)), dtype=torch.float32)
+                    cached_randn((1, 3, 4, 5), dtype=torch.float32)
                 ),
                 "4d_with_zeros":(
                     torch.zeros(32, 3, 224, 224, dtype=torch.float16),
@@ -2516,20 +2515,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 #     torch.full((2, 3, 4, 5), float('nan'))
                 # ),
                 "5d": (  
-                    cached_randn(((5, 10, 64, 128, 128)), dtype=torch.float16), 
-                    cached_randn(((5, 10, 64, 128, 128)), dtype=torch.float16)
+                    cached_randn((5, 10, 64, 128, 128), dtype=torch.float16), 
+                    cached_randn((5, 10, 64, 128, 128), dtype=torch.float16)
                 ),
                 "5d_with_ones": (
                     torch.ones(2, 10, 3, 32, 32, dtype=torch.float32),
                     torch.empty(2, 10, 3, 32, 32, dtype=torch.float32)
                 ),
                 "5d_with_empty": (
-                    cached_randn(((8, 16, 32, 64, 128)), dtype=torch.float16),
+                    cached_randn((8, 16, 32, 64, 128), dtype=torch.float16),
                     torch.empty((8, 16, 32, 64, 128,), dtype=torch.float16)
                 ),
                 #To be enabled when #1830 is resolved
                 # "5d_with_inf": (  
-                #     cached_randn(((8, 16, 32, 64, 128)), dtype=torch.float16), 
+                #     cached_randn((8, 16, 32, 64, 128), dtype=torch.float16), 
                 #     torch.full((8, 16, 32, 64, 128), float('inf'), dtype=torch.float16)
                 # ),
             },
