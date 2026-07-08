@@ -718,6 +718,25 @@ def lower_avg_pool2d(
     if pH > 0 or pW > 0:
         raise Unsupported("avg_pool2d with non-zero padding not yet supported")
 
+    if kH == 1 or kW == 1:
+        # avgpoolfwd is a windowed reduction; a 1-wide kernel has no pooling
+        # window along that axis (it is an identity or a strided subsample),
+        # which the pool datapath cannot express — the DDL rejects a windowless
+        # pool ("Unknown primary dimension kind ... for a window dimension").
+        # Spyre also has no eager avg_pool2d kernel to fall back to.  So delegate
+        # to the in-tree Inductor lowering, which decomposes avg_pool2d into
+        # pointwise/reduction ops the Spyre backend does support and keeps k=1
+        # on-device.
+        return lowering.avg_pool2d(
+            x,
+            [kH, kW],
+            [sH, sW],
+            [pH, pW],
+            ceil_mode,
+            count_include_pad,
+            divisor_override,
+        )
+
     N, C, H_in, W_in = x.get_size()
 
     H_out = (H_in + 2 * pH - kH) // sH + 1
@@ -732,7 +751,19 @@ def lower_avg_pool2d(
             "pad_h": pH,
             "pad_w": pW,
             "scaling_factor": 1.0 / (kH * kW),
-        }
+        },
+        # Explicit SDSC dimension labels for the avgpool iteration space, whose
+        # order is [N, H_out, W_out, C, kH, kW] (the channel dim C is rearranged
+        # to sit after the spatial output dims).  Passed to superdsc.py so label
+        # assignment is never inferred from sizes (which is fragile for
+        # kernel_size=1, non-square outputs, or N==H_out).
+        #
+        # dim_label_sizes gives each label's canonical size in the SAME order.
+        # The pipeline drops size-1 dims from the iteration space before
+        # parse_op_spec runs (e.g. batch N=1), so superdsc filters the labels by
+        # these sizes to stay aligned with the surviving dims — no role guessing.
+        "dim_labels": ["mb", "i", "j", "out", "ki", "kj"],
+        "dim_label_sizes": [N, H_out, W_out, C, kH, kW],
     }
 
     def inner_fn(index, reduction_index):

@@ -110,7 +110,17 @@ class SDSCSpec:
         default_factory=dict
     )
     indirect_access_indices: list[int] = dataclasses.field(default_factory=list)
-    pool_params: dict = dataclasses.field(default_factory=dict)
+    # Generic pool/window fields.  Neutral defaults mean generate_sdsc treats a
+    # non-pool op exactly as before; parse_op_spec fills these for pool ops via
+    # _avgpool_sdsc_fields, so compute_ops.py stays free of op-specific logic.
+    num_corelets: int = 1
+    padding_sizes: dict = dataclasses.field(default_factory=dict)
+    pds_reuse: bool = False
+    stick_replication: bool = False
+    window_dims: frozenset = dataclasses.field(default_factory=frozenset)
+    input_coord_padding: dict = dataclasses.field(default_factory=dict)
+    input_coord_sizes: dict = dataclasses.field(default_factory=dict)
+    emit_memorg_padding: bool = False
 
     def __str__(self) -> str:
         iter_space = ", ".join(f"{k}={v}" for k, v in self.iteration_space.items())
@@ -329,60 +339,104 @@ def _is_pool(op: str) -> bool:
     return op == AVGPOOL2D_OP
 
 
-def _pool_dim_labels(iteration_space: dict, constants: dict) -> list[str]:
-    """Infer SDSC dimension labels (mb, i, j, out, ki, kj) from tensor sizes.
+# The pool datapath runs across 2 corelets, and dxp_standalone's scheduler
+# still requires the SDSC to declare this: emitting 1 corelet makes it abort
+# with "Expect valid lower and upper bound parameters".  Corelet subdivision is
+# otherwise dxp_standalone's concern, so this value is only asserted here, not
+# derived by the inductor codegen.
+_POOL_NUM_CORELETS = 2
 
-    Limitation: dimension labels are inferred from tensor sizes, not carried
-    from the lowering. The output spatial dims (H_out, W_out) are identified as
-    the equal-sized pair among the non-kernel dims, so this assumes a SQUARE
-    pooling output (H_out == W_out). It further assumes N, C, H_out, and the
-    kernel extents (kH, kW) are mutually distinguishable by size. Configurations
-    that break these assumptions are unsupported and may mislabel dimensions or
-    fail to compile:
-      - non-square output (H_out != W_out),
-      - size collisions (e.g. N == H_out, C == H_out, or kH/kW == 1).
-    In practice pooling outputs are square, so this is not currently a blocker.
+
+def _align_pool_dim_labels(op_info: dict, ndim: int) -> list[str]:
+    """Return the pool dim labels aligned to the (possibly squeezed) iteration space.
+
+    The lowering supplies ``dim_labels`` in the canonical iteration-space order
+    together with ``dim_label_sizes`` (each label's canonical size).  The
+    compilation pipeline drops statically size-1 dims (e.g. batch N=1) before
+    parse_op_spec runs, so a label whose canonical size is 1 has no surviving
+    dim and is filtered out here.  This keeps the labels aligned to the real
+    iteration space without inferring dim roles from sizes.
     """
-    kH = int(constants.get("kernel_h", 1))
-    kW = int(constants.get("kernel_w", 1))
-    sizes = [int(size) for size, _ in iteration_space.values()]
-    n = len(sizes)
-    labels: list[str | None] = [None] * n
-    cursor = n - 1
-    if kW > 1 and cursor >= 0 and sizes[cursor] == kW:
-        labels[cursor] = "kj"
-        cursor -= 1
-    if kH > 1 and cursor >= 0 and sizes[cursor] == kH:
-        labels[cursor] = "ki"
-        cursor -= 1
-    remaining = [i for i in range(n) if labels[i] is None]
-    rem_sizes = [sizes[i] for i in remaining]
-    # Search right-to-left so the rightmost equal-sized pair wins.
-    # This ensures (H_out, W_out) is chosen over (N, H_out) when N==H_out
-    # (e.g. k4s4 on 2x3x8x8 gives H_out=2=N=2).
-    spatial_pair: tuple | None = None
-    for b in range(len(remaining) - 1, 0, -1):
-        for a in range(b - 1, -1, -1):
-            if rem_sizes[a] == rem_sizes[b]:
-                spatial_pair = (remaining[a], remaining[b])
-                break
-        if spatial_pair is not None:
-            break
-    if spatial_pair is not None:
-        labels[spatial_pair[0]] = "i"
-        labels[spatial_pair[1]] = "j"
-    leftovers = [i for i in range(n) if labels[i] is None]
-    if len(leftovers) == 1:
-        labels[leftovers[0]] = "out"
-    elif len(leftovers) == 2:
-        a, b = leftovers
-        if sizes[a] <= sizes[b]:
-            labels[a] = "mb"
-            labels[b] = "out"
-        else:
-            labels[a] = "out"
-            labels[b] = "mb"
-    return [lb for lb in labels if lb is not None]
+    labels = op_info["dim_labels"]
+    sizes = op_info.get("dim_label_sizes")
+    if sizes is not None:
+
+        def _is_static_one(sz) -> bool:
+            try:
+                return int(sz) == 1
+            except (TypeError, ValueError):
+                return False  # symbolic/dynamic dim: never dropped
+
+        labels = [lbl for lbl, sz in zip(labels, sizes) if not _is_static_one(sz)]
+    if len(labels) != ndim:
+        raise ValueError(
+            f"pool dim label count {len(labels)} ({labels}) does not match "
+            f"iteration-space rank {ndim}; dim_labels/dim_label_sizes in the "
+            "lowering are out of sync with the emitted iteration space"
+        )
+    return labels
+
+
+def _avgpool_sdsc_fields(iteration_space: dict, pool_params: dict) -> dict:
+    """Compute the pool-specific SDSC field values for an avgpool op.
+
+    Returns plain data that is threaded onto ``SDSCSpec`` and consumed
+    generically by ``generate_sdsc`` in compute_ops.py, which keeps no
+    pool-specific knowledge (see the generic ``padding``/``num_inputs``
+    fields for the established pattern).  ``iteration_space`` is the renamed
+    SDSC iteration space, so the spatial dims are keyed by ``Symbol("i")`` and
+    ``Symbol("j")``.
+    """
+    kH = int(pool_params["kernel_h"])
+    kW = int(pool_params["kernel_w"])
+    sH = int(pool_params.get("stride_h", 1))
+    sW = int(pool_params.get("stride_w", 1))
+    pH = int(pool_params.get("pad_h", 0))
+    pW = int(pool_params.get("pad_w", 0))
+    fullspan = "padded_fullspan_wunneeded"
+
+    # One entry per spatial axis whose pooling window actually survives in the
+    # iteration space.  kernel_size==1 makes that axis' reduction dim size-1,
+    # which the pipeline squeezes out (so its label was already dropped by
+    # _align_pool_dim_labels).  Such an axis is a plain pass-through: emitting a
+    # paddingSizes_/windowDim_ entry for it would reference a dim the SDSC no
+    # longer has, and dxp_standalone aborts with "Missing window size for padded
+    # size calculation".  So skip any axis whose window dim is absent.
+    axes = [
+        ("i", "ki", kH, sH, pH),
+        ("j", "kj", kW, sW, pW),
+    ]
+    padding_sizes: dict = {}
+    window_dims: set = set()
+    input_coord_padding: dict = {}
+    input_coord_sizes: dict = {}
+    for spatial, window, k, s, p in axes:
+        if Symbol(window) not in iteration_space:
+            continue
+        out = int(iteration_space.get(Symbol(spatial), 1))
+        in_size = (out - 1) * s + k
+        padding_sizes[spatial] = {
+            "padFront_": p,
+            "padBack_": p,
+            "totalSize_": in_size,
+            "stride_": s,
+            "dilation_": 1,
+            "windowDim_": window,
+        }
+        window_dims.add(window)
+        input_coord_padding[spatial] = fullspan
+        input_coord_sizes[spatial] = in_size
+
+    return {
+        "num_corelets": _POOL_NUM_CORELETS,
+        "padding_sizes": padding_sizes,
+        "pds_reuse": True,
+        "stick_replication": True,
+        "window_dims": frozenset(window_dims),
+        "input_coord_padding": input_coord_padding,
+        "input_coord_sizes": input_coord_sizes,
+        "emit_memorg_padding": True,
+    }
 
 
 def _get_op_dim_labels(ndim: int, is_matmul: bool) -> list[str]:
@@ -770,8 +824,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     has_indirect_access = bool(index_tensor_indices)
 
     if is_pool and op_spec.op_info:
-        pool_constants = op_spec.op_info.get("constants", {})
-        dim_labels = _pool_dim_labels(op_spec.iteration_space, pool_constants)
+        dim_labels = _align_pool_dim_labels(op_spec.op_info, ndim)
     else:
         dim_labels = _get_op_dim_labels(ndim, is_matmul)
     symbol_mapping = {
@@ -837,7 +890,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             # but the SDSC still needs it.  Use the actual channel count from the
             # output tensor's device layout: device_size[-3] = channel count C.
             # (Using INPUT_DIM_LABELS[ndim] would collide with pool dim labels
-            # like "i", "j", "ki", "kj" that _pool_dim_labels assigns.)
+            # like "i", "j", "ki", "kj" supplied by the lowering.)
             stick_sym = Symbol("out")
             sdsc_iteration_space[stick_sym] = int(op_spec.args[1].device_size[-3])
         else:
@@ -952,6 +1005,13 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                 work_slices[_k_sym] = 1
         num_cores = math.prod(dim_splits.values())
 
+    # Pool-specific SDSC field values.  Computed here (where the op is already
+    # identified) as plain data threaded onto SDSCSpec; generate_sdsc consumes
+    # them generically.  Empty for non-pool ops -> SDSCSpec defaults apply.
+    pool_sdsc_fields = (
+        _avgpool_sdsc_fields(sdsc_iteration_space, pool_params_out) if is_pool else {}
+    )
+
     if _should_use_k_fast_mapping(is_matmul, sdsc_iteration_space, dim_splits):
         core_id_to_work_slice = _k_fast_core_to_slice_mapping(
             sdsc_iteration_space, dim_splits, num_cores
@@ -985,7 +1045,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             coordinate_masking=coordinate_masking,
             symbolic_dims=symbolic_dims,
             indirect_access_indices=indirect_access_indices,
-            pool_params=pool_params_out,
+            **pool_sdsc_fields,
         ),
         symbol_mapping,
     )
