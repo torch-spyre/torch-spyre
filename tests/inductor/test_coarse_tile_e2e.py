@@ -1941,5 +1941,46 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         )
 
 
+# ===========================================================================
+# UNROLL_LOOPS=0 variants
+#
+# Each class below inherits all test methods from its base.  The class-level
+# @config.patch sets unroll_loops=False for every inherited test.  Tests that
+# are known to give wrong results under the scf.for path already contain
+#   ``if not config.unroll_loops: pytest.xfail(...)``
+# guards, so they are reported as xfail here rather than FAILED.
+#
+# Tests whose method-level @config.patch overrides unroll_loops (e.g.
+# test_hint_unrolled_source_calls_sdsc explicitly sets unroll_loops=True)
+# are unaffected: the method decorator wins over the class decorator and
+# those tests run — and pass — with their own explicit setting.
+# ===========================================================================
+
+
+@config.patch({"unroll_loops": False})
+class TestCoarseTileSpyreHintsUnroll0(TestCoarseTileSpyreHints):
+    pass
+
+
+@config.patch({"unroll_loops": False})
+class TestNamedDimsHintUnroll0(TestNamedDimsHint):
+    pass
+
+
+@config.patch({"unroll_loops": False})
+class TestCoarseTileReductionE2EUnroll0(TestCoarseTileReductionE2E):
+    pass
+
+
+@config.patch({"unroll_loops": False})
+class TestCoarseTileReductionDim0E2EUnroll0(TestCoarseTileReductionDim0E2E):
+    pass
+
+
+@config.patch({"unroll_loops": False})
+class TestCoarseTileNestedReductionE2EUnroll0(TestCoarseTileNestedReductionE2E):
+    pass
+
+
 if __name__ == "__main__":
     unittest.main()
