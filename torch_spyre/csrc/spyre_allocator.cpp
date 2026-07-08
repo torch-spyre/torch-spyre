@@ -16,6 +16,7 @@
 #include "spyre_allocator.h"
 
 #include <memory>
+#include <mutex>
 #include <utility>
 
 #include "logging.h"
@@ -29,6 +30,7 @@ SpyreAllocator::SpyreAllocator() = default;
 c10::CachingDeviceAllocator::DeviceStats SpyreAllocator::stats_;
 c10::CachingDeviceAllocator::StatTypes SpyreAllocator::stat_types = {
     true, false, false};  // {AGGREGATE, SMALL_POOL, LARGE_POOL}
+std::mutex SpyreAllocator::stats_mutex_;
 
 std::shared_ptr<flex::FlexAllocator> SpyreAllocator::getFlexAllocator() {
   // FlexAllocator is owned by RuntimeContext (one per device per process).
@@ -52,10 +54,12 @@ void SpyreAllocator::recordStream(const c10::DataPtr& ptr, c10::Stream stream) {
 
 c10::CachingDeviceAllocator::DeviceStats SpyreAllocator::getDeviceStats(
     c10::DeviceIndex device) {
+  std::lock_guard<std::mutex> lock(stats_mutex_);
   return stats_;
 }
 
 void SpyreAllocator::resetAccumulatedStats(c10::DeviceIndex device) {
+  std::lock_guard<std::mutex> lock(stats_mutex_);
   c10::CachingAllocator::for_each_selected_stat_type(
       stat_types, [&](size_t stat_type) {
         stats_.allocated_bytes[stat_type].reset_accumulated();
@@ -64,6 +68,7 @@ void SpyreAllocator::resetAccumulatedStats(c10::DeviceIndex device) {
 }
 
 void SpyreAllocator::resetPeakStats(c10::DeviceIndex device) {
+  std::lock_guard<std::mutex> lock(stats_mutex_);
   c10::CachingAllocator::for_each_selected_stat_type(
       stat_types, [&](size_t stat_type) {
         stats_.allocated_bytes[stat_type].reset_peak();
@@ -72,48 +77,50 @@ void SpyreAllocator::resetPeakStats(c10::DeviceIndex device) {
 }
 
 void SpyreAllocator::recordAlloc(size_t nbytes, void* data, int device_id) {
-  c10::CachingAllocator::for_each_selected_stat_type(
-      stat_types, [&](size_t stat_type) {
-        stats_.allocation[stat_type].increase(1);
-        stats_.allocated_bytes[stat_type].increase(nbytes);
-      });
-
+  int64_t total_allocated;
+  {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    c10::CachingAllocator::for_each_selected_stat_type(
+        stat_types, [&](size_t stat_type) {
+          stats_.allocation[stat_type].increase(1);
+          stats_.allocated_bytes[stat_type].increase(nbytes);
+        });
+    total_allocated = stats_
+                          .allocated_bytes[static_cast<size_t>(
+                              c10::CachingAllocator::StatType::AGGREGATE)]
+                          .current;
+  }
   c10::Device curr_device =
       c10::Device(c10::DeviceType::PrivateUse1, device_id);
   c10::reportMemoryUsageToProfiler(
       data,
-      nbytes,  // alloc_size
-      stats_
-          .allocated_bytes[static_cast<size_t>(
-              c10::CachingAllocator::StatType::AGGREGATE)]
-          .current,  // total_allocated
-      stats_
-          .allocated_bytes[static_cast<size_t>(
-              c10::CachingAllocator::StatType::AGGREGATE)]
-          .current,  // total_reserved (currently same as total_allocated)
+      nbytes,           // alloc_size
+      total_allocated,  // total_allocated
+      total_allocated,  // total_reserved (currently same as total_allocated)
       curr_device);
 }
 
 void SpyreAllocator::recordRelease(size_t nbytes, void* data, int device_id) {
-  c10::CachingAllocator::for_each_selected_stat_type(
-      stat_types, [&](size_t stat_type) {
-        stats_.allocation[stat_type].decrease(1);
-        stats_.allocated_bytes[stat_type].decrease(nbytes);
-      });
-
+  int64_t total_allocated;
+  {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    c10::CachingAllocator::for_each_selected_stat_type(
+        stat_types, [&](size_t stat_type) {
+          stats_.allocation[stat_type].decrease(1);
+          stats_.allocated_bytes[stat_type].decrease(nbytes);
+        });
+    total_allocated = stats_
+                          .allocated_bytes[static_cast<size_t>(
+                              c10::CachingAllocator::StatType::AGGREGATE)]
+                          .current;
+  }
   c10::Device curr_device =
       c10::Device(c10::DeviceType::PrivateUse1, device_id);
   c10::reportMemoryUsageToProfiler(
       data,
-      -nbytes,  // alloc_size
-      stats_
-          .allocated_bytes[static_cast<size_t>(
-              c10::CachingAllocator::StatType::AGGREGATE)]
-          .current,  // total_allocated
-      stats_
-          .allocated_bytes[static_cast<size_t>(
-              c10::CachingAllocator::StatType::AGGREGATE)]
-          .current,  // total_reserved (currently same as total_allocated)
+      -static_cast<int64_t>(nbytes),  // alloc_size
+      total_allocated,                // total_allocated
+      total_allocated,  // total_reserved (currently same as total_allocated)
       curr_device);
 }
 

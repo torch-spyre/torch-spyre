@@ -21,6 +21,7 @@
 
 #include <flex/flex.hpp>
 #include <memory>
+#include <mutex>
 #include <utility>
 
 namespace spyre {
@@ -41,6 +42,7 @@ struct SpyreAllocator final : public c10::DeviceAllocator {
   static c10::CachingDeviceAllocator::DeviceStats stats_;
   static c10::CachingDeviceAllocator::StatTypes
       stat_types;  // {AGGREGATE, SMALL_POOL, LARGE_POOL}
+  static std::mutex stats_mutex_;
 
   static std::shared_ptr<flex::FlexAllocator> getFlexAllocator();
 
