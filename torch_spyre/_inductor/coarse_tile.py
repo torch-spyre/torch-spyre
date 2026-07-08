@@ -1099,6 +1099,207 @@ def _find_terminal_for_state(
     return best
 
 
+def _patch_inside_consumers(
+    old_name: str,
+    new_name: str,
+    loop_group_id: tuple,
+    operations: list[Operation],
+) -> None:
+    """Redirect in-loop consumers from old_name to new_name via NameSwapHandler."""
+    from .insert_restickify import NameSwapHandler
+    from .pass_utils import replace_computed_buffer_body
+
+    outer_key = loop_group_id[0]
+    name_map = {old_name: new_name}
+    for op in operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        li = getattr(op, "loop_info", None)
+        if li is None or li.loop_group_id[0] != outer_key:
+            continue
+        if old_name not in op.get_read_names():
+            continue
+        orig_inner_fn = op.data.inner_fn
+
+        def _new_inner_fn(*args, _map=name_map, _orig=orig_inner_fn):
+            with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
+                return _orig(*args)
+
+        object.__setattr__(op.data, "inner_fn", _new_inner_fn)
+        new_op = replace_computed_buffer_body(op, op.data, operations)
+        V.graph.name_to_buffer[new_op.get_name()] = operations[
+            next(
+                i
+                for i, o in enumerate(operations)
+                if isinstance(o, ComputedBuffer) and o.get_name() == new_op.get_name()
+            )
+        ]
+
+
+def _propagate_carry_op(
+    op: ComputedBuffer,
+    operations: list[Operation],
+    carry_ops: set[str],
+) -> None:
+    """Insert fill + carry-back copy ops to implement loop-carried state for op."""
+    from .ir import FixedTiledLayout  # deferred: avoids circular import
+
+    loop_info = op.loop_info
+    loop_group_id = loop_info.loop_group_id
+    outer_key = loop_group_id[0]
+
+    group_start_idx = next(
+        i
+        for i, o in enumerate(operations)
+        if isinstance(o, ComputedBuffer)
+        and getattr(getattr(o, "loop_info", None), "loop_group_id", (None,))[0]
+        == outer_key
+    )
+
+    state_names = _find_state_input_names(op, loop_group_id, operations)
+
+    # The carry buffer spans the full (pre-division) output shape so that the
+    # outer loop advances it into distinct per-outer-tile slots.  Without
+    # per_tile_fixed the outer loop naturally advances the address; the inner
+    # loop does NOT advance it (the carry op has no innermost loop_tiled_dims).
+    # The fill op runs once per outer tile (fill_loop_info when nested) to
+    # reinitialize the current outer tile's carry slots to the initial value.
+    full_carry_ranges = _compute_full_ranges(op)
+    per_tile_carry_ranges = list(op.data.ranges)
+    fill_loop_info = _compute_fill_loop_info(op)
+
+    for state_name in state_names:
+        buf_map = {o.get_name(): o for o in operations if isinstance(o, ComputedBuffer)}
+
+        carry_buf = _allocate_full_buffer(
+            op, full_carry_ranges, operations, group_start_idx
+        )
+
+        # Do NOT mark per_tile_fixed: the outer loop must advance carry_buf into
+        # each outer tile's slot so that outside consumers can read all tiles.
+
+        # Fill: copy the per-tile state into carry_buf.
+        # When nested (outer + inner loop), fill_loop_info is the outer loop_info
+        # so this fill runs once per outer tile, reinitializing carry_buf each time.
+        # When flat (single-level), fill_loop_info is None and the fill runs globally.
+        state_op = buf_map.get(state_name)
+        assert state_op is not None, (
+            f"_propagate_carry_op: state buffer {state_name!r} not found in operations"
+        )
+
+        # Find terminal BEFORE patching so the forward-reachability walk from
+        # state_name can still follow the original data-flow edges.
+        terminal = _find_terminal_for_state(
+            state_name,
+            loop_group_id,
+            list(op.data.ranges),
+            operations,
+            carry_op=op,
+        )
+        if terminal is None:
+            terminal = op
+
+        # Build the fill inner_fn.  If state_op is inside the loop group its
+        # storage is not accessible before the loop starts; use its raw
+        # computation (inner_fn) instead so the fill op depends only on
+        # state_op's inputs (which are pre-loop constants / graph arguments),
+        # not on state_op's storage buffer.  This avoids a scheduler edge
+        # in-group-op → plain-fill that would split the loop group into two
+        # separate CountedLoopSchedulerNodes.
+        state_li = getattr(state_op, "loop_info", None)
+        state_in_group = state_li is not None and state_li.loop_group_id[0] == outer_key
+        if state_in_group and isinstance(state_op.data, Pointwise):
+            state_inner = state_op.data.inner_fn
+
+            def _fill_inner_fn(index, _fn=state_inner):
+                return _fn(index)
+
+        else:
+            state_loader = TensorBox.create(state_op).make_loader()
+
+            def _fill_inner_fn(index, _loader=state_loader):
+                return _loader(index)
+
+        device = op.get_device()
+        dtype = op.get_dtype()
+
+        # Patch all in-loop reads of state_name to read carry_buf instead.
+        # Do this BEFORE inserting fill_buf so that _patch_inside_consumers
+        # does not also patch the fill's inner_fn (which must keep reading
+        # state_name, not carry_buf).
+        _patch_inside_consumers(
+            state_name, carry_buf.get_name(), loop_group_id, operations
+        )
+
+        fill_data = Pointwise(
+            device=device,
+            dtype=dtype,
+            inner_fn=_fill_inner_fn,
+            ranges=per_tile_carry_ranges,
+        )
+        fill_name = V.graph.qualify_name(f"coarse_tile_carry_fill_{op.get_name()}")
+        fill_buf = ComputedBuffer(
+            name=fill_name,
+            layout=MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(carry_buf))),
+            data=fill_data,
+        )
+        fill_buf.origins = op.origins
+        fill_buf.operation_name = fill_name
+        if fill_loop_info is not None:
+            fill_buf.loop_info = fill_loop_info  # type: ignore[attr-defined]
+        V.graph.name_to_buffer[fill_name] = fill_buf
+        carry_buf_idx = operations.index(carry_buf)
+        operations.insert(carry_buf_idx + 1, fill_buf)
+
+        # Insert the carry-back after the later of (terminal, last reader of
+        # carry_buf) so that:
+        #   (a) terminal has already executed (carry_back sources from terminal), and
+        #   (b) all ops that need the OLD carry value have already read it.
+        # Use operations-list index to pick the later position.
+        carry_buf_name = carry_buf.get_name()
+        terminal_idx = operations.index(terminal)
+        last_carry_reader = terminal
+        last_carry_reader_idx = terminal_idx
+        for cand_idx, candidate in enumerate(operations):
+            if not isinstance(candidate, ComputedBuffer):
+                continue
+            cli = getattr(candidate, "loop_info", None)
+            if cli is None or cli.loop_group_id[0] != outer_key:
+                continue
+            if (
+                _reads_buffer(candidate, carry_buf_name)
+                and cand_idx > last_carry_reader_idx
+            ):
+                last_carry_reader = candidate
+                last_carry_reader_idx = cand_idx
+        _insert_carry_back_op(terminal, last_carry_reader, carry_buf, operations)
+
+        # Patch outside consumers of terminal to read carry_buf.
+        terminal_name = terminal.get_name()
+        outside_consumers, is_graph_output = _find_outside_consumers(
+            terminal_name, loop_group_id, operations
+        )
+        carry_name = carry_buf.get_name()
+        _patch_consumers(outside_consumers, terminal_name, carry_name, operations)
+        if is_graph_output:
+            _patch_graph_outputs(terminal_name, carry_buf)
+
+        # Also patch outside consumers of state_name itself, excluding the
+        # fill op (which must continue to read the original state init).
+        state_outside, state_is_output = _find_outside_consumers(
+            state_name, loop_group_id, operations
+        )
+        state_outside = [c for c in state_outside if c.get_name() != fill_name]
+        _patch_consumers(state_outside, state_name, carry_name, operations)
+        if state_is_output:
+            _patch_graph_outputs(state_name, carry_buf)
+
+    if isinstance(op.layout, FixedTiledLayout):
+        op.layout.per_tile_fixed = True
+
+    carry_ops.add(op.get_name())
+
+
 def _graph_output_names() -> set[str]:
     """Return the set of buffer names that appear in V.graph graph outputs."""
     try:
@@ -1276,6 +1477,45 @@ def _insert_copy_op(
 
     tiled_idx = operations.index(tiled_op)
     operations.insert(tiled_idx + 1, copy_buf)
+
+
+def _insert_carry_back_op(
+    source_op: ComputedBuffer,
+    insert_after: ComputedBuffer,
+    carry_buf: ComputedBuffer,
+    operations: list[Operation],
+) -> None:
+    """Insert a carry-back copy op that writes source_op's output into carry_buf.
+
+    The copy op is positioned after insert_after (which is the last in-loop
+    reader of carry_buf) so all ops that need the old carry state run first.
+    It carries source_op's loop_info so it executes inside the same loop body.
+    Its layout is MutationLayoutSHOULDREMOVE pointing at carry_buf so
+    store_output overwrites carry_buf with the new state value.
+    """
+    copy_data = Pointwise(
+        device=source_op.get_device(),
+        dtype=source_op.get_dtype(),
+        inner_fn=source_op.make_loader(),
+        ranges=list(source_op.data.ranges),
+    )
+
+    copy_name = V.graph.qualify_name(f"coarse_tile_carry_back_{source_op.get_name()}")
+    copy_buf = ComputedBuffer(
+        name=copy_name,
+        layout=MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(carry_buf))),
+        data=copy_data,
+    )
+    copy_buf.origins = source_op.origins
+    copy_buf.operation_name = copy_name
+
+    # Carry the loop_info from source_op so this op is inside the same loop body.
+    copy_buf.loop_info = source_op.loop_info  # type: ignore[attr-defined]
+
+    V.graph.name_to_buffer[copy_name] = copy_buf
+
+    insert_idx = operations.index(insert_after)
+    operations.insert(insert_idx + 1, copy_buf)
 
 
 # ---------------------------------------------------------------------------

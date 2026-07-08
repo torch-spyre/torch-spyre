@@ -4589,3 +4589,168 @@ class TestCarryOpDetection(unittest.TestCase):
             "state", (0,), [Integer(8)], [carry_op, terminal_op], carry_op
         )
         assert terminal is terminal_op
+
+
+class TestCarryStateMechanism(unittest.TestCase):
+    """Tests for _patch_inside_consumers and _propagate_carry_op."""
+
+    def test_patch_inside_consumers_redirects_reads(self):
+        from torch_spyre._inductor.coarse_tile import _patch_inside_consumers
+
+        consumer = _make_inside_consumer_op("consumer", "state_buf", (0,))
+        consumer.get_read_names.return_value = {"state_buf"}
+        original_inner_fn = consumer.data.inner_fn
+
+        with (
+            patch(
+                "torch_spyre._inductor.pass_utils.replace_computed_buffer_body",
+                return_value=consumer,
+            ) as mock_replace,
+            patch("torch_spyre._inductor.coarse_tile.V") as mock_V,
+        ):
+            mock_V.graph.name_to_buffer = {}
+            consumer.get_name.return_value = "consumer"
+            _patch_inside_consumers("state_buf", "carry_buf", (0,), [consumer])
+
+        # inner_fn was replaced with a new wrapped callable
+        self.assertIsNot(consumer.data.inner_fn, original_inner_fn)
+        mock_replace.assert_called_once()
+
+    def test_patch_inside_consumers_ignores_outside_ops(self):
+        from torch_spyre._inductor.coarse_tile import _patch_inside_consumers
+
+        # Op outside loop group (no loop_info) — _make_consumer_op has no loop_info
+        outside_op = _make_consumer_op("outside", "state_buf")
+        outside_op.get_read_names.return_value = {"state_buf"}
+        original_inner_fn = outside_op.data.inner_fn
+
+        with patch(
+            "torch_spyre._inductor.pass_utils.replace_computed_buffer_body"
+        ) as mock_replace:
+            _patch_inside_consumers("state_buf", "carry_buf", (0,), [outside_op])
+
+        # inner_fn must NOT have been replaced
+        self.assertIs(outside_op.data.inner_fn, original_inner_fn)
+        mock_replace.assert_not_called()
+
+    def _make_carry_op_setup(self):
+        """Return (m_init, carry_op, operations) for single-op carry chain.
+
+        m_init: buffer produced outside the loop (no loop_info).
+        carry_op: in-loop op that reads m_init; loop_tiled_dims=[[]].
+        """
+        # _make_consumer_op already calls del op.loop_info → no loop_info attribute
+        m_init = _make_consumer_op("m_init", "")
+
+        carry_op = _make_inside_consumer_op("carry_op", "m_init", (0,))
+        carry_op.loop_info.loop_tiled_dims = [[]]
+        carry_op.data.ranges = [Integer(8)]
+        carry_op.get_read_names.return_value = {"m_init"}
+        # Needed so ComputedBuffer.__eq__ comparisons (via operations.index) work.
+        m_init.name = "m_init"
+        carry_op.name = "carry_op"
+
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        layout = MagicMock(spec=FixedTiledLayout)
+        layout.per_tile_fixed = False
+        carry_op.layout = layout
+
+        return m_init, carry_op, [m_init, carry_op]
+
+    def _make_mock_carry_buf(self):
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        carry_buf = MagicMock()
+        carry_buf.get_name.return_value = "carry_buf_0"
+        carry_buf.layout = MagicMock(spec=FixedTiledLayout)
+        carry_buf.layout.per_tile_fixed = False
+        carry_buf.make_loader.return_value = MagicMock()
+        carry_buf.origins = OrderedSet()
+        return carry_buf
+
+    def _run_propagate_carry_op(self, carry_op, carry_buf, operations):
+        """Run _propagate_carry_op with all heavy dependencies mocked."""
+        from torch_spyre._inductor.coarse_tile import _propagate_carry_op
+
+        carry_ops: set[str] = set()
+
+        with (
+            patch(
+                "torch_spyre._inductor.coarse_tile._allocate_full_buffer",
+                return_value=carry_buf,
+            ) as mock_alloc,
+            patch(
+                "torch_spyre._inductor.coarse_tile._patch_inside_consumers"
+            ) as mock_patch_inside,
+            patch(
+                "torch_spyre._inductor.coarse_tile._insert_carry_back_op"
+            ) as mock_copy,
+            patch(
+                "torch_spyre._inductor.coarse_tile._find_outside_consumers",
+                return_value=([], False),
+            ),
+            patch("torch_spyre._inductor.coarse_tile._patch_consumers"),
+            patch("torch_spyre._inductor.coarse_tile.V") as mock_V,
+        ):
+            # Build a minimal fake fill op that satisfies ComputedBuffer(...) call.
+            mock_V.graph.qualify_name.side_effect = lambda n: n
+            mock_V.graph.name_to_buffer = {}
+
+            # Patch the IR constructors that require a real Buffer arg only after
+            # _allocate_full_buffer returns our mock carry_buf.
+            mock_layout = MagicMock()
+            mock_V.graph.name_to_buffer = {}
+
+            with (
+                patch(
+                    "torch_spyre._inductor.coarse_tile.MutationLayoutSHOULDREMOVE",
+                    return_value=mock_layout,
+                ),
+                patch("torch_spyre._inductor.coarse_tile.TensorBox"),
+                patch("torch_spyre._inductor.coarse_tile.StorageBox"),
+            ):
+                _propagate_carry_op(carry_op, operations, carry_ops)
+
+        return carry_ops, mock_alloc, mock_patch_inside, mock_copy, mock_V
+
+    def test_propagate_carry_op_single_op_chain(self):
+        m_init, carry_op, operations = self._make_carry_op_setup()
+        carry_buf = self._make_mock_carry_buf()
+
+        # Insert carry_buf into operations so operations.index(carry_buf) works.
+        operations.insert(0, carry_buf)
+
+        carry_ops, mock_alloc, mock_patch_inside, mock_copy, mock_V = (
+            self._run_propagate_carry_op(carry_op, carry_buf, operations)
+        )
+
+        mock_alloc.assert_called_once()
+        self.assertFalse(carry_buf.layout.per_tile_fixed)
+        mock_patch_inside.assert_called_once_with(
+            "m_init", "carry_buf_0", (0,), operations
+        )
+        mock_copy.assert_called_once_with(carry_op, carry_op, carry_buf, operations)
+        self.assertIn("carry_op", carry_ops)
+
+        # Verify the fill op (no loop_info) was inserted into operations and
+        # registered in name_to_buffer.
+        fill_name = "coarse_tile_carry_fill_carry_op"
+        self.assertIn(fill_name, mock_V.graph.name_to_buffer)
+        fill_buf = mock_V.graph.name_to_buffer[fill_name]
+        self.assertIsNone(
+            getattr(fill_buf, "loop_info", None),
+            "fill op must have no loop_info (runs before the loop)",
+        )
+
+    def test_propagate_carry_op_marks_per_tile_fixed(self):
+        m_init, carry_op, operations = self._make_carry_op_setup()
+        carry_buf = self._make_mock_carry_buf()
+
+        operations.insert(0, carry_buf)
+
+        carry_ops, _, _, _, _ = self._run_propagate_carry_op(
+            carry_op, carry_buf, operations
+        )
+
+        self.assertTrue(carry_op.layout.per_tile_fixed)
