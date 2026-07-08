@@ -23,12 +23,19 @@ import torch._inductor.lowering as lowering
 import torch._inductor.ir as ir
 from typing import Any, Callable, Union
 
-from .constants import BATCH_MATMUL_OP
+from .constants import (
+    BATCH_MATMUL_OP,
+    COPY_BACK_CANDIDATE_ATTR,
+    BATCH_MATMUL_FP8_OP,
+    SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
+    SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
+)
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import SpyreReduction, SpyreConstantFallback, SpyreEmptyFallback
 from torch_spyre._C import get_elem_in_stick
 from torch._inductor.virtualized import V
+from torch.utils._ordered_set import OrderedSet
 from .errors import Unsupported
 import threading
 from .logging_utils import get_inductor_logger
@@ -43,6 +50,15 @@ _lowerings_nesting = 0
 # The specific spyre lowerings will be registered into this dictionary
 # and merged with the in-tree lowerings when needed
 spyre_lowerings: dict[Union[Callable[..., Any], str], Callable[..., Any]] = {}
+
+
+def _current_fx_custom_meta() -> dict[str, Any]:
+    node = V.get_current_node()
+    meta = getattr(node, "meta", None)
+    if not isinstance(meta, dict):
+        return {}
+    custom = meta.get("custom")
+    return custom if isinstance(custom, dict) else {}
 
 
 def register_spyre_lowering(
@@ -232,6 +248,140 @@ def ensure_default_handler(op_name):
         setattr(cls, op_name, method)
 
 
+def eager_fallback(op, *args, **kwargs):
+    handler = lowering.fallback_handler(op, add_to_fallback_set=False)
+    return handler(*args, **kwargs)
+
+
+def _ensure_synthetic_origin(result, target, args: tuple) -> None:
+    """Give a lowering result a synthetic ``target`` origin FX node, so Spyre
+    layout passes (which key off ``op.data.origins[].target``) recognize it even
+    when the lowering was called directly, without an FX node of its own. No-op
+    if a ``target`` origin already exists.
+    """
+
+    def _realized_buffer(node):
+        while not isinstance(node, StorageBox):
+            node = node.data
+        return node.data
+
+    origins = getattr(_realized_buffer(result), "origins", None)
+    if origins and any(o.target == target for o in origins):
+        return
+
+    fx_graph = V.graph.graph
+    first_compute_node = next(n for n in fx_graph.nodes if n.op != "placeholder")
+    with fx_graph.inserting_before(first_compute_node):
+        fx_node = fx_graph.create_node("call_function", target, args)
+
+    # Realize so the origin lands on a stable ComputedBuffer, not a Pointwise.
+    result.realize()
+    buf = _realized_buffer(result)
+    # buf.data is a frozen Loops; override its origins via object.__setattr__.
+    object.__setattr__(buf.data, "origins", OrderedSet([fx_node]))
+    buf.origins = OrderedSet([fx_node])
+
+
+# TODO:This is just place holder now; Real implementation will follow
+@register_spyre_lowering(torch.ops.aten._scaled_mm.default)
+def lower_scaled_mm(
+    mat1,
+    mat2,
+    scale_a=None,
+    scale_b=None,
+    bias=None,
+    scale_result=None,
+    out_dtype=None,
+    use_fast_accum=False,
+):
+    if scale_a is not None:
+        raise Unsupported("scale_a parameter in _scaled_mm is not yet supported")
+    if scale_b is not None:
+        raise Unsupported("scale_b parameter in _scaled_mm is not yet supported")
+    if bias is not None:
+        raise Unsupported("bias parameter in _scaled_mm is not yet supported")
+    if scale_result is not None:
+        raise Unsupported("scale_result parameter in _scaled_mm is not yet supported")
+    if use_fast_accum:
+        raise Unsupported("use_fast_accum parameter in _scaled_mm is not yet supported")
+
+    mat1.realize()
+    mat2.realize()
+    mat1_loader = mat1.make_loader()
+    mat2_loader = mat2.make_loader()
+
+    mat1_size = mat1.get_size()
+    mat2_size = mat2.get_size()
+    mat1_ndim = len(mat1_size)
+    mat2_ndim = len(mat2_size)
+
+    mat1_dtype = mat1.get_dtype()
+    mat2_dtype = mat2.get_dtype()
+
+    if mat1_dtype not in [torch.float8_e4m3fn]:
+        raise ValueError(f"Expected FP8 input for mat1, got {mat1_dtype}")
+    if mat2_dtype not in [torch.float8_e4m3fn]:
+        raise ValueError(f"Expected FP8 input for mat2, got {mat2_dtype}")
+
+    output_dtype = out_dtype if out_dtype is not None else torch.float16
+    reduction_numel = mat1_size[-1]
+
+    if mat1_ndim == 2 and mat2_ndim == 2:
+        # [M, K] × [K, N] → [M, N]
+        ranges = [mat1_size[0], mat2_size[1]]
+
+        def inner_fn(index, reduction_index):
+            i0, i1 = index
+            (r0,) = reduction_index
+            return (mat1_loader([i0, r0]), mat2_loader([r0, i1]))
+
+    elif mat1_ndim == 3 and mat2_ndim == 2:
+        # [B, M, K] × [K, N] → [B, M, N]
+        ranges = [mat1_size[0], mat1_size[1], mat2_size[1]]
+
+        def inner_fn(index, reduction_index):
+            i0, i1, i2 = index
+            (r0,) = reduction_index
+            return (mat1_loader([i0, i1, r0]), mat2_loader([r0, i2]))
+
+    elif mat1_ndim == 3 and mat2_ndim == 3:
+        # [B, M, K] × [B, K, N] → [B, M, N]
+        ranges = [mat1_size[0], mat1_size[1], mat2_size[2]]
+
+        def inner_fn(index, reduction_index):
+            i0, i1, i2 = index
+            (r0,) = reduction_index
+            return (mat1_loader([i0, i1, r0]), mat2_loader([i0, r0, i2]))
+
+    else:
+        raise Unsupported(
+            f"_scaled_mm with shapes {mat1_size} and {mat2_size} not supported"
+        )
+
+    result = Reduction.create(
+        reduction_type=BATCH_MATMUL_FP8_OP,
+        input_node=[mat1, mat2],
+        device=mat1.get_device(),
+        dst_dtype=output_dtype,
+        src_dtype=mat1_dtype,
+        inner_fn=inner_fn,
+        ranges=ranges,
+        reduction_ranges=[reduction_numel],
+    )
+
+    result.realize()
+
+    if logger.isEnabledFor(logging.DEBUG):
+        result_buf = V.graph.get_buffer(result.get_name())
+        logger.debug(
+            f"_scaled_mm (FP8): mat1{[int(s) for s in mat1_size]} @ mat2{[int(s) for s in mat2_size]} "
+            f"-> {[int(s) for s in result_buf.get_size()]}, "
+            f"mat1_dtype={mat1_dtype}, mat2_dtype={mat2_dtype}, out_dtype={output_dtype}"
+        )
+
+    return result
+
+
 @register_spyre_lowering(torch.ops.aten.mm.default)
 def lower_mm(x, y):
     x.realize()
@@ -339,11 +489,18 @@ def lower_bmm(x, y):
     else:
         raise Unsupported(f"BMM with input shapes {x.get_size()} and {y.get_size()}")
 
+    custom_meta = _current_fx_custom_meta()
+    op_info = {}
+    if SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY in custom_meta:
+        op_info[SHARED_WEIGHT_UNIT_BMM_INFO_KEY] = custom_meta[
+            SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY
+        ]
+
     if reduction_numel == 1:
         # Reduction degenerates to a pointwise mul
         result = lowering.mul(x, y)
     else:
-        result = Reduction.create(
+        reduction_kwargs = dict(
             reduction_type=BATCH_MATMUL_OP,
             input_node=[x, y],
             device=x.get_device(),
@@ -353,6 +510,10 @@ def lower_bmm(x, y):
             ranges=ranges,
             reduction_ranges=[reduction_numel],
         )
+        if op_info:
+            result = SpyreReduction.create(op_info=op_info, **reduction_kwargs)
+        else:
+            result = Reduction.create(**reduction_kwargs)
 
     result.realize()
 
@@ -546,12 +707,34 @@ def lower_mean(x, axis=None, keepdim=False, *, dtype=None):
     return result
 
 
+@register_spyre_lowering(torch.ops.aten.mean.default)
+def lower_mean_default(x, *, dtype=None):
+    axis = list(range(len(x.get_size())))
+    return lower_mean(x, axis=axis, keepdim=False, dtype=dtype)
+
+
 @register_spyre_lowering(torch.ops.spyre.gelu)
 def lower_gelu(x, approximate="none"):
     pw = Pointwise.create(
         device=x.get_device(),
         dtype=x.get_dtype(),
         inner_fn=lambda index: lowering.ops_wrapper(torch.ops.spyre.gelu.__name__)(
+            x.make_loader()(index)
+        ),
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw
+
+
+@register_spyre_lowering(torch.ops.spyre.silu)
+def lower_silu(x):
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=lambda index: lowering.ops_wrapper(torch.ops.spyre.silu.__name__)(
             x.make_loader()(index)
         ),
         ranges=x.get_size(),
@@ -603,10 +786,16 @@ def lower_clamp(x, min=None, max=None):
 
 @register_spyre_lowering(torch.ops.aten.clone.default, type_promotion_kind=None)
 def clone(x, *, memory_format=None):
-    from torch._inductor.ir import FlexibleLayout, get_stride_order
-    from torch._inductor.lowering import clone as clone_lowering
+    result = lowering.clone(x, memory_format=memory_format)
 
-    result = clone_lowering(x, memory_format=memory_format)
+    # A clone called directly from another lowering has no aten.clone FX node,
+    # so it inherits the caller's origin and the layout pass skips clone's
+    # layout propagation enforcement. Inject a synthetic clone origin so it fires.
+    args: tuple = ()
+    if isinstance(x, ir.IRNode) and (n := x.get_origin_node()) is not None:
+        args = (n,)
+    _ensure_synthetic_origin(result, torch.ops.aten.clone.default, args)
+
     # Upstream Inductor ignores memory_format (TODO in clone lowering).
     # The output gets a FlexibleLayout whose stride order is inferred from
     # the input's strides via ComputedBuffer.get_fill_order(). When the
@@ -616,8 +805,8 @@ def clone(x, *, memory_format=None):
     # Fix: freeze the layout to the requested stride order so that
     # decide_layout() respects the memory_format contract.
     if memory_format is not None and memory_format != torch.preserve_format:
-        stride_order = get_stride_order(
-            FlexibleLayout.stride_ordered_for_memory_format(
+        stride_order = ir.get_stride_order(
+            ir.FlexibleLayout.stride_ordered_for_memory_format(
                 result.get_size(), memory_format
             )
         )
@@ -736,6 +925,76 @@ def lower_empty(size, device, dtype=None):
     )
 
 
+def _peel(node):
+    """Unwrap TensorBox/StorageBox/MutableBox layers to reach the underlying Buffer."""
+    while isinstance(node, ir.MutableBox):
+        node = node.data
+    while isinstance(node, ir.StorageBox):
+        node = node.data
+    return node
+
+
+def _copy_back_candidate(dst, src) -> bool:
+    """Whether ``copy_(dst, src)`` is worth checking after layout propagation.
+
+    Lowering only identifies the structural pattern.  Layout propagation later
+    proves the full safety condition and either removes the copy or leaves this
+    normal ``copy_`` mutation op intact.
+    """
+    dst_buf = _peel(dst)
+    if not isinstance(dst_buf, ir.InputBuffer):
+        return False
+    if dst_buf.get_name() not in V.graph.graph_input_names:
+        return False
+
+    if dst.get_device() != src.get_device():
+        return False
+    if dst.get_dtype() != src.get_dtype():
+        return False
+    if tuple(dst.get_size()) != tuple(src.get_size()):
+        return False
+
+    src_buf = _peel(src)
+    if not isinstance(src_buf, ir.ComputedBuffer):
+        return False
+    if not isinstance(src_buf.layout, ir.FlexibleLayout):
+        return False
+    return tuple(dst_buf.layout.stride) == tuple(src_buf.layout.stride)
+
+
+def _mark_copy_back_candidate(first_new_op: int, dst) -> None:
+    dst_name = _peel(dst).get_name()
+    for op in V.graph.operations[first_new_op:]:
+        layout = getattr(op, "layout", None)
+        if not isinstance(layout, ir.MutationLayoutSHOULDREMOVE):
+            continue
+        if layout.get_buffer().get_name() == dst_name:
+            setattr(op, COPY_BACK_CANDIDATE_ATTR, True)
+
+
+@register_spyre_lowering(torch.ops.aten.copy_.default, type_promotion_kind=None)
+def spyre_copy_(dst, src, non_blocking=False):
+    """Lower ``copy_`` and mark graph-input copy-back candidates.
+
+    Do not alias at lowering time.  Candidate marking keeps the structural
+    connection to ``copy_`` while letting layout propagation make the final,
+    feasibility-aware decision after producer layouts are known.
+    """
+    if dst is src:
+        return dst
+
+    candidate = _copy_back_candidate(dst, src)
+    src = lowering.to_device(src, dst.get_device())
+    src = lowering.to_dtype(src, dst.get_dtype())
+    src = lowering.expand(src, dst.get_size())
+
+    first_new_op = len(V.graph.operations)
+    result = lowering.mutate_to(dst, src)
+    if candidate:
+        _mark_copy_back_candidate(first_new_op, dst)
+    return result
+
+
 @register_spyre_lowering(torch.ops.aten.cat.default, type_promotion_kind=None)
 def lower_cat(inputs, dim=0):
     output_size = list(inputs[0].get_size())
@@ -795,7 +1054,7 @@ def lower_constant_pad_nd(input, pad, value=0, align_to_stick=False):
         offsets.append(pad_left)
 
     if not dims:
-        return clone(cropped_input)
+        return lowering.clone(cropped_input)
 
     dtype = input.get_dtype()
     device = input.get_device()
@@ -838,3 +1097,164 @@ def lower_constant_pad_nd(input, pad, value=0, align_to_stick=False):
     lowering.mutate_to(sliced_output, cropped_input)
 
     return output
+
+
+@register_spyre_lowering(
+    torch.ops.prims.convert_element_type.default,
+    type_promotion_kind=None,
+)
+def to_dtype(x, dst_dtype):
+    from torch_spyre._inductor.dtype_ops import DtypeOpTable
+
+    src_dtype = x.get_dtype()
+
+    if src_dtype == dst_dtype:
+        return lowering.clone(x)
+
+    # Check if conversion is supported by backend
+    if DtypeOpTable.get_operator(src_dtype, dst_dtype) is None:
+        # Unsupported conversion - fall back to CPU
+        op = torch.ops.spyre.to_dtype_cpu.default
+        return eager_fallback(op, x, dst_dtype)
+
+    return lowering.to_dtype(x, dst_dtype, copy=True)
+
+
+def with_int64_fallback(fn, *args, convert_output=True):
+    """
+    Helper to handle int64 operations by converting to fp32.
+
+    Args:
+        fn: The lowering function to call
+        *args: Arguments to pass to fn
+        convert_output: If True, convert output back to int64.
+                       Set to False for operations like div that should return float.
+    """
+    # Skip constants (int/float literals) that don't have get_dtype()
+    has_int64 = False
+    for x in args:
+        if isinstance(x, (int, float)):
+            continue
+        if hasattr(x, "get_dtype") and x.get_dtype() == torch.int64:
+            has_int64 = True
+            break
+
+    if not has_int64:
+        return fn(*args)
+
+    # Convert args, skipping constants
+    converted_args = []
+    for x in args:
+        if isinstance(x, (int, float)):
+            converted_args.append(x)
+        else:
+            converted_args.append(to_dtype(x, torch.float32))
+
+    output = fn(*converted_args)
+
+    if convert_output:
+        return to_dtype(output, torch.int64)
+
+    return output
+
+
+@register_spyre_lowering(
+    torch.ops.aten.add.Tensor,
+    type_promotion_kind=None,
+)
+def lower_add(x, y, *, alpha=1):
+    if alpha != 1:
+        alpha_tensor = lower_full(
+            y.get_size(),
+            float(alpha),
+            dtype=y.get_dtype(),
+            device=y.get_device(),
+        )
+        alpha_tensor.realize()
+        y = with_int64_fallback(lowering.mul, y, alpha_tensor)
+        y.realize()
+    return with_int64_fallback(lowering.add, x, y)
+
+
+@register_spyre_lowering(
+    torch.ops.aten.mul.Tensor,
+    type_promotion_kind=None,
+)
+def lower_mul(x, y):
+    return with_int64_fallback(lowering.mul, x, y)
+
+
+@register_spyre_lowering(
+    torch.ops.aten.sub.Tensor,
+    type_promotion_kind=None,
+)
+def lower_sub(x, y, *, alpha=1):
+    if alpha != 1:
+        alpha_tensor = lower_full(
+            y.get_size(),
+            float(alpha),
+            dtype=y.get_dtype(),
+            device=y.get_device(),
+        )
+        alpha_tensor.realize()
+        y = with_int64_fallback(lowering.mul, y, alpha_tensor)
+        y.realize()
+    return with_int64_fallback(lowering.sub, x, y)
+
+
+@register_spyre_lowering(
+    torch.ops.aten.minimum.default,
+    type_promotion_kind=None,
+)
+def lower_minimum(x, y):
+    return with_int64_fallback(lowering.minimum, x, y)
+
+
+@register_spyre_lowering(
+    torch.ops.aten.maximum.default,
+    type_promotion_kind=None,
+)
+def lower_maximum(x, y):
+    return with_int64_fallback(lowering.maximum, x, y)
+
+
+@register_spyre_lowering(torch.ops.spyre.qfp8ch)
+def lower_qfp8ch(x):
+    """
+    Lower qfp8ch operation - channel-wise FP8 format conversion.
+
+    Pointwise format conversion only (no scaling).
+    """
+
+    fn = lowering.ops_wrapper(torch.ops.spyre.qfp8ch.__name__)
+    x_loader = x.make_loader()
+
+    def inner_fn(index):
+        return fn(x_loader(index))
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=torch.float8_e4m3fn,
+        inner_fn=inner_fn,
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw
+
+
+@register_spyre_lowering(
+    torch.ops.spyre.prod_dim_int,
+    type_promotion_kind=None,
+)
+def lower_prod_dim(x, dim, keepdim=False):
+    def _prod_dim_impl(x):
+        kwargs = lowering._make_reduction_inner(
+            x, axis=[dim], keepdims=keepdim, dtype=x.dtype, override_return_dtype=None
+        )
+        result = Reduction.create(reduction_type="prod", input_node=x, **kwargs)
+        result.realize()
+        return result
+
+    return with_int64_fallback(_prod_dim_impl, x)

@@ -18,19 +18,58 @@ from typing import Optional
 from abc import ABC, abstractmethod
 import math
 
+from torch_spyre._inductor.logging_utils import get_inductor_logger
+
+logger = get_inductor_logger("scratchpad.plan_solver")
+
 
 @dataclass
 class LifetimeBoundBuffer:
     """
     Defines the data fields required for a plan solver.
+
+    ``uses`` is the sorted list of operation indices at which the buffer is
+    accessed (as returned by ``calculate_liveness``).  It must be non-empty:
+    the ``start_time``/``end_time`` properties index into it and the
+    FirstFit/BestFit scoring divides by ``len(uses)``, so callers must only
+    construct buffers for names that are actually used.  ``first_use_is_read``
+    is True for graph inputs (all accesses are reads) and False for computed
+    buffers (first access is a write, all subsequent accesses are reads).
+
+    ``start_time`` and ``end_time`` are convenience properties derived from
+    ``uses``: ``uses[0]`` and ``uses[-1] + 1`` respectively.
     """
 
     name: str
     size: int
-    start_time: int
-    end_time: int
+    uses: list[int]
+    first_use_is_read: bool = False
     address: Optional[int] = None
     in_place_parents: list[str] = field(default_factory=list)
+
+    @property
+    def start_time(self) -> int:
+        return self.uses[0]
+
+    @property
+    def end_time(self) -> int:
+        return self.uses[-1] + 1
+
+
+def _assert_in_place_relationships(buffers: list["LifetimeBoundBuffer"]) -> None:
+    """Assert that all declared in-place parent/child pairs satisfy required invariants."""
+    buf_by_name = {b.name: b for b in buffers}
+    for child in buffers:
+        for parent_name in child.in_place_parents:
+            parent = buf_by_name[parent_name]
+            assert parent.end_time == child.start_time + 1, (
+                f"In-place parent {parent_name}.end_time={parent.end_time} must equal "
+                f"child {child.name}.start_time+1={child.start_time + 1}"
+            )
+            assert child.size <= parent.size, (
+                f"In-place child {child.name}.size={child.size} "
+                f"must be <= parent {parent_name}.size={parent.size}"
+            )
 
 
 class MemoryPlanSolver(ABC):
@@ -51,11 +90,10 @@ class MemoryPlanSolver(ABC):
         """
         self.limit = size
         self.alignment = alignment
-        self.usage: list[LifetimeBoundBuffer] = []
 
     @abstractmethod
     def plan_layout(
-        self, buffers: list[LifetimeBoundBuffer]
+        self, buffers: list[LifetimeBoundBuffer], log_lx_usage: bool = False
     ) -> list[LifetimeBoundBuffer]:
         """
         Utilizes an implementation defined algorithm to determine
@@ -64,6 +102,7 @@ class MemoryPlanSolver(ABC):
 
         Args:
             buffers (list[LifetimeBoundBuffer]): The set of candidate buffers for memory planning
+            log_lx_usage (bool): If True, emit per-timestep scratchpad usage at DEBUG level.
 
         Returns:
             list[LifetimeBoundBuffer]: The set of buffers with their placements defined.
@@ -72,6 +111,12 @@ class MemoryPlanSolver(ABC):
 
 
 class GreedyLayoutSolver(MemoryPlanSolver):
+    def __init__(self, size: int, alignment: int = 128):
+        super().__init__(size, alignment)
+        # `usage` tracks live placements during planning. It is specific to the
+        # greedy time-stepping algorithm; the gap-based solvers don't use it.
+        self.usage: list[LifetimeBoundBuffer] = []
+
     def _get_lowest_addr_in_use(self):
         return min(
             (rec.address for rec in self.usage if rec.address is not None),
@@ -141,7 +186,7 @@ class GreedyLayoutSolver(MemoryPlanSolver):
                 self.usage.remove(buf)
 
     def plan_layout(
-        self, buffers: list[LifetimeBoundBuffer]
+        self, buffers: list[LifetimeBoundBuffer], log_lx_usage: bool = False
     ) -> list[LifetimeBoundBuffer]:
         """Allocates addresses to the provided buffer list
 
@@ -175,6 +220,7 @@ class GreedyLayoutSolver(MemoryPlanSolver):
         assert all(buf.address is None for buf in buffers), (
             "Buffers cannot be previously or partially planned"
         )
+        _assert_in_place_relationships(buffers)
 
         self.usage = []
 
@@ -197,5 +243,16 @@ class GreedyLayoutSolver(MemoryPlanSolver):
             for buffer in buffers:
                 if idx == buffer.start_time:
                     self._try_allocate(buffer)
+
+        if log_lx_usage and logger.isEnabledFor(10):  # logging.DEBUG
+            logger.debug("scratchpad limit: %d KB", self.limit // 1024)
+            for idx in range(sorted_times[0], sorted_times[-1]):
+                live = []
+                used = 0
+                for b in buffers:
+                    if b.address is not None and b.start_time <= idx < b.end_time:
+                        live.append(f"{b.name}_{b.size // 1024}KB@{hex(b.address)}")
+                        used += b.size
+                logger.debug("t=%d: %d KB  [%s]", idx, used // 1024, ", ".join(live))
 
         return buffers

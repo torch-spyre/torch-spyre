@@ -49,7 +49,7 @@ def make_lx_planning_class(cls):
         "",
         (torch_spyre._inductor.config, "lx_planning", True),
         (torch_spyre._inductor.config, "allow_all_ops_in_lx_planning", True),
-        (torch_spyre._inductor.config, "sencores", 1),
+        (torch_spyre._inductor.config, "sencores", 32),
     )
 
 
@@ -90,6 +90,27 @@ def _canonical_test_names(test_cls):
     return canonical
 
 
+# Delegator test methods in ``TestOps`` whose body simply calls a sibling
+# ``self.test_*()`` by its bare name (e.g. ``test_eq_scalar_constant_zero``
+# -> ``self.test_eq_scalar_zero()``). The LX-planning wrap renames every test
+# with a ``_{suffix}`` suffix, so those bare-name calls raise ``AttributeError``
+# on the wrapped class. They are redundant aliases of canonical tests that are
+# already wrapped, so skip wrapping them entirely. (The skip-lists below cannot
+# cover this because ``TEST_LX_PLANNING_RUN_SKIPS=1`` bypasses them.)
+_DELEGATOR_TESTS = frozenset(
+    {
+        "test_scalar_comparison",
+        "test_eq_scalar_constant_int",
+        "test_eq_scalar_constant_float",
+        "test_eq_scalar_constant_negative",
+        "test_eq_scalar_constant_zero",
+        "test_eq_scalar_constant_multidim",
+        "test_eq_scalar_constant_large_tensor",
+        "test_eq_scalar_vs_tensor_comparison",
+    }
+)
+
+
 def _copy_canonical_tests(
     src_cls, dst_cls, suffix, test_failures, inherited_test_attributes
 ):
@@ -103,6 +124,8 @@ def _copy_canonical_tests(
     )
     for name, value in src_cls.__dict__.items():
         if not name.startswith("test_"):
+            continue
+        if name in _DELEGATOR_TESTS:
             continue
         if keep is not None and name not in keep:
             continue
@@ -125,30 +148,13 @@ INHERITED_TEST_ATTRIBUTES = [
 ]
 
 POINTWISE_TEST_FAILURES = [
-    "test_addmm_1152_10x1152_1152x1152",
-    "test_bmm_bmm_2x55x2_2x2x99",
-    "test_bmm_bmm_2x99x65_2x65x55",
-    "test_cat_1d_dim0",
-    "test_cat_1d_dim0_three_tensors",
-    "test_cat_2d_dim0_diff_size",
-    "test_cat_2d_dim0_three_tensors",
-    "test_cat_2d_dim1_diff_size",
-    "test_cat_3d_dim0",
-    "test_cat_3d_dim1",
-    "test_cat_3d_dim1_size1",
-    "test_cat_3d_dim2",
-    "test_cat_4d_dim0",
-    "test_cat_4d_dim1",
-    "test_cat_4d_dim2",
-    "test_cat_4d_dim3",
-    "test_cat_4d_dim3_fp32",
-    "test_einsum_einsum_55x2_2x99",
+    "test_conv2d_1x3x32_ksize3_no_pad",
+    "test_conv2d_1x64_ksize3_depthwise",
+    "test_conv2d_2x32_ksize1_stride2",
+    "test_conv2d_2x3x32_ksize1",
+    "test_conv2d_mistral_model",
     "test_einsum_einsum_67x255_255x128",
     "test_einsum_einsum_67x256_256x128",
-    "test_einsum_einsum_67x67_67x67",
-    "test_fallback_1d",
-    "test_fallback_2d",
-    "test_fallback_3d",
     # torch.flatten tests - Contiguous access pattern with span of 4 elements
     # within 64-wide padded stick not supported. Requires Mod(d0, ELEMS_PER_STICK)
     # support for partially-filled contiguous regions. See PR #1866.
@@ -164,51 +170,49 @@ POINTWISE_TEST_FAILURES = [
     "test_flatten_4d_large_full",
     "test_flatten_4d_trailing",
     "test_full_value_1",
-    "test_full_value_2",
-    "test_large_matmul_matmul_3d_M3_K11_N2880",
-    "test_large_matmul_matmul_4d_B2_H2_M2048_K2048_N65536",
-    "test_matmul_matmul_2x3x55x2_2x3x2x99",
-    "test_matmul_matmul_2x3x99x65_2x3x65x55",
-    "test_matmul_matmul_2x55x2_2x2x99",
-    "test_matmul_matmul_2x99x65_2x65x55",
     "test_matmul_matmul_55x2_2x99",
-    "test_matmul_matmul_99x65_65x55",
+    "test_matmul_tiled_y",
     "test_mm_autocast_f16_disabled",
     "test_mm_autocast_f16_enabled",
     "test_mm_mm_55x2_2x99",
-    "test_mm_mm_67x255_255x128",
-    "test_mm_mm_67x67_67x67",
-    "test_pad_2d_both_dims",
-    "test_pad_2d_dim0_left",
-    "test_pad_2d_dim0_left_only",
-    "test_pad_2d_last_dim_left_and_right_stick_aligned",
-    "test_pad_2d_last_dim_left_stick_aligned",
-    "test_pad_2d_last_dim_left_two_sticks",
-    "test_pad_2d_last_dim_right",
-    "test_pad_3d_dim0_left",
-    "test_pad_3d_dim1_left",
-    "test_pad_3d_dim1_right",
-    "test_pad_3d_last_dim_right",
-    "test_pad_4d_dim0_left",
-    "test_qkv_attn_paths_fms_decode_gqa",
-    "test_reduce_edge_multidim_keepdim0_sum_large_2d_dim_01_all",
-    "test_reduce_edge_multidim_keepdim1_sum_large_2d_dim_01_all",
-    "test_squeeze_reduction_sum_3d0",
-    "test_squeeze_reduction_sum_4d0",
-    "test_squeeze_single_3d0",
-    "test_squeeze_single_4d0",
-    "test_t_2d_49159x4096",
-    "test_t_2d_contiguous_4096x49280",
-    "test_t_2d_contiguous_49280x4096",
-    "test_topk_2d_k4_dim0",
-    "test_transpose_2d_large_dim_0_1",
-    "test_transpose_2d_large_dim_0_1_nopad",
-    "test_transpose_2d_large_dim_0_2",
-    "test_transpose_2d_large_dim_0_2_nopad",
-    "test_transpose_2d_large_dim_1_2",
-    "test_transpose_2d_large_dim_1_2_nopad",
-    "test_transpose_4d_contiguous_dim_0_3",
-    "test_transpose_4d_contiguous_dim_1_3",
+    "test_slice_stick_reduce_dim2_amax_3d64_0",
+    "test_slice_stick_reduce_dim2_sum_3d64_0",
+    "test_restickify_add_transpose_10x20_add_transpose",
+    "test_restickify_add_transpose_7x13_add_transpose",
+    "test_restickify_add_transpose_64x129_add_transpose",
+    # unfold: lx_planning cannot handle multi-variable stick expressions produced
+    # by unfold's overlapping/strided access patterns (e.g. d0+d1, 4*d0+d1).
+    # Tracked by issue #2346.
+    "test_unfold_1d_large",
+    "test_unfold_1d_no_overlap",
+    "test_unfold_1d_step1",
+    "test_unfold_1d_step2",
+    "test_unfold_2d_dim0",
+    "test_unfold_2d_dim1",
+    "test_unfold_2d_dim_neg",
+    "test_unfold_2d_square",
+    "test_unfold_3d_dim0",
+    "test_unfold_3d_dim1",
+    "test_unfold_3d_dim2",
+    "test_unfold_4d_batch",
+    "test_unfold_4d_cnn",
+    "test_unfold_4d_spatial",
+    "test_unfold_edge_large_step",
+    "test_unfold_edge_nopad_2d",
+    "test_unfold_edge_nopad_37",
+    "test_unfold_edge_pow2_64",
+    "test_conv2d_1x3x32_ksize3_no_pad",
+    "test_unbind_1d_dim0",
+    "test_where_self_out_where_fp16_2d",
+    "test_unbind_2d_dim0",
+    "test_unbind_2d_dim1",
+    "test_unbind_2d_dimneg1",
+    "test_unbind_3d_dim0",
+    "test_unbind_3d_dim1",
+    "test_unbind_3d_dim2",
+    "test_unbind_3d_dimneg1",
+    "test_unbind_4d_dim0",
+    "test_unbind_4d_dim3",
 ]
 
 
@@ -261,9 +265,11 @@ class LxPlanningTwoOpPointwiseAdditionTest(_LxPlanningTwoOpTestBase):
         def make_seq_of_ops(*fn_args, **fn_kwargs):
             result = fn(*fn_args, **fn_kwargs)
             return pytree.tree_map(
-                lambda x: x + x
-                if isinstance(x, torch.Tensor) and x.dtype == torch.float16
-                else x,
+                lambda x: (
+                    (x + x) / 2
+                    if isinstance(x, torch.Tensor) and x.dtype == torch.float16
+                    else x
+                ),
                 result,
             )
 
@@ -280,117 +286,95 @@ _copy_canonical_tests(
 
 
 REDUCTION_TEST_FAILURES = [
-    "test_activation_cls_gelu_fp16",
     "test_addmm_1152_10x1152_1152x1152",
     "test_addmm_out_basic",
-    "test_addmm_scaled_alpha_0_5",
+    "test_alias_operands_cube_67x256",
     "test_alias_operands_cube_67x71x256",
     "test_alias_operands_double_67x71x256",
+    "test_alias_operands_triple_67x256",
     "test_alias_operands_triple_67x71x256",
-    "test_bmm_bmm_2x55x2_2x2x99",
-    "test_bmm_bmm_2x99x65_2x65x55",
-    "test_cat_1d_dim0",
-    "test_cat_1d_dim0_three_tensors",
-    "test_cat_2d_dim0_diff_size",
-    "test_cat_2d_dim0_three_tensors",
-    "test_cat_2d_dim1_diff_size",
-    "test_cat_3d_dim0",
-    "test_cat_3d_dim1",
-    "test_cat_3d_dim1_size1",
-    "test_cat_3d_dim2",
-    "test_cat_4d_dim0",
-    "test_cat_4d_dim1",
-    "test_cat_4d_dim2",
-    "test_cat_4d_dim3",
-    "test_cat_4d_dim3_fp32",
-    "test_copy_roundtrip_3d",
-    "test_copy_roundtrip_4d_stick",
-    "test_einsum_einsum_55x2_2x99",
+    "test_conv2d_1x3x32_ksize3_no_pad",
+    "test_conv2d_1x64_ksize3_depthwise",
+    "test_conv2d_2x32_ksize1_stride2",
+    "test_conv2d_2x3x32_ksize1",
+    "test_conv2d_mistral_model",
     "test_einsum_einsum_67x255_255x128",
-    "test_einsum_einsum_67x256_256x128",
-    "test_einsum_einsum_67x67_67x67",
-    "test_fallback_1d",
-    "test_fallback_2d",
-    "test_fallback_3d",
     # torch.flatten tests - Contiguous access pattern with span of 4 elements
     # within 64-wide padded stick not supported. Requires Mod(d0, ELEMS_PER_STICK)
     # support for partially-filled contiguous regions. See PR #1866.
+    "test_flatten_2d_full",
+    "test_flatten_3d_full",
+    "test_flatten_3d_leading",
+    "test_flatten_3d_mixed_dims",
     "test_flatten_3d_neg_dims",
+    "test_flatten_3d_neg_full",
+    "test_flatten_3d_noncontig_full",
     "test_flatten_3d_noncontig_partial",
     "test_flatten_3d_trailing",
+    "test_flatten_4d_full",
+    "test_flatten_4d_large_full",
+    "test_flatten_4d_leading",
     "test_flatten_4d_trailing",
     "test_full_value_1",
-    "test_full_value_2",
     "test_large_matmul_matmul_2d_M2048_K2048_N65536",
-    "test_large_matmul_matmul_3d_M3_K11_N2880",
-    "test_large_matmul_matmul_4d_B2_H2_M2048_K2048_N65536",
-    "test_linear_2d_bias",
-    "test_linear_2d_no_bias",
-    "test_matmul_matmul_2x3x55x2_2x3x2x99",
-    "test_matmul_matmul_2x3x99x65_2x3x65x55",
-    "test_matmul_matmul_2x55x2_2x2x99",
-    "test_matmul_matmul_2x99x65_2x65x55",
-    "test_matmul_matmul_55x2_2x99",
-    "test_matmul_matmul_99x65_65x55",
+    "test_matmul_tiled_y",
     "test_mm_autocast_f16_disabled",
     "test_mm_autocast_f16_enabled",
-    "test_mm_mm_55x2_2x99",
-    "test_mm_mm_67x255_255x128",
-    "test_mm_mm_67x67_67x67",
-    "test_pad_2d_both_dims",
-    "test_pad_2d_dim0_left",
-    "test_pad_2d_dim0_left_only",
-    "test_pad_2d_last_dim_left_and_right_stick_aligned",
-    "test_pad_2d_last_dim_left_stick_aligned",
-    "test_pad_2d_last_dim_left_two_sticks",
-    "test_pad_2d_last_dim_right",
-    "test_pad_3d_dim0_left",
-    "test_pad_3d_dim1_left",
-    "test_pad_3d_dim1_right",
-    "test_pad_3d_last_dim_right",
-    "test_pad_4d_dim0_left",
-    "test_permute_4d_0_3_1_2",
-    "test_permute_4d_0_m2_m1_1",
-    "test_pointwise_binary_op_add_67x71x256_67x71x256",
     "test_pointwise_binary_op_div_67x256_67x256",
     "test_pointwise_binary_op_div_67x71x256_67x71x256",
     "test_pointwise_range_op_clamp_fp16",
-    "test_pointwise_unary_op_reciprocal_67x256",
     "test_pointwise_unary_op_reciprocal_67x71x256",
-    "test_qkv_attn_paths_fms_decode_gqa",
-    "test_reduce_edge_multidim_keepdim0_sum_large_2d_dim_01_all",
-    "test_reduce_edge_multidim_keepdim1_sum_large_2d_dim_01_all",
-    "test_rmsnorm_2d",
+    "test_round_trip_to_dtype_add_float16_to_float32_4x8x128",
     "test_scalar_cpu_combined_3d",
-    "test_scalar_cpu_combined_4d",
-    "test_scalar_cpu_div_2d",
-    "test_scalar_cpu_mul_2d",
-    "test_scalar_cpu_true_divide_2d",
-    "test_split_split3_1d0s0",
-    "test_split_split3_1d0s1",
-    "test_split_split3_1d0s2",
-    "test_split_split3_2d0s1",
-    "test_split_split3_2d0s2",
-    "test_split_split3_3d0s1",
-    "test_split_split3_3d0s2",
-    "test_squeeze_reduction_sum_3d0",
-    "test_squeeze_reduction_sum_4d0",
-    "test_squeeze_single_3d0",
-    "test_squeeze_single_4d0",
+    "test_slice_add_3d1s0",
+    "test_slice_add_3d1s1",
+    "test_slice_add_3d1s2",
+    "test_slice_add_3d2s0",
+    "test_slice_add_3d2s1",
+    "test_slice_add_3d2s2",
+    "test_slice_stick_reduce_dim2_sum_3d64_0",
     "test_t_2d_49159x4096",
-    "test_t_2d_contiguous_1088x320",
-    "test_t_2d_contiguous_320x320",
     "test_t_2d_contiguous_4096x49280",
     "test_t_2d_contiguous_49280x4096",
-    "test_topk_2d_k4_dim0",
     "test_transpose_2d_large_dim_0_1",
     "test_transpose_2d_large_dim_0_1_nopad",
     "test_transpose_2d_large_dim_0_2",
     "test_transpose_2d_large_dim_0_2_nopad",
-    "test_transpose_2d_large_dim_1_2",
-    "test_transpose_2d_large_dim_1_2_nopad",
-    "test_transpose_4d_contiguous_dim_0_3",
-    "test_transpose_4d_contiguous_dim_1_3",
+    "test_restickify_add_transpose_10x20_add_transpose",
+    "test_restickify_add_transpose_7x13_add_transpose",
+    "test_restickify_add_transpose_64x129_add_transpose",
+    # unfold: same as POINTWISE — multi-variable stick expressions. Issue #2346.
+    "test_unfold_1d_large",
+    "test_unfold_1d_no_overlap",
+    "test_unfold_1d_step1",
+    "test_unfold_1d_step2",
+    "test_unfold_2d_dim0",
+    "test_unfold_2d_dim1",
+    "test_unfold_2d_dim_neg",
+    "test_unfold_2d_square",
+    "test_unfold_3d_dim0",
+    "test_unfold_3d_dim1",
+    "test_unfold_3d_dim2",
+    "test_unfold_4d_batch",
+    "test_unfold_4d_cnn",
+    "test_unfold_4d_spatial",
+    "test_unfold_edge_large_step",
+    "test_unfold_edge_nopad_2d",
+    "test_unfold_edge_nopad_37",
+    "test_unfold_edge_pow2_64",
+    "test_conv2d_1x3x32_ksize3_no_pad",
+    "test_unbind_1d_dim0",
+    "test_unbind_2d_dim0",
+    "test_unbind_2d_dim1",
+    "test_unbind_2d_dimneg1",
+    "test_unbind_3d_dim0",
+    "test_unbind_3d_dim1",
+    "test_unbind_3d_dim2",
+    "test_unbind_3d_dimneg1",
+    "test_unbind_4d_dim0",
+    "test_unbind_4d_dim3",
+    "test_einsum_einsum_67x256_256x128",
+    "test_t_2d_contiguous_1088x320",
 ]
 
 
@@ -400,9 +384,11 @@ class LxPlanningTwoOpReductionTest(_LxPlanningTwoOpTestBase):
         def make_seq_of_ops(*fn_args, **fn_kwargs):
             result = fn(*fn_args, **fn_kwargs)
             return pytree.tree_map(
-                lambda x: torch.sum(x, dim=0)
-                if isinstance(x, torch.Tensor) and x.dtype == torch.float16
-                else x,
+                lambda x: (
+                    torch.sum(x, dim=0)
+                    if isinstance(x, torch.Tensor) and x.dtype == torch.float16
+                    else x
+                ),
                 result,
             )
 

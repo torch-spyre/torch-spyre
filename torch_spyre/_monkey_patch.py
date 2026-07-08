@@ -15,16 +15,12 @@
 
 from torch_spyre.constants import DEVICE_NAME
 
-from typing import Optional
-from torch_spyre._C import (
-    get_spyre_tensor_layout,
-    empty_with_layout,
-    spyre_empty_with_layout,
-    copy_tensor,
-)
+from typing import Optional, TYPE_CHECKING
 
 from torch._dynamo.guards import GuardBuilder
-from torch_spyre._C import SpyreTensorLayout
+
+if TYPE_CHECKING:
+    from torch_spyre._C import SpyreTensorLayout
 
 
 def _patch_tensor_for_spyre():
@@ -64,22 +60,20 @@ def _patch_tensor_for_spyre():
         # Non-spyre tensors use normal behavior
         return orig_repr(self)
 
-    def device_tensor_layout(self: torch.Tensor) -> Optional[SpyreTensorLayout]:
+    def device_tensor_layout(self: torch.Tensor) -> Optional["SpyreTensorLayout"]:
         if self.device is not None and self.device.type == DEVICE_NAME:
             if isinstance(self, torch._subclasses.FakeTensor):
                 return None  # catch FakeTensor BEFORE calling device_tensor_layout()
+            from torch_spyre._C import get_spyre_tensor_layout
+
             return get_spyre_tensor_layout(self)
         else:
             return None
 
     def spyre_to(self, *args, device_layout=None, **kwargs):
         if device_layout is None:
-            # If caller is doing a combined device+dtype move on a Spyre tensor
-            # (e.g. tensor.to("spyre", dtype=torch.int64) or
-            #        tensor.to(device="spyre", dtype=torch.int64)),
-            # split into two steps: cast dtype on CPU first, then copy to device.
-            # This avoids "does not support type conversion during copy" in the
-            # DCI (DataConversionInfo) C++ code in spyre_mem.cpp.
+            # Support D2H and H2D dtype casting via DCI (DataConversionInfo) in spyre_mem.cpp.
+            # For D2D data casting, split it into a D2H copy and a H2D dtype conversion.
             _device = kwargs.get("device", None)
             if (
                 _device is None
@@ -95,12 +89,19 @@ def _patch_tensor_for_spyre():
                 _device is not None
                 and _dtype is not None
                 and self.device.type == DEVICE_NAME
+                and torch.device(_device).type == DEVICE_NAME
             ):
-                # Step 1: cast dtype on CPU
-                tmp = orig_to(self, dtype=_dtype)
-                # Step 2: plain H2D copy with no dtype change
-                return orig_to(tmp, _device)
+                import warnings
 
+                warnings.warn(
+                    "D2D dtype conversion on Spyre is not directly supported. "
+                    "Using CPU as an intermediate for the cast.",
+                    stacklevel=2,
+                )
+                # Step 1: plain D2H copy (no dtype change)
+                tmp = orig_to(self, "cpu")
+                # Step 2: cast dtype via H2D
+                return orig_to(tmp, _device, dtype=_dtype)
             return orig_to(self, *args, **kwargs)
         else:
             # Check if copy kwarg is explicitly set
@@ -130,11 +131,15 @@ def _patch_tensor_for_spyre():
             if dtype is None:
                 dtype = self.dtype
 
+            from torch_spyre._C import spyre_empty_with_layout
+
             dst = spyre_empty_with_layout(
                 self.size(), self.stride(), dtype, device_layout
             )
 
             if self.device.type == "cpu":
+                from torch_spyre._C import copy_tensor
+
                 copy_tensor(self, dst, non_blocking=False)
                 return dst
             else:  # device to device copy
@@ -178,6 +183,8 @@ def _patch_tensor_for_spyre():
             # layout_opt is omitted; c10::Layout has no pybind11 type caster,
             # so py_empty_with_layout drops that parameter and always uses
             # the default (Strided).
+            from torch_spyre._C import empty_with_layout
+
             return empty_with_layout(
                 *args, device_layout, dtype, device, pin_memory, memory_format
             )
@@ -187,6 +194,17 @@ def _patch_tensor_for_spyre():
     torch.Tensor._spyre_tensor_patched = True
     torch.Tensor.to = spyre_to
     torch.empty = spyre_empty
+
+    # ── Optimal weight loading (issue #1339) ──────────────
+    # Patch dim_order=[1,0] transfer + nn.Module.to override (issue #1339).
+    try:
+        from torch_spyre.model_utils import patch_module_to_for_spyre
+
+        patch_module_to_for_spyre()
+    except Exception as e:  # pragma: no cover - defensive
+        import warnings
+
+        warnings.warn(f"Failed to install optimal weight layout patches: {e}")
 
     # ── SpyreTensorLayout Guard Extension ────────────
     # Extends TENSOR_MATCH to guard on SpyreTensorLayout

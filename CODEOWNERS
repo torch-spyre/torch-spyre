@@ -12,21 +12,19 @@
 *  @mudhakar @raghukiran1224 @viji560 @tehbone @svaidy @elpidatz
 
 # torch_spyre top-level files (runtime infrastructure)
-/torch_spyre/*       @JRosenkranz @thoangtrvn
+/torch_spyre/*       @JRosenkranz @thoangtrvn @ani300
 
 # Inductor / compiler backend
 /torch_spyre/_inductor/  @dgrove-oss @avery-blanchard @cyang49 @marnold-ibm @tardieu
 
 # Device, execution, memory, and C++ runtime
-/torch_spyre/device/     @JRosenkranz @thoangtrvn
-/torch_spyre/execution/  @JRosenkranz @thoangtrvn
-/torch_spyre/memory/     @JRosenkranz @thoangtrvn
-/torch_spyre/csrc/       @JRosenkranz @thoangtrvn
+/torch_spyre/device/     @JRosenkranz @thoangtrvn @ani300
+/torch_spyre/execution/  @JRosenkranz @thoangtrvn @ani300
+/torch_spyre/memory/     @JRosenkranz @thoangtrvn @ani300
+/torch_spyre/csrc/       @JRosenkranz @thoangtrvn @ani300
 
 # Distributed / collective communication (spyre_ccl)
 /torch_spyre/csrc/distributed/  @jjhursey @JRosenkranz @thoangtrvn
-/tests/distributed/              @jjhursey @thoangtrvn @avery-blanchard
-/examples/distributed/           @jjhursey @thoangtrvn @avery-blanchard
 
 # Profiler
 /torch_spyre/profiler/   @ppnaik1890 @kaoutar55 @flop1971
@@ -36,14 +34,18 @@
 /codegen/                @ani300 @moriohara @pradghos
 
 # Tests
-/tests/                  @avery-blanchard @moriohara @ashokponkumar @JRosenkranz @dgrove-oss @tardieu @ani300 @pradghos
+/tests/                  @avery-blanchard @moriohara @ashokponkumar @JRosenkranz @dgrove-oss @tardieu @ani300 @pradghos @anubhavjana @n-marion @thoangtrvn @cyang49 @marnold-ibm @jjhursey
+
+# Distributed tests (more specific than /tests/ above — must come after it so
+# the last-matching-pattern rule gives these owners precedence)
+/tests/distributed/      @jjhursey @thoangtrvn @avery-blanchard
 
 # Documentation
 /docs/                   @kaoutar55 @dgrove-oss @mudhakar @raghukiran1224 @viji560 @tehbone
 
 # CI/CD
-/.github/                 @ashokponkumar @jabostian
-/.pre-commit-config.yaml  @ashokponkumar @jabostian
-/pytest.ini               @ashokponkumar @jabostian
-/pytest_models.ini        @ashokponkumar @jabostian
-/Makefile                 @ashokponkumar @jabostian
+/.github/                 @ashokponkumar @jabostian @anubhavjana @n-marion
+/.pre-commit-config.yaml  @ashokponkumar @jabostian @anubhavjana @n-marion
+/pytest.ini               @ashokponkumar @jabostian @anubhavjana @n-marion
+/pytest_models.ini        @ashokponkumar @jabostian @anubhavjana @n-marion
+/Makefile                 @ashokponkumar @jabostian @anubhavjana @n-marion

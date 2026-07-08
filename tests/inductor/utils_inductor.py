@@ -691,7 +691,7 @@ def compare_with_cpu(
 
         if cpu_compile:
             cpu_other_result = _compile_and_run(
-                fn, get_args(), "cpu", needs_device=needs_device, compile=compiled
+                fn, get_args(), "cpu", needs_device=needs_device, compile=True
             )
             _assert_results_close(
                 spyre_result,
@@ -710,7 +710,7 @@ def compare_with_pytorch(fn, fn_pytorch, *args, atol=0.1, rtol=0.1, target=None)
     _assert_results_close(target, pytorch_result, atol, rtol, "pytorch")
 
 
-def copy_tests(my_cls, other_cls, suffix, test_failures=None, xfail_prop=None):  # noqa: B902
+def copy_tests(my_cls, other_cls, suffix, test_failures=None, xfail_prop=None):
     for name, value in my_cls.__dict__.items():
         if name.startswith("test_"):
             # You cannot copy functions in Python, so we use closures here to

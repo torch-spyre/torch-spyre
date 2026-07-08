@@ -80,15 +80,14 @@ cases:
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [4096, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'foundation-model-stack/fms/modules/attention.py:443 in forward, code: queries = self.query(q)'
     marks:
       - bf16operation
@@ -102,15 +101,14 @@ cases:
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1024, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'foundation-model-stack/fms/modules/attention.py:444 in forward, code: keys = self.key(k)'
     marks:
       - bf16operation
@@ -605,15 +603,14 @@ cases:
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [12800, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'foundation-model-stack/fms/modules/feedforward.py:294 in forward, code: out = self.a(self.wg(x)) * self.w1(x)'
     marks:
       - bf16operation
@@ -660,15 +657,14 @@ cases:
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [4096, 12800]
           stride: [12800, 1]
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'foundation-model-stack/fms/modules/feedforward.py:297 in forward, code: return self.w2(out)'
     marks:
       - bf16operation
@@ -1884,15 +1880,14 @@ cases:
           storage_offset: 0
           dtype: torch.bfloat16
           device: cpu
-          init: rand
+          init: xavier
       - tensor:
           shape: [49159, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.bfloat16
           device: cpu
-          init: rand
-      - value: null
+          init: xavier
     description: 'foundation-model-stack/fms/models/granite.py:381 in torch_dynamo_resume_in_forward_at_380, code: preds = self.head(output.to("cpu")).to("cuda")'
     marks:
       - bf16operation
@@ -2004,15 +1999,14 @@ cases:
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [4096, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'foundation-model-stack/fms/modules/attention.py:443 in forward, code: queries = self.query(q)'
     marks:
       - bf16operation
@@ -2026,15 +2020,14 @@ cases:
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1024, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'foundation-model-stack/fms/modules/attention.py:444 in forward, code: keys = self.key(k)'
     marks:
       - bf16operation
@@ -2556,15 +2549,14 @@ cases:
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [12800, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'foundation-model-stack/fms/modules/feedforward.py:294 in forward, code: out = self.a(self.wg(x)) * self.w1(x)'
     marks:
       - bf16operation
@@ -2611,15 +2603,14 @@ cases:
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [4096, 12800]
           stride: [12800, 1]
           storage_offset: 0
           dtype: torch.bfloat16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'foundation-model-stack/fms/modules/feedforward.py:297 in forward, code: return self.w2(out)'
     marks:
       - bf16operation
@@ -3819,15 +3810,14 @@ cases:
           storage_offset: 0
           dtype: torch.bfloat16
           device: cpu
-          init: rand
+          init: xavier
       - tensor:
           shape: [49159, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.bfloat16
           device: cpu
-          init: rand
-      - value: null
+          init: xavier
     description: 'foundation-model-stack/fms/models/granite.py:381 in torch_dynamo_resume_in_forward_at_380, code: preds = self.head(output.to("cpu")).to("cuda")'
     marks:
       - bf16operation

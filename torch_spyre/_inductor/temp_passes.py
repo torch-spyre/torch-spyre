@@ -15,7 +15,6 @@
 # This file contains inductor passes that are only needed as temp fixes
 
 import torch
-from torch._inductor.ir import ComputedBuffer
 from torch._inductor.pattern_matcher import (
     Arg,
     CallFunction,
@@ -24,13 +23,12 @@ from torch._inductor.pattern_matcher import (
     register_graph_pattern,
 )
 from .logging_utils import get_inductor_logger
-from .propagate_hints import get_op_hints
-from .propagate_named_dims import named_dims_for_sym
+from .constants import SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY
+from .pass_utils import copy_fx_custom_meta
 
 aten = torch.ops.aten
 
 logger = get_inductor_logger("work_division")
-hints_logger = get_inductor_logger("process_hints")
 
 _RESHAPE_OPS = (
     aten.view.default,
@@ -40,6 +38,115 @@ _RESHAPE_OPS = (
 
 mm_to_bmm_pass = PatternMatcherPass(pass_name="unflatten_mm_to_bmm")
 bmm_unflatten_pass = PatternMatcherPass(pass_name="unflatten_bmm_batch_dims")
+
+
+def _is_static_one(value) -> bool:
+    try:
+        return int(value) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_static_multiple(value, divisor: int) -> bool:
+    try:
+        return int(value) % divisor == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _has_stick_aligned_matmul_dims(k, n) -> bool:
+    return _is_static_multiple(k, 64) and _is_static_multiple(n, 64)
+
+
+def _node_shape(node: torch.fx.Node) -> list[int] | None:
+    val = node.meta.get("val")
+    shape = getattr(val, "shape", None)
+    if shape is None:
+        return None
+    return list(shape)
+
+
+def _mark_static_unit_batch_bmm(
+    bmm_node: torch.fx.Node, lhs_node: torch.fx.Node, rhs_node: torch.fx.Node
+) -> None:
+    lhs_shape = _node_shape(lhs_node)
+    rhs_shape = _node_shape(rhs_node)
+    out_shape = _node_shape(bmm_node)
+    if lhs_shape is None or rhs_shape is None or out_shape is None:
+        return
+    if len(lhs_shape) != 3 or len(rhs_shape) != 3 or len(out_shape) != 3:
+        return
+    if not (
+        _is_static_one(lhs_shape[0])
+        and _is_static_one(rhs_shape[0])
+        and _is_static_one(out_shape[0])
+    ):
+        return
+    if not (
+        lhs_shape[1] == out_shape[1]
+        and lhs_shape[2] == rhs_shape[1]
+        and rhs_shape[2] == out_shape[2]
+    ):
+        return
+    if not _has_stick_aligned_matmul_dims(lhs_shape[2], rhs_shape[2]):
+        return
+    custom = dict(bmm_node.meta.get("custom") or {})
+    custom[SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY] = {"batch_dim": 0}
+    bmm_node.meta["custom"] = custom
+
+
+def _is_direct_unit_bmm_operand(node: torch.fx.Node) -> bool:
+    if not isinstance(node, torch.fx.Node):
+        return False
+    if node.op in ("placeholder", "get_attr"):
+        return True
+    if node.op == "call_function" and node.target == aten.expand.default:
+        base = node.args[0]
+        return isinstance(base, torch.fx.Node) and base.op in (
+            "placeholder",
+            "get_attr",
+        )
+    return False
+
+
+def _mark_direct_static_unit_batch_bmm(
+    bmm_node: torch.fx.Node, lhs_node: torch.fx.Node, rhs_node: torch.fx.Node
+) -> None:
+    """Mark direct rank-3 B=1 BMMs without catching unflattened attention views."""
+    if not _is_direct_unit_bmm_operand(rhs_node):
+        return
+
+    for arg in (lhs_node, rhs_node):
+        if (
+            isinstance(arg, torch.fx.Node)
+            and arg.op == "call_function"
+            and arg.target in _RESHAPE_OPS
+        ):
+            return
+
+    bmm_users = list(bmm_node.users.keys())
+    if len(bmm_users) == 1:
+        output_view = bmm_users[0]
+        if (
+            isinstance(output_view, torch.fx.Node)
+            and output_view.op == "call_function"
+            and output_view.target in _RESHAPE_OPS
+        ):
+            output_shape = output_view.args[1]
+            if isinstance(output_shape, (list, tuple)) and len(output_shape) > 3:
+                return
+
+    _mark_static_unit_batch_bmm(bmm_node, lhs_node, rhs_node)
+
+
+def mark_direct_unit_bmm_pass(graph: torch.fx.Graph) -> None:
+    for node in graph.nodes:
+        if node.op != "call_function" or node.target != aten.bmm.default:
+            continue
+        if len(node.args) != 2:
+            continue
+        lhs_node, rhs_node = node.args
+        _mark_direct_static_unit_batch_bmm(node, lhs_node, rhs_node)
 
 
 @register_graph_pattern(
@@ -143,6 +250,8 @@ def _unflatten_mm_to_bmm(
             args=(lhs_input, expanded),
         )
         bmm_node.meta["val"] = torch.empty(output_shape, dtype=rhs_dtype, device="meta")
+        copy_fx_custom_meta(node, bmm_node)
+        _mark_static_unit_batch_bmm(bmm_node, lhs_input, expanded)
 
     # Replace all uses of mm and output view with the bmm
     node.replace_all_uses_with(bmm_node)
@@ -233,6 +342,7 @@ def _unflatten_bmm_batch_dims(
             args=(lhs_orig, rhs_orig),
         )
         matmul_node.meta["val"] = output_view.meta["val"]
+        copy_fx_custom_meta(node, matmul_node)
 
     # Replace all uses of the output view with the new matmul
     output_view.replace_all_uses_with(matmul_node)
@@ -253,128 +363,3 @@ def _unflatten_bmm_batch_dims(
                 and not expand_node.users
             ):
                 graph.erase_node(expand_node)
-
-
-def _hint_split_counts(op) -> dict[str, int]:
-    """Return {dim_name: split_count} from all hints on op (keys 'tiles' or 'slices')."""
-    result: dict[str, int] = {}
-    for hint_dict in get_op_hints(op).values():
-        for key in ("tiles", "slices"):
-            if isinstance(hint_dict.get(key), dict):
-                result.update(hint_dict[key])
-    return result
-
-
-def _dim_sizes(op) -> dict[str, int]:
-    """Return {dim_name: declared_size} for all named dims on op."""
-    return {
-        name: size
-        for sym in op.loop_var_dims
-        for name, size in named_dims_for_sym(op, sym)
-    }
-
-
-def process_hints(operations: list) -> None:
-    """
-    Process and log spyre hints, and their impact on each op and output buffer
-    """
-
-    if not any(_hint_split_counts(op) for op in operations):
-        return
-
-    ops = [
-        op
-        for op in operations
-        if isinstance(op, ComputedBuffer) and getattr(op, "loop_var_dims", None)
-    ]
-
-    hints_logger.info("=== process_hints ===")
-
-    for op in ops:
-        splits = _hint_split_counts(op)
-        dim_sizes = _dim_sizes(op)
-
-        rw = op.get_read_writes()
-        all_ranges = {
-            s: int(v) for dep in [*rw.reads, *rw.writes] for s, v in dep.ranges.items()
-        }
-        reduction_dims = set(op.reduction_named_dims or [])
-
-        hints_logger.info(f"{op.get_operation_name()}:")
-        hints_logger.info("  Loop vars:")
-        for sym in op.loop_var_dims:
-            sym_range = all_ranges.get(sym, "?")
-            nd = named_dims_for_sym(op, sym)
-            nd_str = ", ".join(f"{n}={s}" for n, s in nd) if nd else "(none)"
-
-            tags = []
-            if any(n in reduction_dims for n, _ in nd):
-                tags.append("[reduction]")
-            for n, _ in nd:
-                if n in splits:
-                    k = splits[n]
-                    sliced = sym_range // k if isinstance(sym_range, int) else "?"
-                    tags.append(f"sliced by {k}: {sym_range} -> {sliced}")
-            suffix = ("  " + "  ".join(tags)) if tags else ""
-            hints_logger.info(
-                f"    {sym}  range={sym_range}  Named Dim(s): {nd_str}{suffix}"
-            )
-
-        if op.named_dims:
-            hints_logger.info(f"  Output buffer: {op.get_name()}")
-            for name in op.named_dims:
-                size = dim_sizes.get(name, "?")
-                if name in splits and isinstance(size, int):
-                    k = splits[name]
-                    hints_logger.info(
-                        f"    {name}  size={size}  sliced by {k}: {size} -> {size // k}"
-                    )
-                else:
-                    hints_logger.info(f"    {name}  size={size}")
-
-
-def convert_constant_with_graph_node(graph: torch.fx.Graph) -> None:
-    """
-    Replace constant arguments to any operation with spyre.constant node.
-    Scalar constants are converted to size=1 tensor and passed to the corresponding
-    operations which was consuming the scalar value at lowering.
-    Deduplication of identical constants happens later at the IR level via
-    dedup_and_promote_constants.
-    """
-
-    ops_support_list = [
-        torch.ops.aten.add.Tensor,
-        torch.ops.aten.sub.Tensor,
-        torch.ops.aten.mul.Tensor,
-        torch.ops.aten.true_divide.Tensor,
-        torch.ops.aten.div.Tensor,
-    ]
-
-    for node in graph.nodes:
-        if node.target not in ops_support_list:
-            continue
-        for idx, in_arg in enumerate(node.args):
-            if isinstance(in_arg, torch.fx.node.Node):
-                continue
-            if not isinstance(in_arg, (int, float)):
-                logger.warning(f"Warning: unhandled node type {type(in_arg)}")
-                continue
-            # Currently the dtype of the scalar tensor is set as same as the output dtype.
-            # TODO: Set the scalar tensor type same as scalar type after to_dtype supported
-            # (open issue: https://github.com/torch-spyre/torch-spyre/issues/41)
-            dtype = torch.float16
-            meta = node.meta.get("tensor_meta", None)
-            if meta:
-                dtype = meta.dtype
-            with graph.inserting_before(node):
-                const_node = graph.create_node(
-                    "call_function",
-                    torch.ops.spyre.constant.default,
-                    (in_arg, dtype, torch.device("spyre")),
-                    {},
-                    "py_const",
-                    node.type,
-                )
-            node.update_arg(idx, const_node)
-
-    graph.lint()

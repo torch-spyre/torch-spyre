@@ -15,58 +15,88 @@
 """Tests for launching simple compiled ops through JobPlan execution."""
 
 import os
+from typing import Tuple
 
 import pytest
+from torch.testing._internal.common_utils import TestCase
 import torch
+import torch._dynamo
+
+from torch_spyre._inductor import config as _spyre_config
 
 
-class TestLaunchJobPlan:
-    """Test suite for JobPlan-backed compiled op execution."""
+def _run_compiled_op(op_name: str, symbolic_args: bool) -> None:
+    """
+    Compile an op with SpyreCode and run it on Spyre, comparing to CPU.
 
-    def test_dump_spyre_code_abs_matches_cpu(self):
-        """Run a simple compiled op with `DUMP_SPYRE_CODE=1` and compare to CPU."""
-        x = torch.randn(64, dtype=torch.float16)
-        cpu_result = torch.abs(x)
+    Uses a fresh dynamo compile cache each call to ensure the kernel runner is
+    re-instantiated. Runs in-process (no subprocess) so the Spyre VFIO device
+    opened by the test session is reused rather than triggering a second
+    exclusive open from a child process.
+    """
+    torch._dynamo.reset()
 
-        previous = os.environ.get("DUMP_SPYRE_CODE")
-        os.environ["DUMP_SPYRE_CODE"] = "1"
-        try:
-            # Compile and run on Spyre
-            compiled_fn = torch.compile(torch.abs, backend="inductor")
-            spyre_result = compiled_fn(x.to("spyre")).cpu()
+    op_fn = getattr(torch, op_name)
 
-            # Compare results
-            torch.testing.assert_close(
-                spyre_result, cpu_result, atol=0.1, rtol=0.1, equal_nan=True
-            )
-        finally:
-            if previous is None:
-                del os.environ["DUMP_SPYRE_CODE"]
-            else:
-                os.environ["DUMP_SPYRE_CODE"] = previous
+    torch.manual_seed(42)
+    inputs: Tuple[torch.Tensor, ...]
+    if op_name == "abs":
+        inputs = (torch.randn(64, dtype=torch.float16),)
+    elif op_name == "mul":
+        inputs = (
+            torch.randn(64, dtype=torch.float16),
+            torch.randn(64, dtype=torch.float16),
+        )
+    else:
+        raise ValueError(f"Unknown op: {op_name}")
 
-    def test_dump_spyre_code_mul_matches_cpu(self):
-        """Run a simple compiled binary op with `DUMP_SPYRE_CODE=1` and compare to CPU."""
-        x = torch.randn(64, dtype=torch.float16)
-        y = torch.randn(64, dtype=torch.float16)
-        cpu_result = torch.mul(x, y)
+    cpu_result = op_fn(*inputs)
 
-        previous = os.environ.get("DUMP_SPYRE_CODE")
-        os.environ["DUMP_SPYRE_CODE"] = "1"
-        try:
-            # Compile and run on Spyre
-            compiled_fn = torch.compile(torch.mul, backend="inductor")
-            spyre_result = compiled_fn(x.to("spyre"), y.to("spyre")).cpu()
+    old_sym = os.environ.get("BUNDLE_SYMBOLIC_ARGS")
+    try:
+        # Keep the C++ prepare_kernel env var in sync with the Python config
+        # patch: prepare_kernel reads BUNDLE_SYMBOLIC_ARGS directly from the
+        # process environment, so patching only the Python config is insufficient.
+        os.environ["BUNDLE_SYMBOLIC_ARGS"] = "1" if symbolic_args else "0"
+        with _spyre_config.patch(bundle_symbolic_args=symbolic_args):  # type: ignore[attr-defined]
+            compiled_fn = torch.compile(op_fn, backend="inductor")
+            spyre_inputs = tuple(inp.to("spyre") for inp in inputs)
+            spyre_result = compiled_fn(*spyre_inputs).cpu()
+    finally:
+        if old_sym is None:
+            os.environ.pop("BUNDLE_SYMBOLIC_ARGS", None)
+        else:
+            os.environ["BUNDLE_SYMBOLIC_ARGS"] = old_sym
 
-            # Compare results
-            torch.testing.assert_close(
-                spyre_result, cpu_result, atol=0.1, rtol=0.1, equal_nan=True
-            )
-        finally:
-            if previous is None:
-                del os.environ["DUMP_SPYRE_CODE"]
-            else:
-                os.environ["DUMP_SPYRE_CODE"] = previous
+    torch.testing.assert_close(
+        spyre_result, cpu_result, atol=0.1, rtol=0.1, equal_nan=True
+    )
+
+
+class TestLaunchJobPlan(TestCase):
+    """Test suite for JobPlan-backed compiled op execution.
+
+    Each op is exercised twice: once with symbolic_args=True (the default since
+    BUNDLE_SYMBOLIC_ARGS=1 was made the process default) and once with
+    symbolic_args=False (the non-default override path, retained as a regression
+    guard for users who explicitly disable symbolic args).
+    """
+
+    def test_abs_matches_cpu_no_symbols(self):
+        """abs with symbolic_args=False (non-default override path)."""
+        _run_compiled_op("abs", symbolic_args=False)
+
+    def test_abs_matches_cpu_with_symbols(self):
+        """abs with symbolic_args=True (default path)."""
+        _run_compiled_op("abs", symbolic_args=True)
+
+    def test_mul_matches_cpu_no_symbols(self):
+        """mul with symbolic_args=False (non-default override path)."""
+        _run_compiled_op("mul", symbolic_args=False)
+
+    def test_mul_matches_cpu_with_symbols(self):
+        """mul with symbolic_args=True (default path)."""
+        _run_compiled_op("mul", symbolic_args=True)
 
 
 if __name__ == "__main__":

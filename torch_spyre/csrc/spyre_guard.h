@@ -36,9 +36,13 @@ struct SpyreGuardImpl final : c10::impl::DeviceGuardImplInterface {
 
   c10::DeviceIndex deviceCount() const noexcept override;
 
-  // Do Spyre have streams, override
-  // getStream/exchangeStream/.../recordDataPtrOnStream
+  // Stream methods
   c10::Stream getStream(c10::Device device) const override;
+
+  c10::Stream getDefaultStream(c10::Device device) const override;
+
+  c10::Stream getStreamFromGlobalPool(
+      c10::Device device, bool isHighPriority = false) const override;
 
   c10::Stream getNewStream(c10::Device device, int priority = 0) const override;
 

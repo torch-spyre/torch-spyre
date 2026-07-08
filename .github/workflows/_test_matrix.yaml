@@ -1,0 +1,407 @@
+name: Test matrix (reusable)
+
+# ---------------------------------------------------------------------------
+# Reusable workflow — not triggered directly.
+# Called by tests.yml and tests-nightly.yml.
+#
+# All differences between the two callers are expressed as inputs:
+#   - runner_label      : linux
+#   - extra_test_flags  : "-v" (PR) vs "--cpu-compile -vvv -s" (nightly)
+#   - checkout_pytorch  : false (PR) vs true (nightly)
+#   - ref / rpm_*       : forwarded from workflow_dispatch inputs
+# ---------------------------------------------------------------------------
+on:
+  workflow_call:
+    inputs:
+      # Runner pool to use for both test jobs
+      runner_label:
+        description: Runner label appended to the fixed labels (linux)
+        required: true
+        type: string
+
+      # IMAGE selector label for runs-on. Normal runs use the standing
+      # image_spyre_backend set; the per-PR ephemeral flow passes that PR's set
+      # label (image_spyre_backend_pr_<component>_<sha12>, e.g.
+      # image_spyre_backend_pr_flex_8ddcf3e155e9) so jobs land on the per-PR image
+      # (the RPM is baked in -> no runtime sudo). Default keeps existing callers
+      # unchanged.
+      image_label:
+        description: Image scaleSetLabel to select (image_spyre_backend | image_spyre_backend_pr_<KEY>)
+        required: false
+        type: string
+        default: image_spyre_backend
+
+      # Flags appended to every `bash tests/run_test.sh <config>` call for the test job
+      extra_test_flags:
+        description: Extra flags passed to run_test.sh for the test job (e.g. "-v" or "--cpu-compile -vvv -s")
+        required: true
+        type: string
+
+      # Flags appended to every `bash tests/run_test.sh <config>` call for the test_multi_spyre job
+      extra_test_flags_multi_spyre:
+        description: Extra flags passed to run_test.sh for the test_multi_spyre job (e.g. "-v")
+        required: false
+        type: string
+        default: ''
+
+      # Whether to run checkout-pytorch (nightly only)
+      checkout_pytorch:
+        description: Whether to check out the pre-built PyTorch tree
+        required: false
+        type: boolean
+        default: false
+
+      # workflow_dispatch pass-throughs
+      ref:
+        description: Branch, tag, or SHA to check out
+        required: false
+        type: string
+        default: ''
+      repository:
+        description: Full clone URL of the fork to check out (e.g. "https://github.example.com/myuser/torch-spyre.git"); leave empty for the base repo
+        required: false
+        type: string
+        default: ''
+      rpm_location:
+        description: Artifactory location for RPM download
+        required: false
+        type: string
+        default: ''
+      rpm_names:
+        description: Space-separated list of RPM names to download and install
+        required: false
+        type: string
+        default: ''
+      build_torch_spyre:
+        description: Whether to re-build torch-spyre after installing the RPM
+        required: false
+        type: boolean
+        default: true
+      test_type:
+        description: >-
+          Suite subset to run: smoke | core | full | suite_<group> | <label>.
+          Selects configs whose test_suite_config.labels array contains this
+          value, or (for suite_<group>) whose path sits under that directory.
+          Default: full (every config).
+        required: false
+        type: string
+        default: full
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 0: generate filtered test matrix
+  #
+  # Reads test_suite_config.labels from every YAML under
+  # tests/configs/torch_spyre_tests/ and emits a JSON matrix containing only
+  # the configs that match inputs.test_type.  The test job below consumes this
+  # output via fromJSON so that only the requested subset of runners starts.
+  # ---------------------------------------------------------------------------
+  generate_matrix:
+    name: Generate test matrix (${{ inputs.test_type || 'full' }})
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.filter.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
+          sparse-checkout: |
+            tests/configs/torch_spyre_tests
+            tests/oot_framework/utils/filter_configs.py
+            .github/runner_overrides.yaml
+          sparse-checkout-cone-mode: false
+
+      - name: Filter configs by TEST_TYPE
+        id: filter
+        run: |
+          pip install pyyaml --quiet
+          matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
+            --config-dir tests/configs/torch_spyre_tests \
+            --test-type "${{ inputs.test_type || 'full' }}" \
+            --runner-map .github/runner_overrides.yaml \
+            --format matrix-json)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Job 1: test matrix  (dynamic — driven by generate_matrix output)
+  # ---------------------------------------------------------------------------
+  test:
+    name: ${{ matrix.suite.name }}
+    needs: generate_matrix
+    runs-on:
+      - x86_64
+      - ${{ matrix.suite.runner || 'spyre_pf_x1' }}
+      - ${{ inputs.runner_label }}
+      - ${{ inputs.image_label }}
+    timeout-minutes: 60
+    env:
+      # GitHub Actions sets CI=true which causes pytest inductor tests to fail.
+      # Explicitly clear it.
+      CI: ''
+      TORCH_SPYRE_TEST_TYPE: ${{ inputs.test_type || 'full' }}
+
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.generate_matrix.outputs.matrix) }}
+
+    steps:
+      - name: Checkout composite actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: torch-spyre
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
+
+      - name: Check out pre-built PyTorch
+        if: ${{ inputs.checkout_pytorch }}
+        uses: ./.github/actions/checkout-pytorch
+
+      - uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
+
+      - name: Build torch-spyre
+        if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
+        uses: ./.github/actions/build-torch-spyre
+
+      - name: Derive report paths
+        run: |
+          CONFIG="${{ matrix.suite.config }}"
+          REPORT_NAME="$(basename "${CONFIG%.yaml}.xml")"
+          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
+          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+
+      - name: Run ${{ matrix.suite.name }} tests
+        id: run_tests
+        uses: ./.github/actions/run-test-suite
+        with:
+          suite_name: ${{ matrix.suite.name }}
+          config: tests/configs/torch_spyre_tests/${{ matrix.suite.config }}
+          extra_test_flags: ${{ inputs.extra_test_flags }}
+          junit_xml_path: ${{ env.REPORT_PATH }}
+          report_name: ${{ env.REPORT_NAME }}
+          pre_run: |
+            # Clear the cached AIU setup guard and stale topo.json so
+            # ibm-aiu-setup.sh re-discovers all cards on the x4 runner.
+            unset _IBM_AIU_SETUP
+            rm -rf /tmp/etc/ibm/spyre/topo.json
+            source /etc/profile.d/ibm-aiu-setup.sh
+
+      - name: Upload JUnit XML report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.REPORT_NAME }}
+          path: ${{ env.REPORT_PATH }}
+          if-no-files-found: warn
+          retention-days: 10
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Multi-Spyre test matrix
+  #
+  # Only runs for test_type values that include the distributed suite:
+  #   full              — includes everything
+  #   suite_distributed — targets the distributed_tests/ directory directly
+  #   (empty)           — same as full
+  # For smoke / core / suite_<other> the distributed job is skipped entirely
+  # so no x2 runners are allocated.
+  # ---------------------------------------------------------------------------
+  test_multi_spyre:
+    name: ${{ matrix.suite.name }}
+    if: >-
+      inputs.test_type == '' ||
+      inputs.test_type == 'full' ||
+      inputs.test_type == 'suite_distributed'
+    runs-on:
+      - x86_64
+      - spyre_pf_x2
+      - ${{ inputs.runner_label }}
+      - ${{ inputs.image_label }}
+    timeout-minutes: 60
+    env:
+      CI: ''
+
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - name: Test Multi-Spyre Setup
+            config: distributed_tests/test_general.yaml
+          - name: Test Multi-Spyre Barrier
+            config: distributed_tests/test_barrier.yaml
+          - name: Test Multi-Spyre Broadcast
+            config: distributed_tests/test_broadcast.yaml
+          - name: Test Multi-Spyre Gather
+            config: distributed_tests/test_gather.yaml
+          - name: Test Multi-Spyre Allgather
+            config: distributed_tests/test_allgather.yaml
+
+    steps:
+      - name: Checkout composite actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: torch-spyre
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
+
+      - name: Check out pre-built PyTorch
+        if: ${{ inputs.checkout_pytorch }}
+        uses: ./.github/actions/checkout-pytorch
+
+      - uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
+
+      - name: Build torch-spyre
+        if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
+        uses: ./.github/actions/build-torch-spyre
+
+      - name: Derive report paths
+        run: |
+          CONFIG="${{ matrix.suite.config }}"
+          REPORT_NAME="$(basename "${CONFIG%.yaml}.xml")"
+          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
+          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+
+      - name: Run ${{ matrix.suite.name }} tests
+        uses: ./.github/actions/run-test-suite
+        with:
+          suite_name: ${{ matrix.suite.name }}
+          config: tests/configs/${{ matrix.suite.config }}
+          extra_test_flags: ${{ inputs.extra_test_flags_multi_spyre }}
+          parallel: 'false'
+          junit_xml_path: ${{ env.REPORT_PATH }}
+          report_name: ${{ env.REPORT_NAME }}
+          pre_run: |
+            # Multi-Spyre tests require a fresh topology probe: clear the
+            # cached AIU setup guard and the stale topo.json so
+            # ibm-aiu-setup.sh re-discovers all attached cards.
+
+            unset _IBM_AIU_SETUP
+            rm -rf /tmp/etc/ibm/spyre/topo.json
+            source /etc/profile.d/ibm-aiu-setup.sh
+
+      - name: Upload JUnit XML report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.REPORT_NAME }}
+          path: ${{ env.REPORT_PATH }}
+          if-no-files-found: warn
+          retention-days: 10
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Report test suites that ran zero tests
+  #
+  # Runs after both matrix jobs (even if they fail) and checks every uploaded
+  # JUnit XML artifact for a zero-test result.  Issues ::warning:: annotations
+  # and writes a step summary table (does NOT fail the workflow).
+  # ---------------------------------------------------------------------------
+  report_empty_suites:
+    name: Report empty test suites
+    runs-on: ubuntu-latest
+    needs: [generate_matrix, test, test_multi_spyre]
+    if: always()
+
+    steps:
+      - name: Download all XML artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p xml_artifacts
+          ARTIFACTS=$(gh api \
+            "/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
+            --jq '[.artifacts[] | select(.name | endswith(".xml")) | {id: .id, name: .name}]')
+
+          ARTIFACTS="$ARTIFACTS" python3 <<'PYEOF'
+          import json, os, subprocess
+          artifacts = json.loads(os.environ['ARTIFACTS'])
+          repo = "${{ github.repository }}"
+          for a in artifacts:
+              zip_path = f"xml_artifacts/{a['name']}.zip"
+              result = subprocess.run(
+                  ["gh", "api", f"/repos/{repo}/actions/artifacts/{a['id']}/zip"],
+                  capture_output=True, check=True,
+                  env={**os.environ},
+              )
+              with open(zip_path, "wb") as f:
+                  f.write(result.stdout)
+              subprocess.run(
+                  ["unzip", "-q", "-o", zip_path, "-d", "xml_artifacts/"],
+                  check=True,
+              )
+          print(f"Downloaded {len(artifacts)} artifact(s).")
+          PYEOF
+
+      - name: Check for empty suites
+        run: |
+          python3 <<'PYEOF'
+          import os
+          import sys
+          from pathlib import Path
+          from xml.etree import ElementTree as ET
+
+          xml_dir = Path("xml_artifacts")
+          xml_files = sorted(xml_dir.glob("**/*.xml"))
+
+          empty = []
+          for xml_file in xml_files:
+              try:
+                  tree = ET.parse(xml_file)
+                  root = tree.getroot()
+                  # Handle both <testsuite> and <testsuites><testsuite ...> forms
+                  # Count <testcase> elements directly — the tests= attribute
+                  # is unreliable when pytest-xdist produced the XML (it writes
+                  # tests="0" in the suite header even when cases are present).
+                  total_tests = len(root.findall(".//testcase"))
+                  if total_tests == 0:
+                      empty.append(xml_file.stem)
+              except ET.ParseError as e:
+                  print(f"::warning::Could not parse {xml_file.name}: {e}")
+
+          # Build step summary
+          lines = []
+          if empty:
+              lines.append("### Empty test suites detected\n")
+              lines.append(
+                  "The following suite(s) uploaded a JUnit XML report with **0 tests**:\n"
+              )
+              lines.append("| Artifact |")
+              lines.append("|---|")
+              for name in empty:
+                  lines.append(f"| `{name}` |")
+              lines.append("")
+              lines.append(
+                  "> **Note:** This is a warning only — the workflow is not failed."
+              )
+          else:
+              lines.append("### Empty suite check: all suites ran at least one test.")
+
+          summary = "\n".join(lines)
+          print(summary)
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          if summary_path:
+              with open(summary_path, "a") as f:
+                  f.write(summary + "\n")
+
+          # Emit ::warning:: annotations for each empty suite
+          for name in empty:
+              print(f"::warning title=Empty test suite::{name} reported 0 tests collected")
+
+          sys.exit(0)
+          PYEOF

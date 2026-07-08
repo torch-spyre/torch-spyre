@@ -153,14 +153,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1, 1, 41]
           stride: [41, 41, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L378 in forward, code: freqs
       = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
   - name: torch.transpose.1_spyre
@@ -361,15 +361,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [4096, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L156 in forward, code: query_states
       = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
     marks: constant
@@ -411,15 +410,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1024, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L157 in forward, code: key_states
       = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
     marks: constant
@@ -871,15 +869,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [12800, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L221 in forward, code: down_proj
       = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
     marks: constant
@@ -922,15 +919,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [4096, 12800]
           stride: [12800, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L221 in forward, code: down_proj
       = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
     marks: constant
@@ -957,15 +953,14 @@ cases:
           storage_offset: 163840
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [49159, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L575 in forward, code: logits
       = self.lm_head(hidden_states[:, slice_indices, :])'
     marks: constant
@@ -1075,14 +1070,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1, 1, 1]
           stride: [1, 1, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L378 in forward, code: freqs
       = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
   - name: torch.transpose.5_spyre
@@ -1276,15 +1271,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [4096, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L156 in forward, code: query_states
       = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
     marks: constant
@@ -1326,15 +1320,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [1024, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L157 in forward, code: key_states
       = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
     marks: constant
@@ -1741,15 +1734,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [4096, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L184 in forward, code: attn_output
       = self.o_proj(attn_output)'
     marks: constant
@@ -1781,15 +1773,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [12800, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L221 in forward, code: down_proj
       = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
     marks: constant
@@ -1832,15 +1823,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [4096, 12800]
           stride: [12800, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L221 in forward, code: down_proj
       = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
     marks: constant
@@ -1867,15 +1857,14 @@ cases:
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
+          init: xavier
       - tensor:
           shape: [49159, 4096]
           stride: [4096, 1]
           storage_offset: 0
           dtype: torch.float16
           device: cuda:0
-          init: rand
-      - value: null
+          init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L575 in forward, code: logits
       = self.lm_head(hidden_states[:, slice_indices, :])'
     marks: constant
