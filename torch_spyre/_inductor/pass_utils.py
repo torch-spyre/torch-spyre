@@ -31,7 +31,7 @@ from torch._inductor.ir import (
     Reduction,
 )
 from torch._inductor.scheduler import SchedulerNode
-from torch._inductor.dependencies import MemoryDep, ReadWrites
+from torch._inductor.dependencies import MemoryDep, ReadWrites, StarDep
 from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 from torch_spyre._inductor.errors import Unsupported
@@ -724,20 +724,15 @@ def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
         # The iteration space of a Pointwise is that of its output
         return next(iter(n.read_writes.writes)).ranges.copy()
     elif isinstance(n.node.data, Reduction):
-        # For Reductions in our Spyre scheduler, we need BOTH output and reduction variables
-        # The write dep has the output dimensions, and we need to add the reduction dimensions
-        write_ranges = next(iter(n.read_writes.writes)).ranges.copy()
-
-        # Get the reduction ranges from the Reduction IR node
-        red_node = n.node.data
-        if hasattr(red_node, "reduction_ranges") and red_node.reduction_ranges:
-            # Create symbols for reduction dimensions
-            # Use the same pattern as the scheduler: r0, r1, etc.
-            for i, red_size in enumerate(red_node.reduction_ranges):
-                red_sym = sympy.Symbol(f"r{i}")
-                write_ranges[red_sym] = red_size
-
-        return write_ranges
+        # Output dims from the write dep; reduction dims appended from read deps.
+        result = next(iter(n.read_writes.writes)).ranges.copy()
+        for dep in n.read_writes.reads:
+            if isinstance(dep, StarDep):
+                continue
+            for sym, size in dep.ranges.items():
+                if sym not in result:
+                    result[sym] = size
+        return result
     else:
         raise Unsupported("Unexpected node type")
 
@@ -749,18 +744,15 @@ def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr
     if isinstance(op.data, Pointwise):
         return next(iter(rw.writes)).ranges.copy()
     elif isinstance(op.data, Reduction):
-        # For Reductions in our Spyre scheduler, we need BOTH output and reduction variables
-        # The write dep has the output dimensions, and we need to add the reduction dimensions
-        write_ranges = next(iter(rw.writes)).ranges.copy()
-        # Get the reduction ranges from the Reduction IR node
-        red_node = op.data
-        if hasattr(red_node, "reduction_ranges") and red_node.reduction_ranges:
-            # Create symbols for reduction dimensions
-            # Use the same pattern as the scheduler: r0, r1, etc.
-            for i, red_size in enumerate(red_node.reduction_ranges):
-                red_sym = sympy.Symbol(f"r{i}")
-                write_ranges[red_sym] = red_size
-        return write_ranges
+        # Output dims from write dep; reduction dims appended from read deps.
+        result = next(iter(rw.writes)).ranges.copy()
+        for dep in rw.reads:
+            if isinstance(dep, StarDep):
+                continue
+            for sym, size in dep.ranges.items():
+                if sym not in result:
+                    result[sym] = size
+        return result
     else:
         raise Unsupported("Unexpected node type")
 
