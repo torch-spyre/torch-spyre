@@ -163,8 +163,8 @@ class InputTensorSpec(BaseModel):
                 # rand uses uniform [0, 1), map to make_tensor with low=0, high=1
                 t = make_tensor(*shape, dtype=dtype, device="cpu", low=0.0, high=1.0)
             elif init == "randn":
-                # randn uses normal distribution, make_tensor defaults to this
-                t = make_tensor(*shape, dtype=dtype, device="cpu")
+                # randn means a standard normal distribution (mean 0, std 1).
+                t = torch.randn(*shape, dtype=dtype)
             elif init == "randint":
                 # randint needs explicit low/high
                 t = make_tensor(
@@ -197,7 +197,8 @@ class InputTensorSpec(BaseModel):
                         )
                     )
                 elif init == "randn":
-                    backing.copy_(make_tensor(needed, dtype=dtype, device="cpu"))
+                    # See note above: make_tensor is uniform, not normal.
+                    backing.copy_(torch.randn(needed, dtype=dtype))
                 elif init == "randint":
                     backing.copy_(
                         make_tensor(
@@ -391,6 +392,29 @@ def _parse_input_arg(raw: Any) -> InputArg:
     )
 
 
+def _move_to_test_device(obj: Any, test_device: Optional[torch.device]) -> Any:
+    """Move built tensors (or lists of tensors) to the target test device.
+
+    Tensor specs are always built on CPU for reproducible seeded random data
+    (see ``InputTensorSpec.build``). The module under test, however, is moved to
+    ``test_device`` by the upstream ``test_forward`` harness via ``m.to(device)``,
+    so its parameters/buffers live on the device. Forward inputs must therefore
+    be placed on the same device or ``F.linear`` (and Spyre decompositions) raise
+    a device-mismatch error. Upstream torch builds sample inputs directly on the
+    device; we build on CPU then relocate here.
+
+    ``test_device`` is None only for CPU-target runs, where the tensors already
+    live on the correct device and no move is needed.
+    """
+    if test_device is None:
+        return obj
+    if isinstance(obj, torch.Tensor):
+        return obj.to(test_device)
+    if isinstance(obj, list):
+        return [_move_to_test_device(item, test_device) for item in obj]
+    return obj
+
+
 class InputsEdits(BaseModel):
     """
     Per-test input specification (edits.inputs).
@@ -426,14 +450,15 @@ class InputsEdits(BaseModel):
             inp_seed = None if seed is None else seed + i * 1000
 
             if isinstance(arg, InputArgTensor):
-                cpu_args.append(arg.tensor.build(seed=inp_seed))
+                t = arg.tensor.build(seed=inp_seed)
+                cpu_args.append(_move_to_test_device(t, test_device))
 
             elif isinstance(arg, InputArgTensorList):
                 lst = [
                     spec.build(seed=(None if seed is None else seed + i * 1000 + j * 7))
                     for j, spec in enumerate(arg.tensor_list)
                 ]
-                cpu_args.append(lst)
+                cpu_args.append(_move_to_test_device(lst, test_device))
 
             elif isinstance(arg, InputArgConfig):
                 import importlib
@@ -529,14 +554,16 @@ class InputsEdits(BaseModel):
                 arg = _parse_input_arg(v)
                 inp_seed = None if seed is None else seed + 500000 + i * 131
                 if isinstance(arg, InputArgTensor):
-                    out[k] = arg.tensor.build(seed=inp_seed)
+                    t = arg.tensor.build(seed=inp_seed)
+                    out[k] = _move_to_test_device(t, test_device)
                 elif isinstance(arg, InputArgTensorList):
-                    out[k] = [
+                    lst = [
                         spec.build(
                             seed=(None if inp_seed is None else inp_seed + j * 7)
                         )
                         for j, spec in enumerate(arg.tensor_list)
                     ]
+                    out[k] = _move_to_test_device(lst, test_device)
                 elif isinstance(arg, InputArgConfig):
                     import importlib
 
