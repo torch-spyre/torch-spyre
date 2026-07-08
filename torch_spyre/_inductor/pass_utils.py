@@ -1389,10 +1389,18 @@ def _per_core_view_on_buf(
     # reduction-axis split — independent of which dep we inspect.
     has_partial_reduction = any(n > 1 for n in coeff_splits[1].values())
 
-    buf_layout = V.graph.get_buffer(buf_name).layout
+    buf_op = V.graph.get_buffer(buf_name)
+    buf_layout = buf_op.layout
     if not isinstance(buf_layout, FixedTiledLayout):
         return empty_view
     ind_sizes = indirect_sizes_from_op(op)
+    # Guard: if dep.index contains an indirect symbol not covered by ind_sizes,
+    # host_coordinates would raise Unsupported. Fall back to empty_view so the
+    # buffer is conservatively kept off LX.
+    if ind_sizes is not None:
+        loop_vars = set(iteration_space_from_op(op).keys())
+        if not dep.index.free_symbols.issubset(loop_vars | ind_sizes.keys()):
+            return empty_view
     host_coords = host_coordinates(buf_layout, dep, ind_sizes)
     # host dim index -> the unique loop var whose coord expression covers it.
     # (compute_coordinates yields one coord expr per host dim; a split var
@@ -1401,8 +1409,13 @@ def _per_core_view_on_buf(
     # carry several hint entries (e.g. a fused B/H axis: B split_count=1,
     # H split_count=8) — the tile factor is their product (size-1 dims
     # contribute ×1). Absent / untiled loop var → factor 1.
+    # Fall back to the producer's dim_hints when op has none (e.g. combine/fill
+    # inserted by _maybe_coarse_tile after assign_dim_hints ran).
+    # TODO: fix in coarse_tile.py — _insert_combine_op/_insert_reduction_copy_op
+    # /fill path should copy dim_hints from the tiled op onto inserted ops.
+    dim_hints = getattr(op, "dim_hints", None) or getattr(buf_op, "dim_hints", None)
     tile_by_sym: dict = {}
-    for h in getattr(op, "dim_hints", None) or ():
+    for h in dim_hints or ():
         if h.is_reduction or h.loop_var is None:
             continue
         tile_by_sym[h.loop_var] = tile_by_sym.get(h.loop_var, 1) * int(h.split_count)

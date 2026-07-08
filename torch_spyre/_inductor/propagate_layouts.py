@@ -701,6 +701,11 @@ def _multi_arg_pointwise_layouts(
     for arg in args:
         if (
             arg.layout.size != output.size
+            # Sympy structural (syntactic) equality: two semantically identical
+            # expressions with different variable names or term order compare
+            # unequal here. This is intentionally conservative — only inputs
+            # whose index is exactly the same expression as the output's qualify
+            # as same-frame candidates for in-place layout reuse.
             or arg.dep.index != output_dep.index
             or not same_device_size(arg.layout.dtype, output.dtype)
         ):
