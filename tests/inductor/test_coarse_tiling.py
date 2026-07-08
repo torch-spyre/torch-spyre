@@ -4233,6 +4233,12 @@ class TestAffineStrideMatchesUnrollStride(unittest.TestCase):
 
         Returns the byte-stride value from affine_strides[tensor_idx][0][sym]
         for the first (and only) tiling level.  Raises if no stride is found.
+
+        Note: the output tensor is constructed with the same coordinates as the
+        input, so both tensors share the same affine stride for tiled_sym.  We
+        return the first non-zero value found, which is the input tensor's stride
+        (they are identical here).  Group 4 (multi-stick) inlines this extraction
+        instead because it needs a distinct iteration_space for C_COL.
         """
         out_tensor = TensorArg(
             is_input=False,
@@ -4390,18 +4396,20 @@ class TestAffineStrideMatchesUnrollStride(unittest.TestCase):
 
     def test_multi_stick_row_tiling_affine_stride_matches_unroll(self):
         """[1024,4096] multi-stick row-tiling: affine stride must equal unroll stride."""
-        C_ROW = Symbol("c_row")
-        C_COL = Symbol("c_col")
         tensor = TensorArg(
             is_input=True,
             arg_index=0,
             device_dtype=_FP16,
             device_size=[64, 1024, 64],  # [4096//64, 1024, 64]
-            device_coordinates=[C_COL // 64, C_ROW, sympy.Mod(C_COL, 64)],
+            device_coordinates=[
+                self._C_COL // 64,
+                self._C_ROW,
+                sympy.Mod(self._C_COL, 64),
+            ],
             allocation={"hbm": self._HBM_BASE},
         )
         T_ROW = 512
-        expected = _byte_stride_for_arg(tensor, C_ROW, T_ROW)
+        expected = _byte_stride_for_arg(tensor, self._C_ROW, T_ROW)
         # ground truth: 512 * 64 * 2 = 65536
         self.assertEqual(expected, T_ROW * 64 * 2)
 
@@ -4410,19 +4418,26 @@ class TestAffineStrideMatchesUnrollStride(unittest.TestCase):
             arg_index=1,
             device_dtype=_FP16,
             device_size=[64, 1024, 64],
-            device_coordinates=[C_COL // 64, C_ROW, sympy.Mod(C_COL, 64)],
+            device_coordinates=[
+                self._C_COL // 64,
+                self._C_ROW,
+                sympy.Mod(self._C_COL, 64),
+            ],
             allocation={"hbm": 0x500000000},
         )
+        # Note: C_COL range here is the full tensor width (4096), not T_ROW.
+        # The helper _get_flat_affine_stride cannot be reused for this group
+        # because it assigns iter_range to all free symbols uniformly.
         op_spec = OpSpec(
             op="add",
             is_reduction=False,
             iteration_space={
-                C_ROW: (Integer(T_ROW), 1),
-                C_COL: (Integer(4096), 1),
+                self._C_ROW: (Integer(T_ROW), 1),
+                self._C_COL: (Integer(4096), 1),
             },
             args=[tensor, out_tensor],
             op_info={},
-            tiled_symbols=[[C_ROW]],
+            tiled_symbols=[[self._C_ROW]],
         )
         symbols: list[int] = []
         _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
