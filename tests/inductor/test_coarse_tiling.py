@@ -4516,10 +4516,6 @@ class TestAffineStrideMatchesUnrollStride(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestCarryOpDetection(unittest.TestCase):
     """Tests for _is_carry_op, _find_state_input_names, _find_terminal_for_state."""
 
@@ -4754,3 +4750,94 @@ class TestCarryStateMechanism(unittest.TestCase):
         )
 
         self.assertTrue(carry_op.layout.per_tile_fixed)
+
+
+class TestInsertTilingPropagationCarryWiring(unittest.TestCase):
+    """Tests that _propagate_tiled_op routes carry ops to _propagate_carry_op."""
+
+    def _make_loop_invariant_carry_op(self):
+        """Return (tiled_dep, carry_op, operations) for loop-invariant carry op."""
+        tiled_dep = _make_tiled_op("tiled_dep", [Integer(8)], (0,), [Integer(2)], [[0]])
+
+        carry_op = _make_inside_consumer_op("carry_op", "tiled_dep", (0,))
+        carry_op.loop_info.loop_tiled_dims = [[]]
+        carry_op.data.ranges = [Integer(8)]
+        carry_op.get_read_names.return_value = {"tiled_dep"}
+
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        layout = MagicMock(spec=FixedTiledLayout)
+        layout.per_tile_fixed = False
+        carry_op.layout = layout
+
+        return tiled_dep, carry_op, [tiled_dep, carry_op]
+
+    def _make_internal_scratch_carry_op(self):
+        """Return (tiled_dep, carry_op, operations) for loop-internal carry op.
+
+        Simulates an op that is H-tiled (outer level non-empty) but Lk-invariant
+        (inner/last level empty) — like maximum(M, block_max) in flash attention.
+        loop_tiled_dims is outermost-first, so [[0], []] means outer H-tiling,
+        inner Lk-invariant.  Such ops advance per H tile but carry state across
+        Lk tiles.
+        """
+        tiled_dep = _make_tiled_op(
+            "tiled_dep", [Integer(8)], (0,), [Integer(2)], [[0], [0]]
+        )
+
+        carry_op = _make_inside_consumer_op("carry_op", "tiled_dep", (0,))
+        carry_op.loop_info.loop_tiled_dims = [[0], []]
+        carry_op.data.ranges = [Integer(8)]
+        carry_op.get_read_names.return_value = {"tiled_dep"}
+
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        layout = MagicMock(spec=FixedTiledLayout)
+        layout.per_tile_fixed = False
+        carry_op.layout = layout
+
+        return tiled_dep, carry_op, [tiled_dep, carry_op]
+
+    def test_propagate_tiled_op_calls_propagate_carry_for_loop_invariant(self):
+        from torch_spyre._inductor.coarse_tile import _propagate_tiled_op
+
+        _, carry_op, operations = self._make_loop_invariant_carry_op()
+        carry_ops: set[str] = set()
+
+        with (
+            patch(
+                "torch_spyre._inductor.coarse_tile._graph_output_names",
+                return_value=set(),
+            ),
+            patch(
+                "torch_spyre._inductor.coarse_tile._propagate_carry_op"
+            ) as mock_propagate,
+        ):
+            _propagate_tiled_op(carry_op, operations, carry_ops)
+
+        mock_propagate.assert_called_once_with(carry_op, operations, carry_ops)
+        self.assertFalse(carry_op.layout.per_tile_fixed)
+
+    def test_propagate_tiled_op_calls_propagate_carry_for_internal_scratch(self):
+        from torch_spyre._inductor.coarse_tile import _propagate_tiled_op
+
+        _, carry_op, operations = self._make_internal_scratch_carry_op()
+        carry_ops: set[str] = set()
+
+        with (
+            patch(
+                "torch_spyre._inductor.coarse_tile._graph_output_names",
+                return_value=set(),
+            ),
+            patch(
+                "torch_spyre._inductor.coarse_tile._propagate_carry_op"
+            ) as mock_propagate,
+        ):
+            _propagate_tiled_op(carry_op, operations, carry_ops)
+
+        mock_propagate.assert_called_once_with(carry_op, operations, carry_ops)
+        self.assertFalse(carry_op.layout.per_tile_fixed)
+
+
+if __name__ == "__main__":
+    unittest.main()

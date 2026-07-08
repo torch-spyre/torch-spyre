@@ -634,13 +634,14 @@ def insert_tiling_propagation(
     In both cases the existing tiled_symbols / affine.apply machinery in
     SpyreKernel and bundle.py handles the per-iteration address offset.
     """
+    carry_ops: set[str] = set()
     for group_ops, _ in groups:
         for op in group_ops:
             if not isinstance(op, ComputedBuffer):
                 continue
             if not isinstance(op.data, (Pointwise, Reduction)):
                 continue
-            _propagate_tiled_op(op, operations)
+            _propagate_tiled_op(op, operations, carry_ops)
 
 
 def _validate_reduction_tiling(op: ComputedBuffer) -> None:
@@ -692,17 +693,12 @@ def _validate_reduction_tiling(op: ComputedBuffer) -> None:
 def _propagate_tiled_op(
     op: ComputedBuffer,
     operations: list[Operation],
+    carry_ops: set[str],
 ) -> None:
     """Handle buffer propagation for a single tiled Pointwise or Reduction op."""
     loop_info = getattr(op, "loop_info", None)
     if isinstance(op.data, Reduction):
         _validate_reduction_tiling(op)
-        has_tiled_reduction = loop_info is not None and any(
-            dims for dims in getattr(loop_info, "loop_tiled_reduction_dims", [])
-        )
-        if has_tiled_reduction:
-            _propagate_tiled_reduction_op(op, operations)
-            return
 
     if loop_info is None:
         return
@@ -713,11 +709,26 @@ def _propagate_tiled_op(
         buf_name, loop_group_id, operations
     )
 
+    if isinstance(op.data, Reduction):
+        has_tiled_reduction = any(
+            dims for dims in getattr(loop_info, "loop_tiled_reduction_dims", [])
+        )
+        # Only insert cross-tile accumulation infrastructure when the reduction
+        # result is needed outside the loop.  A tiled reduction with no outside
+        # consumers is per-tile scratch (e.g. block_max in flash attention) —
+        # handle it below like any other loop-internal buffer.
+        if has_tiled_reduction and (outside_consumers or is_graph_output):
+            _propagate_tiled_reduction_op(op, operations)
+            return
+
     # If no dims were tiled (loop_tiled_dims all empty), the op is loop-invariant —
     # mark per_tile_fixed so the unroller reuses the same address each tile.
     if all(not dims for dims in loop_info.loop_tiled_dims):
         from .ir import FixedTiledLayout
 
+        if _is_carry_op(op, loop_group_id, operations, carry_ops):
+            _propagate_carry_op(op, operations, carry_ops)
+            return
         if isinstance(op.layout, FixedTiledLayout):
             op.layout.per_tile_fixed = True
         return
@@ -727,6 +738,15 @@ def _propagate_tiled_op(
         # iteration.  Mark it so the unroller does not advance its base address.
         from .ir import FixedTiledLayout
 
+        # Only check carry if the innermost tiled_dims level is empty — ops
+        # that advance their output per innermost tile are not carry ops at
+        # that level.  Levels are ordered outermost-first, so loop_tiled_dims[-1]
+        # is the innermost level.
+        if not loop_info.loop_tiled_dims[-1] and _is_carry_op(
+            op, loop_group_id, operations, carry_ops
+        ):
+            _propagate_carry_op(op, operations, carry_ops)
+            return
         if isinstance(op.layout, FixedTiledLayout):
             op.layout.per_tile_fixed = True
         # Non-FixedTiledLayout buffers (e.g. MutationLayoutSHOULDREMOVE from a
