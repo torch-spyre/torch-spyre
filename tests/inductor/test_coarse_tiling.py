@@ -4518,3 +4518,74 @@ class TestAffineStrideMatchesUnrollStride(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCarryOpDetection(unittest.TestCase):
+    """Tests for _is_carry_op, _find_state_input_names, _find_terminal_for_state."""
+
+    def test_is_carry_op_true_when_reads_tiled_dep(self):
+        from torch_spyre._inductor.coarse_tile import _is_carry_op
+
+        tiled = _make_tiled_op("tiled", [Integer(8)], (0,), [Integer(2)], [[0]])
+        op = _make_inside_consumer_op("op", "tiled", (0,))
+        op.loop_info.loop_tiled_dims = [[]]
+        assert _is_carry_op(op, (0,), [tiled, op], set()) is True
+
+    def test_is_carry_op_false_when_all_inputs_fixed(self):
+        from torch_spyre._inductor.coarse_tile import _is_carry_op
+
+        fixed_op = _make_tiled_op("fixed", [Integer(8)], (0,), [Integer(2)], [[]])
+        fixed_op.loop_info.loop_tiled_dims = [[]]
+        op = _make_inside_consumer_op("op", "fixed", (0,))
+        op.loop_info.loop_tiled_dims = [[]]
+        assert _is_carry_op(op, (0,), [fixed_op, op], set()) is False
+
+    def test_is_carry_op_true_via_innermost_reduction(self):
+        from torch_spyre._inductor.coarse_tile import _is_carry_op
+
+        # Dep has empty output tiled_dims at the innermost level but non-empty
+        # innermost reduction dim — like block_max (amax over Lk).
+        # loop_tiled_dims = [[0], []] : outer H-tiled, inner Lk-empty output
+        # loop_tiled_reduction_dims = [[], [0]] : outer no-rdim, inner Lk-rdim
+        rdim_dep = _make_tiled_op("dep", [Integer(8)], (0,), [Integer(2)], [[0], []])
+        rdim_dep.loop_info.loop_tiled_dims = [[0], []]
+        rdim_dep.loop_info.loop_tiled_reduction_dims = [[], [0]]
+        op = _make_inside_consumer_op("op", "dep", (0,))
+        op.loop_info.loop_tiled_dims = [[0], []]
+        assert _is_carry_op(op, (0,), [rdim_dep, op], set()) is True
+
+    def test_find_state_input_names_returns_outside_loop_input(self):
+        from torch_spyre._inductor.coarse_tile import _find_state_input_names
+
+        init = _make_consumer_op("init", "")
+        op = _make_inside_consumer_op("op", "init", (0,))
+        op.loop_info.loop_tiled_dims = [[]]
+        result = _find_state_input_names(op, (0,), [init, op])
+        assert "init" in result
+
+    def test_find_terminal_single_op_chain(self):
+        from torch_spyre._inductor.coarse_tile import _find_terminal_for_state
+
+        carry_op = _make_inside_consumer_op("carry", "state", (0,))
+        carry_op.loop_info.loop_tiled_dims = [[]]
+        carry_op.data.ranges = [Integer(8)]
+        terminal = _find_terminal_for_state(
+            "state", (0,), [Integer(8)], [carry_op], carry_op
+        )
+        assert terminal is None
+
+    def test_find_terminal_two_op_chain(self):
+        from torch_spyre._inductor.coarse_tile import _find_terminal_for_state
+
+        carry_op = _make_inside_consumer_op("carry", "state", (0,))
+        carry_op.loop_info.loop_tiled_dims = [[]]
+        carry_op.data.ranges = [Integer(8)]
+
+        terminal_op = _make_inside_consumer_op("terminal", "carry", (0,))
+        terminal_op.loop_info.loop_tiled_dims = [[]]
+        terminal_op.data.ranges = [Integer(8)]
+
+        terminal = _find_terminal_for_state(
+            "state", (0,), [Integer(8)], [carry_op, terminal_op], carry_op
+        )
+        assert terminal is terminal_op

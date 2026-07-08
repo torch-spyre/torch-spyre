@@ -836,6 +836,269 @@ def _has_inside_consumers(
     return False
 
 
+# ---------------------------------------------------------------------------
+# Carry-op detection helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_carry_op(
+    op: ComputedBuffer,
+    loop_group_id: tuple,
+    operations: list[Operation],
+    carry_ops: set[str],
+) -> bool:
+    """Return True if op's output value changes per innermost tile.
+
+    An op with empty innermost loop_tiled_dims is address-stable per innermost
+    tile (per_tile_fixed=True).  But its VALUE may still vary each tile if:
+      1. A same-group dep has a non-empty innermost loop_tiled_dims (advancing
+         output address) or non-empty innermost loop_tiled_reduction_dims
+         (reducing over the innermost loop dimension).
+      2. A same-group dep is itself in carry_ops (its value changes each tile
+         even though its address is per_tile_fixed).
+      3. The op directly reads an outside-group buffer with the same shape as
+         its own output (a pre-loop state value that holds the previous tile's
+         accumulated result and must be threaded across tiles via a carry buffer).
+         The shape-match guard prevents misclassifying ops that merely read
+         graph inputs of a different shape (e.g. weight tensors).
+
+    Only the innermost tiling level is checked for cases 1 and 2: outer-level
+    advancement (handled by address arithmetic for outer-tiled dimensions) does
+    not require a carry buffer.
+    """
+    outer_key = loop_group_id[0]
+    buf_map: dict[str, ComputedBuffer] = {}
+    for candidate in operations:
+        if not isinstance(candidate, ComputedBuffer):
+            continue
+        li = getattr(candidate, "loop_info", None)
+        if li is None or li.loop_group_id[0] != outer_key:
+            continue
+        buf_map[candidate.get_name()] = candidate
+
+    try:
+        rw = op.get_read_writes()
+    except Exception as e:
+        logger.debug(
+            "_is_carry_op: get_read_writes() raised for %s: %s", op.get_name(), e
+        )
+        return False
+
+    # Check for outside-group state inputs (case 3): an op that directly reads
+    # a pre-loop buffer with the same shape as its own output is accumulating
+    # state that must be threaded across tiles via a carry buffer.
+    # The shape-match guard prevents misclassifying ops that merely read graph
+    # inputs of a different shape (e.g. a weight tensor or scalar constant).
+    all_group_names = {
+        o.get_name()
+        for o in operations
+        if isinstance(o, ComputedBuffer)
+        and getattr(getattr(o, "loop_info", None), "loop_group_id", (None,))[0]
+        == outer_key
+    }
+    op_ranges = [int(r) for r in op.data.ranges]
+    op_buf_map = {o.get_name(): o for o in operations if isinstance(o, ComputedBuffer)}
+    for dep in rw.reads:
+        dep_name = getattr(dep, "name", None)
+        if dep_name is None or dep_name in all_group_names:
+            continue
+        # Dep is outside the loop group.  Only a carry state input if its shape
+        # matches op's output shape (it holds the previous tile's accumulated value).
+        dep_op = op_buf_map.get(dep_name)
+        if dep_op is None:
+            continue
+        try:
+            dep_ranges = [int(r) for r in dep_op.data.ranges]
+        except Exception:
+            continue
+        if dep_ranges == op_ranges:
+            return True
+
+    for dep in rw.reads:
+        dep_name = getattr(dep, "name", None)
+        if dep_name is None:
+            continue
+        dep_op = buf_map.get(dep_name)
+        if dep_op is None:
+            continue
+        dep_li = (
+            dep_op.loop_info
+        )  # guaranteed non-None and same group by buf_map filter
+        # Case 1: dep's address advances per innermost tile.
+        innermost_out = dep_li.loop_tiled_dims[-1] if dep_li.loop_tiled_dims else []
+        tiled_rdims = getattr(dep_li, "loop_tiled_reduction_dims", [])
+        innermost_red = tiled_rdims[-1] if tiled_rdims else []
+        if innermost_out or innermost_red:
+            return True
+        # Case 2: dep's value changes each tile (transitive carry).
+        if dep_name in carry_ops:
+            return True
+    return False
+
+
+def _find_state_input_names(
+    op: ComputedBuffer,
+    loop_group_id: tuple,
+    operations: list[Operation],
+) -> list[str]:
+    """Return names of op's state inputs — buffers whose value must be carried.
+
+    A state input is a buffer that holds the previous tile's accumulated value
+    and needs to be threaded across tiles via a carry buffer.  Two kinds:
+
+    1. Outside-group buffers: produced before the loop (no loop_info or
+       different outer loop_group_id).  E.g. M_init, denom_init.
+    2. Inside-group loop-invariant buffers: in the same group but with all-empty
+       loop_tiled_dims (address never advances in any loop level).
+
+    The search is transitive through in-group deps that have non-empty outer
+    tiled_dims but empty innermost tiled_dims: those intermediaries pass the
+    state through unchanged in address terms, so the state root is the
+    all-empty-td buffer they read.
+    """
+    outer_key = loop_group_id[0]
+    buf_map: dict[str, ComputedBuffer] = {}
+    for candidate in operations:
+        if not isinstance(candidate, ComputedBuffer):
+            continue
+        buf_map[candidate.get_name()] = candidate
+
+    result: list[str] = []
+    seen: set[str] = set()
+
+    def _is_all_empty_td(li) -> bool:
+        return li is not None and all(not d for d in li.loop_tiled_dims)
+
+    def _collect(source: ComputedBuffer, depth: int) -> None:
+        if depth > 3:
+            return
+        try:
+            rw = source.get_read_writes()
+        except Exception as e:
+            logger.debug(
+                "_find_state_input_names: get_read_writes() raised for %s: %s",
+                source.get_name(),
+                e,
+            )
+            return
+        for dep in rw.reads:
+            dep_name = getattr(dep, "name", None)
+            if dep_name is None or dep_name in seen:
+                continue
+            dep_op = buf_map.get(dep_name)
+            if dep_op is None:
+                continue
+            dep_li = getattr(dep_op, "loop_info", None)
+            in_group = dep_li is not None and dep_li.loop_group_id[0] == outer_key
+            if not in_group:
+                # Outside-group: this is a state input.
+                seen.add(dep_name)
+                result.append(dep_name)
+            elif _is_all_empty_td(dep_li):
+                # In-group but fully loop-invariant: treat as a state init buffer.
+                seen.add(dep_name)
+                result.append(dep_name)
+            else:
+                # In-group with non-empty outer tiled_dims: recurse to find the
+                # state root via this intermediary.
+                seen.add(dep_name)
+                _collect(dep_op, depth + 1)
+
+    _collect(op, 0)
+    return result
+
+
+def _find_terminal_for_state(
+    state_buf_name: str,
+    loop_group_id: tuple,
+    same_shape_ranges: list,
+    operations: list[Operation],
+    carry_op: "ComputedBuffer",
+) -> "ComputedBuffer | None":
+    """Find the in-loop op that produces the new value for state_buf_name.
+
+    Performs a forward DFS from ``carry_op`` within the loop group, pruning
+    at any op that also reads ``state_buf_name`` directly (those are sibling
+    ops in parallel state chains, not the carry chain being followed).  The
+    terminal is the reachable in-group op with the same shape as the state
+    buffer that appears latest in the operations list.
+
+    Returns None when ``carry_op`` itself is the terminal (single-op chains
+    like ``max_running = maximum(M_carry, block_max)``).
+    """
+    outer_key = loop_group_id[0]
+    target_ranges = [int(r) for r in same_shape_ranges]
+
+    # Build a forward-adjacency map: buf_name → set of in-group readers.
+    readers_of: dict[str, list[ComputedBuffer]] = {}
+    direct_readers_of_state: set[str] = set()
+    for candidate in operations:
+        if not isinstance(candidate, ComputedBuffer):
+            continue
+        li = getattr(candidate, "loop_info", None)
+        if li is None or li.loop_group_id[0] != outer_key:
+            continue
+        try:
+            dep_names = {
+                getattr(dep, "name", None) for dep in candidate.get_read_writes().reads
+            }
+        except Exception:
+            continue
+        for dname in dep_names:
+            if dname is None:
+                continue
+            readers_of.setdefault(dname, []).append(candidate)
+        if state_buf_name in dep_names:
+            direct_readers_of_state.add(candidate.get_name())
+
+    # Forward DFS from carry_op, pruning paths through direct_readers_of_state
+    # (those are parallel chains that also read the state, not the carry chain).
+    reachable: set[str] = set()
+    stack = list(readers_of.get(carry_op.get_name(), []))
+    while stack:
+        node = stack.pop()
+        nname = node.get_name()
+        if nname in reachable:
+            continue
+        if nname in direct_readers_of_state:
+            continue  # prune: this branch reads the state directly (parallel chain)
+        # Only traverse nodes with the same shape as the target.  Ops with a
+        # different shape are not part of the state accumulation chain; following
+        # them would leak into unrelated chains that happen to share the same
+        # output shape further downstream.
+        try:
+            node_ranges = [int(r) for r in node.data.ranges]
+        except Exception:
+            node_ranges = None
+        if node_ranges is not None and node_ranges != target_ranges:
+            continue
+        reachable.add(nname)
+        stack.extend(readers_of.get(nname, []))
+
+    excluded = {state_buf_name} | direct_readers_of_state | {carry_op.get_name()}
+
+    best: ComputedBuffer | None = None
+    best_idx: int = -1
+    for idx, candidate in enumerate(operations):
+        if not isinstance(candidate, ComputedBuffer):
+            continue
+        cname = candidate.get_name()
+        if cname in excluded or cname not in reachable:
+            continue
+        li = getattr(candidate, "loop_info", None)
+        if li is None or li.loop_group_id[0] != outer_key:
+            continue
+        try:
+            cand_ranges = [int(r) for r in candidate.data.ranges]
+        except Exception:
+            continue
+        if cand_ranges == target_ranges and idx > best_idx:
+            best = candidate
+            best_idx = idx
+
+    return best
+
+
 def _graph_output_names() -> set[str]:
     """Return the set of buffer names that appear in V.graph graph outputs."""
     try:
