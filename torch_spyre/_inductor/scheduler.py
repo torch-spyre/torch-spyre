@@ -189,8 +189,8 @@ def build_loop_scheduler_nodes(
     Running before Inductor's fusion pass ensures CountedLoopSchedulerNodes are
     visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return False),
     so loop groups survive Inductor fusion intact.  spyre_fuse_nodes is separately
-    protected because it only fuses plain SchedulerNodes (isinstance check), causing
-    CountedLoopSchedulerNodes to force a bundle boundary.
+    aware of CountedLoopSchedulerNodes: they are accumulated alongside plain
+    SchedulerNodes and may share a bundle with adjacent ops.
     """
     result = _build_loop_group(nodes, depth=0)
 
@@ -305,38 +305,31 @@ class SuperDSCScheduling(BaseScheduling):
 
         assert self.scheduler
         nodes = [
-            node
-            for node in node.get_nodes()
-            if node.get_name() not in self.scheduler.removed_ops
+            n
+            for n in node.get_nodes()
+            if n.get_name() not in self.scheduler.removed_ops
         ]
         if len(nodes) == 0:
             return
 
-        node_schedule = self.generate_node_schedule(nodes)
         kernel = SpyreKernel()
+        all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
-            for node in node_schedule:
-                var_ranges = iteration_space(node)
-                vars = list(var_ranges.keys())
-                index_vars = [
-                    vars[: len(node._body.iter_vars)],
-                    vars[len(node._body.iter_vars) :],
-                ]
-                node.codegen(index_vars)
+            self._codegen_into_kernel(nodes, kernel, all_schedule_nodes)
 
         with V.set_kernel_handler(kernel):
             src_code = kernel.codegen_kernel()
-        kernel_name = self.define_kernel(src_code, node_schedule, kernel)
+        kernel_name = self.define_kernel(src_code, all_schedule_nodes, kernel)
         kernel.kernel_name = kernel_name
         kernel.code_hash = code_hash(src_code)
 
         with V.set_kernel_handler(kernel):
-            for node in node_schedule:
-                node.mark_run()
+            for snode in all_schedule_nodes:
+                snode.mark_run()
 
-        self.codegen_comment(node_schedule, kernel_name)
+        self.codegen_comment(all_schedule_nodes, kernel_name)
         kernel.call_kernel(kernel.kernel_name)
-        kernel.emit_layout_restores(self._collect_layout_restores(node_schedule))
+        kernel.emit_layout_restores(self._collect_layout_restores(all_schedule_nodes))
 
         V.graph.removed_buffers |= kernel.removed_buffers
         V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
@@ -354,29 +347,10 @@ class SuperDSCScheduling(BaseScheduling):
         if len(inner_nodes) == 0:
             return
 
-        # Each snode in the group may itself be a CountedLoopSchedulerNode
-        # (nested loop) or a plain SchedulerNode.  Drive them all into the
-        # same SpyreKernel so their OpSpecs land in one op_specs list.
         kernel = SpyreKernel()
         all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
-            for inner in inner_nodes:
-                if isinstance(inner, CountedLoopSchedulerNode):
-                    # Recurse: codegen the inner loop into the same kernel,
-                    # which will call wrap_op_specs_in_loop on the inner body.
-                    # We temporarily redirect codegen to this kernel.
-                    self._codegen_loop_body(inner, kernel, all_schedule_nodes)
-                else:
-                    sched = self.generate_node_schedule([inner])
-                    all_schedule_nodes.extend(sched)
-                    for snode in sched:
-                        var_ranges = iteration_space(snode)
-                        vs = list(var_ranges.keys())
-                        index_vars = [
-                            vs[: len(snode._body.iter_vars)],
-                            vs[len(snode._body.iter_vars) :],
-                        ]
-                        snode.codegen(index_vars)
+            self._codegen_into_kernel(inner_nodes, kernel, all_schedule_nodes)
 
         kernel.wrap_op_specs_in_loop(node.loop_count)
 
@@ -438,6 +412,33 @@ class SuperDSCScheduling(BaseScheduling):
         body = kernel.op_specs[body_start:]
         kernel.op_specs = kernel.op_specs[:body_start]
         kernel.op_specs.append(LoopSpec(count=node.loop_count, body=body))
+
+    def _codegen_into_kernel(
+        self,
+        nodes: list[BaseSchedulerNode],
+        kernel: SpyreKernel,
+        all_schedule_nodes: list[SchedulerNode],
+    ) -> None:
+        """Codegen a sequence of nodes into an existing kernel in order.
+
+        Each CountedLoopSchedulerNode is driven via _codegen_loop_body so its
+        ops land as a LoopSpec entry in kernel.op_specs.  Plain SchedulerNodes
+        are codegenned flat.  The two types may appear in any order.
+        """
+        for node in nodes:
+            if isinstance(node, CountedLoopSchedulerNode):
+                self._codegen_loop_body(node, kernel, all_schedule_nodes)
+            else:
+                sched = self.generate_node_schedule([node])
+                all_schedule_nodes.extend(sched)
+                for snode in sched:
+                    var_ranges = iteration_space(snode)
+                    vs = list(var_ranges.keys())
+                    index_vars = [
+                        vs[: len(snode._body.iter_vars)],
+                        vs[len(snode._body.iter_vars) :],
+                    ]
+                    snode.codegen(index_vars)
 
     def define_kernel(self, src_code, node_schedule, kernel):
         """

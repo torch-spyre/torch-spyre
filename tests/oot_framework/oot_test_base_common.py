@@ -628,11 +628,17 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
             _OOTOpDtypeExpander(test, all_extra_dtypes).patch()
 
         # Collect precision overrides: merge global + union across all entries.
-        # Per-variant selection happens below in new_methods loop.
+        # precision_overrides/tolerance_overrides are dtype-keyed only (an
+        # upstream limitation), so -- like the dtype injection above -- these
+        # can only vary per dtype, not per op within a shared test method.
+        include_dtype_precision: Dict[torch.dtype, Precision] = {}
+        for _e in all_entries_for_name:
+            include_dtype_precision.update(_e.edits.dtypes.resolved_include_precision())
+
         _OOTPrecisionOverridePatcher(
             test,
             global_dtype_precision=cls.GLOBAL_DTYPE_PRECISION,
-            include_dtype_precision={},  # handled per-variant below
+            include_dtype_precision=include_dtype_precision,
         ).patch()
 
         # Dynamically adds pytest marker to each of ops and dtype passed to @ops
