@@ -1737,6 +1737,63 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
             ["mb", "out", "x"],
         )
 
+    def test_unit_bmm_preserve_skips_higher_rank_attention_layout(self):
+        c0 = Symbol("c0")
+        c1 = Symbol("c1")
+        c2 = Symbol("c2")
+        z0 = Symbol("z0")
+        input_arg = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=_FP16,
+            device_size=[512, 32, 2, 1, 64],
+            device_coordinates=[
+                c0,
+                z0,
+                floor(c2 / 64),
+                Integer(0),
+                Mod(c2, 64),
+            ],
+            allocation={"pool": 0},
+        )
+        kernel_arg = TensorArg(
+            is_input=True,
+            arg_index=1,
+            device_dtype=_FP16,
+            device_size=[64, 4096, 64],
+            device_coordinates=[floor(c1 / 64), c2, Mod(c1, 64)],
+            allocation={"hbm": 0x400000000},
+        )
+        output_arg = TensorArg(
+            is_input=False,
+            arg_index=2,
+            device_dtype=_FP16,
+            device_size=[512, 64, 1, 64],
+            device_coordinates=[c0, floor(c1 / 64), Integer(0), Mod(c1, 64)],
+            allocation={"hbm": 0x800000000},
+        )
+        iteration_space = {
+            c0: (Integer(512), 4),
+            c1: (Integer(4096), 8),
+            c2: (Integer(4096), 1),
+        }
+        op_info = {SHARED_WEIGHT_UNIT_BMM_INFO_KEY: {"batch_dim": 0}}
+
+        new_iteration_space = _preserve_shared_weight_unit_bmm_dim(
+            "batchmatmul",
+            iteration_space,
+            [input_arg, kernel_arg, output_arg],
+            op_info,
+        )
+
+        self.assertIs(new_iteration_space, iteration_space)
+        self.assertNotIn("_spyre_bmm_unit", {str(dim) for dim in iteration_space})
+        self.assertEqual(input_arg.device_size, [512, 32, 2, 1, 64])
+        self.assertEqual(
+            input_arg.device_coordinates,
+            [c0, z0, floor(c2 / 64), Integer(0), Mod(c2, 64)],
+        )
+
     def test_shared_weight_marker_requires_stick_aligned_dims(self):
         m, k, n = 2, 128, 64
         self.assertEqual(
