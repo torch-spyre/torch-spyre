@@ -129,6 +129,11 @@ void SpyreStream::synchronize() const {
   handle->synchronize();
 }
 
+bool SpyreStream::hasStreamError() const {
+  flex::RuntimeStream* handle = resolveRuntimeHandle();
+  return handle->needsShutdown();
+}
+
 c10::Stream SpyreStream::unwrap() const {
   return stream_;
 }
@@ -352,12 +357,23 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
     idx = (idx + 1) % streams.size();
   }
 
-  // Create corresponding flex stream handle (if not exists)
-  if (pool.stream_handle_map.find(stream_id) == pool.stream_handle_map.end()) {
-    auto runtime = GlobalRuntime::get();
-    flex::RuntimeStreamPriority streamPriority =
-        priority < 0 ? flex::RuntimeStreamPriority::HIGH
-                     : flex::RuntimeStreamPriority::NORMAL;
+  // Refresh the flex handle if it exists but is in error state (option a
+  // recovery). destroyStream() synchronises and releases the broken handle;
+  // createStream() returns a clean one. The default stream (ID 0) cannot be
+  // destroyed via destroyStream(), but it is never returned by
+  // getStreamFromPool(), so this branch is always safe.
+  auto runtime = GlobalRuntime::get();
+  flex::RuntimeStreamPriority streamPriority =
+      priority < 0 ? flex::RuntimeStreamPriority::HIGH
+                   : flex::RuntimeStreamPriority::NORMAL;
+
+  auto it = pool.stream_handle_map.find(stream_id);
+  if (it != pool.stream_handle_map.end() && it->second->needsShutdown()) {
+    runtime->destroyStream(it->second);
+    pool.stream_handle_map.erase(it);
+    it = pool.stream_handle_map.end();
+  }
+  if (it == pool.stream_handle_map.end()) {
     flex::RuntimeStream* flex_handle = runtime->createStream(streamPriority);
     pool.stream_handle_map[stream_id] = flex_handle;
   }

@@ -355,12 +355,23 @@ PYBIND11_MODULE(_C, m) {
   m.def("synchronize", &spyre::synchronizeDevice,
         py::arg("device") = py::none(), "Synchronize a device or all devices");
 
+  m.def(
+      "has_any_stream_error",
+      []() -> bool {
+        auto runtime = spyre::GlobalRuntime::get();
+        if (!runtime) return false;
+        return runtime->hasStreamError();
+      },
+      "Return True if any stream in the runtime context is in error state");
+
   // Expose SpyreStream class to Python
   py::class_<spyre::SpyreStream>(m, "_SpyreStreamBase")
       .def("synchronize", &spyre::SpyreStream::synchronize,
            "Wait for all operations on this stream to complete")
       .def("query", &spyre::SpyreStream::query,
            "Check if all operations on this stream have completed")
+      .def("has_stream_error", &spyre::SpyreStream::hasStreamError,
+           "Return True if the underlying flex stream is in error state")
       .def("device", &spyre::SpyreStream::device,
            "Get the device associated with this stream")
       .def("id", &spyre::SpyreStream::id, "Get the stream ID")

@@ -45,6 +45,8 @@ class SpyreStream {
   // Synchronization
   bool query() const;        // Check if work completed
   void synchronize() const;  // Block until work done
+  bool hasStreamError()
+      const;  // True if the underlying flex stream is in error state
 
   void copyAsync(const at::Tensor& src, const at::Tensor& dst) const;
   void copyProgramAsync(void* prog_cpu_ptr,

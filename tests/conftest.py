@@ -480,6 +480,44 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         terminalreporter.write_line(rep.nodeid)
 
 
+# ── Stream error isolation ────────────────────────────────────────────────────
+# Option (a): getStreamFromPool() automatically destroys and recreates any
+# broken non-default handle, so subsequent tests on pool streams self-recover.
+# Option (c) fallback: if the default stream (unrecoverable) goes into error
+# state, all remaining tests are skipped with a clear message.
+
+_device_stream_broken: bool = False
+
+
+def _any_stream_has_error() -> bool:
+    """Return True if any stream in the runtime context is in error state."""
+    try:
+        from torch_spyre import _C  # type: ignore[import]
+
+        return bool(_C.has_any_stream_error())
+    except Exception:
+        # If we cannot query (e.g. device not present), be conservative.
+        return False
+
+
+@pytest.fixture(autouse=True)
+def stream_error_guard():
+    """Isolate stream errors so one hardware failure → one FAILED test,
+    not cascading mysterious crashes across the whole session."""
+    global _device_stream_broken
+
+    if _device_stream_broken:
+        pytest.skip(
+            "Spyre stream is in error state from a previous test — "
+            "device reset required before further tests can run."
+        )
+
+    yield  # ── run the test ──
+
+    if _any_stream_has_error():
+        _device_stream_broken = True
+
+
 def _is_spyre_hardware_available() -> bool:
     """
     Detect whether Spyre hardware is available.
