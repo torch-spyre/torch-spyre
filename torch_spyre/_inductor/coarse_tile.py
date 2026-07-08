@@ -34,8 +34,8 @@ Entry point::
     coarse_tile(graph, groups)
 
 ``groups`` is a list of ``(ops, levels)`` tuples where ``levels`` is a list of
-``(hint_id, count, is_reduction_level)`` triples, outermost first.  Each op
-resolves its own tiled dimension from its ``loop_var`` in ``dim_hints``.
+``(hint_id, count)`` pairs, outermost first.  Each op resolves its own
+tiled dimension from its ``loop_var`` in ``dim_hints``.
 
 Each ``ops`` list must be a contiguous sub-sequence of ``operations``.
 
@@ -115,35 +115,45 @@ def _loop_var_to_ranges_pos(out_coords: list, sym: sympy.Symbol) -> int | None:
 
 
 def _hints_levels(ops: list[Operation]) -> list[tuple]:
-    """Build (hint_id, K, is_reduction) level triples from the first hinted op.
+    """Build (hint_id, K) level pairs by unioning across all ops.
 
-    All ops in the group share the same hint IDs and split counts.  Any op
-    with a non-None loop_var is representative.  Each op reads its own
-    loop_var from dim_hints in _stamp_group.
+    All ops in the group share the same hint IDs and split counts.  For each
+    hint_id, pick the best DimHint across all ops: one with loop_var is not None
+    beats one with loop_var=None.  Hints that are broadcast at every op
+    (loop_var=None everywhere) are dropped.  Hints with split_count==1 are
+    dropped (tiling by 1 is a no-op).  Returns pairs sorted by hint_id
+    ascending (outermost-first).
 
-    Returns a list of (hint_id, count, is_reduction_level) triples, outermost
-    first.  Previously this skipped is_reduction hints; it now includes them so
-    that _stamp_group can divide reduction_ranges for reduction-dim tiling.
-    Hints with split_count == 1 are dropped: tiling by 1 is a no-op.
+    is_reduction is intentionally absent from the returned pairs: it is a
+    per-op, per-dimension property consulted directly in _stamp_group via each
+    op's own DimHint, not a group-level concept.
     """
+    best: dict[int, DimHint] = {}
     for op in ops:
-        levels = []
         for h in getattr(op, "dim_hints", []):
-            if h.loop_var is None:
-                continue
-            if h.split_count == 1:
-                hints_logger.debug(
-                    "spyre_hint on [%s]: hint_id=%d dims=%s split_count=1"
-                    " — tiling by 1 is a no-op, dropping",
-                    ", ".join(o.get_name() for o in ops),
-                    h.hint_id,
-                    h.dim_names,
-                )
-                continue
-            levels.append((h.hint_id, sympy.Integer(h.split_count), h.is_reduction))
-        if levels:
-            return levels
-    return []
+            prev = best.get(h.hint_id)
+            if (
+                prev is None
+                or prev.loop_var is None
+                or (prev.split_count == 1 and h.split_count > 1)
+            ):
+                best[h.hint_id] = h
+
+    levels = []
+    for h in sorted(best.values(), key=lambda x: x.hint_id):
+        if h.loop_var is None:
+            continue
+        if h.split_count == 1:
+            hints_logger.debug(
+                "spyre_hint on [%s]: hint_id=%d dims=%s split_count=1"
+                " — tiling by 1 is a no-op, dropping",
+                ", ".join(o.get_name() for o in ops),
+                h.hint_id,
+                h.dim_names,
+            )
+            continue
+        levels.append((h.hint_id, sympy.Integer(h.split_count)))
+    return levels
 
 
 def _hint_key(op: Operation) -> frozenset | None:
@@ -428,7 +438,7 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
     """Build coarse_tile() groups from automatic span-overflow plans.
 
     This adapter converts a SpanOverflowTilePlan into the same group shape as
-    user spyre_hint annotations: ``[([op], [(hint_id, count, is_reduction)])]``.
+    user spyre_hint annotations: ``[([op], [(hint_id, count)])]``.
     Ops that already carry user hints are left for the user-hint grouping path.
     """
     from . import config
@@ -493,7 +503,6 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
                 (
                     hint_id,
                     sympy.Integer(split_count),
-                    is_reduction,
                 )
             )
             level_summary.append((host_dim, split_count))
@@ -571,7 +580,7 @@ def coarse_tile(
     groups:
         Sequence of ``(ops, levels)`` tuples produced by
         ``hints_to_coarse_tile_groups``.  ``levels`` is a list of
-        ``(hint_id, count, is_reduction_level)`` triples, outermost first.
+        ``(hint_id, count)`` pairs, outermost first.
     """
     operations = graph.operations
     op_to_position: dict[str, int] = {
@@ -1547,16 +1556,20 @@ def _stamp_group(
 ) -> dict[str, _RetiledBufferInfo]:
     """Stamp loop_group_id / loop_count / loop_tiled_dims and divide ranges.
 
-    ``levels`` is a list of ``(hint_id, count, is_reduction_level)`` triples,
-    outermost first.  Each op resolves its own tiled dimension from its
-    loop_var in dim_hints.  Ops that have no matching dim for a level are
-    loop-invariant at that level.
+    ``levels`` is a list of ``(hint_id, count)`` pairs, outermost first.  Each
+    op resolves its own tiled dimension from its loop_var in dim_hints.  Ops
+    that have no matching dim for a level are loop-invariant at that level.
 
-    For reduction-dim levels (``is_reduction_level=True``), the resolved dim
-    index populates ``loop_tiled_reduction_dims`` and ``_divide_reduction_ranges``
-    is called instead of ``_divide_ranges``.  End-to-end correctness of this
-    path is covered by ``TestCoarseTileReductionDim0E2E`` in
-    ``tests/inductor/test_coarse_tile_e2e.py``.
+    For each (op, hint_id) pair the dispatch is per-op:
+    - If hint_id is in hint_id_to_ranges_pos (output dim for this op):
+      populate loop_tiled_dims and call _divide_ranges.
+    - If hint_id is in hint_id_to_reduction_ranges_pos (reduction dim for this
+      op): populate loop_tiled_reduction_dims and call _divide_reduction_ranges.
+    - These are mutually exclusive per op (enforced by _validate_reduction_tiling).
+    - If hint_id is in neither (broadcast op): both lists get [] for this level.
+
+    End-to-end correctness of the reduction path is covered by
+    TestCoarseTileReductionDim0E2E in tests/inductor/test_coarse_tile_e2e.py.
     """
     if not ops:
         return {}
@@ -1564,7 +1577,7 @@ def _stamp_group(
     _validate_contiguous(ops, op_to_position, group_id)
 
     nested_group_id: tuple[int, ...] = group_id + (0,) * (len(levels) - 1)
-    counts = [count for _, count, _ in levels]
+    counts = [count for _, count in levels]
     retiled_infos: dict[str, _RetiledBufferInfo] = {}
 
     for op in ops:
@@ -1599,36 +1612,29 @@ def _stamp_group(
 
         op_tiled_dims: list[list[int]] = []
         op_tiled_reduction_dims: list[list[int]] = []
-        for hint_id, count, is_reduction_level in levels:
-            if is_reduction_level:
-                rpos = hint_id_to_reduction_ranges_pos.get(hint_id)
-                op_tiled_dims.append([])
-                op_tiled_reduction_dims.append([rpos] if rpos is not None else [])
-                if isinstance(op.data, Reduction):
-                    # NOTE: _divide_reduction_ranges mutates data.reduction_ranges
-                    # before _validate_reduction_tiling runs in the later
-                    # insert_tiling_propagation pass.  If validation raises (e.g.
-                    # mixed output+reduction at one level), the mutated ranges are
-                    # never observed: the RuntimeError propagates uncaught through
-                    # the pass runner and aborts compilation.
-                    _divide_reduction_ranges(
-                        op, count, [rpos] if rpos is not None else []
-                    )
-            else:
-                opos = hint_id_to_ranges_pos.get(hint_id)
-                op_tiled_dims.append([opos] if opos is not None else [])
-                op_tiled_reduction_dims.append([])
-                retiled_info = _divide_ranges(
-                    op, count, [opos] if opos is not None else []
+        for hint_id, count in levels:
+            opos = hint_id_to_ranges_pos.get(hint_id)
+            rpos = hint_id_to_reduction_ranges_pos.get(hint_id)
+            op_tiled_dims.append([opos] if opos is not None else [])
+            op_tiled_reduction_dims.append([rpos] if rpos is not None else [])
+            # _divide_ranges with tiled_dims=[] is a no-op.
+            retiled_info = _divide_ranges(op, count, [opos] if opos is not None else [])
+            if retiled_info is not None:
+                name = op.get_name()
+                prior = retiled_infos.get(name)
+                retiled_infos[name] = (
+                    _RetiledBufferInfo(prior.old_stride, retiled_info.new_stride)
+                    if prior is not None
+                    else retiled_info
                 )
-                if retiled_info is not None:
-                    name = op.get_name()
-                    prior = retiled_infos.get(name)
-                    retiled_infos[name] = (
-                        _RetiledBufferInfo(prior.old_stride, retiled_info.new_stride)
-                        if prior is not None
-                        else retiled_info
-                    )
+            if isinstance(op.data, Reduction):
+                # NOTE: _divide_reduction_ranges mutates data.reduction_ranges
+                # before _validate_reduction_tiling runs in the later
+                # insert_tiling_propagation pass.  If validation raises (e.g.
+                # mixed output+reduction at one level), the mutated ranges are
+                # never observed: the RuntimeError propagates uncaught through
+                # the pass runner and aborts compilation.
+                _divide_reduction_ranges(op, count, [rpos] if rpos is not None else [])
 
         op.loop_info = CoarseTileInfo(  # type: ignore[attr-defined]
             loop_group_id=nested_group_id,

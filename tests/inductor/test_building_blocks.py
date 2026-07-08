@@ -18,6 +18,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import torch_spyre._inductor.propagate_named_dims as _pnd
+from torch._inductor.utils import run_and_get_code
+from torch_spyre._inductor import spyre_hint  # noqa: F401
+
 from utils_inductor import compare_with_cpu, compare_with_pytorch
 
 
@@ -210,3 +214,53 @@ class TestBuildingBlocks(unittest.TestCase):
             atol=0.1,
             rtol=0.1,
         )
+
+    def test_refactored_plain_bundle_codegen(self):
+        """Pointwise ops fuse into one bundle via the refactored codegen path."""
+
+        def fn(x, y, z):
+            # Three separate pointwise ops — the scheduler should fuse them
+            # into one FusedSchedulerNode, exercising _codegen_into_kernel.
+            a = x + y
+            b = a * z
+            return b - x
+
+        T, D = 128, 64
+        x = torch.randn(T, D, dtype=torch.float16)
+        y = torch.randn(T, D, dtype=torch.float16)
+        z = torch.randn(T, D, dtype=torch.float16)
+
+        compare_with_cpu(fn, x, y, z, run_eager=False)
+
+    def test_mixed_plain_and_loop_bundle_codegen(self):
+        """Plain op + hint-tiled op fuse into one bundle; LoopSpec must appear."""
+        from torch_spyre._inductor import spyre_hint as sh
+
+        T, D = 128, 64
+        x_cpu = torch.randn(T, D, dtype=torch.float16)
+
+        # Named dims must be set on the device tensor so propagation can map
+        # the hint's "T" name to the loop variable at compile time.
+        x_dev = x_cpu.to("spyre")
+        _pnd.declare_tensor_dim("T", T)
+        _pnd.declare_tensor_dim("D", D)
+        _pnd.name_tensor_dims(x_dev, ["T", "D"])
+
+        def fn(x):
+            # abs is a plain SchedulerNode; neg inside the hint becomes a
+            # CountedLoopSchedulerNode.  The two must fuse into one bundle.
+            y = torch.abs(x)
+            with sh(num_tiles_per_dim={"T": 2}):
+                return torch.neg(y)
+
+        cfn = torch.compile(fn)
+        spyre_result, source_codes = run_and_get_code(cfn, x_dev)
+        self.assertTrue(len(source_codes) > 0)
+        self.assertIn(
+            "LoopSpec(",
+            source_codes[0],
+            "CountedLoopSchedulerNode must produce a LoopSpec in the bundle",
+        )
+
+        cpu_result = fn(x_cpu)
+        torch.testing.assert_close(spyre_result.cpu(), cpu_result, atol=1e-3, rtol=1e-3)
