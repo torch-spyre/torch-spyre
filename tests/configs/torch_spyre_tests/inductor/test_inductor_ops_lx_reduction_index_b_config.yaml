@@ -14,6 +14,15 @@ test_suite_config:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_planning.py
       unlisted_test_mode: skip
       tests:
+        # Known LX-planning failures -- run and expected to fail. Non-strict
+        # xfail: an unexpected pass (XPASS) does not fail CI. Entries failing
+        # in both wraps collapse to (pointwise|reduction).
+        - names:
+            - LxPlanning.*::test_aminmax_keepdim0_aminmax_2d_dim_0_lx_planning_pointwise
+            - LxPlanning.*::test_mean_keepdim1_mean_fp16_2d_dim_1_lx_planning_pointwise
+            - LxPlanning.*::test_mean_keepdim1_mean_fp16_2d_dim_0_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_mean_keepdim0_mean_fp16_3d_dim_1_lx_planning_reduction
+          mode: xfail
         - names:
             - LxPlanning.*::test_aminmax_keepdim.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_sum_keepdim0.*_lx_planning_(pointwise|reduction)

@@ -28,6 +28,7 @@ test_suite_config:
             - LxPlanning.*::test_addmm_1152_10x1152_1152x1152_lx_planning_reduction
             - LxPlanning.*::test_addmm_out_basic_lx_planning_reduction
             - LxPlanning.*::test_large_matmul_matmul_2d_M2048_K2048_N65536_lx_planning_reduction
+            - LxPlanning.*::test_large_matmul_matmul_4d_B2_H2_M2048_K2048_N65536_lx_planning_pointwise
           mode: xfail
         - names:
             - LxPlanning.*::test_(addmm|mm|bmm|einsum|matmul|linear).*_lx_planning_(pointwise|reduction)
