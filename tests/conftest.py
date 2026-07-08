@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 import yaml
 import pytest
-
+import re
 
 import shared_config
 from oot_framework.oot_test_utilities import _RUNTIME_TAGS, _RUNTIME_SHAPES
@@ -51,6 +51,16 @@ def pytest_runtest_makereport(item, call):
             rep._spyre_tags = tags
 
         shapes = _RUNTIME_SHAPES.get(method_name)
+        if not shapes:
+            # Fallback: extract op unique_name from the variant method name
+            # e.g. "test_model_ops_db_torch_mul__1_spyre_float16" -> "torch_mul__1"
+            # _RUNTIME_SHAPES is pre-populated at collection time with this key.
+            # This covers the case where the test body never ran (runner crash /
+            # fresh-process retry), mirroring the _oot_method_tags fallback above.
+            m = re.search(r"^test_model_ops_db_(\w+__\d+)", method_name)
+            if m:
+                shapes = _RUNTIME_SHAPES.get(m.group(1))
+
         if shapes:
             rep._spyre_shapes = shapes
 

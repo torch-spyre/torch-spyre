@@ -117,7 +117,6 @@ void startRuntime() {
 }
 
 void freeRuntime() {
-  clearArtifactCache();
   GlobalRuntime::reset();
 }
 
@@ -194,13 +193,13 @@ PYBIND11_MODULE(_C, m) {
   m.def("start_runtime", &spyre::startRuntime);
   m.def("free_runtime", &spyre::freeRuntime);
   m.def("device_count", &spyre::getVisibleDeviceCount);
-  m.def("launch_kernel", &spyre::launchKernel);
   m.def("encode_constant", &spyre::encodeConstant);
 
   py::enum_<spyre::ElementArrangement>(m, "ElementArrangement")
       .value("STANDARD", spyre::ElementArrangement::STANDARD)
       .value("DL16_TO_FP32", spyre::ElementArrangement::DL16_TO_FP32)
       .value("QFP8CH", spyre::ElementArrangement::QFP8CH)
+      .value("FP32_TO_DL16", spyre::ElementArrangement::FP32_TO_DL16)
       .value("EXX2", spyre::ElementArrangement::EXX2);
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");

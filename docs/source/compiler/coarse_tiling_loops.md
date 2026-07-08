@@ -32,6 +32,8 @@ what constraints forced each choice — see the companion RFC
 - [Design Overview](#design-overview)
 - [Small Example](#small-example)
 - [Layer 1 — IR pass & `coarse_tile()` API](#layer-1--pre-scheduling-ir-pass)
+  - [`reorder_unhinted_interlopers`](#reorder_unhinted_interlopers-pre-grouping-pass)
+  - [Groups derivation and placement](#groups-derivation-and-placement-in-custompreschedulingpasses)
 - [Layer 2 — `CountedLoopSchedulerNode`](#layer-2--countedloopschedulernode)
 - [Layer 3 — `LoopSpec` & codegen](#layer-3--loopspec-and-codegen)
 - [Key files](#key-files)
@@ -99,8 +101,8 @@ name_tensor_dims(b, ["A", "B"])
 name_tensor_dims(c, ["A", "B"])
 
 def f(a, b, c):
-    with spyre_hint(slices={"A": 2}):     # outer loop: 2 iterations over rows
-        with spyre_hint(slices={"B": 4}): # inner loop: 4 iterations over cols
+    with spyre_hint(num_tiles_per_dim={"A": 2}):     # outer loop: 2 iterations over rows
+        with spyre_hint(num_tiles_per_dim={"B": 4}): # inner loop: 4 iterations over cols
             y = a + b
             z = y * c
             return z
@@ -115,7 +117,8 @@ within the tile.
 
 This example is the canonical small example tested by
 `test_hint_nested_loop_with_scratchpad` in
-`tests/inductor/test_coarse_tile_e2e.py`.
+`tests/inductor/test_coarse_tile_e2e.py`.  (`slices=` also works — it is a
+deprecated alias for `num_tiles_per_dim=`.)
 
 ### What the coarse-tiling pass stamps
 
@@ -202,7 +205,7 @@ Key points:
 
 The Python wrapper emitted by `codegen_kernel()` contains both ops inside a
 single nested `LoopSpec`.  Below is the actual output produced by running the e2e test
-`test_hint_nested_loop_with_scratchpad` (which uses `spyre_hint(slices=...)` /
+`test_hint_nested_loop_with_scratchpad` (which uses `spyre_hint(num_tiles_per_dim=...)` /
 `declare_tensor_dim` / `name_tensor_dims` with `allow_all_ops_in_lx_planning=True`;
 concrete HBM addresses replaced with symbolic names for readability):
 
@@ -223,7 +226,7 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                                 sympify('c1'): (sympify('1024'), 1),
                             },
                             op_info={},
-                            tiled_symbols=[sympify('c0'), sympify('c1')],
+                            tiled_symbols=[[sympify('c1')], [sympify('c0')]],
                             args=[
                                 TensorArg(              # input a
                                     is_input=True, arg_index=0,
@@ -268,7 +271,7 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                                 sympify('c1'): (sympify('1024'), 1),
                             },
                             op_info={},
-                            tiled_symbols=[sympify('c0'), sympify('c1')],
+                            tiled_symbols=[[sympify('c1')], [sympify('c0')]],
                             args=[
                                 TensorArg(              # input y (LX scratchpad)
                                     is_input=True, arg_index=-1,
@@ -317,8 +320,9 @@ Key observations:
 
 - `c0` and `c1` are Inductor's iteration-space symbols for the two dimensions.
   `iteration_space` reflects the per-inner-iteration tile size `[512, 1024]`.
-- `tiled_symbols=[c0, c1]` records — outermost first — which symbols correspond
-  to the tiled dimensions: `c0` drives the outer `scf.for`, `c1` the inner one.
+- `tiled_symbols=[[c1], [c0]]` records — innermost first — which symbols
+  correspond to the tiled dimensions: `c1` is tiled by the inner loop,
+  `c0` by the outer loop.
 - The intermediate tensor `y` (output of `add`, input to `mul`) has
   `allocation={'lx': 0}` — it lives in LX scratchpad memory at address 0.
   Its `device_size=[16, 512, 64]` reflects the per-tile shape `[512, 1024]`.
@@ -425,9 +429,10 @@ key.  `loop_tiled_dims` is the bridge between the pre-scheduling pass (which
 operates on positional `data.ranges` indices) and the codegen phase (which
 uses named sympy Symbols) — it is read by `create_op_spec` to identify, by
 index, which scheduler-level symbols correspond to the tiled output dimensions
-and should be recorded in `OpSpec.tiled_symbols`.  All levels are flattened
-(outermost first) so that `tiled_symbols` covers every loop variable for the
-op.  Using a list-of-lists of indices (rather than a count or a flag) allows
+and should be recorded in `OpSpec.tiled_symbols`.  Each loop level gets its
+own sublist (innermost first) so that `tiled_symbols` covers every loop
+variable for the op.  Using a list-of-lists of indices (rather than a count
+or a flag) allows
 different ops in the same loop to tile non-contiguous or differently
 positioned dimensions of their respective iteration spaces.
 
@@ -464,15 +469,17 @@ object.__setattr__(data, "ranges", ranges)
 
 ```python
 def coarse_tile(
-    operations: list[Operation],
+    graph: GraphLowering,
     groups: list[tuple],
 ) -> None:
 ```
 
 `groups` is a pre-computed list of group tuples produced by
 `hints_to_coarse_tile_groups`.  Each `ops` list must be a contiguous
-sub-sequence of `operations`; a gap indicates a data-flow dependency
-crossing the group boundary and raises `RuntimeError`.
+sub-sequence of `graph.operations`; a gap indicates a data-flow dependency
+crossing the group boundary and raises `RuntimeError`.  The full
+`GraphLowering` is required (not just the operations list) because
+`insert_tiling_propagation` calls `V.graph` APIs to allocate new buffers.
 
 Each group tuple has the form:
 
@@ -501,9 +508,88 @@ representation; it is built by `_hints_levels()` inside
 `hints_to_coarse_tile_groups` in `coarse_tile.py` before `coarse_tile()`
 stamps each op.
 
+### `reorder_unhinted_interlopers`: pre-grouping pass
+
+Before `hints_to_coarse_tile_groups` walks the operation list,
+`reorder_unhinted_interlopers` reorders any unhinted `ComputedBuffer` that
+would otherwise break a contiguous run of same-hint ops into two separate groups.
+
+#### Why it is needed
+
+`hints_to_coarse_tile_groups` collects consecutive same-key ops into a group and
+stops as soon as the key changes.  An unhinted op sandwiched between two
+same-key ops would split what should be one group into two.  This pass attempts
+to move ("reorder") such interlopers either before or after the run so the run
+becomes contiguous.
+
+#### Algorithm invariants enforced by the pass
+
+The algorithm is a two-cursor scan.  The outer cursor `i` starts at the first
+op of each new candidate run.  The inner cursor `j` walks forward, absorbing
+same-key ops.  When it encounters an unhinted `ComputedBuffer` interloper it
+applies one of three outcomes:
+
+1. **Move before** (`_can_move_before` returns `True`): `ops.insert(run_start,
+   ops.pop(j))`.  `run_start` is incremented by 1 to skip past the newly
+   inserted op; `j` stays pointing at the next candidate.
+2. **Move after** (`_can_move_after` returns `True`): `ops.insert(run_end - 1,
+   ops.pop(j))`.  `run_end` is one past the *last* same-key op in the remainder
+   (found by a backward scan), not merely the next one.  This ensures the entire
+   remaining run is covered when later interlopers would otherwise still split it.
+   After `pop(j)` shifts everything left, the insertion at `run_end - 1` lands
+   just after the last hinted op.
+3. **Neither** (both checks fail): raises `RuntimeError` with the op name and the
+   hint group it is blocking.
+
+When **both** directions are legal, the op is moved **before** the run (closer
+to its original position).
+
+#### Legality check: `_no_dep_conflict`
+
+A move is legal when it introduces no new data-flow hazard between the interloper
+and every op in the skipped range.  `_no_dep_conflict` checks four conditions:
+
+- **RAW** (read-after-write): the interloper reads a buffer written by an op in
+  the range (would observe a stale value after reordering).
+- **WAW** (write-after-write): the interloper writes a buffer also written by an
+  op in the range (order of writes matters; both directions are conservatively
+  flagged).
+- Symmetric versions: an op in the range reads or mutates a buffer written by the
+  interloper.
+
+`_no_dep_conflict` includes `op.get_mutation_names()` on both sides so that WAW
+hazards through mutation aliases are detected.  The WAW check is deliberately
+conservative: two ops mutating the same buffer cannot be safely reordered in
+either direction.
+
+#### Non-`ComputedBuffer` ops are hard stops
+
+If the inner cursor `j` reaches an op that is not a `ComputedBuffer`, or a
+`ComputedBuffer` whose hint key is different from the current run's key and
+is non-`None` (i.e., it belongs to a *different* hint group), the scan stops
+immediately.  Such ops cannot be moved by this pass.
+
+#### Trailing consumer pattern
+
+If no same-key op exists after position `j` (i.e. the unhinted op is after the
+last hinted op in this group), `run_end` is `None` and the scan ends silently.
+The unhinted op is not an interloper in this case — it is a trailing consumer.
+
+#### Key invariant summary
+
+| Invariant | How it is enforced |
+|---|---|
+| Every interloper is moved before or after the run | `RuntimeError` if neither direction is legal |
+| Move-before uses the run start (not last position) | `run_start` used as insertion target |
+| Move-after uses the last same-key op (not just the next) | Backward scan for `run_end` |
+| WAW hazards are treated as conflicts in both directions | `get_mutation_names()` included in both `op_written` and `op_needs` |
+| Non-`ComputedBuffer` ops are not moved | Type check in `_can_move_before` / `_can_move_after` |
+| Only unhinted `ComputedBuffer`s are candidates | `ckey is not None` triggers hard stop |
+
 ### Groups derivation and placement in `CustomPreSchedulingPasses`
 
-Groups are derived automatically from `spyre_hint(slices=...)` annotations
+Groups are derived automatically from `spyre_hint(num_tiles_per_dim=...)` annotations
+(`slices=` and `tiles=` are deprecated aliases that still work)
 via `hints_to_coarse_tile_groups` (in `torch_spyre/_inductor/coarse_tile.py`),
 which is a no-op when no hints are present.  `CustomPreSchedulingPasses`
 maintains a `self.passes` list of uniform `Callable[[GraphLowering], None]`
@@ -513,18 +599,26 @@ wrapped in private helpers tagged with `@_runs(...)` for cache-key purposes:
 ```python
 self.passes = [
     deadcode_elimination,
+    # Tensor Layout (Stickification)
+    split_multi_ops,
     propagate_spyre_tensor_layouts,
+    validate_ops,
     optimize_restickify_locations,
     finalize_layouts,
     insert_restickify,
     insert_bmm_padding,
+    #
     dedup_and_promote_constants,
+    # Working Set Reduction
     _maybe_chunk_large_tensors,   # config-gated
     propagate_named_dims,
     assign_dim_hints,
-    _maybe_coarse_tile,           # calls hints_to_coarse_tile_groups + coarse_tile
+    _maybe_coarse_tile,           # reorder_unhinted_interlopers + hints_to_coarse_tile_groups
+                                  # + span_overflow_groups + coarse_tile
+    # Core Division
     span_reduction,
     _distribute_work,             # calls cost_model_matmul_division + work_distribution
+    # LX Planning
     _maybe_scratchpad_planning,   # config-gated; calls scratchpad_planning
 ]
 ```
@@ -843,7 +937,6 @@ bug in the tiling pass.  The post-fusion pass asserts contiguity.
 class LoopSpec:
     count: sympy.Expr
     body: list[OpSpec | UnimplementedOp | LoopSpec]
-    tiled_symbols: list[Symbol] = field(default_factory=list)
 
 @dataclasses.dataclass
 class OpSpec:
@@ -852,7 +945,7 @@ class OpSpec:
     iteration_space: dict[Symbol, tuple[Expr, int]]
     args: Sequence[TensorArg]
     op_info: dict[str, Any]
-    tiled_symbols: list[Symbol] = field(default_factory=list)
+    tiled_symbols: list[list[Symbol]] = field(default_factory=list)
 ```
 
 `LoopSpec` is a peer of `OpSpec` and `UnimplementedOp` in the list that
@@ -863,22 +956,19 @@ belong to the inner `OpSpec`s.
 The `body` type is recursive: a `LoopSpec` body may itself contain
 `LoopSpec` entries, representing nested counted loops.
 
-`LoopSpec.tiled_symbols` carries the loop-level tiling information: the
-iteration-space symbols divided by `count` at this loop level.  It is
-populated by `_codegen_counted_loop` and `_codegen_loop_body` using
-`_tiled_syms_for_sched_node_at_depth` — a helper that maps
-`loop_info.loop_tiled_dims[depth]` (host-range indices) to iteration-space
-symbol keys, accounting for unit-size batch dimensions that the scheduler
-skips.
-The `bundle.py` and `compile_op_spec` paths use `LoopSpec.tiled_symbols`
-to compute per-iteration HBM address offsets.
+`OpSpec.tiled_symbols` is a `list[list[Symbol]]` containing per-loop-level
+iteration-space symbols, **innermost first**.  `tiled_symbols[0]` lists
+the symbols tiled by the innermost enclosing loop; `tiled_symbols[1]`
+lists those tiled by the next-outer loop; and so on.  It is **empty for
+ops not inside a `LoopSpec`**.  Every enclosing loop level has an entry
+(even if empty `[]`) so that level indices stay aligned with nesting
+depth.  Two ops in the same loop group can have different `tiled_symbols`
+if work division or stickification places the batch dimension at
+different positions in each op's iteration space.
 
-`OpSpec.tiled_symbols` provides per-op tiling information (present for
-legacy / fallback paths): all iteration-space symbols divided by any
-enclosing loop, listed **outermost first**.  It is **empty for ops not
-inside a `LoopSpec`**.  Two ops in the same loop group can have different
-`tiled_symbols` if work division or stickification places the batch
-dimension at different positions in each op's iteration space.
+The `bundle.py` and `compile_op_spec` paths reverse `tiled_symbols` to
+outermost-first order and build per-level `affine.apply` stride maps,
+mapping each level's strides to the correct loop variable by index.
 
 ### Nested loops and the `loop_group_id` tree
 
@@ -983,7 +1073,7 @@ def _codegen_counted_loop(self, node: CountedLoopSchedulerNode) -> None:
             break
 
     # Wrap the collected inner specs in a LoopSpec
-    kernel.wrap_op_specs_in_loop(node.loop_count, tiled_symbols=outer_tiled_syms)
+    kernel.wrap_op_specs_in_loop(node.loop_count)
 
     with V.set_kernel_handler(kernel):
         src_code = kernel.codegen_kernel()
@@ -1013,32 +1103,30 @@ A `LoopSpec` entry is serialized as:
 ```python
 LoopSpec(
     count=sympify('K'),
-    tiled_symbols=[sympify('c0')],       # the symbol tiled at this loop level
     body=[
         OpSpec(
             ...,
-            tiled_symbols=[sympify('c0')],   # per-op; emitted only when non-empty
+            tiled_symbols=[[sympify('c0')]],   # one level: innermost
         ),
         LoopSpec(          # nested loop
             count=sympify('J'),
-            tiled_symbols=[sympify('c1')],   # symbol tiled at inner level
             body=[
-                OpSpec(..., tiled_symbols=[sympify('c0'), sympify('c1')]),
+                OpSpec(..., tiled_symbols=[[sympify('c1')], [sympify('c0')]]),
+                # tiled_symbols[0] = innermost loop symbols
+                # tiled_symbols[1] = outer loop symbols
             ],
         ),
     ],
 )
 ```
 
-`LoopSpec.tiled_symbols` is populated by `_codegen_counted_loop` (depth 0)
-and `_codegen_loop_body` (deeper levels) via
-`_tiled_syms_for_sched_node_at_depth`.  `OpSpec.tiled_symbols` is populated
-by `SpyreKernel.create_op_spec`: it reads `loop_info.loop_tiled_dims` (a
-`list[list[int]]`) from the `ir.Operation` (stamped by `coarse_tile()`),
-flattens all levels outermost-first, and selects the symbols at those indices
-from the scheduler-level `iteration_space` dict.  `MemoryDep.ranges`
-preserves the `data.ranges` ordering, so this positional correspondence is
-stable across the pre-scheduling to codegen boundary.
+`OpSpec.tiled_symbols` is populated by `SpyreKernel.create_op_spec`: it
+reads `loop_info.loop_tiled_dims` (a `list[list[int]]`) from the
+`ir.Operation` (stamped by `coarse_tile()`), and for each loop level
+selects the symbols at those indices from the scheduler-level
+`iteration_space` dict.  The result is stored innermost-first.
+`MemoryDep.ranges` preserves the `data.ranges` ordering, so this positional
+correspondence is stable across the pre-scheduling to codegen boundary.
 
 For reduction-dim tiling, `create_op_spec` also consults
 `loop_info.loop_tiled_reduction_dims`.  For a `Reduction` op,
@@ -1136,7 +1224,7 @@ When backend support lands, `unroll_loops` will be flipped to default
 | File | Role |
 |---|---|
 | `torch_spyre/_inductor/loop_info.py` | Layer 1: `CoarseTileInfo` dataclass; `copy_op_metadata` |
-| `torch_spyre/_inductor/coarse_tile.py` | Layer 1: `coarse_tile()` stamps `loop_info` and rewrites ranges; `insert_tiling_propagation` handles the data perimeter |
+| `torch_spyre/_inductor/coarse_tile.py` | Layer 1: `reorder_unhinted_interlopers()` reorders interlopers before grouping; `coarse_tile()` stamps `loop_info` and rewrites ranges; `insert_tiling_propagation` handles the data perimeter |
 | `torch_spyre/_inductor/scheduler.py` | Layer 2: `CountedLoopSchedulerNode`, `build_loop_scheduler_nodes`, `_codegen_counted_loop` |
 | `torch_spyre/_inductor/op_spec.py` | Layer 3: `LoopSpec` and `OpSpec` dataclasses |
 | `torch_spyre/_inductor/spyre_kernel.py` | Layer 3: serializes `LoopSpec` tree in `codegen_kernel()`; `wrap_op_specs_in_loop()` |
@@ -1152,11 +1240,20 @@ When backend support lands, `unroll_loops` will be flipped to default
 
 ## Invariants and failure modes
 
+**Pre-grouping contiguity** (`reorder_unhinted_interlopers`): before
+`hints_to_coarse_tile_groups` runs, every unhinted `ComputedBuffer` that
+sits between two same-hint ops is moved to just before or just after the
+run.  If a data-flow dependency prevents both directions, a `RuntimeError`
+is raised.  This ensures that all same-hint ops are contiguous in
+`graph.operations` before grouping begins.
+
 **Contiguity invariant**: all `SchedulerNode`s sharing a
 `loop_info.loop_group_id` must be contiguous after the scheduler's
-topological sort.  If the tiling pass stamps ops that have a data dependency
-crossing the group boundary, the post-fusion pass will detect a non-contiguous
-run and raise a `RuntimeError`.
+topological sort.  `_stamp_group` enforces this at stamp time via
+`_validate_contiguous`, which raises `RuntimeError` if the ops are not
+a contiguous slice of the operation list.  The post-fusion pass
+(`build_loop_scheduler_nodes`) also asserts this by processing a contiguous
+run — a non-contiguous run indicates a bug in the tiling pass.
 
 **Consistent `loop_count`**: all ops sharing a `loop_group_id` must agree on
 `loop_info.loop_count` at every depth level.  The post-fusion pass asserts
@@ -1164,9 +1261,9 @@ this.
 
 **`tiled_symbols` populated iff inside a loop**: `OpSpec.tiled_symbols` is
 non-empty exactly when the op was codegen'd inside a `CountedLoopSchedulerNode`.
-Its elements are the flattened (outermost-first) per-level tiled dims from
-`loop_info.loop_tiled_dims` on the corresponding `ir.Operation`, selected from
-the scheduler-level `iteration_space` keys.
+It is a `list[list[Symbol]]` (innermost first) derived from the per-level
+tiled dims in `loop_info.loop_tiled_dims` on the corresponding
+`ir.Operation`, selected from the scheduler-level `iteration_space` keys.
 
 **Pass ordering**: coarse tiling must run after stickify/padding and
 before `span_reduction`, `cost_model_matmul_division`, `work_distribution`,
