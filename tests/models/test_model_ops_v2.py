@@ -41,8 +41,11 @@ from oot_framework.oot_test_config_models import (
     TestEntry,
 )
 from oot_framework.oot_test_parsing import load_yaml_config, resolve_current_file
-from oot_framework.oot_test_utilities import print_test_tags_oot
-
+from oot_framework.oot_test_utilities import (
+    print_test_tags_oot,
+    _format_input_args_shapes,
+    _RUNTIME_SHAPES,
+)
 # ---------------------------------------------------------------------------
 # ModelOpInfo
 # ---------------------------------------------------------------------------
@@ -171,6 +174,14 @@ def _init_model_ops_db() -> None:
     global model_ops_db
     if not model_ops_db and "pytest" in sys.modules:
         model_ops_db.extend(_build_model_ops_db())
+        # Pre-populate _RUNTIME_SHAPES at collection time keyed by op.name
+        # key when the test body never ran (runner killed mid-run, fresh-process
+        # retry).  Mirrors how _oot_method_tags is stamped at collection time so
+        # that [TAGS] always appears even on a second-attempt run.
+        for op in model_ops_db:
+            shapes_str = _format_input_args_shapes(op.ops_item.sample_inputs_func.args)
+            if shapes_str:
+                _RUNTIME_SHAPES[op.name] = shapes_str
 
 
 _init_model_ops_db()
