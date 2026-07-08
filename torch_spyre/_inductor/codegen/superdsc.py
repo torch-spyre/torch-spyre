@@ -21,13 +21,13 @@ from sympy import Integer, Symbol, Expr, Mod, floor
 from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.constants import (
-    AVGPOOL2D_OP,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     OUTPUT_DIM_LABELS,
     LAYOUT_LABELS,
     MATMUL_DIM_LABELS,
     MATMUL_LAYOUT_LABELS,
+    POOL_OPS,
     RESTICKIFY_OP,
     TOPK_OPS,
 )
@@ -336,7 +336,7 @@ def _is_topk(op: str) -> bool:
 
 
 def _is_pool(op: str) -> bool:
-    return op == AVGPOOL2D_OP
+    return op in POOL_OPS
 
 
 # The pool datapath runs across 2 corelets, and dxp_standalone's scheduler

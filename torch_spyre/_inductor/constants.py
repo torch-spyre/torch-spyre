@@ -173,6 +173,9 @@ LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
 
 AVGPOOL2D_OP = "avgpoolfwd"
+# Pool opfunc names, mirroring TOPK_OPS. Add maxpool/minpool here as they land so
+# _is_pool stays a single membership test rather than a growing chain of ==.
+POOL_OPS = {AVGPOOL2D_OP}
 
 # Populate more valid labels from deeptools here if needed
 INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j", "ki", "kj"]
