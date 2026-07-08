@@ -1,0 +1,31 @@
+# LX-planning shard: inductor_ops family 'misc_compute_a', the sum-reduction wrap (torch.sum(x, dim=0)) -- LxPlanningTwoOpReductionTest.
+#
+# Auto-split of test_inductor_ops_lx_planning.py, mirroring the
+# test_inductor_ops.py config sharding. The full (non-truncated) test
+# set is enabled in CI via TEST_LX_PLANNING_FULL=1 + TEST_LX_PLANNING_RUN_SKIPS=1
+# (see .github/workflows/_test_matrix.yaml). Tests that were previously
+# skipped via the in-file skip-lists are marked xfail here instead.
+test_suite_config:
+  labels: [core, full]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_planning.py
+      unlisted_test_mode: skip
+      tests:
+        # Former skip-list entries (in-file POINTWISE/REDUCTION_TEST_FAILURES) now run and are
+        # expected to fail. Non-strict xfail: an unexpected pass (XPASS) does not fail CI.
+        - names:
+            - LxPlanningTwoOpReductionTest.*::test_scalar_cpu_combined_3d_lx_planning_reduction
+          mode: xfail
+        - names:
+            - LxPlanningTwoOpReductionTest.*::test_activation_cls.*_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_activation_fn.*_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_relu_inplace.*_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_add_broadcast.*_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_add_alpha.*_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_add_scalar.*_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_max_sub_broadcast.*_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_sub_alpha.*_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_sub_broadcast.*_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_sub_scalar.*_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_scalar_cpu.*_lx_planning_reduction
+          mode: mandatory_success

@@ -8,4 +8,11 @@
 # than inside the test suite config files themselves.
 
 inductor/test_inductor_ops_misc_shape_a_config.yaml: spyre_pf_x2
-inductor/test_ops_lx_planning_config.yaml: spyre_pf_x4
+
+# The LX-planning suite is now sharded into test_inductor_ops_lx_*_config.yaml
+# (one config per op-family x wrap-class), replacing the former single
+# test_ops_lx_planning_config.yaml (which ran on spyre_pf_x4). The shards run
+# on the default spyre_pf_x1; add a per-shard override here if one ever needs
+# multi-card hardware.
+
+# inductor/test_inductor_ops_lx_matmul_pwwrap_config.yaml: spyre_pf_x4

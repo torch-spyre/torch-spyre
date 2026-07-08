@@ -1,0 +1,37 @@
+# LX-planning shard: inductor_ops family 'matmul', the sum-reduction wrap (torch.sum(x, dim=0)) -- LxPlanningTwoOpReductionTest.
+#
+# Auto-split of test_inductor_ops_lx_planning.py, mirroring the
+# test_inductor_ops.py config sharding. The full (non-truncated) test
+# set is enabled in CI via TEST_LX_PLANNING_FULL=1 + TEST_LX_PLANNING_RUN_SKIPS=1
+# (see .github/workflows/_test_matrix.yaml). Tests that were previously
+# skipped via the in-file skip-lists are marked xfail here instead.
+test_suite_config:
+  labels: [core, full]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_planning.py
+      unlisted_test_mode: skip
+      tests:
+        # Former skip-list entries (in-file POINTWISE/REDUCTION_TEST_FAILURES) now run and are
+        # expected to fail. Non-strict xfail: an unexpected pass (XPASS) does not fail CI.
+        - names:
+            - LxPlanningTwoOpReductionTest.*::test_addmm_1152_10x1152_1152x1152_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_addmm_out_basic_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_einsum_einsum_67x255_255x128_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_einsum_einsum_67x256_256x128_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_large_matmul_matmul_2d_M2048_K2048_N65536_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_matmul_tiled_y_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_mm_autocast_f16_disabled_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_mm_autocast_f16_enabled_lx_planning_reduction
+          mode: xfail
+        - names:
+            - LxPlanningTwoOpReductionTest.*::test_(addmm|mm|bmm|einsum|matmul|linear).*_lx_planning_reduction
+          mode: mandatory_success
+          tags:
+            - ops__inductor-matmul
+        - names:
+            - LxPlanningTwoOpReductionTest.*::test_large_matmul.*_lx_planning_reduction
+          mode: mandatory_success
+          tags:
+            - ops__inductor-matmul
+            - slow__plat_ppc64
+            - slow__plat_s390x

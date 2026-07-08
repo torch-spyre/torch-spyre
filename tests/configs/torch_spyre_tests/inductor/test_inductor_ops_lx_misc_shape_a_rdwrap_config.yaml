@@ -1,0 +1,32 @@
+# LX-planning shard: inductor_ops family 'misc_shape_a', the sum-reduction wrap (torch.sum(x, dim=0)) -- LxPlanningTwoOpReductionTest.
+#
+# Auto-split of test_inductor_ops_lx_planning.py, mirroring the
+# test_inductor_ops.py config sharding. The full (non-truncated) test
+# set is enabled in CI via TEST_LX_PLANNING_FULL=1 + TEST_LX_PLANNING_RUN_SKIPS=1
+# (see .github/workflows/_test_matrix.yaml). Tests that were previously
+# skipped via the in-file skip-lists are marked xfail here instead.
+test_suite_config:
+  labels: [core, full]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_planning.py
+      unlisted_test_mode: skip
+      tests:
+        # Former skip-list entries (in-file POINTWISE/REDUCTION_TEST_FAILURES) now run and are
+        # expected to fail. Non-strict xfail: an unexpected pass (XPASS) does not fail CI.
+        - names:
+            - LxPlanningTwoOpReductionTest.*::test_full_value_1_lx_planning_reduction
+          mode: xfail
+        - names:
+            - LxPlanningTwoOpReductionTest.*::test_split.*_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_arange.*_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_full.*_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_new_ones.*_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_numel.*_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_ones.*_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_zeros.*_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_empty_like.*_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_clone.*_lx_planning_reduction
+            - LxPlanningTwoOpReductionTest.*::test_copy_roundtrip.*_lx_planning_reduction
+          mode: mandatory_success
+          tags:
+            - ops__inductor_misc_shape
