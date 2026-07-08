@@ -288,7 +288,7 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
                 dtypes = (
                     tuple(sorted(resolved_dtypes, key=str))
                     if resolved_dtypes
-                    else (torch.float32, torch.float16)
+                    else (torch.float32, torch.float16, torch.bfloat16)
                 )
                 module_info = ModuleInfo(
                     module_cls,
