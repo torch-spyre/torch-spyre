@@ -6231,17 +6231,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
 
     def test_avg_pool2d_base(self, op, x):
-        # CPU reference on NCHW input
-        cpu_ref = op(x)
-        # Spyre input: NCHW → NHWC (contiguous) → Spyre → permute back to NCHW-view
-        # This matches the pattern in examples/test_pool_spyre_3.py: the physical
-        # layout on Spyre is NHWC (Spyre-native), presented as NCHW to the op.
-        torch._dynamo.reset()
-        x_spyre = x.permute(0, 2, 3, 1).contiguous().to("spyre").permute(0, 3, 1, 2)
-        compiled = torch.compile(op, dynamic=False)
-        with torch.no_grad():
-            spyre_out = compiled(x_spyre).cpu()
-        torch.testing.assert_close(spyre_out, cpu_ref, atol=0.1, rtol=0.1)
+        # Spyre stores C as the stick (innermost) dim, so the op must see a
+        # physically-NHWC tensor viewed as NCHW.  Pass an NHWC-contiguous input
+        # (its layout is preserved by .to("spyre")) and do the NHWC→NCHW permute
+        # inside fn so the compiled graph carries it — this lets us use the
+        # standard compare_with_cpu harness (cpu fn(x_nhwc) == op(x)).
+        #
+        # run_eager=False: Spyre has no eager avg_pool2d kernel
+        # (aten::avg_pool2d.out is unregistered for the 'spyre' backend), so only
+        # the compiled path is valid for this op.
+        def fn(t):
+            return op(t.permute(0, 3, 1, 2))
+
+        x_nhwc = x.permute(0, 2, 3, 1).contiguous()
+        self.compare_with_cpu(
+            fn, x_nhwc, atol=0.1, rtol=0.1, run_eager=False, dynamic=False
+        )
 
     def test_conv2d_cpu(self, x, weight, bias, padding, stride, groups):
         def fn(x, weight, bias, padding, stride, groups):
