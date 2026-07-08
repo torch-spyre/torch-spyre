@@ -78,18 +78,11 @@ core_id_k_fast_emission: bool = (
     os.environ.get("SPYRE_CORE_ID_K_FAST_EMISSION", "1") == "1"
 )
 
-# When True, HBM tensor addresses are emitted as runtime symbols (%sym_N
-# constants) in bundle.mlir.
-# Requires backend compiler support for the sdscbundle symbol table.
-# Independent of bundle_symbolic_args: you can have symbols in the SDSC JSON
-# without exposing them as function arguments (staged adoption).
-bundle_hbm_symbols: bool = os.environ.get("BUNDLE_HBM_SYMBOLS", "1") == "1"
-
+# When True (default), HBM tensor addresses are emitted as runtime symbols
+# with !sdscbundle.input_arg<index> parameters and input_arg_extract ops
+# in the bundle.mlir.
 # When False, HBM tensor addresses are baked as concrete integers
 # into the SDSC JSON and bundle.mlir emits sdsc_execute with no operands.
-# When True, addresses are emitted as runtime symbols with
-# !sdscbundle.input_arg<index> parameters and input_arg_extract ops.
-# Requires bundle_hbm_symbols=True to have any effect.
 bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 
 # When True (default), LoopSpec nodes are fully unrolled into flat OpSpecs

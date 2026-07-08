@@ -70,13 +70,15 @@ def create_module_inputs_func_from_yaml(item: Any) -> Callable:
 
                     # Build forward inputs for this invocation
                     if hasattr(forward_spec, "build_cpu_args"):
+                        fwd_seed = None if seed is None else seed + 10000 + i * 1000
                         forward_args = forward_spec.build_cpu_args(
-                            seed=(None if seed is None else seed + 10000 + i * 1000),
+                            seed=fwd_seed,
                             op_name=item.name,
                             test_device=test_device,
                         )
                         forward_kwargs = forward_spec.resolved_kwargs(
-                            test_device=test_device
+                            test_device=test_device,
+                            seed=fwd_seed,
                         )
                     else:
                         forward_args = []
@@ -172,12 +174,15 @@ def create_module_inputs_func_from_config(config: Any) -> Callable:
             if isinstance(forward_spec, list):
                 for i, spec in enumerate(forward_spec):
                     if spec.has_inputs():
+                        fwd_seed = None if seed is None else seed + 10000 + i * 1000
                         forward_args = spec.build_cpu_args(
-                            seed=(None if seed is None else seed + 10000 + i * 1000),
+                            seed=fwd_seed,
                             op_name=module_info.name,
                             test_device=test_device,
                         )
-                        forward_kwargs = spec.resolved_kwargs(test_device=test_device)
+                        forward_kwargs = spec.resolved_kwargs(
+                            test_device=test_device, seed=fwd_seed
+                        )
                     else:
                         forward_args = []
                         forward_kwargs = {}
@@ -192,13 +197,14 @@ def create_module_inputs_func_from_config(config: Any) -> Callable:
             # Handle single forward_inputs (backward compatibility)
             else:
                 if forward_spec.has_inputs():
+                    fwd_seed = None if seed is None else seed + 10000
                     forward_args = forward_spec.build_cpu_args(
-                        seed=(None if seed is None else seed + 10000),
+                        seed=fwd_seed,
                         op_name=module_info.name,
                         test_device=test_device,
                     )
                     forward_kwargs = forward_spec.resolved_kwargs(
-                        test_device=test_device
+                        test_device=test_device, seed=fwd_seed
                     )
                 else:
                     forward_args = []

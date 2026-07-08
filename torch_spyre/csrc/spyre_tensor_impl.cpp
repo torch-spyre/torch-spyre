@@ -205,6 +205,10 @@ std::string SpyreTensorLayout::toString() const {
   }
   ss << "], device_dtype=DataFormats.";
   ss << EnumsConversion::dataFormatsToString(this->device_dtype);
+  if (this->element_arrangement != ElementArrangement::STANDARD) {
+    ss << ", element_arrangement=ElementArrangement.";
+    ss << spyre::elementArrangementToString(this->element_arrangement);
+  }
   ss << ")";
   return ss.str();
 }
