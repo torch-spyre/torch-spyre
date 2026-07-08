@@ -392,6 +392,42 @@ def _parse_input_arg(raw: Any) -> InputArg:
     )
 
 
+def _dtypes_from_input_arg(arg: "InputArg") -> Set[torch.dtype]:
+    """Return the dtype(s) baked into a single positional arg, if any."""
+    if isinstance(arg, InputArgTensor):
+        return {arg.tensor.resolved_dtype()}
+    if isinstance(arg, InputArgTensorList):
+        return {spec.resolved_dtype() for spec in arg.tensor_list}
+    return set()
+
+
+def _dtypes_from_kwarg_value(v: Any) -> Set[torch.dtype]:
+    """Return the dtype(s) baked into a raw (unparsed) kwarg value, if any.
+
+    Kwarg values are stored as raw dicts until ``resolved_kwargs()`` builds
+    them, so a tensor/tensor_list spec is recognized the same way
+    ``resolved_kwargs()`` recognizes it: by its dict keys.
+    """
+    if isinstance(v, dict):
+        if "tensor" in v:
+            return {InputTensorSpec(**v["tensor"]).resolved_dtype()}
+        if "tensor_list" in v:
+            return {InputTensorSpec(**t).resolved_dtype() for t in v["tensor_list"]}
+    return set()
+
+
+def _dtypes_from_inputs_edits(edits: Optional["InputsEdits"]) -> Set[torch.dtype]:
+    """Collect every dtype baked into an InputsEdits' args/kwargs tensor specs."""
+    if edits is None:
+        return set()
+    dtypes: Set[torch.dtype] = set()
+    for arg in edits.args:
+        dtypes |= _dtypes_from_input_arg(arg)
+    for v in edits.kwargs.values():
+        dtypes |= _dtypes_from_kwarg_value(v)
+    return dtypes
+
+
 def _move_to_test_device(obj: Any, test_device: Optional[torch.device]) -> Any:
     """Move built tensors (or lists of tensors) to the target test device.
 
@@ -645,6 +681,32 @@ class ModulesNamedItem(BaseModel):
                         parsed_list.append(item)
                 values["forward_inputs"] = parsed_list
         return values
+
+    def resolved_input_dtypes(self) -> Set[torch.dtype]:
+        """Return the dtype(s) actually baked into this module's tensor specs.
+
+        Every tensor spec under constructor_inputs/forward_inputs carries an
+        explicit ``dtype`` (see InputTensorSpec), so the dtype exercised at
+        test time is whatever the YAML specifies -- independent of the
+        ``dtype`` argument the upstream ``@modules`` test loop happens to be
+        iterating on (module_inputs_func never reads it, see
+        create_module_inputs_func_from_yaml). Registering this module with a
+        hardcoded ModuleInfo.dtypes tuple therefore silently drops any dtype
+        (e.g. bfloat16) used in the YAML but absent from that tuple: no test
+        variant is ever generated for it. Scanning the specs here keeps
+        ModuleInfo.dtypes in sync with what the YAML actually tests.
+        """
+        dtypes: Set[torch.dtype] = set()
+        dtypes |= _dtypes_from_inputs_edits(self.constructor_inputs)
+
+        forward_spec = self.forward_inputs or self.sample_inputs_func
+        if isinstance(forward_spec, list):
+            for spec in forward_spec:
+                dtypes |= _dtypes_from_inputs_edits(spec)
+        else:
+            dtypes |= _dtypes_from_inputs_edits(forward_spec)
+
+        return dtypes
 
     def build_module_input(
         self,
