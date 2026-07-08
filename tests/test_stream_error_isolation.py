@@ -32,13 +32,8 @@ def _pool_cdata(priority: int = 0):
     return _C.get_stream_from_pool(dev, priority)
 
 
-# ---------------------------------------------------------------------------
-# AC4 — non-error path is unchanged
-#
-# synchronize() and stream.synchronize() must return None and not raise when
-# no error has occurred.  has_any_stream_error() must be False on a clean
-# runtime.
-# ---------------------------------------------------------------------------
+# AC4 — non-error path is unchanged: synchronize() returns None and all
+# error probes are False when no fault has occurred.
 
 
 class TestNonErrorPath(TestCase):
@@ -58,14 +53,9 @@ class TestNonErrorPath(TestCase):
         self.assertFalse(_pool_cdata().has_stream_error())
 
 
-# ---------------------------------------------------------------------------
-# AC1 — error visibility: has_stream_error() and has_any_stream_error()
-#
-# These probe the shutdown flag that the async ResponseWorker sets when a
-# hardware fault occurs.  On a clean runtime both must be False.  The actual
-# C++ → Python rethrow path (setError + synchronize) is covered by the flex
-# unit tests; here we verify the Python-visible probes are wired correctly.
-# ---------------------------------------------------------------------------
+# AC1 — has_stream_error() and has_any_stream_error() probe the C++ shutdown
+# flag; both must be False on a clean runtime.  The rethrow path itself
+# (setError + synchronize) is exercised by the flex C++ unit tests.
 
 
 class TestErrorVisibility(TestCase):
@@ -76,13 +66,8 @@ class TestErrorVisibility(TestCase):
         self.assertFalse(_C.has_any_stream_error())
 
 
-# ---------------------------------------------------------------------------
-# AC3a — option-a recovery: pool always vends a clean handle
-#
-# getStreamFromPool() destroys and recreates any handle whose needsShutdown()
-# flag is set, so every call returns an error-free stream.  This is what lets
-# subsequent tests run without a device reset after a single stream error.
-# ---------------------------------------------------------------------------
+# AC3a — getStreamFromPool() destroys and recreates any broken handle, so
+# subsequent tests always receive an error-free stream without a device reset.
 
 
 class TestOptionARecovery(TestCase):
@@ -100,19 +85,9 @@ class TestOptionARecovery(TestCase):
         self.assertFalse(_C.has_any_stream_error())
 
 
-# ---------------------------------------------------------------------------
-# AC2 + AC3c — conftest stream_error_guard fixture logic
-#
-# The fixture (tests/conftest.py) implements two behaviours:
-#   - After a test: if any stream has an error, set _device_stream_broken=True
-#   - Before a test: if _device_stream_broken is True, skip with a clear message
-#
-# This gives exactly one FAILED test (the one that triggered the error) and
-# explicit skips for all subsequent tests instead of mysterious crashes.
-#
-# We test the fixture logic directly without needing real hardware by
-# temporarily mutating the module-level flag and patching _any_stream_has_error.
-# ---------------------------------------------------------------------------
+# AC2 + AC3c — stream_error_guard (conftest.py) gives exactly one FAILED test
+# then skips the rest with a clear message.  Verified by mutating the
+# module-level flag and patching _any_stream_has_error; no hardware required.
 
 
 class TestStreamErrorGuardLogic(TestCase):
