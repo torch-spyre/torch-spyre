@@ -20,9 +20,9 @@ Covers six areas, each in its own class group:
   2. coarse_tile IR pass: range rewriting, attribute stamping, nested groups
      (TestDivideRanges, TestCoarseTile, TestCoarseTileNested)
   3. CountedLoopSchedulerNode, build_loop_scheduler_nodes,
-     _tiled_syms_for_sched_node_at_depth, and spyre_fuse_nodes budget check
+     _tiled_syms_for_sched_node_at_depth, and spyre_fuse_nodes loop fusion
      (TestHelpers, TestBuildLoopSchedulerNodes, TestTiledSymsForSchedNode,
-      TestSpyreFuseNodesLoopBudget)
+      TestSpyreFuseNodesLoopFusion)
   4. generate_sdsc and compile_op_spec symbol/affine-stride paths
      (TestTiledByteStride, TestGenerateSdscTiledSymbols,
       TestCompileOpSpecTwoTiledSymbols, TestCompileOpSpecSymbolMapping)
@@ -47,6 +47,7 @@ from sympy import Integer, Mod, Symbol, floor, simplify, sympify  # noqa: F401
 
 import torch
 from torch import fx
+from torch._inductor import dependencies as inductor_deps
 from torch._inductor.utils import IndentedBuffer
 from torch.utils._ordered_set import OrderedSet
 
@@ -80,13 +81,13 @@ from torch_spyre._inductor.coarse_tile import (
     coarse_tile,
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
+from torch_spyre._inductor.fusion import spyre_fuse_nodes
 from torch_spyre._inductor.scheduler import (
     CountedLoopSchedulerNode,
     _loop_count,
     _loop_group_id,
     build_loop_scheduler_nodes,
 )
-from torch_spyre._inductor.fusion import spyre_fuse_nodes
 from torch_spyre._inductor.spyre_kernel import (
     _codegen_op_spec_list,
     _iter_op_specs,
@@ -292,11 +293,17 @@ def _make_snode(scheduler, ir_op, name="buf0"):
     snode.node = ir_op
     snode.get_name.return_value = name
     snode.get_nodes.return_value = [snode]
-    snode.ancestors = set()
+    snode.ancestors = OrderedSet()
     snode.min_order = 0
     snode.max_order = 0
-    snode.read_writes = MagicMock()
-    snode.read_writes.reads_and_writes.return_value = []
+    snode.unmet_dependencies = OrderedSet()
+    snode.is_reduction.return_value = False
+    snode.group = (None, None)
+    snode.read_writes = inductor_deps.ReadWrites(
+        reads=OrderedSet(),
+        writes=OrderedSet(),
+        index_exprs=OrderedSet(),
+    )
     snode.outputs_by_name = {}
     return snode
 
@@ -1255,145 +1262,91 @@ class TestBuildLoopSchedulerNodes(unittest.TestCase):
 
 
 # ===========================================================================
-# 3b. spyre_fuse_nodes CountedLoopSchedulerNode budget check
+# 3b. spyre_fuse_nodes — CountedLoopSchedulerNode fusion
 # ===========================================================================
 
 
-def _make_snode_with_tensors(scheduler, ir_op, name, tensor_names):
-    """Like _make_snode but read_writes returns named dependency mocks."""
-    snode = _make_snode(scheduler, ir_op, name)
-    deps = []
-    for tname in tensor_names:
-        dep = MagicMock()
-        dep.name = tname
-        deps.append(dep)
-    snode.read_writes.reads_and_writes.return_value = deps
-    return snode
-
-
-def _make_counted_loop_node(scheduler, tensor_names, name="loop0"):
-    """Return a fake CountedLoopSchedulerNode with the given tensor names."""
+def _make_counted_loop(scheduler, name="loop0", loop_count=sympy.Integer(4)):
+    """Return a MagicMock CountedLoopSchedulerNode for use in fusion tests."""
     node = MagicMock(spec=CountedLoopSchedulerNode)
     node.scheduler = scheduler
     node.get_name.return_value = name
     node.get_nodes.return_value = [node]
-    deps = []
-    for tname in tensor_names:
-        dep = MagicMock()
-        dep.name = tname
-        deps.append(dep)
-    node.read_writes = MagicMock()
-    node.read_writes.reads_and_writes.return_value = deps
+    node.loop_count = loop_count
+    node.ancestors = OrderedSet()
+    node.min_order = 0
+    node.max_order = 0
+    node.unmet_dependencies = OrderedSet()
+    node.is_reduction.return_value = False
+    node.group = (None, None)
+    node.read_writes = inductor_deps.ReadWrites(
+        reads=OrderedSet(),
+        writes=OrderedSet(),
+        index_exprs=OrderedSet(),
+    )
+    node.outputs_by_name = {}
     return node
 
 
-class TestSpyreFuseNodesLoopBudget(unittest.TestCase):
-    def setUp(self):
-        # All tensor names count as non-intermediate.
-        self._patcher = patch(
-            "torch_spyre._inductor.fusion._is_non_intermediate",
-            side_effect=lambda name: True,
-        )
-        self._patcher.start()
-        # Cap the bundle at 2 tensors so overflow is easy to trigger.
-        self._max_patcher = patch(
-            "torch_spyre._inductor.fusion._max_bundle_tensors",
-            return_value=2,
-        )
-        self._max_patcher.start()
-
-    def tearDown(self):
-        self._patcher.stop()
-        self._max_patcher.stop()
-
-    def test_loop_node_within_budget_no_error(self):
-        """A loop node referencing <= max_tensors: passes through without error."""
+class TestSpyreFuseNodesLoopFusion(unittest.TestCase):
+    def test_lone_loop_node_is_own_bundle(self):
+        """A lone CountedLoopSchedulerNode produces exactly one bundle."""
         sched = _make_scheduler()
-        loop = _make_counted_loop_node(sched, ["t1", "t2"], "loop0")
+        loop = _make_counted_loop(sched, "loop0")
         result = spyre_fuse_nodes([loop])
         self.assertEqual(len(result), 1)
-        self.assertIs(result[0], loop)
+        self.assertIsInstance(result[0], CountedLoopSchedulerNode)
 
-    def test_loop_node_exceeds_budget_raises(self):
-        """A loop node referencing > max_tensors must raise RuntimeError."""
-        sched = _make_scheduler()
-        loop = _make_counted_loop_node(sched, ["t1", "t2", "t3"], "loop0")
-        with self.assertRaises(RuntimeError) as ctx:
-            spyre_fuse_nodes([loop])
-        self.assertIn("loop0", str(ctx.exception))
-        self.assertIn("3", str(ctx.exception))
-        self.assertIn("2", str(ctx.exception))
-
-    def test_loop_node_empty_tensors_no_error(self):
-        """A loop node with no tensors (all intermediates) is fine."""
-        sched = _make_scheduler()
-        # Override: nothing is non-intermediate for this test.
-        with patch(
-            "torch_spyre._inductor.fusion._is_non_intermediate",
-            side_effect=lambda name: False,
-        ):
-            loop = _make_counted_loop_node(sched, ["t1", "t2", "t3"], "loop0")
-            result = spyre_fuse_nodes([loop])
-        self.assertEqual(len(result), 1)
-
-    def test_plain_scheduler_node_split_unaffected(self):
-        """Plain SchedulerNode tensor-budget splits still work (no regression)."""
-        sched = _make_scheduler()
-        a = _make_snode_with_tensors(sched, _make_ir_op(), "a", ["t1", "t2"])
-        b = _make_snode_with_tensors(sched, _make_ir_op(), "b", ["t3"])
-        # a fills the 2-tensor budget; b starts a new bundle.
-        result = spyre_fuse_nodes([a, b])
-        self.assertEqual(len(result), 2)
-
-    def test_loop_node_preceded_by_scheduler_nodes(self):
-        """Loop node after plain nodes: budget check on loop node itself."""
-        sched = _make_scheduler()
-        a = _make_snode_with_tensors(sched, _make_ir_op(), "a", ["t1"])
-        loop = _make_counted_loop_node(sched, ["t2", "t3", "t4"], "loop0")
-        with self.assertRaises(RuntimeError):
-            spyre_fuse_nodes([a, loop])
-
-    def test_fallback_node_exceeds_budget_no_error(self):
-        """Non-CountedLoop nodes (e.g. FallbackKernel) bypass the budget check."""
+    def test_plain_then_loop_fuses_into_one_bundle(self):
+        """SchedulerNode followed by CountedLoopSchedulerNode → one FusedSchedulerNode."""
         from torch._inductor.scheduler import FusedSchedulerNode
 
         sched = _make_scheduler()
-        # Build a plain FusedSchedulerNode mock (not CountedLoopSchedulerNode).
-        node = MagicMock(spec=FusedSchedulerNode)
-        node.scheduler = sched
-        node.get_name.return_value = "fallback0"
-        deps = []
-        for tname in ["t1", "t2", "t3", "t4"]:
-            dep = MagicMock()
-            dep.name = tname
-            deps.append(dep)
-        node.read_writes = MagicMock()
-        node.read_writes.reads_and_writes.return_value = deps
-        # 4 tensors > max_tensors(2), but this is not a CountedLoopSchedulerNode.
-        result = spyre_fuse_nodes([node])
+        plain = _make_snode(sched, _make_ir_op(), "plain0")
+        loop = _make_counted_loop(sched, "loop0")
+        result = spyre_fuse_nodes([plain, loop])
         self.assertEqual(len(result), 1)
-        self.assertIs(result[0], node)
+        self.assertIsInstance(result[0], FusedSchedulerNode)
 
-    def test_nested_loop_node_tensor_union_checked(self):
-        """Outer CountedLoopSchedulerNode's read_writes covers inner tensors.
+    def test_loop_then_plain_fuses_into_one_bundle(self):
+        """CountedLoopSchedulerNode followed by SchedulerNode → one FusedSchedulerNode."""
+        from torch._inductor.scheduler import FusedSchedulerNode
 
-        _build_loop_group wraps inner loops first, then the outer loop.
-        FusedSchedulerNode.__init__ calls ReadWrites.merge_list on its
-        snodes, so the outer node's read_writes is already the full union
-        of all inner tensors.  This test confirms that the budget check
-        on the outer node sees all tensors from nested inner nodes.
-        """
         sched = _make_scheduler()
-        # Simulate an outer CountedLoopSchedulerNode whose read_writes
-        # already aggregates tensors from two inner loop nodes (t1..t4).
-        # In production this aggregation is done by ReadWrites.merge_list
-        # during FusedSchedulerNode construction.
-        outer = _make_counted_loop_node(sched, ["t1", "t2", "t3", "t4"], "outer_loop")
-        # 4 unique non-intermediate tensors > max_tensors(2): must raise.
-        with self.assertRaises(RuntimeError) as ctx:
-            spyre_fuse_nodes([outer])
-        self.assertIn("outer_loop", str(ctx.exception))
-        self.assertIn("4", str(ctx.exception))
+        loop = _make_counted_loop(sched, "loop0")
+        plain = _make_snode(sched, _make_ir_op(), "plain0")
+        result = spyre_fuse_nodes([loop, plain])
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], FusedSchedulerNode)
+
+    def test_plain_loop_plain_fuses_into_one_bundle(self):
+        """plain → loop → plain sequence → one FusedSchedulerNode."""
+        from torch._inductor.scheduler import FusedSchedulerNode
+
+        sched = _make_scheduler()
+        plain_a = _make_snode(sched, _make_ir_op(), "plain_a")
+        loop = _make_counted_loop(sched, "loop0")
+        plain_b = _make_snode(sched, _make_ir_op(), "plain_b")
+        result = spyre_fuse_nodes([plain_a, loop, plain_b])
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], FusedSchedulerNode)
+
+    def test_fallback_still_forces_boundary(self):
+        """An ExternKernelSchedulerNode between two fusable nodes creates two bundles."""
+        from torch._inductor.scheduler import ExternKernelSchedulerNode
+
+        sched = _make_scheduler()
+        plain_a = _make_snode(sched, _make_ir_op(), "plain_a")
+        fallback = MagicMock(spec=ExternKernelSchedulerNode)
+        fallback.scheduler = sched
+        fallback.get_name.return_value = "fallback0"
+        plain_b = _make_snode(sched, _make_ir_op(), "plain_b")
+        result = spyre_fuse_nodes([plain_a, fallback, plain_b])
+        # plain_a fuses alone before fallback; fallback forces boundary;
+        # plain_b is a separate bundle after fallback.
+        self.assertEqual(len(result), 3)
+        # First entry is plain_a (single SchedulerNode, returned as-is by _make_fused).
+        self.assertIs(result[1], fallback)
 
 
 # ===========================================================================
