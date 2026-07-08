@@ -114,6 +114,12 @@ def _preserve_shared_weight_unit_bmm_dim(
         ]
 
     target_args = (args[0], args[-1])
+    # The unit-BMM marker is only valid for plain rank-3 BMMs after layout
+    # construction. If a target tensor still carries extra physical axes, such
+    # as attention heads from SDPA, rewriting one axis into the BMM iteration
+    # space can produce an illegal SDSC layout.
+    if any(len(arg.device_size) > 4 for arg in target_args):
+        return it_space
     unit_idxs_by_arg = [_unit_indices(arg) for arg in target_args]
 
     if all(len(unit_idxs) == 0 for unit_idxs in unit_idxs_by_arg):
