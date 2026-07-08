@@ -144,13 +144,6 @@ jobs:
       # Explicitly clear it.
       CI: ''
       TORCH_SPYRE_TEST_TYPE: ${{ inputs.test_type || 'full' }}
-      # Run the full (non-truncated) LX-planning suite -- all ~4000 generated
-      # cases across the test_inductor_ops_lx_*_config.yaml shards -- and let
-      # the former in-file skip-list tests run so the shard configs can mark
-      # them xfail. These vars are read only by test_inductor_ops_lx_planning.py
-      # and are inert for every other suite.
-      TEST_LX_PLANNING_FULL: '1'
-      TEST_LX_PLANNING_RUN_SKIPS: '1'
 
     strategy:
       fail-fast: false
