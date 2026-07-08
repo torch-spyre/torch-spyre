@@ -312,12 +312,12 @@ def _per_core_symbolic_dim_info(symbolic_dims: dict, work_slices: dict) -> dict:
 def _tiled_byte_stride(tensor, tiled_sym) -> int:
     """Byte stride per loop iteration for a single tiled dimension.
 
-    ``tensor.strides[tiled_sym]`` is already the per-tile element stride after
-    the ``dev_dim_size > it_dim_size`` backGap adjustment in
-    ``_create_sdsc_tensors``.  Multiplying by bytes-per-element gives the
-    correct per-iteration byte advance.  No ``per_iter_range`` factor — that
-    was a double-count (the tile range is already baked into
-    ``tensor.strides[tiled_sym]``).
+    ``tensor.strides[tiled_sym]`` is already the per-tile element stride
+    (``_create_sdsc_tensors`` receives the per-tile iteration space, since
+    ``coarse_tile.py`` has already divided the op ranges by ``loop_count``
+    before ``create_op_spec`` runs).  Multiplying by bytes-per-element
+    gives the correct per-iteration byte advance for the ``affine.apply``
+    in the ``scf.for`` loop body.
     """
     return int(tensor.strides[tiled_sym] * num_bytes(tensor.data_format))
 
@@ -591,10 +591,18 @@ def generate_sdsc(
                 sliced_base_sym_idx = -1
             # Build per-level strides: for each level, collect the symbols at that
             # level that tile this tensor (i.e. appear in tensor.strides).
+            # Exclude symbols whose scale is negative: those are reduced dimensions
+            # whose stride describes element layout within one tile, not the advance
+            # between tiles.  Tiling by a reduction-dim symbol would incorrectly
+            # advance the base address of a pool output past its single allocated slot.
             per_level_strides: list[dict] = []
             any_tiled = False
             for level_syms in tiled_symbols:
-                tensor_tiled_at_level = [s for s in level_syms if s in tensor.strides]
+                tensor_tiled_at_level = [
+                    s
+                    for s in level_syms
+                    if s in tensor.strides and tensor.scales.get(s, 1) > 0
+                ]
                 strides_for_level: dict = {}
                 for s in tensor_tiled_at_level:
                     strides_for_level[s] = _tiled_byte_stride(tensor, s)
