@@ -204,6 +204,7 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
     the layout after — which is not yet implemented.
     """
     for i, arg in enumerate(args):
+        representable = 0
         for stl in arg.layouts:
             coords = try_device_coordinates(stl, arg.dep, None)
             if coords is None:
@@ -212,6 +213,7 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
                 # access). It is not a usable candidate, so skip it rather than
                 # aborting — another candidate for this input may be valid.
                 continue
+            representable += 1
             stick_expr = coords[-1]
             if not is_stick_expr_offset_free(stick_expr, stl.elems_per_stick()):
                 raise Unsupported(
@@ -219,6 +221,20 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
                     f"{stick_expr!r} (likely from slicing the stick dimension); "
                     f"this op requires a fixed input layout and double-restickify is not yet supported"
                 )
+        if arg.layouts and representable == 0:
+            # Every candidate layout for this input was unrepresentable. This
+            # is not fatal here, but the downstream layout selection will fail
+            # (find_stick_compatible_input_layout raises "cannot restickify any
+            # input layout"). Log the more specific cause so that error is
+            # easier to diagnose.
+            logger.warning(
+                "%s: all %d candidate layout(s) of input arg%d have "
+                "unrepresentable stick expressions; downstream layout "
+                "selection is expected to fail for this op.",
+                op_label,
+                len(arg.layouts),
+                i,
+            )
 
 
 def _rescale_stl_for_dtype(

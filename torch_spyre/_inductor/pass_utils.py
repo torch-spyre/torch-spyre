@@ -1010,9 +1010,13 @@ def compute_restickify_needed(
     if idc is None or out_idc is None:
         # One of the layouts has a stick expression the backend cannot
         # represent (e.g. floor(var/N) from a cross-stick access). Such a
-        # candidate can never be a feasible restickify source/target, so report
-        # it as infeasible (the cost model maps this to INF and the beam search
-        # discards it) rather than aborting the whole pass.
+        # candidate can never be a feasible restickify source/target.
+        #
+        # Return (True, None): the (needed=True, tgt=None) pair is the
+        # "infeasible restickify" signal on this function's contract. The beam
+        # search maps it to INF cost and discards the candidate — see
+        # EdgeCostMap._compute_and_cache_cost in optimize_restickify.py. This is
+        # preferable to aborting the whole pass when another candidate is valid.
         return True, None
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
