@@ -58,6 +58,7 @@ from torch_spyre._inductor.codegen.compute_ops import (
     _tiled_byte_stride,
     generate_sdsc,
 )
+from torch_spyre._inductor.codegen.unroll import _byte_stride_for_arg
 from torch_spyre._inductor.codegen.superdsc import (
     SDSCArgs,
     SDSCSpec,
@@ -1369,8 +1370,8 @@ class TestTiledByteStride(unittest.TestCase):
             start_address=0,
             backGap={},
         )
-        stride = _tiled_byte_stride(tensor, s, {s: 64})
-        self.assertEqual(stride, 64 * 128 * 2)
+        stride = _tiled_byte_stride(tensor, s)
+        self.assertEqual(stride, 128 * 2)
 
     def test_fp16_larger_stride(self):
         s = Symbol("s")
@@ -1386,8 +1387,8 @@ class TestTiledByteStride(unittest.TestCase):
             start_address=0,
             backGap={},
         )
-        stride = _tiled_byte_stride(tensor, s, {s: 32})
-        self.assertEqual(stride, 32 * 512 * 2)
+        stride = _tiled_byte_stride(tensor, s)
+        self.assertEqual(stride, 512 * 2)
 
     def test_stride_one(self):
         s = Symbol("s")
@@ -1403,8 +1404,8 @@ class TestTiledByteStride(unittest.TestCase):
             start_address=0,
             backGap={},
         )
-        stride = _tiled_byte_stride(tensor, s, {s: 16})
-        self.assertEqual(stride, 16 * 1 * 2)
+        stride = _tiled_byte_stride(tensor, s)
+        self.assertEqual(stride, 1 * 2)
 
 
 class TestGenerateSdscTiledSymbols(unittest.TestCase):
@@ -1424,7 +1425,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
         # With one tiling level, affine_strides[0] = [{s: stride}].
         self.assertEqual(len(affine_strides), 1)
         self.assertIn(s, affine_strides[0][0])
-        self.assertEqual(affine_strides[0][0][s], 64 * 128 * 2)
+        self.assertEqual(affine_strides[0][0][s], 128 * 2)
 
     def test_tiled_tensor_base_address_registered(self):
         s = Symbol("s")
@@ -4159,6 +4160,302 @@ class TestHintsToCoarseTileGroupsLogging(unittest.TestCase):
             f"scopes= must mention Lq even though op0 is broadcast on Lq "
             f"(loop_var=None for hint_id=2 on group_ops[0]); "
             f"got: {scopes_line!r}",
+        )
+
+
+class TestAffineStrideMatchesUnrollStride(unittest.TestCase):
+    """Verify that the UNROLL=0 affine-stride path produces the same byte
+    advances as the UNROLL=1 ``_byte_stride_for_arg`` ground truth.
+
+    Each test builds an ``OpSpec`` with a realistic stick-layout ``TensorArg``
+    (same geometry as ``test_unroll_loop_specs.py``), calls ``compile_op_spec``
+    to obtain ``affine_strides``, and asserts that the stride value equals what
+    ``_byte_stride_for_arg`` computes for the same tensor and symbol.
+
+    The scenarios mirror the three main coarse-tiling patterns covered by
+    ``TestUnrollLoopSpecs`` and ``TestNestedReductionUnroll``:
+
+      Group 1 — flat row-tiling: [512, 256] fp16 tensor, tile by c_row.
+      Group 2 — flat col-tiling: same tensor, tile by c_col (non-linear coord).
+      Group 3 — K-input K-tiling: [64, 128] fp16 per-tile (device_size=[2,64,64]),
+                tile by c_k (non-linear coord c_k//64).
+
+    Stick layout reference (2D fp16 tensor [R, C], C multiple of 64):
+      device_size        = [C//64, R, 64]
+      device_coordinates = [c_col//64, c_row, Mod(c_col, 64)]
+    """
+
+    # --- Symbols ---
+    _C_ROW = Symbol("c_row")
+    _C_COL = Symbol("c_col")
+    _C_K = Symbol("c_k")
+    _C_M = Symbol("c_m")
+
+    # --- [512, 256] fp16 stick-layout tensor fixture ---
+    _R, _C = 512, 256
+    _DS_RC = [_C // 64, _R, 64]  # [4, 512, 64]
+    _HBM_BASE = 0x400000000
+
+    def _make_rc_tensor(self, base: int = _HBM_BASE) -> TensorArg:
+        """Stick-layout TensorArg for [512, 256] fp16 (device_size=[4,512,64])."""
+        return TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=_FP16,
+            device_size=list(self._DS_RC),
+            device_coordinates=[
+                self._C_COL // 64,
+                self._C_ROW,
+                sympy.Mod(self._C_COL, 64),
+            ],
+            allocation={"hbm": base},
+        )
+
+    def _make_k_input_tensor(self, base: int = 0x800000000) -> TensorArg:
+        """K-input tensor: [64, 128] fp16 per-tile (device_size=[2,64,64])."""
+        return TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=_FP16,
+            device_size=[2, 64, 64],
+            device_coordinates=[
+                self._C_K // 64,
+                self._C_M,
+                sympy.Mod(self._C_K, 64),
+            ],
+            allocation={"hbm": base},
+        )
+
+    def _get_flat_affine_stride(
+        self, tensor: TensorArg, tiled_sym: Symbol, iter_range: int
+    ) -> int:
+        """Run compile_op_spec and extract the affine stride for tiled_sym.
+
+        Returns the byte-stride value from affine_strides[tensor_idx][0][sym]
+        for the first (and only) tiling level.  Raises if no stride is found.
+
+        Note: the output tensor is constructed with the same coordinates as the
+        input, so both tensors share the same affine stride for tiled_sym.  We
+        return the first non-zero value found, which is the input tensor's stride
+        (they are identical here).  Group 4 (multi-stick) inlines this extraction
+        instead because it needs a distinct iteration_space for C_COL.
+        """
+        out_tensor = TensorArg(
+            is_input=False,
+            arg_index=1,
+            device_dtype=tensor.device_dtype,
+            device_size=list(tensor.device_size),
+            device_coordinates=list(tensor.device_coordinates),
+            allocation={"hbm": 0x500000000},
+        )
+        all_syms: set = set()
+        for expr in tensor.device_coordinates:
+            all_syms |= expr.free_symbols
+        it_space = {s: (Integer(iter_range), 1) for s in all_syms if s != tiled_sym}
+        it_space[tiled_sym] = (Integer(iter_range), 1)
+        op_spec = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space=it_space,
+            args=[tensor, out_tensor],
+            op_info={},
+            tiled_symbols=[[tiled_sym]],
+        )
+        symbols: list[int] = []
+        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        # affine_strides uses SDSC-renamed symbols as keys (not the original
+        # inductor symbols).  Extract the first non-zero stride value from any
+        # tensor's per-level strides.
+        for per_level in affine_strides:
+            for level_d in per_level:
+                if level_d:
+                    return next(iter(level_d.values()))
+        self.fail(
+            f"No affine stride found for {tiled_sym} in affine_strides={affine_strides}"
+        )
+
+    # -------------------------------------------------------------------------
+    # Group 1: flat row-tiling — [512, 256] fp16, tile by c_row
+    #
+    # UNROLL=1 ground truth (_byte_stride_for_arg):
+    #   coord[1] = c_row; delta = T_ROW; device_stride[1] = prod([64]) = 64
+    #   byte_stride = T_ROW * 64 * 2
+    # -------------------------------------------------------------------------
+
+    def test_row_tiling_affine_stride_matches_unroll(self):
+        """compile_op_spec affine stride for c_row must equal _byte_stride_for_arg."""
+        T_ROW = 512
+        tensor = self._make_rc_tensor()
+        expected = _byte_stride_for_arg(tensor, self._C_ROW, T_ROW)
+        actual = self._get_flat_affine_stride(tensor, self._C_ROW, T_ROW)
+        self.assertEqual(
+            actual,
+            expected,
+            f"UNROLL=0 affine stride {actual} != UNROLL=1 ground truth {expected} "
+            f"for c_row tiling of [512,256] fp16 tensor",
+        )
+
+    def test_row_tiling_ground_truth_value(self):
+        """Row-tiling stride == T_ROW * 64 * 2 (matching test_unroll_loop_specs.py)."""
+        T_ROW = 512
+        tensor = self._make_rc_tensor()
+        expected = T_ROW * 64 * 2  # 65536 — from TestUnrollLoopSpecs._STRIDE_BYTES
+        actual = _byte_stride_for_arg(tensor, self._C_ROW, T_ROW)
+        self.assertEqual(actual, expected)
+        affine = self._get_flat_affine_stride(tensor, self._C_ROW, T_ROW)
+        self.assertEqual(
+            affine,
+            expected,
+            f"affine stride {affine} != expected {expected}",
+        )
+
+    # -------------------------------------------------------------------------
+    # Group 2: flat col-tiling — [512, 256] fp16, tile by c_col (non-linear)
+    #
+    # UNROLL=1 ground truth (_byte_stride_for_arg):
+    #   coord[0] = c_col//64; delta[0] = T_COL//64; device_stride[0] = 512*64 = 32768
+    #   coord[2] = Mod(c_col,64); delta[2] = 0 (Mod resets at T_COL=128 since 128%64==0)
+    #   byte_stride = (T_COL//64) * 32768 * 2
+    # -------------------------------------------------------------------------
+
+    def test_col_tiling_affine_stride_matches_unroll(self):
+        """compile_op_spec affine stride for c_col must equal _byte_stride_for_arg."""
+        T_COL = 128  # 2 sticks
+        tensor = self._make_rc_tensor()
+        expected = _byte_stride_for_arg(tensor, self._C_COL, T_COL)
+        actual = self._get_flat_affine_stride(tensor, self._C_COL, T_COL)
+        self.assertEqual(
+            actual,
+            expected,
+            f"UNROLL=0 affine stride {actual} != UNROLL=1 ground truth {expected} "
+            f"for c_col tiling of [512,256] fp16 tensor",
+        )
+
+    def test_col_tiling_ground_truth_value(self):
+        """Col-tiling stride == (T_COL//64) * 32768 * 2 (from TestUnrollLoopSpecs)."""
+        T_COL = 128
+        tensor = self._make_rc_tensor()
+        # device_stride[0] = prod(device_size[1:]) = 512 * 64 = 32768
+        expected = (T_COL // 64) * (512 * 64) * 2  # 131072
+        actual = _byte_stride_for_arg(tensor, self._C_COL, T_COL)
+        self.assertEqual(actual, expected)
+        affine = self._get_flat_affine_stride(tensor, self._C_COL, T_COL)
+        self.assertEqual(
+            affine,
+            expected,
+            f"affine stride {affine} != expected {expected}",
+        )
+
+    # -------------------------------------------------------------------------
+    # Group 3: K-input K-tiling — device_size=[2,64,64], tile by c_k (non-linear)
+    #
+    # This is the nested reduction scenario from TestNestedReductionUnroll.
+    # UNROLL=1 ground truth:
+    #   coord[0] = c_k//64; delta[0] = T_K//64 = 128//64 = 2
+    #   device_stride[0] = prod(device_size[1:]) = 64*64 = 4096
+    #   byte_stride = 2 * 4096 * 2 = 16384
+    # -------------------------------------------------------------------------
+
+    def test_k_tiling_affine_stride_matches_unroll(self):
+        """compile_op_spec affine stride for c_k must equal _byte_stride_for_arg."""
+        T_K = 128  # 2 sticks
+        tensor = self._make_k_input_tensor()
+        expected = _byte_stride_for_arg(tensor, self._C_K, T_K)
+        actual = self._get_flat_affine_stride(tensor, self._C_K, T_K)
+        self.assertEqual(
+            actual,
+            expected,
+            f"UNROLL=0 affine stride {actual} != UNROLL=1 ground truth {expected} "
+            f"for c_k tiling of k_input tensor (device_size=[2,64,64])",
+        )
+
+    def test_k_tiling_ground_truth_value(self):
+        """K-tiling stride == (T_K//64) * 4096 * 2 (from TestNestedReductionUnroll)."""
+        T_K = 128
+        tensor = self._make_k_input_tensor()
+        # device_stride[0] = prod(device_size[1:]) = 64 * 64 = 4096
+        K_TILE_BYTES = (T_K // 64) * (64 * 64) * 2  # 16384
+        actual = _byte_stride_for_arg(tensor, self._C_K, T_K)
+        self.assertEqual(actual, K_TILE_BYTES)
+        affine = self._get_flat_affine_stride(tensor, self._C_K, T_K)
+        self.assertEqual(
+            affine,
+            K_TILE_BYTES,
+            f"affine stride {affine} != expected {K_TILE_BYTES}",
+        )
+
+    # -------------------------------------------------------------------------
+    # Group 4: multi-stick row-tiling — [1024, 4096] fp16 tensor
+    #
+    # This is the reproducer from test_hint_row_tiling_multi_stick_pointwise_correct.
+    # device_size = [4096//64, 1024, 64] = [64, 1024, 64]
+    # Tiling c_row by T_ROW=512:
+    #   device_stride[1] = prod([64]) = 64
+    #   byte_stride = 512 * 64 * 2 = 65536
+    # -------------------------------------------------------------------------
+
+    def test_multi_stick_row_tiling_affine_stride_matches_unroll(self):
+        """[1024,4096] multi-stick row-tiling: affine stride must equal unroll stride."""
+        tensor = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=_FP16,
+            device_size=[64, 1024, 64],  # [4096//64, 1024, 64]
+            device_coordinates=[
+                self._C_COL // 64,
+                self._C_ROW,
+                sympy.Mod(self._C_COL, 64),
+            ],
+            allocation={"hbm": self._HBM_BASE},
+        )
+        T_ROW = 512
+        expected = _byte_stride_for_arg(tensor, self._C_ROW, T_ROW)
+        # ground truth: 512 * 64 * 2 = 65536
+        self.assertEqual(expected, T_ROW * 64 * 2)
+
+        out_tensor = TensorArg(
+            is_input=False,
+            arg_index=1,
+            device_dtype=_FP16,
+            device_size=[64, 1024, 64],
+            device_coordinates=[
+                self._C_COL // 64,
+                self._C_ROW,
+                sympy.Mod(self._C_COL, 64),
+            ],
+            allocation={"hbm": 0x500000000},
+        )
+        # Note: C_COL range here is the full tensor width (4096), not T_ROW.
+        # The helper _get_flat_affine_stride cannot be reused for this group
+        # because it assigns iter_range to all free symbols uniformly.
+        op_spec = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={
+                self._C_ROW: (Integer(T_ROW), 1),
+                self._C_COL: (Integer(4096), 1),
+            },
+            args=[tensor, out_tensor],
+            op_info={},
+            tiled_symbols=[[self._C_ROW]],
+        )
+        symbols: list[int] = []
+        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        # affine_strides uses SDSC-renamed symbols; extract first non-zero stride value.
+        actual = None
+        for per_level in affine_strides:
+            for level_d in per_level:
+                if level_d:
+                    actual = next(iter(level_d.values()))
+                    break
+            if actual is not None:
+                break
+        self.assertIsNotNone(actual, "No affine stride found for C_ROW")
+        self.assertEqual(
+            actual,
+            expected,
+            f"UNROLL=0 affine stride {actual} != UNROLL=1 ground truth {expected} "
+            f"for [1024,4096] multi-stick row tiling",
         )
 
 
