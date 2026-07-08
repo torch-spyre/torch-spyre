@@ -305,7 +305,7 @@ def get_ncores_for_buffers(
                     # broadcast footprint -- cases the `view != ref_view` check
                     # below cannot see.
                     view_cores = math.prod(f for _, f in view.work_slice_dims)
-                    if view_cores < _op_num_cores(op):
+                    if view_cores != _op_num_cores(op):
                         mismatch = True
                         break
                 if view != ref_view:
