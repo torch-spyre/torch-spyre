@@ -1764,10 +1764,6 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
 
     def test_nested_bmm_outer_Batch_inner_K_correct(self):
         """bmm [B,M,K]@[B,K,N] outer B (output) + inner K (reduction) — correct."""
-        if not config.unroll_loops:
-            pytest.xfail(
-                "UNROLL_LOOPS=0: nested scf.for loops not yet correct in backend"
-            )
         from torch_spyre._inductor import spyre_hint
 
         B, M, K, N = 4, 64, 512, 32
@@ -1791,10 +1787,6 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
 
     def test_nested_matmul_outer_M_inner_K_correct(self):
         """mm [M,K]@[K,N] with outer M (output) + inner K (reduction) — correct."""
-        if not config.unroll_loops:
-            pytest.xfail(
-                "UNROLL_LOOPS=0: nested scf.for loops not yet correct in backend"
-            )
         from torch_spyre._inductor import spyre_hint
 
         M, K, N = 128, 512, 32
