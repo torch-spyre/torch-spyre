@@ -138,9 +138,10 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         layout = buffer.get_layout()
         return isinstance(layout, FixedTiledLayout) and "pool" in layout.allocation
 
-    def codegen_free_buffer(self, buffer: BufferLike) -> None:
-        if not self._is_pool_buffer(buffer):
-            super().codegen_free_buffer(buffer)
+    def make_buffer_free(self, buffer: BufferLike) -> str:
+        if self._is_pool_buffer(buffer):
+            return ""
+        return super().make_buffer_free(buffer)
 
     def make_buffer_reuse(self, old: BufferLike, new: BufferLike, delete_old: bool):
         assert old.get_dtype() == new.get_dtype()

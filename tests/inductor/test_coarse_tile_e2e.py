@@ -796,23 +796,22 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 num_tiles_per_dim={"B": 1}
             ):  # 3 nested scopes exercises multi-hint logic
                 with spyre_hint(num_tiles_per_dim={"H": 4}):
-                    # TODO: re-enable once numerical error with Lk tiling is fixed
-                    # with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
-                    keys_T = keys.transpose(-1, -2).contiguous()
-                    denominator = torch.zeros(
-                        (B, H, Lq), device=queries.device, dtype=torch.float16
-                    )
-                    scores = torch.matmul(queries * scale, keys_T * scale)
-                    scores = scores.transpose(-1, -2).contiguous()
-                    block_max = torch.amax(scores, dim=-2)
-                    max_running = torch.maximum(M, block_max)
-                    exp_scores = torch.exp(scores - max_running.unsqueeze(-2))
-                    correction = torch.exp(M - max_running)
-                    denominator = denominator * correction + exp_scores.sum(dim=-2)
-                    output = output * correction.unsqueeze(-1) + torch.matmul(
-                        exp_scores.transpose(-1, -2), values
-                    )
-                    M = max_running
+                    with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
+                        keys_T = keys.transpose(-1, -2).contiguous()
+                        denominator = torch.zeros(
+                            (B, H, Lq), device=queries.device, dtype=torch.float16
+                        )
+                        scores = torch.matmul(queries * scale, keys_T * scale)
+                        scores = scores.transpose(-1, -2).contiguous()
+                        block_max = torch.amax(scores, dim=-2)
+                        max_running = torch.maximum(M, block_max)
+                        exp_scores = torch.exp(scores - max_running.unsqueeze(-2))
+                        correction = torch.exp(M - max_running)
+                        denominator = denominator * correction + exp_scores.sum(dim=-2)
+                        output = output * correction.unsqueeze(-1) + torch.matmul(
+                            exp_scores.transpose(-1, -2), values
+                        )
+                        M = max_running
             return output / denominator.unsqueeze(-1)
 
         # CPU reference first, then device setup — matching the driver pattern exactly

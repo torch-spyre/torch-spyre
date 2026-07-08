@@ -13,12 +13,14 @@
 # limitations under the License.
 
 from contextlib import contextmanager
+from typing import Callable, Optional
 
 import torch
+from torch._inductor import ir
 from torch._inductor.graph import GraphLowering
+from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
-from typing import Callable, Optional
 
 
 @contextmanager
@@ -122,6 +124,25 @@ def enable_spyre_context(
 
     GraphLowering._update_scheduler = _spyre_update_scheduler  # type: ignore[method-assign]
 
+    # Protect MutationLayoutSHOULDREMOVE ops from Inductor's scheduler-level DCE.
+    # Inductor's dead_node_elimination removes SchedulerNodes whose output buffers
+    # have no active users.  Coarse-tile carry-back ops write to a carry buffer via
+    # MutationLayout and may have no outside consumers (e.g. flash attention's M
+    # state) — yet they are essential for loop-carried correctness.  Marking them as
+    # having side effects prevents DCE from removing them.  This mirrors the logic
+    # already in torch_spyre/_inductor/deadcode_elimination._has_side_effects.
+    _orig_has_side_effects = SchedulerNode.has_side_effects
+    _orig_unwrapped = _orig_has_side_effects.__wrapped__  # type: ignore[attr-defined]
+
+    def _spyre_has_side_effects(self: SchedulerNode) -> bool:
+        if isinstance(
+            getattr(self.node, "layout", None), ir.MutationLayoutSHOULDREMOVE
+        ):
+            return True
+        return _orig_unwrapped(self)
+
+    SchedulerNode.has_side_effects = _spyre_has_side_effects  # type: ignore[method-assign]
+
     with (
         spyre_data_types(),
         enable_spyre_lowerings(),
@@ -136,3 +157,4 @@ def enable_spyre_context(
             joint_graph.pass_patterns[:] = origin_pass
             Loops.has_large_inner_fn = old_loop
             GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]
+            SchedulerNode.has_side_effects = _orig_has_side_effects  # type: ignore[method-assign]
