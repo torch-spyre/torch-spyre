@@ -78,6 +78,12 @@ class DtypeOpTable:
     _TYPECAST_OP_NAMES = set(_TYPECAST_OPS_TABLE.values())
     _TYPECAST_OP_DTYPES = set(_TYPECAST_OPS_TABLE.keys())
 
+    # Typecast ops that change the physical stick element ordering, as opposed to
+    # IDENTITY_OP (a same-width byte copy). Reading a reordering op's output back
+    # over a DMA-copied host buffer with a different HBM ordering yields shuffled
+    # elements, so host bool InputBuffers feeding one must fall back to CPU.
+    _STICK_REORDERING_OPS = {DL16TOFP32_OP, FP32TODL16_OP, FP8TODL16_OP}
+
     @classmethod
     def get_operator(
         cls, src_dtype: torch.dtype, dst_dtype: torch.dtype
@@ -101,11 +107,33 @@ class DtypeOpTable:
         return cls.get_operator(equivalent_src_dtype, dst_dtype)
 
     @classmethod
+    def bool_host_conversion_reorders_sticks(cls, dst_dtype: torch.dtype) -> bool:
+        """Whether converting a host (fp16-format) bool to dst_dtype reorders sticks.
+
+        Host bool InputBuffers are DMA-copied in the fp16 physical format
+        (SEN169_FP16). A reordering typecast (e.g. DL16TOFP32 for bool->fp32)
+        reads that DMA layout back shuffled, so the caller must fall back to CPU;
+        an IDENTITY byte-copy (e.g. bool->fp16) is safe.
+        """
+        op = cls.get_bool_src_operator(DataFormats.SEN169_FP16, dst_dtype)
+        return op in cls._STICK_REORDERING_OPS
+
+    @classmethod
     def is_supported(cls, src_dtype: torch.dtype, dst_dtype: torch.dtype) -> bool:
         """Whether Spyre can natively perform this dtype conversion.
 
-        For torch.bool sources, checks whether *some* physical format
-        could convert to dst_dtype (see get_bool_src_operator).
+        For torch.bool sources this is a *static* gate with no access to the
+        tensor's real device_dtype, so it accepts the pair if *some* physical
+        format could convert to dst_dtype (see get_bool_src_operator). The
+        codegen (spyre_kernel.to_dtype) instead resolves from the one real
+        device_dtype.
+
+        This "any format" looseness is safe only while every dst reachable from
+        a bool resolves to a supported op under *both* SEN169_FP16 (fp16) and
+        IEEE_FP32 (fp32) -- true for the current table, so the predicate and its
+        consumer never disagree. If a future op supports a dst under one bool
+        equivalent but not the other, this could accept a conversion the codegen
+        cannot then lower; tighten to key on the real device_dtype at that point.
         """
         if src_dtype == torch.bool:
             return any(

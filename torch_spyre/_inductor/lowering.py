@@ -1093,13 +1093,16 @@ def to_dtype(x, dst_dtype):
         op = torch.ops.spyre.to_dtype_cpu.default
         return eager_fallback(op, x, dst_dtype)
 
-    # DL16TOFP32_OP reads SEN169_FP16 data written by a computation kernel.
-    # DMA-copied bool InputBuffers have a different HBM element ordering that
-    # produces wrong results (28/64 elements shuffled). Fall back to CPU for
-    # host-created bool → float32; on-device computed bools use the native path.
-    # Peel through views (e.g. reshape/expand) too, since a viewed host bool
-    # is still backed by the same DMA-copied InputBuffer.
-    if src_dtype == torch.bool and dst_dtype == torch.float32:
+    # DMA-copied bool InputBuffers have a different HBM element ordering than
+    # computation-kernel outputs, so a stick-reordering typecast (e.g.
+    # DL16TOFP32 for bool → float32) reads them back shuffled (28/64 elements).
+    # Fall back to CPU for host bools whose conversion reorders sticks; an
+    # IDENTITY byte-copy (e.g. bool → float16) is safe. On-device computed bools
+    # use the native path. Peel through views (reshape/expand) too, since a
+    # viewed host bool is still backed by the same DMA-copied InputBuffer.
+    if src_dtype == torch.bool and DtypeOpTable.bool_host_conversion_reorders_sticks(
+        dst_dtype
+    ):
         if isinstance(_peel_through_views(x), ir.InputBuffer):
             op = torch.ops.spyre.to_dtype_cpu.default
             return eager_fallback(op, x, dst_dtype)
