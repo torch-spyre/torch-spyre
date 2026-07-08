@@ -8,6 +8,7 @@ on:
       - tests/docs/**
       - docs/**
       - README.md
+      - CODEOWNERS
   # Removing from CICD till the ops tests get matured
   # pull_request:
   #   branches: [main]
