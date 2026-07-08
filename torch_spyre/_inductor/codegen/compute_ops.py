@@ -816,7 +816,11 @@ def generate_sdsc(
                                     str(dim) + "_": size
                                     for dim, size in sdsc_spec.iteration_space.items()
                                 },
-                                **({"paddingSizes_": sdsc_spec.padding_sizes} if sdsc_spec.padding_sizes else {}),
+                                **(
+                                    {"paddingSizes_": sdsc_spec.padding_sizes}
+                                    if sdsc_spec.padding_sizes
+                                    else {}
+                                ),
                             },
                             "coordinateMasking_": {
                                 str(dim): mask_range
@@ -890,11 +894,19 @@ def generate_sdsc(
                                         str(layout_info["stick_dim_order"])
                                     ],
                                     "stickSize_": [layout_info["stick_size"]],
-                                    **({"stickRepl_": [1]} if sdsc_spec.stick_replication else {}),
+                                    **(
+                                        {"stickRepl_": [1]}
+                                        if sdsc_spec.stick_replication
+                                        else {}
+                                    ),
                                 }
                                 for label, layout_info in sdsc_spec.layouts.items()
                             },
-                            **({"pdsRelation_": {"isPdsReuse": 1}} if sdsc_spec.pds_reuse else {}),
+                            **(
+                                {"pdsRelation_": {"isPdsReuse": 1}}
+                                if sdsc_spec.pds_reuse
+                                else {}
+                            ),
                             "scheduleTree_": [
                                 {
                                     "nodeType_": "allocate",
@@ -941,7 +953,14 @@ def generate_sdsc(
                                         ],
                                         "data_": _start_addr_data(tensor),
                                     },
-                                    **({"padding_": sdsc_spec.input_coord_padding} if (i < sdsc_spec.num_inputs and sdsc_spec.input_coord_padding) else {}),
+                                    **(
+                                        {"padding_": sdsc_spec.input_coord_padding}
+                                        if (
+                                            i < sdsc_spec.num_inputs
+                                            and sdsc_spec.input_coord_padding
+                                        )
+                                        else {}
+                                    ),
                                     **(
                                         {
                                             "backGapCore_": {
