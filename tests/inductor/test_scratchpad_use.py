@@ -868,8 +868,7 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
         covers fewer cores than the GEMM runs. That is a broadcast read of a
         per-core scratchpad buffer, which the single-base LX path cannot serve,
         so the broadcast-read guard in ``get_ncores_for_buffers`` keeps ``x`` in
-        HBM. See ``test_shared_activation_into_matmuls_not_lx_pinned`` for the
-        divergence this prevents.
+        HBM.
         """
         self._assert_prescribed_allocation(
             *self._swiglu(),
