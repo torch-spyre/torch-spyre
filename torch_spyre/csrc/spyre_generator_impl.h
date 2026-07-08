@@ -78,9 +78,9 @@ uint64_t initial_seed(c10::DeviceIndex device_index = -1);
 
 namespace detail {
 
-inline c10::DeviceIndex num_cards = -1;
-inline std::deque<c10::once_flag> spyre_gens_init_flag;
-inline std::vector<at::Generator> default_gens_spyre;
+extern c10::DeviceIndex num_cards;
+extern std::deque<c10::once_flag> spyre_gens_init_flag;
+extern std::vector<at::Generator> default_gens_spyre;
 
 const at::Generator& getDefaultSpyreGenerator(
     c10::DeviceIndex device_index = -1);

@@ -1,25 +1,9 @@
-name: upstream-pytorch-tests
+name: model-ops-tests-nightly
 
 on:
-  # Run automatically on every merge to main
-  push:
-    branches: [main]
-    paths-ignore:
-      - tests/docs/**
-      - docs/**
-      - README.md
-      - CODEOWNERS
-      - .github/workflows/config_integrity_checker.yaml
-  pull_request:
-    branches: [main]
-    paths-ignore:
-      - tests/docs/**
-      - docs/**
-      - README.md
-      - CODEOWNERS
-      - .github/workflows/config_integrity_checker.yaml
-  merge_group:
-    types: [checks_requested]
+  # Run on a schedule (nightly at 2 AM UTC)
+  schedule:
+    - cron: 0 2 * * *
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -32,9 +16,10 @@ defaults:
 permissions:
   contents: read
   checks: write
+  actions: read    # needed by push-model-ops-logs-to-clickhouse to fetch job logs
 
 jobs:
-  upstream-tests:
+  model-ops-tests:
     name: ${{ matrix.suite.name }}
     runs-on:
       - x86_64
@@ -51,21 +36,45 @@ jobs:
       CI: ''
 
     # ---------------------------------------------------------------------------
-    # To add a new upstream test suite, append an entry here:
+    # To add a new model ops test suite, append an entry here:
     #   - name: <human-readable label shown in the GHA UI>
-    #     config: <filename inside tests/configs/>
+    #     config: <filename inside tests/configs/model_ops_tests/>
     #
     # The JUnit XML report is automatically named after the config file, e.g.:
-    #   test_view_ops_config.yaml  ->  test_view_ops_config.xml
+    #   granite-4.1-8b_spyre.yaml  ->  granite-4.1-8b_spyre.xml
     # ---------------------------------------------------------------------------
     strategy:
       fail-fast: false   # run all suites even if one fails
       matrix:
         suite:
-          - name: View Ops
-            config: test_view_ops_config.yaml
-          - name: Profiler
-            config: test_profiler_config.yaml
+          - name: GPT OSS 20B
+            config: gpt-oss-20b.yaml
+          - name: GPT OSS 20B Spyre
+            config: gpt-oss-20b_spyre.yaml
+          - name: Granite 3.3 8B Instruct FMS
+            config: granite-3.3-8b-instruct-fms.yaml
+          - name: Granite 3.3 8B Instruct FMS Spyre
+            config: granite-3.3-8b-instruct-fms_spyre.yaml
+          - name: Granite 3.3 8B Instruct
+            config: granite-3.3-8b-instruct.yaml
+          - name: Granite 3.3 8B Instruct Spyre
+            config: granite-3.3-8b-instruct_spyre.yaml
+          - name: Granite 4.1 8B
+            config: granite-4.1-8b.yaml
+          - name: Granite 4.1 8B Spyre
+            config: granite-4.1-8b_spyre.yaml
+          - name: Meta Llama 3.1 8B Instruct
+            config: Meta-Llama-3.1-8B-Instruct.yaml
+          - name: Meta Llama 3.1 8B Instruct Spyre
+            config: Meta-Llama-3.1-8B-Instruct_spyre.yaml
+          - name: Ministral 3 14B Instruct 2512
+            config: Ministral-3-14B-Instruct-2512.yaml
+          - name: Ministral 3 14B Instruct 2512 Spyre
+            config: Ministral-3-14B-Instruct-2512_spyre.yaml
+          - name: Mistral Small 3.2 24B Instruct 2506
+            config: Mistral-Small-3.2-24B-Instruct-2506.yaml
+          - name: Mistral Small 3.2 24B Instruct 2506 Spyre
+            config: Mistral-Small-3.2-24B-Instruct-2506_spyre.yaml
 
     steps:
       # Sparse checkout into the GHA workspace so the local composite
@@ -79,12 +88,6 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           path: torch-spyre
-
-      - run: |
-          export TORCH_SPYRE_DIR="$GITHUB_WORKSPACE/torch-spyre"
-          ls -la "$TORCH_SPYRE_DIR"
-          echo "TORCH_SPYRE_DIR $TORCH_SPYRE_DIR"
-          echo "TORCH_SPYRE_DIR=${TORCH_SPYRE_DIR}" >> "$GITHUB_ENV"
 
       - uses: ./.github/actions/checkout-pytorch
 
@@ -100,14 +103,22 @@ jobs:
           echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
           echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
 
-      - name: Run ${{ matrix.suite.name }} tests
+      - name: Run ${{ matrix.suite.name }} model ops test suite
         uses: ./.github/actions/run-test-suite
         with:
           suite_name: ${{ matrix.suite.name }}
-          config: tests/configs/upstream_tests/${{ matrix.suite.config }}
+          config: tests/configs/model_ops_tests/${{ matrix.suite.config }}
           extra_test_flags: -v
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
+          pre_run: |
+            # Clear the cached AIU setup guard and stale topo.json before
+            # every attempt so a card left in a bad state by a killed
+            # (stalled) previous attempt gets re-discovered cleanly instead
+            # of carrying stale state into the retry.
+            unset _IBM_AIU_SETUP
+            rm -rf /tmp/etc/ibm/spyre/topo.json
+            source /etc/profile.d/ibm-aiu-setup.sh
 
       # ---------------------------------------------------------------------------
       # Upload the JUnit XML as a GHA artifact so it can be downloaded and
@@ -126,4 +137,17 @@ jobs:
           name: ${{ env.REPORT_NAME }}
           path: ${{ env.REPORT_PATH }}
           if-no-files-found: warn   # warn (not fail) if pytest itself crashed
-          retention-days: 90 # for now keep it for 90 days until we push to COS
+          retention-days: 10
+      # ---------------------------------------------------------------------------
+      # Write a brief summary to the job UI page.
+      # ---------------------------------------------------------------------------
+      - name: Annotate job with suite metadata
+        if: always()
+        run: |
+          {
+            echo "### Model-ops suite: ${{ matrix.suite.name }}"
+            echo "| Key | Value |"
+            echo "|---|---|"
+            echo "| Config | \`${{ matrix.suite.config }}\` |"
+            echo "| Report | \`${{ env.REPORT_NAME }}\` |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"

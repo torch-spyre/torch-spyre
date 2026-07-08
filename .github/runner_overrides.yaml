@@ -9,10 +9,8 @@
 
 inductor/test_inductor_ops_misc_shape_a_config.yaml: spyre_pf_x2
 
-# The LX-planning suite is now sharded into test_inductor_ops_lx_*_config.yaml
-# (one config per op-family x wrap-class), replacing the former single
-# test_ops_lx_planning_config.yaml (which ran on spyre_pf_x4). The shards run
-# on the default spyre_pf_x1; add a per-shard override here if one ever needs
-# multi-card hardware.
+# The following 4-card is blocking users from getting spyre cards 
+# for PR commit checks + Merge Queues. Thus commenting out
+# to keep to default spyre_pf_x1 label (1 card)
 
-# inductor/test_inductor_ops_lx_matmul_pwwrap_config.yaml: spyre_pf_x4
+# inductor/test_ops_lx_planning_config.yaml: spyre_pf_x4

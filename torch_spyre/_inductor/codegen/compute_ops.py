@@ -309,18 +309,17 @@ def _per_core_symbolic_dim_info(symbolic_dims: dict, work_slices: dict) -> dict:
     return info
 
 
-def _tiled_byte_stride(tensor, tiled_sym, iteration_space) -> int:
+def _tiled_byte_stride(tensor, tiled_sym) -> int:
     """Byte stride per loop iteration for a single tiled dimension.
 
-    The coarse_tile pass already divided iteration_space[tiled_sym].range by
-    the loop count, so that range is the per-iteration element count.  The full
-    per-iteration byte advancement is:
-        per_iter_elems * device_stride_for_dim * bytes_per_element
+    ``tensor.strides[tiled_sym]`` is already the per-tile element stride after
+    the ``dev_dim_size > it_dim_size`` backGap adjustment in
+    ``_create_sdsc_tensors``.  Multiplying by bytes-per-element gives the
+    correct per-iteration byte advance.  No ``per_iter_range`` factor — that
+    was a double-count (the tile range is already baked into
+    ``tensor.strides[tiled_sym]``).
     """
-    per_iter_range = iteration_space[tiled_sym]
-    return int(
-        per_iter_range * tensor.strides[tiled_sym] * num_bytes(tensor.data_format)
-    )
+    return int(tensor.strides[tiled_sym] * num_bytes(tensor.data_format))
 
 
 def _find_index_tensor_for_value(sdsc_spec, value_tensor_idx: int) -> int:
@@ -598,9 +597,7 @@ def generate_sdsc(
                 tensor_tiled_at_level = [s for s in level_syms if s in tensor.strides]
                 strides_for_level: dict = {}
                 for s in tensor_tiled_at_level:
-                    strides_for_level[s] = _tiled_byte_stride(
-                        tensor, s, sdsc_spec.iteration_space
-                    )
+                    strides_for_level[s] = _tiled_byte_stride(tensor, s)
                     any_tiled = True
                 per_level_strides.append(strides_for_level)
             if not any_tiled:
