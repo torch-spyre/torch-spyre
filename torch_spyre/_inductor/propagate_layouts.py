@@ -410,7 +410,7 @@ def _single_arg_op_layout(
     match aten_op:
         case prims.convert_element_type.default if (
             output.dtype != torch.bool
-            and not same_device_size(in_layout.dtype, output.dtype)
+            and stl.elems_per_stick() != get_elem_in_stick(output.dtype)
         ):
             # Type conversion may require padding when input has padding due to stick
             # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),
