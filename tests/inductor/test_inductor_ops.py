@@ -5457,6 +5457,56 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # for bool tensors.  Disable eager mode for all dtypes.
         self.compare_with_cpu(lambda a: torch.clone(a).contiguous(), x, run_eager=False)
 
+    def test_clone_lowering(self):
+        """Calling the Spyre clone lowering directly (no aten.clone FX node)
+        must still yield clone's standard row-major layout, matching a real
+        aten.clone on the same input.
+        """
+        from torch_spyre._inductor.lowering import (
+            clone as spyre_clone_lowering,
+            register_spyre_lowering,
+            spyre_lowerings,
+        )
+        import torch._inductor.lowering as inductor_lowering
+        from torch._inductor.utils import fresh_cache
+
+        lib = torch.library.Library("spyre_test", "FRAGMENT")  # noqa: TOR901
+        lib.define("clone_identity(Tensor x) -> Tensor")
+        op = torch.ops.spyre_test.clone_identity.default
+        lib.impl("clone_identity", lambda x: x.clone(), "CPU")
+        lib.impl("clone_identity", lambda x: torch.empty_like(x), "Meta")
+
+        @register_spyre_lowering(op, type_promotion_kind=None)
+        def _lower_clone_identity(x):
+            return spyre_clone_lowering(x)
+
+        def fn(a):
+            return torch.ops.spyre_test.clone_identity(a.permute(1, 0))
+
+        def ref_fn(a):
+            return a.permute(1, 0).clone()
+
+        try:
+            x_cpu = cached_randn((128, 192))
+            expected = fn(x_cpu)
+
+            # fresh_cache() prevents a cached graph from masking a regression.
+            with fresh_cache():
+                out = torch.compile(fn, backend="inductor")(x_cpu.to("spyre"))
+                ref = torch.compile(ref_fn, backend="inductor")(x_cpu.to("spyre"))
+
+            torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
+
+            out_layout = out.device_tensor_layout()
+            ref_layout = ref.device_tensor_layout()
+            self.assertIsNotNone(out_layout)
+            self.assertEqual(list(out_layout.device_size), list(ref_layout.device_size))
+            self.assertEqual(list(out_layout.stride_map), list(ref_layout.stride_map))
+        finally:
+            spyre_lowerings.pop(op, None)
+            inductor_lowering.lowerings.pop(op, None)
+            lib._destroy()
+
     def test_permute(self, input_dims, dims):
         self.compare_with_cpu(
             lambda input: torch.permute(input, dims),
