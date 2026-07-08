@@ -124,7 +124,7 @@ def _effective_size(v: Symbol, it_space: dict[Symbol, Expr], meta: SymbolMeta) -
     """
     if v in meta:
         return meta[v][0]
-    return concretize_expr(it_space[v])
+    return concretize_expr(it_space.get(v, 1))
 
 
 def _valid_divisor_basis(
@@ -136,10 +136,14 @@ def _valid_divisor_basis(
     ``n | granularity`` ensures ``R / n`` stays integer for every admissible
     runtime value ``R = granularity * k``. For concrete dims, it is just the
     concretized size.
+
+    Absent dims (e.g. pool reduction dims ki/kj stripped from the
+    work-division iteration space) return 1 — no valid split beyond 1,
+    matching the hardware constraint that pool window dims are never split.
     """
     if v in meta:
         return meta[v][1]
-    return concretize_expr(it_space[v])
+    return concretize_expr(it_space.get(v, 1))
 
 
 def core_split(size: int, max_cores: int) -> int:
