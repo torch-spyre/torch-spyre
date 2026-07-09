@@ -857,18 +857,18 @@ def _multi_arg_pointwise_layouts(
             _try_stick_dim(alt_stick_dim)
 
     # LX in-place: promote a same-frame input's layout to FIRST so the beam
-    # commits it on a cost tie, (1) avoiding an unnecessary permutation of the
-    # logically-rebuilt (possibly transposed) order, which is free per the
-    # restickify cost model but defeats the positional in-place check
-    # (allocator.py _determine_in_place). (2) A buffer just unpacked from fp8
-    # carries fp8-unpack padding, so its layout has a different total device
-    # element count than the plain output; promoting it commits a stride_map
-    # the output's host strides cannot tile (copy_tensor rejects it at runtime),
-    # so skip insertion when the footprint does not match a natural candidate.
+    # commits it on a cost tie, avoiding a free-but-in-place-defeating permutation
+    # (allocator.py _determine_in_place). Two skips guard it:
+    #   - footprint mismatch: an fp8-unpack layout has a different total device
+    #     element count than the plain output, so its stride_map cannot tile the
+    #     output's host strides (copy_tensor rejects it at runtime).
+    #   - staggered EA present: the output EA is dictated by that input, so a
+    #     STANDARD promotion would corrupt the arrangement of downstream converts
+    #     (e.g. rmsnorm fp32-upcast: weight * x_normed.to(fp16)).
     natural_footprints = {
         math.prod([s for s in r.device_size if s > 0]) for r in results
     }
-    for arg in args:
+    for arg in args if not staggered_inputs else []:
         if (
             arg.layout.size != output.size
             # Sympy structural (syntactic) equality: two semantically identical
