@@ -53,12 +53,8 @@ class TestNonErrorPath(TestCase):
         self.assertFalse(_pool_cdata().has_stream_error())
 
 
-# AC1 — has_stream_error() and has_any_stream_error() probe the C++ shutdown
-# flag; both must be False on a clean runtime.  The rethrow path itself
-# (setError + synchronize) is exercised by the flex C++ unit tests.
-# AC1 also requires the exception to cross the C++→Python boundary with the
-# original message intact; test_synchronize_propagates_error_message covers
-# that by patching the C++ binding to raise and confirming Python catches it.
+# AC1 — error flags must be False on a clean runtime; exceptions thrown by
+# C++ synchronize() must cross the pybind11 boundary with the message intact.
 
 
 class TestErrorVisibility(TestCase):
