@@ -97,7 +97,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -141,7 +140,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -203,7 +201,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -214,7 +211,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -411,7 +407,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -494,7 +489,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -544,7 +538,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -597,7 +590,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -650,7 +642,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -837,7 +828,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -890,7 +880,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -1294,7 +1283,6 @@ class TestNamedDimsHint(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -1336,7 +1324,6 @@ class TestNamedDimsHint(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -1877,7 +1864,7 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         self.assertIn("sympify('2')", src, "Expected outer loop count 2")
         self.assertIn("sympify('4')", src, "Expected inner loop count 4")
 
-    @config.patch({"lx_planning": False, "unroll_loops": False})
+    @config.patch({"lx_planning": False})
     def test_nested_matmul_copy_after_inner_loop(self):
         """The accum→output copy op appears in generated source for nested K-tiling."""
         from torch_spyre._inductor import spyre_hint
@@ -1917,7 +1904,6 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         {
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
-            "unroll_loops": False,
         }
     )
     def test_nested_matmul_outer_M_inner_K_accum_in_lx(self):
@@ -1957,43 +1943,35 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
 
 
 # ===========================================================================
-# UNROLL_LOOPS=0 variants
+# UNROLL_LOOPS=1 variants
 #
 # Each class below inherits all test methods from its base.  The class-level
-# @config.patch sets unroll_loops=False for every inherited test.  Tests that
-# are known to give wrong results under the scf.for path already contain
-#   ``if not config.unroll_loops: pytest.xfail(...)``
-# guards, so they are reported as xfail here rather than FAILED.
-#
-# Tests whose method-level @config.patch overrides unroll_loops (e.g.
-# test_hint_unrolled_source_calls_sdsc explicitly sets unroll_loops=True)
-# are unaffected: the method decorator wins over the class decorator and
-# those tests run — and pass — with their own explicit setting.
+# @config.patch sets unroll_loops=True for every inherited test.
 # ===========================================================================
 
 
-@config.patch({"unroll_loops": False})
-class TestCoarseTileSpyreHintsUnroll0(TestCoarseTileSpyreHints):
+@config.patch({"unroll_loops": True})
+class TestCoarseTileSpyreHintsUnroll1(TestCoarseTileSpyreHints):
     pass
 
 
-@config.patch({"unroll_loops": False})
-class TestNamedDimsHintUnroll0(TestNamedDimsHint):
+@config.patch({"unroll_loops": True})
+class TestNamedDimsHintUnroll1(TestNamedDimsHint):
     pass
 
 
-@config.patch({"unroll_loops": False})
-class TestCoarseTileReductionE2EUnroll0(TestCoarseTileReductionE2E):
+@config.patch({"unroll_loops": True})
+class TestCoarseTileReductionE2EUnroll1(TestCoarseTileReductionE2E):
     pass
 
 
-@config.patch({"unroll_loops": False})
-class TestCoarseTileReductionDim0E2EUnroll0(TestCoarseTileReductionDim0E2E):
+@config.patch({"unroll_loops": True})
+class TestCoarseTileReductionDim0E2EUnroll1(TestCoarseTileReductionDim0E2E):
     pass
 
 
-@config.patch({"unroll_loops": False})
-class TestCoarseTileNestedReductionE2EUnroll0(TestCoarseTileNestedReductionE2E):
+@config.patch({"unroll_loops": True})
+class TestCoarseTileNestedReductionE2EUnroll1(TestCoarseTileNestedReductionE2E):
     pass
 
 
