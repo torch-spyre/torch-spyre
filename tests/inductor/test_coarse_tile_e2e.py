@@ -762,17 +762,10 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         )
 
     def test_hint_flash_attention(self):
-        """Flash attention tiled over H (4 slices) via nested spyre_hints.
-
-        # TODO: re-enable Lk tiling once the numerical error is understood.
-        # The Lk hint was previously a no-op (dropped by _hints_levels bug fixed
-        # on this branch).  Now that Lk tiling is correctly applied, the result
-        # is numerically wrong (~90% element mismatch).  Investigate and fix
-        # before re-adding spyre_hint(num_tiles_per_dim={"Lk": lk_slices}).
-        """
+        """Flash attention tiled over H (4 slices) and Lk (2 slices) via nested spyre_hints."""
         if not config.unroll_loops:
             pytest.xfail(
-                "UNROLL_LOOPS=0: nested scf.for loops not yet correct in backend"
+                "UNROLL_LOOPS=0: nested scf.for loops with loop-carried buffers"
             )
         import math
         from torch_spyre._inductor import spyre_hint
@@ -785,16 +778,14 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         values_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
 
         scale = 1.0 / math.sqrt(math.sqrt(D))
-        lk_slices = Lk // block_size  # noqa: F841 — used in commented-out Lk hint
+        lk_slices = Lk // block_size
 
         def flash(queries, keys, values):
             output = torch.zeros_like(queries)
             M = torch.full(
                 (B, H, Lq), float("-inf"), device=queries.device, dtype=torch.float16
             )
-            with spyre_hint(
-                num_tiles_per_dim={"B": 1}
-            ):  # 3 nested scopes exercises multi-hint logic
+            with spyre_hint(num_tiles_per_dim={"B": 1}):
                 with spyre_hint(num_tiles_per_dim={"H": 4}):
                     with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
                         keys_T = keys.transpose(-1, -2).contiguous()
