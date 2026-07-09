@@ -39,7 +39,9 @@ def get_output_dir(kernel_name: str):
     spyre_dir = os.path.join(cache_dir(), "inductor-spyre")
     os.makedirs(spyre_dir, exist_ok=True)
     digest = hashlib.sha1(str(time.time_ns()).encode()).hexdigest()[:8]
-    kernel_output_dir = tempfile.mkdtemp(dir=spyre_dir, prefix=f"{digest}_{kernel_name}_")
+    kernel_output_dir = tempfile.mkdtemp(
+        dir=spyre_dir, prefix=f"{digest}_{kernel_name}_"
+    )
     return kernel_output_dir
 
 
