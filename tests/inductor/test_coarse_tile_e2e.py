@@ -883,6 +883,94 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "count=sympify('4')", src, "Expected B loop count 4 as count= in LoopSpec"
         )
 
+    @pytest.mark.xfail(
+        reason=(
+            "three-level tiling (H/Lq/Lk): _find_state_input_names returns [] for "
+            "carry ops whose state root is only reachable via Lq-tiled intermediaries; "
+            "_is_carry_op and _find_state_input_names disagree on whether a dep is "
+            "a state input vs. an intermediary"
+        ),
+        strict=True,
+    )
+    def test_hint_flash_attention_three_level(self):
+        """Flash attention tiled over H (outer), Lq (middle), and Lk (inner).
+
+        This matches the fully-tiled pattern in the production flash-attention
+        driver where H, Lq, and Lk are all independently tiled.  Carry-state
+        propagation must thread M, denominator, and output across Lk tiles
+        for every (H, Lq) combination.
+        """
+        if not config.unroll_loops:
+            pytest.xfail(
+                "UNROLL_LOOPS=0: nested scf.for loops with loop-carried buffers"
+            )
+        import math
+        from torch_spyre._inductor import spyre_hint
+
+        B, H, Lq, Lk, D = 1, 4, 128, 128, 64
+        h_slices = 2
+        lq_slices = 2
+        lk_slices = 2
+        scale = 1.0 / math.sqrt(math.sqrt(D))
+
+        queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
+        keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        values_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+
+        def flash(queries, keys, values):
+            output = torch.zeros_like(queries)
+            M = torch.full(
+                (B, H, Lq),
+                float("-inf"),
+                device=queries.device,
+                dtype=torch.float16,
+            )
+            with spyre_hint(num_tiles_per_dim={"H": h_slices}):
+                with spyre_hint(num_tiles_per_dim={"Lq": lq_slices}):
+                    with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
+                        keys_T = keys.transpose(-1, -2).contiguous()
+                        denominator = torch.zeros(
+                            (B, H, Lq),
+                            device=queries.device,
+                            dtype=torch.float16,
+                        )
+                        scores = torch.matmul(queries * scale, keys_T * scale)
+                        scores = scores.transpose(-1, -2).contiguous()
+                        block_max = torch.amax(scores, dim=-2)
+                        max_running = torch.maximum(M, block_max)
+                        exp_scores = torch.exp(scores - max_running.unsqueeze(-2))
+                        correction = torch.exp(M - max_running)
+                        denominator = denominator * correction + exp_scores.sum(dim=-2)
+                        output = output * correction.unsqueeze(-1) + torch.matmul(
+                            exp_scores.transpose(-1, -2), values
+                        )
+                        M = max_running
+            return output / denominator.unsqueeze(-1)
+
+        ref = flash(queries_t, keys_t, values_t)
+
+        queries_dev = queries_t.to("spyre")
+        keys_dev = keys_t.to("spyre")
+        values_dev = values_t.to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("Lk", Lk)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(queries_dev, ["B", "H", "Lq", "D"])
+        _name_tensor_dims(keys_dev, ["B", "H", "Lk", "D"])
+        _name_tensor_dims(values_dev, ["B", "H", "Lk", "D"])
+
+        result = torch.compile(flash)(queries_dev, keys_dev, values_dev).cpu()
+        torch.testing.assert_close(
+            result,
+            ref,
+            equal_nan=True,
+            atol=0.01,
+            rtol=0.1,
+            msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
+        )
+
     @config.patch(
         {
             "unroll_loops": False,
