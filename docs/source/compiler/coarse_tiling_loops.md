@@ -136,8 +136,8 @@ op.loop_info = CoarseTileInfo(
 ```
 
 `_divide_ranges` is applied once per level in outermost-first order (the
-`hint_id` in each `(hint_id, K, is_reduction_level)` triple is used only for
-per-op `dim_index` lookup, not by `_divide_ranges` itself):
+`hint_id` in each `(hint_id, K)` pair is used only for per-op `dim_index`
+lookup, not by `_divide_ranges` itself):
 
 1. Outer level `(K=2, dim 0)`: `data.ranges [1024, 4096] → [512, 4096]`
 2. Inner level `(M=4, dim 1)`: `data.ranges [512, 4096] → [512, 1024]`
@@ -227,6 +227,7 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                             },
                             op_info={},
                             tiled_symbols=[[sympify('c1')], [sympify('c0')]],
+                            symbolic_dim_bounds={},
                             args=[
                                 TensorArg(              # input a
                                     is_input=True, arg_index=0,
@@ -260,6 +261,7 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                                         sympify('Mod(c1, 64)'),
                                     ],
                                     allocation={'lx': 0},
+                                    per_tile_fixed=True,
                                 ),
                             ]
                         ),
@@ -272,6 +274,7 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                             },
                             op_info={},
                             tiled_symbols=[[sympify('c1')], [sympify('c0')]],
+                            symbolic_dim_bounds={},
                             args=[
                                 TensorArg(              # input y (LX scratchpad)
                                     is_input=True, arg_index=-1,
@@ -283,6 +286,7 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                                         sympify('Mod(c1, 64)'),
                                     ],
                                     allocation={'lx': 0},
+                                    per_tile_fixed=True,
                                 ),
                                 TensorArg(              # input c
                                     is_input=True, arg_index=2,
@@ -295,10 +299,10 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                                     ],
                                     allocation={'hbm': <base_addr_c>},
                                 ),
-                                TensorArg(              # output z (HBM, per-tile)
+                                TensorArg(              # output z (HBM, full tensor)
                                     is_input=False, arg_index=3,
                                     device_dtype=DataFormats.SEN169_FP16,
-                                    device_size=[16, 512, 64],
+                                    device_size=[64, 1024, 64],
                                     device_coordinates=[
                                         sympify('floor(c1/64)'),
                                         sympify('c0'),
@@ -323,21 +327,26 @@ Key observations:
 - `tiled_symbols=[[c1], [c0]]` records — innermost first — which symbols
   correspond to the tiled dimensions: `c1` is tiled by the inner loop,
   `c0` by the outer loop.
+- `symbolic_dim_bounds={}` is a new field added alongside `tiled_symbols`; it
+  is empty here because all loop counts are concrete integers.
 - The intermediate tensor `y` (output of `add`, input to `mul`) has
   `allocation={'lx': 0}` — it lives in LX scratchpad memory at address 0.
   Its `device_size=[16, 512, 64]` reflects the per-tile shape `[512, 1024]`.
-  Because `y` is produced and fully consumed within the same tile iteration,
-  no HBM allocation is needed and its address is a fixed scratchpad offset
-  that does not change between loop iterations (no `affine.apply` needed).
+  `per_tile_fixed=True` tells the unroller that this tensor's base address is
+  fixed across iterations (no `affine.apply` advance).  Because `y` is
+  produced and fully consumed within the same tile iteration, no HBM
+  allocation is needed.
 - The final output `z` (output of `mul`) has `allocation={'hbm': ...}` and
-  `arg_index=3` — it lives in HBM.  Its `device_size=[16, 512, 64]` also
-  reflects the per-tile shape; the per-iteration write address into the full
-  HBM buffer is computed by `affine.apply` in `bundle.mlir` (see next
-  section).
-- HBM inputs `a`, `b`, `c` have `device_size=[64, 1024, 64]` — the full
+  `arg_index=3` — it lives in HBM.  Its `device_size=[64, 1024, 64]` is the
+  **full** tensor shape in Spyre stick layout: `insert_tiling_propagation`
+  applies Case 3 (mutation layout) here because `z` has no inside consumers,
+  so the tiled op writes directly into the full HBM buffer and
+  `per_tile_fixed` is not set.  The per-iteration write offset into the full
+  buffer is computed by `affine.apply` in `bundle.mlir` (see next section).
+- HBM inputs `a`, `b`, `c` also have `device_size=[64, 1024, 64]` — the full
   tensor shape `[1024, 4096]` in Spyre stick layout.  Their
   `device_coordinates` use `c0` and `c1` to index the per-iteration tile
-  window into the full tensor.  The per-tile output buffers (`y`, `z`) have
+  window into the full tensor.  The LX scratchpad tensor `y` has
   `device_size=[16, 512, 64]`, the stick-layout shape for `[512, 1024]`
   fp16: 16 sticks of 64 columns across 512 rows.
 
@@ -487,26 +496,25 @@ Each group tuple has the form:
 (ops, levels)
 ```
 
-where `levels` is a list of `(hint_id, K, is_reduction_level)` triples,
-outermost first:
+where `levels` is a list of `(hint_id, K)` pairs, outermost first:
 
 ```python
-(ops, [(hint_id_0, K1, False), (hint_id_1, K2, True)])
+(ops, [(hint_id_0, K1), (hint_id_1, K2)])
 ```
 
 `hint_id` is the integer ID assigned by the enclosing `spyre_hint` scope
-(smaller IDs are outer scopes).  `is_reduction_level` is `True` when the
-hinted dimension is a reduction dimension (i.e. the `DimHint` was derived
-from a reduction-ranges position).  `tiled_dims` are **not** in the triple
-— they are derived per-op inside `_stamp_group` by consulting each op's
-own `DimHint.loop_var` so that ops which lack a particular dimension
-(e.g. broadcast ops, or `Pointwise` ops in a reduction-level group) get
-an empty sub-list rather than an incorrect positional index.
+(smaller IDs are outer scopes).  Whether a level tiles an output dimension
+or a reduction dimension is a **per-op** property: `_stamp_group` consults
+each op's own `DimHint.is_reduction` for each level rather than carrying
+`is_reduction` at the group level.  This means broadcast ops and
+`Pointwise` ops inside a reduction-level group get an empty sub-list for
+that level and are not split along that axis.  `tiled_dims` are likewise
+**not** in the pair — they are derived per-op inside `_stamp_group` by
+consulting each op's `DimHint.loop_var`.
 
-`_stamp_group` always receives this canonical list-of-triples
-representation; it is built by `_hints_levels()` inside
-`hints_to_coarse_tile_groups` in `coarse_tile.py` before `coarse_tile()`
-stamps each op.
+`_stamp_group` always receives this canonical list-of-pairs representation;
+it is built by `_hints_levels()` inside `hints_to_coarse_tile_groups` in
+`coarse_tile.py` before `coarse_tile()` stamps each op.
 
 ### `reorder_unhinted_interlopers`: pre-grouping pass
 
@@ -606,6 +614,7 @@ self.passes = [
     optimize_restickify_locations,
     finalize_layouts,
     insert_restickify,
+    insert_post_mutation_restickify,
     insert_bmm_padding,
     #
     dedup_and_promote_constants,
