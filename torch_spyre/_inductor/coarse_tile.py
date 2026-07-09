@@ -991,6 +991,11 @@ def _find_state_input_names(
 
     def _collect(source: ComputedBuffer, depth: int) -> None:
         if depth > 3:
+            logger.warning(
+                "_find_state_input_names: depth limit reached tracing %s; "
+                "state root may be missing",
+                source.get_name(),
+            )
             return
         try:
             rw = source.get_read_writes()
@@ -1177,6 +1182,17 @@ def _propagate_carry_op(
     )
 
     state_names = _find_state_input_names(op, loop_group_id, operations)
+    if not state_names:
+        # _is_carry_op detected a carry dependency but _find_state_input_names
+        # could not trace back to the state root (e.g. chain depth > 3).
+        # Log and skip; another op in the chain will propagate the carry buffer.
+        logger.warning(
+            "_propagate_carry_op: %r classified as carry op but no state "
+            "inputs found; skipping (check depth-limit warning above)",
+            op.get_name(),
+        )
+        carry_ops.add(op.get_name())
+        return
 
     # The carry buffer spans the full (pre-division) output shape so that the
     # outer loop advances it into distinct per-outer-tile slots.  Without
@@ -1188,9 +1204,9 @@ def _propagate_carry_op(
     per_tile_carry_ranges = list(op.data.ranges)
     fill_loop_info = _compute_fill_loop_info(op)
 
-    for state_name in state_names:
-        buf_map = {o.get_name(): o for o in operations if isinstance(o, ComputedBuffer)}
+    buf_map = {o.get_name(): o for o in operations if isinstance(o, ComputedBuffer)}
 
+    for state_name in state_names:
         carry_buf = _allocate_full_buffer(
             op, full_carry_ranges, operations, group_start_idx
         )

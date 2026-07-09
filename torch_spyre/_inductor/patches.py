@@ -132,14 +132,13 @@ def enable_spyre_context(
     # having side effects prevents DCE from removing them.  This mirrors the logic
     # already in torch_spyre/_inductor/deadcode_elimination._has_side_effects.
     _orig_has_side_effects = SchedulerNode.has_side_effects
-    _orig_unwrapped = _orig_has_side_effects.__wrapped__  # type: ignore[attr-defined]
 
     def _spyre_has_side_effects(self: SchedulerNode) -> bool:
         if isinstance(
             getattr(self.node, "layout", None), ir.MutationLayoutSHOULDREMOVE
         ):
             return True
-        return _orig_unwrapped(self)
+        return _orig_has_side_effects(self)
 
     SchedulerNode.has_side_effects = _spyre_has_side_effects  # type: ignore[method-assign]
 
