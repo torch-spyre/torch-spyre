@@ -649,6 +649,9 @@ class TestCloneAtGraphBoundaries(BaseTestScratchpadUsage):
 # regressions when operating on matmuls. There is likely a better
 # approach where we use a proxy to estimate the runtime perforamance
 # of given allocations.
+@unittest.skipUnless(
+    ts_inductor_config.co_optimizing_lx_planning, "co-optimization is not enabled"
+)
 class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
     """Generic real-graph coverage for the co-optimising allocator.
 
