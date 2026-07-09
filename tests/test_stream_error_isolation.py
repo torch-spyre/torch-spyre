@@ -14,10 +14,14 @@
 
 # Owner(s): ["module: stream"]
 
+import importlib.util
+import os
+import sys
+import unittest
+import unittest.mock as mock
+
 import pytest
 import torch
-import unittest.mock as mock
-from torch.testing._internal.common_utils import run_tests, TestCase
 
 from torch_spyre import _C
 
@@ -32,11 +36,29 @@ def _pool_cdata(priority: int = 0):
     return _C.get_stream_from_pool(dev, priority)
 
 
+def _import_conftest():
+    """Import the tests/conftest.py module robustly regardless of sys.path."""
+    # Prefer a cached import so repeated calls return the same module object.
+    if "conftest" in sys.modules:
+        return sys.modules["conftest"]
+    # Walk up from this file until we find tests/conftest.py.
+    here = os.path.dirname(os.path.abspath(__file__))
+    for candidate in [here, os.path.join(here, "..")]:
+        path = os.path.join(candidate, "conftest.py")
+        if os.path.isfile(path):
+            spec = importlib.util.spec_from_file_location("conftest", path)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["conftest"] = mod
+            spec.loader.exec_module(mod)
+            return mod
+    raise ImportError("Could not locate tests/conftest.py")
+
+
 # AC4 — non-error path is unchanged: synchronize() returns None and all
 # error probes are False when no fault has occurred
 
 
-class TestNonErrorPath(TestCase):
+class TestNonErrorPath(unittest.TestCase):
     def test_synchronize_returns_none_when_idle(self):
         self.assertIsNone(torch.spyre.synchronize())
 
@@ -57,7 +79,7 @@ class TestNonErrorPath(TestCase):
 # C++ synchronize() must cross the pybind11 boundary with the message intact.
 
 
-class TestErrorVisibility(TestCase):
+class TestErrorVisibility(unittest.TestCase):
     def test_pool_stream_reports_no_error(self):
         self.assertFalse(_pool_cdata().has_stream_error())
 
@@ -91,7 +113,7 @@ class TestErrorVisibility(TestCase):
 # subsequent tests always receive an error-free stream without a device reset.
 
 
-class TestOptionARecovery(TestCase):
+class TestOptionARecovery(unittest.TestCase):
     def test_pool_streams_are_always_clean(self):
         dev = torch.device("spyre", torch.spyre.current_device())
         for _ in range(2):
@@ -111,9 +133,9 @@ class TestOptionARecovery(TestCase):
 # module-level flag and patching _any_stream_has_error; no hardware required.
 
 
-class TestStreamErrorGuardLogic(TestCase):
+class TestStreamErrorGuardLogic(unittest.TestCase):
     def test_flag_false_means_no_skip(self):
-        import conftest as cf  # type: ignore[import]
+        cf = _import_conftest()
 
         original = cf._device_stream_broken
         try:
@@ -123,7 +145,7 @@ class TestStreamErrorGuardLogic(TestCase):
             cf._device_stream_broken = original
 
     def test_flag_set_when_stream_error_detected(self):
-        import conftest as cf  # type: ignore[import]
+        cf = _import_conftest()
 
         original = cf._device_stream_broken
         try:
@@ -136,7 +158,7 @@ class TestStreamErrorGuardLogic(TestCase):
             cf._device_stream_broken = original
 
     def test_flag_true_causes_skip(self):
-        import conftest as cf  # type: ignore[import]
+        cf = _import_conftest()
 
         original = cf._device_stream_broken
         try:
@@ -161,4 +183,4 @@ class TestStreamErrorGuardLogic(TestCase):
 
 
 if __name__ == "__main__":
-    run_tests()
+    unittest.main()
