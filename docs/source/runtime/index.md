@@ -130,6 +130,13 @@ What `flex_alloc->allocate(nbytes)` returns is a `flex::CompositeAddress`, a han
 What happens between a Python tensor going out of scope and the device allocation returning to the flex pool. The piece that connects the two ends is the `ReportAndDelete` callback that `SpyreAllocator` installs on every `c10::DataPtr` it hands out.
 :::
 
+When the allocator runs out of memory regions it invokes a registered
+memory-pressure callback. The torch-spyre callback releases the allocator mutex,
+calls `PyGC_Collect()` to free Python cyclic garbage, and re-acquires the mutex
+before returning — allowing the allocation to be retried. See
+[Memory Pressure and Python GC](memory_pressure_gc.md) for the full GIL
+interaction and lock-ordering details.
+
 Physical-frame (PF) and virtual-frame (VF) execution are *not* allocator strategies inside `SpyreAllocator`. The mode is picked by the `FLEX_DEVICE` environment variable, which configures the underlying flex runtime (see `csrc/spyre_device_enum.cpp`):
 
 | Mode | Selection | Description |
@@ -300,3 +307,11 @@ unsupported — the protocol overhead is high and call sites are rare.
 to a single Spyre device (typically `torch.device(f"spyre:{os.getenv('RANK', '0')}")`
 in the user code). The backend reuses the rank's existing flex runtime instance
 and default stream. It does not own a separate runtime context.
+
+## More in This Section
+
+```{toctree}
+:maxdepth: 1
+
+memory_pressure_gc
+```
