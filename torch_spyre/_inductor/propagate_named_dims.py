@@ -417,6 +417,17 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
             if hint:
                 coords = op_out_coords(op)
                 layout_size = op.get_layout().size
+                # zip() below truncates to the shorter of named_dims/layout_size,
+                # so a name-count mismatch would silently drop names (leaving them
+                # unregistered) rather than fail loudly like the input path.  Warn
+                # so a bad in-graph annotation is visible instead of a no-op.
+                if len(named_dims) != len(layout_size):
+                    logger.warning(
+                        f"{op.get_operation_name()}: named_dims hint has "
+                        f"{len(named_dims)} name(s) {named_dims} but output layout "
+                        f"has {len(layout_size)} dim(s) {list(layout_size)}; "
+                        f"extra entries are ignored"
+                    )
                 loop_var_dims: dict[sympy.Symbol, list[str]] = {}
                 for i, (coord, dim_name) in enumerate(zip(coords, named_dims)):
                     # Register the size for every name (including size-1 dims) so
@@ -489,6 +500,11 @@ def _graph_has_named_dims_hint(graph: GraphLowering) -> bool:
     (e.g. the flash SDPA decomposition), without a driver-side name_tensor_dims()
     call.  Such a hint is the only in-graph way to name a matmul output, whose
     loop vars carry no names from inputs.
+
+    This scans graph.operations, which _propagate_named_dims_impl then scans
+    again; the extra pass is a cheap gate on a per-compilation path.  If it ever
+    shows up as a hotspot, fold the check into _propagate_named_dims_impl (run
+    unconditionally, short-circuit inside) so operations is walked once.
     """
     for op in graph.operations:
         if isinstance(op, ComputedBuffer):
@@ -514,6 +530,12 @@ def propagate_named_dims(
     finally:
         _named_tensor_dims.clear()
         _enabled = False
+        # In the normal flow _named_dims is consumed by assign_dim_hints and
+        # cleared by its reset(). But the in-graph path self-registers sizes
+        # here, so if _propagate_named_dims_impl raises, the pipeline aborts
+        # before assign_dim_hints runs and those sizes would leak into the next
+        # compilation. Clear on the way out to keep the reset contract intact.
+        _named_dims.clear()
 
 
 def _assign_dim_hints_impl(operations: list[Operation]) -> None:
