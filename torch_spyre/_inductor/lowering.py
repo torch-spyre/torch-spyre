@@ -820,6 +820,12 @@ def lower_spyre_from_d2d(src, dst):
     lowering.mutate_to(dst, src)
 
 
+@register_spyre_lowering(torch.ops.spyre.copy_)
+def lower_spyre_copy_(src, dst):
+    lowering.mutate_to(dst, src)
+    return dst
+
+
 @register_spyre_lowering(torch.ops.spyre.overwrite)
 def lower_overwrite(input, output, dims, offsets):
     depr_msg = """torch.ops.spyre.overwrite is deprecated. Use standard PyTorch operations like \
