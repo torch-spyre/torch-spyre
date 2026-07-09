@@ -33,7 +33,7 @@ def _pool_cdata(priority: int = 0):
 
 
 # AC4 — non-error path is unchanged: synchronize() returns None and all
-# error probes are False when no fault has occurred.
+# error probes are False when no fault has occurred
 
 
 class TestNonErrorPath(TestCase):
