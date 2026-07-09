@@ -31,10 +31,13 @@ def _make_fused(
         return nodes[0]
     return None
 
+
 def _is_spyre_node(node: BaseSchedulerNode) -> bool:
     """True if the node computes on the Spyre device."""
     device = node.get_device()
     return device is not None and device.type == DEVICE_NAME
+
+
 def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     """
     Fuse nodes together to form kernels without changing their order.
@@ -52,7 +55,9 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     cur_nodes: list[SchedulerNode | CountedLoopSchedulerNode] = []
 
     for n in nodes:
-        if isinstance(n, (SchedulerNode, CountedLoopSchedulerNode)) and _is_spyre_node(n):
+        if isinstance(n, (SchedulerNode, CountedLoopSchedulerNode)) and _is_spyre_node(
+            n
+        ):
             cur_nodes.append(n)
         else:
             # Other node types (eg Fallback nodes) force a bundle boundary.
