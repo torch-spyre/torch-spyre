@@ -24,6 +24,7 @@ import torch._decomp as decomp
 from .constants import DEVICE_NAME, FP8_E4M3_MAX
 from .errors import Unsupported
 from . import customops  # noqa: F401
+from . import spyre_hint
 from torch_spyre._C import DataFormats, get_device_dtype
 
 import threading
@@ -548,56 +549,124 @@ def spyre__sdpa_overrideable(
     num_kvheads = key.size(1)
     max_seqlen_q = query.size(2)
     max_seqlen_kv = key.size(2)
+    head_dim = query.size(3)
 
     scaling_factor = scale
     if scaling_factor is None:
-        scaling_factor = 1.0 / math.sqrt(query.shape[-1])
-    scaling_factor = math.sqrt(scaling_factor)
+        scaling_factor = 1.0 / math.sqrt(math.sqrt(head_dim))
+    else:
+        scaling_factor = math.sqrt(scaling_factor)
 
-    query = query * scaling_factor
-    key = key * scaling_factor
+    if dropout_p > 0.0:
+        raise Unsupported("Attention dropout not implemented for Spyre")
 
     expansion = num_heads // num_kvheads
     if expansion != 1:
         key = key.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
         value = value.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
-    key_t = key.transpose(-2, -1)
 
-    attn = torch.matmul(query, key_t)
+    kv_block_size = 64
+    q_block_size = 64
 
+    output = torch.zeros_like(query)
+
+    # FIXME: create a sparse M tensor via reduction
+    M_reduced = torch.full(
+        (batch_size, num_heads, max_seqlen_q, 64),
+        float("-inf"),
+        device=query.device,
+        dtype=query.dtype,
+    )
+    M = M_reduced.amax(dim=-1)  # batch_size, num_heads, max_seqlen_q sparse
+
+    # FIXME: create a sparse denominator tensor via reduction
+    denominator_reduced = torch.zeros(
+        (batch_size, num_heads, max_seqlen_q, 64),
+        device=query.device,
+        dtype=query.dtype,
+    )
+    denominator = denominator_reduced.amax(
+        dim=-1
+    )  # batch_size, num_heads, max_seqlen_q sparse
+
+    # Precompute the causal additive mask once before entering the tiled loops.
+    # Shape [1, 1, max_seqlen_q, max_seqlen_kv]: 0.0 = keep, -inf = masked.
+    #
+    # spyre::causal_mask builds the mask on CPU (tril + masked_fill_) and
+    # transfers it to the query device. Wrapping this in a custom op makes the
+    # CPU-side in-place ops opaque to torch.compile, so assert_functional_graph
+    # is satisfied and the compiled graph sees only the resulting Spyre tensor.
     if is_causal:
-        assert attn_bias is None
-        attn_bias = torch.full_like(attn, float("-inf"))
-        attn_bias = attn_bias.triu(diagonal=1)
+        causal_mask = torch.ops.spyre.causal_mask(
+            max_seqlen_q, max_seqlen_kv, query.dtype, query.device
+        )
 
-    if attn_bias is not None:
-        attn = attn + attn_bias
+    with spyre_hint(tiles={"batch_size": max(1, batch_size // 2)}):
+        with spyre_hint(tiles={"num_heads": max(1, num_heads // 4)}):
+            with spyre_hint(
+                tiles={"max_seqlen_q": max(1, max_seqlen_q // q_block_size)}
+            ):
+                with spyre_hint(
+                    tiles={"max_seqlen_kv": max(1, max_seqlen_kv // kv_block_size)}
+                ):
+                    with spyre_hint(
+                        work_div={"num_heads": 4, "max_seqlen_q": 8, "max_seqlen_kv": 8}
+                    ):
+                        scaled_keys = (
+                            key * scaling_factor
+                        )  # batch_size, num_heads, max_seqlen_kv, head_dim
+                        keys_T = scaled_keys.transpose(
+                            -1, -2
+                        )  # batch_size, num_heads, head_dim, max_seqlen_kv
+                        scores = torch.matmul(
+                            query * scaling_factor, keys_T
+                        )  # batch_size, num_heads, max_seqlen_q, max_seqlen_kv
 
-    # TODO (aviros): Switch to _safe_softmax
-    attn = torch.softmax(attn, -1)
+                        if is_causal:
+                            scores = scores + causal_mask
 
-    if dropout_p > 0.0:
-        # TODO(aviros): Implement
-        raise Unsupported("Attention dropout not implemented for Spyre")
+                        if attn_bias is not None:
+                            scores = scores + attn_bias
 
-    # Unused for now
+                        block_max = torch.amax(
+                            scores, dim=-1
+                        )  # batch_size, num_heads, max_seqlen_q sparse
+                        max_running = torch.maximum(
+                            M, block_max
+                        )  # batch_size, num_heads, max_seqlen_q sparse
+
+                        exp_scores = torch.exp(
+                            scores - max_running.unsqueeze(-1)
+                        )  # batch_size, num_heads, max_seqlen_q, max_seqlen_kv
+                        correction = torch.exp(
+                            M - max_running
+                        )  # batch_size, num_heads, max_seqlen_q sparse
+
+                        denominator = torch.ops.spyre.copy_f(
+                            denominator * correction + exp_scores.sum(dim=-1),
+                            denominator,
+                        )  # batch_size, num_heads, max_seqlen_q sparse
+                        output = torch.ops.spyre.copy_f(
+                            output * correction.unsqueeze(-1)
+                            + torch.matmul(exp_scores, value),
+                            output,
+                        )  # batch_size, num_heads, max_seqlen_q, head_dim
+
+                        M = torch.ops.spyre.copy_f(
+                            max_running,
+                            M,
+                        )  # batch_size, num_heads, max_seqlen_q sparse
+
+    output = torch.ops.spyre.copy_f(output / denominator.unsqueeze(-1), output)
+
     logsumexp = torch.empty(
         (batch_size, num_heads, max_seqlen_q), dtype=torch.float32, device="spyre"
     )
     philox_seed = torch.empty((1,), dtype=torch.float16, device="spyre")
     philox_offset = torch.empty((1,), dtype=torch.float16, device="spyre")
 
-    # B, H, S, E
-    out = torch.matmul(attn, value)
-
-    # B, S, H, E
-    # Do not remove contiguous here.
-    # This is needed to maintain the API promise from SDPA (attn needs to have same size+stride as q)
-    out = out.transpose(1, 2).clone(memory_format=torch.contiguous_format)
-
-    # Returns (Tensor output, Tensor logsumexp, Tensor cum_seq_q, Tensor cum_seq_k, SymInt max_q, SymInt max_k, Tensor philox_seed, Tensor philox_offset, Tensor debug_attn_mask)
     return (
-        out.transpose(1, 2),
+        output,
         logsumexp,
         None,
         None,
