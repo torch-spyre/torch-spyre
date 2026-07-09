@@ -277,13 +277,21 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
 
             # Create ModuleInfo and add to module_db
             try:
-                # The dtype actually exercised is whatever each tensor spec in
-                # the YAML declares (e.g. bfloat16), not whichever dtype this
-                # tuple lists -- module_inputs_func ignores the dtype it's
-                # called with (see create_module_inputs_func_from_yaml).
-                # Derive the tuple from the YAML so no dtype used there is
-                # silently skipped; fall back to the historical default only
-                # when no tensor spec can be found (e.g. a no-input module).
+                # edits.modules.include is additive: ModuleInfo.dtypes (the set
+                # of dtype variants @modules will ever generate for this
+                # module) is derived from the floating-point dtype(s) actually
+                # baked into the YAML's tensor specs, so a dtype absent from
+                # the YAML (e.g. float16 for a bfloat16-only module) is never
+                # registered and therefore never generated -- regardless of
+                # global.supported_dtypes.
+                #
+                # global.supported_dtypes (GLOBAL_SUPPORTED_DTYPES, applied in
+                # _should_run_test_case below) is purely a filter on top of
+                # that: it can only skip a dtype variant that was registered
+                # here, never add one that wasn't. Fall back to the historical
+                # default triple only when no tensor spec can be found at all
+                # (e.g. a no-input module), so such a module still gets some
+                # coverage.
                 resolved_dtypes = module_item.resolved_input_dtypes()
                 dtypes = (
                     tuple(sorted(resolved_dtypes, key=str))
