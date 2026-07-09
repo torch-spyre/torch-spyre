@@ -191,7 +191,20 @@ def compute_input_named_dims(dep: MemoryDep, op=None, ind_sizes=None) -> dict:
                 f"and no indirect index symbol in coord {coord!r} for names {names}"
             )
         elif len(loop_vars) > len(names):
-            # More loop vars than named dims: a single named dim was split by reshape.
+            # More loop vars than named dims: a reshape split this layout dim.
+            if all(n.startswith("_untracked_") for n in names):
+                # The split name is only an _untracked_ placeholder (no
+                # meaningful name to preserve, e.g. a k/v projection output
+                # reshaped into heads).  Assign fresh untracked names per loop
+                # var rather than aborting the whole pass.
+                for loop_var in loop_vars:
+                    size = int(dep.ranges[loop_var])
+                    result.setdefault(loop_var, []).append(
+                        _untracked_name(dep.name, loop_var, size)
+                    )
+                continue
+            # A real (meaningful) name was split — the caller must re-annotate
+            # after the reshape; we cannot guess the split.
             raise Unsupported(
                 f"{dep.name}: layout dim {i} has {len(loop_vars)} loop vars but only "
                 f"{len(names)} name(s) {names} -- reshape split a named dim, "
@@ -403,11 +416,34 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
                     break
             if hint:
                 coords = op_out_coords(op)
-                loop_var_dims = {
-                    sym: [dim_name]
-                    for coord, dim_name in zip(coords, named_dims)
-                    if (sym := _lone_sym(coord)) is not None
-                }
+                layout_size = op.get_layout().size
+                # zip() below truncates to the shorter of named_dims/layout_size,
+                # so a name-count mismatch would silently drop names (leaving them
+                # unregistered) rather than fail loudly like the input path.  Warn
+                # so a bad in-graph annotation is visible instead of a no-op.
+                if len(named_dims) != len(layout_size):
+                    logger.warning(
+                        f"{op.get_operation_name()}: named_dims hint has "
+                        f"{len(named_dims)} name(s) {named_dims} but output layout "
+                        f"has {len(layout_size)} dim(s) {list(layout_size)}; "
+                        f"extra entries are ignored"
+                    )
+                loop_var_dims: dict[sympy.Symbol, list[str]] = {}
+                for i, (coord, dim_name) in enumerate(zip(coords, named_dims)):
+                    # Register the size for every name (including size-1 dims) so
+                    # downstream consumers resolve it: named_dims_for_sym filters
+                    # on `name in _named_dims`, and _consume_names raises KeyError
+                    # for an undeclared name.  setdefault preserves the
+                    # declare-once contract (a driver-side declare_tensor_dim or
+                    # an earlier op naming the same dim wins).
+                    _named_dims.setdefault(dim_name, int(layout_size[i]))
+                    # A size-1 dim yields coord == 0 (sym is None): the name stays
+                    # in named_dims for positional alignment and is declared
+                    # above, but it has no loop var to tile (it is optimized
+                    # away), so it is absent from loop_var_dims.
+                    sym = _lone_sym(coord)
+                    if sym is not None:
+                        loop_var_dims[sym] = [dim_name]
                 op._dim_prop_info = _DimPropInfo(  # type: ignore[attr-defined]
                     named_dims=named_dims,
                     loop_var_dims=loop_var_dims,
@@ -457,15 +493,50 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
             _log_op(op)
 
 
+def _graph_has_named_dims_hint(graph: GraphLowering) -> bool:
+    """True if any op carries a spyre_hint(named_dims=[...]) annotation.
+
+    This lets a decomposition name its own intermediate dims entirely in-graph
+    (e.g. the flash SDPA decomposition), without a driver-side name_tensor_dims()
+    call.  Such a hint is the only in-graph way to name a matmul output, whose
+    loop vars carry no names from inputs.
+
+    This scans graph.operations, which _propagate_named_dims_impl then scans
+    again; the extra pass is a cheap gate on a per-compilation path.  If it ever
+    shows up as a hotspot, fold the check into _propagate_named_dims_impl (run
+    unconditionally, short-circuit inside) so operations is walked once.
+    """
+    for op in graph.operations:
+        if isinstance(op, ComputedBuffer):
+            for hint_dict in get_op_hints(op).values():
+                if "named_dims" in hint_dict:
+                    return True
+    return False
+
+
 def propagate_named_dims(
     graph: GraphLowering,
 ) -> None:
     """Propagate named dims from annotated inputs through the op graph."""
     global _enabled
-    if not _enabled:
+    # Run when a driver called name_tensor_dims() (_enabled) OR when the graph
+    # itself carries an in-graph named_dims hint. Do not set _enabled here — the
+    # finally block still resets it, and _graph_has_named_dims_hint re-derives
+    # the in-graph case each run.
+    if not (_enabled or _graph_has_named_dims_hint(graph)):
         return
     try:
         _propagate_named_dims_impl(graph)
+    except BaseException:
+        # On the normal path _named_dims MUST survive: assign_dim_hints runs
+        # next and reads it (named_dims_for_sym filters on `name in
+        # _named_dims`), then clears it in its own reset(). Only when
+        # _propagate_named_dims_impl raises does the pipeline abort before
+        # assign_dim_hints runs -- then the sizes self-registered by the
+        # in-graph path (and any driver-declared dims) would leak into the next
+        # compilation, so clear them here on the error path only.
+        _named_dims.clear()
+        raise
     finally:
         _named_tensor_dims.clear()
         _enabled = False
