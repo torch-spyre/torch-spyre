@@ -46,6 +46,11 @@ struct SpyreAllocator final : public c10::DeviceAllocator {
 
   static std::shared_ptr<flex::FlexAllocator> getFlexAllocator();
 
+  // Memory pressure callback for FlexAllocator
+  // Invoked when allocator exhausts all regions
+  // Releases mutex, triggers Python GC, re-acquires mutex
+  static void memoryPressureCallback(std::unique_lock<std::mutex>& lock);
+
  public:
   static SpyreAllocator& instance();
   bool initialized() override;

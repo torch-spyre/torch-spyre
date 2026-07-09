@@ -342,7 +342,9 @@ class ParameterizedScratchpadUsage(
     parameter_axes = {
         "solver_method": ("greedy", "bestfit", "firstfit"),
         "sencores": (1, 32),
-        "co_optimization": (False, True),
+        "co_optimization": (False, True)
+        if ts_inductor_config.co_optimizing_lx_planning
+        else (False,),
         "boundary_clones": (False, True),
     }
 
@@ -430,14 +432,14 @@ class TestMeasureHBMUsageCoOptimizing(BaseTestScratchpadUsage):
     def test_softmax_dim0_strictly_lower_hbm(self):
         """The canonical motivating case from the design doc. softmax(dim=0)
         has every adjacent op pair disagreeing on which dim to split, so
-        DefaultAllocator only pins 1 of 4 shared buffers; Strategy B should
+        ScratchpadAllocator only pins 1 of 4 shared buffers; Strategy B should
         flip the pointwise ops to cols and pin all 4 → strictly lower HBM."""
         f = functools.partial(torch.softmax, dim=0)
         x = self.rand_device((512, 1024))
         self.run_test(f, (x,), strict=True)
 
     def test_softmax_dim_neg1_no_regression(self):
-        """softmax(dim=-1) is the well-behaved baseline where DefaultAllocator
+        """softmax(dim=-1) is the well-behaved baseline where ScratchpadAllocator
         already pins everything pinnable. Strategy B must match (no regression)."""
         f = functools.partial(torch.softmax, dim=-1)
         x = self.rand_device((512, 1024))
@@ -673,6 +675,9 @@ class TestCloneAtGraphBoundaries(BaseTestScratchpadUsage):
 # regressions when operating on matmuls. There is likely a better
 # approach where we use a proxy to estimate the runtime perforamance
 # of given allocations.
+@unittest.skipUnless(
+    ts_inductor_config.co_optimizing_lx_planning, "co-optimization is not enabled"
+)
 class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
     """Generic real-graph coverage for the co-optimising allocator.
 
