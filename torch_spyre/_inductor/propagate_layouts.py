@@ -17,6 +17,7 @@ from collections import Counter
 from typing import NamedTuple
 
 import logging
+import math
 
 import sympy
 import torch
@@ -885,6 +886,54 @@ def _multi_arg_pointwise_layouts(
             if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
                 continue
             _try_stick_dim(alt_stick_dim)
+
+    # LX in-place: promote a same-frame input's layout to FIRST so the beam
+    # commits it on a cost tie, avoiding a free-but-in-place-defeating permutation
+    # (allocator.py _determine_in_place). Two skips guard it:
+    #   - footprint mismatch: an fp8-unpack layout has a different total device
+    #     element count than the plain output, so its stride_map cannot tile the
+    #     output's host strides (copy_tensor rejects it at runtime).
+    #   - staggered EA present: the output EA is dictated by that input, so a
+    #     STANDARD promotion would corrupt the arrangement of downstream converts
+    #     (e.g. rmsnorm fp32-upcast: weight * x_normed.to(fp16)).
+    natural_footprints = {
+        math.prod([s for s in r.device_size if s > 0]) for r in results
+    }
+    for arg in args if not staggered_inputs else []:
+        if (
+            arg.layout.size != output.size
+            # Sympy structural (syntactic) equality: two semantically identical
+            # expressions with different variable names or term order compare
+            # unequal here. This is intentionally conservative — only inputs
+            # whose index is exactly the same expression as the output's qualify
+            # as same-frame candidates for in-place layout reuse.
+            or arg.dep.index != output_dep.index
+            or not same_device_size(arg.layout.dtype, output.dtype)
+        ):
+            continue
+        src_stl = next(iter(arg.layouts))
+        candidate = SpyreTensorLayout(
+            src_stl.device_size,
+            src_stl.stride_map,
+            get_device_dtype(output.dtype),
+        )
+        if (
+            math.prod([s for s in candidate.device_size if s > 0])
+            not in natural_footprints
+        ):
+            continue
+        # Stick must be offset-free; per-input feasibility is left to
+        # AllSameNode (INF-costs incompatible).
+        out_coord = device_coordinates(candidate, output_dep, ind_sizes)
+        if not is_stick_expr_offset_free(out_coord[-1], stick_size):
+            continue
+        # Move to front (or insert if new): the in-place layout must win on
+        # cost ties so the allocator's positional in-place check can fire.
+        key = (tuple(candidate.device_size), tuple(candidate.stride_map))
+        results = [
+            r for r in results if (tuple(r.device_size), tuple(r.stride_map)) != key
+        ]
+        results.insert(0, candidate)
 
     if not results:
         raise Unsupported(
