@@ -344,7 +344,7 @@ class ParameterizedScratchpadUsage(
         "sencores": (1, 32),
         "co_optimization": (False, True)
         if ts_inductor_config.co_optimizing_lx_planning
-        else (False),
+        else (False,),
         "boundary_clones": (False, True),
     }
 
