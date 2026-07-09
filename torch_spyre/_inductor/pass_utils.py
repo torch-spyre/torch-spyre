@@ -705,6 +705,26 @@ def device_coordinates(
     return coords
 
 
+def try_device_coordinates(
+    stl: SpyreTensorLayout,
+    dep: MemoryDep,
+    indirect_sizes: "dict[sympy.Symbol, int] | None",
+) -> list[sympy.Expr] | None:
+    """Like ``device_coordinates`` but returns ``None`` instead of raising when
+    the layout's stick expression is one the backend cannot represent.
+
+    Intended for callers that *enumerate* candidate layouts (e.g. matmul input
+    layout selection) and want to skip an unrepresentable candidate rather than
+    abort the whole compile. Callers that have already committed to a single
+    layout should keep using ``device_coordinates`` so an unrepresentable stick
+    remains a hard error.
+    """
+    try:
+        return device_coordinates(stl, dep, indirect_sizes)
+    except Unsupported:
+        return None
+
+
 def iter_var_id(stick_expr) -> int:
     """Iteration variable index from a stick expr: Mod(d2,64) -> 2, d2 -> 2.
     Returns -1 for constant-zero (scalar/broadcast, no real stick).
@@ -985,8 +1005,19 @@ def compute_restickify_needed(
     ind_names, _, ind_sizes = indirect_info_from_op(op)
     if in_dep.name in ind_names:
         return False, None
-    idc = device_coordinates(in_stl, in_dep, ind_sizes)
-    out_idc = device_coordinates(out_stl, out_dep, ind_sizes)
+    idc = try_device_coordinates(in_stl, in_dep, ind_sizes)
+    out_idc = try_device_coordinates(out_stl, out_dep, ind_sizes)
+    if idc is None or out_idc is None:
+        # One of the layouts has a stick expression the backend cannot
+        # represent (e.g. floor(var/N) from a cross-stick access). Such a
+        # candidate can never be a feasible restickify source/target.
+        #
+        # Return (True, None): the (needed=True, tgt=None) pair is the
+        # "infeasible restickify" signal on this function's contract. The beam
+        # search maps it to INF cost and discards the candidate — see
+        # EdgeCostMap._compute_and_cache_cost in optimize_restickify.py. This is
+        # preferable to aborting the whole pass when another candidate is valid.
+        return True, None
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
     # Input stick with an offset always needs restickify to remove the offset.
