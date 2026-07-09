@@ -17,6 +17,7 @@ from collections import Counter
 from typing import NamedTuple
 
 import logging
+import math
 
 import sympy
 import torch
@@ -855,11 +856,18 @@ def _multi_arg_pointwise_layouts(
                 continue
             _try_stick_dim(alt_stick_dim)
 
-    # LX in-place: offer a same-frame input's device order as a candidate, placed
-    # FIRST so the beam's stable cost-tie-break commits it over the logically-
-    # rebuilt (possibly transposed) order. The transpose is free per the restickify
-    # cost model but defeats the positional in-place check (allocator.py
-    # _determine_in_place). Broadcast/sliced inputs fail the per-arg guard.
+    # LX in-place: promote a same-frame input's layout to FIRST so the beam
+    # commits it on a cost tie, (1) avoiding an unnecessary permutation of the
+    # logically-rebuilt (possibly transposed) order, which is free per the
+    # restickify cost model but defeats the positional in-place check
+    # (allocator.py _determine_in_place). (2) A buffer just unpacked from fp8
+    # carries fp8-unpack padding, so its layout has a different total device
+    # element count than the plain output; promoting it commits a stride_map
+    # the output's host strides cannot tile (copy_tensor rejects it at runtime),
+    # so skip insertion when the footprint does not match a natural candidate.
+    natural_footprints = {
+        math.prod([s for s in r.device_size if s > 0]) for r in results
+    }
     for arg in args:
         if (
             arg.layout.size != output.size
@@ -872,21 +880,29 @@ def _multi_arg_pointwise_layouts(
             or not same_device_size(arg.layout.dtype, output.dtype)
         ):
             continue
-        for src_stl in arg.layouts:
-            candidate = SpyreTensorLayout(
-                src_stl.device_size,
-                src_stl.stride_map,
-                get_device_dtype(output.dtype),
-            )
-            # Stick must be offset-free; per-input feasibility is left to
-            # AllSameNode (INF-costs incompatible). Skip if offset or duplicate.
-            out_coord = device_coordinates(candidate, output_dep, ind_sizes)
-            key = (tuple(candidate.device_size), tuple(candidate.stride_map))
-            if not is_stick_expr_offset_free(out_coord[-1], stick_size) or key in {
-                (tuple(r.device_size), tuple(r.stride_map)) for r in results
-            }:
-                continue
-            results.insert(0, candidate)
+        src_stl = next(iter(arg.layouts))
+        candidate = SpyreTensorLayout(
+            src_stl.device_size,
+            src_stl.stride_map,
+            get_device_dtype(output.dtype),
+        )
+        if (
+            math.prod([s for s in candidate.device_size if s > 0])
+            not in natural_footprints
+        ):
+            continue
+        # Stick must be offset-free; per-input feasibility is left to
+        # AllSameNode (INF-costs incompatible).
+        out_coord = device_coordinates(candidate, output_dep, ind_sizes)
+        if not is_stick_expr_offset_free(out_coord[-1], stick_size):
+            continue
+        # Move to front (or insert if new): the in-place layout must win on
+        # cost ties so the allocator's positional in-place check can fire.
+        key = (tuple(candidate.device_size), tuple(candidate.stride_map))
+        results = [
+            r for r in results if (tuple(r.device_size), tuple(r.stride_map)) != key
+        ]
+        results.insert(0, candidate)
 
     if not results:
         raise Unsupported(
