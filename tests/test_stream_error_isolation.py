@@ -68,13 +68,14 @@ class TestErrorVisibility(TestCase):
     # the pybind11 boundary and arrives in Python as a RuntimeError with the
     # original message text intact.
     def test_synchronize_propagates_error_message(self):
-        stream = torch.spyre.Stream()
         sentinel = "Deferred Error First"
+        # Patch the Python-level Stream.synchronize so we can inject an error
+        # without touching the read-only pybind11 binding directly.
         with mock.patch.object(
-            stream._cdata, "synchronize", side_effect=RuntimeError(sentinel)
+            torch.spyre.Stream, "synchronize", side_effect=RuntimeError(sentinel)
         ):
             with self.assertRaises(RuntimeError) as ctx:
-                stream.synchronize()
+                torch.spyre.Stream().synchronize()
         self.assertIn(sentinel, str(ctx.exception))
 
     # AC1 — same boundary check via the device-level torch.spyre.synchronize().
