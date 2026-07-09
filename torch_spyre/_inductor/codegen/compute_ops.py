@@ -401,6 +401,7 @@ def generate_sdsc(
     symbol_id_offset: int = 0,
     tiled_symbols=None,
     use_symbols: bool = False,
+    per_tile_fixed_arg_indices: set[int] | None = None,
 ):
     """Generate SDSC JSON for one OpSpec.
 
@@ -430,6 +431,8 @@ def generate_sdsc(
     # tiled_symbols is list[list[Symbol]], outermost-first per nesting level.
     if tiled_symbols is None:
         tiled_symbols = []
+    if per_tile_fixed_arg_indices is None:
+        per_tile_fixed_arg_indices = set()
 
     out_idx = len(sdsc_spec.args) - 1
     core_id_to_wk_slice = {
@@ -529,7 +532,10 @@ def generate_sdsc(
         # the symbols at that level that advance tensor i.  Empty list of dicts
         # (i.e. [{}] * n_levels or []) for non-tiled / lx tensors.
         affine_strides: list[list[dict]] = []
-        for tensor in sdsc_spec.args:
+        for tensor_idx, tensor in enumerate(sdsc_spec.args):
+            if tensor_idx in per_tile_fixed_arg_indices:
+                affine_strides.append([{} for _ in tiled_symbols])
+                continue
             if "lx" in tensor.allocation:
                 affine_strides.append([{} for _ in tiled_symbols])
                 continue

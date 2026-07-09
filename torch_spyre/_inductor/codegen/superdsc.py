@@ -907,6 +907,9 @@ def compile_op_spec(
         [symbol_mapping[s] for s in level if s in symbol_mapping]
         for level in reversed(op_spec.tiled_symbols)
     ]
+    per_tile_fixed_arg_indices = {
+        i for i, arg in enumerate(op_spec.args) if arg.per_tile_fixed
+    }
     return generate_sdsc(
         idx,
         sdsc_spec,
@@ -914,4 +917,5 @@ def compile_op_spec(
         symbol_id_offset,
         tiled_symbols=tiled_symbols_per_level,
         use_symbols=use_symbols,
+        per_tile_fixed_arg_indices=per_tile_fixed_arg_indices,
     )

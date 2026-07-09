@@ -4515,6 +4515,56 @@ class TestAffineStrideMatchesUnrollStride(unittest.TestCase):
             f"for [1024,4096] multi-stick row tiling",
         )
 
+    def test_per_tile_fixed_tensor_has_empty_affine_strides(self):
+        """per_tile_fixed=True tensors must produce empty affine strides (pool scratch
+        at a fixed base address should not be advanced by the tiling loop)."""
+        tiled_sym = self._C_ROW
+        input_tensor = self._make_rc_tensor()
+        pool_tensor = TensorArg(
+            is_input=False,
+            arg_index=-1,
+            device_dtype=_FP16,
+            device_size=list(self._DS_RC),
+            device_coordinates=[
+                self._C_COL // 64,
+                self._C_ROW,
+                sympy.Mod(self._C_COL, 64),
+            ],
+            allocation={"lx": 0},
+            per_tile_fixed=True,
+        )
+        out_tensor = TensorArg(
+            is_input=False,
+            arg_index=1,
+            device_dtype=_FP16,
+            device_size=list(self._DS_RC),
+            device_coordinates=[
+                self._C_COL // 64,
+                self._C_ROW,
+                sympy.Mod(self._C_COL, 64),
+            ],
+            allocation={"hbm": 0x500000000},
+        )
+        iter_range = self._R
+        op_spec = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={
+                tiled_sym: (Integer(iter_range), 1),
+                self._C_COL: (Integer(self._C), 1),
+            },
+            args=[input_tensor, pool_tensor, out_tensor],
+            op_info={},
+            tiled_symbols=[[tiled_sym]],
+        )
+        symbols: list[int] = []
+        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        # input (idx 0) and output (idx 2) are tiled — must have non-empty strides.
+        self.assertNotEqual(affine_strides[0], [{}])
+        # pool scratch (idx 1) is per_tile_fixed — must produce empty affine strides.
+        self.assertEqual(affine_strides[1], [{}])
+        self.assertNotEqual(affine_strides[2], [{}])
+
 
 if __name__ == "__main__":
     unittest.main()
