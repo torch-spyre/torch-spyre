@@ -277,12 +277,25 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
 
             # Create ModuleInfo and add to module_db
             try:
+                # The dtype actually exercised is whatever each tensor spec in
+                # the YAML declares (e.g. bfloat16), not whichever dtype this
+                # tuple lists -- module_inputs_func ignores the dtype it's
+                # called with (see create_module_inputs_func_from_yaml).
+                # Derive the tuple from the YAML so no dtype used there is
+                # silently skipped; fall back to the historical default only
+                # when no tensor spec can be found (e.g. a no-input module).
+                resolved_dtypes = module_item.resolved_input_dtypes()
+                dtypes = (
+                    tuple(sorted(resolved_dtypes, key=str))
+                    if resolved_dtypes
+                    else (torch.float32, torch.float16, torch.bfloat16)
+                )
                 module_info = ModuleInfo(
                     module_cls,
                     module_inputs_func=create_module_inputs_func_from_yaml(module_item),
                     skips=(),
                     decorators=None,
-                    dtypes=(torch.float32, torch.float16),
+                    dtypes=dtypes,
                 )
                 module_db.append(module_info)
                 existing_names.add(module_name)
@@ -628,11 +641,17 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
             _OOTOpDtypeExpander(test, all_extra_dtypes).patch()
 
         # Collect precision overrides: merge global + union across all entries.
-        # Per-variant selection happens below in new_methods loop.
+        # precision_overrides/tolerance_overrides are dtype-keyed only (an
+        # upstream limitation), so -- like the dtype injection above -- these
+        # can only vary per dtype, not per op within a shared test method.
+        include_dtype_precision: Dict[torch.dtype, Precision] = {}
+        for _e in all_entries_for_name:
+            include_dtype_precision.update(_e.edits.dtypes.resolved_include_precision())
+
         _OOTPrecisionOverridePatcher(
             test,
             global_dtype_precision=cls.GLOBAL_DTYPE_PRECISION,
-            include_dtype_precision={},  # handled per-variant below
+            include_dtype_precision=include_dtype_precision,
         ).patch()
 
         # Dynamically adds pytest marker to each of ops and dtype passed to @ops

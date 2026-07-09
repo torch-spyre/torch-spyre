@@ -392,6 +392,65 @@ def _parse_input_arg(raw: Any) -> InputArg:
     )
 
 
+def _dtypes_from_input_arg(arg: "InputArg") -> Set[torch.dtype]:
+    """Return the dtype(s) baked into a single positional arg, if any."""
+    if isinstance(arg, InputArgTensor):
+        return {arg.tensor.resolved_dtype()}
+    if isinstance(arg, InputArgTensorList):
+        return {spec.resolved_dtype() for spec in arg.tensor_list}
+    return set()
+
+
+def _dtypes_from_kwarg_value(v: Any) -> Set[torch.dtype]:
+    """Return the dtype(s) baked into a raw (unparsed) kwarg value, if any.
+
+    Kwarg values are stored as raw dicts until ``resolved_kwargs()`` builds
+    them, so a tensor/tensor_list spec is recognized the same way
+    ``resolved_kwargs()`` recognizes it: by its dict keys.
+    """
+    if isinstance(v, dict):
+        if "tensor" in v:
+            return {InputTensorSpec(**v["tensor"]).resolved_dtype()}
+        if "tensor_list" in v:
+            return {InputTensorSpec(**t).resolved_dtype() for t in v["tensor_list"]}
+    return set()
+
+
+def _dtypes_from_inputs_edits(edits: Optional["InputsEdits"]) -> Set[torch.dtype]:
+    """Collect every dtype baked into an InputsEdits' args/kwargs tensor specs."""
+    if edits is None:
+        return set()
+    dtypes: Set[torch.dtype] = set()
+    for arg in edits.args:
+        dtypes |= _dtypes_from_input_arg(arg)
+    for v in edits.kwargs.values():
+        dtypes |= _dtypes_from_kwarg_value(v)
+    return dtypes
+
+
+def _move_to_test_device(obj: Any, test_device: Optional[torch.device]) -> Any:
+    """Move built tensors (or lists of tensors) to the target test device.
+
+    Tensor specs are always built on CPU for reproducible seeded random data
+    (see ``InputTensorSpec.build``). The module under test, however, is moved to
+    ``test_device`` by the upstream ``test_forward`` harness via ``m.to(device)``,
+    so its parameters/buffers live on the device. Forward inputs must therefore
+    be placed on the same device or ``F.linear`` (and Spyre decompositions) raise
+    a device-mismatch error. Upstream torch builds sample inputs directly on the
+    device; we build on CPU then relocate here.
+
+    ``test_device`` is None only for CPU-target runs, where the tensors already
+    live on the correct device and no move is needed.
+    """
+    if test_device is None:
+        return obj
+    if isinstance(obj, torch.Tensor):
+        return obj.to(test_device)
+    if isinstance(obj, list):
+        return [_move_to_test_device(item, test_device) for item in obj]
+    return obj
+
+
 class InputsEdits(BaseModel):
     """
     Per-test input specification (edits.inputs).
@@ -427,14 +486,15 @@ class InputsEdits(BaseModel):
             inp_seed = None if seed is None else seed + i * 1000
 
             if isinstance(arg, InputArgTensor):
-                cpu_args.append(arg.tensor.build(seed=inp_seed))
+                t = arg.tensor.build(seed=inp_seed)
+                cpu_args.append(_move_to_test_device(t, test_device))
 
             elif isinstance(arg, InputArgTensorList):
                 lst = [
                     spec.build(seed=(None if seed is None else seed + i * 1000 + j * 7))
                     for j, spec in enumerate(arg.tensor_list)
                 ]
-                cpu_args.append(lst)
+                cpu_args.append(_move_to_test_device(lst, test_device))
 
             elif isinstance(arg, InputArgConfig):
                 import importlib
@@ -530,14 +590,16 @@ class InputsEdits(BaseModel):
                 arg = _parse_input_arg(v)
                 inp_seed = None if seed is None else seed + 500000 + i * 131
                 if isinstance(arg, InputArgTensor):
-                    out[k] = arg.tensor.build(seed=inp_seed)
+                    t = arg.tensor.build(seed=inp_seed)
+                    out[k] = _move_to_test_device(t, test_device)
                 elif isinstance(arg, InputArgTensorList):
-                    out[k] = [
+                    lst = [
                         spec.build(
                             seed=(None if inp_seed is None else inp_seed + j * 7)
                         )
                         for j, spec in enumerate(arg.tensor_list)
                     ]
+                    out[k] = _move_to_test_device(lst, test_device)
                 elif isinstance(arg, InputArgConfig):
                     import importlib
 
@@ -619,6 +681,32 @@ class ModulesNamedItem(BaseModel):
                         parsed_list.append(item)
                 values["forward_inputs"] = parsed_list
         return values
+
+    def resolved_input_dtypes(self) -> Set[torch.dtype]:
+        """Return the dtype(s) actually baked into this module's tensor specs.
+
+        Every tensor spec under constructor_inputs/forward_inputs carries an
+        explicit ``dtype`` (see InputTensorSpec), so the dtype exercised at
+        test time is whatever the YAML specifies -- independent of the
+        ``dtype`` argument the upstream ``@modules`` test loop happens to be
+        iterating on (module_inputs_func never reads it, see
+        create_module_inputs_func_from_yaml). Registering this module with a
+        hardcoded ModuleInfo.dtypes tuple therefore silently drops any dtype
+        (e.g. bfloat16) used in the YAML but absent from that tuple: no test
+        variant is ever generated for it. Scanning the specs here keeps
+        ModuleInfo.dtypes in sync with what the YAML actually tests.
+        """
+        dtypes: Set[torch.dtype] = set()
+        dtypes |= _dtypes_from_inputs_edits(self.constructor_inputs)
+
+        forward_spec = self.forward_inputs or self.sample_inputs_func
+        if isinstance(forward_spec, list):
+            for spec in forward_spec:
+                dtypes |= _dtypes_from_inputs_edits(spec)
+        else:
+            dtypes |= _dtypes_from_inputs_edits(forward_spec)
+
+        return dtypes
 
     def build_module_input(
         self,
