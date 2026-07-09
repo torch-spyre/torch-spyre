@@ -989,14 +989,7 @@ def _find_state_input_names(
     def _is_all_empty_td(li) -> bool:
         return li is not None and all(not d for d in li.loop_tiled_dims)
 
-    def _collect(source: ComputedBuffer, depth: int) -> None:
-        if depth > 3:
-            logger.warning(
-                "_find_state_input_names: depth limit reached tracing %s; "
-                "state root may be missing",
-                source.get_name(),
-            )
-            return
+    def _collect(source: ComputedBuffer) -> None:
         try:
             rw = source.get_read_writes()
         except Exception as e:
@@ -1025,11 +1018,12 @@ def _find_state_input_names(
                 result.append(dep_name)
             else:
                 # In-group with non-empty outer tiled_dims: recurse to find the
-                # state root via this intermediary.
+                # state root via this intermediary.  `seen` prevents revisiting
+                # nodes, so this terminates without a depth cap.
                 seen.add(dep_name)
-                _collect(dep_op, depth + 1)
+                _collect(dep_op)
 
-    _collect(op, 0)
+    _collect(op)
     return result
 
 
