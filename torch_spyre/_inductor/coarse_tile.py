@@ -1023,6 +1023,10 @@ def _find_state_input_names(
                 seen.add(dep_name)
                 _collect(dep_op)
 
+    # Seed seen with op itself so that any dep cycle back to op is cut.
+    # Inductor IR is a DAG so this shouldn't occur in practice, but it's
+    # a cheap belt-and-suspenders guard.
+    seen.add(op.get_name())
     _collect(op)
     return result
 
@@ -1182,9 +1186,13 @@ def _propagate_carry_op(
         # Log and skip; another op in the chain will propagate the carry buffer.
         logger.warning(
             "_propagate_carry_op: %r classified as carry op but no state "
-            "inputs found; skipping (check depth-limit warning above)",
+            "inputs found; skipping (_is_carry_op and _find_state_input_names disagree)",
             op.get_name(),
         )
+        # Still register in carry_ops: downstream ops that transitively depend
+        # on this op via _is_carry_op case 2 will also hit the empty-state_names
+        # path and skip gracefully, rather than trying to find a state root that
+        # doesn't exist from their vantage point either.
         carry_ops.add(op.get_name())
         return
 
@@ -1219,6 +1227,11 @@ def _propagate_carry_op(
 
         # Find terminal BEFORE patching so the forward-reachability walk from
         # state_name can still follow the original data-flow edges.
+        # NOTE: terminal is resolved per state_name.  If op has multiple state
+        # inputs (unusual but possible), each gets its own carry buffer but they
+        # share the same op-level shape, so both terminals must produce the same
+        # shape.  In practice all state chains for a given carry op converge at
+        # the same terminal (or the op itself is terminal); this is not enforced.
         terminal = _find_terminal_for_state(
             state_name,
             loop_group_id,
