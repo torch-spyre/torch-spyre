@@ -7,7 +7,7 @@ test_suite_config:
         - names:
             # Covers pointwise ops plus PR 2180 eq-scalar tests, including
             # parameterized variants, shared base helpers, and standalone cases.
-            - TestOps::test_(pointwise|sqrt|rsqrt|log_|alias_operands|cmp_(eq|ne|ge|le|gt|lt|scalar_int64)|logical_not|bool|eq_scalar|scalar_(comparison|multidim|vs_tensor)_base|scalar_comparison_simple1|eq_scalar_constant_int).*
+            - TestOps::test_(pointwise|sqrt|rsqrt|log_|alias_operands|cmp|logical_not|bool|eq_scalar|scalar_(comparison|multidim|vs_tensor)_base|scalar_comparison_simple1|eq_scalar_constant_int).*
           mode: mandatory_success
           tags:
             - ops__inductor-pointwise
@@ -23,12 +23,6 @@ test_suite_config:
             - TestOps::test_eq_scalar_constant_zero
             - TestOps::test_eq_scalar_multidim
             - TestOps::test_eq_scalar_vs_tensor_comparison
-            # Standalone fp32 comparisons can't correctly read their bool result back
-            # from device memory -- the read-back only supports the fp16 data format,
-            # but fp32 results need a different one. Fused cases (e.g.
-            # test_bool_fp32_src_to_*) are unaffected, since the result never leaves
-            # the device.
-            - TestOps::test_cmp_fp32.*
           mode: xfail
           tags:
             - ops__inductor-pointwise
