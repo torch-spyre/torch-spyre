@@ -277,12 +277,25 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
 
             # Create ModuleInfo and add to module_db
             try:
+                # The dtype actually exercised is whatever each tensor spec in
+                # the YAML declares (e.g. bfloat16), not whichever dtype this
+                # tuple lists -- module_inputs_func ignores the dtype it's
+                # called with (see create_module_inputs_func_from_yaml).
+                # Derive the tuple from the YAML so no dtype used there is
+                # silently skipped; fall back to the historical default only
+                # when no tensor spec can be found (e.g. a no-input module).
+                resolved_dtypes = module_item.resolved_input_dtypes()
+                dtypes = (
+                    tuple(sorted(resolved_dtypes, key=str))
+                    if resolved_dtypes
+                    else (torch.float32, torch.float16, torch.bfloat16)
+                )
                 module_info = ModuleInfo(
                     module_cls,
                     module_inputs_func=create_module_inputs_func_from_yaml(module_item),
                     skips=(),
                     decorators=None,
-                    dtypes=(torch.float32, torch.float16),
+                    dtypes=dtypes,
                 )
                 module_db.append(module_info)
                 existing_names.add(module_name)
