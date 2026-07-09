@@ -315,9 +315,16 @@ def get_ncores_for_buffers(
                     # into LX) or when a producer's view happens to match the
                     # broadcast footprint -- cases the `view != ref_view` check
                     # below cannot see.
-                    view_cores = math.prod(f for _, f in view.work_slice_dims)
+                    # work_slice_dims entries are (host-dim, (work_div, tile));
+                    # the per-dim core count is the work_div factor.
+                    view_cores = math.prod(
+                        work_div for _, (work_div, _tile) in view.work_slice_dims
+                    )
                     if view_cores != _op_num_cores(op):
-                        mismatch = True
+                        mismatch_reason = (
+                            f"broadcast read on '{op.get_name()}': view covers "
+                            f"{view_cores} cores but op runs {_op_num_cores(op)}"
+                        )
                         break
                 if view != ref_view:
                     mismatch_reason = (
