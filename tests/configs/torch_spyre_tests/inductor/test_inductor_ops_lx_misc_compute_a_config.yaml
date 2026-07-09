@@ -1,0 +1,41 @@
+# LX-planning shard: inductor_ops family 'misc_compute_a', both wrap classes
+# (LxPlanningTwoOpPointwiseAdditionTest '(x + x) / 2' and
+#  LxPlanningTwoOpReductionTest 'torch.sum(x, dim=0)').
+#
+# Auto-split of test_inductor_ops_lx_planning.py, mirroring the
+# test_inductor_ops.py config sharding. The full (non-truncated) test
+# set is enabled in CI via TEST_LX_PLANNING_FULL=1 + TEST_LX_PLANNING_RUN_SKIPS=1
+# (see .github/workflows/_test_matrix.yaml). The xfail lists below are
+# the source of truth for known LX-planning failures (the in-file .py
+# skip-lists were removed as duplicates).
+test_suite_config:
+  labels: [full]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_planning.py
+      unlisted_test_mode: skip
+      tests:
+        # Known LX-planning failures -- run and expected to fail. Non-strict
+        # xfail: an unexpected pass (XPASS) does not fail CI. Entries failing
+        # in both wraps collapse to (pointwise|reduction).
+        - names:
+            - LxPlanning.*::test_scalar_cpu_combined_3d_lx_planning_reduction
+            - LxPlanning.*::test_add_alpha_add_alpha_0.5_6x7x12x256_6x7x12x256_lx_planning_reduction
+            - LxPlanning.*::test_add_alpha_add_alpha_2_67x256_67x256_lx_planning_reduction
+            - LxPlanning.*::test_add_alpha_add_alpha_2_67x71x256_67x71x256_lx_planning_reduction
+            - LxPlanning.*::test_add_alpha_add_alpha_2_6x7x12x256_6x7x12x256_lx_planning_reduction
+            - LxPlanning.*::test_add_alpha_add_alpha_neg_67x71x256_67x71x256_lx_planning_reduction
+            - LxPlanning.*::test_add_alpha_add_alpha_neg_6x7x12x256_6x7x12x256_lx_planning_reduction
+          mode: xfail
+        - names:
+            - LxPlanning.*::test_activation_cls.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_activation_fn.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_relu_inplace.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_add_broadcast.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_add_alpha.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_add_scalar.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_max_sub_broadcast.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_sub_alpha.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_sub_broadcast.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_sub_scalar.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_scalar_cpu.*_lx_planning_(pointwise|reduction)
+          mode: mandatory_success

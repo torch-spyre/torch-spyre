@@ -1,0 +1,61 @@
+# LX-planning shard: inductor_ops family 'misc_compute_b', both wrap classes
+# (LxPlanningTwoOpPointwiseAdditionTest '(x + x) / 2' and
+#  LxPlanningTwoOpReductionTest 'torch.sum(x, dim=0)').
+#
+# Auto-split of test_inductor_ops_lx_planning.py, mirroring the
+# test_inductor_ops.py config sharding. The full (non-truncated) test
+# set is enabled in CI via TEST_LX_PLANNING_FULL=1 + TEST_LX_PLANNING_RUN_SKIPS=1
+# (see .github/workflows/_test_matrix.yaml). The xfail lists below are
+# the source of truth for known LX-planning failures (the in-file .py
+# skip-lists were removed as duplicates).
+test_suite_config:
+  labels: [full]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_planning.py
+      unlisted_test_mode: skip
+      tests:
+        # Known LX-planning failures -- run and expected to fail. Non-strict
+        # xfail: an unexpected pass (XPASS) does not fail CI. Entries failing
+        # in both wraps collapse to (pointwise|reduction).
+        - names:
+            - LxPlanning.*::test_restickify_add_transpose_10x20_add_transpose_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_restickify_add_transpose_64x129_add_transpose_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_restickify_add_transpose_7x13_add_transpose_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_where_self_out_where_fp16_2d_lx_planning_pointwise
+          mode: xfail
+        - names:
+            - LxPlanning.*::test_layernorm.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_rmsnorm.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_softmax.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_softplus.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_embedding.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_isin.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_inplace_copy.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_inplace_op.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_bitwise_and.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_bitwise_not.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_dropout_functional.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_fallback.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_fill_scalar.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_implicit_loading.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_is_nonzero.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_item.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_log_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_mean_3d_dim0_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_mean_3d_dim1_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_mean_default.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_normal_randn_cpu.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_overwrite.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_tril.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_triu.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_uniform_cpu.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_uniform_custom_range_cpu.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_random_from_cpu.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_where.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_core_reduction_invalid_dims_api.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_core_reduction_invalid_dims_spyre.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_single_dim_reduction_invalid_dims_api.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_single_dim_reduction_invalid_dims_spyre.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_restickify_add_transpose.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_prod.*_lx_planning_(pointwise|reduction)
+          mode: mandatory_success
