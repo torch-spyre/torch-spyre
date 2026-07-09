@@ -770,7 +770,8 @@ const at::Tensor& spyre_resize_(
 }
 
 at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
-  TORCH_CHECK(self.is_privateuseone(), "spyre_fill_tensor: tensor must be on spyre device");
+  TORCH_CHECK(self.is_privateuseone(),
+              "spyre_fill_tensor: tensor must be on spyre device");
   TORCH_CHECK(self.numel() > 0, "spyre_fill_tensor: cannot fill empty tensor");
 
   // Get the device allocation (CompositeAddress) from the spyre tensor
@@ -782,9 +783,10 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
   DataFormats dtype = get_device_dtype(self.scalar_type());
 
   // Construct FillParams and launch via SpyreStream
-  flex::FillParams params(&ctx->composite_addr, ctx->composite_addr.total_size(),
-                          flex::RuntimeOperationFill::valueToFillPattern(value, dtype),
-                          /*use_dmai=*/true);
+  flex::FillParams params(
+      &ctx->composite_addr, ctx->composite_addr.total_size(),
+      flex::RuntimeOperationFill::valueToFillPattern(value, dtype),
+      /*use_dmai=*/true);
   SpyreStream stream;
   stream.launchFill(&params);
 

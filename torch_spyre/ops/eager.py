@@ -129,6 +129,8 @@ register_torch_compile_kernel(
 def spyre__fill_scalar(
     self: torch.Tensor, other: int | float | bool | complex
 ) -> torch.Tensor:
+    if isinstance(other, complex):
+        raise TypeError("spyre fill_ does not support complex fill values")
     torch_spyre._C.fill_tensor(self, float(other))
     return self
 
@@ -145,6 +147,8 @@ def spyre_full(
 ) -> torch.Tensor:
     assert layout in (torch.strided, None), f"doesn't support layout={layout}"
     assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
+    if isinstance(fill_value, complex):
+        raise TypeError("spyre full does not support complex fill values")
     t = torch.empty(size, dtype=dtype, device=device)
     torch_spyre._C.fill_tensor(t, float(fill_value))
     return t
