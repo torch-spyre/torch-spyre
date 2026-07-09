@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -133,6 +134,18 @@ bool SpyreStream::hasStreamError() const {
   flex::RuntimeStream* handle = resolveRuntimeHandle();
   return handle->needsShutdown();
 }
+
+#ifdef TORCH_SPYRE_TEST_HOOKS
+void SpyreStream::testSetShutdown(bool value) const {
+  resolveRuntimeHandle()->setShutdown(value);
+}
+
+void SpyreStream::testSetError(const std::string& message) const {
+  flex::RuntimeStream* handle = resolveRuntimeHandle();
+  handle->setError(std::make_exception_ptr(std::runtime_error(message)));
+  handle->setShutdown(true);
+}
+#endif
 
 c10::Stream SpyreStream::unwrap() const {
   return stream_;

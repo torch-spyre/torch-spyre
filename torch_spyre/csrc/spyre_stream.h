@@ -19,6 +19,7 @@
 #include <ATen/ATen.h>
 #include <c10/core/Stream.h>
 
+#include <string>
 #include <vector>
 
 #include "module.h"
@@ -47,6 +48,14 @@ class SpyreStream {
   void synchronize() const;  // Block until work done
   bool hasStreamError()
       const;  // True if the underlying flex stream is in error state
+
+#ifdef TORCH_SPYRE_TEST_HOOKS
+  // Test-only: inject a fault into the underlying flex stream so Python tests
+  // can drive the error-recovery path (getStreamFromPool destroy+recreate)
+  // without physical hardware.  Never compiled into production builds.
+  void testSetShutdown(bool value) const;
+  void testSetError(const std::string& message) const;
+#endif
 
   void copyAsync(const at::Tensor& src, const at::Tensor& dst) const;
   void copyProgramAsync(void* prog_cpu_ptr,

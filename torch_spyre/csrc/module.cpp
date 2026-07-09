@@ -382,6 +382,16 @@ PYBIND11_MODULE(_C, m) {
                std::to_string(stream.device().index()) +
                " id=" + std::to_string(stream.id()) + ">";
       });
+#ifdef TORCH_SPYRE_TEST_HOOKS
+  py::class_<spyre::SpyreStream>(m, "_SpyreStreamBase")
+      .def("_test_set_shutdown", &spyre::SpyreStream::testSetShutdown,
+           py::arg("value"),
+           "[TEST ONLY] Set the shutdown flag on the underlying flex stream")
+      .def("_test_set_error", &spyre::SpyreStream::testSetError,
+           py::arg("message"),
+           "[TEST ONLY] Inject a deferred error and set shutdown on the flex "
+           "stream");
+#endif
   m.def("set_device", [](int idx) {
     int count = spyre::device_count();
     TORCH_CHECK(idx >= 0 && idx < count, "Device index ", idx,
