@@ -101,16 +101,18 @@ if "RUNTIME_INSTALL_DIR" in os.environ:
     SENLIB_DIR = Path(os.environ["SENLIB_INSTALL_DIR"])
     DEEPTOOLS_DIR = Path(os.environ["DEEPTOOLS_INSTALL_DIR"])
     INCLUDE_DIRS += [
-        RUNTIME_DIR / "include",
-    ]
-    INCLUDE_DIRS += [
-        RUNTIME_DIR / "include" / "concurrentqueue" / "moodycamel",
-    ]
-    INCLUDE_DIRS += [
         SENLIB_DIR / "include",
     ]
     INCLUDE_DIRS += [
         DEEPTOOLS_DIR / "include",
+    ]
+    INCLUDE_DIRS += [
+        RUNTIME_DIR / "include" / "concurrentqueue" / "moodycamel",
+    ]
+    # RUNTIME_INSTALL_DIR/include comes last so local flex headers (SEN_COMMON_HEADERS)
+    # take precedence over the installed runtime headers when both define the same files.
+    INCLUDE_DIRS += [
+        RUNTIME_DIR / "include",
     ]
     LIBRARY_DIRS += [RUNTIME_DIR / "lib"]
 
@@ -152,7 +154,13 @@ else:
             "or set the SPYRE_COMMS_INSTALL_DIR to the Spyre Comms install directory."
         )
 
-INCLUDE_DIRS += [os.environ["SEN_COMMON_HEADERS"]]
+# SEN_COMMON_HEADERS (local flex submodule) is inserted before RUNTIME_INSTALL_DIR/include
+# (which is appended last in the block above) so that local flex headers take precedence
+# over any older headers in the installed runtime package.
+INCLUDE_DIRS.insert(
+    len(INCLUDE_DIRS) - (1 if "RUNTIME_INSTALL_DIR" in os.environ else 0),
+    os.environ["SEN_COMMON_HEADERS"],
+)
 
 use_new_system = os.environ.get("NEW_SYSTEM_SETUP", "0") == "1"
 
