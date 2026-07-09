@@ -243,7 +243,7 @@ Scratchpad planning has three layers with separate concerns:
 :width: 480px
 :align: center
 
-`DefaultAllocator` runs pre-passes (clone insertion), gathers
+`ScratchpadAllocator` runs pre-passes (clone insertion), gathers
 `LifetimeBoundBuffer`s, hands them to a pluggable solver, then writes the
 chosen LX addresses onto buffer layouts. `StrategyBCoOptimizingAllocator`
 extends this flow with a split-search step before the solver runs.
@@ -256,16 +256,16 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `passes.py` | `ScratchpadOptimizationPass` ABC, `CloneInputNodesPass` |
 | `plan_solver.py` | `MemoryPlanSolver` ABC, `LifetimeBoundBuffer`, `GreedyLayoutSolver` |
 | `firstfit_bestfit_solver.py` | `FirstFitLayoutSolver`, `BestFitLayoutSolver` |
-| `allocator.py` | `ScratchpadAllocator` ABC, `DefaultAllocator`, `StrategyBCoOptimizingAllocator` |
+| `allocator.py` | `ScratchpadAllocator`, `StrategyBCoOptimizingAllocator` |
 | `utils.py` | liveness, in-place candidates, op eligibility lists |
 
 ### Entry point
 
 ```python
-scratchpad_planning(graph, allocator=DefaultAllocator())
+scratchpad_planning(graph, allocator=ScratchpadAllocator())
 ```
 
-`DefaultAllocator` runs the following pipeline:
+`ScratchpadAllocator` runs the following pipeline:
 
 1. **Pre-passes.** `CloneInputNodesPass` walks graph inputs and inserts a
    `clone` for any HBM input that is read more than once *and* fits on
