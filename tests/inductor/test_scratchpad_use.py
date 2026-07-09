@@ -430,14 +430,14 @@ class TestMeasureHBMUsageCoOptimizing(BaseTestScratchpadUsage):
     def test_softmax_dim0_strictly_lower_hbm(self):
         """The canonical motivating case from the design doc. softmax(dim=0)
         has every adjacent op pair disagreeing on which dim to split, so
-        DefaultAllocator only pins 1 of 4 shared buffers; Strategy B should
+        ScratchpadAllocator only pins 1 of 4 shared buffers; Strategy B should
         flip the pointwise ops to cols and pin all 4 → strictly lower HBM."""
         f = functools.partial(torch.softmax, dim=0)
         x = self.rand_device((512, 1024))
         self.run_test(f, (x,), strict=True)
 
     def test_softmax_dim_neg1_no_regression(self):
-        """softmax(dim=-1) is the well-behaved baseline where DefaultAllocator
+        """softmax(dim=-1) is the well-behaved baseline where ScratchpadAllocator
         already pins everything pinnable. Strategy B must match (no regression)."""
         f = functools.partial(torch.softmax, dim=-1)
         x = self.rand_device((512, 1024))
