@@ -1,0 +1,65 @@
+# LX-planning shard: inductor_ops family 'misc_shape_b2', both wrap classes
+# (LxPlanningTwoOpPointwiseAdditionTest '(x + x) / 2' and
+#  LxPlanningTwoOpReductionTest 'torch.sum(x, dim=0)').
+#
+# Auto-split of test_inductor_ops_lx_planning.py, mirroring the
+# test_inductor_ops.py config sharding. The full (non-truncated) test
+# set is enabled in CI via TEST_LX_PLANNING_FULL=1 + TEST_LX_PLANNING_RUN_SKIPS=1
+# (see .github/workflows/_test_matrix.yaml). The xfail lists below are
+# the source of truth for known LX-planning failures (the in-file .py
+# skip-lists were removed as duplicates).
+test_suite_config:
+  labels: [full]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_planning.py
+      unlisted_test_mode: skip
+      tests:
+        # Known LX-planning failures -- run and expected to fail. Non-strict
+        # xfail: an unexpected pass (XPASS) does not fail CI. Entries failing
+        # in both wraps collapse to (pointwise|reduction).
+        - names:
+            - LxPlanning.*::test_unfold_1d_large_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unfold_1d_no_overlap_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unfold_1d_step1_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unfold_1d_step2_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unfold_2d_dim0_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unfold_2d_dim1_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unfold_2d_dim_neg_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unfold_2d_square_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unfold_3d_dim0_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unfold_3d_dim1_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unfold_3d_dim2_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unfold_4d_batch_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unfold_4d_cnn_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unfold_4d_spatial_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unfold_edge_large_step_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unfold_edge_nopad_2d_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unfold_edge_nopad_37_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unfold_edge_pow2_64_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_t_2d_49159x4096_lx_planning_reduction
+            - LxPlanning.*::test_t_2d_contiguous_1088x320_lx_planning_reduction
+            - LxPlanning.*::test_t_2d_contiguous_4096x49280_lx_planning_reduction
+            - LxPlanning.*::test_t_2d_contiguous_49280x4096_lx_planning_reduction
+            - LxPlanning.*::test_transpose_2d_large_dim_0_1_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_transpose_2d_large_dim_0_1_nopad_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_transpose_2d_large_dim_0_2_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_transpose_2d_large_dim_0_2_nopad_lx_planning_(pointwise|reduction)
+          mode: xfail
+        - names:
+            - LxPlanning.*::test_unfold.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_squeeze.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unsqueeze.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_t_1d.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_t_2d.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_transpose_2d.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_transpose_3d.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_transpose_4d.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_transpose_patterns.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_add_constant.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_repeat.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_restickify_fp32_unsupported_xfail.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_restickify_int64_unsupported_xfail.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_multiops_split.*_lx_planning_(pointwise|reduction)
+          mode: mandatory_success
+          tags:
+            - ops__inductor_misc_shape
