@@ -56,6 +56,9 @@ class TestNonErrorPath(TestCase):
 # AC1 — has_stream_error() and has_any_stream_error() probe the C++ shutdown
 # flag; both must be False on a clean runtime.  The rethrow path itself
 # (setError + synchronize) is exercised by the flex C++ unit tests.
+# AC1 also requires the exception to cross the C++→Python boundary with the
+# original message intact; test_synchronize_propagates_error_message covers
+# that by patching the C++ binding to raise and confirming Python catches it.
 
 
 class TestErrorVisibility(TestCase):
@@ -64,6 +67,27 @@ class TestErrorVisibility(TestCase):
 
     def test_has_any_stream_error_false_on_clean_runtime(self):
         self.assertFalse(_C.has_any_stream_error())
+
+    # AC1 — verify that an exception originating from C++ synchronize() crosses
+    # the pybind11 boundary and arrives in Python as a RuntimeError with the
+    # original message text intact.
+    def test_synchronize_propagates_error_message(self):
+        stream = torch.spyre.Stream()
+        sentinel = "Deferred Error First"
+        with mock.patch.object(
+            stream._cdata, "synchronize", side_effect=RuntimeError(sentinel)
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                stream.synchronize()
+        self.assertIn(sentinel, str(ctx.exception))
+
+    # AC1 — same boundary check via the device-level torch.spyre.synchronize().
+    def test_device_synchronize_propagates_error_message(self):
+        sentinel = "Deferred Error First"
+        with mock.patch.object(_C, "synchronize", side_effect=RuntimeError(sentinel)):
+            with self.assertRaises(RuntimeError) as ctx:
+                torch.spyre.synchronize()
+        self.assertIn(sentinel, str(ctx.exception))
 
 
 # AC3a — getStreamFromPool() destroys and recreates any broken handle, so
