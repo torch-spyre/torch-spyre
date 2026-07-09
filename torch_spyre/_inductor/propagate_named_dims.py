@@ -527,15 +527,19 @@ def propagate_named_dims(
         return
     try:
         _propagate_named_dims_impl(graph)
+    except BaseException:
+        # On the normal path _named_dims MUST survive: assign_dim_hints runs
+        # next and reads it (named_dims_for_sym filters on `name in
+        # _named_dims`), then clears it in its own reset(). Only when
+        # _propagate_named_dims_impl raises does the pipeline abort before
+        # assign_dim_hints runs -- then the sizes self-registered by the
+        # in-graph path (and any driver-declared dims) would leak into the next
+        # compilation, so clear them here on the error path only.
+        _named_dims.clear()
+        raise
     finally:
         _named_tensor_dims.clear()
         _enabled = False
-        # In the normal flow _named_dims is consumed by assign_dim_hints and
-        # cleared by its reset(). But the in-graph path self-registers sizes
-        # here, so if _propagate_named_dims_impl raises, the pipeline aborts
-        # before assign_dim_hints runs and those sizes would leak into the next
-        # compilation. Clear on the way out to keep the reset contract intact.
-        _named_dims.clear()
 
 
 def _assign_dim_hints_impl(operations: list[Operation]) -> None:
