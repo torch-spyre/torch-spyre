@@ -342,7 +342,9 @@ class ParameterizedScratchpadUsage(
     parameter_axes = {
         "solver_method": ("greedy", "bestfit", "firstfit"),
         "sencores": (1, 32),
-        "co_optimization": (False, True),
+        "co_optimization": (False, True)
+        if ts_inductor_config.co_optimizing_lx_planning
+        else (False,),
         "boundary_clones": (False, True),
     }
 
@@ -673,6 +675,9 @@ class TestCloneAtGraphBoundaries(BaseTestScratchpadUsage):
 # regressions when operating on matmuls. There is likely a better
 # approach where we use a proxy to estimate the runtime perforamance
 # of given allocations.
+@unittest.skipUnless(
+    ts_inductor_config.co_optimizing_lx_planning, "co-optimization is not enabled"
+)
 class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
     """Generic real-graph coverage for the co-optimising allocator.
 
