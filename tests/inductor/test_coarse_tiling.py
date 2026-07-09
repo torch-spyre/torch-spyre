@@ -20,9 +20,9 @@ Covers six areas, each in its own class group:
   2. coarse_tile IR pass: range rewriting, attribute stamping, nested groups
      (TestDivideRanges, TestCoarseTile, TestCoarseTileNested)
   3. CountedLoopSchedulerNode, build_loop_scheduler_nodes,
-     _tiled_syms_for_sched_node_at_depth, and spyre_fuse_nodes budget check
+     _tiled_syms_for_sched_node_at_depth, and spyre_fuse_nodes loop fusion
      (TestHelpers, TestBuildLoopSchedulerNodes, TestTiledSymsForSchedNode,
-      TestSpyreFuseNodesLoopBudget)
+      TestSpyreFuseNodesLoopFusion)
   4. generate_sdsc and compile_op_spec symbol/affine-stride paths
      (TestTiledByteStride, TestGenerateSdscTiledSymbols,
       TestCompileOpSpecTwoTiledSymbols, TestCompileOpSpecSymbolMapping)
@@ -47,6 +47,7 @@ from sympy import Integer, Mod, Symbol, floor, simplify, sympify  # noqa: F401
 
 import torch
 from torch import fx
+from torch._inductor import dependencies as inductor_deps
 from torch._inductor.utils import IndentedBuffer
 from torch.utils._ordered_set import OrderedSet
 
@@ -57,6 +58,7 @@ from torch_spyre._inductor.codegen.compute_ops import (
     _tiled_byte_stride,
     generate_sdsc,
 )
+from torch_spyre._inductor.codegen.unroll import _byte_stride_for_arg
 from torch_spyre._inductor.codegen.superdsc import (
     SDSCArgs,
     SDSCSpec,
@@ -71,17 +73,22 @@ from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.coarse_tile import (
     _LOOPS_FREE_SYMS_KEY,
     _REDUCTION_FREE_SYMS_KEY,
+    _RetiledBufferInfo,
     _divide_ranges,
+    _replace_group_op,
+    _retile_load_index_from_strides,
+    _should_patch_retiled_load_indexes,
+    _stride_rewrite_map,
     coarse_tile,
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
+from torch_spyre._inductor.fusion import spyre_fuse_nodes
 from torch_spyre._inductor.scheduler import (
     CountedLoopSchedulerNode,
     _loop_count,
     _loop_group_id,
     build_loop_scheduler_nodes,
 )
-from torch_spyre._inductor.fusion import spyre_fuse_nodes
 from torch_spyre._inductor.spyre_kernel import (
     _codegen_op_spec_list,
     _iter_op_specs,
@@ -287,11 +294,17 @@ def _make_snode(scheduler, ir_op, name="buf0"):
     snode.node = ir_op
     snode.get_name.return_value = name
     snode.get_nodes.return_value = [snode]
-    snode.ancestors = set()
+    snode.ancestors = OrderedSet()
     snode.min_order = 0
     snode.max_order = 0
-    snode.read_writes = MagicMock()
-    snode.read_writes.reads_and_writes.return_value = []
+    snode.unmet_dependencies = OrderedSet()
+    snode.is_reduction.return_value = False
+    snode.group = (None, None)
+    snode.read_writes = inductor_deps.ReadWrites(
+        reads=OrderedSet(),
+        writes=OrderedSet(),
+        index_exprs=OrderedSet(),
+    )
     snode.outputs_by_name = {}
     return snode
 
@@ -448,6 +461,98 @@ class TestCoarseTileInfo(unittest.TestCase):
         self.assertEqual(info.loop_group_id, (0, 0))
         self.assertEqual(info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(info.loop_tiled_dims, [[0], [1]])
+
+
+class TestRetileLoadIndexFromStrides(unittest.TestCase):
+    """Unit tests for converting stale full-buffer load indexes to tile indexes."""
+
+    def test_rewrites_stale_full_stride_to_tile_stride(self):
+        c0, c1 = sympy.symbols("c0 c1")
+        rewrites = _stride_rewrite_map(
+            _RetiledBufferInfo(
+                old_stride=(Integer(8192), Integer(2048), Integer(1)),
+                new_stride=(Integer(2048), Integer(512), Integer(1)),
+            )
+        )
+
+        result = _retile_load_index_from_strides("buf", 2048 * c0 + c1, rewrites)
+
+        self.assertEqual(simplify(result - (512 * c0 + c1)), 0)
+
+    def test_mixed_loop_variable_terms_are_not_rewritten(self):
+        c0, c1, c2 = sympy.symbols("c0 c1 c2")
+        index = c0 * c1 + 128 * c0 + c2
+        rewrites = _stride_rewrite_map(
+            _RetiledBufferInfo(
+                old_stride=(Integer(256), Integer(128), Integer(1)),
+                new_stride=(Integer(128), Integer(64), Integer(1)),
+            )
+        )
+
+        result = _retile_load_index_from_strides("buf", index, rewrites)
+
+        self.assertEqual(simplify(result - index), 0)
+
+    def test_ambiguous_old_strides_are_not_rewritten(self):
+        c0 = sympy.symbols("c0")
+        rewrites = _stride_rewrite_map(
+            _RetiledBufferInfo(
+                old_stride=(Integer(128), Integer(128), Integer(1)),
+                new_stride=(Integer(64), Integer(32), Integer(1)),
+            )
+        )
+
+        result = _retile_load_index_from_strides("buf", 128 * c0, rewrites)
+
+        self.assertEqual(simplify(result - 128 * c0), 0)
+
+
+class TestShouldPatchRetiledLoadIndexes(unittest.TestCase):
+    """Unit tests for selecting exact-loop consumers of retiled buffers."""
+
+    def test_requires_exact_loop_group_id(self):
+        op = _make_inside_consumer_op("consumer", "retiled", loop_group_id=(0,))
+
+        result = _should_patch_retiled_load_indexes(op, (0, 0), {"retiled"})
+
+        self.assertFalse(result)
+
+    def test_requires_reading_retiled_buffer(self):
+        op = _make_inside_consumer_op("consumer", "other", loop_group_id=(0, 0))
+
+        result = _should_patch_retiled_load_indexes(op, (0, 0), {"retiled"})
+
+        self.assertFalse(result)
+
+    def test_accepts_same_group_consumer_of_retiled_buffer(self):
+        op = _make_inside_consumer_op("consumer", "retiled", loop_group_id=(0, 0))
+
+        result = _should_patch_retiled_load_indexes(op, (0, 0), {"retiled"})
+
+        self.assertTrue(result)
+
+
+class TestReplaceGroupOp(unittest.TestCase):
+    """Unit tests for keeping coarse-tile group op references current."""
+
+    def test_replaces_by_identity(self):
+        old_op = _make_op(_make_pointwise([4]), "old")
+        new_op = _make_op(_make_pointwise([4]), "new")
+        group_ops = [old_op]
+
+        _replace_group_op(group_ops, old_op, new_op)
+
+        self.assertIs(group_ops[0], new_op)
+
+    def test_replaces_by_operation_name_when_identity_changed(self):
+        stale_op = _make_op(_make_pointwise([4]), "old")
+        current_op = _make_op(_make_pointwise([4]), "old")
+        new_op = _make_op(_make_pointwise([4]), "new")
+        group_ops = [stale_op]
+
+        _replace_group_op(group_ops, current_op, new_op)
+
+        self.assertIs(group_ops[0], new_op)
 
 
 # ===========================================================================
@@ -916,7 +1021,7 @@ class TestCoarseTile(unittest.TestCase):
         op_computed = _make_hinted_op(data, "op0", hints=((0, 0),))
         coarse_tile(
             _graph([op_extern, op_computed]),
-            [([op_extern, op_computed], [(0, Integer(2), False)])],
+            [([op_extern, op_computed], [(0, Integer(2))])],
         )
         self.assertEqual(op_computed.loop_info.loop_group_id, (0,))
         self.assertEqual(data.ranges[0], Integer(8))
@@ -926,7 +1031,7 @@ class TestCoarseTile(unittest.TestCase):
         n = Symbol("N", positive=True)
         data = _make_pointwise([n])
         op = _make_hinted_op(data, "op0", hints=((0, 0),))
-        coarse_tile(_graph([op]), [([op], [(0, k, False)])])
+        coarse_tile(_graph([op]), [([op], [(0, k)])])
         self.assertEqual(op.loop_info.loop_count, [k])
         self.assertEqual(simplify(data.ranges[0] - n / k), 0)
 
@@ -938,9 +1043,7 @@ class TestCoarseTile(unittest.TestCase):
         op1 = _make_hinted_op(d1, "op1", hints=((0, 0),))
         op2 = _make_hinted_op(d2, "op2", hints=((0, 0),))
         with self.assertRaises(RuntimeError):
-            coarse_tile(
-                _graph([op0, op1, op2]), [([op0, op2], [(0, Integer(4), False)])]
-            )
+            coarse_tile(_graph([op0, op1, op2]), [([op0, op2], [(0, Integer(4))])])
 
     def test_op_not_in_operations_raises(self):
         data = _make_pointwise([Integer(32)])
@@ -949,11 +1052,11 @@ class TestCoarseTile(unittest.TestCase):
             _make_pointwise([Integer(8)]), "unknown", hints=((0, 0),)
         )
         with self.assertRaises(RuntimeError):
-            coarse_tile(_graph([op_known]), [([op_unknown], [(0, Integer(2), False)])])
+            coarse_tile(_graph([op_known]), [([op_unknown], [(0, Integer(2))])])
 
 
 class TestCoarseTileNested(unittest.TestCase):
-    """Verify that the nested group format [(hint_id, K1, is_reduction), ...] works."""
+    """Verify that the nested group format [(hint_id, K1), ...] works."""
 
     def setUp(self):
         self._patch = patch(
@@ -968,9 +1071,7 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_spec_stamps_list_attributes(self):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile(
-            _graph([op]), [([op], [(1, Integer(4), False), (2, Integer(2), False)])]
-        )
+        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
         self.assertEqual(op.loop_info.loop_group_id, (0, 0))
         self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [1]])
@@ -978,18 +1079,14 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_spec_divides_ranges_both_levels(self):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile(
-            _graph([op]), [([op], [(1, Integer(4), False), (2, Integer(2), False)])]
-        )
+        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
         self.assertEqual(data.ranges[0], Integer(64))
         self.assertEqual(data.ranges[1], Integer(64))
 
     def test_nested_spec_outer_only_divides_outer_dim(self):
         data = _make_pointwise([Integer(32), Integer(64), Integer(16)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile(
-            _graph([op]), [([op], [(1, Integer(4), False), (2, Integer(8), False)])]
-        )
+        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(8))])])
         self.assertEqual(data.ranges[0], Integer(8))
         self.assertEqual(data.ranges[1], Integer(8))
         self.assertEqual(data.ranges[2], Integer(16))
@@ -1003,8 +1100,8 @@ class TestCoarseTileNested(unittest.TestCase):
         coarse_tile(
             _graph([op0, op1]),
             [
-                ([op0], [(1, Integer(4), False)]),
-                ([op1], [(2, Integer(4), False), (3, Integer(2), False)]),
+                ([op0], [(1, Integer(4))]),
+                ([op1], [(2, Integer(4)), (3, Integer(2))]),
             ],
         )
         self.assertEqual(op0.loop_info.loop_group_id, (0,))
@@ -1021,9 +1118,7 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_same_dim_different_counts(self):
         data = _make_pointwise([Integer(256)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 0)))
-        coarse_tile(
-            _graph([op]), [([op], [(1, Integer(4), False), (2, Integer(2), False)])]
-        )
+        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
         self.assertEqual(data.ranges[0], Integer(32))
         self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [0]])
@@ -1168,145 +1263,91 @@ class TestBuildLoopSchedulerNodes(unittest.TestCase):
 
 
 # ===========================================================================
-# 3b. spyre_fuse_nodes CountedLoopSchedulerNode budget check
+# 3b. spyre_fuse_nodes — CountedLoopSchedulerNode fusion
 # ===========================================================================
 
 
-def _make_snode_with_tensors(scheduler, ir_op, name, tensor_names):
-    """Like _make_snode but read_writes returns named dependency mocks."""
-    snode = _make_snode(scheduler, ir_op, name)
-    deps = []
-    for tname in tensor_names:
-        dep = MagicMock()
-        dep.name = tname
-        deps.append(dep)
-    snode.read_writes.reads_and_writes.return_value = deps
-    return snode
-
-
-def _make_counted_loop_node(scheduler, tensor_names, name="loop0"):
-    """Return a fake CountedLoopSchedulerNode with the given tensor names."""
+def _make_counted_loop(scheduler, name="loop0", loop_count=sympy.Integer(4)):
+    """Return a MagicMock CountedLoopSchedulerNode for use in fusion tests."""
     node = MagicMock(spec=CountedLoopSchedulerNode)
     node.scheduler = scheduler
     node.get_name.return_value = name
     node.get_nodes.return_value = [node]
-    deps = []
-    for tname in tensor_names:
-        dep = MagicMock()
-        dep.name = tname
-        deps.append(dep)
-    node.read_writes = MagicMock()
-    node.read_writes.reads_and_writes.return_value = deps
+    node.loop_count = loop_count
+    node.ancestors = OrderedSet()
+    node.min_order = 0
+    node.max_order = 0
+    node.unmet_dependencies = OrderedSet()
+    node.is_reduction.return_value = False
+    node.group = (None, None)
+    node.read_writes = inductor_deps.ReadWrites(
+        reads=OrderedSet(),
+        writes=OrderedSet(),
+        index_exprs=OrderedSet(),
+    )
+    node.outputs_by_name = {}
     return node
 
 
-class TestSpyreFuseNodesLoopBudget(unittest.TestCase):
-    def setUp(self):
-        # All tensor names count as non-intermediate.
-        self._patcher = patch(
-            "torch_spyre._inductor.fusion._is_non_intermediate",
-            side_effect=lambda name: True,
-        )
-        self._patcher.start()
-        # Cap the bundle at 2 tensors so overflow is easy to trigger.
-        self._max_patcher = patch(
-            "torch_spyre._inductor.fusion._max_bundle_tensors",
-            return_value=2,
-        )
-        self._max_patcher.start()
-
-    def tearDown(self):
-        self._patcher.stop()
-        self._max_patcher.stop()
-
-    def test_loop_node_within_budget_no_error(self):
-        """A loop node referencing <= max_tensors: passes through without error."""
+class TestSpyreFuseNodesLoopFusion(unittest.TestCase):
+    def test_lone_loop_node_is_own_bundle(self):
+        """A lone CountedLoopSchedulerNode produces exactly one bundle."""
         sched = _make_scheduler()
-        loop = _make_counted_loop_node(sched, ["t1", "t2"], "loop0")
+        loop = _make_counted_loop(sched, "loop0")
         result = spyre_fuse_nodes([loop])
         self.assertEqual(len(result), 1)
-        self.assertIs(result[0], loop)
+        self.assertIsInstance(result[0], CountedLoopSchedulerNode)
 
-    def test_loop_node_exceeds_budget_raises(self):
-        """A loop node referencing > max_tensors must raise RuntimeError."""
-        sched = _make_scheduler()
-        loop = _make_counted_loop_node(sched, ["t1", "t2", "t3"], "loop0")
-        with self.assertRaises(RuntimeError) as ctx:
-            spyre_fuse_nodes([loop])
-        self.assertIn("loop0", str(ctx.exception))
-        self.assertIn("3", str(ctx.exception))
-        self.assertIn("2", str(ctx.exception))
-
-    def test_loop_node_empty_tensors_no_error(self):
-        """A loop node with no tensors (all intermediates) is fine."""
-        sched = _make_scheduler()
-        # Override: nothing is non-intermediate for this test.
-        with patch(
-            "torch_spyre._inductor.fusion._is_non_intermediate",
-            side_effect=lambda name: False,
-        ):
-            loop = _make_counted_loop_node(sched, ["t1", "t2", "t3"], "loop0")
-            result = spyre_fuse_nodes([loop])
-        self.assertEqual(len(result), 1)
-
-    def test_plain_scheduler_node_split_unaffected(self):
-        """Plain SchedulerNode tensor-budget splits still work (no regression)."""
-        sched = _make_scheduler()
-        a = _make_snode_with_tensors(sched, _make_ir_op(), "a", ["t1", "t2"])
-        b = _make_snode_with_tensors(sched, _make_ir_op(), "b", ["t3"])
-        # a fills the 2-tensor budget; b starts a new bundle.
-        result = spyre_fuse_nodes([a, b])
-        self.assertEqual(len(result), 2)
-
-    def test_loop_node_preceded_by_scheduler_nodes(self):
-        """Loop node after plain nodes: budget check on loop node itself."""
-        sched = _make_scheduler()
-        a = _make_snode_with_tensors(sched, _make_ir_op(), "a", ["t1"])
-        loop = _make_counted_loop_node(sched, ["t2", "t3", "t4"], "loop0")
-        with self.assertRaises(RuntimeError):
-            spyre_fuse_nodes([a, loop])
-
-    def test_fallback_node_exceeds_budget_no_error(self):
-        """Non-CountedLoop nodes (e.g. FallbackKernel) bypass the budget check."""
+    def test_plain_then_loop_fuses_into_one_bundle(self):
+        """SchedulerNode followed by CountedLoopSchedulerNode → one FusedSchedulerNode."""
         from torch._inductor.scheduler import FusedSchedulerNode
 
         sched = _make_scheduler()
-        # Build a plain FusedSchedulerNode mock (not CountedLoopSchedulerNode).
-        node = MagicMock(spec=FusedSchedulerNode)
-        node.scheduler = sched
-        node.get_name.return_value = "fallback0"
-        deps = []
-        for tname in ["t1", "t2", "t3", "t4"]:
-            dep = MagicMock()
-            dep.name = tname
-            deps.append(dep)
-        node.read_writes = MagicMock()
-        node.read_writes.reads_and_writes.return_value = deps
-        # 4 tensors > max_tensors(2), but this is not a CountedLoopSchedulerNode.
-        result = spyre_fuse_nodes([node])
+        plain = _make_snode(sched, _make_ir_op(), "plain0")
+        loop = _make_counted_loop(sched, "loop0")
+        result = spyre_fuse_nodes([plain, loop])
         self.assertEqual(len(result), 1)
-        self.assertIs(result[0], node)
+        self.assertIsInstance(result[0], FusedSchedulerNode)
 
-    def test_nested_loop_node_tensor_union_checked(self):
-        """Outer CountedLoopSchedulerNode's read_writes covers inner tensors.
+    def test_loop_then_plain_fuses_into_one_bundle(self):
+        """CountedLoopSchedulerNode followed by SchedulerNode → one FusedSchedulerNode."""
+        from torch._inductor.scheduler import FusedSchedulerNode
 
-        _build_loop_group wraps inner loops first, then the outer loop.
-        FusedSchedulerNode.__init__ calls ReadWrites.merge_list on its
-        snodes, so the outer node's read_writes is already the full union
-        of all inner tensors.  This test confirms that the budget check
-        on the outer node sees all tensors from nested inner nodes.
-        """
         sched = _make_scheduler()
-        # Simulate an outer CountedLoopSchedulerNode whose read_writes
-        # already aggregates tensors from two inner loop nodes (t1..t4).
-        # In production this aggregation is done by ReadWrites.merge_list
-        # during FusedSchedulerNode construction.
-        outer = _make_counted_loop_node(sched, ["t1", "t2", "t3", "t4"], "outer_loop")
-        # 4 unique non-intermediate tensors > max_tensors(2): must raise.
-        with self.assertRaises(RuntimeError) as ctx:
-            spyre_fuse_nodes([outer])
-        self.assertIn("outer_loop", str(ctx.exception))
-        self.assertIn("4", str(ctx.exception))
+        loop = _make_counted_loop(sched, "loop0")
+        plain = _make_snode(sched, _make_ir_op(), "plain0")
+        result = spyre_fuse_nodes([loop, plain])
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], FusedSchedulerNode)
+
+    def test_plain_loop_plain_fuses_into_one_bundle(self):
+        """plain → loop → plain sequence → one FusedSchedulerNode."""
+        from torch._inductor.scheduler import FusedSchedulerNode
+
+        sched = _make_scheduler()
+        plain_a = _make_snode(sched, _make_ir_op(), "plain_a")
+        loop = _make_counted_loop(sched, "loop0")
+        plain_b = _make_snode(sched, _make_ir_op(), "plain_b")
+        result = spyre_fuse_nodes([plain_a, loop, plain_b])
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], FusedSchedulerNode)
+
+    def test_fallback_still_forces_boundary(self):
+        """An ExternKernelSchedulerNode between two fusable nodes creates two bundles."""
+        from torch._inductor.scheduler import ExternKernelSchedulerNode
+
+        sched = _make_scheduler()
+        plain_a = _make_snode(sched, _make_ir_op(), "plain_a")
+        fallback = MagicMock(spec=ExternKernelSchedulerNode)
+        fallback.scheduler = sched
+        fallback.get_name.return_value = "fallback0"
+        plain_b = _make_snode(sched, _make_ir_op(), "plain_b")
+        result = spyre_fuse_nodes([plain_a, fallback, plain_b])
+        # plain_a fuses alone before fallback; fallback forces boundary;
+        # plain_b is a separate bundle after fallback.
+        self.assertEqual(len(result), 3)
+        # First entry is plain_a (single SchedulerNode, returned as-is by _make_fused).
+        self.assertIs(result[1], fallback)
 
 
 # ===========================================================================
@@ -1329,8 +1370,8 @@ class TestTiledByteStride(unittest.TestCase):
             start_address=0,
             backGap={},
         )
-        stride = _tiled_byte_stride(tensor, s, {s: 64})
-        self.assertEqual(stride, 64 * 128 * 2)
+        stride = _tiled_byte_stride(tensor, s)
+        self.assertEqual(stride, 128 * 2)
 
     def test_fp16_larger_stride(self):
         s = Symbol("s")
@@ -1346,8 +1387,8 @@ class TestTiledByteStride(unittest.TestCase):
             start_address=0,
             backGap={},
         )
-        stride = _tiled_byte_stride(tensor, s, {s: 32})
-        self.assertEqual(stride, 32 * 512 * 2)
+        stride = _tiled_byte_stride(tensor, s)
+        self.assertEqual(stride, 512 * 2)
 
     def test_stride_one(self):
         s = Symbol("s")
@@ -1363,8 +1404,8 @@ class TestTiledByteStride(unittest.TestCase):
             start_address=0,
             backGap={},
         )
-        stride = _tiled_byte_stride(tensor, s, {s: 16})
-        self.assertEqual(stride, 16 * 1 * 2)
+        stride = _tiled_byte_stride(tensor, s)
+        self.assertEqual(stride, 1 * 2)
 
 
 class TestGenerateSdscTiledSymbols(unittest.TestCase):
@@ -1384,7 +1425,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
         # With one tiling level, affine_strides[0] = [{s: stride}].
         self.assertEqual(len(affine_strides), 1)
         self.assertIn(s, affine_strides[0][0])
-        self.assertEqual(affine_strides[0][0][s], 64 * 128 * 2)
+        self.assertEqual(affine_strides[0][0][s], 128 * 2)
 
     def test_tiled_tensor_base_address_registered(self):
         s = Symbol("s")
@@ -1603,7 +1644,7 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
         loop = LoopSpec(count=Integer(4), body=[op_spec])
         tmpdir = tempfile.mkdtemp()
         generate_bundle(
-            "test_kernel", tmpdir, [loop], unroll_loops=False, symbolic_args=True
+            "test_kernel", tmpdir, [loop], unroll_loops=False, use_symbols=True
         )
 
         with open(os.path.join(tmpdir, "bundle.mlir")) as f:
@@ -1694,6 +1735,63 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
         self.assertEqual(
             [str(dim) for dim in output_layout["dim_order"]],
             ["mb", "out", "x"],
+        )
+
+    def test_unit_bmm_preserve_skips_higher_rank_attention_layout(self):
+        c0 = Symbol("c0")
+        c1 = Symbol("c1")
+        c2 = Symbol("c2")
+        z0 = Symbol("z0")
+        input_arg = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=_FP16,
+            device_size=[512, 32, 2, 1, 64],
+            device_coordinates=[
+                c0,
+                z0,
+                floor(c2 / 64),
+                Integer(0),
+                Mod(c2, 64),
+            ],
+            allocation={"pool": 0},
+        )
+        kernel_arg = TensorArg(
+            is_input=True,
+            arg_index=1,
+            device_dtype=_FP16,
+            device_size=[64, 4096, 64],
+            device_coordinates=[floor(c1 / 64), c2, Mod(c1, 64)],
+            allocation={"hbm": 0x400000000},
+        )
+        output_arg = TensorArg(
+            is_input=False,
+            arg_index=2,
+            device_dtype=_FP16,
+            device_size=[512, 64, 1, 64],
+            device_coordinates=[c0, floor(c1 / 64), Integer(0), Mod(c1, 64)],
+            allocation={"hbm": 0x800000000},
+        )
+        iteration_space = {
+            c0: (Integer(512), 4),
+            c1: (Integer(4096), 8),
+            c2: (Integer(4096), 1),
+        }
+        op_info = {SHARED_WEIGHT_UNIT_BMM_INFO_KEY: {"batch_dim": 0}}
+
+        new_iteration_space = _preserve_shared_weight_unit_bmm_dim(
+            "batchmatmul",
+            iteration_space,
+            [input_arg, kernel_arg, output_arg],
+            op_info,
+        )
+
+        self.assertIs(new_iteration_space, iteration_space)
+        self.assertNotIn("_spyre_bmm_unit", {str(dim) for dim in iteration_space})
+        self.assertEqual(input_arg.device_size, [512, 32, 2, 1, 64])
+        self.assertEqual(
+            input_arg.device_coordinates,
+            [c0, z0, floor(c2 / 64), Integer(0), Mod(c2, 64)],
         )
 
     def test_shared_weight_marker_requires_stick_aligned_dims(self):
@@ -1935,7 +2033,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
                 self.tmpdir,
                 specs,
                 unroll_loops=False,
-                symbolic_args=True,
+                use_symbols=True,
             )
         return _read_mlir(self.tmpdir)
 
@@ -2064,7 +2162,7 @@ class TestGenerateBundleNestedTiling(unittest.TestCase):
                 self.tmpdir,
                 specs,
                 unroll_loops=False,
-                symbolic_args=True,
+                use_symbols=True,
             )
         return _read_mlir(self.tmpdir)
 
@@ -2177,7 +2275,7 @@ class TestGenerateBundleUnrollPath(unittest.TestCase):
                 self.tmpdir,
                 specs,
                 unroll_loops=False,
-                symbolic_args=True,
+                use_symbols=True,
             )
         return _read_mlir(self.tmpdir)
 
@@ -2998,7 +3096,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
 
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def _bundle(self, specs, symbolic_args=False, fake_compile=None):
+    def _bundle(self, specs, use_symbols=False, fake_compile=None):
         if fake_compile is None:
             fake_compile = _fake_compile_op_spec
         with patch(
@@ -3010,7 +3108,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 self.tmpdir,
                 specs,
                 unroll_loops=False,
-                symbolic_args=symbolic_args,
+                use_symbols=use_symbols,
             )
         return _read_mlir(self.tmpdir)
 
@@ -3038,7 +3136,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
 
     def test_signature_accepts_symbolic_args_param(self):
         a = _make_minimal_op_spec("a")
-        mlir = self._bundle([a], symbolic_args=False)
+        mlir = self._bundle([a], use_symbols=False)
         self.assertIn("sdsc_execute", mlir)
 
     def test_func_signature_has_params_for_tensor_args(self):
@@ -3075,7 +3173,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 [SymbolKind.kernel(arg.arg_index) for arg in op_spec.args],
             )
 
-        mlir = self._bundle([a], symbolic_args=True, fake_compile=fake)
+        mlir = self._bundle([a], use_symbols=True, fake_compile=fake)
 
         self.assertIn(
             "func.func @sdsc_bundle("
@@ -3109,7 +3207,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 [SymbolKind.kernel(0)],
             )
 
-        mlir = self._bundle([a], symbolic_args=True, fake_compile=fake)
+        mlir = self._bundle([a], use_symbols=True, fake_compile=fake)
 
         self.assertIn("sdscbundle.sdsc_execute (%arg_0)", mlir)
         self.assertNotIn("sdsc_execute (%sym_0_1)", mlir)
@@ -3148,7 +3246,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
             )  # op_b has pool allocation
             return _make_tiled_json(idx, sym_id), [values[i]], [{}], [kind]
 
-        mlir = self._bundle([op_a, op_b], symbolic_args=True, fake_compile=fake)
+        mlir = self._bundle([op_a, op_b], use_symbols=True, fake_compile=fake)
 
         # First sym → parameter (kernel tensor arg)
         self.assertIn("%arg_0_base_addr: !sdscbundle.input_arg<index>", mlir)
@@ -3159,9 +3257,9 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
 
     def test_symbolic_args_false_no_params(self):
         a = self._make_op_spec_with_hbm_args("a", [0])
-        # When symbolic_args=False, use_symbols=False: no symbols registered,
+        # When use_symbols=False: no symbols registered,
         # sdsc_execute has no operands.
-        mlir = self._bundle([a], symbolic_args=False)
+        mlir = self._bundle([a], use_symbols=False)
         self.assertIn("func.func @sdsc_bundle()", mlir)
         self.assertNotIn("input_arg", mlir)
         self.assertNotIn("%sym_", mlir)
@@ -3218,7 +3316,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
             kinds = [SymbolKind.kernel(0), SymbolKind.kernel(1)]
             return json_out, [a0, a1], [{}, {}], kinds
 
-        mlir = self._bundle([op0] + ops_rest, symbolic_args=True, fake_compile=fake)
+        mlir = self._bundle([op0] + ops_rest, use_symbols=True, fake_compile=fake)
 
         # 10 symbols across 5 SDSCs but only 2 unique arg_indices → 2 params
         self.assertIn("%arg_0_base_addr: !sdscbundle.input_arg<index>", mlir)
@@ -3242,7 +3340,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
             symbols.append(base)
             return _make_tiled_json(idx, sym_id), [base], [{}], [SymbolKind.kernel(0)]
 
-        mlir = self._bundle([a, b], symbolic_args=True, fake_compile=fake)
+        mlir = self._bundle([a, b], use_symbols=True, fake_compile=fake)
 
         # Only one input_arg param (deduped cross-SDSC)
         self.assertIn("%arg_0_base_addr: !sdscbundle.input_arg<index>", mlir)
@@ -3278,7 +3376,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 [SymbolKind.kernel(0)],
             )
 
-        mlir = self._bundle([a, b], symbolic_args=True, fake_compile=fake)
+        mlir = self._bundle([a, b], use_symbols=True, fake_compile=fake)
 
         # Only one input_arg param — no duplicate %arg_0_base_addr
         self.assertEqual(
@@ -3314,7 +3412,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 [SymbolKind.pool()],
             )
 
-        mlir = self._bundle([a, b, c], symbolic_args=True, fake_compile=fake)
+        mlir = self._bundle([a, b, c], use_symbols=True, fake_compile=fake)
 
         # Exactly two arith.constant / arith.addi pairs (offsets 0 and 2048)
         self.assertEqual(mlir.count("arith.constant 0 : index"), 1)
@@ -3457,7 +3555,7 @@ class TestSymbolKind(unittest.TestCase):
                 self.tmpdir,
                 [a, b],
                 unroll_loops=False,
-                symbolic_args=True,
+                use_symbols=True,
             )
         mlir = _read_mlir(self.tmpdir)
 
@@ -3984,10 +4082,9 @@ class TestHintsLevels(unittest.TestCase):
         op = self._make_op([(3, 4, c0)])
         levels = _hints_levels([op])
         self.assertEqual(len(levels), 1)
-        hint_id, count, is_reduction = levels[0]
+        hint_id, count = levels[0]
         self.assertEqual(hint_id, 3)
         self.assertEqual(count, sympy.Integer(4))
-        self.assertFalse(is_reduction)
 
     def test_mixed_hints_drops_only_size1(self):
         """When one hint is size-1 and another is size>1, only the size>1 survives."""
@@ -3998,7 +4095,7 @@ class TestHintsLevels(unittest.TestCase):
         op = self._make_op([(0, 1, c0), (1, 8, c1)])
         levels = _hints_levels([op])
         self.assertEqual(len(levels), 1)
-        hint_id, count, _ = levels[0]
+        hint_id, count = levels[0]
         self.assertEqual(hint_id, 1)
         self.assertEqual(count, sympy.Integer(8))
 
@@ -4012,7 +4109,7 @@ class TestHintsLevels(unittest.TestCase):
         op1 = self._make_op([(0, 4, c0)])
         levels = _hints_levels([op0, op1])
         self.assertEqual(len(levels), 1)
-        _, count, _ = levels[0]
+        _, count = levels[0]
         self.assertEqual(count, sympy.Integer(4))
 
 
@@ -4120,6 +4217,302 @@ class TestHintsToCoarseTileGroupsLogging(unittest.TestCase):
             f"scopes= must mention Lq even though op0 is broadcast on Lq "
             f"(loop_var=None for hint_id=2 on group_ops[0]); "
             f"got: {scopes_line!r}",
+        )
+
+
+class TestAffineStrideMatchesUnrollStride(unittest.TestCase):
+    """Verify that the UNROLL=0 affine-stride path produces the same byte
+    advances as the UNROLL=1 ``_byte_stride_for_arg`` ground truth.
+
+    Each test builds an ``OpSpec`` with a realistic stick-layout ``TensorArg``
+    (same geometry as ``test_unroll_loop_specs.py``), calls ``compile_op_spec``
+    to obtain ``affine_strides``, and asserts that the stride value equals what
+    ``_byte_stride_for_arg`` computes for the same tensor and symbol.
+
+    The scenarios mirror the three main coarse-tiling patterns covered by
+    ``TestUnrollLoopSpecs`` and ``TestNestedReductionUnroll``:
+
+      Group 1 — flat row-tiling: [512, 256] fp16 tensor, tile by c_row.
+      Group 2 — flat col-tiling: same tensor, tile by c_col (non-linear coord).
+      Group 3 — K-input K-tiling: [64, 128] fp16 per-tile (device_size=[2,64,64]),
+                tile by c_k (non-linear coord c_k//64).
+
+    Stick layout reference (2D fp16 tensor [R, C], C multiple of 64):
+      device_size        = [C//64, R, 64]
+      device_coordinates = [c_col//64, c_row, Mod(c_col, 64)]
+    """
+
+    # --- Symbols ---
+    _C_ROW = Symbol("c_row")
+    _C_COL = Symbol("c_col")
+    _C_K = Symbol("c_k")
+    _C_M = Symbol("c_m")
+
+    # --- [512, 256] fp16 stick-layout tensor fixture ---
+    _R, _C = 512, 256
+    _DS_RC = [_C // 64, _R, 64]  # [4, 512, 64]
+    _HBM_BASE = 0x400000000
+
+    def _make_rc_tensor(self, base: int = _HBM_BASE) -> TensorArg:
+        """Stick-layout TensorArg for [512, 256] fp16 (device_size=[4,512,64])."""
+        return TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=_FP16,
+            device_size=list(self._DS_RC),
+            device_coordinates=[
+                self._C_COL // 64,
+                self._C_ROW,
+                sympy.Mod(self._C_COL, 64),
+            ],
+            allocation={"hbm": base},
+        )
+
+    def _make_k_input_tensor(self, base: int = 0x800000000) -> TensorArg:
+        """K-input tensor: [64, 128] fp16 per-tile (device_size=[2,64,64])."""
+        return TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=_FP16,
+            device_size=[2, 64, 64],
+            device_coordinates=[
+                self._C_K // 64,
+                self._C_M,
+                sympy.Mod(self._C_K, 64),
+            ],
+            allocation={"hbm": base},
+        )
+
+    def _get_flat_affine_stride(
+        self, tensor: TensorArg, tiled_sym: Symbol, iter_range: int
+    ) -> int:
+        """Run compile_op_spec and extract the affine stride for tiled_sym.
+
+        Returns the byte-stride value from affine_strides[tensor_idx][0][sym]
+        for the first (and only) tiling level.  Raises if no stride is found.
+
+        Note: the output tensor is constructed with the same coordinates as the
+        input, so both tensors share the same affine stride for tiled_sym.  We
+        return the first non-zero value found, which is the input tensor's stride
+        (they are identical here).  Group 4 (multi-stick) inlines this extraction
+        instead because it needs a distinct iteration_space for C_COL.
+        """
+        out_tensor = TensorArg(
+            is_input=False,
+            arg_index=1,
+            device_dtype=tensor.device_dtype,
+            device_size=list(tensor.device_size),
+            device_coordinates=list(tensor.device_coordinates),
+            allocation={"hbm": 0x500000000},
+        )
+        all_syms: set = set()
+        for expr in tensor.device_coordinates:
+            all_syms |= expr.free_symbols
+        it_space = {s: (Integer(iter_range), 1) for s in all_syms if s != tiled_sym}
+        it_space[tiled_sym] = (Integer(iter_range), 1)
+        op_spec = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space=it_space,
+            args=[tensor, out_tensor],
+            op_info={},
+            tiled_symbols=[[tiled_sym]],
+        )
+        symbols: list[int] = []
+        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        # affine_strides uses SDSC-renamed symbols as keys (not the original
+        # inductor symbols).  Extract the first non-zero stride value from any
+        # tensor's per-level strides.
+        for per_level in affine_strides:
+            for level_d in per_level:
+                if level_d:
+                    return next(iter(level_d.values()))
+        self.fail(
+            f"No affine stride found for {tiled_sym} in affine_strides={affine_strides}"
+        )
+
+    # -------------------------------------------------------------------------
+    # Group 1: flat row-tiling — [512, 256] fp16, tile by c_row
+    #
+    # UNROLL=1 ground truth (_byte_stride_for_arg):
+    #   coord[1] = c_row; delta = T_ROW; device_stride[1] = prod([64]) = 64
+    #   byte_stride = T_ROW * 64 * 2
+    # -------------------------------------------------------------------------
+
+    def test_row_tiling_affine_stride_matches_unroll(self):
+        """compile_op_spec affine stride for c_row must equal _byte_stride_for_arg."""
+        T_ROW = 512
+        tensor = self._make_rc_tensor()
+        expected = _byte_stride_for_arg(tensor, self._C_ROW, T_ROW)
+        actual = self._get_flat_affine_stride(tensor, self._C_ROW, T_ROW)
+        self.assertEqual(
+            actual,
+            expected,
+            f"UNROLL=0 affine stride {actual} != UNROLL=1 ground truth {expected} "
+            f"for c_row tiling of [512,256] fp16 tensor",
+        )
+
+    def test_row_tiling_ground_truth_value(self):
+        """Row-tiling stride == T_ROW * 64 * 2 (matching test_unroll_loop_specs.py)."""
+        T_ROW = 512
+        tensor = self._make_rc_tensor()
+        expected = T_ROW * 64 * 2  # 65536 — from TestUnrollLoopSpecs._STRIDE_BYTES
+        actual = _byte_stride_for_arg(tensor, self._C_ROW, T_ROW)
+        self.assertEqual(actual, expected)
+        affine = self._get_flat_affine_stride(tensor, self._C_ROW, T_ROW)
+        self.assertEqual(
+            affine,
+            expected,
+            f"affine stride {affine} != expected {expected}",
+        )
+
+    # -------------------------------------------------------------------------
+    # Group 2: flat col-tiling — [512, 256] fp16, tile by c_col (non-linear)
+    #
+    # UNROLL=1 ground truth (_byte_stride_for_arg):
+    #   coord[0] = c_col//64; delta[0] = T_COL//64; device_stride[0] = 512*64 = 32768
+    #   coord[2] = Mod(c_col,64); delta[2] = 0 (Mod resets at T_COL=128 since 128%64==0)
+    #   byte_stride = (T_COL//64) * 32768 * 2
+    # -------------------------------------------------------------------------
+
+    def test_col_tiling_affine_stride_matches_unroll(self):
+        """compile_op_spec affine stride for c_col must equal _byte_stride_for_arg."""
+        T_COL = 128  # 2 sticks
+        tensor = self._make_rc_tensor()
+        expected = _byte_stride_for_arg(tensor, self._C_COL, T_COL)
+        actual = self._get_flat_affine_stride(tensor, self._C_COL, T_COL)
+        self.assertEqual(
+            actual,
+            expected,
+            f"UNROLL=0 affine stride {actual} != UNROLL=1 ground truth {expected} "
+            f"for c_col tiling of [512,256] fp16 tensor",
+        )
+
+    def test_col_tiling_ground_truth_value(self):
+        """Col-tiling stride == (T_COL//64) * 32768 * 2 (from TestUnrollLoopSpecs)."""
+        T_COL = 128
+        tensor = self._make_rc_tensor()
+        # device_stride[0] = prod(device_size[1:]) = 512 * 64 = 32768
+        expected = (T_COL // 64) * (512 * 64) * 2  # 131072
+        actual = _byte_stride_for_arg(tensor, self._C_COL, T_COL)
+        self.assertEqual(actual, expected)
+        affine = self._get_flat_affine_stride(tensor, self._C_COL, T_COL)
+        self.assertEqual(
+            affine,
+            expected,
+            f"affine stride {affine} != expected {expected}",
+        )
+
+    # -------------------------------------------------------------------------
+    # Group 3: K-input K-tiling — device_size=[2,64,64], tile by c_k (non-linear)
+    #
+    # This is the nested reduction scenario from TestNestedReductionUnroll.
+    # UNROLL=1 ground truth:
+    #   coord[0] = c_k//64; delta[0] = T_K//64 = 128//64 = 2
+    #   device_stride[0] = prod(device_size[1:]) = 64*64 = 4096
+    #   byte_stride = 2 * 4096 * 2 = 16384
+    # -------------------------------------------------------------------------
+
+    def test_k_tiling_affine_stride_matches_unroll(self):
+        """compile_op_spec affine stride for c_k must equal _byte_stride_for_arg."""
+        T_K = 128  # 2 sticks
+        tensor = self._make_k_input_tensor()
+        expected = _byte_stride_for_arg(tensor, self._C_K, T_K)
+        actual = self._get_flat_affine_stride(tensor, self._C_K, T_K)
+        self.assertEqual(
+            actual,
+            expected,
+            f"UNROLL=0 affine stride {actual} != UNROLL=1 ground truth {expected} "
+            f"for c_k tiling of k_input tensor (device_size=[2,64,64])",
+        )
+
+    def test_k_tiling_ground_truth_value(self):
+        """K-tiling stride == (T_K//64) * 4096 * 2 (from TestNestedReductionUnroll)."""
+        T_K = 128
+        tensor = self._make_k_input_tensor()
+        # device_stride[0] = prod(device_size[1:]) = 64 * 64 = 4096
+        K_TILE_BYTES = (T_K // 64) * (64 * 64) * 2  # 16384
+        actual = _byte_stride_for_arg(tensor, self._C_K, T_K)
+        self.assertEqual(actual, K_TILE_BYTES)
+        affine = self._get_flat_affine_stride(tensor, self._C_K, T_K)
+        self.assertEqual(
+            affine,
+            K_TILE_BYTES,
+            f"affine stride {affine} != expected {K_TILE_BYTES}",
+        )
+
+    # -------------------------------------------------------------------------
+    # Group 4: multi-stick row-tiling — [1024, 4096] fp16 tensor
+    #
+    # This is the reproducer from test_hint_row_tiling_multi_stick_pointwise_correct.
+    # device_size = [4096//64, 1024, 64] = [64, 1024, 64]
+    # Tiling c_row by T_ROW=512:
+    #   device_stride[1] = prod([64]) = 64
+    #   byte_stride = 512 * 64 * 2 = 65536
+    # -------------------------------------------------------------------------
+
+    def test_multi_stick_row_tiling_affine_stride_matches_unroll(self):
+        """[1024,4096] multi-stick row-tiling: affine stride must equal unroll stride."""
+        tensor = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=_FP16,
+            device_size=[64, 1024, 64],  # [4096//64, 1024, 64]
+            device_coordinates=[
+                self._C_COL // 64,
+                self._C_ROW,
+                sympy.Mod(self._C_COL, 64),
+            ],
+            allocation={"hbm": self._HBM_BASE},
+        )
+        T_ROW = 512
+        expected = _byte_stride_for_arg(tensor, self._C_ROW, T_ROW)
+        # ground truth: 512 * 64 * 2 = 65536
+        self.assertEqual(expected, T_ROW * 64 * 2)
+
+        out_tensor = TensorArg(
+            is_input=False,
+            arg_index=1,
+            device_dtype=_FP16,
+            device_size=[64, 1024, 64],
+            device_coordinates=[
+                self._C_COL // 64,
+                self._C_ROW,
+                sympy.Mod(self._C_COL, 64),
+            ],
+            allocation={"hbm": 0x500000000},
+        )
+        # Note: C_COL range here is the full tensor width (4096), not T_ROW.
+        # The helper _get_flat_affine_stride cannot be reused for this group
+        # because it assigns iter_range to all free symbols uniformly.
+        op_spec = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={
+                self._C_ROW: (Integer(T_ROW), 1),
+                self._C_COL: (Integer(4096), 1),
+            },
+            args=[tensor, out_tensor],
+            op_info={},
+            tiled_symbols=[[self._C_ROW]],
+        )
+        symbols: list[int] = []
+        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        # affine_strides uses SDSC-renamed symbols; extract first non-zero stride value.
+        actual = None
+        for per_level in affine_strides:
+            for level_d in per_level:
+                if level_d:
+                    actual = next(iter(level_d.values()))
+                    break
+            if actual is not None:
+                break
+        self.assertIsNotNone(actual, "No affine stride found for C_ROW")
+        self.assertEqual(
+            actual,
+            expected,
+            f"UNROLL=0 affine stride {actual} != UNROLL=1 ground truth {expected} "
+            f"for [1024,4096] multi-stick row tiling",
         )
 
 
