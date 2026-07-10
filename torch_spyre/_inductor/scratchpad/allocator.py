@@ -86,7 +86,7 @@ class ScratchpadAllocator:
 
     def __init__(
         self,
-        layout_planning: MemoryPlanSolver | None = None,
+        layout_planning: MemoryPlanSolver,
         pre_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
         post_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
     ):
@@ -100,18 +100,6 @@ class ScratchpadAllocator:
             post_optimization_passes: Graph passes applied after layout planning.
                 Defaults to no passes.
         """
-        size = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
-        if layout_planning is None:
-            if config.layout_solver == "greedy":
-                layout_planning = GreedyLayoutSolver(size)
-            elif config.layout_solver == "bestfit":
-                layout_planning = BestFitLayoutSolver(size)
-            elif config.layout_solver == "firstfit":
-                layout_planning = FirstFitLayoutSolver(size)
-            else:
-                raise ValueError(
-                    f"Invalid layout_solver config option '{config.layout_solver}'."
-                )
         if pre_optimization_passes is None:
             pre_optimization_passes = []
         if post_optimization_passes is None:
