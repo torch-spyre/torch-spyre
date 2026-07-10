@@ -1,0 +1,44 @@
+# LX-planning shard: inductor_ops family 'matmul', both wrap classes
+# (LxPlanningTwoOpPointwiseAdditionTest '(x + x) / 2' and
+#  LxPlanningTwoOpReductionTest 'torch.sum(x, dim=0)').
+#
+# Auto-split of test_inductor_ops_lx_planning.py, mirroring the
+# test_inductor_ops.py config sharding. The full (non-truncated) test
+# set is enabled in CI via TEST_LX_PLANNING_FULL=1 + TEST_LX_PLANNING_RUN_SKIPS=1
+# (see .github/workflows/_test_matrix.yaml). The xfail lists below are
+# the source of truth for known LX-planning failures (the in-file .py
+# skip-lists were removed as duplicates).
+test_suite_config:
+  labels: [full]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_planning.py
+      unlisted_test_mode: skip
+      tests:
+        # Known LX-planning failures -- run and expected to fail. Non-strict
+        # xfail: an unexpected pass (XPASS) does not fail CI. Entries failing
+        # in both wraps collapse to (pointwise|reduction).
+        - names:
+            - LxPlanning.*::test_einsum_einsum_67x255_255x128_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_einsum_einsum_67x256_256x128_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_matmul_tiled_y_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_mm_autocast_f16_disabled_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_mm_autocast_f16_enabled_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_matmul_matmul_55x2_2x99_lx_planning_pointwise
+            - LxPlanning.*::test_mm_mm_55x2_2x99_lx_planning_pointwise
+            - LxPlanning.*::test_addmm_1152_10x1152_1152x1152_lx_planning_reduction
+            - LxPlanning.*::test_addmm_out_basic_lx_planning_reduction
+            - LxPlanning.*::test_large_matmul_matmul_2d_M2048_K2048_N65536_lx_planning_reduction
+            - LxPlanning.*::test_large_matmul_matmul_4d_B2_H2_M2048_K2048_N65536_lx_planning_pointwise
+          mode: xfail
+        - names:
+            - LxPlanning.*::test_(addmm|mm|bmm|einsum|matmul|linear).*_lx_planning_(pointwise|reduction)
+          mode: mandatory_success
+          tags:
+            - ops__inductor-matmul
+        - names:
+            - LxPlanning.*::test_large_matmul.*_lx_planning_(pointwise|reduction)
+          mode: mandatory_success
+          tags:
+            - ops__inductor-matmul
+            - slow__plat_ppc64
+            - slow__plat_s390x
