@@ -33,14 +33,14 @@ import inductor.test_inductor_ops  # noqa: E402
 from torch_spyre._inductor import config as _lx_config  # noqa: E402
 
 tests_lx_planning_run_skips: bool = (
-    os.environ.get("TEST_LX_PLANNING_RUN_SKIPS", "0") == "1"
+    os.environ.get("TEST_LX_PLANNING_RUN_SKIPS", "1") == "1"
 )
 
 # By default, only run one representative test per (prefix, op) cell of
 # TestOps.PARAMS plus all non-parameterized methods. Set this to "1" to
 # wrap every generated test — useful for thorough triage, skip-list
 # maintenance, and CI but slow for everyday dev workflow.
-tests_lx_planning_full: bool = os.environ.get("TEST_LX_PLANNING_FULL", "0") == "1"
+tests_lx_planning_full: bool = os.environ.get("TEST_LX_PLANNING_FULL", "1") == "1"
 
 
 def make_lx_planning_class(cls):
@@ -148,128 +148,7 @@ INHERITED_TEST_ATTRIBUTES = [
     "_get_single_dim_reduction_invalid_dim_cases",
 ]
 
-# Skip-lists for the LX-planning two-op suite, split by scratchpad allocator.
-# The greedy and ILP allocators have different failing sets, so the effective
-# list is an allocator-independent common base plus an allocator-specific delta,
-# selected by config.layout_solver. Refreshed against a full RUN_SKIPS=1 run.
-# Families: flatten / mm_67x67 are a backend partial-stick limitation
-# (Mod(d,K), K<64 unmappable by ddl_conversion; PR #1866); unfold has multi-var
-# stick expressions (d0+d1, 4*d0+d1; issue #2346); unbind / transpose / conv2d
-# are layout/stick-expression op-support gaps.
-# When ILP becomes the only solver, delete the _GREEDY_ONLY_* lists and the
-# selector and fold _ILP_ONLY_* into the common lists.
-_COMMON_POINTWISE_FAILURES = [
-    "test_conv2d_1x3x32_ksize3_no_pad",
-    "test_conv2d_1x64_ksize3_depthwise",
-    "test_conv2d_2x32_ksize1_stride2",
-    "test_conv2d_2x3x32_ksize1",
-    "test_conv2d_mistral_model",
-    "test_einsum_einsum_67x255_255x128",
-    "test_einsum_einsum_67x256_256x128",
-    "test_flatten_2d_full",
-    "test_flatten_3d_full",
-    "test_flatten_3d_mixed_dims",
-    "test_flatten_3d_neg_dims",
-    "test_flatten_3d_neg_full",
-    "test_flatten_3d_noncontig_full",
-    "test_flatten_3d_noncontig_partial",
-    "test_flatten_3d_trailing",
-    "test_flatten_4d_full",
-    "test_flatten_4d_large_full",
-    "test_flatten_4d_trailing",
-    "test_full_value_1",
-    "test_slice_stick_reduce_dim1_sum_3d128_01",
-    "test_slice_stick_reduce_dim1_sum_3d64_01",
-    "test_slice_stick_reduce_dim2_sum_3d128_01",
-    "test_transpose_2d_large_dim_0_1",
-    "test_transpose_2d_large_dim_0_1_nopad",
-    "test_transpose_2d_large_dim_0_2",
-    "test_transpose_2d_large_dim_0_2_nopad",
-    "test_unbind_1d_dim0",
-    "test_unbind_2d_dim0",
-    "test_unbind_2d_dim1",
-    "test_unbind_2d_dimneg1",
-    "test_unbind_3d_dim0",
-    "test_unbind_3d_dim1",
-    "test_unbind_3d_dim2",
-    "test_unbind_3d_dimneg1",
-    "test_unbind_4d_dim0",
-    "test_unbind_4d_dim3",
-    "test_unfold_1d_large",
-    "test_unfold_1d_no_overlap",
-    "test_unfold_1d_step1",
-    "test_unfold_1d_step2",
-    "test_unfold_2d_dim0",
-    "test_unfold_2d_dim1",
-    "test_unfold_2d_dim_neg",
-    "test_unfold_2d_square",
-    "test_unfold_3d_dim0",
-    "test_unfold_3d_dim1",
-    "test_unfold_3d_dim2",
-    "test_unfold_4d_batch",
-    "test_unfold_4d_cnn",
-    "test_unfold_4d_spatial",
-    "test_unfold_edge_large_step",
-    "test_unfold_edge_nopad_2d",
-    "test_unfold_edge_nopad_37",
-    "test_unfold_edge_pow2_64",
-]
-
-_COMMON_REDUCTION_FAILURES = [
-    "test_conv2d_1x3x32_ksize3_no_pad",
-    "test_conv2d_1x64_ksize3_depthwise",
-    "test_conv2d_2x32_ksize1_stride2",
-    "test_conv2d_2x3x32_ksize1",
-    "test_conv2d_mistral_model",
-    "test_flatten_2d_full",
-    "test_flatten_3d_full",
-    "test_flatten_3d_leading",
-    "test_flatten_3d_mixed_dims",
-    "test_flatten_3d_neg_dims",
-    "test_flatten_3d_neg_full",
-    "test_flatten_3d_noncontig_full",
-    "test_flatten_3d_noncontig_partial",
-    "test_flatten_3d_trailing",
-    "test_flatten_4d_full",
-    "test_flatten_4d_large_full",
-    "test_flatten_4d_leading",
-    "test_flatten_4d_trailing",
-    "test_full_value_1",
-    "test_pointwise_binary_op_div_67x71x256_67x71x256",
-    "test_t_2d_contiguous_4096x49280",
-    "test_transpose_2d_large_dim_0_1",
-    "test_transpose_2d_large_dim_0_1_nopad",
-    "test_transpose_2d_large_dim_0_2",
-    "test_transpose_2d_large_dim_0_2_nopad",
-    "test_unbind_1d_dim0",
-    "test_unbind_2d_dim0",
-    "test_unbind_2d_dim1",
-    "test_unbind_2d_dimneg1",
-    "test_unbind_3d_dim0",
-    "test_unbind_3d_dim1",
-    "test_unbind_3d_dim2",
-    "test_unbind_3d_dimneg1",
-    "test_unbind_4d_dim0",
-    "test_unbind_4d_dim3",
-    "test_unfold_1d_large",
-    "test_unfold_1d_no_overlap",
-    "test_unfold_1d_step1",
-    "test_unfold_1d_step2",
-    "test_unfold_2d_dim0",
-    "test_unfold_2d_dim1",
-    "test_unfold_2d_dim_neg",
-    "test_unfold_2d_square",
-    "test_unfold_3d_dim0",
-    "test_unfold_3d_dim1",
-    "test_unfold_3d_dim2",
-    "test_unfold_4d_batch",
-    "test_unfold_4d_cnn",
-    "test_unfold_4d_spatial",
-    "test_unfold_edge_large_step",
-    "test_unfold_edge_nopad_2d",
-    "test_unfold_edge_nopad_37",
-    "test_unfold_edge_pow2_64",
-]
+POINTWISE_TEST_FAILURES = []
 
 # Coherence cases the ILP allocator fixes (core-division choice + frame
 # barriers) but the greedy allocator still fails:
@@ -399,6 +278,9 @@ _copy_canonical_tests(
     POINTWISE_TEST_FAILURES if not tests_lx_planning_run_skips else None,
     INHERITED_TEST_ATTRIBUTES,
 )
+
+
+REDUCTION_TEST_FAILURES = []
 
 
 class LxPlanningTwoOpReductionTest(_LxPlanningTwoOpTestBase):

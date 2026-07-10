@@ -97,7 +97,7 @@ def _align_up(n: int, alignment: int) -> int:
 def _compute_size_bytes(name: str) -> int:
     """Return the stick-aligned device size in bytes for buffer `name`."""
     buf = V.graph.get_buffer(name)
-    layout = buf.get_layout()
+    layout = buf.maybe_get_layout()
     assert isinstance(layout, FixedTiledLayout), (
         f"memory_planning: expected FixedTiledLayout for {name}, got {type(layout)}"
     )
@@ -209,14 +209,16 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         for io_name in io_names
         if (io_buf := V.graph.get_buffer(io_name)) is not None
         and not isinstance(io_buf, Symbol)
-        and isinstance(layout := io_buf.get_layout(), FixedTiledLayout)
+        # Use maybe_get_layout(): None-valued args carried by FallbackKernels
+        # have no layout and raise from get_layout().
+        and isinstance(layout := io_buf.maybe_get_layout(), FixedTiledLayout)
     }
 
     def _is_intermediate(name: str) -> bool:
         buf = V.graph.get_buffer(name)
         if buf is None:
             return False
-        layout = buf.get_layout()
+        layout = buf.maybe_get_layout()
         return (
             isinstance(layout, FixedTiledLayout)
             and "lx" not in layout.allocation
@@ -271,7 +273,7 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
 
         # Assign HBM address directly to layout.allocation.
         buf = V.graph.get_buffer(name)
-        layout = buf.get_layout()
+        layout = buf.maybe_get_layout()
         assert isinstance(layout, FixedTiledLayout)
         layout.allocation["pool"] = INTERMEDIATES_SEGMENT + offset
 

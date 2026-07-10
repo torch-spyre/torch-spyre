@@ -56,12 +56,6 @@ class DimHint:
 _HINT_RE = re.compile(r"^_hint_(\d+)$")
 _hint_counter = 0
 
-# Snapshot of FX node `custom` meta taken at CustomPrePasses time, indexed
-# by call_function node position. Used by recover_spyre_hints to restore
-# meta on nodes renamed by AOT re-tracing (e.g. mm -> mm_default), which
-# drops node.meta["custom"].
-_dim_hints: list[tuple[Any, dict[str, Any] | None]] = []
-
 
 def spyre_hint(**kwargs: Any):
     """
@@ -71,6 +65,11 @@ def spyre_hint(**kwargs: Any):
 
     _hint_counter += 1
     return torch.fx.traceback.annotate({f"_hint_{_hint_counter}": kwargs})
+
+
+def _reset_counter(*args, **kwargs):
+    global _hint_counter
+    _hint_counter = 0
 
 
 def get_op_hints(op: Operation) -> dict[int, dict[str, Any]]:
@@ -105,9 +104,9 @@ def collect_spyre_hints(graph: torch.fx.Graph) -> None:
     *name* is renamed by AOT re-tracing (mm -> mm_default) and so is unstable, but
     the ``target`` OpOverload is preserved and is what we align on.
     """
-    global _dim_hints
+    assert graph.owning_module is not None
 
-    _dim_hints = [
+    graph.owning_module.meta["__spyre_dim_hints"] = [
         (node.target, node.meta.get("custom"))
         for node in graph.nodes
         if node.op == "call_function"
@@ -128,6 +127,7 @@ def recover_spyre_hints(graph: torch.fx.Graph) -> None:
     the same hint. This keeps alignment intact across such insertions, where the
     old count check would bail and silently drop every hint.
     """
+    _dim_hints = graph.owning_module.meta["__spyre_dim_hints"]
     nodes = [n for n in graph.nodes if n.op == "call_function"]
 
     cursor = 0
