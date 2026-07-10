@@ -226,8 +226,9 @@ void SpyreStream::launchHostCallback(flex::HostCallbackParams* params) const {
   resolveRuntimeHandle()->launchOperationHostCallback(params);
 }
 
-void SpyreStream::launchFill(flex::FillParams* params) const {
-  resolveRuntimeHandle()->launchOperationFill(params);
+void SpyreStream::fillAsync(const flex::CompositeAddress* dst, double value,
+                            DataFormats dtype, bool use_dmai) const {
+  resolveRuntimeHandle()->fillAsync(dst, value, dtype, use_dmai);
 }
 
 void SpyreStream::launch(const JobPlan& plan,
