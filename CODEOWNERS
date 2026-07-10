@@ -25,7 +25,6 @@
 
 # Distributed / collective communication (spyre_ccl)
 /torch_spyre/csrc/distributed/  @jjhursey @JRosenkranz @thoangtrvn
-/tests/distributed/              @jjhursey @thoangtrvn @avery-blanchard
 
 # Profiler
 /torch_spyre/profiler/   @ppnaik1890 @kaoutar55 @flop1971
@@ -36,6 +35,10 @@
 
 # Tests
 /tests/                  @avery-blanchard @moriohara @ashokponkumar @JRosenkranz @dgrove-oss @tardieu @ani300 @pradghos @anubhavjana @n-marion @thoangtrvn @cyang49 @marnold-ibm @jjhursey
+
+# Distributed tests (more specific than /tests/ above — must come after it so
+# the last-matching-pattern rule gives these owners precedence)
+/tests/distributed/      @jjhursey @thoangtrvn @avery-blanchard
 
 # Documentation
 /docs/                   @kaoutar55 @dgrove-oss @mudhakar @raghukiran1224 @viji560 @tehbone

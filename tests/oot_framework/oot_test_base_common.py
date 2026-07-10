@@ -46,6 +46,7 @@ from oot_framework.oot_upstream_patcher import (
     _OOTPrecisionOverridePatcher,
     _OOTNativeDeviceTypesPatcher,
     _OOTCpuMovePatcher,
+    _OOTNoGradPatcher,
     _OOTPlatformMarkerPatcher,
 )
 from oot_framework.oot_test_config_models import (
@@ -277,12 +278,33 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
 
             # Create ModuleInfo and add to module_db
             try:
+                # edits.modules.include is additive: ModuleInfo.dtypes (the set
+                # of dtype variants @modules will ever generate for this
+                # module) is derived from the floating-point dtype(s) actually
+                # baked into the YAML's tensor specs, so a dtype absent from
+                # the YAML (e.g. float16 for a bfloat16-only module) is never
+                # registered and therefore never generated -- regardless of
+                # global.supported_dtypes.
+                #
+                # global.supported_dtypes (GLOBAL_SUPPORTED_DTYPES, applied in
+                # _should_run_test_case below) is purely a filter on top of
+                # that: it can only skip a dtype variant that was registered
+                # here, never add one that wasn't. Fall back to the historical
+                # default triple only when no tensor spec can be found at all
+                # (e.g. a no-input module), so such a module still gets some
+                # coverage.
+                resolved_dtypes = module_item.resolved_input_dtypes()
+                dtypes = (
+                    tuple(sorted(resolved_dtypes, key=str))
+                    if resolved_dtypes
+                    else (torch.float32, torch.float16, torch.bfloat16)
+                )
                 module_info = ModuleInfo(
                     module_cls,
                     module_inputs_func=create_module_inputs_func_from_yaml(module_item),
                     skips=(),
                     decorators=None,
-                    dtypes=(torch.float32, torch.float16),
+                    dtypes=dtypes,
                 )
                 module_db.append(module_info)
                 existing_names.add(module_name)
@@ -628,11 +650,17 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
             _OOTOpDtypeExpander(test, all_extra_dtypes).patch()
 
         # Collect precision overrides: merge global + union across all entries.
-        # Per-variant selection happens below in new_methods loop.
+        # precision_overrides/tolerance_overrides are dtype-keyed only (an
+        # upstream limitation), so -- like the dtype injection above -- these
+        # can only vary per dtype, not per op within a shared test method.
+        include_dtype_precision: Dict[torch.dtype, Precision] = {}
+        for _e in all_entries_for_name:
+            include_dtype_precision.update(_e.edits.dtypes.resolved_include_precision())
+
         _OOTPrecisionOverridePatcher(
             test,
             global_dtype_precision=cls.GLOBAL_DTYPE_PRECISION,
-            include_dtype_precision={},  # handled per-variant below
+            include_dtype_precision=include_dtype_precision,
         ).patch()
 
         # Dynamically adds pytest marker to each of ops and dtype passed to @ops
@@ -754,6 +782,18 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
                         marked_fn = pytest.mark.__getattr__(tag)(marked_fn)
                     setattr(cls, method_name, marked_fn)
                 _tags_to_write[method_name] = method_tags
+
+            # Spyre's custom ops have no registered autograd formula, so a
+            # test that builds modules/tensors with ordinary
+            # requires_grad=True and never calls backward() must run under
+            # torch.no_grad() to avoid AOTAutograd tracing a backward graph
+            # at compile time. Opt in per test entry via the YAML `no_grad`
+            # flag (e.g. upstream's ModuleInfo-based test_forward). See
+            # _OOTNoGradPatcher.
+            if resolved_entry is not None and resolved_entry.no_grad:
+                existing_fn = cls.__dict__.get(method_name)
+                if existing_fn is not None:
+                    setattr(cls, method_name, _OOTNoGradPatcher.wrap(existing_fn))
 
             # apply xfail if needed
             if is_xfail:

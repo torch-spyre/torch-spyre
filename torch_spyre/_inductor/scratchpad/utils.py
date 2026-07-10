@@ -17,7 +17,11 @@ import math
 from typing import Any, Optional
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import Operation, IRNode, Pointwise
+from torch._inductor.ir import (
+    Operation,
+    IRNode,
+    Pointwise,
+)
 from torch._inductor.virtualized import V
 from torch._inductor.ops_handler import WrapperHandler
 
@@ -32,6 +36,7 @@ OP_OUTPUT_GOOD_FOR_LX_REUSE = frozenset(
     {
         "max",
         "amax",
+        "maximum",
         "sum",
         # "clone",
         "exp",
@@ -123,7 +128,7 @@ def mem_usage_by_buf(
         buf_name = op.name
         buf = graph.get_buffer(buf_name)
         num_cores = num_cores_per_op.get(buf_name, -1)
-        dev_layout = buf.layout.device_layout
+        dev_layout = buf.get_layout().device_layout
         dev_size = (
             math.prod(dev_layout.device_size[:-1]) * 128
         )  # num_sticks * bytes_per_stick
@@ -241,6 +246,7 @@ def get_ncores_for_buffers(
     graph: GraphLowering | GraphView,
     cache: Optional[dict] = None,
     rw_cache: Optional[dict] = None,
+    reject_reasons_out: Optional[dict[str, str]] = None,
 ) -> dict[str, int]:
     """
     Return a dictionary mapping buffer names to the number of cores
@@ -253,6 +259,9 @@ def get_ncores_for_buffers(
     share only within a single graph, since the cache key includes the
     op name and `dep` (which carries the buffer name). `rw_cache`
     ({op name: ReadWrites}) likewise memoizes get_read_writes().
+
+    Pass an optional `reject_reasons_out` dict to receive detailed
+    reasons for core division mismatches (keyed by buffer name).
     """
     result: dict[str, int] = {}
     using_multicore = config.sencores > 1
@@ -264,12 +273,14 @@ def get_ncores_for_buffers(
             # k-last cores hold the final value), so it's unsafe on LX even if
             # geometry matches — the `flag` gate applies to write-deps only.
             ref_view = None
-            mismatch = False
+            ref_op_name = None
+            mismatch_reason = None
             writer_cores = None
             for op, dep in users:
                 view, flag = _per_core_view_on_buf(op, dep, buf_name, cache)
                 if ref_view is None:
                     ref_view = view
+                    ref_op_name = op.get_name()
                 op_rw = (
                     rw_cache[op.get_name()]
                     if rw_cache is not None
@@ -285,13 +296,45 @@ def get_ncores_for_buffers(
                     # rejected below, so writer_cores divides only for output splits.
                     writer_cores = _op_num_cores(op)
                     if flag:
-                        mismatch = True
+                        mismatch_reason = f"K-split writer '{op.get_name()}'"
+                        break
+                else:
+                    # Broadcast-read guard. `view` is how this consumer slices the
+                    # buffer; its core count is the product of the split factors.
+                    # When a consumer splits an iteration axis the buffer does not
+                    # have (e.g. a GEMM's free/N dim over a shared activation, or
+                    # its M dim over a shared weight), that split contracts out of
+                    # the view, so the view covers fewer cores than the op runs.
+                    # An LX (per-core scratchpad) buffer would then live on
+                    # view_cores cores but be read by op_cores; the cores without
+                    # a local copy read stale scratchpad -> wrong results. There is
+                    # no single-base LX broadcast, so treat it as a core-division
+                    # mismatch and keep the buffer in HBM (correct, just unpinned).
+                    # This is not writer-relative: it catches broadcast reads even
+                    # when the buffer has no in-graph writer (a graph input cloned
+                    # into LX) or when a producer's view happens to match the
+                    # broadcast footprint -- cases the `view != ref_view` check
+                    # below cannot see.
+                    # work_slice_dims entries are (host-dim, (work_div, tile));
+                    # the per-dim core count is the work_div factor.
+                    view_cores = math.prod(
+                        work_div for _, (work_div, _tile) in view.work_slice_dims
+                    )
+                    if view_cores != _op_num_cores(op):
+                        mismatch_reason = (
+                            f"broadcast read on '{op.get_name()}': view covers "
+                            f"{view_cores} cores but op runs {_op_num_cores(op)}"
+                        )
                         break
                 if view != ref_view:
-                    mismatch = True
+                    mismatch_reason = (
+                        f"op '{ref_op_name}' ref {ref_view} != '{op.get_name()}' {view}"
+                    )
                     break
-            if mismatch:
+            if mismatch_reason is not None:
                 num_cores = -1
+                if reject_reasons_out is not None:
+                    reject_reasons_out[buf_name] = mismatch_reason
             elif writer_cores is not None:
                 num_cores = writer_cores
             else:

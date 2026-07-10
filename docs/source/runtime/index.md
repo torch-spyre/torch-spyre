@@ -42,7 +42,7 @@ to handle device management and synchronization.
 
 ### Device Enumeration
 
-`torch.spyre.device_count()` is handled by the PrivateUse1 hooks in `csrc/spyre_hooks.cpp`, which look up the visible-device set from a small group of environment variables read in `csrc/spyre_device_enum.cpp`:
+`torch.spyre.device_count()` is handled by the PrivateUse1 hooks registered in `csrc/module.cpp`, which look up the visible-device set from a small group of environment variables read in `csrc/spyre_device_enum.cpp`:
 
 | Variable | Effect |
 |---|---|
@@ -64,9 +64,7 @@ The count itself comes from `flex::getNumDevices`.
 | `csrc/spyre_views.cpp` | Tensor view and striding support on device, including `_reshape_alias`. |
 | `csrc/spyre_guard.cpp` | `SpyreGuardImpl`, device guard and synchronization. |
 | `csrc/spyre_stream.cpp` | Stream management for asynchronous execution. |
-| `csrc/spyre_hooks.cpp` | `PrivateUse1HooksInterface`, wires PyTorch's PrivateUse1 hooks to Spyre. |
 | `csrc/spyre_device_enum.cpp` | Visible-device enumeration. Reads `AIU_WORLD_SIZE`, `SPYRE_DEVICES`, `FLEX_DEVICE`. |
-| `csrc/spyre_sendnn_utils.cpp` | Eager-mode helpers, including the `EAGER_MODE` env var. |
 | `csrc/logging.cpp` | C++ debug logging, gated on `TORCH_SPYRE_DEBUG`. |
 | `csrc/profiler/` | PyTorch Profiler (PrivateUse1) integration. |
 | `csrc/attn_utils.cpp` | SDPA dispatch. Routes `scaled_dot_product_attention` to the Spyre backend, with GQA support. |
@@ -132,6 +130,13 @@ What `flex_alloc->allocate(nbytes)` returns is a `flex::CompositeAddress`, a han
 What happens between a Python tensor going out of scope and the device allocation returning to the flex pool. The piece that connects the two ends is the `ReportAndDelete` callback that `SpyreAllocator` installs on every `c10::DataPtr` it hands out.
 :::
 
+When the allocator runs out of memory regions it invokes a registered
+memory-pressure callback. The torch-spyre callback releases the allocator mutex,
+calls `PyGC_Collect()` to free Python cyclic garbage, and re-acquires the mutex
+before returning — allowing the allocation to be retried. See
+[Memory Pressure and Python GC](memory_pressure_gc.md) for the full GIL
+interaction and lock-ordering details.
+
 Physical-frame (PF) and virtual-frame (VF) execution are *not* allocator strategies inside `SpyreAllocator`. The mode is picked by the `FLEX_DEVICE` environment variable, which configures the underlying flex runtime (see `csrc/spyre_device_enum.cpp`):
 
 | Mode | Selection | Description |
@@ -143,11 +148,11 @@ Physical-frame (PF) and virtual-frame (VF) execution are *not* allocator strateg
 
 Eager kernels reach the Spyre dispatch key from two Python sources.
 
-The first is manual registrations in [`torch_spyre/ops/eager.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/eager.py), which use `torch.library.register_kernel` to wire up ops like `mm`, `silu`, `mish`, `fill_.Scalar`, `normal_`, `uniform_`, `_local_scalar_dense`, and `_copy_from`.
+The first is manual registrations in [`torch_spyre/ops/eager.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/eager.py), which use `register_torch_compile_kernel` to register 45+ ops (arithmetic, comparison, reduction, activation, and view ops) for the PrivateUse1 dispatch key.
 
 The second is CPU fallbacks in [`torch_spyre/ops/fallbacks.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/fallbacks.py), registered through `@register_fallback` (or the `register_fallback_default` helper for plain pass-throughs). These cover the long tail: `arange`, `embedding`, `cumsum`, `tril`/`triu`, `isin`, `bitwise_xor`/`bitwise_or`, `argmax`, and similar.
 
-Five Inductor decompositions registered through `register_spyre_decomposition` also dispatch eagerly: `rms_norm`, `layer_norm`, `softplus`, `linear`, and `_scaled_dot_product_fused_attention_overrideable`.
+Inductor decompositions registered through `register_spyre_decomposition` also dispatch eagerly when the underlying ATen op does not already have a PrivateUse1 kernel. See the [supported operations table](../user_guide/supported_operations.md) for the full list.
 
 C++ kernels can still be registered through the usual `TORCH_LIBRARY_IMPL` block, but most of the public eager surface today comes from the Python sources above.
 
@@ -302,3 +307,11 @@ unsupported — the protocol overhead is high and call sites are rare.
 to a single Spyre device (typically `torch.device(f"spyre:{os.getenv('RANK', '0')}")`
 in the user code). The backend reuses the rank's existing flex runtime instance
 and default stream. It does not own a separate runtime context.
+
+## More in This Section
+
+```{toctree}
+:maxdepth: 1
+
+memory_pressure_gc
+```
