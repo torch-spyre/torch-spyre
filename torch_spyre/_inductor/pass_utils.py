@@ -1327,24 +1327,22 @@ def lower_pad_sequence(
 class PerCoreView:
     """Geometric description of a buffer's per-core slicing.
 
-    - work_slice_dims: (host-dim index, (work_div_factor, tile_factor)) pairs,
-      one per split dim. Comparing both factors means two ops must agree on the
-      whole-tensor axis, its work division, AND its tiling (from spyre_hint).
-    - core_to_slot: (host-dim index, slice-index expression in core_id)
+    - work_slice_dims: (device-dim index, split factor) pairs, one per
+      split dim.
+    - core_to_slot: (device-dim index, slice-index expression in core_id)
       pairs giving each core's position along that split dim.
 
-    Both fields are keyed by the buffer's HOST-dim index — a buffer-intrinsic,
-    frame-stable identity shared by the writer and every reader — not by op-
-    local iter symbols, so the value depends only on how the buffer is sliced,
-    not on the (logical vs tiled) frame a given dep's index happens to be in.
+    Both fields are keyed by the buffer's device-dim index — not by op-
+    local iter symbols — so the value depends only on the buffer's
+    physical slicing.
 
-    Example: a 2D buffer split 4-ways on host dim 0 across 4 cores, untiled, has
-        work_slice_dims = ((0, (4, 1)),)
+    Example: a 2D buffer split 4-ways on dim 0 across 4 cores has
+        work_slice_dims = ((0, 4),)
         core_to_slot    = ((0, Mod(core_id, 4)),)
-    so core_id=2 owns slot 2 along host dim 0.
+    so core_id=2 owns slot 2 along dim 0.
     """
 
-    work_slice_dims: tuple[tuple[int, tuple[int, int]], ...]
+    work_slice_dims: tuple[tuple[int, int], ...]
     core_to_slot: tuple[tuple[int, Expr], ...]
 
 
@@ -1560,8 +1558,9 @@ def _per_core_view_from_prep(
             or device_size[dev_dim] % split != 0
         ):
             logger.debug(
-                f"could not place split {sym} factor={split} on host_coords="
-                f"{host_coords}; returning empty_view"
+                f"could not place split h={h} factor={split} on "
+                f"stride_map={stride_map} device_size={device_size}; "
+                f"returning empty_view"
             )
             return unrepresentable
         work_slice_dims[dev_dim] = split
@@ -1577,14 +1576,14 @@ def _per_core_view_from_prep(
     else:
         _mapping_func = _get_core_to_slice_mapping
     core_to_slot_by_name = _mapping_func(iter_space, per_sym, num_cores)
-    # Re-key by the buffer's host-dim index (canonical) instead of the op's
+    # Re-key by the buffer's device-dim index (canonical) instead of the op's
     # iter symbol name. Two ops with the same per-core slicing on this buffer
     # compare equal even if they name their iter axes differently.
     pruned_core_to_slot: list[tuple[int, "Expr"]] = []
-    for sym, host_dim in sym_to_host_dim.items():
+    for sym, dev_dim in sym_to_device_dim.items():
         expr = core_to_slot_by_name.get(str(sym))
         if expr is not None:
-            pruned_core_to_slot.append((host_dim, expr))
+            pruned_core_to_slot.append((dev_dim, expr))
     pruned_core_to_slot.sort(key=lambda x: x[0])
 
     view = PerCoreView(

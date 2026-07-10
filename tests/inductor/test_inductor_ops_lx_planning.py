@@ -30,7 +30,6 @@ _test_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(_test_dir)
 
 import inductor.test_inductor_ops  # noqa: E402
-from torch_spyre._inductor import config as _lx_config  # noqa: E402
 
 tests_lx_planning_run_skips: bool = (
     os.environ.get("TEST_LX_PLANNING_RUN_SKIPS", "1") == "1"
@@ -149,53 +148,7 @@ INHERITED_TEST_ATTRIBUTES = [
 ]
 
 POINTWISE_TEST_FAILURES = []
-
-# Coherence cases the ILP allocator fixes (core-division choice + frame
-# barriers) but the greedy allocator still fails:
-_GREEDY_ONLY_POINTWISE_FAILURES = [
-    "test_matmul_matmul_55x2_2x99",
-    "test_matmul_tiled_y",
-    "test_mm_mm_55x2_2x99",
-]
-
-_GREEDY_ONLY_REDUCTION_FAILURES = [
-    "test_add_alpha_add_alpha_0.5_6x7x12x256_6x7x12x256",
-    "test_add_alpha_add_alpha_2_6x7x12x256_6x7x12x256",
-    "test_add_alpha_add_alpha_neg_6x7x12x256_6x7x12x256",
-    "test_matmul_tiled_y",
-    "test_round_trip_to_dtype_add_float16_to_float32_4x8x128",
-    "test_round_trip_to_dtype_implicit_add_float16_to_float32_4x8x128",
-    "test_slice_add_3d1s0",
-    "test_slice_add_3d1s1",
-    "test_slice_add_3d1s2",
-    "test_slice_add_3d2s0",
-    "test_slice_add_3d2s1",
-    "test_slice_add_3d2s2",
-]
-
-# Fail only under the ILP allocator (e.g. mm_67x67: backend partial-stick on
-# a pinned matmul output):
-_ILP_ONLY_POINTWISE_FAILURES = [
-    "test_mm_mm_67x67_67x67",
-]
-
-_ILP_ONLY_REDUCTION_FAILURES = []
-
-# The joint core-division + LX-placement allocator (CoOptimizingAllocator) is
-# selected by layout_solver == "cpsat" (OR-Tools CP-SAT). The _ILP_ONLY_* /
-# _GREEDY_ONLY_* deltas distinguish that co-optimizing allocator from the
-# greedy/bestfit/firstfit placement-only path.
-_USE_COOPT_FAILURES = _lx_config.layout_solver == "cpsat"
-POINTWISE_TEST_FAILURES = _COMMON_POINTWISE_FAILURES + (
-    _ILP_ONLY_POINTWISE_FAILURES
-    if _USE_COOPT_FAILURES
-    else _GREEDY_ONLY_POINTWISE_FAILURES
-)
-REDUCTION_TEST_FAILURES = _COMMON_REDUCTION_FAILURES + (
-    _ILP_ONLY_REDUCTION_FAILURES
-    if _USE_COOPT_FAILURES
-    else _GREEDY_ONLY_REDUCTION_FAILURES
-)
+REDUCTION_TEST_FAILURES = []
 
 
 class _LxPlanningTwoOpTestBase(unittest.TestCase):

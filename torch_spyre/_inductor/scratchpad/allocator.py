@@ -124,7 +124,7 @@ class ScratchpadAllocator(ABC):
         self.reject_reasons: dict[str, str] = {}
         self.pre_optimization_passes = pre_optimization_passes
         self.post_optimization_passes = post_optimization_passes
-        self.layout_planning = layout_planning
+        self.layout_planning: Optional[MemoryPlanSolver[Any]] = layout_planning
 
     def plan_allocation(self, graph: GraphLowering):
         """Run pre-passes, assign LX addresses to eligible buffers, then run post-passes.
@@ -137,6 +137,7 @@ class ScratchpadAllocator(ABC):
         for p in self.pre_optimization_passes:
             p.apply_pass(graph)
         buffers = self._generate_buffers(graph)
+        assert self.layout_planning is not None
         allocation = self.layout_planning.plan_layout(buffers, log_lx_usage=True)
         for b in allocation:
             if b.address is None:
@@ -204,7 +205,10 @@ class ScratchpadAllocator(ABC):
         graph: GraphLowering,
         cache: Optional[dict] = None,
     ) -> list[Operation]:
-        core_div_mismatch = get_ncores_for_buffers(graph, cache)
+        core_div_reasons: dict[str, str] = {}
+        core_div_mismatch = get_ncores_for_buffers(
+            graph, cache, reject_reasons_out=core_div_reasons
+        )
         drop_list = set()
 
         # filter out by permitted operations
@@ -685,6 +689,7 @@ class DefaultAllocator(ScratchpadAllocator):
         # CpSatLayoutSolver additionally gets the parent-edge slicing matches.
         # TODO: Refactor to combine this with default allocator behavior
         buffers = _as_core_division_buffers(buffers, graph)
+        assert self.layout_planning is not None
         allocation = self.layout_planning.plan_layout(buffers, log_lx_usage=True)
         for b in allocation:
             if b.address is None:
@@ -1152,6 +1157,7 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
             cache=None if clone_inserted else search_cache,
             lifetimes=None if clone_inserted else search_lifetimes,
         )
+        assert self.layout_planning is not None
         allocation = self.layout_planning.plan_layout(buffers, log_lx_usage=True)
         for b in allocation:
             if b.address is None:
@@ -1268,6 +1274,7 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
         (split-invariant) is forwarded to avoid recomputing it per leaf.
         """
         buffers = self._generate_buffers(graph, cache, timings, lifetimes)
+        assert self.layout_planning is not None
         allocation = self.layout_planning.plan_layout(buffers)
         pinned_names = {b.name for b in allocation if b.address is not None}
 

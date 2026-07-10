@@ -338,7 +338,9 @@ def _op_num_cores(op: Operation) -> int:
 
 
 def get_ncores_for_buffers(
-    graph: GraphLowering | GraphView, cache: Optional[dict] = None
+    graph: GraphLowering | GraphView,
+    cache: Optional[dict] = None,
+    reject_reasons_out: Optional[dict[str, str]] = None,
 ) -> dict[str, int]:
     """
     Return a dictionary mapping buffer names to the number of cores
@@ -349,8 +351,7 @@ def get_ncores_for_buffers(
     Pass an optional `cache` dict to memoize `_per_core_view_on_buf`
     results across calls (e.g. across co-opt search leaves). Safe to
     share only within a single graph, since the cache key includes the
-    op name and `dep` (which carries the buffer name). `rw_cache`
-    ({op name: ReadWrites}) likewise memoizes get_read_writes().
+    op name and `dep` (which carries the buffer name).
 
     Pass an optional `reject_reasons_out` dict to receive detailed
     reasons for core division mismatches (keyed by buffer name).
@@ -402,11 +403,9 @@ def get_ncores_for_buffers(
                     # into LX) or when a producer's view happens to match the
                     # broadcast footprint -- cases the `view != ref_view` check
                     # below cannot see.
-                    # work_slice_dims entries are (host-dim, (work_div, tile));
-                    # the per-dim core count is the work_div factor.
-                    view_cores = math.prod(
-                        work_div for _, (work_div, _tile) in view.work_slice_dims
-                    )
+                    # work_slice_dims entries are (device-dim, split factor);
+                    # the per-dim core count is the split factor.
+                    view_cores = math.prod(f for _, f in view.work_slice_dims)
                     if view_cores != _op_num_cores(op):
                         mismatch_reason = (
                             f"broadcast read on '{op.get_name()}': view covers "
