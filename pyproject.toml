@@ -34,7 +34,7 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 cpsat = [ # OR-Tools CP-SAT LX layout solver (layout_solver='cpsat' / LAYOUT_SOLVER=cpsat)
-    "ortools",
+    "ortools>=9.0",
 ]
 build = [ # no-isolation build
     # any change here should be reflected in the build system above
