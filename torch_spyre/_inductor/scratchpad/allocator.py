@@ -136,6 +136,14 @@ class ScratchpadAllocator:
         for p in self.pre_optimization_passes:
             p.apply_pass(graph)
         buffers = self._generate_buffers(graph)
+        # CoreDivisionBuffer subclasses LifetimeBoundBuffer and the placement
+        # solvers read only the base fields, so every solver accepts the converted
+        # buffers (LSP); convert unconditionally rather than probing the solver.
+        # The conversion keeps each buffer's already-per-core size and a trivial
+        # division, so the placement solvers see the same footprint as before while
+        # CpSatLayoutSolver additionally gets the parent-edge slicing matches (it
+        # requires core_divisions on every buffer).
+        buffers = _as_core_division_buffers(buffers, graph)
         assert self.layout_planning is not None
         allocation = self.layout_planning.plan_layout(buffers, log_lx_usage=True)
         for b in allocation:
@@ -1234,7 +1242,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         When the CP-SAT solver is unavailable (``ortools`` not installed) or a
         solve produces no feasible plan, planning falls back to the placement-only
-        :class:`DefaultAllocator` (greedy) so a ``layout_solver="cpsat"`` request
+        :class:`ScratchpadAllocator` (greedy) so a ``layout_solver="cpsat"`` request
         degrades to a correct plan instead of aborting the compile. The greedy
         path does not co-optimize core division, but every op keeps its
         upstream-chosen division, so the result is correct -- just less optimal.
@@ -1273,7 +1281,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         """Run pre-passes, jointly solve core-division + LX placement, commit the
         chosen divisions, then run post-passes.
 
-        Falls back to the greedy :class:`DefaultAllocator` when the CP-SAT solver
+        Falls back to the greedy :class:`ScratchpadAllocator` when the CP-SAT solver
         is unavailable.
         """
         self.reject_reasons = {}
@@ -1480,7 +1488,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         mis-address a single LX base), would not produce a backGapCore_ (the
         backend supports backGap for HBM but not LX), and is actually read.
         Otherwise it stays non-resident (carrying the reason) so it doesn't
-        orphan its neighbours. The reason strings mirror the ``DefaultAllocator``
+        orphan its neighbours. The reason strings mirror the ``ScratchpadAllocator``
         ``reject_reasons`` vocabulary where the checks overlap.
 
         Note: core-division consistency is *not* pre-filtered here (unlike the
@@ -1827,13 +1835,13 @@ def select_allocator() -> ScratchpadAllocator:
       core-division + LX placement via :class:`CoOptimizingAllocator` (with a
       built-in greedy fallback).
     * ``layout_solver == "cpsat"`` without co-optimization -> placement-only
-      :class:`DefaultAllocator` driven by the CP-SAT solver, placing buffers on
+      :class:`ScratchpadAllocator` driven by the CP-SAT solver, placing buffers on
       each op's pre-determined core division (the buffers are converted to
       trivial ``CoreDivisionBuffer``s). Falls back to greedy when ortools is
       absent.
     * ``co_optimizing_lx_planning`` (non-cpsat solver) -> gap-based
       co-optimization via :class:`StrategyBCoOptimizingAllocator`.
-    * otherwise -> placement-only :class:`DefaultAllocator` with the configured
+    * otherwise -> placement-only :class:`ScratchpadAllocator` with the configured
       gap-based solver (greedy/bestfit/firstfit).
     """
     size = _lx_planning_size()

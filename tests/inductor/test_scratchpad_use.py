@@ -1218,7 +1218,7 @@ class TestSelectAllocator(unittest.TestCase):
     def test_dispatch_by_config(self):
         from torch_spyre._inductor.scratchpad.allocator import (
             CoOptimizingAllocator,
-            DefaultAllocator,
+            ScratchpadAllocator,
             StrategyBCoOptimizingAllocator,
             select_allocator,
         )
@@ -1231,14 +1231,14 @@ class TestSelectAllocator(unittest.TestCase):
             layout_solver="greedy", co_optimizing_lx_planning=False
         ):
             a = select_allocator()
-            self.assertIs(type(a), DefaultAllocator)
+            self.assertIs(type(a), ScratchpadAllocator)
             self.assertIsInstance(a.layout_planning, GreedyLayoutSolver)
 
         with ts_inductor_config.patch(
             layout_solver="bestfit", co_optimizing_lx_planning=False
         ):
             a = select_allocator()
-            self.assertIs(type(a), DefaultAllocator)
+            self.assertIs(type(a), ScratchpadAllocator)
             self.assertIsInstance(a.layout_planning, BestFitLayoutSolver)
 
         with ts_inductor_config.patch(
@@ -1252,13 +1252,13 @@ class TestSelectAllocator(unittest.TestCase):
         ):
             self.assertIsInstance(select_allocator(), CoOptimizingAllocator)
 
-        # cpsat without co-optimization is placement-only: a DefaultAllocator
+        # cpsat without co-optimization is placement-only: a ScratchpadAllocator
         # driven by the CP-SAT solver on the pre-determined core divisions.
         with ts_inductor_config.patch(
             layout_solver="cpsat", co_optimizing_lx_planning=False
         ):
             a = select_allocator()
-            self.assertIs(type(a), DefaultAllocator)
+            self.assertIs(type(a), ScratchpadAllocator)
             if _HAS_ORTOOLS:
                 from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
                     CpSatLayoutSolver,
