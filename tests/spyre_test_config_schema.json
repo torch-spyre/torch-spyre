@@ -200,6 +200,11 @@
           },
           "description": "Pytest marks applied to all variants of all tests in 'names'."
         },
+        "no_grad": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run all variants of all tests in 'names' under torch.no_grad(). Spyre's custom ops have no registered autograd formula, so tests that build modules/tensors with requires_grad=True but never call backward() (e.g. upstream's ModuleInfo-based test_forward) must opt in to avoid AOTAutograd tracing a backward graph at compile time."
+        },
         "edits": { "$ref": "#/$defs/TestEdits" }
       }
     },
