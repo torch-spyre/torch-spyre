@@ -21,6 +21,31 @@ from . import config
 from .scheduler import CountedLoopSchedulerNode
 
 
+def _op_count(node: BaseSchedulerNode) -> int:
+    """Number of leaf SchedulerNodes represented by ``node``."""
+    return len(node.get_nodes())
+
+
+def _can_extend_bundle(
+    cur_nodes: list[SchedulerNode | CountedLoopSchedulerNode],
+    candidate: SchedulerNode | CountedLoopSchedulerNode,
+) -> bool:
+    """Return True if ``candidate`` may join the current (non-empty) bundle.
+
+    Phase-1 policy (see the design doc):
+      * Reduction isolation: a reduction op is never fused with anything else,
+        keeping RMSNorm reduction dims out of a kernel that also holds GQA
+        broadcast / KV-cache transpose dims (the DDL-unmappable combination).
+      * Op-count cap: a bundle holds at most ``config.max_fused_ops`` leaf ops.
+    """
+    if candidate.is_reduction():
+        return False
+    if any(n.is_reduction() for n in cur_nodes):
+        return False
+    total = sum(_op_count(n) for n in cur_nodes) + _op_count(candidate)
+    return total <= config.max_fused_ops
+
+
 def _make_fused(
     nodes: list[SchedulerNode | CountedLoopSchedulerNode],
 ) -> BaseSchedulerNode | None:

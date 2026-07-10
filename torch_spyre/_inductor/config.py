@@ -51,6 +51,14 @@ sencores: int = int(os.getenv("SENCORES", "32"))
 # TODO: confirm the default with the Deeptools team.
 max_buckets: int = int(os.getenv("MAX_BUCKETS", "32"))
 
+# Max number of leaf ops fused into one SuperDSC bundle. Backstop against
+# kernels too large for the external DDL dimension mapper (see
+# docs/superpowers/specs/2026-07-10-limit-fusion-ddl-mapper-design.md).
+# Reduction isolation in fusion.py is the primary safety mechanism; this cap
+# is insurance. TODO(calibrate): finalize default in Task 4 against
+# ministral/qwen3/olmo2/gemma3.
+max_fused_ops: int = int(os.getenv("SPYRE_MAX_FUSED_OPS", "16"))
+
 # Soft floor on the auto-derived granularity when mark_dynamic(min=...)
 # is not provided. Keeps the picked granularity from collapsing to a
 # very small divisor when max_size has many of them.
