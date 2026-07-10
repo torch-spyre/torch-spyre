@@ -618,7 +618,7 @@ def collect_tensor_deps(
 ) -> tuple[list[TensorDep], TensorDep]:
     """Build TensorDep lists for inputs and the output of op."""
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
-    rw = op.get_read_writes()
+    rw = op_read_writes(op)
     output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))
     return input_tds, output_td
 
@@ -636,7 +636,7 @@ def apply_splits(
     if cores_used <= 1:
         return
 
-    rw = op.get_read_writes()
+    rw = op_read_writes(op)
     write_index = output_td.dep.index
     first_read = next(iter(rw.reads), None)
     read_index = first_read.index if first_read is not None else write_index
@@ -966,7 +966,7 @@ def work_distribution_pass(
     # Recover splits committed by span_reduction_pass using the same
     # coeff-keyed encoding that codegen uses — stable across passes.
     if hasattr(op, "op_it_space_splits"):
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         min_splits = apply_splits_from_index_coeff(
@@ -1443,7 +1443,7 @@ def span_reduction(graph: GraphLowering) -> None:
     operations = graph.operations
     max_cores = _validate_max_cores()
     for op in _iter_computed_buffers(operations):
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         args = _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw))
         if isinstance(op.data, Pointwise):
             divide_pointwise_op(op, args, max_cores, span_reduction_pass)
@@ -1465,7 +1465,7 @@ def work_distribution(
     for op in _iter_computed_buffers(operations):
         if op in preassigned_ops:
             continue
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         args = _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw))
         if isinstance(op.data, Pointwise):
             divide_pointwise_op(op, args, max_cores, work_distribution_pass)
@@ -1490,7 +1490,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
         # User hints take ownership of the split decision; do not override them.
         return False
 
-    rw = op.get_read_writes()
+    rw = op_read_writes(op)
     args = get_mem_deps_from_rw(rw)
     input_tds, output_td = collect_tensor_deps(op, args)
     all_tds = input_tds + [output_td]

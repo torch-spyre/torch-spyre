@@ -1252,12 +1252,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         ``post_optimization_passes`` (default none) run before / after layout
         planning.
 
-        When the CP-SAT solver is unavailable (``ortools`` not installed) or a
-        solve produces no feasible plan, planning falls back to the placement-only
-        :class:`ScratchpadAllocator` (greedy) so a ``layout_solver="cpsat"`` request
-        degrades to a correct plan instead of aborting the compile. The greedy
-        path does not co-optimize core division, but every op keeps its
-        upstream-chosen division, so the result is correct -- just less optimal.
+        When the CP-SAT solver is unavailable (``ortools`` not installed),
+        planning falls back to the placement-only :class:`ScratchpadAllocator`
+        (greedy) so a ``layout_solver="cpsat"`` request degrades to a correct
+        plan instead of aborting the compile. The greedy path does not
+        co-optimize core division, but every op keeps its upstream-chosen
+        division, so the result is correct -- just less optimal.
         """
         size = _lx_planning_size()
         if pre_optimization_passes is None:
@@ -1268,7 +1268,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         self.pre_optimization_passes = pre_optimization_passes
         self.post_optimization_passes = post_optimization_passes
 
-        # Greedy fallback for when CP-SAT is unavailable or finds no plan.
+        # Greedy fallback for when CP-SAT is unavailable (ortools not installed).
         self._fallback = ScratchpadAllocator(layout_planning=GreedyLayoutSolver(size))
 
         self.layout_planning: Optional[MemoryPlanSolver[CoreDivisionBuffer]]

@@ -96,6 +96,19 @@ def op_read_writes(op: Operation) -> ReadWrites:
     return rw
 
 
+def invalidate_op_read_writes(op: Operation) -> None:
+    """Drop any memoized :func:`op_read_writes` result for ``op``.
+
+    Call this immediately after mutating an op's dependencies in place -- e.g.
+    swapping a load name in its ``inner_fn`` -- so the next
+    :func:`op_read_writes` re-traces instead of returning stale reads/writes.
+    The memo is keyed on the op instance and is otherwise never invalidated: its
+    result is independent of ``op_it_space_splits`` (the only thing the LX
+    planner normally mutates), so a plain split change needs no invalidation.
+    """
+    op.__dict__.pop("_ts_cached_read_writes", None)
+
+
 def concretize_expr(expr: Union[Expr, int]) -> int:
     """Concretize a sympy expression to a Python int.
 

@@ -21,6 +21,7 @@ from torch_spyre._inductor.pass_utils import (
     iteration_space_from_op,
     splits_by_index_coeff,
     op_read_writes,
+    invalidate_op_read_writes,
 )
 from torch._inductor.virtualized import V
 from torch._inductor.ir import (
@@ -295,6 +296,11 @@ class GraphEditor:
             old_loop.data, name_map={old_name: new_name}
         )
         old_loop.data = new_loop
+        # inner_fn now loads new_name in place of old_name, so this op's
+        # get_read_writes() changes; drop its memoized entry so any later
+        # op_read_writes() re-traces instead of returning the pre-swap reads.
+        # TODO: Contemplate automating there to make the cache opaque.
+        invalidate_op_read_writes(old_loop)
 
     class _NameSwapHandler(WrapperHandler):
         def __init__(self, inner, name_map: dict[str, str]):
