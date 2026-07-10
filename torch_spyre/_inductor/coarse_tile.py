@@ -1795,6 +1795,20 @@ def _resize_device_layout(
     ndev = len(orig_sm)
     ndim = len(old_host_size)
 
+    # Trust a caller-provided stick_host_dim only when it is consistent with the
+    # device tile-count structure: the stick host dim must have a corresponding
+    # tile-count device dim of size ceil(size/eps).  Identity recovery can be
+    # imperfect for permuted layouts (an ambiguous inner-stick coordinate match),
+    # and a wrong label would otherwise *override* correct size-based inference
+    # and break reconstruction.  When it does not validate, drop it and fall back.
+    if stick_host_dim is not None:
+        if not (0 <= stick_host_dim < ndim):
+            stick_host_dim = None
+        else:
+            expected_tc = -(-int(old_host_size[stick_host_dim]) // eps)  # ceil
+            if expected_tc not in [int(s) for s in orig_ds[:-1]]:
+                stick_host_dim = None
+
     old_hs = [int(s) for s in FlexibleLayout.contiguous_strides(old_host_size)]
     new_hs = [int(s) for s in FlexibleLayout.contiguous_strides(new_host_size)]
 
