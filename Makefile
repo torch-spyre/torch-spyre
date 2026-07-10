@@ -51,7 +51,8 @@ precommit: ## Run all pre-commit hooks against every file
 # ---------------------------------------------------------------------------
 
 .PHONY: tests
-tests: ## Run torch spyre tests. Narrow scope with TEST_TYPE=smoke|core|full|suite_<group>.
+tests: ## Run torch spyre tests. Narrow scope with TEST_TYPE=smoke|core|full|suite_<group>. TEST_CONFIGS may point at a config directory (filtered by TEST_TYPE) or a single config yaml file (run directly).
+ifneq ($(wildcard $(TEST_CONFIGS)/.),)
 	$(eval _PATHS := $(shell python3 $(FILTER_SCRIPT) \
 		--config-dir $(TEST_CONFIGS) \
 		--test-type "$(TEST_TYPE)" \
@@ -61,6 +62,13 @@ tests: ## Run torch spyre tests. Narrow scope with TEST_TYPE=smoke|core|full|sui
 		exit 1; \
 	fi
 	@TORCH_SPYRE_TEST_TYPE="$(TEST_TYPE)" bash tests/run_test.sh $(_PATHS) $(PYTEST_ARGS)
+else
+	@if [ ! -f "$(TEST_CONFIGS)" ]; then \
+		echo "ERROR: TEST_CONFIGS not found (expected a directory or a config file): $(TEST_CONFIGS)" >&2; \
+		exit 1; \
+	fi
+	@TORCH_SPYRE_TEST_TYPE="$(TEST_TYPE)" bash tests/run_test.sh $(TEST_CONFIGS) $(PYTEST_ARGS)
+endif
 
 
 # ---------------------------------------------------------------------------
