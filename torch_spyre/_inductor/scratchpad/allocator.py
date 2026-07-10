@@ -201,13 +201,8 @@ class ScratchpadAllocator:
             return False
         if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
             return False
-        return (
-            config.allow_all_ops_in_lx_planning
-            or (self._get_op_name(op) in OP_OUTPUT_GOOD_FOR_LX_REUSE)
-            # Clones are only pinned when the boundary-clone path is on; they
-            # are never in the whitelist, so without this they'd be ineligible
-            # and the inserted clones would not land in LX.
-            or (config.lx_boundary_clones and self._get_op_name(op) == "clone")
+        return config.allow_all_ops_in_lx_planning or (
+            self._get_op_name(op) in OP_OUTPUT_GOOD_FOR_LX_REUSE
         )
 
     def _op_inputs_good_for_lx_inplace(self, op: Any) -> list[str]:

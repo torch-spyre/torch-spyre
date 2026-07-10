@@ -267,7 +267,6 @@ class _ParameterizedScratchpadMeta(type):
         "solver_method": lambda v: str(v),
         "sencores": lambda v: f"sc{v}",
         "co_optimization": lambda v: "coopt" if v else "nocoopt",
-        "boundary_clones": lambda v: "clones" if v else "noclones",
     }
 
     @staticmethod
@@ -345,7 +344,6 @@ class ParameterizedScratchpadUsage(
         "co_optimization": (False, True)
         if ts_inductor_config.co_optimizing_lx_planning
         else (False,),
-        "boundary_clones": (False, True),
     }
 
     parameter_models = (("softmax", _softmax_case), ("mlp", _mlp_case))
@@ -358,7 +356,6 @@ class ParameterizedScratchpadUsage(
             layout_solver=params["solver_method"],
             sencores=params["sencores"],
             co_optimizing_lx_planning=params["co_optimization"],
-            lx_boundary_clones=params["boundary_clones"],
         ):
             model, args, kwargs = factory(self)
             torch.compiler.reset()
@@ -455,10 +452,9 @@ class TestCloneAtGraphBoundaries(BaseTestScratchpadUsage):
     - graph outputs that are also read inside the graph get a clone (for the HBM return
       value), while the original buffer is pinned to LX
 
-    Enabling ``lx_boundary_clones`` flips ``clone_at_graph_boundaries()`` on and
-    makes the inserted clone outputs LX-eligible, so the boundary clone path is
-    exercised. This class applies that patch itself at the test-case level (in
-    ``_compile_and_inspect``), so every compile here runs with it on.
+    Boundary cloning (``clone_at_graph_boundaries()``) is always on, making the
+    inserted clone outputs LX-eligible, so this class exercises that path
+    directly.
     """
 
     def _compile_and_inspect(
@@ -488,9 +484,8 @@ class TestCloneAtGraphBoundaries(BaseTestScratchpadUsage):
                 }
 
         with self.pre_scheduling_iterating_pass(visitor):
-            with ts_inductor_config.patch(lx_boundary_clones=True):
-                compiled_kernel = torch.compile(f, fullgraph=True)
-                raw = compiled_kernel(*args)
+            compiled_kernel = torch.compile(f, fullgraph=True)
+            raw = compiled_kernel(*args)
             if isinstance(raw, tuple):
                 result = tuple(r.to("cpu") for r in raw)
             else:
@@ -740,7 +735,6 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
                 layout_solver="greedy",
                 sencores=32,
                 co_optimizing_lx_planning=True,
-                lx_boundary_clones=True,
             ):
                 compiled = torch.compile(model, fullgraph=True)
                 device_result = compiled(*args).to("cpu")
