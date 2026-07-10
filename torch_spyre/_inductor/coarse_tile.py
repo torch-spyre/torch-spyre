@@ -927,11 +927,15 @@ def _allocate_full_buffer(
         # scatter copy op computes correct device addresses.
         full_size_ints = [int(s) for s in full_ranges]
         tile_size_ints = [int(s) for s in orig_layout.size]
+        # Authoritative stick host dim from coordinate identity (issue #3116);
+        # None falls back to size-based inference inside _resize_device_layout.
+        stick_hd = _stick_host_dim(tiled_op, orig_layout.device_layout)
         try:
             device_layout = _resize_device_layout(
                 orig_layout.device_layout,
                 tile_size_ints,
                 full_size_ints,
+                stick_host_dim=stick_hd,
             )
         except RuntimeError:
             # Non-standard device layout (e.g. post-restickify HBM strides that
@@ -1656,6 +1660,50 @@ def _stamp_group(
     return retiled_infos
 
 
+def _stick_host_dim(op, device_layout) -> int | None:
+    """Authoritative stick host-dim index for ``op``'s output, recovered from
+    coordinate identity (issue #3116).
+
+    ``SpyreTensorLayout`` discards its ``dim_map`` at construction, so the
+    host<->device dim identity is not carried on the layout object.  We recover
+    only the stick host dim: the device layout's inner-stick coordinate has a
+    single iteration symbol that also drives exactly one host coordinate, so
+    ``matching_dim`` resolves it unambiguously — even when two host dims share a
+    size (transposed flash-attn QK^T with ``Sq == Skv``), which defeats the
+    size-based inference in ``_resize_device_layout``.
+
+    This is the same identity mechanism ``_pick_stick_dim`` uses to choose a
+    stick dim, so it is as reliable as the existing stick logic.  Returns
+    ``None`` when identity cannot be resolved (single-symbol match not unique),
+    so the caller falls back to size-based inference.
+
+    The stick host dim is invariant under coarse tiling (tiling shrinks a range
+    but does not change which axis is the stick), so this may be computed either
+    before or after ``_divide_ranges`` mutates the ranges.
+    """
+    from .pass_utils import (
+        host_coordinates,
+        indirect_sizes_from_op,
+        try_device_coordinates,
+    )
+    from .views import matching_dim
+
+    try:
+        writes = op.get_read_writes().writes
+        if not writes:
+            return None
+        out_dep = next(iter(writes))
+        ind_sizes = indirect_sizes_from_op(op)
+        dcoords = try_device_coordinates(device_layout, out_dep, ind_sizes)
+        if not dcoords:
+            return None
+        hcoords = host_coordinates(op.get_layout(), out_dep, ind_sizes)
+        return matching_dim(hcoords, dcoords[-1])
+    except Exception:
+        # Identity recovery is best-effort; any failure falls back to inference.
+        return None
+
+
 def _resize_device_layout(
     orig_stl,
     old_host_size: list[int],
@@ -2000,8 +2048,12 @@ def _divide_ranges(
     for i in tiled_dims:
         old_host_size[i] = int(new_size[i] * loop_count)
     new_size_ints = [int(s) for s in new_size]
+    # Recover the authoritative stick host dim from coordinate identity so
+    # _resize_device_layout does not have to infer it by size (ambiguous for
+    # transposed same-size dims — issue #3116). Tiling-invariant, so safe here.
+    stick_hd = _stick_host_dim(op, layout.device_layout)
     layout.device_layout = _resize_device_layout(
-        layout.device_layout, old_host_size, new_size_ints
+        layout.device_layout, old_host_size, new_size_ints, stick_host_dim=stick_hd
     )
     return retiled_info
 
