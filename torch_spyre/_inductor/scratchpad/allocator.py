@@ -146,23 +146,7 @@ class ScratchpadAllocator:
             p.apply_pass(graph)
 
     def _get_op_name(self, op: Any) -> str:
-        # Resolve the op's short name from its origin_node target first, then
-        # fall back to each fused fx node in op.origins. origin_node is always
-        # tried first (independent of origins, which may be empty), so a plain
-        # op still resolves; the origins fallback recovers a fused op like
-        # bmm+permute, whose origin_node target has no resolvable name and would
-        # otherwise resolve to "None" and be wrongly rejected as "op not allowed".
-        name = None
-        for fx_node in (getattr(op, "origin_node", None), *getattr(op, "origins", ())):
-            target = getattr(fx_node, "target", None)
-            name = (
-                getattr(target, "_opname", None)
-                or getattr(target, "__name__", None)
-                or getattr(target, "name", None)
-            )
-            if name is not None:
-                break
-        return name if name is not None else "None"
+        return _op_short_name(op)
 
     def _op_output_good_for_lx_reuse(self, op: Any) -> bool:
         if not isinstance(op, ComputedBuffer):
@@ -471,6 +455,30 @@ class ScratchpadAllocator:
         layout.allocation["lx"] = address
 
 
+def _op_short_name(op: Any) -> str:
+    """Resolve an op's short name from its ``origin_node`` target, falling back
+    to each fused fx node in ``op.origins``; ``"None"`` when unresolvable.
+
+    ``origin_node`` is tried first (independent of ``origins``, which may be
+    empty), so a plain op still resolves; the ``origins`` fallback recovers a
+    fused op like bmm+permute, whose ``origin_node`` target has no resolvable
+    name and would otherwise resolve to ``"None"`` and be wrongly rejected as
+    "op not allowed". Module-level so ``ScratchpadAllocator._get_op_name`` and the
+    module-level buffer conversion share one implementation.
+    """
+    name = None
+    for fx_node in (getattr(op, "origin_node", None), *getattr(op, "origins", ())):
+        target = getattr(fx_node, "target", None)
+        name = (
+            getattr(target, "_opname", None)
+            or getattr(target, "__name__", None)
+            or getattr(target, "name", None)
+        )
+        if name is not None:
+            break
+    return name if name is not None else "None"
+
+
 def _lx_planning_size() -> int:
     """LX scratchpad bytes available to the layout solver."""
     return int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
@@ -616,6 +624,21 @@ def _as_core_division_buffers(
         # Restrict in-place parents to candidates: the solver indexes its buffer
         # dict by every merge parent, so a filtered-out parent would KeyError.
         in_place = [p for p in b.in_place_parents if p in candidate_names]
+        # Restickify cross-frame barrier (see
+        # ``ScratchpadAllocator._residency_reason``): the hazard is one-sided --
+        # only a buffer a restickify *reads* must stay in HBM, because a per-core
+        # LX slice of the restickify output could otherwise need another core's
+        # slice of the input. Marked non-resident directly here so the CP-SAT
+        # solver force-spills it up front (placement=False), matching the joint
+        # path. The restickify's *output* is not barred: given the input is HBM it
+        # is a normal core-local write. TODO(follow-up): a precise cross-STL gate
+        # would relax even the read side for the core-local cases.
+        residency_reason: Optional[str] = None
+        if any(
+            c in op_by_name and _op_short_name(op_by_name[c]) == "restickify"
+            for c in consumers_of.get(b.name, ())
+        ):
+            residency_reason = "read by restickify (cross-frame barrier)"
         converted.append(
             CoreDivisionBuffer(
                 b.name,
@@ -628,6 +651,7 @@ def _as_core_division_buffers(
                 parents=parents,
                 cd_parent_matches=cd_parent_matches,
                 unallocated_reads=unallocated_reads,
+                residency_reason=residency_reason,
             )
         )
     return converted
@@ -1523,6 +1547,20 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         non-mutation ``ComputedBuffer`` that is read in full."""
         if op is None or not self._op_output_good_for_lx_reuse(op):
             return "op not allowed"
+        # Restickify moves the stick dimension: its per-core read frame and write
+        # frame are transposes, so a per-core (LX) slice of the OUTPUT can need
+        # bytes from another core's slice of the INPUT. That hazard is one-sided
+        # -- it only bites when the input is core-sliced in LX. So the barrier is
+        # asymmetric: a buffer a restickify *reads* must stay in HBM (global HBM
+        # reads let each core gather its whole output slice), while the
+        # restickify's *output* is fine in LX given that -- a normal core-local
+        # write, read back in its single new-STL frame -- so it is not barred here
+        # (it takes the normal residency + slicing-match path). TODO(follow-up): a
+        # precise cross-STL gate (split axis non-stick in both the pre- and
+        # post-restickify layouts) would relax even the read side for the
+        # core-local cases.
+        if any(self._get_op_name(graph.operations[u]) == "restickify" for u in uses):
+            return "read by restickify (cross-frame barrier)"
         if any(isinstance(graph.operations[u], ExternKernel) for u in uses):
             return "extern kernel user"
         if name in mutated_buffers:
@@ -1652,17 +1690,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         """
         if consumer_op is None:
             return {}
-        # A restickify moves the stick dimension, so its per-core read frame and
-        # write frame are transposes of each other. The per-core view comparison
-        # below runs in a single buffer's device-dim frame and cannot see that
-        # cross-frame transpose, so it would wrongly accept a match and pin a
-        # buffer the restickify actually reads/writes across core boundaries
-        # (wholesale-wrong). Treat restickify as a coherence barrier: a buffer a
-        # restickify reads can't be pinned for it (consumer-side), and a
-        # restickify's output can't be a resident producer (producer-side).
-        # Both fall back to HBM, where the restickify is globally correct.
-        if self._get_op_name(consumer_op) == "restickify":
-            return {}
         matches: dict[str, list[tuple[int, int]]] = {}
         consumer_reads = op_read_writes(consumer_op).reads
         for parent in parent_names:
@@ -1674,8 +1701,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 continue
             parent_divs = divisions[parent]
             parent_op = op_by_name[parent]
-            if self._get_op_name(parent_op) == "restickify":
-                continue
             if self._is_frame_changing_clone(parent_op, parent):
                 # A clone whose output has a dimension its input lacks
                 # broadcasts that dim (e.g. GQA broadcasting K/V over the

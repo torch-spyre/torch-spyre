@@ -1611,14 +1611,27 @@ def _per_core_view_on_buf(
     callers act on it only for write-deps. ``representable`` is False only on the
     give-up cases (a split that slices this buffer can't be placed on a device
     dim), which cross-op comparisons must treat as a non-match. Pass `cache` to
-    memoize, keyed by (op.op_it_space_splits, dep, buf_name).
+    memoize, keyed by (op name, op.op_it_space_splits, dep, buf_name).
+
+    The op name is part of the key because the result also depends on op-derived
+    write_index / read_index / iter_space / matmul-ness, not just (splits, dep,
+    buf_name): two different ops can share the same (splits, dep, buf_name) — e.g.
+    a producer's write-dep and a consumer's read-dep on the same buffer at the
+    same index — and must NOT alias the same entry (``_as_core_division_buffers``
+    shares one cache across a producer and consumer of the same buffer).
     """
     coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
     if cache is not None:
         # dicts aren't hashable; freeze each into a frozenset of items so
         # the key is hashable and order-independent.
         out, red = coeff_splits
-        key = (frozenset(out.items()), frozenset(red.items()), dep, buf_name)
+        key = (
+            op.get_name(),
+            frozenset(out.items()),
+            frozenset(red.items()),
+            dep,
+            buf_name,
+        )
         hit = cache.get(key)
         if hit is not None:
             return hit

@@ -137,7 +137,9 @@ def mem_usage_by_buf(
         ):
             mem_usage[buf_name] = {
                 "size": -1,
-                "size_per_core": -1 // num_cores,
+                # Unsized sentinel (mirrors "size"); the core_div_mismatch flag
+                # below carries validity, so no arithmetic on num_cores here.
+                "size_per_core": -1,
                 "core_div_mismatch": num_cores < 0,
                 "op_inputs": [dep.name for dep in rw.reads if dep.name in buf_names],
             }
@@ -370,7 +372,7 @@ def get_ncores_for_buffers(
             mismatch_reason = None
             writer_cores = None
             for op, dep in users:
-                view, flag, _ = _per_core_view_on_buf(op, dep, buf_name)
+                view, flag, _ = _per_core_view_on_buf(op, dep, buf_name, cache)
                 if ref_view is None:
                     ref_view = view
                 op_rw = op_read_writes(op)

@@ -43,6 +43,7 @@ Test sub-suites:
 | `TORCH_SPYRE_DEBUG=1` | Enable C++ debug logging and `-O0` builds |
 | `SENCORES` | Number of Spyre cores (1–32, default 32) |
 | `LX_PLANNING=1` | Enable LX scratchpad memory planning |
+| `LAYOUT_SOLVER` | LX layout solver: `greedy` (default), `firstfit`, `bestfit`, `cpsat` |
 | `TORCH_LOGS="+inductor"` | Verbose Inductor logging |
 | `TORCH_COMPILE_DEBUG=1` | Dump Inductor debug artifacts |
 | `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 downcast warnings |
