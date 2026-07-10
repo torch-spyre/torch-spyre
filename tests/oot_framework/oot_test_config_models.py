@@ -958,6 +958,7 @@ class TestEntry(BaseModel):
     mode: str = MODE_MANDATORY_SUCCESS
     tags: List[str] = []
     labels: List[str] = []
+    no_grad: bool = False
     edits: TestEdits = TestEdits()
 
     @field_validator("names", mode="before")

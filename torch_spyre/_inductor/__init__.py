@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
 from .constants import DEVICE_NAME
 from .patches import enable_spyre_context
 from . import config
@@ -19,12 +20,13 @@ from . import config
 import threading
 from functools import wraps
 
-from .propagate_hints import spyre_hint, get_op_hints  # noqa: F401
+from .propagate_hints import spyre_hint, get_op_hints, _reset_counter  # noqa: F401
 
 _autoload_lock = threading.Lock()
 
 
 def enable_spyre_compile_fx_wrapper():
+    from torch._dynamo.repro.after_dynamo import WrapBackendDebug
     import torch._inductor.compile_fx as cfx
     import torch.fx as fx
     import torch
@@ -118,6 +120,18 @@ def enable_spyre_compile_fx_wrapper():
                     )
 
             return _orig(gm, example_inputs, *args, **kwargs)
+
+        # Reset the global counter after each
+        # run to prevent recompilation
+        @contextmanager
+        def backend_context():
+            _reset_counter()
+            yield
+
+        def backend_ctx_ctor(self):
+            return backend_context
+
+        setattr(WrapBackendDebug, "backend_ctx_ctor", property(backend_ctx_ctor))
 
         cfx.compile_fx = _wrapper
         cfx._spyre_wrapped = True

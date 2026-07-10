@@ -46,6 +46,7 @@ from oot_framework.oot_upstream_patcher import (
     _OOTPrecisionOverridePatcher,
     _OOTNativeDeviceTypesPatcher,
     _OOTCpuMovePatcher,
+    _OOTNoGradPatcher,
     _OOTPlatformMarkerPatcher,
 )
 from oot_framework.oot_test_config_models import (
@@ -781,6 +782,18 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
                         marked_fn = pytest.mark.__getattr__(tag)(marked_fn)
                     setattr(cls, method_name, marked_fn)
                 _tags_to_write[method_name] = method_tags
+
+            # Spyre's custom ops have no registered autograd formula, so a
+            # test that builds modules/tensors with ordinary
+            # requires_grad=True and never calls backward() must run under
+            # torch.no_grad() to avoid AOTAutograd tracing a backward graph
+            # at compile time. Opt in per test entry via the YAML `no_grad`
+            # flag (e.g. upstream's ModuleInfo-based test_forward). See
+            # _OOTNoGradPatcher.
+            if resolved_entry is not None and resolved_entry.no_grad:
+                existing_fn = cls.__dict__.get(method_name)
+                if existing_fn is not None:
+                    setattr(cls, method_name, _OOTNoGradPatcher.wrap(existing_fn))
 
             # apply xfail if needed
             if is_xfail:
