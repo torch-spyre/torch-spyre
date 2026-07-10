@@ -24,6 +24,7 @@ from torch._inductor.ir import (
     ComputedBuffer,
     Operation,
     MutationLayoutSHOULDREMOVE,
+    ReinterpretView,
     Reduction,
     ExternKernel,
 )
@@ -282,6 +283,17 @@ class ScratchpadAllocator:
         in_place = {} if in_place is None else in_place
         buffers = []
         graph_output_names = set(graph.get_output_names())
+        # Graph outputs wrapped in a ReinterpretView (e.g. a transpose applied on
+        # top of an op's raw output, as SDPA does): output cloning
+        # (GraphEditor.change_graph_output / _replace_matching_buffer) does not
+        # currently know how to rewrap a ReinterpretView around the clone, so
+        # these must not be promoted as output-clone candidates below.
+        reinterp_buf_names = {
+            go.get_name()
+            for go in graph.graph_outputs
+            if isinstance(go, ReinterpretView)
+            or isinstance(getattr(go, "data", None), ReinterpretView)
+        }
         cloning_allowed = clone_at_graph_boundaries()
         for output_name, info in mem_usage.items():
             uses = lifetimes[output_name]
@@ -303,6 +315,9 @@ class ScratchpadAllocator:
                 # A pinned graph output is cloned for the HBM return; if a
                 # consumer reads it partially (sliced / multi-offset), SDSC
                 # mis-addresses the single-base LX buffer. Don't pin it.
+                continue
+            if output_name in reinterp_buf_names:
+                self.reject_reasons[output_name] = "graph output is a ReinterpretView"
                 continue
             buffers.append(
                 LifetimeBoundBuffer(
