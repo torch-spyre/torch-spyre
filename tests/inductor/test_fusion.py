@@ -72,6 +72,26 @@ class TestCanExtendBundle(InductorTestCase):
                 _can_extend_bundle([_FakeNode(count=2)], _FakeNode(count=2))
             )
 
+    def test_at_cap_boundary_allows(self):
+        # total == cap must be allowed (spec: reject only when total > cap).
+        with patch.object(config, "max_fused_ops", 3):
+            self.assertTrue(_can_extend_bundle([_FakeNode(), _FakeNode()], _FakeNode()))
+
+    def test_reduction_detected_via_leaf_not_container(self):
+        # A loop-group whose container reports non-reduction but wraps a
+        # reduction leaf must still be treated as a reduction. Guards against
+        # trusting the container's own is_reduction().
+        class _Group:
+            def is_reduction(self) -> bool:
+                return False  # container does not reflect its members
+
+            def get_nodes(self) -> list:
+                return [_FakeNode(), _FakeNode(reduction=True)]
+
+        with patch.object(config, "max_fused_ops", 100):
+            self.assertFalse(_can_extend_bundle([_FakeNode()], _Group()))
+            self.assertFalse(_can_extend_bundle([_Group()], _FakeNode()))
+
 
 class _FakeLeaf:
     """Fusible-node fake; registered via _FUSIBLE_NODE_TYPES in tests."""
@@ -136,6 +156,20 @@ class TestSpyreFuseNodes(InductorTestCase):
         nodes = [_FakeLeaf("a"), _FakeLeaf("b")]
         with patch.object(config, "bundle_symbolic_args", False):
             self.assertIs(spyre_fuse_nodes(nodes), nodes)
+
+    def test_non_fusible_node_forces_boundary(self):
+        # A node not in _FUSIBLE_NODE_TYPES (e.g. a Fallback) breaks the run and
+        # passes through as-is between the two surrounding bundles.
+        class _Fallback:
+            def get_name(self) -> str:
+                return "f"
+
+        fb = _Fallback()
+        out = self._run([_FakeLeaf("a"), fb, _FakeLeaf("b")], cap=100)
+        self.assertEqual(len(out), 3)
+        self.assertEqual([n.get_name() for n in out[0]], ["a"])
+        self.assertIs(out[1], fb)
+        self.assertEqual([n.get_name() for n in out[2]], ["b"])
 
 
 if __name__ == "__main__":

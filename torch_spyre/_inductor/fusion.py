@@ -30,6 +30,16 @@ def _op_count(node: BaseSchedulerNode) -> int:
     return len(node.get_nodes())
 
 
+def _is_reduction(node: BaseSchedulerNode) -> bool:
+    """True if ``node`` or any leaf it wraps is a reduction.
+
+    Inspects leaves via ``get_nodes()`` rather than trusting a container's own
+    ``is_reduction()``, so a ``CountedLoopSchedulerNode`` wrapping a reduction
+    is classified correctly regardless of how the container delegates.
+    """
+    return any(leaf.is_reduction() for leaf in node.get_nodes())
+
+
 def _can_extend_bundle(
     cur_nodes: list[SchedulerNode | CountedLoopSchedulerNode],
     candidate: SchedulerNode | CountedLoopSchedulerNode,
@@ -42,9 +52,9 @@ def _can_extend_bundle(
         broadcast / KV-cache transpose dims (the DDL-unmappable combination).
       * Op-count cap: a bundle holds at most ``config.max_fused_ops`` leaf ops.
     """
-    if candidate.is_reduction():
+    if _is_reduction(candidate):
         return False
-    if any(n.is_reduction() for n in cur_nodes):
+    if any(_is_reduction(n) for n in cur_nodes):
         return False
     total = sum(_op_count(n) for n in cur_nodes) + _op_count(candidate)
     return total <= config.max_fused_ops
