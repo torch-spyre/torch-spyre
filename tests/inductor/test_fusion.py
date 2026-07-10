@@ -18,7 +18,12 @@ from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.test_case import run_tests
 
 from torch_spyre._inductor import config
-from torch_spyre._inductor.fusion import _can_extend_bundle, _op_count
+from torch_spyre._inductor import fusion
+from torch_spyre._inductor.fusion import (
+    _can_extend_bundle,
+    _op_count,
+    spyre_fuse_nodes,
+)
 
 
 class _FakeNode:
@@ -66,6 +71,71 @@ class TestCanExtendBundle(InductorTestCase):
             self.assertFalse(
                 _can_extend_bundle([_FakeNode(count=2)], _FakeNode(count=2))
             )
+
+
+class _FakeLeaf:
+    """Fusible-node fake; registered via _FUSIBLE_NODE_TYPES in tests."""
+
+    def __init__(self, name: str, reduction: bool = False, count: int = 1) -> None:
+        self._name = name
+        self._reduction = reduction
+        self._count = count
+
+    def is_reduction(self) -> bool:
+        return self._reduction
+
+    def get_nodes(self) -> list:
+        return [self] * self._count
+
+    def get_name(self) -> str:
+        return self._name
+
+
+def _grouped_names(out) -> list:
+    # _make_fused is patched to return the node list, so each group is a list.
+    return [[n.get_name() for n in g] for g in out]
+
+
+class TestSpyreFuseNodes(InductorTestCase):
+    def _ctx(self, cap):
+        # Patch the fusible-type gate to accept _FakeLeaf and make _make_fused
+        # return the raw list so we can assert boundaries without building a
+        # real FusedSchedulerNode.
+        return [
+            patch.object(config, "bundle_symbolic_args", True),
+            patch.object(config, "max_fused_ops", cap),
+            patch.object(fusion, "_FUSIBLE_NODE_TYPES", (_FakeLeaf,)),
+            patch.object(fusion, "_make_fused", lambda ns: list(ns)),
+        ]
+
+    def _run(self, nodes, cap):
+        ctxs = self._ctx(cap)
+        for c in ctxs:
+            c.start()
+        try:
+            return spyre_fuse_nodes(nodes)
+        finally:
+            for c in reversed(ctxs):
+                c.stop()
+
+    def test_reduction_isolated_into_own_bundle(self):
+        out = self._run(
+            [_FakeLeaf("a"), _FakeLeaf("r", reduction=True), _FakeLeaf("b")], cap=100
+        )
+        self.assertEqual(_grouped_names(out), [["a"], ["r"], ["b"]])
+
+    def test_cap_splits_long_run(self):
+        out = self._run([_FakeLeaf(str(i)) for i in range(5)], cap=2)
+        self.assertEqual([len(g) for g in out], [2, 2, 1])
+
+    def test_op_exceeding_cap_survives_as_singleton(self):
+        out = self._run([_FakeLeaf("big", count=5), _FakeLeaf("n")], cap=2)
+        self.assertEqual(_grouped_names(out), [["big"], ["n"]])
+
+    def test_no_fusion_when_symbolic_args_off(self):
+        nodes = [_FakeLeaf("a"), _FakeLeaf("b")]
+        with patch.object(config, "bundle_symbolic_args", False):
+            self.assertIs(spyre_fuse_nodes(nodes), nodes)
 
 
 if __name__ == "__main__":

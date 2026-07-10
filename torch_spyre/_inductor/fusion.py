@@ -20,6 +20,10 @@ from torch._inductor.scheduler import (
 from . import config
 from .scheduler import CountedLoopSchedulerNode
 
+# Node types that participate in SuperDSC bundling. Module-level so tests can
+# substitute lightweight fakes.
+_FUSIBLE_NODE_TYPES: tuple = (SchedulerNode, CountedLoopSchedulerNode)
+
 
 def _op_count(node: BaseSchedulerNode) -> int:
     """Number of leaf SchedulerNodes represented by ``node``."""
@@ -73,7 +77,11 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     cur_nodes: list[SchedulerNode | CountedLoopSchedulerNode] = []
 
     for n in nodes:
-        if isinstance(n, (SchedulerNode, CountedLoopSchedulerNode)):
+        if isinstance(n, _FUSIBLE_NODE_TYPES):
+            if cur_nodes and not _can_extend_bundle(cur_nodes, n):
+                if fused := _make_fused(cur_nodes):
+                    fused_nodes.append(fused)
+                cur_nodes = []
             cur_nodes.append(n)
         else:
             # Other node types (eg Fallback nodes) force a bundle boundary.
