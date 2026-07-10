@@ -269,9 +269,9 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
             return len(children_of.get(sb.name, [])) + sb.buffer.unallocated_reads
 
         hbm_terms = [
-            _spill_weight(sb) * sb.buffer.size * (1 - sb.in_buffer)
+            weight * (1 - sb.in_buffer)
             for sb in tensors.values()
-            if _spill_weight(sb) * sb.buffer.size
+            if (weight := _spill_weight(sb) * sb.buffer.size)
         ]
         if hbm_terms:
             model.minimize(sum(hbm_terms))

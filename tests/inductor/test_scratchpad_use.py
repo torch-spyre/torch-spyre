@@ -811,10 +811,19 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
     plans which achieve desirable performance. New plans should be profiled
     before making these test more permissive.
 
-    The acceptance criterion for each model (its prescribed fingerprint) is
-    defined *once* in that model's factory and swept over the ``solver_method``
-    axis by ``_ParameterizedScratchpadMeta``. The prescribed plans are the
-    *greedy* StrategyB plans; the joint CP-SAT allocator
+    NOTE: this suite is intentionally *disabled* today. Unlike
+    ``ParameterizedScratchpadUsage`` / ``TestCpSatAllocatorFallback`` it does not
+    set ``metaclass=_ParameterizedScratchpadMeta``, so no ``test_*`` methods are
+    generated and nothing is collected -- the co-optimization compiles are too
+    slow to run on every CI job. The ``parameter_axes`` / ``parameter_models`` /
+    ``case_decorators`` / ``run_case`` machinery below is ready; re-enable the
+    suite by attaching the metaclass once ``cpsat`` becomes the default
+    ``layout_solver``. (This omission is deliberate, not a dropped metaclass.)
+
+    When enabled: the acceptance criterion for each model (its prescribed
+    fingerprint) is defined *once* in that model's factory and swept over the
+    ``solver_method`` axis by ``_ParameterizedScratchpadMeta``. The prescribed
+    plans are the *greedy* StrategyB plans; the joint CP-SAT allocator
     (``layout_solver="cpsat"``) optimises core division and placement jointly
     and is expected to land on a different (not yet pinned-down) plan, so the
     ``cpsat`` combos are marked ``expectedFailure`` via ``case_decorators``.
