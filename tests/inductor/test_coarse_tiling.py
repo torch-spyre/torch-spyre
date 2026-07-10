@@ -987,6 +987,35 @@ class TestDivideRanges(unittest.TestCase):
         expected = SpyreTensorLayout([64], [1], torch.float16, [0])
         self.assertEqual(result, expected)
 
+    def test_resize_device_layout_transposed_same_size_dims_ambiguous(self):
+        """Characterization test for issue #3116.
+
+        Flash-attention QK^T output: logical [B, H, Sq, Skv] with Sq == Skv,
+        stored transposed.  The device layout is byte-identical whether Sq or
+        Skv is the stick dim (device_size=[32,512,8,1,64],
+        stride_map=[512,16384,64,-1,1]), so ``_resize_device_layout``'s
+        size-based elimination + contiguous-stride tiebreak cannot tell the two
+        size-512 host dims apart and raises.
+
+        This pins the *current* (pre-refactor) failure.  Phase 2 threads
+        authoritative dim identity (named dims) into ``_resize_device_layout``
+        so the stick host dim is known by label rather than inferred from
+        magnitudes; when that lands, this test is updated to assert the correct
+        reconstruction instead of the raise.
+        """
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.coarse_tile import _resize_device_layout
+
+        dev = SpyreTensorLayout([1, 1], torch.float16).device_dtype
+        # Transposed QK^T output: Skv (dim3) is the stick; Sq (dim2) is a
+        # non-stick dim of the same size (512), so they collide by size.
+        stl = SpyreTensorLayout([32, 512, 8, 1, 64], [512, 16384, 64, -1, 1], dev)
+        host_size = [1, 32, 512, 512]
+
+        # Size-based elimination cannot disambiguate the two size-512 dims.
+        with self.assertRaises(RuntimeError):
+            _resize_device_layout(stl, host_size, [1, 32, 256, 512])
+
 
 def _mock_op_out_coords(op):
     """Return pre-built coords stored on op by _make_hinted_op, or empty list."""
