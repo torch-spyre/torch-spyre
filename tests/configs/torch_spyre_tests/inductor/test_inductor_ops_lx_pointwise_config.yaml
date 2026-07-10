@@ -1,0 +1,37 @@
+# LX-planning shard: inductor_ops family 'pointwise', both wrap classes
+# (LxPlanningTwoOpPointwiseAdditionTest '(x + x) / 2' and
+#  LxPlanningTwoOpReductionTest 'torch.sum(x, dim=0)').
+#
+# Auto-split of test_inductor_ops_lx_planning.py, mirroring the
+# test_inductor_ops.py config sharding. The full (non-truncated) test
+# set is enabled in CI via TEST_LX_PLANNING_FULL=1 + TEST_LX_PLANNING_RUN_SKIPS=1
+# (see .github/workflows/_test_matrix.yaml). The xfail lists below are
+# the source of truth for known LX-planning failures (the in-file .py
+# skip-lists were removed as duplicates).
+test_suite_config:
+  labels: [full]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_planning.py
+      unlisted_test_mode: skip
+      tests:
+        # Known LX-planning failures -- run and expected to fail. Non-strict
+        # xfail: an unexpected pass (XPASS) does not fail CI. Entries failing
+        # in both wraps collapse to (pointwise|reduction).
+        - names:
+            - LxPlanning.*::test_alias_operands_cube_67x256_lx_planning_reduction
+            - LxPlanning.*::test_alias_operands_cube_67x71x256_lx_planning_reduction
+            - LxPlanning.*::test_alias_operands_double_67x71x256_lx_planning_reduction
+            - LxPlanning.*::test_alias_operands_triple_67x256_lx_planning_reduction
+            - LxPlanning.*::test_alias_operands_triple_67x71x256_lx_planning_reduction
+            - LxPlanning.*::test_pointwise_binary_op_div_67x256_67x256_lx_planning_reduction
+            - LxPlanning.*::test_pointwise_binary_op_div_67x71x256_67x71x256_lx_planning_reduction
+            - LxPlanning.*::test_pointwise_range_op_clamp_fp16_lx_planning_reduction
+            - LxPlanning.*::test_pointwise_unary_op_reciprocal_67x71x256_lx_planning_reduction
+            - LxPlanning.*::test_pointwise_binary_op_add_67x71x256_67x71x256_lx_planning_reduction
+            - LxPlanning.*::test_pointwise_binary_op_sub_67x71x256_67x71x256_lx_planning_reduction
+          mode: xfail
+        - names:
+            - LxPlanning.*::test_(pointwise|sqrt|rsqrt|log_|alias_operands|cmp|logical_not|bool|eq_scalar|scalar_(comparison|multidim|vs_tensor)_base|scalar_comparison_simple1|eq_scalar_constant_int).*_lx_planning_(pointwise|reduction)
+          mode: mandatory_success
+          tags:
+            - ops__inductor-pointwise

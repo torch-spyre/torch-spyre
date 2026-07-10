@@ -113,6 +113,12 @@ def _preserve_shared_weight_unit_bmm_dim(
         ]
 
     target_args = (args[0], args[-1])
+    # The unit-BMM marker is only valid for plain rank-3 BMMs after layout
+    # construction. If a target tensor still carries extra physical axes, such
+    # as attention heads from SDPA, rewriting one axis into the BMM iteration
+    # space can produce an illegal SDSC layout.
+    if any(len(arg.device_size) > 4 for arg in target_args):
+        return it_space
     unit_idxs_by_arg = [_unit_indices(arg) for arg in target_args]
 
     if all(len(unit_idxs) == 0 for unit_idxs in unit_idxs_by_arg):
@@ -727,13 +733,21 @@ class SpyreKernel(Kernel[CSEVariable]):
         # Pool buffers are intermediates whose address is baked into the TensorArg
         # allocation dict; registering them as outputs would overflow SEGMENT_OFFSETS.
         # (lx buffers are already excluded from spyre_kernel_args in _tensor_arg.)
-        if "pool" not in layout.allocation:
+        # Also skip buffers marked as removed by Inductor's optimizer (e.g., by LX )
+        # This can occur when SDPA decomposition creates intermediate
+        # buffers that later get marked as dead code.
+        real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
+        is_removed = real_dst_name in V.graph.removed_buffers
+        if "pool" not in layout.allocation and not is_removed:
             # Pass the alias here, not real_dst_name: args.output resolves the
             # mutation alias internally. (load() passes the pre-resolved real
             # name to args.input, which does not resolve.)
             _ = self.args.output(name)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        dst = TensorAccess(real_dst_name, index, layout)
+        dst = TensorAccess(name, index, layout)
+        if real_dst_name != name:
+            # Skip allocating an output buffer; this name is an alias to another buffer
+            V.graph.removed_buffers.add(name)
         op_info: dict[str, Any] = {}
         if logger.isEnabledFor(logging.DEBUG):
             value_type = type(value).__name__

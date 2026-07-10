@@ -30,6 +30,7 @@ import sys
 import os
 import regex as re
 
+import pytest
 import torch
 import unittest
 from unittest.mock import patch as mock_patch
@@ -769,6 +770,10 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         # is numerically wrong (~90% element mismatch).  Investigate and fix
         # before re-adding spyre_hint(num_tiles_per_dim={"Lk": lk_slices}).
         """
+        if not config.unroll_loops:
+            pytest.xfail(
+                "UNROLL_LOOPS=0: nested scf.for loops not yet correct in backend"
+            )
         import math
         from torch_spyre._inductor import spyre_hint
 
@@ -1370,6 +1375,48 @@ class TestNamedDimsHint(InductorTestCase):
         self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
         self.assertIn("sympify('2')", src, "Expected loop count 2")
 
+    @config.patch(
+        {
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_named_dims_hint_self_contained_no_driver_calls(self):
+        """spyre_hint(named_dims=[...]) alone enables coarse tiling.
+
+        Unlike the tests above, this omits the driver-side declare_tensor_dim /
+        name_tensor_dims calls entirely.  It locks in the in-graph path: the
+        named_dims hint must (1) self-enable propagate_named_dims and (2)
+        self-register the dim sizes, so the tiling hint resolves without any
+        driver bootstrapping.  This is how a decomposition names its own
+        intermediate dims (e.g. the flash SDPA decomposition).
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        M, K = 256, 64
+
+        def fn(x):
+            with spyre_hint(slices={"M": 4}, named_dims=["M", "K"]):
+                bias = torch.full(x.shape, 0.5, dtype=x.dtype, device=x.device)
+            return x + bias
+
+        x = torch.randn(M, K, dtype=torch.float16)
+        x_dev = x.to("spyre")
+        # Deliberately NO _declare_tensor_dim / _name_tensor_dims here.
+
+        cfn = torch.compile(fn)
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, x_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
+        self.assertIn("sympify('4')", src, "Expected loop count 4")
+
 
 class TestCoarseTileReductionE2E(InductorTestCase):
     """E2E tests for coarse-tiling a reduction dimension.
@@ -1912,6 +1959,47 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
             src,
             "Expected tile-sized accum TensorArg with lx allocation for nested M+K tiling",
         )
+
+
+# ===========================================================================
+# UNROLL_LOOPS=0 variants
+#
+# Each class below inherits all test methods from its base.  The class-level
+# @config.patch sets unroll_loops=False for every inherited test.  Tests that
+# are known to give wrong results under the scf.for path already contain
+#   ``if not config.unroll_loops: pytest.xfail(...)``
+# guards, so they are reported as xfail here rather than FAILED.
+#
+# Tests whose method-level @config.patch overrides unroll_loops (e.g.
+# test_hint_unrolled_source_calls_sdsc explicitly sets unroll_loops=True)
+# are unaffected: the method decorator wins over the class decorator and
+# those tests run — and pass — with their own explicit setting.
+# ===========================================================================
+
+
+@config.patch({"unroll_loops": False})
+class TestCoarseTileSpyreHintsUnroll0(TestCoarseTileSpyreHints):
+    pass
+
+
+@config.patch({"unroll_loops": False})
+class TestNamedDimsHintUnroll0(TestNamedDimsHint):
+    pass
+
+
+@config.patch({"unroll_loops": False})
+class TestCoarseTileReductionE2EUnroll0(TestCoarseTileReductionE2E):
+    pass
+
+
+@config.patch({"unroll_loops": False})
+class TestCoarseTileReductionDim0E2EUnroll0(TestCoarseTileReductionDim0E2E):
+    pass
+
+
+@config.patch({"unroll_loops": False})
+class TestCoarseTileNestedReductionE2EUnroll0(TestCoarseTileNestedReductionE2E):
+    pass
 
 
 if __name__ == "__main__":

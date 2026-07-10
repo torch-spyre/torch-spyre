@@ -90,7 +90,7 @@ bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 # for the scf.for / affine.apply path.
 unroll_loops: bool = os.environ.get("UNROLL_LOOPS", "1") == "1"
 
-# Layout solver class used by default in scratchpad.allocator.DefaultAllocator.
+# Layout solver class used by default in scratchpad.allocator.ScratchpadAllocator.
 # Options:
 #  "greedy":   GreedyLayoutSolver (default),
 #  "bestfit":  BestFitLayoutSolver,

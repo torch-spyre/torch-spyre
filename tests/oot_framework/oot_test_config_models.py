@@ -120,20 +120,38 @@ class InputTensorSpec(BaseModel):
     def resolved_dtype(self) -> torch.dtype:
         return _resolve_dtype_str(self.dtype)
 
-    def build(self, *, seed: Optional[int]) -> torch.Tensor:
+    def _effective_dtype(self, dtype_override: Optional[torch.dtype]) -> torch.dtype:
+        """Resolve the dtype to build this tensor with.
+
+        The YAML-declared dtype is honored as-is for non-floating specs (e.g.
+        int64 position_ids), which must not change with the dtype variant
+        under test. Floating-point specs follow `dtype_override` when given,
+        so the same YAML spec can be exercised at float16/float32/bfloat16
+        without diverging from the module's own parameter dtype (which the
+        upstream @modules dtype sweep casts separately via module.to(dtype)).
+        """
+        resolved = self.resolved_dtype()
+        if dtype_override is not None and resolved.is_floating_point:
+            return dtype_override
+        return resolved
+
+    def build(
+        self, *, seed: Optional[int], dtype: Optional[torch.dtype] = None
+    ) -> torch.Tensor:
         """Build and return a CPU tensor according to this spec.
 
         Uses PyTorch's upstream make_tensor utility for consistency with
-        upstream test patterns.
+        upstream test patterns. `dtype`, if given, overrides the YAML's
+        declared dtype for floating-point specs only (see _effective_dtype).
         """
         try:
             from torch.testing._internal.common_utils import make_tensor
         except ImportError:
             # Fallback to direct torch functions if make_tensor not available
-            return self._build_fallback(seed=seed)
+            return self._build_fallback(seed=seed, dtype=dtype)
 
         shape = list(self.shape)
-        dtype = self.resolved_dtype()
+        dtype = self._effective_dtype(dtype)
         init = self.init
         ia = self.init_args
 
@@ -209,10 +227,12 @@ class InputTensorSpec(BaseModel):
 
         return t
 
-    def _build_fallback(self, *, seed: Optional[int]) -> torch.Tensor:
+    def _build_fallback(
+        self, *, seed: Optional[int], dtype: Optional[torch.dtype] = None
+    ) -> torch.Tensor:
         """Fallback tensor builder when make_tensor is not available."""
         shape = list(self.shape)
-        dtype = self.resolved_dtype()
+        dtype = self._effective_dtype(dtype)
         init = self.init
         ia = self.init_args
 
@@ -392,6 +412,42 @@ def _parse_input_arg(raw: Any) -> InputArg:
     )
 
 
+def _dtypes_from_input_arg(arg: "InputArg") -> Set[torch.dtype]:
+    """Return the dtype(s) baked into a single positional arg, if any."""
+    if isinstance(arg, InputArgTensor):
+        return {arg.tensor.resolved_dtype()}
+    if isinstance(arg, InputArgTensorList):
+        return {spec.resolved_dtype() for spec in arg.tensor_list}
+    return set()
+
+
+def _dtypes_from_kwarg_value(v: Any) -> Set[torch.dtype]:
+    """Return the dtype(s) baked into a raw (unparsed) kwarg value, if any.
+
+    Kwarg values are stored as raw dicts until ``resolved_kwargs()`` builds
+    them, so a tensor/tensor_list spec is recognized the same way
+    ``resolved_kwargs()`` recognizes it: by its dict keys.
+    """
+    if isinstance(v, dict):
+        if "tensor" in v:
+            return {InputTensorSpec(**v["tensor"]).resolved_dtype()}
+        if "tensor_list" in v:
+            return {InputTensorSpec(**t).resolved_dtype() for t in v["tensor_list"]}
+    return set()
+
+
+def _dtypes_from_inputs_edits(edits: Optional["InputsEdits"]) -> Set[torch.dtype]:
+    """Collect every dtype baked into an InputsEdits' args/kwargs tensor specs."""
+    if edits is None:
+        return set()
+    dtypes: Set[torch.dtype] = set()
+    for arg in edits.args:
+        dtypes |= _dtypes_from_input_arg(arg)
+    for v in edits.kwargs.values():
+        dtypes |= _dtypes_from_kwarg_value(v)
+    return dtypes
+
+
 def _move_to_test_device(obj: Any, test_device: Optional[torch.device]) -> Any:
     """Move built tensors (or lists of tensors) to the target test device.
 
@@ -443,19 +499,29 @@ class InputsEdits(BaseModel):
         seed: Optional[int],
         op_name: str = "",
         test_device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
     ) -> List[Any]:
-        """Build all positional args on CPU. Delegates to InputTensorSpec.build()."""
+        """Build all positional args on CPU. Delegates to InputTensorSpec.build().
+
+        `dtype`, if given, is applied to floating-point tensor specs only (see
+        InputTensorSpec._effective_dtype), so the dtype variant under test is
+        reflected in the built inputs rather than always using the YAML's
+        literal dtype.
+        """
         cpu_args: List[Any] = []
         for i, arg in enumerate(self.args):
             inp_seed = None if seed is None else seed + i * 1000
 
             if isinstance(arg, InputArgTensor):
-                t = arg.tensor.build(seed=inp_seed)
+                t = arg.tensor.build(seed=inp_seed, dtype=dtype)
                 cpu_args.append(_move_to_test_device(t, test_device))
 
             elif isinstance(arg, InputArgTensorList):
                 lst = [
-                    spec.build(seed=(None if seed is None else seed + i * 1000 + j * 7))
+                    spec.build(
+                        seed=(None if seed is None else seed + i * 1000 + j * 7),
+                        dtype=dtype,
+                    )
                     for j, spec in enumerate(arg.tensor_list)
                 ]
                 cpu_args.append(_move_to_test_device(lst, test_device))
@@ -520,8 +586,15 @@ class InputsEdits(BaseModel):
         *,
         test_device: Optional[torch.device] = None,
         seed: Optional[int] = None,
+        dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, Any]:
         """Return kwargs with tensor specs built and dtype strings resolved.
+
+        `dtype`, if given, is applied to floating-point tensor/tensor_list
+        specs only (see InputTensorSpec._effective_dtype) so kwarg tensors
+        (e.g. hidden_states) follow the dtype variant under test the same
+        way positional args do, while non-floating kwargs (e.g. int64
+        position_ids) are unaffected.
 
         A kwarg value may itself be a tensor spec — a dict carrying one of
         ``tensor`` / ``tensor_list`` / ``config_path`` / ``value`` / ``py`` — just
@@ -554,12 +627,13 @@ class InputsEdits(BaseModel):
                 arg = _parse_input_arg(v)
                 inp_seed = None if seed is None else seed + 500000 + i * 131
                 if isinstance(arg, InputArgTensor):
-                    t = arg.tensor.build(seed=inp_seed)
+                    t = arg.tensor.build(seed=inp_seed, dtype=dtype)
                     out[k] = _move_to_test_device(t, test_device)
                 elif isinstance(arg, InputArgTensorList):
                     lst = [
                         spec.build(
-                            seed=(None if inp_seed is None else inp_seed + j * 7)
+                            seed=(None if inp_seed is None else inp_seed + j * 7),
+                            dtype=dtype,
                         )
                         for j, spec in enumerate(arg.tensor_list)
                     ]
@@ -646,6 +720,33 @@ class ModulesNamedItem(BaseModel):
                 values["forward_inputs"] = parsed_list
         return values
 
+    def resolved_input_dtypes(self) -> Set[torch.dtype]:
+        """Return the floating-point dtype(s) baked into this module's tensor specs.
+
+        edits.modules.include is additive: this is the sole source of
+        ModuleInfo.dtypes for a YAML-registered module (see
+        _register_custom_modules_from_edits), which in turn is the sole
+        determinant of which dtype variants @modules ever generates for it.
+        global.supported_dtypes only filters that set further (it can skip a
+        generated variant, never add one) -- so a dtype absent here is never
+        generated at all, no matter what global.supported_dtypes says.
+
+        Non-floating dtypes (e.g. int64 position_ids) are excluded: they are
+        never recast per dtype variant (see InputTensorSpec._effective_dtype)
+        and have no bearing on which dtype variants should be generated.
+        """
+        dtypes: Set[torch.dtype] = set()
+        dtypes |= _dtypes_from_inputs_edits(self.constructor_inputs)
+
+        forward_spec = self.forward_inputs or self.sample_inputs_func
+        if isinstance(forward_spec, list):
+            for spec in forward_spec:
+                dtypes |= _dtypes_from_inputs_edits(spec)
+        else:
+            dtypes |= _dtypes_from_inputs_edits(forward_spec)
+
+        return {d for d in dtypes if d.is_floating_point}
+
     def build_module_input(
         self,
         *,
@@ -653,6 +754,7 @@ class ModulesNamedItem(BaseModel):
         test_device: Optional[torch.device],
         FunctionInput,
         ModuleInput,
+        dtype: Optional[torch.dtype] = None,
     ) -> Any:
         """Build a ModuleInput from the config inputs.
 
@@ -664,7 +766,11 @@ class ModulesNamedItem(BaseModel):
         - forward_input: FunctionInput with args/kwargs for module.forward()
 
         FunctionInput and ModuleInput are passed in as arguments to avoid importing
-        torch.testing internals into this models file.
+        torch.testing internals into this models file. `dtype`, if given, is
+        applied to floating-point tensor specs only (see
+        InputTensorSpec._effective_dtype) so constructor/forward tensors match
+        the dtype variant the caller is currently exercising, the same way
+        module.to(dtype) recasts the module's own floating parameters.
         """
         # Build constructor inputs
         constructor_spec = self.constructor_inputs or InputsEdits()
@@ -672,8 +778,11 @@ class ModulesNamedItem(BaseModel):
             seed=seed,
             op_name=self.name,
             test_device=test_device,
+            dtype=dtype,
         )
-        constructor_kwargs = constructor_spec.resolved_kwargs(test_device=test_device)
+        constructor_kwargs = constructor_spec.resolved_kwargs(
+            test_device=test_device, dtype=dtype
+        )
         constructor_input = FunctionInput(*constructor_args, **constructor_kwargs)
 
         # Build forward inputs (prefer forward_inputs, fallback to sample_inputs_func for backward compat)
@@ -691,8 +800,11 @@ class ModulesNamedItem(BaseModel):
             seed=(None if seed is None else seed + 10000),  # Different seed for forward
             op_name=self.name,
             test_device=test_device,
+            dtype=dtype,
         )
-        forward_kwargs = forward_spec.resolved_kwargs(test_device=test_device)
+        forward_kwargs = forward_spec.resolved_kwargs(
+            test_device=test_device, dtype=dtype
+        )
         forward_input = FunctionInput(*forward_args, **forward_kwargs)
 
         return ModuleInput(

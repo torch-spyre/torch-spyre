@@ -17,6 +17,7 @@ from collections import Counter
 from typing import NamedTuple
 
 import logging
+import math
 
 import sympy
 import torch
@@ -66,6 +67,7 @@ from .pass_utils import (
     identify_matmul_inputs,
     host_coordinates,
     device_coordinates,
+    try_device_coordinates,
     indirect_info_from_op,
     is_stick_expr_offset_free,
     iter_var_id,
@@ -203,14 +205,37 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
     the layout after — which is not yet implemented.
     """
     for i, arg in enumerate(args):
+        representable = 0
         for stl in arg.layouts:
-            stick_expr = device_coordinates(stl, arg.dep, None)[-1]
+            coords = try_device_coordinates(stl, arg.dep, None)
+            if coords is None:
+                # This candidate layout has a stick expression the backend
+                # cannot represent (e.g. floor(var/N) from a cross-stick
+                # access). It is not a usable candidate, so skip it rather than
+                # aborting — another candidate for this input may be valid.
+                continue
+            representable += 1
+            stick_expr = coords[-1]
             if not is_stick_expr_offset_free(stick_expr, stl.elems_per_stick()):
                 raise Unsupported(
                     f"{op_label}: input arg{i} has stick expression with offset "
                     f"{stick_expr!r} (likely from slicing the stick dimension); "
                     f"this op requires a fixed input layout and double-restickify is not yet supported"
                 )
+        if arg.layouts and representable == 0:
+            # Every candidate layout for this input was unrepresentable. This
+            # is not fatal here, but the downstream layout selection will fail
+            # (find_stick_compatible_input_layout raises "cannot restickify any
+            # input layout"). Log the more specific cause so that error is
+            # easier to diagnose.
+            logger.warning(
+                "%s: all %d candidate layout(s) of input arg%d have "
+                "unrepresentable stick expressions; downstream layout "
+                "selection is expected to fail for this op.",
+                op_label,
+                len(arg.layouts),
+                i,
+            )
 
 
 def _rescale_stl_for_dtype(
@@ -586,19 +611,26 @@ def find_stick_compatible_input_layout(
     2. Else return the first layout that can be restickified to put reduction_var on the stick.
     3. Else raise Unsupported.
     """
-    arg_dev_coords = [device_coordinates(stl, arg.dep, None) for stl in arg.layouts]
+    # Skip candidates whose stick expression the backend cannot represent
+    # (e.g. floor(var/N) from a cross-stick access); they are not usable inputs
+    # and another candidate may work.
+    candidates = [
+        (stl, coords)
+        for stl in arg.layouts
+        if (coords := try_device_coordinates(stl, arg.dep, None)) is not None
+    ]
 
     # Pass 1: already stick-compatible.
     # stick_compatible() checks cross-tensor compatibility; here we only need
     # to know if this input's stick coord already carries the target loop variable.
-    for stl, dev_coords in zip(arg.layouts, arg_dev_coords):
+    for stl, dev_coords in candidates:
         if reduction_var in dev_coords[-1].free_symbols:
             return stl
 
     # Pass 2: can be restickified — find the resolvable device coord for reduction_var
     # and use it as target_stick_expr for compute_restickify_target_layout.
     arg_host_coords = host_coordinates(arg.layout, arg.dep, None)
-    for stl, dev_coords in zip(arg.layouts, arg_dev_coords):
+    for stl, dev_coords in candidates:
         target_stick_expr = _dev_coord_for_var(
             dev_coords, arg_host_coords, reduction_var
         )
@@ -854,6 +886,54 @@ def _multi_arg_pointwise_layouts(
             if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
                 continue
             _try_stick_dim(alt_stick_dim)
+
+    # LX in-place: promote a same-frame input's layout to FIRST so the beam
+    # commits it on a cost tie, avoiding a free-but-in-place-defeating permutation
+    # (allocator.py _determine_in_place). Two skips guard it:
+    #   - footprint mismatch: an fp8-unpack layout has a different total device
+    #     element count than the plain output, so its stride_map cannot tile the
+    #     output's host strides (copy_tensor rejects it at runtime).
+    #   - staggered EA present: the output EA is dictated by that input, so a
+    #     STANDARD promotion would corrupt the arrangement of downstream converts
+    #     (e.g. rmsnorm fp32-upcast: weight * x_normed.to(fp16)).
+    natural_footprints = {
+        math.prod([s for s in r.device_size if s > 0]) for r in results
+    }
+    for arg in args if not staggered_inputs else []:
+        if (
+            arg.layout.size != output.size
+            # Sympy structural (syntactic) equality: two semantically identical
+            # expressions with different variable names or term order compare
+            # unequal here. This is intentionally conservative — only inputs
+            # whose index is exactly the same expression as the output's qualify
+            # as same-frame candidates for in-place layout reuse.
+            or arg.dep.index != output_dep.index
+            or not same_device_size(arg.layout.dtype, output.dtype)
+        ):
+            continue
+        src_stl = next(iter(arg.layouts))
+        candidate = SpyreTensorLayout(
+            src_stl.device_size,
+            src_stl.stride_map,
+            get_device_dtype(output.dtype),
+        )
+        if (
+            math.prod([s for s in candidate.device_size if s > 0])
+            not in natural_footprints
+        ):
+            continue
+        # Stick must be offset-free; per-input feasibility is left to
+        # AllSameNode (INF-costs incompatible).
+        out_coord = device_coordinates(candidate, output_dep, ind_sizes)
+        if not is_stick_expr_offset_free(out_coord[-1], stick_size):
+            continue
+        # Move to front (or insert if new): the in-place layout must win on
+        # cost ties so the allocator's positional in-place check can fire.
+        key = (tuple(candidate.device_size), tuple(candidate.stride_map))
+        results = [
+            r for r in results if (tuple(r.device_size), tuple(r.stride_map)) != key
+        ]
+        results.insert(0, candidate)
 
     if not results:
         raise Unsupported(
