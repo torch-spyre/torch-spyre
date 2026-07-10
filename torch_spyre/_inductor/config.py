@@ -21,7 +21,7 @@ from .logging_utils import _get_env_bool
 
 lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
 co_optimizing_lx_planning: bool = (
-    os.environ.get("CO_OPTIMIZING_LX_PLANNING", "1") == "1"
+    os.environ.get("CO_OPTIMIZING_LX_PLANNING", "0") == "1"
 )
 hbm_planning: bool = _get_env_bool("SPYRE_INDUCTOR_MEMORY_PLAN", True)
 chunk_large_tensors: bool = os.environ.get("CHUNK_LARGE_TENSORS", "0") == "1"
@@ -90,7 +90,7 @@ bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 # for the scf.for / affine.apply path.
 unroll_loops: bool = os.environ.get("UNROLL_LOOPS", "1") == "1"
 
-# Layout solver class used by default in scratchpad.allocator.ScratchpadAllocator.
+# Layout solver class used by default in scratchpad.allocator.DefaultAllocator.
 # Options:
 #  "greedy":   GreedyLayoutSolver (default),
 #  "bestfit":  BestFitLayoutSolver,
@@ -100,7 +100,7 @@ unroll_loops: bool = os.environ.get("UNROLL_LOOPS", "1") == "1"
 
 # TODO(isuruf): Change to firstfit when deeptools PR4298 lands
 layout_solver: Literal["greedy", "bestfit", "firstfit", "cpsat"] = os.environ.get(
-    "LAYOUT_SOLVER", "cpsat"
+    "LAYOUT_SOLVER", "greedy"
 )  # type: ignore[assignment]
 
 install_config_module(sys.modules[__name__])
