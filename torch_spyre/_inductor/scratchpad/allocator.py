@@ -15,7 +15,6 @@
 import logging
 import math
 import time
-from abc import ABC
 from collections.abc import Sequence
 from typing import Any, Optional
 
@@ -80,7 +79,7 @@ from torch_spyre._inductor.pass_utils import _is_matmul_op
 logger = get_inductor_logger("scratchpad.allocator")
 
 
-class ScratchpadAllocator(ABC):
+class ScratchpadAllocator:
     """
     Class for allocating on scratchpad
     """
@@ -636,68 +635,6 @@ def _as_core_division_buffers(
             )
         )
     return converted
-
-
-class DefaultAllocator(ScratchpadAllocator):
-    def __init__(
-        self,
-        layout_planning: MemoryPlanSolver | None = None,
-        pre_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
-        post_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
-    ):
-        """Configure the allocator with an optional solver and graph passes.
-
-        Args:
-            layout_planning: Solver that assigns LX addresses to lifetime-bound
-                buffers. Defaults to GreedyLayoutSolver sized to available LX memory.
-            pre_optimization_passes: Graph passes applied before layout planning.
-                Defaults to no passes.
-            post_optimization_passes: Graph passes applied after layout planning.
-                Defaults to no passes.
-        """
-        # No config inspection here: the config -> (allocator, solver) mapping
-        # lives in ``select_allocator``. A bare ``DefaultAllocator()`` defaults to
-        # the greedy solver; any other solver is injected explicitly.
-        if layout_planning is None:
-            layout_planning = GreedyLayoutSolver(_lx_planning_size())
-        if pre_optimization_passes is None:
-            pre_optimization_passes = []
-        if post_optimization_passes is None:
-            post_optimization_passes = []
-
-        super().__init__()
-        self.pre_optimization_passes = pre_optimization_passes
-        self.post_optimization_passes = post_optimization_passes
-        self.layout_planning = layout_planning
-
-    def plan_allocation(self, graph: GraphLowering):
-        """Run pre-passes, assign LX addresses to eligible buffers, then run post-passes.
-
-        Args:
-            graph: Lowered graph whose buffers will be assigned LX scratchpad
-                addresses where viable.
-        """
-        self.reject_reasons = {}
-        for p in self.pre_optimization_passes:
-            p.apply_pass(graph)
-        buffers = self._generate_buffers(graph)
-        # CoreDivisionBuffer subclasses LifetimeBoundBuffer and the placement
-        # solvers read only the base fields, so every solver accepts the converted
-        # buffers (LSP); convert unconditionally rather than probing the solver.
-        # The conversion keeps each buffer's already-per-core size and a trivial
-        # division, so the placement solvers see the same footprint as before while
-        # CpSatLayoutSolver additionally gets the parent-edge slicing matches.
-        # TODO: Refactor to combine this with default allocator behavior
-        buffers = _as_core_division_buffers(buffers, graph)
-        assert self.layout_planning is not None
-        allocation = self.layout_planning.plan_layout(buffers, log_lx_usage=True)
-        for b in allocation:
-            if b.address is None:
-                self.reject_reasons[b.name] = "no room on scratchpad"
-        self._push_allocation(graph, allocation)
-        self._log_lx_pinning(graph)
-        for p in self.post_optimization_passes:
-            p.apply_pass(graph)
 
 
 DEFAULT_VARIANT_CAP = 6
@@ -1302,9 +1239,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         path does not co-optimize core division, but every op keeps its
         upstream-chosen division, so the result is correct -- just less optimal.
         """
-        super().__init__()
         size = _lx_planning_size()
-
         if pre_optimization_passes is None:
             pre_optimization_passes = []
         if post_optimization_passes is None:
@@ -1314,7 +1249,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         self.post_optimization_passes = post_optimization_passes
 
         # Greedy fallback for when CP-SAT is unavailable or finds no plan.
-        self._fallback = DefaultAllocator(layout_planning=GreedyLayoutSolver(size))
+        self._fallback = ScratchpadAllocator(layout_planning=GreedyLayoutSolver(size))
 
         self.layout_planning: Optional[MemoryPlanSolver[CoreDivisionBuffer]]
         try:
@@ -1913,7 +1848,7 @@ def select_allocator() -> ScratchpadAllocator:
                 "falling back to greedy solver. Make sure Or-Tools is available"
             )
             solver = GreedyLayoutSolver(size)
-        return DefaultAllocator(layout_planning=solver)
+        return ScratchpadAllocator(layout_planning=solver)
 
     try:
         solver_cls = _PLACEMENT_SOLVERS[config.layout_solver]
@@ -1925,7 +1860,7 @@ def select_allocator() -> ScratchpadAllocator:
 
     if config.co_optimizing_lx_planning:
         return StrategyBCoOptimizingAllocator(layout_planning=solver)
-    return DefaultAllocator(layout_planning=solver)
+    return ScratchpadAllocator(layout_planning=solver)
 
 
 def scratchpad_planning(
