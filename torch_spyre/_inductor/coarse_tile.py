@@ -1660,7 +1660,7 @@ def _stamp_group(
     return retiled_infos
 
 
-def _stick_host_dim(op, device_layout) -> int | None:
+def _stick_host_dim(op: ComputedBuffer, device_layout) -> int | None:
     """Authoritative stick host-dim index for ``op``'s output, recovered from
     coordinate identity (issue #3116).
 
@@ -1695,7 +1695,7 @@ def _stick_host_dim(op, device_layout) -> int | None:
         out_dep = next(iter(writes))
         ind_sizes = indirect_sizes_from_op(op)
         dcoords = try_device_coordinates(device_layout, out_dep, ind_sizes)
-        if not dcoords:
+        if not dcoords:  # None (unrepresentable stick) or empty → no identity
             return None
         hcoords = host_coordinates(op.get_layout(), out_dep, ind_sizes)
         return matching_dim(hcoords, dcoords[-1])
@@ -1806,7 +1806,7 @@ def _resize_device_layout(
             stick_host_dim = None
         else:
             expected_tc = -(-int(old_host_size[stick_host_dim]) // eps)  # ceil
-            if expected_tc not in [int(s) for s in orig_ds[:-1]]:
+            if expected_tc not in orig_ds[:-1]:
                 stick_host_dim = None
 
     old_hs = [int(s) for s in FlexibleLayout.contiguous_strides(old_host_size)]
