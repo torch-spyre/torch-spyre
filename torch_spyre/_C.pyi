@@ -21,6 +21,7 @@ __all__: list[str] = [
     "as_strided_with_layout",
     "empty_with_layout",
     "copy_tensor",
+    "fill_tensor",
     "encode_constant",
     "free_runtime",
     "get_device_dtype",
@@ -287,6 +288,16 @@ def copy_tensor(
 
     Args:
         self or dst: one of that must be on spyre device
+    """
+    ...
+
+def fill_tensor(self: torch.Tensor, value: float) -> torch.Tensor:
+    """
+    Fill a spyre tensor with a scalar value using device-side FillDMA.
+
+    Args:
+        self: the spyre tensor to fill (in-place)
+        value: the fill value (converted to the tensor's dtype pattern)
     """
     ...
 
