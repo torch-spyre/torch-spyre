@@ -215,7 +215,7 @@ class TestTracedDeviceCopy(unittest.TestCase):
         compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
         out = compiled(x)
         self.assertEqual(out.device.type, DEVICE)
-        torch.testing.assert_close(out.cpu(), fn(x).cpu(), atol=0.1, rtol=0.1)
+        torch.testing.assert_close(out.cpu(), fn(x).cpu(), atol=0.01, rtol=0.01)
 
 
 class TestReinterpretTensorCpuBuffer(unittest.TestCase):
@@ -246,7 +246,7 @@ class TestReinterpretTensorCpuBuffer(unittest.TestCase):
         compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
         out = compiled(x.to(spyre))
         self.assertEqual(out.device.type, DEVICE)
-        torch.testing.assert_close(out.cpu(), fn(x).cpu(), atol=0.1, rtol=0.1)
+        torch.testing.assert_close(out.cpu(), fn(x).cpu(), atol=0.01, rtol=0.01)
 
 
 class TestFallbackKernelPoolResidentArg(unittest.TestCase):
@@ -265,7 +265,7 @@ class TestFallbackKernelPoolResidentArg(unittest.TestCase):
         compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
         out = compiled(x.to(DEVICE))
         self.assertEqual(out.dtype, DTYPE)
-        torch.testing.assert_close(out.cpu(), fn(x), atol=0.1, rtol=0.1)
+        torch.testing.assert_close(out.cpu(), fn(x), atol=0.01, rtol=0.01)
 
     def test_inplace_arg_keeps_dtype(self):
         def fn(x):
@@ -280,7 +280,7 @@ class TestFallbackKernelPoolResidentArg(unittest.TestCase):
         compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
         out = compiled(x.clone().to(DEVICE))
         self.assertEqual(out.dtype, DTYPE)
-        torch.testing.assert_close(out.cpu(), fn(x.clone()), atol=0.1, rtol=0.1)
+        torch.testing.assert_close(out.cpu(), fn(x.clone()), atol=0.01, rtol=0.01)
 
 
 if __name__ == "__main__":
