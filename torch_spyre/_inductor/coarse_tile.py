@@ -927,11 +927,15 @@ def _allocate_full_buffer(
         # scatter copy op computes correct device addresses.
         full_size_ints = [int(s) for s in full_ranges]
         tile_size_ints = [int(s) for s in orig_layout.size]
+        # Authoritative stick host dim from coordinate identity (issue #3116);
+        # None falls back to size-based inference inside _resize_device_layout.
+        stick_hd = _stick_host_dim(tiled_op, orig_layout.device_layout)
         try:
             device_layout = _resize_device_layout(
                 orig_layout.device_layout,
                 tile_size_ints,
                 full_size_ints,
+                stick_host_dim=stick_hd,
             )
         except RuntimeError:
             # Non-standard device layout (e.g. post-restickify HBM strides that
@@ -1656,7 +1660,56 @@ def _stamp_group(
     return retiled_infos
 
 
-def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: list[int]):
+def _stick_host_dim(op: ComputedBuffer, device_layout) -> int | None:
+    """Authoritative stick host-dim index for ``op``'s output, recovered from
+    coordinate identity (issue #3116).
+
+    ``SpyreTensorLayout`` discards its ``dim_map`` at construction, so the
+    host<->device dim identity is not carried on the layout object.  We recover
+    only the stick host dim: the device layout's inner-stick coordinate has a
+    single iteration symbol that also drives exactly one host coordinate, so
+    ``matching_dim`` resolves it unambiguously — even when two host dims share a
+    size (transposed flash-attn QK^T with ``Sq == Skv``), which defeats the
+    size-based inference in ``_resize_device_layout``.
+
+    This is the same identity mechanism ``_pick_stick_dim`` uses to choose a
+    stick dim, so it is as reliable as the existing stick logic.  Returns
+    ``None`` when identity cannot be resolved (single-symbol match not unique),
+    so the caller falls back to size-based inference.
+
+    The stick host dim is invariant under coarse tiling (tiling shrinks a range
+    but does not change which axis is the stick), so this may be computed either
+    before or after ``_divide_ranges`` mutates the ranges.
+    """
+    from .pass_utils import (
+        host_coordinates,
+        indirect_sizes_from_op,
+        try_device_coordinates,
+    )
+    from .views import matching_dim
+
+    try:
+        writes = op.get_read_writes().writes
+        if not writes:
+            return None
+        out_dep = next(iter(writes))
+        ind_sizes = indirect_sizes_from_op(op)
+        dcoords = try_device_coordinates(device_layout, out_dep, ind_sizes)
+        if not dcoords:  # None (unrepresentable stick) or empty → no identity
+            return None
+        hcoords = host_coordinates(op.get_layout(), out_dep, ind_sizes)
+        return matching_dim(hcoords, dcoords[-1])
+    except Exception:
+        # Identity recovery is best-effort; any failure falls back to inference.
+        return None
+
+
+def _resize_device_layout(
+    orig_stl,
+    old_host_size: list[int],
+    new_host_size: list[int],
+    stick_host_dim: int | None = None,
+):
     """Derive a new SpyreTensorLayout for a resized host buffer.
 
     Used in two directions:
@@ -1703,6 +1756,14 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
     that case Passes 3 and 4 are skipped (tile-count and inner-stick entries are
     frozen at their collapsed values).
 
+    ``stick_host_dim`` (optional): the authoritative stick host-dim index,
+    supplied by callers that know it from named-dim identity.  When given, it is
+    used directly as ``p*`` and is excluded from the non-stick candidate pool,
+    which resolves same-size-dim collisions (transposed layouts where two host
+    dims share a size, e.g. flash-attention QK^T with ``Sq == Skv`` — issue
+    #3116) without relying on the ambiguous size-elimination + contiguous-stride
+    tiebreak.  When ``None`` (all current callers), behaviour is unchanged.
+
     Multi-pass algorithm:
 
     * **Pass 1**: match non-inner-stick device dims to host dims by size.
@@ -1734,6 +1795,20 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
     ndev = len(orig_sm)
     ndim = len(old_host_size)
 
+    # Trust a caller-provided stick_host_dim only when it is consistent with the
+    # device tile-count structure: the stick host dim must have a corresponding
+    # tile-count device dim of size ceil(size/eps).  Identity recovery can be
+    # imperfect for permuted layouts (an ambiguous inner-stick coordinate match),
+    # and a wrong label would otherwise *override* correct size-based inference
+    # and break reconstruction.  When it does not validate, drop it and fall back.
+    if stick_host_dim is not None:
+        if not (0 <= stick_host_dim < ndim):
+            stick_host_dim = None
+        else:
+            expected_tc = -(-int(old_host_size[stick_host_dim]) // eps)  # ceil
+            if expected_tc not in orig_ds[:-1]:
+                stick_host_dim = None
+
     old_hs = [int(s) for s in FlexibleLayout.contiguous_strides(old_host_size)]
     new_hs = [int(s) for s in FlexibleLayout.contiguous_strides(new_host_size)]
 
@@ -1748,11 +1823,20 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
         dsz = orig_ds[j]
         if dsz == 1:
             size1_cands = [p for p in range(ndim) if old_host_size[p] == 1]
+            # The authoritative stick host dim is never a non-stick match.
+            if stick_host_dim is not None:
+                size1_cands = [p for p in size1_cands if p != stick_host_dim]
             if len(size1_cands) == 1:
                 matched_host[j] = size1_cands[0]
             # else: sparse placeholder with no host counterpart — skip silently.
         else:
             size_cands = [p for p in range(ndim) if old_host_size[p] == dsz]
+            # When the stick host dim is known (named-dim identity), remove it
+            # from the non-stick candidate pool. This resolves same-size
+            # collisions (e.g. flash-attn QK^T with Sq == Skv, issue #3116)
+            # without falling back to the contiguous-stride tiebreak.
+            if stick_host_dim is not None:
+                size_cands = [p for p in size_cands if p != stick_host_dim]
             if len(size_cands) == 1:
                 # provisional; may be reclassified as tile-count in Pass 1b
                 matched_host[j] = size_cands[0]
@@ -1793,7 +1877,18 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
     matched_p = set(matched_host.values())
     unmatched_all = [p for p in range(ndim) if p not in matched_p]
     pstar: int | None
-    if not unmatched_all:
+    if stick_host_dim is not None:
+        # Authoritative stick host dim from named-dim identity — no inference by
+        # elimination. It must not also have been matched as a non-stick dim.
+        if stick_host_dim not in unmatched_all:
+            raise RuntimeError(
+                f"_resize_device_layout: caller-provided stick_host_dim="
+                f"{stick_host_dim} was matched as a non-stick device dim "
+                f"(matched_host={matched_host}) in {orig_stl!r} "
+                f"(old_host_size={old_host_size}). Inconsistent dim identity."
+            )
+        pstar = stick_host_dim
+    elif not unmatched_all:
         # Reduction output: stick dim eliminated, pstar=None.
         # unmatched_j must be empty — no device dims should be unclaimed.
         if unmatched_j:
@@ -1967,8 +2062,12 @@ def _divide_ranges(
     for i in tiled_dims:
         old_host_size[i] = int(new_size[i] * loop_count)
     new_size_ints = [int(s) for s in new_size]
+    # Recover the authoritative stick host dim from coordinate identity so
+    # _resize_device_layout does not have to infer it by size (ambiguous for
+    # transposed same-size dims — issue #3116). Tiling-invariant, so safe here.
+    stick_hd = _stick_host_dim(op, layout.device_layout)
     layout.device_layout = _resize_device_layout(
-        layout.device_layout, old_host_size, new_size_ints
+        layout.device_layout, old_host_size, new_size_ints, stick_host_dim=stick_hd
     )
     return retiled_info
 
