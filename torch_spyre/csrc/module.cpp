@@ -371,34 +371,22 @@ PYBIND11_MODULE(_C, m) {
       "Return True if any stream in the runtime context is in error state");
 
   // Expose SpyreStream class to Python
-  auto spyre_stream_cls =
-      py::class_<spyre::SpyreStream>(m, "_SpyreStreamBase")
-          .def("synchronize", &spyre::SpyreStream::synchronize,
-               "Wait for all operations on this stream to complete")
-          .def("query", &spyre::SpyreStream::query,
-               "Check if all operations on this stream have completed")
-          .def("has_stream_error", &spyre::SpyreStream::hasStreamError,
-               "Return True if the underlying flex stream is in error state")
-          .def("device", &spyre::SpyreStream::device,
-               "Get the device associated with this stream")
-          .def("id", &spyre::SpyreStream::id, "Get the stream ID")
-          .def("priority", &spyre::SpyreStream::priority,
-               "Get the stream priority")
-          .def("__repr__", [](const spyre::SpyreStream& stream) {
-            return "<torch_spyre.Stream device=" +
-                   std::to_string(stream.device().index()) +
-                   " id=" + std::to_string(stream.id()) + ">";
-          });
-#ifdef TORCH_SPYRE_TEST_HOOKS
-  spyre_stream_cls
-      .def("_test_set_shutdown", &spyre::SpyreStream::testSetShutdown,
-           py::arg("value"),
-           "[TEST ONLY] Set the shutdown flag on the underlying flex stream")
-      .def("_test_set_error", &spyre::SpyreStream::testSetError,
-           py::arg("message"),
-           "[TEST ONLY] Inject a deferred error and set shutdown on the flex "
-           "stream");
-#endif
+  py::class_<spyre::SpyreStream>(m, "_SpyreStreamBase")
+      .def("synchronize", &spyre::SpyreStream::synchronize,
+           "Wait for all operations on this stream to complete")
+      .def("query", &spyre::SpyreStream::query,
+           "Check if all operations on this stream have completed")
+      .def("has_stream_error", &spyre::SpyreStream::hasStreamError,
+           "Return True if the underlying flex stream is in error state")
+      .def("device", &spyre::SpyreStream::device,
+           "Get the device associated with this stream")
+      .def("id", &spyre::SpyreStream::id, "Get the stream ID")
+      .def("priority", &spyre::SpyreStream::priority, "Get the stream priority")
+      .def("__repr__", [](const spyre::SpyreStream& stream) {
+        return "<torch_spyre.Stream device=" +
+               std::to_string(stream.device().index()) +
+               " id=" + std::to_string(stream.id()) + ">";
+      });
   m.def("set_device", [](int idx) {
     int count = spyre::device_count();
     TORCH_CHECK(idx >= 0 && idx < count, "Device index ", idx,

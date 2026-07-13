@@ -235,8 +235,6 @@ if __name__ == "__main__":
             base_define_macros.append(("USE_SPYRE_CCL", None))
         if use_new_system:
             base_define_macros.append(("USE_FLEX_NAMESPACE", None))
-        if os.environ.get("TORCH_SPYRE_TEST_HOOKS", "0") == "1":
-            base_define_macros.append(("TORCH_SPYRE_TEST_HOOKS", None))
 
         ext_modules = [
             CppExtension(

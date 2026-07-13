@@ -223,16 +223,6 @@ class _SpyreStreamBase:
 
     def __repr__(self) -> str: ...
 
-    # Test-only hooks — present only in builds with -DTORCH_SPYRE_TEST_HOOKS.
-    # Never call these from production code.
-    def _test_set_shutdown(self, value: bool) -> None:
-        """[TEST ONLY] Set the shutdown flag on the underlying flex stream."""
-        ...
-
-    def _test_set_error(self, message: str) -> None:
-        """[TEST ONLY] Inject a deferred error and set shutdown on the flex stream."""
-        ...
-
 def get_stream_from_pool(device: torch.device, priority: int = 0) -> _SpyreStreamBase:
     """
     Get a stream from the pool for the specified device and priority.
