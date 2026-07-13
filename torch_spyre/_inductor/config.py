@@ -24,7 +24,6 @@ co_optimizing_lx_planning: bool = (
     os.environ.get("CO_OPTIMIZING_LX_PLANNING", "0") == "1"
 )
 hbm_planning: bool = _get_env_bool("SPYRE_INDUCTOR_MEMORY_PLAN", True)
-chunk_large_tensors: bool = os.environ.get("CHUNK_LARGE_TENSORS", "0") == "1"
 
 global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == "1"
 
@@ -65,9 +64,16 @@ ignore_wsr_hints: bool = os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "
 # Disable compiler-generated span-overflow coarse-tiling hints.  The global
 # SPYRE_INDUCTOR_IGNORE_HINTS flag also disables these so one switch can still
 # suppress all WSR/coarse-tiling hint paths.
+#
+# Defaults to disabled (opt-in): span-overflow auto-tiling can synchronize
+# compatible contiguous pointwise groups, but incompatible producer/consumer
+# groups and reduction-dim tiling still need broader support. Set
+# SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS=0 to opt in;
+# tests exercising this path directly should override via
+# config.patch({"ignore_span_overflow_hints": False}).
 ignore_span_overflow_hints: bool = (
     ignore_wsr_hints
-    or os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "0") == "1"
+    or os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "1") == "1"
 )
 
 # For K-split matmuls, permute physical core IDs so the cores collaborating on a

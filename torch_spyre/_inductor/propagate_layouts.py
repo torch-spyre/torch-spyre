@@ -42,6 +42,7 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.virtualized import V
 
+from . import config
 from torch_spyre._C import (
     ElementArrangement,
     SpyreTensorLayout,
@@ -49,7 +50,6 @@ from torch_spyre._C import (
     get_elem_in_stick,
 )
 from .errors import Unsupported
-from . import config
 from .constants import (
     BATCH_MATMUL_OP,
     COPY_BACK_CANDIDATE_ATTR,
@@ -81,6 +81,7 @@ from .views import matching_dim
 # ---------------------------------------------------------------------------
 
 logger = get_inductor_logger("propagate_layouts")
+
 
 prims = torch.ops.prims
 aten = torch.ops.aten
@@ -1231,9 +1232,19 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
             continue
         if not isinstance(producer, ComputedBuffer):
             continue
-        if isinstance(producer.layout, MutationLayoutSHOULDREMOVE):
+        if not config.ignore_span_overflow_hints and isinstance(
+            producer.data, Pointwise
+        ):
+            # Layouts are still plain FixedLayout here (finalize_layouts
+            # hasn't run yet), so we can't yet tell whether this specific
+            # producer will actually get auto-tiled. Conservatively preserve
+            # the copy-back for any Pointwise producer while the feature is
+            # on, the same way the old (now-removed) chunk_large_tensors
+            # guard did: `config.chunk_large_tensors and
+            # isinstance(producer.data, Pointwise)`, with no layout-type
+            # check either.
             continue
-        if config.chunk_large_tensors and isinstance(producer.data, Pointwise):
+        if isinstance(producer.layout, MutationLayoutSHOULDREMOVE):
             continue
         if write_counts[source.name] != 1:
             continue

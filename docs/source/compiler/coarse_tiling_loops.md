@@ -619,7 +619,6 @@ self.passes = [
     #
     dedup_and_promote_constants,
     # Working Set Reduction
-    _maybe_chunk_large_tensors,   # config-gated
     propagate_named_dims,
     assign_dim_hints,
     _maybe_coarse_tile,           # reorder_unhinted_interlopers + hints_to_coarse_tile_groups
