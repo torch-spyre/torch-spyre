@@ -73,6 +73,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
     MemoryPlanSolver,
     _assert_in_place_relationships,
+    SolveError,
 )
 
 __all__ = ["CpSatLayoutSolver"]
@@ -278,7 +279,7 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
         if hbm_terms:
             model.minimize(sum(hbm_terms))
             if solver.Solve(model) not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                raise RuntimeError("CP-SAT memory planner found no feasible plan")
+                raise SolveError("CP-SAT memory planner found no feasible plan")
             # Lock in the residency optimum (the traffic value, not just the
             # count) so phase 2 can never trade a spill for parallelism.
 
@@ -292,7 +293,7 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
         model.maximize(sum(sb.cores for sb in tensors.values()))
         status = solver.Solve(model)
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            raise RuntimeError("CP-SAT memory planner found no feasible plan")
+            raise SolveError("CP-SAT memory planner found no feasible plan")
 
         offsets, spilled, chosen_div = self._extract(solver, tensors)
 

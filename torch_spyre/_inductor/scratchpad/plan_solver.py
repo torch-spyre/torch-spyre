@@ -18,10 +18,15 @@ from dataclasses import dataclass, field
 from typing import Generic, Optional, TypeVar
 from abc import ABC, abstractmethod
 import math
+import Exception
 
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
 logger = get_inductor_logger("scratchpad.plan_solver")
+
+
+class SolveError(Exception):
+    """Raised when a solver is unable to find a solution"""
 
 
 @dataclass

@@ -49,6 +49,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     GreedyLayoutSolver,
     LifetimeBoundBuffer,
     MemoryPlanSolver,
+    SolveError,
 )
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     BestFitLayoutSolver,
@@ -1900,4 +1901,12 @@ def scratchpad_planning(
     """
     if allocator is None:
         allocator = select_allocator()
-    allocator.plan_allocation(graph)
+    try:
+        allocator.plan_allocation(graph)
+    except SolveError:
+        # When a solve error arises we assume a strong excpetion guarentee
+        # meaning despite the solver failing. The allocator has not mutated
+        # the state of the graph allowing a second attempt with a 
+        # greedy approach.
+        logger.debug("solve error detected. falling back to greedy solver.")
+        GreedyLayoutSolver(_lx_planning_size()).plan_allocation(graph)
