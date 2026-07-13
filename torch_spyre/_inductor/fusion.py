@@ -60,7 +60,8 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         ):
             cur_nodes.append(n)
         else:
-            # Other node types (eg Fallback nodes) force a bundle boundary.
+            # Non-Spyre nodes (Fallback nodes, CPU SchedulerNodes) force a
+            # bundle boundary.
             if fused := _make_fused(cur_nodes):
                 fused_nodes.append(fused)
             fused_nodes.append(n)
