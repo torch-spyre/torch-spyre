@@ -365,6 +365,12 @@ manipulation of device tensor layouts. See
 
       The on-device data format (e.g., ``SEN169_FP16``).
 
+   .. attribute:: element_arrangement
+      :type: ElementArrangement
+
+      How elements are packed within a stick. Defaults to ``STANDARD``
+      and appears in the ``repr`` only when it is non-standard.
+
    .. method:: elems_per_stick() -> int
 
       Returns the number of elements per stick for this layout's dtype.
@@ -522,10 +528,6 @@ Environment Variables
    * - ``BUNDLE_SYMBOLIC_ARGS``
      - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
        integers (default ``1``)
-   * - ``BUNDLE_HBM_SYMBOLS``
-     - Emit HBM tensor addresses as runtime symbols in the SDSC JSON and
-       ``bundle.mlir`` (default ``1``); independent of
-       ``BUNDLE_SYMBOLIC_ARGS``
    * - ``UNROLL_LOOPS``
      - Fully unroll ``LoopSpec`` nodes into flat ``OpSpec``\s before bundle
        generation (default ``1``; set ``0`` to keep the

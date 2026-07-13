@@ -357,7 +357,7 @@ A shared-weight projection has no batch dim to split, so the term is
 zero.
 
 The constants are defined at
-[`work_division.py:934–961`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py#L934):
+[`work_division.py:952–979`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py#L952):
 the peak MAC rate per core, HBM bandwidth, cohort limit and exponent,
 PSUM coefficients, the tie-break weights, and the batch penalty. They are
 internal tuning constants and are not user-configurable. The values are
