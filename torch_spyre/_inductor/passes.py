@@ -80,7 +80,6 @@ from .scheduler import build_loop_scheduler_nodes
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
-from .chunk_large_tensors import chunk_large_tensors
 from .coarse_tile import coarse_tile
 from .split_multi_ops import split_multi_ops, validate_ops
 
@@ -272,12 +271,6 @@ def _runs(*passes: Callable) -> Callable[[Callable], Callable]:
     return annotate
 
 
-@_runs(chunk_large_tensors)
-def _maybe_chunk_large_tensors(graph: GraphLowering) -> None:
-    if config.chunk_large_tensors:
-        chunk_large_tensors(graph)
-
-
 @_runs(
     reorder_unhinted_interlopers,
     hints_to_coarse_tile_groups,
@@ -348,7 +341,6 @@ class CustomPreSchedulingPasses:
             dedup_and_promote_constants,
             #
             # Working Set Reduction
-            _maybe_chunk_large_tensors,
             propagate_named_dims,
             assign_dim_hints,
             _maybe_coarse_tile,

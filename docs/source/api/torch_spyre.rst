@@ -513,9 +513,6 @@ Environment Variables
      - Use the co-optimizing LX allocator strategy (default ``0``)
    * - ``SPYRE_INDUCTOR_MEMORY_PLAN``
      - Enable HBM / device-buffer memory planning (default ``1``)
-   * - ``CHUNK_LARGE_TENSORS``
-     - Run the ``chunk_large_tensors`` pass to split tensors that exceed
-       the per-core span (default ``0``)
    * - ``GLOBAL_STICK_OPTIMIZER``
      - Enable the global stick-dimension optimizer (default ``1``)
    * - ``SPYRE_CORE_ID_K_FAST_EMISSION``
@@ -546,7 +543,9 @@ Environment Variables
        span-overflow coarse-tiling hints (default ``0``)
    * - ``SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS``
      - Ignore only span-overflow coarse-tiling hints; a narrower
-       alternative to ``SPYRE_INDUCTOR_IGNORE_HINTS`` (default ``0``)
+       alternative to ``SPYRE_INDUCTOR_IGNORE_HINTS``.  Defaults to
+       ``1`` (disabled/opt-in): set to ``0`` to enable automatic
+       span-overflow coarse tiling.
 
 **Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
 
