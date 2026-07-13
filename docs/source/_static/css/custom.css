@@ -101,3 +101,45 @@ code.literal {
     border-color: #3498db;
     box-shadow: 0 0 0 2px rgba(52, 152, 219, 0.15);
 }
+
+/* View control buttons (fit / focus / png / reset) */
+.kg-ctrl-btn {
+    padding: 5px 12px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    background: #fff;
+    color: #444;
+    font-size: 0.85em;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.kg-ctrl-btn:hover {
+    background: #f0f4f8;
+    border-color: #3498db;
+    color: #2c3e50;
+}
+
+.kg-ctrl-btn.active {
+    background: #3498db;
+    border-color: #3498db;
+    color: #fff;
+    font-weight: 600;
+}
+
+/* "View source" link in the info panel */
+.kg-source-link {
+    display: inline-block;
+    margin-top: 2px;
+    text-decoration: none;
+    color: #2c3e50;
+}
+
+.kg-source-link:hover {
+    text-decoration: underline;
+}
+
+/* Neighbor links stay quiet until hovered */
+.kg-neighbor:hover {
+    background: #fffbe6;
+}
