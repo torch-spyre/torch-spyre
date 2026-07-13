@@ -2084,6 +2084,7 @@ _run_parallel_across_cards() {
                 while IFS= read -r _nid; do
                     [[ -n "$_nid" ]] && _node_ids+=("$_nid")
                 done <<< "${_file_to_ids[$_fidx]}"
+
                 echo "========================================================================"
                 echo "[torch_oot_device_tests_run] card ${_subshell_card} | SPYRE_DEVICES=${_subshell_device_id} | ${#_node_ids[@]} test(s)"
                 if [[ "$run_file" != "$original_file" ]]; then
@@ -2430,12 +2431,10 @@ for i in "${!RUN_FILES[@]}"; do
             fi
         done
 
-        # Guard the probe with `|| _probe_exit=$?`: under `set -euo pipefail` a
-        # bare `( ... )` that exits non-zero would abort the whole script before
-        # the exit-5 handling below runs.
         _probe_exit=0
         (cd "$run_dir" && python3 -m pytest "$run_basename" \
-            "${_PROBE_ARGS[@]}" --collect-only -q 2>/dev/null) || _probe_exit=$?
+            "${_PROBE_ARGS[@]}" --collect-only -q 2>/dev/null)
+        _probe_exit=$?
 
         if [[ $_probe_exit -eq 5 ]]; then
             # 0 tests match this marker in this file — strip -m from args.
