@@ -28,7 +28,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.nn.functional.sigmoid` | Y | Y | Spyre | |
 | `torch.nn.functional.softplus` | Y | Y | Spyre | Custom op + lowering |
 | `torch.nn.functional.dropout` | Y | Y | Spyre | |
-| `torch.nn.functional.scaled_dot_product_attention` | Y | Y | Spyre | Custom decomposition (math path); auto-registers a PrivateUse1 kernel for eager dispatch |
+| `torch.nn.functional.scaled_dot_product_attention` | Y | Y | Spyre | Custom decomposition (flash-attention-style tiled online softmax); auto-registers a PrivateUse1 kernel for eager dispatch |
 | **Pointwise Unary** | | | | |
 | `torch.abs` | Y | Y | Spyre | |
 | `torch.neg` | Y | Y | Spyre | |
