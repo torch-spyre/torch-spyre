@@ -987,6 +987,41 @@ class TestDivideRanges(unittest.TestCase):
         expected = SpyreTensorLayout([64], [1], torch.float16, [0])
         self.assertEqual(result, expected)
 
+    def test_resize_device_layout_transposed_same_size_dims(self):
+        """Issue #3116: two host dims of the same size in a transposed layout.
+
+        Flash-attention QK^T output: logical [B, H, Sq, Skv] with Sq == Skv,
+        stored transposed.  The device layout is byte-identical whether Sq or
+        Skv is the stick dim (device_size=[32,512,8,1,64],
+        stride_map=[512,16384,64,-1,1]), so size-based elimination cannot tell
+        the two size-512 host dims apart.
+
+        Without identity (``stick_host_dim=None``) this is genuinely ambiguous
+        and must raise.  With the authoritative stick host dim threaded in
+        (named-dim identity), it reconstructs correctly: tiling Sq 512 -> 256
+        shrinks the non-stick Sq device dim and leaves the transposed
+        stride_map / stick untouched.
+        """
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.coarse_tile import _resize_device_layout
+
+        dev = SpyreTensorLayout([1, 1], torch.float16).device_dtype
+        # Transposed QK^T output: Skv (host dim 3) is the stick; Sq (host dim 2)
+        # is a non-stick dim of the same size (512), so they collide by size.
+        stl = SpyreTensorLayout([32, 512, 8, 1, 64], [512, 16384, 64, -1, 1], dev)
+        host_size = [1, 32, 512, 512]
+
+        # Fallback (no identity): size-based elimination is ambiguous -> raise.
+        with self.assertRaises(RuntimeError):
+            _resize_device_layout(stl, host_size, [1, 32, 256, 512])
+
+        # With authoritative stick host dim (Skv == host dim 3): unambiguous.
+        result = _resize_device_layout(
+            stl, host_size, [1, 32, 256, 512], stick_host_dim=3
+        )
+        self.assertEqual(list(result.device_size), [32, 256, 8, 1, 64])
+        self.assertEqual(list(result.stride_map), [512, 16384, 64, -1, 1])
+
 
 def _mock_op_out_coords(op):
     """Return pre-built coords stored on op by _make_hinted_op, or empty list."""
