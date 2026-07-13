@@ -128,11 +128,82 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
+  # Job 0b: build torch-spyre ONCE
+  #
+  # Compiles the torch_spyre._C extension a single time and uploads it as a
+  # wheel artifact. Every test / test_multi_spyre matrix job below installs that
+  # one wheel instead of recompiling from source (previously each of the ~90
+  # matrix jobs ran its own ~12 min build). Gated exactly like the old per-job
+  # build step, so the RPM path (rpm_names set, build disabled) still skips it.
+  # ---------------------------------------------------------------------------
+  build_torch_spyre:
+    name: Build torch-spyre wheel (once)
+    if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
+    # Compile-only: needs the backend image + SDK toolchain but NO physical Spyre
+    # card, so it targets the cardless spyre_pf_x0 pool. This leaves the scarce
+    # card runners (spyre_pf_x1/x2) for the test jobs below.
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - ${{ inputs.runner_label }}
+      - ${{ inputs.image_label }}
+    timeout-minutes: 40
+    outputs:
+      wheel_name: ${{ steps.build.outputs.wheel_name }}
+    steps:
+      - name: Checkout composite actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: torch-spyre
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
+
+      # No checkout-pytorch: the C++ build compiles against the installed torch
+      # wheel headers; the pytorch source tree (TORCH_ROOT) is only used by the
+      # upstream *test* configs, which run in the matrix jobs, not here.
+      - uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
+
+      - name: Build torch-spyre wheel
+        id: build
+        uses: ./.github/actions/build-torch-spyre-wheel
+        with:
+          image_label: ${{ inputs.image_label }}
+
+      - name: Upload torch-spyre wheel
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: torch-spyre-wheel
+          path: torch-spyre/dist/*.whl
+          if-no-files-found: error
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
   # Job 1: test matrix  (dynamic — driven by generate_matrix output)
   # ---------------------------------------------------------------------------
   test:
     name: ${{ matrix.suite.name }}
-    needs: generate_matrix
+    needs: [generate_matrix, build_torch_spyre]
+    # Run when the single build succeeded, or was skipped (RPM path). If it
+    # failed, skip every test job (fail-fast) — build_torch_spyre going red then
+    # fails the reusable workflow, blocking merge.
+    #
+    # The leading `!cancelled() &&` is REQUIRED, not cosmetic: without a
+    # status-check function in the `if`, GitHub applies its default
+    # transitive-skip and skips this job whenever a `needs` job was skipped.
+    # That would make the `== 'skipped'` branch dead code and silently skip
+    # every test on the RPM path. (The OR group must stay parenthesised because
+    # `&&` binds tighter than `||`.)
+    if: >-
+      !cancelled() &&
+      (needs.build_torch_spyre.result == 'success' ||
+       needs.build_torch_spyre.result == 'skipped')
     runs-on:
       - x86_64
       - ${{ matrix.suite.runner || 'spyre_pf_x1' }}
@@ -170,9 +241,12 @@ jobs:
         with:
           verbose: 'true'
 
-      - name: Build torch-spyre
-        if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
-        uses: ./.github/actions/build-torch-spyre
+      # Install the wheel built once by build_torch_spyre — no recompile.
+      # Skipped on the RPM path (build_torch_spyre skipped), where the RPM
+      # provides torch-spyre exactly as before.
+      - name: Install prebuilt torch-spyre
+        if: ${{ needs.build_torch_spyre.result == 'success' }}
+        uses: ./.github/actions/install-prebuilt-torch-spyre
 
       - name: Derive report paths
         run: |
@@ -218,10 +292,19 @@ jobs:
   # ---------------------------------------------------------------------------
   test_multi_spyre:
     name: ${{ matrix.suite.name }}
+    needs: build_torch_spyre
+    # Run for distributed-including test_types AND only when the single build
+    # succeeded or was skipped (RPM path). A failed build skips this job too.
+    # The leading `!cancelled() &&` is REQUIRED (see the `test` job above):
+    # without a status-check function the default transitive-skip would skip
+    # this job on the RPM path, where build_torch_spyre is intentionally skipped.
     if: >-
-      inputs.test_type == '' ||
-      inputs.test_type == 'full' ||
-      inputs.test_type == 'suite_distributed'
+      !cancelled() &&
+      (inputs.test_type == '' ||
+       inputs.test_type == 'full' ||
+       inputs.test_type == 'suite_distributed') &&
+      (needs.build_torch_spyre.result == 'success' ||
+       needs.build_torch_spyre.result == 'skipped')
     runs-on:
       - x86_64
       - spyre_pf_x2
@@ -267,9 +350,12 @@ jobs:
         with:
           verbose: 'true'
 
-      - name: Build torch-spyre
-        if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
-        uses: ./.github/actions/build-torch-spyre
+      # Install the wheel built once by build_torch_spyre — no recompile.
+      # Skipped on the RPM path (build_torch_spyre skipped), where the RPM
+      # provides torch-spyre exactly as before.
+      - name: Install prebuilt torch-spyre
+        if: ${{ needs.build_torch_spyre.result == 'success' }}
+        uses: ./.github/actions/install-prebuilt-torch-spyre
 
       - name: Derive report paths
         run: |
