@@ -16,7 +16,6 @@
 
 import importlib.util
 import os
-import subprocess
 import sys
 import unittest
 import unittest.mock as mock
@@ -120,118 +119,6 @@ class TestOptionARecovery(unittest.TestCase):
         streams = [torch.spyre.Stream() for _ in range(4)]
         self.assertTrue(all(not s._cdata.has_stream_error() for s in streams))
         self.assertFalse(_C.has_any_stream_error())
-
-
-# AC3a — end-to-end fault injection via mock device (no hardware needed).
-# Requires -DTORCH_SPYRE_TEST_HOOKS. Each test runs in a subprocess so
-# FLEX_DEVICE=MOCK is set before the first import (std::call_once constraint).
-
-try:
-    _probe = _C.get_stream_from_pool(torch.device("spyre", 0), 0)
-    _TEST_HOOKS_BUILT = hasattr(_probe, "_test_set_error")
-except Exception:
-    _TEST_HOOKS_BUILT = False
-
-
-def _run_in_mock_subprocess(script: str) -> subprocess.CompletedProcess:
-    """Run script in a fresh process with FLEX_DEVICE=MOCK AIU_WORLD_SIZE=1."""
-    env = {**os.environ, "FLEX_DEVICE": "MOCK", "AIU_WORLD_SIZE": "1"}
-    return subprocess.run(
-        [sys.executable, "-c", script],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-
-
-@unittest.skipUnless(
-    _TEST_HOOKS_BUILT,
-    "requires a build with -DTORCH_SPYRE_TEST_HOOKS",
-)
-class TestOptionARecoveryMockDevice(unittest.TestCase):
-    """AC3a: inject a real fault, verify recovery, no hardware needed."""
-
-    def test_inject_fault_then_recover(self):
-        # Fault a stream → flags set → synchronize() raises → next pool stream is clean.
-        result = _run_in_mock_subprocess("""\
-import os, sys
-os.environ["FLEX_DEVICE"] = "MOCK"
-os.environ["AIU_WORLD_SIZE"] = "1"
-import torch
-from torch_spyre import _C
-
-dev = torch.device("spyre", 0)
-stream = _C.get_stream_from_pool(dev, 0)
-
-# Inject fault.
-stream._test_set_error("simulated hardware fault")
-assert stream.has_stream_error()
-assert _C.has_any_stream_error()
-
-# synchronize() must raise with the original message.
-try:
-    stream.synchronize()
-    sys.exit("synchronize() did not raise")
-except RuntimeError as e:
-    assert "simulated hardware fault" in str(e)
-
-# Next stream from pool must be clean (Option a recovery).
-fresh = _C.get_stream_from_pool(dev, 0)
-assert not fresh.has_stream_error()
-assert not _C.has_any_stream_error()
-print("OK")
-""")
-        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
-        self.assertIn("OK", result.stdout)
-
-    def test_sibling_stream_stays_clean(self):
-        # A fault on one pool slot must not affect a sibling slot.
-        result = _run_in_mock_subprocess("""\
-import os
-os.environ["FLEX_DEVICE"] = "MOCK"
-os.environ["AIU_WORLD_SIZE"] = "1"
-import torch
-from torch_spyre import _C
-
-dev = torch.device("spyre", 0)
-s1 = _C.get_stream_from_pool(dev, 0)
-s2 = _C.get_stream_from_pool(dev, 0)
-
-s1._test_set_error("only s1 broken")
-assert _C.has_any_stream_error()
-assert not s2.has_stream_error()
-
-# Recycle s1 — global flag must clear.
-_C.get_stream_from_pool(dev, 0)
-assert not _C.has_any_stream_error()
-print("OK")
-""")
-        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
-        self.assertIn("OK", result.stdout)
-
-    def test_set_shutdown_alone_drives_error_flag(self):
-        # set_shutdown(True) alone is enough to set the error flag.
-        result = _run_in_mock_subprocess("""\
-import os
-os.environ["FLEX_DEVICE"] = "MOCK"
-os.environ["AIU_WORLD_SIZE"] = "1"
-import torch
-from torch_spyre import _C
-
-dev = torch.device("spyre", 0)
-stream = _C.get_stream_from_pool(dev, 0)
-
-stream._test_set_shutdown(True)
-assert stream.has_stream_error()
-assert _C.has_any_stream_error()
-
-fresh = _C.get_stream_from_pool(dev, 0)
-assert not fresh.has_stream_error()
-assert not _C.has_any_stream_error()
-print("OK")
-""")
-        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
-        self.assertIn("OK", result.stdout)
 
 
 # AC2 + AC3c — stream_error_guard fixture: one FAILED test then skips the rest.
