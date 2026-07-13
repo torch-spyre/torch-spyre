@@ -128,8 +128,6 @@ CREATE TABLE model_ops_variants
     input_shapes    String DEFAULT '[]',      -- JSON array of shape strings
     input_strides   String DEFAULT '[]',
     input_dtypes    String DEFAULT '[]',
-    arg_values      String DEFAULT '[]',
-    target_shape    String DEFAULT '',
 
     -- Timestamps
     triggered_at    DateTime64(3, 'UTC'),
@@ -154,6 +152,7 @@ def get_client():
         password=os.environ["CLICKHOUSE_PASS"],
         database=os.environ.get("CLICKHOUSE_DB", "spyre"),
         secure=True,
+        verify=False,
     )
 
 
@@ -287,8 +286,6 @@ VARIANT_COLS = [
     "input_shapes",
     "input_strides",
     "input_dtypes",
-    "arg_values",
-    "target_shape",
     "triggered_at",
     "ingested_at",
 ]
@@ -395,8 +392,6 @@ def _build_variant_rows(
                 _jstr(v.get("input_shapes", [])),
                 _jstr(v.get("input_strides", [])),
                 _jstr(v.get("input_dtypes", [])),
-                _jstr(v.get("arg_values", [])),
-                _str(v.get("target_shape", "")),
                 triggered_at,
                 now,
             ]
@@ -482,7 +477,6 @@ def main() -> None:
     if not records:
         print("[info] JSON file contains no records — nothing to ingest.")
         sys.exit(0)
-
     # Filter out records without a valid suite_name
     records = [
         r

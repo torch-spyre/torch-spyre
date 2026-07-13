@@ -21,6 +21,7 @@ each call has its own fresh decorator instances. A one-time global patch
 would not affect these copies.
 """
 
+from functools import wraps
 from typing import Set, List, Optional
 import torch
 import regex as re
@@ -116,6 +117,34 @@ class _OOTCpuMovePatcher:
 
             # Set the wrapped method on the class
             setattr(self._cls, func_name, wrapped)
+
+
+class _OOTNoGradPatcher:
+    """Wraps an already-instantiated test method to run under torch.no_grad().
+
+    Spyre's custom ops (torch_spyre/_inductor/customops.py) never register an
+    autograd formula, and every eager op call is transparently routed through
+    torch.compile(backend="inductor") (torch_spyre/ops/eager.py). Since
+    nn.Module parameters default to requires_grad=True, AOTAutograd builds a
+    joint forward+backward graph at *compile* time even when the test never
+    calls .backward() -- compilation then fails as soon as a backward-less
+    custom op (e.g. spyre::silu) appears in that graph.
+
+    Upstream's ModuleInfo-based test_forward (test/test_modules.py) builds
+    modules with ordinary requires_grad=True parameters and never calls
+    backward(), so wrapping it in torch.no_grad() keeps compilation on the
+    inference-only path this backend actually supports without changing
+    upstream test semantics.
+    """
+
+    @staticmethod
+    def wrap(fn):
+        @wraps(fn)
+        def _no_grad_wrapper(self, *args, **kwargs):
+            with torch.no_grad():
+                return fn(self, *args, **kwargs)
+
+        return _no_grad_wrapper
 
 
 class _OOTNativeDeviceTypesPatcher:
