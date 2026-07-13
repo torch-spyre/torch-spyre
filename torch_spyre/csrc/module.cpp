@@ -199,6 +199,7 @@ PYBIND11_MODULE(_C, m) {
       .value("STANDARD", spyre::ElementArrangement::STANDARD)
       .value("DL16_TO_FP32", spyre::ElementArrangement::DL16_TO_FP32)
       .value("QFP8CH", spyre::ElementArrangement::QFP8CH)
+      .value("FP32_TO_DL16", spyre::ElementArrangement::FP32_TO_DL16)
       .value("EXX2", spyre::ElementArrangement::EXX2);
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
@@ -337,6 +338,11 @@ PYBIND11_MODULE(_C, m) {
   m.def("copy_tensor", &spyre::spyre_copy_from,
         "Copy tensor between host and device using DMA", py::arg("self"),
         py::arg("dst"), py::arg("non_blocking") = false);
+
+  // Device-side fill using FillDMA (no host buffer or H2D copy)
+  m.def("fill_tensor", &spyre::spyre_fill_tensor,
+        "Fill a spyre tensor with a scalar value using device-side FillDMA",
+        py::arg("self"), py::arg("value"));
 
   // Stream management functions
   m.def("get_stream_from_pool", &spyre::getStreamFromPool, py::arg("device"),
