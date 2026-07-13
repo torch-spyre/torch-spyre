@@ -56,7 +56,7 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
-
+import torch
 import numpy as np
 
 
@@ -244,7 +244,9 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
         solver = cp_model.CpSolver()
         if self._time_limit_seconds:
             solver.parameters.max_time_in_seconds = float(self._time_limit_seconds)
-        solver.parameters.num_search_workers = os.cpu_count() or 1
+        solver.parameters.num_search_workers = (
+            1 if torch.are_deterministic_algorithms_enabled() else os.cpu_count()
+        )
         # Fixed seed so a given worker configuration is reproducible run-to-run.
         solver.parameters.random_seed = 0
 
