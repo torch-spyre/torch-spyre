@@ -50,7 +50,7 @@ Usage::
 """
 
 import logging
-
+from typing import List
 import torch
 import torch.nn as nn
 
@@ -256,3 +256,90 @@ def patch_module_to_for_spyre() -> None:
     _spyre_module_to._spyre_patched = True  # type: ignore[attr-defined]
     nn.Module.to = _spyre_module_to  # type: ignore[method-assign]
     logger.info("Patched nn.Module.to() for automatic Spyre weight layout optimization")
+
+
+# ---------------------------------------------------------------------------
+# Safetensors transfer hook (issue #400)
+# ---------------------------------------------------------------------------
+
+def _should_swap_dims(name: str, shape: List[int]) -> bool:
+    """Return True if dim_order=[1,0] should be used for this tensor.
+
+    Only 2-D weight tensors for Linear layers benefit from the transposed
+    Spyre storage layout.  Embeddings, normalisation weights and biases
+    use the default contiguous layout.
+    """
+    if len(shape) != 2:
+        return False
+    name_lower = name.lower()
+    if any(x in name_lower for x in ("embed", "norm", "ln_", "layernorm", "rmsnorm")):
+        return False
+    return name_lower.endswith(".weight")
+
+
+def spyre_layout_hook(
+    cpu_tensor: torch.Tensor,
+    name: str,
+    device,
+) -> torch.Tensor:
+    """Transfer hook called by safetensors for every tensor loaded to Spyre.
+
+    Satisfies the hook contract defined by
+    ``safetensors.torch._register_device_transfer_hook``:
+      hook(cpu_tensor, name, device) -> torch.Tensor
+    """
+    #print("In spyre_layout_hook::cpu_tensor.dtype = ", cpu_tensor.dtype)
+    if cpu_tensor.dtype != torch.float16 and cpu_tensor.dtype.is_floating_point:
+        cpu_tensor = cpu_tensor.to(dtype=torch.float16)
+
+    if not cpu_tensor.is_contiguous():
+        cpu_tensor = cpu_tensor.contiguous()
+
+    swap_dims = _should_swap_dims(name, list(cpu_tensor.shape))
+
+    if swap_dims:
+        layout = SpyreTensorLayout(
+            list(cpu_tensor.shape),
+            list(cpu_tensor.stride()),
+            cpu_tensor.dtype,
+            [1, 0],
+        )
+    else:
+        layout = SpyreTensorLayout(list(cpu_tensor.shape), cpu_tensor.dtype)
+
+    dst = spyre_empty_with_layout(
+        cpu_tensor.size(), cpu_tensor.stride(), cpu_tensor.dtype, layout
+    )
+    copy_tensor(cpu_tensor, dst, non_blocking=False)
+    return dst
+
+
+_safetensors_hook_registered = False
+
+
+def register_safetensors_hook() -> None:
+    """Register the Spyre layout hook with safetensors.torch.
+
+    After this call, safe_open / load_file / load_model with
+    device="spyre" all use the optimal DMA layout automatically.
+    Idempotent.
+    """
+    global _safetensors_hook_registered
+    if _safetensors_hook_registered:
+        return
+    try:
+        from safetensors.torch import _register_device_transfer_hook
+    except ImportError:
+        logger.warning(
+            "safetensors not installed; Spyre transfer hook not registered. "
+            "device='spyre' in safe_open / load_file will not work."
+        )
+        return
+
+    _register_device_transfer_hook(DEVICE_NAME, spyre_layout_hook)
+    _safetensors_hook_registered = True
+    logger.info(
+        "Registered Spyre safetensors transfer hook "
+        "(resolves issue #400; uses optimal dim_order layout for Linear weights)"
+    )
+

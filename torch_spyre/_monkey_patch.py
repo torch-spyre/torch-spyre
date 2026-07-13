@@ -206,6 +206,18 @@ def _patch_tensor_for_spyre():
 
         warnings.warn(f"Failed to install optimal weight layout patches: {e}")
 
+
+    # Register the optimal Spyre transfer hook with safetensors so that
+    # safe_open / load_file / load_model with device="spyre" uses the
+    # dim_order=[1,0] DMA layout for Linear weights automatically.
+    # This resolves issue #400.
+    try:
+        from torch_spyre.model_utils import register_safetensors_hook
+        register_safetensors_hook()
+    except Exception as e:
+        import warnings
+        warnings.warn(f"torch_spyre: failed to register safetensors hook: {e}")
+
     # ── SpyreTensorLayout Guard Extension ────────────
     # Extends TENSOR_MATCH to guard on SpyreTensorLayout
     # preventing wrong compiled graph reuse when layout
