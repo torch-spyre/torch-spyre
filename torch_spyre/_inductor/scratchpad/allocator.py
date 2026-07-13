@@ -1906,7 +1906,7 @@ def scratchpad_planning(
     except SolveError:
         # When a solve error arises we assume a strong excpetion guarentee
         # meaning despite the solver failing. The allocator has not mutated
-        # the state of the graph allowing a second attempt with a 
+        # the state of the graph allowing a second attempt with a
         # greedy approach.
         logger.debug("solve error detected. falling back to greedy solver.")
         GreedyLayoutSolver(_lx_planning_size()).plan_allocation(graph)
