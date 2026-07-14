@@ -4322,6 +4322,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
         (
+            "test_round_trip_reduction_with_to_dtype",
+            "test_round_trip_reduction_with_to_dtype_cpu",
+        ): {
+            "ops_dict": {
+                "sum": torch.sum,
+                "mean": torch.mean,
+                "prod": torch.prod,
+            },
+            "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+        },
+        (
             "test_round_trip_to_dtype_implicit_invalid",
             "test_round_trip_to_dtype_implicit_invalid_cpu",
         ): {
@@ -6134,6 +6146,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             op,
             x,
             y,
+            dst_dtype,
+            cpu_compile=False,
+            run_eager=False,
+        )
+
+    def test_round_trip_reduction_with_to_dtype_cpu(self, op, x, dst_dtype):
+        def fn(op, x, dst_dtype):
+            y = op(x, dtype=dst_dtype)
+            return y.to(x.dtype)
+
+        self.compare_with_cpu(
+            fn,
+            op,
+            x,
             dst_dtype,
             cpu_compile=False,
             run_eager=False,
