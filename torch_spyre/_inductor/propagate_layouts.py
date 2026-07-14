@@ -24,6 +24,7 @@ import torch
 from .logging_utils import get_inductor_logger
 from torch._inductor.ir import (
     ComputedBuffer,
+    DeviceCopy,
     ExternKernel,
     FallbackKernel,
     FixedLayout,
@@ -53,6 +54,7 @@ from .errors import Unsupported
 from .constants import (
     BATCH_MATMUL_OP,
     COPY_BACK_CANDIDATE_ATTR,
+    DEVICE_NAME,
     ELIDED_COPY_BACK_ATTR,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
@@ -1318,6 +1320,9 @@ def propagate_spyre_tensor_layouts(
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ComputedBuffer):
+            layout = op.maybe_get_layout()
+            if layout is None or layout.device.type != DEVICE_NAME:
+                continue
             if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
                 target = op.layout.target
                 while isinstance(target, ReinterpretView):
@@ -1401,6 +1406,14 @@ def propagate_spyre_tensor_layouts(
         elif isinstance(op, SpyreConstantFallback):
             op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
+        elif isinstance(op, DeviceCopy):
+            # spyre -> cpu: the output is a host tensor and carries no Spyre
+            #     layout. Leave `.layouts` unset.
+            # cpu -> spyre: the output is a fresh on-device buffer with no
+            #     inherited tiling, so give it a new device layout.
+            if op.get_layout().device.type == DEVICE_NAME:
+                op.layouts = [generic_layout(op)]
+                op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ExternKernel):
             logger.warning(f"unhandled node type {type(op)}")
         else:

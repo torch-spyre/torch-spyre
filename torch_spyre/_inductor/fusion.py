@@ -18,6 +18,7 @@ from torch._inductor.scheduler import (
     SchedulerNode,
 )
 from . import config
+from .constants import DEVICE_NAME
 from .scheduler import CountedLoopSchedulerNode
 
 
@@ -29,6 +30,12 @@ def _make_fused(
     elif len(nodes) == 1:
         return nodes[0]
     return None
+
+
+def _is_spyre_node(node: BaseSchedulerNode) -> bool:
+    """True if the node computes on the Spyre device."""
+    device = node.get_device()
+    return device is not None and device.type == DEVICE_NAME
 
 
 def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
@@ -48,10 +55,13 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     cur_nodes: list[SchedulerNode | CountedLoopSchedulerNode] = []
 
     for n in nodes:
-        if isinstance(n, (SchedulerNode, CountedLoopSchedulerNode)):
+        if isinstance(n, (SchedulerNode, CountedLoopSchedulerNode)) and _is_spyre_node(
+            n
+        ):
             cur_nodes.append(n)
         else:
-            # Other node types (eg Fallback nodes) force a bundle boundary.
+            # Non-Spyre nodes (Fallback nodes, CPU SchedulerNodes) force a
+            # bundle boundary.
             if fused := _make_fused(cur_nodes):
                 fused_nodes.append(fused)
             fused_nodes.append(n)
