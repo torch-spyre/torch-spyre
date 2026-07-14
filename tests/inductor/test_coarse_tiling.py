@@ -292,6 +292,7 @@ def _make_snode(scheduler, ir_op, name="buf0"):
     snode = MagicMock(spec=SchedulerNode)
     snode.scheduler = scheduler
     snode.node = ir_op
+    snode.get_device.return_value = torch.device("spyre")
     snode.get_name.return_value = name
     snode.get_nodes.return_value = [snode]
     snode.ancestors = OrderedSet()
@@ -1306,6 +1307,7 @@ def _make_counted_loop(scheduler, name="loop0", loop_count=sympy.Integer(4)):
     """Return a MagicMock CountedLoopSchedulerNode for use in fusion tests."""
     node = MagicMock(spec=CountedLoopSchedulerNode)
     node.scheduler = scheduler
+    node.get_device.return_value = torch.device("spyre")
     node.get_name.return_value = name
     node.get_nodes.return_value = [node]
     node.loop_count = loop_count
