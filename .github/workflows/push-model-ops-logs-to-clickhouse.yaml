@@ -43,7 +43,7 @@ jobs:
       CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
 
       TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id        || inputs.gha_run_id }}
-      TRIGGERING_WORKFLOW: ${{ github.event.workflow_run.name      || 'model-ops-tests' }}
+      TRIGGERING_WORKFLOW: ${{ github.event.workflow_run.name      || 'model-ops-tests-nightly' }}
       TRIGGERING_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
       TRIGGERING_SHA: ${{ github.event.workflow_run.head_sha   || github.sha }}
 

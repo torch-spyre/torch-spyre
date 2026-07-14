@@ -2,8 +2,11 @@ name: model-ops-tests-nightly
 
 on:
   # Run on a schedule (nightly at 2 AM UTC)
+  # TEMPORARY: triggers at 10:10 UTC 14 Jul 2025 — revert to "0 2 * * *" after run
   schedule:
-    - cron: 0 2 * * *
+    - cron: 10 10 14 7 *
+  # Allow manual triggering from the GitHub Actions UI or gh CLI
+  workflow_dispatch: null
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}

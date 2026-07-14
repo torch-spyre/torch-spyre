@@ -458,7 +458,7 @@ def main() -> None:
         "--json-file", required=True, help="Path to JSON from parse_model_ops_logs.py"
     )
     parser.add_argument(
-        "--workflow", default="model-ops-tests", help="GHA workflow name"
+        "--workflow", default="model-ops-tests-nightly", help="GHA workflow name"
     )
     parser.add_argument("--branch", default="", help="Git branch name")
     parser.add_argument("--sha", default="", help="Git commit SHA")
