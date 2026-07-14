@@ -666,7 +666,7 @@ def spyre__sdpa_overrideable(
     philox_offset = torch.empty((1,), dtype=torch.float16, device="spyre")
 
     return (
-        output,
+        output.clone(memory_format=torch.contiguous_format),
         logsumexp,
         None,
         None,
