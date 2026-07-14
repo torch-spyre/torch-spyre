@@ -108,12 +108,22 @@ static int64_t composite_address_to_dmva(
 
 void JobPlanStepHostCompute::construct(LaunchContext& ctx,
                                        const SpyreStream& stream) const {
-  // Helper lambda to build HostCallbackParams and launch on the stream
+  // Helper lambda to build HostCallbackParams and launch on the stream.
+  // flex::RuntimeStream::launchOperationHostCallback() invokes the callback
+  // synchronously in the calling thread, so exceptions propagate directly
+  // through launchHostCallback() to the caller
   auto launch_host_callback = [this, &stream](auto&& callback) {
     auto* params = flex::createHostCallbackParams(
         std::forward<decltype(callback)>(callback), nullptr, pipeline_barrier_);
+    // Use a scope-exit guard so params is freed even if launchHostCallback
+    // throws (which it does when the synchronous host callback raises).
+    struct Guard {
+      flex::HostCallbackParams* p;
+      ~Guard() {
+        flex::destroyHostCallbackParams(p);
+      }
+    } guard{params};
     stream.launchHostCallback(params);
-    flex::destroyHostCallbackParams(params);
   };
 
   // Case 1: input_buffer_ is provided
