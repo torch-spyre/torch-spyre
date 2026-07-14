@@ -21,6 +21,7 @@ and submit a pull request.
 | [0601](https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md) | Spyre Profiling Toolkit | Profiling |
 | [0682](https://github.com/torch-spyre/rfcs/blob/main/0682-KtirSpec/0682-KtirSpecRFC.md) | Kernel Tile Intermediate Representation | Compiler IR |
 | [1287](https://github.com/torch-spyre/rfcs/blob/main/1287-SpyreTestFramework/1287-SpyreTestFrameworkRFC.md) | Test Suite Configuration for Upstream PyTorch Tests on OOT Devices | Testing |
+| [1358](https://github.com/torch-spyre/rfcs/blob/main/1358-CoarseTiling/1358-CoarseTiling.md) | Coarse Tiling | Compiler |
 | [1632](https://github.com/torch-spyre/rfcs/blob/main/1632-ModelEnablement/1632-ModelEnablement.md) | Model Enablement Tracking | Model enablement |
 | [1633](https://github.com/torch-spyre/rfcs/blob/main/1633-E2EModelPerf/1633-E2EModelPerf.md) | End-to-End Model Performance Testing | Performance |
 
@@ -79,6 +80,18 @@ that lets out-of-tree backends like Spyre reuse PyTorch's upstream test
 suite without drowning in noise. OOT teams declare supported ops, dtypes,
 and devices, and can selectively skip or xfail upstream tests, override
 tolerances, inject custom inputs, and tag variants.
+
+### RFC 1358 — Coarse Tiling
+
+Records the motivation and design rationale behind coarse-level tiling in
+the compiler: take a sequence of operations that share an iteration-space
+dimension, split that dimension into K (possibly symbolic) chunks, and emit
+the body inside a counted outer loop. This time-domain tiling is the key
+transformation for working-set reduction — it reshapes the computation so
+most tensors fit in the LX scratchpad — and the RFC captures the constraints
+that forced each choice in the loop IR design.
+
+See also: [Coarse-Tiling Loop IR](../compiler/coarse_tiling_loops.md)
 
 ### RFC 1632 — Model Enablement Tracking
 

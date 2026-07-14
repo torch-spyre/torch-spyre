@@ -137,7 +137,6 @@ finalize_layouts
 insert_restickify
 insert_bmm_padding
 dedup_and_promote_constants
-chunk_large_tensors                   # conditional on config.chunk_large_tensors
 propagate_named_dims                  # named-dimension metadata
 assign_dim_hints
 coarse_tile                           # runs when hints produce groups

@@ -365,6 +365,12 @@ manipulation of device tensor layouts. See
 
       The on-device data format (e.g., ``SEN169_FP16``).
 
+   .. attribute:: element_arrangement
+      :type: ElementArrangement
+
+      How elements are packed within a stick. Defaults to ``STANDARD``
+      and appears in the ``repr`` only when it is non-standard.
+
    .. method:: elems_per_stick() -> int
 
       Returns the number of elements per stick for this layout's dtype.
@@ -513,9 +519,6 @@ Environment Variables
      - Use the co-optimizing LX allocator strategy (default ``0``)
    * - ``SPYRE_INDUCTOR_MEMORY_PLAN``
      - Enable HBM / device-buffer memory planning (default ``1``)
-   * - ``CHUNK_LARGE_TENSORS``
-     - Run the ``chunk_large_tensors`` pass to split tensors that exceed
-       the per-core span (default ``0``)
    * - ``GLOBAL_STICK_OPTIMIZER``
      - Enable the global stick-dimension optimizer (default ``1``)
    * - ``SPYRE_CORE_ID_K_FAST_EMISSION``
@@ -525,10 +528,6 @@ Environment Variables
    * - ``BUNDLE_SYMBOLIC_ARGS``
      - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
        integers (default ``1``)
-   * - ``BUNDLE_HBM_SYMBOLS``
-     - Emit HBM tensor addresses as runtime symbols in the SDSC JSON and
-       ``bundle.mlir`` (default ``1``); independent of
-       ``BUNDLE_SYMBOLIC_ARGS``
    * - ``UNROLL_LOOPS``
      - Fully unroll ``LoopSpec`` nodes into flat ``OpSpec``\s before bundle
        generation (default ``1``; set ``0`` to keep the
@@ -546,7 +545,9 @@ Environment Variables
        span-overflow coarse-tiling hints (default ``0``)
    * - ``SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS``
      - Ignore only span-overflow coarse-tiling hints; a narrower
-       alternative to ``SPYRE_INDUCTOR_IGNORE_HINTS`` (default ``0``)
+       alternative to ``SPYRE_INDUCTOR_IGNORE_HINTS``.  Defaults to
+       ``1`` (disabled/opt-in): set to ``0`` to enable automatic
+       span-overflow coarse tiling.
 
 **Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
 

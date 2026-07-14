@@ -1,0 +1,100 @@
+name: Install prebuilt torch-spyre
+description: |
+  Download the single prebuilt torch-spyre wheel (built once by the
+  build_torch_spyre job) and install it non-editable, with NO C++ compilation.
+
+  This is the per-test-job replacement for the old build-from-source step: it
+  still runs `uv sync` to materialise the venv + torch + test deps, but with
+  `--no-install-project` so the C++ extension is never rebuilt; the prebuilt
+  wheel is then dropped on top with `uv pip install`.
+
+inputs:
+  torch_spyre_dir:
+    description: Path to the checked-out torch-spyre directory
+    required: false
+    default: torch-spyre
+  artifact_name:
+    description: Name of the uploaded wheel artifact to download
+    required: false
+    default: torch-spyre-wheel
+
+runs:
+  using: composite
+  steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+    - name: Download prebuilt wheel
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: ${{ github.workspace }}/prebuilt-wheel
+
+    - name: Install prebuilt wheel
+      shell: bash
+      env:
+        TORCH_SPYRE_DIR: ${{ inputs.torch_spyre_dir }}
+      run: |
+        source "$HOME/.bashrc"
+        source /etc/profile.d/ibm-aiu-setup.sh
+
+        [[ "$TORCH_SPYRE_DIR" != /* ]] && TORCH_SPYRE_DIR="${PWD}/${TORCH_SPYRE_DIR}"
+        echo "TORCH_SPYRE_DIR $TORCH_SPYRE_DIR"
+
+        cd "$TORCH_SPYRE_DIR"
+
+        # Materialise the venv with all deps (torch + test extras) but DO NOT
+        # build the project -> no C++ compile. Then install the prebuilt wheel.
+        uv sync --verbose --frozen --all-extras --no-install-project
+        source .venv/bin/activate
+
+        WHEEL="$(ls -1 "$GITHUB_WORKSPACE"/prebuilt-wheel/*.whl | head -1)"
+        if [[ -z "$WHEEL" ]]; then
+          echo "::error::No prebuilt wheel found under prebuilt-wheel/" >&2
+          exit 1
+        fi
+        echo "Installing prebuilt wheel: $WHEEL"
+        uv pip install --no-deps --reinstall "$WHEEL"
+
+        # Remove the checked-out torch_spyre/ SOURCE package so it cannot shadow
+        # the installed wheel. The repo-root conftest.py makes pytest's rootdir
+        # (the repo root) land on sys.path, so `import torch_spyre` would resolve
+        # to this source tree — which, in the wheel flow, has NO compiled _C.so —
+        # and autoload dies with "No module named 'torch_spyre._C'" (that is what
+        # broke every test job). We install and test the wheel, never the source
+        # tree, so dropping the source package here makes the wheel the only
+        # importable torch_spyre. tests/ (oot_framework, configs, test files) is
+        # untouched; no test imports from the source package.
+        if [[ -d torch_spyre ]]; then
+          echo "Removing checked-out torch_spyre/ source package (wheel is authoritative)"
+          rm -rf torch_spyre
+        fi
+
+        uv pip show torch
+
+        # Guardrail: prove the installed wheel (site-packages) — NOT an editable
+        # rebuild from the source tree — is what resolves, and that the compiled
+        # _C.so shipped inside it. find_spec locates the module WITHOUT importing
+        # torch_spyre, so it does not start the Spyre runtime here.
+        python - <<'PY'
+        import importlib.util
+        import os
+        import sys
+
+        # `python -` puts '' (cwd = the repo root we cd'd into) at sys.path[0],
+        # so the checked-out torch_spyre/ source tree — which has NO compiled
+        # _C.so — would shadow the installed wheel and make this check resolve
+        # the wrong package. Drop cwd from the search path so find_spec sees the
+        # site-packages wheel, exactly as the test jobs do (pytest runs from the
+        # test file's directory, never the repo root).
+        sys.path = [p for p in sys.path if p not in ("", os.getcwd())]
+
+        spec = importlib.util.find_spec("torch_spyre")
+        assert spec is not None and spec.origin, "torch_spyre not importable"
+        assert "site-packages" in spec.origin, (
+            f"torch_spyre resolved to {spec.origin}, expected the installed wheel"
+        )
+        so = os.path.join(os.path.dirname(spec.origin), "_C.so")
+        assert os.path.exists(so), f"_C.so missing next to {spec.origin}"
+        print("OK:", spec.origin, "| _C.so present")
+        PY

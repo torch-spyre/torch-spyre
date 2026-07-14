@@ -34,8 +34,50 @@ permissions:
   checks: write
 
 jobs:
+  # Build the torch_spyre._C extension ONCE and publish it as a wheel; the
+  # matrix job below installs that single wheel instead of recompiling per entry.
+  build:
+    name: Build torch-spyre wheel (once)
+    # Compile-only: needs the backend image + SDK toolchain but NO physical Spyre
+    # card, so it targets the cardless spyre_pf_x0 pool and leaves card runners
+    # for the test jobs.
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - linux
+      - image_spyre_backend
+    timeout-minutes: 40
+    steps:
+      - name: Checkout composite actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: torch-spyre
+
+      - uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
+
+      - name: Build torch-spyre wheel
+        uses: ./.github/actions/build-torch-spyre-wheel
+        with:
+          image_label: image_spyre_backend
+
+      - name: Upload torch-spyre wheel
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: torch-spyre-wheel
+          path: torch-spyre/dist/*.whl
+          if-no-files-found: error
+          retention-days: 5
+
   upstream-tests:
     name: ${{ matrix.suite.name }}
+    needs: build
     runs-on:
       - x86_64
       - spyre_pf_x1
@@ -92,7 +134,8 @@ jobs:
         with:
           verbose: 'true'
 
-      - uses: ./.github/actions/build-torch-spyre
+      - name: Install prebuilt torch-spyre
+        uses: ./.github/actions/install-prebuilt-torch-spyre
 
       - name: Derive report paths
         run: |
