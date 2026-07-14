@@ -72,7 +72,6 @@ from .work_division import (
 )
 from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
 from .scratchpad.allocator import (
-    StrategyBCoOptimizingAllocator,
     scratchpad_planning,
 )
 from .fusion import spyre_fuse_nodes
@@ -302,10 +301,9 @@ def _distribute_work(graph: GraphLowering) -> None:
 def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
     if not config.lx_planning:
         return
-    allocator = (
-        StrategyBCoOptimizingAllocator() if config.co_optimizing_lx_planning else None
-    )
-    scratchpad_planning(graph, allocator=allocator)
+    # The allocator (and its layout solver) is selected from config by
+    # scratchpad_planning -> select_allocator; no allocator wiring here.
+    scratchpad_planning(graph)
 
 
 class CustomPreSchedulingPasses:

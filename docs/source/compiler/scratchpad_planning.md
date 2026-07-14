@@ -9,7 +9,9 @@ working on next.
 Scratchpad planning runs by default. The pass is gated by `lx_planning`,
 which has defaulted to `1` since [#2459](https://github.com/torch-spyre/torch-spyre/pull/2459).
 The greedy solver (`config.layout_solver = "greedy"`) is the default.
-First-fit and best-fit are available as opt-ins.
+First-fit, best-fit, and an OR-Tools CP-SAT solver (`"cpsat"`) are
+available as opt-ins; `layout_solver` can also be set from the
+`LAYOUT_SOLVER` environment variable.
 
 Co-optimization with work distribution is opt-in.
 `config.co_optimizing_lx_planning` (`CO_OPTIMIZING_LX_PLANNING=1`)
@@ -318,8 +320,9 @@ Once `layout.allocation["lx"]` is set:
 
 ## Solvers
 
-`config.layout_solver` (`"greedy" | "firstfit" | "bestfit"`) picks the
-solver.
+`config.layout_solver` (`"greedy" | "firstfit" | "bestfit" | "cpsat"`)
+picks the solver; it defaults from the `LAYOUT_SOLVER` environment
+variable (falling back to `"greedy"`).
 
 ### GreedyLayoutSolver (default)
 
@@ -355,6 +358,25 @@ The two solvers differ only in the gap-selection policy:
 Both naturally avoid the "buffer at address 0 blocks everything else"
 failure mode of the greedy solver. They are not yet selected by default.
 Once a deeptools dependency clears, first-fit is the expected default.
+
+### CpSatLayoutSolver
+
+`config.layout_solver = "cpsat"` selects an OR-Tools CP-SAT solver that
+models placement as a global 2D no-overlap — each resident buffer is an
+optional `[lifetime] × [address, address + size)` rectangle — and
+minimizes total HBM transfer traffic, so a buffer that would be re-read by
+*N* consumers costs `N × size` when spilled. In-place reuse is encoded by
+shortening a parent's lifetime by the single handoff tick, letting the
+in-place child legally share its slot.
+
+It requires the optional `ortools` package
+(`pip install torch-spyre[cpsat]`); when it is missing, the allocator logs
+a warning and falls back to the greedy solver, so a `"cpsat"` request
+always degrades to a correct plan. Without co-optimization the CP-SAT
+solver only *places* buffers on each op's pre-determined core division;
+with `co_optimizing_lx_planning` it is driven by the joint
+`CoOptimizingAllocator` (below), which additionally chooses each op's core
+division.
 
 ## Co-optimization with work-distribution
 
@@ -437,6 +459,18 @@ splits and counts the HBM bytes of every buffer the solver could not pin.
 Repeated `_per_core_view_on_buf` work is memoized across leaves, and the
 split-invariant liveness / filtered-op-view / mem-usage computations are
 hoisted out of the per-leaf path.
+
+### Joint CP-SAT co-optimization
+
+Setting `layout_solver = "cpsat"` together with
+`co_optimizing_lx_planning` routes co-optimization through
+`CoOptimizingAllocator` instead of the search above. Rather than
+enumerating split variants and scoring leaves, it hands every op's
+candidate core divisions (from `enumerate_work_division_candidates`) and
+the producer/consumer slicing-match constraints to the CP-SAT solver,
+which chooses the core divisions and LX placements jointly in one
+constraint model. It falls back to the greedy allocator when `ortools`
+is unavailable.
 
 ## Current limitations
 

@@ -28,7 +28,13 @@ from torch._inductor.ops_handler import WrapperHandler
 import sympy
 
 from torch_spyre._inductor import config
-from torch_spyre._inductor.pass_utils import _per_core_view_on_buf, concretize_expr
+from torch_spyre._inductor.pass_utils import (
+    _per_core_view_on_buf,
+    concretize_expr,
+    op_read_writes,
+    device_coordinates,
+)
+from torch._inductor.ir import MutationLayoutSHOULDREMOVE, ComputedBuffer
 
 # Op outputs eligible for LX-pinning. `amax` is the lowered form of
 # `max`; both names are listed to match whichever the IR shows.
@@ -96,7 +102,7 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
     for input_name in graph.graph_input_names:
         liveness[input_name] = []
     for i, op in enumerate(graph.operations):
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         for mem_dep in rw.reads | rw.writes:
             buf_name = mem_dep.name
             if buf_name not in liveness:
@@ -108,7 +114,6 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
 def mem_usage_by_buf(
     graph: GraphLowering | GraphView,
     cache: Optional[dict] = None,
-    rw_cache: Optional[dict] = None,
 ) -> dict:
     """
     Get a summary of memory usage of each operation.
@@ -116,11 +121,8 @@ def mem_usage_by_buf(
     which has "size_per_core", "size", "core_div_mismatch", "op_inputs" fields
     NOTE:
     if a buf is not in core_div_mismatch => it has no users => graph output
-
-    `rw_cache` ({op name: ReadWrites}) memoizes get_read_writes() across
-    co-opt search leaves; None recomputes it.
     """
-    num_cores_per_op = get_ncores_for_buffers(graph, cache, rw_cache)
+    num_cores_per_op = get_ncores_for_buffers(graph, cache)
     mem_usage: dict = {}
 
     buf_names = {op.name for op in graph.operations}
@@ -128,11 +130,24 @@ def mem_usage_by_buf(
         buf_name = op.name
         buf = graph.get_buffer(buf_name)
         num_cores = num_cores_per_op.get(buf_name, -1)
-        dev_layout = buf.get_layout().device_layout
+        rw = op_read_writes(op)
+        layout = buf.layout
+        if isinstance(layout, MutationLayoutSHOULDREMOVE) or not isinstance(
+            op, ComputedBuffer
+        ):
+            mem_usage[buf_name] = {
+                "size": -1,
+                # Unsized sentinel (mirrors "size"); the core_div_mismatch flag
+                # below carries validity, so no arithmetic on num_cores here.
+                "size_per_core": -1,
+                "core_div_mismatch": num_cores < 0,
+                "op_inputs": [dep.name for dep in rw.reads if dep.name in buf_names],
+            }
+            continue
+        dev_layout = layout.device_layout
         dev_size = (
             math.prod(dev_layout.device_size[:-1]) * 128
         )  # num_sticks * bytes_per_stick
-        rw = rw_cache[op.get_name()] if rw_cache is not None else op.get_read_writes()
         mem_usage[buf_name] = {
             "size": dev_size,
             "size_per_core": dev_size // num_cores,
@@ -186,7 +201,7 @@ def buffer_not_read_in_full(graph: GraphLowering | GraphView, buf_name: str) -> 
     except (TypeError, ValueError):
         return True
     for op in graph.operations:
-        for dep in op.get_read_writes().reads:
+        for dep in op_read_writes(op).reads:
             if dep.name != buf_name:
                 continue
             try:
@@ -197,10 +212,96 @@ def buffer_not_read_in_full(graph: GraphLowering | GraphView, buf_name: str) -> 
     return False
 
 
+def _writes_at_constant_offset(op: Operation) -> bool:
+    """True if ``op`` writes any buffer at a non-zero *constant* offset -- a
+    sliced in-place mutation into a sub-region (e.g. ``x[:, 32:96] = ...``,
+    whose write ``MemoryDep`` index is ``256*d0 + d1 + 32`` with
+    ``get_offset() == 32``).
+
+    Coverage-aware: only a *constant* non-zero offset counts. Per-core /
+    coarse-tile writes carry their per-core shift as a symbol in the offset
+    (``free_symbols`` non-empty), so those are NOT flagged -- avoiding the
+    coarse-tile over-guard a flat-numel test would trigger.
+    """
+    for dep in op_read_writes(op).writes:
+        try:
+            off = dep.get_offset()
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if off != 0 and not getattr(off, "free_symbols", frozenset()):
+            return True
+    return False
+
+
+def ops_in_offset_mutation_component(
+    graph: GraphLowering | GraphView,
+) -> set[str]:
+    """Names of ops data-connected to a sliced in-place mutation that writes at
+    a constant non-zero offset (e.g. ``x[:, 32:96] = ...``).
+
+    Such a mutation and everything fused with it land in one SDSC. The offset
+    write's codegen assumes the target buffer keeps the slicing the eager path
+    chose; if the co-optimizing allocator re-slices any op in that fused kernel
+    (a different core division), the deeptools scheduler can no longer place the
+    offset write and aborts the compile (``DtException: "There must be at least
+    one valid candidate"``, ``L3DlOpsScheduler.cpp:1196``). This is the root
+    cause of the ``slice_stick_mutation_*`` co-optimizing-allocator failures --
+    the division change, *not* LX residency (the abort reproduces with pinning
+    fully disabled).
+
+    The caller pins every op in this set to its upstream (fixed) division, so
+    the offset-write SDSC keeps the schedulable slicing the greedy /
+    placement-only path uses. Fusion boundaries are unknown at planning time, so
+    the SDSC is over-approximated by the undirected data-dependency component
+    containing the offset write: producer chain (the value written), the
+    mutation target it aliases, and the consumers of that target. Over-approxi-
+    mation only forgoes a division optimization (correct, never a new failure --
+    a fixed division is exactly what greedy uses).
+
+    Coverage-aware via :func:`_writes_at_constant_offset`: symbolic per-core
+    offsets (coarse tiling) are not offset writes, so no component is seeded and
+    coarse tiling is not constrained.
+    """
+    # Undirected adjacency over buffer names (op.name == its output buffer,
+    # Inductor convention). Edges: producer<->operand (read deps) and a
+    # MutationLayout op <-> its aliased target buffer.
+    adj: dict[str, set[str]] = {}
+
+    def link(a: str, b: str) -> None:
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+
+    seeds: list[str] = []
+    for op in graph.operations:
+        for dep in op_read_writes(op).reads:
+            name = getattr(dep, "name", None)
+            if name:
+                link(op.name, name)
+        layout = getattr(op, "layout", None)
+        if isinstance(layout, MutationLayoutSHOULDREMOVE):
+            try:
+                link(op.name, layout.target.get_name())
+            except (AttributeError, TypeError):
+                pass
+        if _writes_at_constant_offset(op):
+            seeds.append(op.name)
+
+    op_names = {op.name for op in graph.operations}
+    component: set[str] = set()
+    stack = list(seeds)
+    while stack:
+        node = stack.pop()
+        if node in component:
+            continue
+        component.add(node)
+        stack.extend(adj.get(node, ()))
+    return component & op_names
+
+
 def get_buffer_users(graph: GraphLowering | GraphView) -> dict[str, list[Operation]]:
     buf_users_read_and_write: dict[str, list[Operation]] = {}
     for op in graph.operations:
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         for dep in rw.reads | rw.writes:  # union of the OrderedSets
             buf = dep.name  # buffer name, i.e. a str
             buf_users_read_and_write[buf] = buf_users_read_and_write.get(buf, []) + [op]
@@ -209,7 +310,6 @@ def get_buffer_users(graph: GraphLowering | GraphView) -> dict[str, list[Operati
 
 def _get_buffer_user_deps(
     graph: GraphLowering | GraphView,
-    rw_cache: Optional[dict] = None,
 ) -> dict[str, list[tuple[Operation, MemoryDep]]]:
     """Like get_buffer_users but pairs each op with the specific dep it uses.
 
@@ -217,13 +317,10 @@ def _get_buffer_user_deps(
     one per dep. If their per-core views diverge — read at one index,
     write at another — the buffer is correctly rejected for LX, since
     that's a within-core data hazard, not just cross-op disagreement.
-
-    `rw_cache` ({op name: ReadWrites}) memoizes the split-invariant
-    get_read_writes() across co-opt search leaves; None recomputes it.
     """
     buf_user_deps: dict[str, list[tuple[Operation, MemoryDep]]] = {}
     for op in graph.operations:
-        rw = rw_cache[op.get_name()] if rw_cache is not None else op.get_read_writes()
+        rw = op_read_writes(op)
         for dep in rw.reads | rw.writes:
             buf_user_deps.setdefault(dep.name, []).append((op, dep))
     return buf_user_deps
@@ -245,7 +342,6 @@ def _op_num_cores(op: Operation) -> int:
 def get_ncores_for_buffers(
     graph: GraphLowering | GraphView,
     cache: Optional[dict] = None,
-    rw_cache: Optional[dict] = None,
     reject_reasons_out: Optional[dict[str, str]] = None,
 ) -> dict[str, int]:
     """
@@ -257,15 +353,14 @@ def get_ncores_for_buffers(
     Pass an optional `cache` dict to memoize `_per_core_view_on_buf`
     results across calls (e.g. across co-opt search leaves). Safe to
     share only within a single graph, since the cache key includes the
-    op name and `dep` (which carries the buffer name). `rw_cache`
-    ({op name: ReadWrites}) likewise memoizes get_read_writes().
+    op name and `dep` (which carries the buffer name).
 
     Pass an optional `reject_reasons_out` dict to receive detailed
     reasons for core division mismatches (keyed by buffer name).
     """
     result: dict[str, int] = {}
     using_multicore = config.sencores > 1
-    buf_user_deps = _get_buffer_user_deps(graph, rw_cache)
+    buf_user_deps = _get_buffer_user_deps(graph)
     for buf_name, users in buf_user_deps.items():
         # this dict includes graph input and output
         if using_multicore and len(users) > 1:
@@ -277,15 +372,10 @@ def get_ncores_for_buffers(
             mismatch_reason = None
             writer_cores = None
             for op, dep in users:
-                view, flag = _per_core_view_on_buf(op, dep, buf_name, cache)
+                view, flag, _ = _per_core_view_on_buf(op, dep, buf_name, cache)
                 if ref_view is None:
                     ref_view = view
-                    ref_op_name = op.get_name()
-                op_rw = (
-                    rw_cache[op.get_name()]
-                    if rw_cache is not None
-                    else op.get_read_writes()
-                )
+                op_rw = op_read_writes(op)
                 if dep in op_rw.writes:
                     # Size by the writer's core count (the writer sets per-core
                     # footprint size/writer_cores; readers touch only their slice),
@@ -315,11 +405,9 @@ def get_ncores_for_buffers(
                     # into LX) or when a producer's view happens to match the
                     # broadcast footprint -- cases the `view != ref_view` check
                     # below cannot see.
-                    # work_slice_dims entries are (host-dim, (work_div, tile));
-                    # the per-dim core count is the work_div factor.
-                    view_cores = math.prod(
-                        work_div for _, (work_div, _tile) in view.work_slice_dims
-                    )
+                    # work_slice_dims entries are (device-dim, split factor);
+                    # the per-dim core count is the split factor.
+                    view_cores = math.prod(f for _, f in view.work_slice_dims)
                     if view_cores != _op_num_cores(op):
                         mismatch_reason = (
                             f"broadcast read on '{op.get_name()}': view covers "
@@ -384,3 +472,41 @@ def get_op_pointwise_inputs(node: IRNode) -> list[str]:
         for inp, load_index in loads.items()
         if all(store_index == load_index for store_index in stores.values())
     ]
+
+
+def _would_produce_lx_back_gap(
+    graph: GraphLowering,
+    buf_name: str,
+    uses: list[int],
+) -> bool:
+    """Check if pinning a buffer to LX would produce a backGapCore_.
+
+    A backGap fires when device_size[d] > it_dim_size for any device dimension d.
+    The backend supports backGap for HBM but not for LX, so buffers triggering
+    this condition must stay in HBM.
+    """
+    buf = graph.get_buffer(buf_name)
+    stl = buf.layout.device_layout
+    device_size = stl.device_size
+
+    for use_idx in uses:
+        op = graph.operations[use_idx]
+        rw = op_read_writes(op)
+        for dep in rw.reads | rw.writes:
+            if dep.name != buf_name:
+                continue
+            try:
+                coords = device_coordinates(stl, dep, None)
+            except Exception:
+                continue
+            for d, coord_expr in enumerate(coords[:-1]):
+                syms = coord_expr.free_symbols
+                if not syms:
+                    if device_size[d] > 1:
+                        return True
+                    continue
+                sym = next(iter(syms))
+                it_dim_size = int(dep.ranges[sym])
+                if device_size[d] > it_dim_size:
+                    return True
+    return False
