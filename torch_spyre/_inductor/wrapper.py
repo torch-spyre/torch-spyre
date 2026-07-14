@@ -56,7 +56,7 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         self.imports.splice(
             """
                 from sympy import sympify
-                from torch_spyre._inductor.op_spec import TensorArg, OpSpec, UnimplementedOp, LoopSpec, spyre_constant_tensor, IndirectAccess
+                from torch_spyre._inductor.op_spec import TensorArg, OpSpec, UnimplementedOp, LoopSpec, spyre_constant_tensor, IndirectAccess, DebugHandle, SourceLoc
                 from torch_spyre.execution.async_compile import SpyreAsyncCompile
                 from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout, spyre_empty_with_layout, set_spyre_tensor_layout
                 import subprocess
