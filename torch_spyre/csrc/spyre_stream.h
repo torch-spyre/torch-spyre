@@ -49,8 +49,6 @@ class SpyreStream {
   void copyAsync(const at::Tensor& src, const at::Tensor& dst) const;
   void copyProgramAsync(void* prog_cpu_ptr,
                         const flex::CompositeAddress* device_address) const;
-  void executeProgramAsync(const KernelArtifacts& arts,
-                           const std::vector<at::Tensor>& args) const;
 
   void launch(const JobPlan& plan, const std::vector<at::Tensor>& args) const;
 
@@ -61,6 +59,11 @@ class SpyreStream {
   void launchD2H(flex::DmaParams* params) const;
   void launchCompute(flex::ComputeParams* params) const;
   void launchHostCallback(flex::HostCallbackParams* params) const;
+  // Device-side MEMORY_FILL DMA. Routes through the typed
+  // flex::RuntimeStream::fillAsync overload, which performs the value->pattern
+  // conversion internally (no FillParams construction here).
+  void fillAsync(const flex::CompositeAddress* dst, double value,
+                 DataFormats dtype, bool use_dmai) const;
 
   // Conversions
   c10::Stream unwrap() const;

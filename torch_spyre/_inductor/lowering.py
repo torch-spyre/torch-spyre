@@ -35,6 +35,7 @@ from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import SpyreReduction, SpyreConstantFallback, SpyreEmptyFallback
 from torch_spyre._C import get_elem_in_stick
 from torch._inductor.virtualized import V
+from torch.utils._ordered_set import OrderedSet
 from .errors import Unsupported
 import threading
 from .logging_utils import get_inductor_logger
@@ -250,6 +251,35 @@ def ensure_default_handler(op_name):
 def eager_fallback(op, *args, **kwargs):
     handler = lowering.fallback_handler(op, add_to_fallback_set=False)
     return handler(*args, **kwargs)
+
+
+def _ensure_synthetic_origin(result, target, args: tuple) -> None:
+    """Give a lowering result a synthetic ``target`` origin FX node, so Spyre
+    layout passes (which key off ``op.data.origins[].target``) recognize it even
+    when the lowering was called directly, without an FX node of its own. No-op
+    if a ``target`` origin already exists.
+    """
+
+    def _realized_buffer(node):
+        while not isinstance(node, StorageBox):
+            node = node.data
+        return node.data
+
+    origins = getattr(_realized_buffer(result), "origins", None)
+    if origins and any(o.target == target for o in origins):
+        return
+
+    fx_graph = V.graph.graph
+    first_compute_node = next(n for n in fx_graph.nodes if n.op != "placeholder")
+    with fx_graph.inserting_before(first_compute_node):
+        fx_node = fx_graph.create_node("call_function", target, args)
+
+    # Realize so the origin lands on a stable ComputedBuffer, not a Pointwise.
+    result.realize()
+    buf = _realized_buffer(result)
+    # buf.data is a frozen Loops; override its origins via object.__setattr__.
+    object.__setattr__(buf.data, "origins", OrderedSet([fx_node]))
+    buf.origins = OrderedSet([fx_node])
 
 
 # TODO:This is just place holder now; Real implementation will follow
@@ -756,10 +786,16 @@ def lower_clamp(x, min=None, max=None):
 
 @register_spyre_lowering(torch.ops.aten.clone.default, type_promotion_kind=None)
 def clone(x, *, memory_format=None):
-    from torch._inductor.ir import FlexibleLayout, get_stride_order
-    from torch._inductor.lowering import clone as clone_lowering
+    result = lowering.clone(x, memory_format=memory_format)
 
-    result = clone_lowering(x, memory_format=memory_format)
+    # A clone called directly from another lowering has no aten.clone FX node,
+    # so it inherits the caller's origin and the layout pass skips clone's
+    # layout propagation enforcement. Inject a synthetic clone origin so it fires.
+    args: tuple = ()
+    if isinstance(x, ir.IRNode) and (n := x.get_origin_node()) is not None:
+        args = (n,)
+    _ensure_synthetic_origin(result, torch.ops.aten.clone.default, args)
+
     # Upstream Inductor ignores memory_format (TODO in clone lowering).
     # The output gets a FlexibleLayout whose stride order is inferred from
     # the input's strides via ComputedBuffer.get_fill_order(). When the
@@ -769,8 +805,8 @@ def clone(x, *, memory_format=None):
     # Fix: freeze the layout to the requested stride order so that
     # decide_layout() respects the memory_format contract.
     if memory_format is not None and memory_format != torch.preserve_format:
-        stride_order = get_stride_order(
-            FlexibleLayout.stride_ordered_for_memory_format(
+        stride_order = ir.get_stride_order(
+            ir.FlexibleLayout.stride_ordered_for_memory_format(
                 result.get_size(), memory_format
             )
         )
@@ -782,6 +818,12 @@ def clone(x, *, memory_format=None):
 @register_spyre_lowering(torch.ops.spyre.copy_from_d2d)
 def lower_spyre_from_d2d(src, dst):
     lowering.mutate_to(dst, src)
+
+
+@register_spyre_lowering(torch.ops.spyre.copy_)
+def lower_spyre_copy_(src, dst):
+    lowering.mutate_to(dst, src)
+    return dst
 
 
 @register_spyre_lowering(torch.ops.spyre.overwrite)
@@ -1018,7 +1060,7 @@ def lower_constant_pad_nd(input, pad, value=0, align_to_stick=False):
         offsets.append(pad_left)
 
     if not dims:
-        return clone(cropped_input)
+        return lowering.clone(cropped_input)
 
     dtype = input.get_dtype()
     device = input.get_device()
@@ -1073,7 +1115,7 @@ def to_dtype(x, dst_dtype):
     src_dtype = x.get_dtype()
 
     if src_dtype == dst_dtype:
-        return clone(x)
+        return lowering.clone(x)
 
     # Check if conversion is supported by backend
     if DtypeOpTable.get_operator(src_dtype, dst_dtype) is None:
@@ -1206,3 +1248,19 @@ def lower_qfp8ch(x):
     )
     pw.realize()
     return pw
+
+
+@register_spyre_lowering(
+    torch.ops.spyre.prod_dim_int,
+    type_promotion_kind=None,
+)
+def lower_prod_dim(x, dim, keepdim=False):
+    def _prod_dim_impl(x):
+        kwargs = lowering._make_reduction_inner(
+            x, axis=[dim], keepdims=keepdim, dtype=x.dtype, override_return_dtype=None
+        )
+        result = Reduction.create(reduction_type="prod", input_node=x, **kwargs)
+        result.realize()
+        return result
+
+    return with_int64_fallback(_prod_dim_impl, x)

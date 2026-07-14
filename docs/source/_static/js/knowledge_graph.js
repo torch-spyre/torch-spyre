@@ -136,8 +136,30 @@
   // -------------------------------------------------------------------------
 
   var graphData = null;
+  var graphMeta = {};
   var activeCy = null;
   var activeView = null;
+  var focusMode = false;
+
+  // -------------------------------------------------------------------------
+  // Build a "view source" URL back to the code that defines a node.
+  //
+  // Node source_file paths are repo-relative (e.g.
+  // "torch_spyre/_inductor/lowering.py"). We pin to the exact commit the
+  // graph was extracted from so a link never rots against a moved line;
+  // if the commit is unknown (graph built outside a git checkout), fall
+  // back to the default branch.
+  // -------------------------------------------------------------------------
+
+  function buildSourceUrl(sourceFile, line) {
+    if (!sourceFile) return null;
+    var repo = graphMeta.repo_url || "https://github.com/torch-spyre/torch-spyre";
+    var commit = graphMeta.source_commit;
+    var ref = commit && commit !== "unknown" ? commit : graphMeta.default_branch || "main";
+    var url = repo + "/blob/" + ref + "/" + sourceFile;
+    if (line) url += "#L" + line;
+    return url;
+  }
 
   // -------------------------------------------------------------------------
   // Cytoscape style shared across views
@@ -318,6 +340,11 @@
     if (activeView === viewKey && activeCy) return;
     activeView = viewKey;
 
+    // A new view has no selection; drop any lingering focus state.
+    focusMode = false;
+    var focusBtn = document.getElementById("kg-focus");
+    if (focusBtn) focusBtn.classList.remove("active");
+
     var view = VIEWS[viewKey];
     var filtered = filterForView(viewKey);
 
@@ -375,19 +402,22 @@
 
     activeCy.layout(layoutOpts).run();
 
-    // Click handler
+    // Single click: select the node (highlight + info panel).
     activeCy.on("tap", "node", function (evt) {
-      activeCy.elements().removeClass("selected-node neighbor");
-      var node = evt.target;
-      node.addClass("selected-node");
-      node.neighborhood("node").addClass("neighbor");
-      showNodeInfo(node.data());
+      selectNode(evt.target.id());
     });
 
+    // Double click: jump straight to the defining source on GitHub.
+    activeCy.on("dbltap", "node", function (evt) {
+      var d = evt.target.data();
+      var url = buildSourceUrl(d.source_file, d.line);
+      if (url) window.open(url, "_blank", "noopener");
+    });
+
+    // Background click: clear selection, focus, and the deep link.
     activeCy.on("tap", function (evt) {
       if (evt.target === activeCy) {
-        activeCy.elements().removeClass("selected-node neighbor");
-        clearInfo();
+        clearSelection();
       }
     });
 
@@ -413,11 +443,22 @@
     // Clear search
     var search = document.getElementById("kg-search");
     if (search) search.value = "";
+
+    // Reflect the active view in the URL (node cleared on view switch).
+    updateHash(null);
   }
 
   // -------------------------------------------------------------------------
   // UI: info panel
   // -------------------------------------------------------------------------
+
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
 
   function showNodeInfo(data) {
     var info = document.getElementById("kg-info");
@@ -427,28 +468,47 @@
       "background:" +
       meta.color +
       ';border-radius:2px;vertical-align:middle;margin-right:6px;"></span>';
-    html += "<strong>" + data.label + "</strong>";
-    html += " <em>(" + meta.label + ")</em>";
+    html += "<strong>" + escapeHtml(data.label) + "</strong>";
+    html += " <em>(" + escapeHtml(meta.label) + ")</em>";
+
+    // Source location: a clickable link straight to the defining code.
     if (data.source_file) {
-      html += "<br>File: <code>" + data.source_file + "</code>";
-      if (data.line) {
-        html += " line " + data.line;
+      var url = buildSourceUrl(data.source_file, data.line);
+      var locText = escapeHtml(data.source_file);
+      if (data.line) locText += ":" + data.line;
+      if (url) {
+        html +=
+          '<br><a class="kg-source-link" href="' +
+          escapeHtml(url) +
+          '" target="_blank" rel="noopener noreferrer" ' +
+          'title="Open this definition on GitHub">' +
+          "&#128196; <code>" +
+          locText +
+          "</code> &#8599;</a>";
+      } else {
+        html += "<br>File: <code>" + locText + "</code>";
       }
+    } else {
+      html +=
+        '<br><span style="color:#999;">No single source location ' +
+        "(this node is referenced from several places).</span>";
     }
-    var neighbors = activeCy
-      .getElementById(data.id)
-      .neighborhood("node");
+
+    var neighbors = activeCy.getElementById(data.id).neighborhood("node");
     if (neighbors.length > 0) {
       html += "<br><strong>Connected to:</strong> ";
       var items = neighbors
         .map(function (n) {
           var nm = TYPE_META[n.data("type")] || { color: "#bdc3c7" };
           return (
-            '<span style="border-bottom:2px solid ' +
+            '<a href="#" class="kg-neighbor" data-node-id="' +
+            escapeHtml(n.id()) +
+            '" style="border-bottom:2px solid ' +
             nm.color +
-            '">' +
-            n.data("label") +
-            "</span>"
+            ';text-decoration:none;color:inherit;" ' +
+            'title="Focus this node">' +
+            escapeHtml(n.data("label")) +
+            "</a>"
           );
         })
         .slice(0, 15);
@@ -462,7 +522,149 @@
 
   function clearInfo() {
     document.getElementById("kg-info").innerHTML =
-      "<em>Click a node to see its source location and connections.</em>";
+      "<em>Click a node to see its source location and connections. " +
+      "Double-click a node to jump straight to its code.</em>";
+  }
+
+  // Select a node by id: highlight it and its neighbors, center the
+  // viewport on it, and refresh the info panel. Shared by tap handlers,
+  // the "Connected to" neighbor links, and deep-link restoration.
+  function selectNode(nodeId, opts) {
+    if (!activeCy) return;
+    var node = activeCy.getElementById(nodeId);
+    if (!node || node.empty()) return;
+    activeCy.elements().removeClass("selected-node neighbor");
+    node.addClass("selected-node");
+    node.neighborhood("node").addClass("neighbor");
+    if (focusMode) applyFocus(node);
+    if (!opts || opts.center !== false) {
+      activeCy.animate({ center: { eles: node }, duration: 250 });
+    }
+    showNodeInfo(node.data());
+    updateHash(nodeId);
+  }
+
+  // -------------------------------------------------------------------------
+  // Focus mode, selection, and deep-linking
+  // -------------------------------------------------------------------------
+
+  // Fade everything except a node and its immediate neighborhood, so a
+  // dense view collapses to just the relationships around one concept.
+  function applyFocus(node) {
+    activeCy.elements().addClass("faded");
+    node.closedNeighborhood().removeClass("faded");
+  }
+
+  function clearFocus() {
+    if (activeCy) activeCy.elements().removeClass("faded");
+  }
+
+  function toggleFocus() {
+    focusMode = !focusMode;
+    var btn = document.getElementById("kg-focus");
+    if (btn) btn.classList.toggle("active", focusMode);
+    var selected = activeCy ? activeCy.$(".selected-node") : null;
+    if (focusMode && selected && selected.length) {
+      applyFocus(selected);
+    } else {
+      clearFocus();
+    }
+  }
+
+  function clearSelection() {
+    if (activeCy) activeCy.elements().removeClass("selected-node neighbor");
+    clearFocus();
+    clearInfo();
+    updateHash(null);
+  }
+
+  // Reflect the current view (and optionally a selected node) in the URL
+  // hash so a specific node can be linked and shared, e.g. the page can be
+  // opened at "#ops/op::mm" to land directly on that op.
+  function updateHash(nodeId) {
+    if (!activeView) return;
+    var hash = "#" + activeView;
+    if (nodeId) hash += "/" + encodeURIComponent(nodeId);
+    if (typeof history !== "undefined" && history.replaceState) {
+      history.replaceState(null, "", hash);
+    } else {
+      location.hash = hash;
+    }
+  }
+
+  function parseHash() {
+    var h = (location.hash || "").replace(/^#/, "");
+    if (!h) return null;
+    var slash = h.indexOf("/");
+    if (slash === -1) return { view: h, nodeId: null };
+    return {
+      view: h.slice(0, slash),
+      nodeId: decodeURIComponent(h.slice(slash + 1)),
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // UI: view controls (fit / focus / reset / export)
+  // -------------------------------------------------------------------------
+
+  function setupControls() {
+    var fit = document.getElementById("kg-fit");
+    if (fit) {
+      fit.addEventListener("click", function () {
+        if (activeCy) activeCy.animate({ fit: { padding: 30 }, duration: 250 });
+      });
+    }
+
+    var focus = document.getElementById("kg-focus");
+    if (focus) focus.addEventListener("click", toggleFocus);
+
+    var reset = document.getElementById("kg-reset");
+    if (reset) {
+      reset.addEventListener("click", function () {
+        focusMode = false;
+        var fb = document.getElementById("kg-focus");
+        if (fb) fb.classList.remove("active");
+        var search = document.getElementById("kg-search");
+        if (search) search.value = "";
+        if (activeCy) {
+          activeCy.elements().removeClass("highlighted faded");
+          clearSelection();
+          activeCy.animate({ fit: { padding: 30 }, duration: 250 });
+        }
+      });
+    }
+
+    var png = document.getElementById("kg-png");
+    if (png) {
+      png.addEventListener("click", function () {
+        if (!activeCy) return;
+        var uri = activeCy.png({ full: true, scale: 2, bg: "#ffffff" });
+        var a = document.createElement("a");
+        a.href = uri;
+        a.download = "torch-spyre-" + (activeView || "graph") + ".png";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      });
+    }
+
+    // Escape clears the current selection.
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape") clearSelection();
+    });
+
+    // Delegate clicks on the "Connected to" neighbor links so navigating
+    // between related nodes stays inside the graph.
+    var info = document.getElementById("kg-info");
+    if (info) {
+      info.addEventListener("click", function (e) {
+        var link = e.target.closest ? e.target.closest(".kg-neighbor") : null;
+        if (link && link.dataset && link.dataset.nodeId) {
+          e.preventDefault();
+          selectNode(link.dataset.nodeId);
+        }
+      });
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -542,15 +744,30 @@
 
   function init(data) {
     graphData = data;
+    graphMeta = data.metadata || {};
     buildTabs();
     setupSearch();
+    setupControls();
 
-    // Activate first tab
+    // Restore the view (and node) from the URL hash if present, so shared
+    // deep links like "#architecture/class::SpyreScheduler" land correctly.
+    var parsed = parseHash();
+    var initialView = parsed && VIEWS[parsed.view] ? parsed.view : "ops";
+
     var tabBar = document.getElementById("kg-tabs");
-    if (tabBar && tabBar.firstChild) {
-      tabBar.firstChild.classList.add("active");
+    if (tabBar) {
+      tabBar.querySelectorAll(".kg-tab").forEach(function (b) {
+        b.classList.toggle("active", b.dataset.view === initialView);
+      });
     }
-    renderView("ops");
+    renderView(initialView);
+
+    if (parsed && parsed.nodeId) {
+      // Defer until the layout has placed nodes for the freshly rendered view.
+      setTimeout(function () {
+        selectNode(parsed.nodeId);
+      }, 0);
+    }
   }
 
   // -------------------------------------------------------------------------
