@@ -137,7 +137,6 @@ finalize_layouts
 insert_restickify
 insert_bmm_padding
 dedup_and_promote_constants
-chunk_large_tensors                   # conditional on config.chunk_large_tensors
 propagate_named_dims                  # named-dimension metadata
 assign_dim_hints
 coarse_tile                           # runs when hints produce groups
@@ -186,8 +185,7 @@ it sets up the next two optimizations, which are large.
 
 **Stage 3, in-place ops.** When a buffer is on LX and its last reader is
 itself dying-after-this-op, the output of the next op can reuse the same
-LX address. `exp` and `sub` are flagged
-[OP_GOOD_FOR_LX_INPLACE](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/scratchpad/utils.py)
+LX address. `exp` and `sub` are flagged as `torch.Tag.pointwise`
 and therefore in-placeable. After stage 3, the only HBM access left is
 the graph input and graph output, for `3MN` bytes total, a 62% reduction.
 
@@ -244,7 +242,7 @@ Scratchpad planning has three layers with separate concerns:
 :width: 480px
 :align: center
 
-`DefaultAllocator` runs pre-passes (clone insertion), gathers
+`ScratchpadAllocator` runs pre-passes (clone insertion), gathers
 `LifetimeBoundBuffer`s, hands them to a pluggable solver, then writes the
 chosen LX addresses onto buffer layouts. `StrategyBCoOptimizingAllocator`
 extends this flow with a split-search step before the solver runs.
@@ -257,16 +255,16 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | `passes.py` | `ScratchpadOptimizationPass` ABC, `CloneInputNodesPass` |
 | `plan_solver.py` | `MemoryPlanSolver` ABC, `LifetimeBoundBuffer`, `GreedyLayoutSolver` |
 | `firstfit_bestfit_solver.py` | `FirstFitLayoutSolver`, `BestFitLayoutSolver` |
-| `allocator.py` | `ScratchpadAllocator` ABC, `DefaultAllocator`, `StrategyBCoOptimizingAllocator` |
+| `allocator.py` | `ScratchpadAllocator`, `StrategyBCoOptimizingAllocator` |
 | `utils.py` | liveness, in-place candidates, op eligibility lists |
 
 ### Entry point
 
 ```python
-scratchpad_planning(graph, allocator=DefaultAllocator())
+scratchpad_planning(graph, allocator=ScratchpadAllocator())
 ```
 
-`DefaultAllocator` runs the following pipeline:
+`ScratchpadAllocator` runs the following pipeline:
 
 1. **Pre-passes.** `CloneInputNodesPass` walks graph inputs and inserts a
    `clone` for any HBM input that is read more than once *and* fits on

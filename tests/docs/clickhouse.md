@@ -80,6 +80,79 @@ CREATE TABLE spyre.run_properties
 )
 ```
 
+### Performance data
+
+### `spyre.benchmark_runs`
+
+```sql
+CREATE TABLE IF NOT EXISTS benchmark_runs (
+    run_id      UInt64 DEFAULT rand64(),
+    source_file String NOT NULL,
+    created_at  DateTime DEFAULT now()
+)
+```
+
+### `spyre.perf_benchmarks`
+
+```sql
+CREATE TABLE IF NOT EXISTS perf_benchmarks (
+    benchmark_id  UInt64 DEFAULT rand64(),
+    run_id        UInt64 NOT NULL,
+    record_type   String NOT NULL,
+    operation_name Nullable(String),
+    config_name    Nullable(String),
+    stack          String NOT NULL,
+    input_shapes   Nullable(String),
+    batch_size    Nullable(Int32),
+    prompt_length Nullable(Int32),
+    run_mode      Nullable(String),
+    kernel_name   Nullable(String),
+    total_duration_ms       Nullable(Float64),
+    kernel_mean_ms          Nullable(Float64),
+    memcpy_htod_ms          Nullable(Float64),
+    memcpy_dtoh_ms          Nullable(Float64),
+    memset_device_ms        Nullable(Float64),
+    memory_transfer_mean_ms Nullable(Float64),
+    pt_util_percent         Nullable(Float64),
+    num_runs       Nullable(Int32),
+    custom_op_file Nullable(String),
+    version_info   Nullable(String),
+    created_at DateTime DEFAULT now()
+)
+```
+
+### `spyre.sendnn_runs`
+
+```sql
+CREATE TABLE IF NOT EXISTS sendnn_runs (
+    run_id      UInt64 DEFAULT rand64(),
+    source_file String NOT NULL,
+    created_at  DateTime DEFAULT now()
+)
+```
+
+### `spyre.sendnn_benchmarks`
+
+```sql
+CREATE TABLE IF NOT EXISTS sendnn_benchmarks (
+    benchmark_id  UInt64 DEFAULT rand64(),
+    run_id        UInt64 NOT NULL,
+    record_type   String NOT NULL,
+    operation_name Nullable(String),
+    stack          String NOT NULL,
+    input_shapes   Nullable(String),
+    batch_size    Nullable(Int32),
+    prompt_length Nullable(Int32),
+    run_mode      Nullable(String),
+    total_duration_ms       Nullable(Float64),
+    kernel_mean_ms          Nullable(Float64),
+    memory_transfer_mean_ms Nullable(Float64),
+    pt_util_percent         Nullable(Float64),
+    custom_op_file Nullable(String),
+    created_at DateTime DEFAULT now()
+)
+```
+
 ---
 
 ## Useful SQL Queries

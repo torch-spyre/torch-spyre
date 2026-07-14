@@ -112,6 +112,7 @@ register_torch_compile_kernel(
         aten.ge,
         aten.gt,
         aten.lt,
+        aten.amax,
         aten.maximum,
         aten.minimum,
         aten.pow,
@@ -128,9 +129,45 @@ register_torch_compile_kernel(
 def spyre__fill_scalar(
     self: torch.Tensor, other: int | float | bool | complex
 ) -> torch.Tensor:
-    tmp = torch.ones(self.size(), dtype=self.dtype) * other
-    self.copy_(tmp)
+    if isinstance(other, complex):
+        raise TypeError("spyre fill_ does not support complex fill values")
+    torch_spyre._C.fill_tensor(self, float(other))
     return self
+
+
+@torch.library.register_kernel("aten::full", ["spyre"])  # type:ignore
+def spyre_full(
+    size: list | tuple,
+    fill_value: int | float | bool | complex,
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
+) -> torch.Tensor:
+    assert layout in (torch.strided, None), f"doesn't support layout={layout}"
+    assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
+    if isinstance(fill_value, complex):
+        raise TypeError("spyre full does not support complex fill values")
+    t = torch.empty(size, dtype=dtype, device=device)
+    torch_spyre._C.fill_tensor(t, float(fill_value))
+    return t
+
+
+@torch.library.register_kernel("aten::ones", ["spyre"])  # type:ignore
+def spyre_ones(
+    size: list | tuple,
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
+) -> torch.Tensor:
+    assert layout in (torch.strided, None), f"doesn't support layout={layout}"
+    assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
+    t = torch.empty(size, dtype=dtype, device=device)
+    torch_spyre._C.fill_tensor(t, 1.0)
+    return t
 
 
 @torch.library.register_kernel("aten::normal_", ["spyre"])  # type:ignore
@@ -148,12 +185,8 @@ def spyre__normal_(self, mean=0.0, std=1.0, *, generator=None):
 
 @torch.library.register_kernel("aten::zero_", ["spyre"])  # type:ignore
 def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
-    """Zero out the tensor in-place."""
-    # Create zeros on CPU
-    tmp = torch.zeros(self.size(), dtype=self.dtype, device="cpu")
-    # Copy to device
-    self.copy_(tmp)
-    # TODO: Can we zero out tensors in-place without copy
+    """Zero out the tensor in-place using device-side FillDMA."""
+    torch_spyre._C.fill_tensor(self, 0.0)
     return self
 
 

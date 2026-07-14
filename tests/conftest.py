@@ -16,10 +16,10 @@ import os
 from pathlib import Path
 import yaml
 import pytest
-
+import re
 
 import shared_config
-from oot_framework.oot_test_utilities import _RUNTIME_TAGS
+from oot_framework.oot_test_utilities import _RUNTIME_TAGS, _RUNTIME_SHAPES
 
 
 # Attaches per-test tags to the pytest report object after each test call.
@@ -49,6 +49,20 @@ def pytest_runtest_makereport(item, call):
                 tags = getattr(fn, "_oot_method_tags", [])
         if tags:
             rep._spyre_tags = tags
+
+        shapes = _RUNTIME_SHAPES.get(method_name)
+        if not shapes:
+            # Fallback: extract op unique_name from the variant method name
+            # e.g. "test_model_ops_db_torch_mul__1_spyre_float16" -> "torch_mul__1"
+            # _RUNTIME_SHAPES is pre-populated at collection time with this key.
+            # This covers the case where the test body never ran (runner crash /
+            # fresh-process retry), mirroring the _oot_method_tags fallback above.
+            m = re.search(r"^test_model_ops_db_(\w+__\d+)", method_name)
+            if m:
+                shapes = _RUNTIME_SHAPES.get(m.group(1))
+
+        if shapes:
+            rep._spyre_shapes = shapes
 
         # Rewrite SKIPPED/FAILED -> XFAIL for unittest.TestCase methods marked
         # xfail by OOT config. pytest.mark.xfail is ignored by the unittest runner
@@ -87,6 +101,9 @@ def pytest_runtest_logreport(report):
         if tags:
             # Write directly to terminal
             os.write(1, f"  [TAGS = {' '.join(tags)}]\n".encode())
+        shapes = getattr(report, "_spyre_shapes", None)
+        if shapes:
+            os.write(1, f"  [INPUT SHAPES]\n{shapes}\n".encode())
 
 
 def _get_case_marks(case: dict) -> set[str]:

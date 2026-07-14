@@ -8,6 +8,7 @@ on:
       - tests/docs/**
       - docs/**
       - README.md
+      - CODEOWNERS
   # Removing from CICD till the ops tests get matured
   # pull_request:
   #   branches: [main]
@@ -27,8 +28,51 @@ permissions:
   checks: write
 
 jobs:
+  # Build the torch_spyre._C extension ONCE and publish it as a wheel; every
+  # matrix entry below installs that single wheel instead of recompiling per
+  # model (previously each of the ~14 model jobs ran its own build).
+  build:
+    name: Build torch-spyre wheel (once)
+    # Compile-only: needs the backend image + SDK toolchain but NO physical Spyre
+    # card, so it targets the cardless spyre_pf_x0 pool and leaves card runners
+    # for the test jobs.
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - linux
+      - image_spyre_backend
+    timeout-minutes: 40
+    steps:
+      - name: Checkout composite actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: torch-spyre
+
+      - uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
+
+      - name: Build torch-spyre wheel
+        uses: ./.github/actions/build-torch-spyre-wheel
+        with:
+          image_label: image_spyre_backend
+
+      - name: Upload torch-spyre wheel
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: torch-spyre-wheel
+          path: torch-spyre/dist/*.whl
+          if-no-files-found: error
+          retention-days: 5
+
   model-ops-tests:
     name: ${{ matrix.suite.name }}
+    needs: build
     runs-on:
       - x86_64
       - spyre_pf_x1
@@ -67,10 +111,10 @@ jobs:
             config: granite-3.3-8b-instruct.yaml
           - name: Granite 3.3 8B Instruct Spyre
             config: granite-3.3-8b-instruct_spyre.yaml
-          # - name: Granite 4.0 H Tiny   # omitted for now
-          #   config: granite-4.0-h-tiny.yaml
-          # - name: Granite 4.0 H Tiny Spyre   # omitted for now
-          #   config: granite-4.0-h-tiny_spyre.yaml
+          - name: Granite 4.1 8B
+            config: granite-4.1-8b.yaml
+          - name: Granite 4.1 8B Spyre
+            config: granite-4.1-8b_spyre.yaml
           - name: Meta Llama 3.1 8B Instruct
             config: Meta-Llama-3.1-8B-Instruct.yaml
           - name: Meta Llama 3.1 8B Instruct Spyre
@@ -103,7 +147,8 @@ jobs:
         with:
           verbose: 'true'
 
-      - uses: ./.github/actions/build-torch-spyre
+      - name: Install prebuilt torch-spyre
+        uses: ./.github/actions/install-prebuilt-torch-spyre
 
       - name: Derive report paths
         run: |
@@ -119,6 +164,14 @@ jobs:
           extra_test_flags: -v
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
+          pre_run: |
+            # Clear the cached AIU setup guard and stale topo.json before
+            # every attempt so a card left in a bad state by a killed
+            # (stalled) previous attempt gets re-discovered cleanly instead
+            # of carrying stale state into the retry.
+            unset _IBM_AIU_SETUP
+            rm -rf /tmp/etc/ibm/spyre/topo.json
+            source /etc/profile.d/ibm-aiu-setup.sh
 
       # ---------------------------------------------------------------------------
       # Upload the JUnit XML as a GHA artifact so it can be downloaded and

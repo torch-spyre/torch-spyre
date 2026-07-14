@@ -42,7 +42,7 @@ to handle device management and synchronization.
 
 ### Device Enumeration
 
-`torch.spyre.device_count()` is handled by the PrivateUse1 hooks in `csrc/spyre_hooks.cpp`, which look up the visible-device set from a small group of environment variables read in `csrc/spyre_device_enum.cpp`:
+`torch.spyre.device_count()` is handled by the PrivateUse1 hooks registered in `csrc/module.cpp`, which look up the visible-device set from a small group of environment variables read in `csrc/spyre_device_enum.cpp`:
 
 | Variable | Effect |
 |---|---|
@@ -58,15 +58,13 @@ The count itself comes from `flex::getNumDevices`.
 |------|---------------|
 | `csrc/module.cpp` | pybind11 entry point for the `_C` extension module. Device registration itself happens in `torch_spyre/__init__.py::_autoload()`. |
 | `csrc/spyre_tensor_impl.cpp` | `SpyreTensorImpl`, the device tensor backing store. |
-| `csrc/spyre_mem.cpp` | Device memory allocation and DMA, including graph-free DMA and FlexAllocator support. |
+| `csrc/spyre_mem.cpp` | Device tensor factory ops (`spyre_empty*`, `resize_`) and host↔device copy: builds the `DataConversionInfo` (DCI) descriptors via `generate_dci` that drive `copyAsync` transfers between host memory and LPDDR5. |
 | `csrc/spyre_allocator.cpp` | `SpyreAllocator`, which bridges PyTorch's `c10::Allocator` to `flex::FlexAllocator`. |
 | `csrc/spyre_storage_impl.cpp` | `SpyreStorageImpl`, the storage object backing `SpyreTensorImpl`. |
 | `csrc/spyre_views.cpp` | Tensor view and striding support on device, including `_reshape_alias`. |
 | `csrc/spyre_guard.cpp` | `SpyreGuardImpl`, device guard and synchronization. |
 | `csrc/spyre_stream.cpp` | Stream management for asynchronous execution. |
-| `csrc/spyre_hooks.cpp` | `PrivateUse1HooksInterface`, wires PyTorch's PrivateUse1 hooks to Spyre. |
 | `csrc/spyre_device_enum.cpp` | Visible-device enumeration. Reads `AIU_WORLD_SIZE`, `SPYRE_DEVICES`, `FLEX_DEVICE`. |
-| `csrc/spyre_sendnn_utils.cpp` | Eager-mode helpers, including the `EAGER_MODE` env var. |
 | `csrc/logging.cpp` | C++ debug logging, gated on `TORCH_SPYRE_DEBUG`. |
 | `csrc/profiler/` | PyTorch Profiler (PrivateUse1) integration. |
 | `csrc/attn_utils.cpp` | SDPA dispatch. Routes `scaled_dot_product_attention` to the Spyre backend, with GQA support. |
@@ -82,7 +80,7 @@ device and backend registration without requiring an explicit import.
 :width: 40%
 :align: center
 
-The Spyre device allocator call chain. A `torch.empty(..., device="spyre")` call flows through `spyre_empty_strided` into `SpyreAllocator::allocate`, which calls `flex::FlexAllocator::allocate(nbytes)` ([`spyre_allocator.cpp:137`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_allocator.cpp#L137)).
+The Spyre device allocator call chain. A `torch.empty(..., device="spyre")` call flows through `spyre_empty_strided` into `SpyreAllocator::allocate`, which calls `flex_alloc->allocate(nbytes, directive)` ([`spyre_allocator.cpp:167`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_allocator.cpp#L167)).
 :::
 
 ## Memory Model
@@ -101,12 +99,16 @@ For the layout that lets the runtime actually walk one of those tensors, see [Te
 
 ### SpyreTensorImpl
 
-A standard PyTorch `(size, stride)` pair cannot describe a tiled device tensor, so Torch-Spyre defines `SpyreTensorImpl` as a subclass of `TensorImpl`. The subclass adds one piece of data, a `SpyreTensorLayout`, that captures everything the runtime needs:
+A standard PyTorch `(size, stride)` pair cannot describe a tiled device tensor, so Torch-Spyre defines `SpyreTensorImpl` as a subclass of `TensorImpl`. The subclass adds three members: a `SpyreTensorLayout` (`spyre_layout`) plus two standalone vectors, `dma_sizes` and `dma_strides`. Together they capture everything the runtime needs.
+
+The `SpyreTensorLayout` holds:
 
 - `device_size` — the tensor's shape on device, including the extra tiling and padding dims.
 - `stride_map` — the host stride for each device dim. A `-1` here means the dim is synthetic or fully padded.
 - `device_dtype` — the on-device data format, for example `SEN169_FP16`.
-- `dma_sizes` and `dma_strides` — a host-shape DMA descriptor used when copying views back to the host. They drive `copyAsync()` in `spyre_stream.cpp`.
+- `element_arrangement` — how elements are packed within a stick (defaults to `STANDARD`).
+
+Alongside the layout, `SpyreTensorImpl` carries `dma_sizes` and `dma_strides` directly — a host-shape DMA descriptor used when copying views back to the host. They drive `copyAsync()` in `spyre_stream.cpp`.
 
 Note that the handles returned to Python never carry a raw device pointer. That is a hard requirement on IBM Z.
 
@@ -115,7 +117,7 @@ Note that the handles returned to Python never carry a raw device pointer. That 
 :width: 80%
 :align: center
 
-What is behind a Spyre tensor, drawn as a stack of layers. Python only ever sees the outermost `at::Tensor` handle. Underneath, `c10::TensorImpl` carries the standard tensor metadata, and the Spyre subclass adds a `SpyreTensorLayout` that holds the device shape, the `stride_map`, the device dtype, and the DMA descriptor.
+What is behind a Spyre tensor, drawn as a stack of layers. Python only ever sees the outermost `at::Tensor` handle. Underneath, `c10::TensorImpl` carries the standard tensor metadata, and the Spyre subclass adds a `SpyreTensorLayout` (device shape, `stride_map`, device dtype, and `element_arrangement`) plus the standalone `dma_sizes`/`dma_strides` DMA descriptor.
 :::
 
 ### SpyreAllocator
@@ -132,6 +134,13 @@ What `flex_alloc->allocate(nbytes)` returns is a `flex::CompositeAddress`, a han
 What happens between a Python tensor going out of scope and the device allocation returning to the flex pool. The piece that connects the two ends is the `ReportAndDelete` callback that `SpyreAllocator` installs on every `c10::DataPtr` it hands out.
 :::
 
+When the allocator runs out of memory regions it invokes a registered
+memory-pressure callback. The torch-spyre callback releases the allocator mutex,
+calls `PyGC_Collect()` to free Python cyclic garbage, and re-acquires the mutex
+before returning — allowing the allocation to be retried. See
+[Memory Pressure and Python GC](memory_pressure_gc.md) for the full GIL
+interaction and lock-ordering details.
+
 Physical-frame (PF) and virtual-frame (VF) execution are *not* allocator strategies inside `SpyreAllocator`. The mode is picked by the `FLEX_DEVICE` environment variable, which configures the underlying flex runtime (see `csrc/spyre_device_enum.cpp`):
 
 | Mode | Selection | Description |
@@ -143,11 +152,11 @@ Physical-frame (PF) and virtual-frame (VF) execution are *not* allocator strateg
 
 Eager kernels reach the Spyre dispatch key from two Python sources.
 
-The first is manual registrations in [`torch_spyre/ops/eager.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/eager.py), which use `torch.library.register_kernel` to wire up ops like `mm`, `silu`, `mish`, `fill_.Scalar`, `normal_`, `uniform_`, `_local_scalar_dense`, and `_copy_from`.
+The first is manual registrations in [`torch_spyre/ops/eager.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/eager.py), which use `register_torch_compile_kernel` to register 45+ ops (arithmetic, comparison, reduction, activation, and view ops) for the PrivateUse1 dispatch key.
 
 The second is CPU fallbacks in [`torch_spyre/ops/fallbacks.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/fallbacks.py), registered through `@register_fallback` (or the `register_fallback_default` helper for plain pass-throughs). These cover the long tail: `arange`, `embedding`, `cumsum`, `tril`/`triu`, `isin`, `bitwise_xor`/`bitwise_or`, `argmax`, and similar.
 
-Five Inductor decompositions registered through `register_spyre_decomposition` also dispatch eagerly: `rms_norm`, `layer_norm`, `softplus`, `linear`, and `_scaled_dot_product_fused_attention_overrideable`.
+Inductor decompositions registered through `register_spyre_decomposition` also dispatch eagerly when the underlying ATen op does not already have a PrivateUse1 kernel. See the [supported operations table](../user_guide/supported_operations.md) for the full list.
 
 C++ kernels can still be registered through the usual `TORCH_LIBRARY_IMPL` block, but most of the public eager surface today comes from the Python sources above.
 
@@ -246,9 +255,9 @@ Cross-card collective communication is exposed through the standard PyTorch
 
 Torch-Spyre registers a `c10d::Backend` named `spyreccl`. The class is
 `SpyreCCLBackend` in `csrc/distributed/spyre_ccl.{cpp,hpp}`, registered with the
-process-group machinery via `createSpyreCCLBackend` (called from
-`torch_spyre/__init__.py:237` when the user invokes
-`init_process_group(backend="spyreccl")`). The constant
+process-group machinery via `createSpyreCCLBackend`, wired up in
+`_create_spyre_ccl_backend` in `torch_spyre/__init__.py` when the user invokes
+`init_process_group(backend="spyreccl")`. The constant
 `DISTRIBUTED_BACKEND_NAME = "spyreccl"` is defined in `torch_spyre/constants.py`.
 
 Standard usage looks like any other PyTorch distributed setup:
@@ -302,3 +311,11 @@ unsupported — the protocol overhead is high and call sites are rare.
 to a single Spyre device (typically `torch.device(f"spyre:{os.getenv('RANK', '0')}")`
 in the user code). The backend reuses the rank's existing flex runtime instance
 and default stream. It does not own a separate runtime context.
+
+## More in This Section
+
+```{toctree}
+:maxdepth: 1
+
+memory_pressure_gc
+```

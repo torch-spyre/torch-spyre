@@ -309,13 +309,13 @@ laid out in device memory.
 Compilation
 -----------
 
-Spyre models are compiled using ``torch.compile`` with the ``"spyre"``
-backend:
+Spyre models are compiled using ``torch.compile``. Inductor routes to
+the Spyre backend automatically when the model is on a Spyre device:
 
 .. code-block:: python
 
    model = MyModel().to("spyre")
-   compiled = torch.compile(model, backend="spyre")
+   compiled = torch.compile(model)
    output = compiled(inputs)
 
 See :doc:`../user_guide/running_models` for details and
@@ -364,6 +364,12 @@ manipulation of device tensor layouts. See
       :type: DataFormats
 
       The on-device data format (e.g., ``SEN169_FP16``).
+
+   .. attribute:: element_arrangement
+      :type: ElementArrangement
+
+      How elements are packed within a stick. Defaults to ``STANDARD``
+      and appears in the ``repr`` only when it is non-standard.
 
    .. method:: elems_per_stick() -> int
 
@@ -437,11 +443,11 @@ Warnings
 
 .. function:: torch_spyre._C.get_downcast_warning() -> bool
 
-   Returns whether float32 → float16 downcast warnings are enabled.
+   Returns whether int64 → int32 downcast warnings are enabled.
 
 .. function:: torch_spyre._C.set_downcast_warning(enabled)
 
-   Enable or disable float32 → float16 downcast warnings.
+   Enable or disable int64 → int32 downcast warnings.
 
    :param bool enabled: ``True`` to enable warnings, ``False`` to suppress.
 
@@ -476,13 +482,17 @@ Environment Variables
    * - ``TORCH_SPYRE_DEBUG=1``
      - Enable C++ debug logging and ``-O0`` builds
    * - ``TORCH_SPYRE_DOWNCAST_WARN=0``
-     - Suppress float32 → float16 downcast warnings
+     - Suppress int64 → int32 downcast warnings
    * - ``SPYRE_INDUCTOR_LOG=1``
-     - Enable Spyre Inductor logging
+     - *Deprecated*. Use ``TORCH_LOGS='spyre.inductor:INFO'``. Enables Spyre
+       Inductor logging
    * - ``SPYRE_INDUCTOR_LOG_LEVEL=DEBUG``
-     - Set Spyre Inductor log verbosity (DEBUG, INFO, WARNING, ERROR)
+     - *Deprecated*. Set the level in ``TORCH_LOGS`` (e.g.
+       ``spyre.inductor:DEBUG``). Sets Spyre Inductor log verbosity (DEBUG,
+       INFO, WARNING, ERROR)
    * - ``SPYRE_LOG_FILE=path``
-     - Redirect Spyre Inductor logs to a file
+     - *Deprecated*. Mapped to the top-level ``spyre`` logger file handler.
+       Redirects Spyre Inductor logs to a file
    * - ``TORCH_SENDNN_LOG``
      - SendNN library logging level (default: ``CRITICAL``)
    * - ``DT_DEEPRT_VERBOSE``
@@ -507,9 +517,8 @@ Environment Variables
        ``scratchpad_planning`` pass)
    * - ``CO_OPTIMIZING_LX_PLANNING``
      - Use the co-optimizing LX allocator strategy (default ``0``)
-   * - ``CHUNK_LARGE_TENSORS``
-     - Run the ``chunk_large_tensors`` pass to split tensors that exceed
-       the per-core span (default ``0``)
+   * - ``SPYRE_INDUCTOR_MEMORY_PLAN``
+     - Enable HBM / device-buffer memory planning (default ``1``)
    * - ``GLOBAL_STICK_OPTIMIZER``
      - Enable the global stick-dimension optimizer (default ``1``)
    * - ``SPYRE_CORE_ID_K_FAST_EMISSION``
@@ -518,7 +527,7 @@ Environment Variables
        ``1``)
    * - ``BUNDLE_SYMBOLIC_ARGS``
      - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
-       integers (default ``0``)
+       integers (default ``1``)
    * - ``UNROLL_LOOPS``
      - Fully unroll ``LoopSpec`` nodes into flat ``OpSpec``\s before bundle
        generation (default ``1``; set ``0`` to keep the
@@ -531,7 +540,14 @@ Environment Variables
    * - ``MIN_DEFAULT_GRANULARITY``
      - Minimum default granularity for work division (default ``4``)
    * - ``SPYRE_INDUCTOR_IGNORE_HINTS``
-     - Ignore ``spyre_hint(work_div={...})`` annotations (default ``0``)
+     - Ignore ``spyre_hint`` annotations: ``work_div={...}``
+       work-division hints, hint-based working-set reduction, and
+       span-overflow coarse-tiling hints (default ``0``)
+   * - ``SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS``
+     - Ignore only span-overflow coarse-tiling hints; a narrower
+       alternative to ``SPYRE_INDUCTOR_IGNORE_HINTS``.  Defaults to
+       ``1`` (disabled/opt-in): set to ``0`` to enable automatic
+       span-overflow coarse tiling.
 
 **Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
 
@@ -546,7 +562,8 @@ Environment Variables
    * - ``SPYRE_DEVICES``
      - Comma-separated list of device indices to expose
    * - ``FLEX_DEVICE``
-     - Select the underlying flex runtime mode (PF / VF)
+     - Select the underlying flex runtime mode (``PF``, ``VF``, or
+       ``MOCK``)
 
 **Internal:**
 

@@ -56,8 +56,8 @@ The following environment variables control the level of diagnostic output:
 | `TORCHINDUCTOR_FORCE_DISABLE_CACHES=1` | Forces full recompilation on every run; ensures you see fresh artifacts, not cached ones |
 | `TORCH_SPYRE_DEBUG=1` | Logs all CPU↔Spyre data transfers, including tensor shapes, layouts, and raw values |
 | `TORCH_COMPILE_DEBUG=1` | Writes intermediate compiler artifacts to a local directory for offline inspection |
-| `SPYRE_INDUCTOR_LOG=1` | Enable Spyre-specific Inductor logging |
-| `SPYRE_INDUCTOR_LOG_LEVEL=DEBUG` | Set Spyre Inductor log verbosity (DEBUG, INFO, WARNING, ERROR) |
+| `SPYRE_INDUCTOR_LOG=1` | *Deprecated.* Use `TORCH_LOGS="spyre.inductor:INFO"` instead |
+| `SPYRE_INDUCTOR_LOG_LEVEL=DEBUG` | *Deprecated.* Use `TORCH_LOGS="spyre.inductor:DEBUG"` instead |
 | `SPYRE_LOG_FILE=path/to/file.log` | Redirect Spyre Inductor log output to a file |
 | `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 warnings |
 | `TORCH_LOGS="+inductor"` | PyTorch provided tool to selectively enable Inductor or other parts of the `torch.compile` to the log |

@@ -25,8 +25,15 @@ from torch._inductor.utils import (
     run_and_get_code,
 )
 
+from torch_spyre._C import DataFormats
 from torch_spyre._inductor import config
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.codegen.compute_ops import (
+    SymbolKind,
+    _per_core_symbolic_dim_info,
+)
+from torch_spyre._inductor.codegen.superdsc import _resolve_sdsc_size, compile_op_spec
+from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 from torch_spyre._inductor.work_division import (
     _collect_symbol_metadata,
     _effective_size,
@@ -68,7 +75,7 @@ class TestSpyreConfig(InductorTestCase):
     def test_sencores_16(self):
         fn = torch.abs
         x = torch.randn((256, 128, 512)).to("spyre")
-        cfn = torch.compile(fn, dynamic=False)
+        cfn = torch.compile(fn)
         out, source_codes = run_and_get_code(cfn, x)
         # print("test_sencores 16")
         # print(source_codes[0])
@@ -89,7 +96,8 @@ class TestSpyreConfig(InductorTestCase):
         y = torch.randn_like(x)
         torch._dynamo.mark_dynamic(x, 0, min=64, max=1024)
         torch._dynamo.mark_dynamic(y, 0, min=64, max=1024)
-        comp_fn = torch.compile(fn, dynamic=True)
+        # dynamic=True not needed: mark_dynamic already makes dim 0 symbolic.
+        comp_fn = torch.compile(fn, dynamic=False)
         _, source_codes = run_and_get_code(comp_fn, x.to("spyre"), y.to("spyre"))
         # Iteration space embeds (size_expr, split). The symbolic batch dim's
         # split must equal SENCORES=32; the static stick dim's split must be 1.
@@ -197,3 +205,198 @@ class TestSpyreConfig(InductorTestCase):
                 {s0: sympy.Integer(128)}, [fake_td], {s0: (512, 64)}
             )
         self.assertIn("symbolic stick dim", str(cm.exception))
+
+    def test_inplace_op_run_call_deduplicates_args(self):
+        """An inplace op (x *= 2) must not pass the same tensor twice to .run().
+
+        With symbolic args, the MLIR bundle emits one input_arg param per unique
+        tensor.  Passing arg0_1 twice would cause a "Number of inputs mismatches"
+        error at launch time.  This test verifies the generated .run() call
+        contains no duplicate tensor arguments.
+        """
+
+        def fn(x):
+            x *= 2
+            return x
+
+        x = torch.randn((4, 128), dtype=torch.float16, device="spyre")
+        cfn = torch.compile(fn)
+        _, source_codes = run_and_get_code(cfn, x)
+        code = source_codes[0]
+        # Find the .run(...) call for the fused kernel
+        run_lines = [ln.strip() for ln in code.splitlines() if ".run(" in ln]
+        self.assertTrue(run_lines, "No .run(...) call found in generated code")
+        for line in run_lines:
+            # Extract the argument list between the outermost parentheses
+            args_str = line[line.index("(") + 1 : line.rindex(")")]
+            args = [a.strip() for a in args_str.split(",")]
+            self.assertEqual(
+                len(args),
+                len(set(args)),
+                f"Duplicate args in .run() call: {line}",
+            )
+
+
+class TestResolveSdscSize(InductorTestCase):
+    """Unit tests for superdsc._resolve_sdsc_size."""
+
+    def test_concrete_sympy_integer(self):
+        self.assertEqual(_resolve_sdsc_size(sympy.Integer(256), {}), 256)
+
+    def test_concrete_python_int(self):
+        self.assertEqual(_resolve_sdsc_size(128, {}), 128)
+
+    def test_symbolic_in_bounds_returns_max(self):
+        # bounds carries (max, granularity); index [0] is max.
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+        self.assertEqual(_resolve_sdsc_size(s0, {"s0": (1024, 64)}), 1024)
+
+    def test_symbolic_not_in_bounds_falls_back_to_size_hint(self):
+        # Symbol absent from bounds → _concretize_for_sdsc → size_hint.
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+        sizevars = SimpleNamespace(size_hint=lambda _: 128)
+        mock_v = SimpleNamespace(graph=SimpleNamespace(sizevars=sizevars))
+        with patch("torch_spyre._inductor.codegen.superdsc.V", mock_v):
+            self.assertEqual(_resolve_sdsc_size(s0, {}), 128)
+
+
+class TestSymbolKindDimension(InductorTestCase):
+    """Unit tests for the dimension variant added to compute_ops.SymbolKind."""
+
+    def test_factory_sets_all_fields(self):
+        sk = SymbolKind.dimension(granularity=64, max_value=1024, pytorch_sym="s0")
+        self.assertEqual(sk.kind, "dimension")
+        self.assertEqual(sk.granularity, 64)
+        self.assertEqual(sk.max_value, 1024)
+        self.assertEqual(sk.pytorch_sym, "s0")
+
+    def test_is_dimension_true(self):
+        sk = SymbolKind.dimension(granularity=64, max_value=1024, pytorch_sym="s0")
+        self.assertTrue(sk.is_dimension)
+
+    def test_address_fields_are_sentinels(self):
+        # Address-specific fields must not be set by the dimension factory so
+        # they don't collide with kernel/pool symbol-table entries.
+        sk = SymbolKind.dimension(granularity=64, max_value=1024, pytorch_sym="s0")
+        self.assertEqual(sk.arg_index, -1)
+        self.assertEqual(sk.base_sym_idx, -1)
+        self.assertEqual(sk.offset, 0)
+
+    def test_kernel_is_not_dimension(self):
+        self.assertFalse(SymbolKind.kernel(arg_index=0).is_dimension)
+
+    def test_pool_is_not_dimension(self):
+        self.assertFalse(SymbolKind.pool().is_dimension)
+
+
+class TestPerCoreSymbolicDimInfo(InductorTestCase):
+    """Unit tests for compute_ops._per_core_symbolic_dim_info."""
+
+    def test_no_symbolic_dims_returns_empty(self):
+        self.assertEqual(_per_core_symbolic_dim_info({}, {}), {})
+
+    def test_single_dim_no_split(self):
+        # work_slices == 1 means undivided: maxSize_/granularity_ pass through.
+        symbolic_dims = {"c0": ("s0", 64, 1024)}
+        work_slices = {sympy.Symbol("c0"): 1}
+        self.assertEqual(
+            _per_core_symbolic_dim_info(symbolic_dims, work_slices),
+            {"c0": {"maxSize_": 1024, "granularity_": 64}},
+        )
+
+    def test_single_dim_split_across_cores(self):
+        symbolic_dims = {"c0": ("s0", 64, 1024)}
+        work_slices = {sympy.Symbol("c0"): 4}
+        self.assertEqual(
+            _per_core_symbolic_dim_info(symbolic_dims, work_slices),
+            {"c0": {"maxSize_": 256, "granularity_": 16}},
+        )
+
+    def test_granularity_floors_at_one(self):
+        # granularity // wk_slices would floor to 0; result must clamp to 1
+        # so the runtime never sees a zero batch-size granularity.
+        symbolic_dims = {"c0": ("s0", 1, 1024)}
+        work_slices = {sympy.Symbol("c0"): 4}
+        result = _per_core_symbolic_dim_info(symbolic_dims, work_slices)
+        self.assertEqual(result["c0"], {"maxSize_": 256, "granularity_": 1})
+
+    def test_multiple_symbolic_dims_independent(self):
+        symbolic_dims = {
+            "c0": ("s0", 64, 1024),
+            "c1": ("s1", 32, 512),
+        }
+        work_slices = {
+            sympy.Symbol("c0"): 4,
+            sympy.Symbol("c1"): 2,
+        }
+        self.assertEqual(
+            _per_core_symbolic_dim_info(symbolic_dims, work_slices),
+            {
+                "c0": {"maxSize_": 256, "granularity_": 16},
+                "c1": {"maxSize_": 256, "granularity_": 16},
+            },
+        )
+
+
+class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
+    """Smoke test: a symbolic iteration-space dim survives end-to-end through
+    compile_op_spec (parse_op_spec + generate_sdsc) into the emitted SDSC
+    JSON's dimToSymbolMapping_ / symbolicDimInfo_ fields.
+
+    Fixture mirrors the [512, 256] fp16 stick-layout tensor used in
+    test_unroll_loop_specs.py, with the row dim made symbolic. Because
+    _resolve_sdsc_size resolves a symbolic dim to its declared max (512,
+    same as the concrete value the unrolling fixture uses), every
+    downstream computation (padding, stick-dim detection, core slicing)
+    runs identically to the already-exercised concrete case -- only the
+    symbolic_dims side-channel asserted on here differs.
+    """
+
+    _DEVICE_SIZE = [4, 512, 64]
+    _HBM_BASE = 0x400000000
+
+    def _make_symbolic_op_spec(self) -> OpSpec:
+        c_row, c_col = sympy.Symbol("c_row"), sympy.Symbol("c_col")
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+        coords = [c_col // 64, c_row, sympy.Mod(c_col, 64)]
+
+        def _tensor_arg(is_input, arg_index, hbm_base):
+            return TensorArg(
+                is_input=is_input,
+                arg_index=arg_index,
+                device_dtype=DataFormats.SEN169_FP16,
+                device_size=list(self._DEVICE_SIZE),
+                device_coordinates=coords,
+                allocation={"hbm": hbm_base},
+            )
+
+        return OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={
+                c_row: (s0, 1),
+                c_col: (sympy.Integer(256), 1),
+            },
+            args=[
+                _tensor_arg(True, 0, self._HBM_BASE),
+                _tensor_arg(True, 1, self._HBM_BASE + 0x1000),
+                _tensor_arg(False, 2, self._HBM_BASE + 0x100000000),
+            ],
+            op_info={},
+            symbolic_dim_bounds={"s0": (512, 64)},  # (max, granularity)
+        )
+
+    def test_symbolic_dim_fields_in_sdsc_json(self):
+        op_spec = self._make_symbolic_op_spec()
+        sdsc_json, _, _, _ = compile_op_spec(idx=0, op_spec=op_spec, symbols=[])
+
+        top = next(iter(sdsc_json.values()))
+        dsc = next(iter(top["dscs_"][0].values()))
+
+        # "s0" is registered as dim-symbol id -1 and bound to the SDSC "mb"
+        # dim (c_row maps to the first non-output dim label for a 2-dim op).
+        self.assertEqual(dsc["dimToSymbolMapping_"], {"mb": [-1]})
+
+        for stage in ("ss_", "el_"):
+            sym_info = dsc["dataStageParam_"]["0"][stage]["symbolicDimInfo_"]
+            self.assertEqual(sym_info, {"mb": {"maxSize_": 512, "granularity_": 64}})
