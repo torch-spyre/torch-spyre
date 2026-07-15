@@ -62,6 +62,11 @@ on:
         required: false
         type: string
         default: ''
+      rpm_location:
+        description: Artifactory location for RPM download
+        required: false
+        type: string
+        default: ''
       rpm_names:
         description: Space-separated list of RPM names to download and install
         required: false
@@ -140,16 +145,18 @@ jobs:
         id: filter
         run: |
           # Prebaked: read the configs baked in the dev image; else the checkout cwd.
+          # cd into the source root so every path below stays repo-relative and
+          # byte-identical to the normal path (the CI-coverage scanner greps
+          # `--config-dir tests/configs/torch_spyre_tests` literally).
           if [ "${{ inputs.prebaked_image }}" = "true" ]; then
-            SRC="${PREBAKED_TORCH_SPYRE_DIR}"
+            cd "${PREBAKED_TORCH_SPYRE_DIR}"
           else
-            SRC="${GITHUB_WORKSPACE}"
             pip install pyyaml --quiet
           fi
-          matrix=$(python3 "${SRC}/tests/oot_framework/utils/filter_configs.py" \
-            --config-dir "${SRC}/tests/configs/torch_spyre_tests" \
+          matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
+            --config-dir tests/configs/torch_spyre_tests \
             --test-type "${{ inputs.test_type || 'full' }}" \
-            --runner-map "${SRC}/.github/runner_overrides.yaml" \
+            --runner-map .github/runner_overrides.yaml \
             --format matrix-json)
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
