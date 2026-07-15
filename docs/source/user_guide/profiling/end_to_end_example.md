@@ -30,6 +30,10 @@ shrink. This page will be revised to the in-tree API once it ships.
 
 Ensure that you have access a pod with spyre accelerator and torch spyre and spyre software stack installed.
 
+**Prerequisites Step**
+
+Ensure that you have access a pod with spyre accelerator and torch spyre and spyre software stack installed.
+
 | Piece | Source | Sample install (verify against the upstream README) |
 |---|---|---|
 | `foundation-model-stack` (`fms`) | [github.com/foundation-model-stack/foundation-model-stack][fms] (`eager_spyre` branch) | `git clone -b eager_spyre <repo>.git && uv pip install -e ./foundation-model-stack` |
@@ -67,6 +71,7 @@ hf download ibm-granite/granite-3.3-8b-instruct --local-dir /tmp/models/granite-
 # If your environment uses PyTorch 2.11, install the matching kineto-spyre wheel. It is not required for PyTorch 2.13 and later
 # See below an example of 2.11 kineto Wheel on x86
 uv pip install --no-deps --force-reinstall \
+  https://github.com/IBM/kineto-spyre/releases/download/torch-2.11.0.aiu.kineto.1.1.2/torch-2.11.0+aiu.kineto.1.1.2-cp312-cp312-linux_x86_64.whl
   https://github.com/IBM/kineto-spyre/releases/download/torch-2.11.0.aiu.kineto.1.1.2/torch-2.11.0+aiu.kineto.1.1.2-cp312-cp312-linux_x86_64.whl
 ```
 
@@ -185,6 +190,9 @@ print(f"profiler-derived CPU ms (per run): {cpu_per_run_ms:.3f}")
 **Note**
 
 Ensure the profiler report includes Spyre/device time; otherwise the trace does not confirm the accelerator execution
+
+**Note**
+Please ensure spyre time is present in report output in order to ensure to confirm correctness
 
 Three patterns to call out:
 
