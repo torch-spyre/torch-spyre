@@ -356,8 +356,8 @@ batch = log2(max(1, b)) × 10 µs        # 0 for a shared weight
 A shared-weight projection has no batch dim to split, so the term is
 zero.
 
-The constants are defined at
-[`work_division.py:952–979`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py#L952):
+The constants are defined in
+[`work_division.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py):
 the peak MAC rate per core, HBM bandwidth, cohort limit and exponent,
 PSUM coefficients, the tie-break weights, and the batch penalty. They are
 internal tuning constants and are not user-configurable. The values are
@@ -512,9 +512,10 @@ Aligned splits (LX reuse possible)        Mismatched splits (DDR round-trip)
         ✓ reuse                                   ✗ DDR reload
 ```
 
-A graph-aware co-optimisation pass is in development. It aligns splits
-across adjacent ops to grow the LX planner's legal-reuse set. The work
-is tracked in the [scratchpad planning](scratchpad_planning.md) doc.
+A graph-aware co-optimisation pass exists and is opt-in via
+`CO_OPTIMIZING_LX_PLANNING=1`. It aligns splits across adjacent ops to
+grow the LX planner's legal-reuse set. See the
+[scratchpad planning](scratchpad_planning.md) doc for details.
 
 ## User Work-Division Hints
 
@@ -594,9 +595,6 @@ annotations and use the automatic work-distribution planner.
 
 **Potential future enhancements:**
 
-- Add a graph-aware co-optimisation pass that aligns splits across
-  adjacent ops to grow the LX legal-reuse set (see
-  [Scratchpad planning](#scratchpad-planning)).
 - Extend optimisation across operations to take data reuse and the
   wider memory hierarchy into account.
 - Make the cost model bmm-aware so it can price shared-weight bmms

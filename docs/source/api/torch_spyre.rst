@@ -321,6 +321,57 @@ the Spyre backend automatically when the model is on a Spyre device:
 See :doc:`../user_guide/running_models` for details and
 :doc:`../user_guide/supported_operations` for the list of supported ops.
 
+Model Loading Utilities
+-----------------------
+
+The ``torch_spyre.model_utils`` module provides utilities that transfer a
+model to Spyre with optimal weight layout. For ``nn.Linear`` layers, weights
+are stickified along ``out_features`` (using ``dim_order=[1, 0]``) so that
+matrix multiplications can run at full throughput without a host-side
+transpose.
+
+.. function:: torch_spyre.model_utils.load_model_to_spyre(model, dtype=None)
+
+   Transfer all parameters and buffers of *model* to Spyre. ``nn.Linear``
+   weights use a dimension-swapped layout (``dim_order=[1, 0]``); all other
+   tensors use the default layout. Idempotent: parameters already on Spyre
+   are skipped.
+
+   :param model: The model to transfer.
+   :type model: torch.nn.Module
+   :param dtype: Target dtype on Spyre (default: the parameter's existing
+       dtype).
+   :type dtype: torch.dtype or None
+   :returns: The model with all parameters on Spyre.
+   :rtype: torch.nn.Module
+
+   Example:
+
+   .. code-block:: python
+
+      from torch_spyre.model_utils import load_model_to_spyre
+
+      model = MyModel()
+      load_model_to_spyre(model)
+      compiled = torch.compile(model)
+
+.. function:: torch_spyre.model_utils.patch_module_to_for_spyre()
+
+   Monkeypatch ``nn.Module.to`` so that ``model.to("spyre")`` automatically
+   applies the optimal weight layout described above. Non-Spyre destinations
+   fall through to the original ``to`` implementation.
+
+   Call this once at program startup before any ``.to("spyre")`` call.
+
+   Example:
+
+   .. code-block:: python
+
+      from torch_spyre.model_utils import patch_module_to_for_spyre
+
+      patch_module_to_for_spyre()
+      model = MyModel().to("spyre")  # uses optimal layout automatically
+
 Tensor Layouts
 --------------
 
@@ -335,12 +386,20 @@ manipulation of device tensor layouts. See
    ``SpyreTensorLayout`` captures the tiling, padding, and dimension
    mapping required by the hardware.
 
-   Can be constructed in two ways:
+   Can be constructed in three ways:
 
    .. code-block:: python
 
       # From host tensor metadata (automatic layout computation)
       layout = SpyreTensorLayout(host_size=[4, 128], dtype=torch.float16)
+
+      # From host metadata with explicit dimension order
+      layout = SpyreTensorLayout(
+          host_size=[512, 768],
+          host_strides=[768, 1],
+          dtype=torch.float16,
+          dim_order=[1, 0],  # stickify along the second dimension
+      )
 
       # From explicit device layout parameters
       layout = SpyreTensorLayout(
@@ -348,6 +407,11 @@ manipulation of device tensor layouts. See
           stride_map=[128, 64, 1],
           device_dtype=DataFormats.SEN169_FP16,
       )
+
+   The ``dim_order`` parameter controls which logical dimension is
+   stickified first. For example, ``dim_order=[1, 0]`` stickifies the
+   second dimension, which is the optimal layout for ``nn.Linear`` weights
+   on Spyre (see :func:`torch_spyre.model_utils.load_model_to_spyre`).
 
    .. attribute:: device_size
       :type: list[int]
@@ -374,6 +438,15 @@ manipulation of device tensor layouts. See
    .. method:: elems_per_stick() -> int
 
       Returns the number of elements per stick for this layout's dtype.
+
+   .. method:: with_element_arrangement(element_arrangement) -> SpyreTensorLayout
+
+      Return a new layout with the given element arrangement, preserving
+      all other fields.
+
+      :param element_arrangement: The new element arrangement.
+      :type element_arrangement: ElementArrangement
+      :rtype: SpyreTensorLayout
 
 .. class:: torch_spyre._C.DataFormats
 
@@ -480,7 +553,9 @@ Environment Variables
    * - Variable
      - Purpose
    * - ``TORCH_SPYRE_DEBUG=1``
-     - Enable C++ debug logging and ``-O0`` builds
+     - Build-time: enable C++ debug logging and ``-O0`` builds.
+       Runtime: deprecated, use ``TORCH_LOGS='spyre:DEBUG'`` instead
+       (see ``torch_spyre.logging_config``)
    * - ``TORCH_SPYRE_DOWNCAST_WARN=0``
      - Suppress int64 → int32 downcast warnings
    * - ``SPYRE_INDUCTOR_LOG=1``
@@ -535,6 +610,10 @@ Environment Variables
    * - ``LX_BOUNDARY_CLONES``
      - Insert boundary clones at LX scratchpad planning edges (default
        ``0``)
+   * - ``LAYOUT_SOLVER``
+     - LX scratchpad layout solver strategy: ``greedy`` (default),
+       ``bestfit``, ``firstfit``, ``cpsat``.
+       See :doc:`/compiler/scratchpad_planning`
    * - ``MAX_BUCKETS``
      - Maximum number of work division buckets (default ``32``)
    * - ``MIN_DEFAULT_GRANULARITY``

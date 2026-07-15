@@ -54,7 +54,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.maximum` | Y | Y | Spyre | |
 | `torch.minimum` | Y | Y | Spyre | |
 | `torch.bitwise_and` | Y | Y | Spyre | Custom decomposition |
-| `torch.where` | Y | Y | Spyre | `where.self` registered eagerly; `where.Scalar*` overloads via custom decomposition |
+| `torch.where` | Y | Y | Spyre | `where.self` registered eagerly; `where.Scalar*` overloads via custom decomposition; `where.default` (condition-only form) falls back to CPU |
 | **Comparison** | | | | |
 | `torch.eq` | Y | Y | Spyre | |
 | `torch.ne` | Y | Y | Spyre | |
@@ -72,12 +72,12 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.max` | Y | Y | Spyre | `max.dim` via custom decomposition |
 | `torch.min` | Y | Y | Spyre | `min.dim` via custom decomposition (fp16) |
 | `torch.topk` | | Y | Spyre | Custom decomposition + custom ops (`spyre::topkvalue`, `spyre::topkindex`) |
-| `torch.linalg.vector_norm` | Y | Y | Spyre | |
+| `torch.linalg.vector_norm` | | Y | Spyre | Compiled only (eager misroutes `ord`) |
 | `torch.linalg.norm` | | Y | Spyre | Compiled only |
 | `torch.linalg.matrix_norm` | | Y | Spyre | Compiled only |
 | **View Ops** [^views] | | | | |
 | `torch.reshape` / `torch.view` | | Y | Spyre | Includes `_reshape_alias` (a C++ device view, not an Inductor lowering) |
-| `torch.transpose` | | Y | Spyre | |
+| `torch.transpose` | Y | Y | Spyre | |
 | `torch.t` | Y | Y | Spyre | View op |
 | `torch.permute` | Y | Y | Spyre | |
 | `torch.clone` | | Y | Spyre | Compiled-tested as `clone().contiguous()`; standalone `clone` is also lowered and used by many decompositions |

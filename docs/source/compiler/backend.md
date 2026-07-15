@@ -48,6 +48,7 @@ Each `dscs_` entry is a complete description of one compute configuration:
 | `labeledDs_` | Tensor descriptors. Each entry pairs a tensor argument with its `dsType_` (tiling layout class), `dataFormat_` (for example `SEN169_FP16`), and `memOrg_` (HBM or LX residency). The `layoutDimOrder_` of each entry is independent: two arguments of the same op can pick different dim orders. |
 | `scheduleTree_` | Allocate nodes, one per tensor, with memory placement (HBM or LX scratchpad), dimension ordering, per-core start addresses via fold mappings, and coordinate information. |
 | `computeOp_` | One entry per operation, encoding the execution unit (`PT` or `SFP`), op name, data format, fidelity, and input/output tensor references. |
+| `debug_handle_` | Per-operation provenance metadata linking the DSC back to source code. Contains a stable content hash and a `SourceLoc` (file, line, function) extracted from the FX graph's `stack_trace`. |
 
 ### Folding and affine transforms
 
