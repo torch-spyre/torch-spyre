@@ -26,6 +26,11 @@ shrink. This page will be revised to the in-tree API once it ships.
 
 ## What you need
 
+
+**Prerequisites Step**
+
+Ensure that you have access a pod with spyre accelerator and torch spyre and spyre software stack installed.
+
 | Piece | Source | Sample install (verify against the upstream README) |
 |---|---|---|
 | `foundation-model-stack` (`fms`) | [github.com/foundation-model-stack/foundation-model-stack][fms] (`eager_spyre` branch) | `git clone -b eager_spyre <repo>.git && uv pip install -e ./foundation-model-stack` |
@@ -41,6 +46,7 @@ build.
 
 ## Setup
 
+
 ```bash
 # Install fms and aiu-fms-testing-utils from the eager_spyre branch
 # (the branch that registers the Spyre device backend today).
@@ -53,10 +59,10 @@ uv pip install -e ./aiu-fms-testing-utils
 export HF_HOME=/tmp/models/hf_cache
 hf download ibm-granite/granite-3.3-8b-instruct --local-dir /tmp/models/granite-3.3-8b-instruct
 
-# Example kineto-spyre wheel for PyTorch 2.10.0 + Python 3.12 on x86_64
+# Example kineto-spyre wheel for PyTorch 2.11.0 + Python 3.12 on x86_64
 # Linux. Pick the wheel that matches your stack from the releases page.
 uv pip install --no-deps --force-reinstall \
-  https://github.com/IBM/kineto-spyre/releases/download/torch-2.10.0.aiu.kineto.1.1.1/torch-2.10.0+aiu.kineto.1.1.1-cp312-cp312-linux_x86_64.whl
+  https://github.com/IBM/kineto-spyre/releases/download/torch-2.11.0.aiu.kineto.1.1.2/torch-2.11.0+aiu.kineto.1.1.2-cp312-cp312-linux_x86_64.whl
 ```
 
 Useful environment variables (see [Environment variables](environment_variables.md)
@@ -89,8 +95,6 @@ DEVICE = torch.device("spyre")
 DTYPE = torch.float16  # Spyre's default dtype
 MODEL_PATH = "/tmp/models/granite-3.3-8b-instruct"
 
-_ = torch.empty(1, dtype=torch.float16, device="spyre")
-
 print("=" * 42)
 print("Loading".center(42))
 print("=" * 42)
@@ -111,11 +115,11 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 #     0, tokenizer.vocab_size, (1, 512), dtype=torch.int64,
 # ).to(DEVICE)
 raw_ids = tokenizer(
-    "Explain artificial intelligence to a 10 year old", return_tensors="pt"
+    "What is the capital of Francw", return_tensors="pt"
 )["input_ids"].squeeze(0)
 
 ids, kwargs = pad_input_ids(
-    [raw_ids], min_pad_length=512, pad_token_id=tokenizer.pad_token_id
+    [raw_ids], min_pad_length=64, pad_token_id=tokenizer.pad_token_id
 )
 position_ids = kwargs["position_ids"]
 
@@ -178,6 +182,9 @@ print(prof.key_averages().table(sort_by="device_time_total", row_limit=10))
 print(f"wall-clock ms: mean={mean(wall_clock_ms):.3f} median={median(wall_clock_ms):.3f}")
 print(f"profiler-derived CPU ms (per run): {cpu_per_run_ms:.3f}")
 ```
+
+**Note** 
+Please ensure spyre time is present in report output in order to ensure to confirm correctness
 
 Three patterns to call out:
 
