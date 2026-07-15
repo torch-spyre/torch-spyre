@@ -49,7 +49,8 @@ Usage::
     model.to("spyre")
 """
 
-import logging
+from torch_spyre._inductor.logging_utils import get_inductor_logger
+
 
 import torch
 import torch.nn as nn
@@ -63,7 +64,7 @@ from torch_spyre._C import (
 )
 from torch_spyre.constants import DEVICE_NAME
 
-logger = logging.getLogger(__name__)
+logger = get_inductor_logger("model_utils")
 
 
 def _ensure_spyre_runtime() -> None:

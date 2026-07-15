@@ -309,18 +309,17 @@ def _per_core_symbolic_dim_info(symbolic_dims: dict, work_slices: dict) -> dict:
     return info
 
 
-def _tiled_byte_stride(tensor, tiled_sym, iteration_space) -> int:
+def _tiled_byte_stride(tensor, tiled_sym) -> int:
     """Byte stride per loop iteration for a single tiled dimension.
 
-    The coarse_tile pass already divided iteration_space[tiled_sym].range by
-    the loop count, so that range is the per-iteration element count.  The full
-    per-iteration byte advancement is:
-        per_iter_elems * device_stride_for_dim * bytes_per_element
+    ``tensor.strides[tiled_sym]`` is already the per-tile element stride
+    (``_create_sdsc_tensors`` receives the per-tile iteration space, since
+    ``coarse_tile.py`` has already divided the op ranges by ``loop_count``
+    before ``create_op_spec`` runs).  Multiplying by bytes-per-element
+    gives the correct per-iteration byte advance for the ``affine.apply``
+    in the ``scf.for`` loop body.
     """
-    per_iter_range = iteration_space[tiled_sym]
-    return int(
-        per_iter_range * tensor.strides[tiled_sym] * num_bytes(tensor.data_format)
-    )
+    return int(tensor.strides[tiled_sym] * num_bytes(tensor.data_format))
 
 
 def _find_index_tensor_for_value(sdsc_spec, value_tensor_idx: int) -> int:
@@ -592,15 +591,21 @@ def generate_sdsc(
                 sliced_base_sym_idx = -1
             # Build per-level strides: for each level, collect the symbols at that
             # level that tile this tensor (i.e. appear in tensor.strides).
+            # Exclude symbols whose scale is negative: those are reduced dimensions
+            # whose stride describes element layout within one tile, not the advance
+            # between tiles.  Tiling by a reduction-dim symbol would incorrectly
+            # advance the base address of a pool output past its single allocated slot.
             per_level_strides: list[dict] = []
             any_tiled = False
             for level_syms in tiled_symbols:
-                tensor_tiled_at_level = [s for s in level_syms if s in tensor.strides]
+                tensor_tiled_at_level = [
+                    s
+                    for s in level_syms
+                    if s in tensor.strides and tensor.scales.get(s, 1) > 0
+                ]
                 strides_for_level: dict = {}
                 for s in tensor_tiled_at_level:
-                    strides_for_level[s] = _tiled_byte_stride(
-                        tensor, s, sdsc_spec.iteration_space
-                    )
+                    strides_for_level[s] = _tiled_byte_stride(tensor, s)
                     any_tiled = True
                 per_level_strides.append(strides_for_level)
             if not any_tiled:
@@ -740,6 +745,14 @@ def generate_sdsc(
     return (
         {
             f"{idx}_{sdsc_spec.opfunc}": {
+                # Source-to-kernel provenance. JSON key uses the SDSC
+                # trailing-underscore convention; the Python field stays
+                # `debug_handle`. dxp_standalone ignores unknown keys.
+                "debug_handle_": (
+                    sdsc_spec.debug_handle.to_dict()
+                    if sdsc_spec.debug_handle is not None
+                    else None
+                ),
                 "sdscFoldProps_": [{"factor_": 1, "label_": "time"}],
                 "sdscFolds_": {
                     "dim_prop_func": [{"Affine": {"alpha_": 1, "beta_": 0}}],

@@ -14,9 +14,11 @@
 
 """Tests for PrepareKernel Python bindings and JobPlan verification."""
 
+import copy
+import json
 import os
 import tempfile
-import json
+
 import pytest
 import torch
 import torch_spyre
@@ -39,6 +41,7 @@ class TestPrepareKernel:
         tmpdir,
         exec_command="ComputeOnDevice",
         exec_properties=None,
+        job_exec_plan=None,
     ):
         """Create a mock SpyreCode directory structure for testing.
 
@@ -54,42 +57,45 @@ class TestPrepareKernel:
         os.makedirs(spyrecode_dir, exist_ok=True)
 
         # Auto-generate properties if not provided
-        if exec_properties is None:
-            if exec_command == "ComputeOnDevice":
-                exec_properties = {"job_bin_ptr": "120259084288"}
-            elif exec_command == "ComputeOnHost":
-                exec_properties = {
-                    "ohandle": "output_buffer",
-                    "size": "1024",
-                    "ishape": ["64", "16"],
-                    "ihandle": "",
-                    "hcm": {"vdci": {}, "senConstants": []},
-                }
-
-        # Build JobExecPlan
-        job_exec_plan = [{"command": exec_command, "properties": exec_properties}]
-
-        # If ComputeOnHost, add required H2D and Compute steps
-        if exec_command == "ComputeOnHost":
-            # Add H2D transfer (transfers output_buffer to device)
-            job_exec_plan.append(
-                {
-                    "command": "DataTransfer",
-                    "properties": {
-                        "dirn": "false",
-                        "host_handle": "output_buffer",
-                        "dev_ptr": "120259084288",
+        if job_exec_plan is None:
+            if exec_properties is None:
+                if exec_command == "ComputeOnDevice":
+                    exec_properties = {"job_bin_ptr": "120259084288"}
+                elif exec_command == "ComputeOnHost":
+                    exec_properties = {
+                        "ohandle": "output_buffer",
                         "size": "1024",
-                    },
-                }
-            )
-            # Add Compute step
-            job_exec_plan.append(
-                {
-                    "command": "ComputeOnDevice",
-                    "properties": {"job_bin_ptr": "120259084288"},
-                }
-            )
+                        "ishape": ["64", "16"],
+                        "ihandle": "",
+                        "hcm": {"vdci": {}, "senConstants": []},
+                    }
+
+            # Build JobExecPlan
+            job_exec_plan = [{"command": exec_command, "properties": exec_properties}]
+
+            # If ComputeOnHost, add required H2D and Compute steps
+            if exec_command == "ComputeOnHost":
+                # Add H2D transfer (transfers output_buffer to device)
+                job_exec_plan.append(
+                    {
+                        "command": "DataTransfer",
+                        "properties": {
+                            "dirn": "false",
+                            "host_handle": "output_buffer",
+                            "dev_ptr": "120259084288",
+                            "size": "1024",
+                        },
+                    }
+                )
+                # Add Compute step
+                job_exec_plan.append(
+                    {
+                        "command": "ComputeOnDevice",
+                        "properties": {"job_bin_ptr": "120259084288"},
+                    }
+                )
+        else:
+            job_exec_plan = copy.deepcopy(job_exec_plan)
 
         # Create a minimal spyrecode.json
         spyrecode_json = {
@@ -373,6 +379,106 @@ class TestPrepareKernel:
             with pytest.raises(
                 RuntimeError,
                 match="ihandle 'nonexistent_buffer' not found in pinned buffer map",
+            ):
+                torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+    def test_invalid_hcm_metadata_raises_runtime_error(self):
+        """Invalid HCM metadata should raise a clean RuntimeError during prepare_kernel."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            properties = {
+                "ohandle": "output_buffer",
+                "size": "1024",
+                "ishape": ["64", "16"],
+                "ihandle": "",
+                "hcm": {"vdci": "invalid", "senConstants": []},
+            }
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost", exec_properties=properties
+            )
+
+            with pytest.raises(
+                RuntimeError,
+                match="Failed to parse SpyreCode command: .*vdci field",
+            ):
+                torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+    def test_stoull_allocate_negative_size(self):
+        """Test that negative size in Allocate command is rejected."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job_exec_plan = [
+                {
+                    "command": "ComputeOnDevice",
+                    "properties": {"job_bin_ptr": "120259084288"},
+                }
+            ]
+
+            spyrecode_dir = os.path.join(tmpdir, "spyreCodeDir")
+            os.makedirs(spyrecode_dir, exist_ok=True)
+
+            spyrecode_json = {
+                "JobPreparationPlan": [
+                    {"command": "Allocate", "properties": {"size": "-1024"}},
+                    {
+                        "command": "InitTransfer",
+                        "properties": {
+                            "init_bin_file": "init_binary.bin",
+                            "dev_ptr": "120259084288",
+                            "size": "1024",
+                        },
+                    },
+                ],
+                "JobExecPlan": job_exec_plan,
+            }
+
+            with open(os.path.join(spyrecode_dir, "spyrecode.json"), "w") as f:
+                json.dump(spyrecode_json, f, indent=2)
+
+            with open(os.path.join(spyrecode_dir, "init_binary.bin"), "wb") as f:
+                f.write(b"\x00" * 1024)
+
+            with pytest.raises(
+                RuntimeError,
+                match="negative value not allowed for unsigned integer",
+            ):
+                torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+    def test_stoull_allocate_negative_size_with_leading_whitespace(self):
+        """Test that negative size with leading whitespace is rejected."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job_exec_plan = [
+                {
+                    "command": "ComputeOnDevice",
+                    "properties": {"job_bin_ptr": "120259084288"},
+                }
+            ]
+
+            spyrecode_dir = os.path.join(tmpdir, "spyreCodeDir")
+            os.makedirs(spyrecode_dir, exist_ok=True)
+
+            spyrecode_json = {
+                "JobPreparationPlan": [
+                    {"command": "Allocate", "properties": {"size": "  -512"}},
+                    {
+                        "command": "InitTransfer",
+                        "properties": {
+                            "init_bin_file": "init_binary.bin",
+                            "dev_ptr": "120259084288",
+                            "size": "1024",
+                        },
+                    },
+                ],
+                "JobExecPlan": job_exec_plan,
+            }
+
+            with open(os.path.join(spyrecode_dir, "spyrecode.json"), "w") as f:
+                json.dump(spyrecode_json, f, indent=2)
+
+            with open(os.path.join(spyrecode_dir, "init_binary.bin"), "wb") as f:
+                f.write(b"\x00" * 1024)
+
+            with pytest.raises(
+                RuntimeError,
+                match="negative value not allowed for unsigned integer",
             ):
                 torch_spyre._C.prepare_kernel(spyrecode_dir)
 

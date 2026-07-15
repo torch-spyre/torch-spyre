@@ -52,6 +52,7 @@ class GlobalRuntime {
 };
 bool get_downcast_warn_enabled();
 bool is_supported_dtype(c10::ScalarType dtype);
+DataFormats get_device_dtype(c10::ScalarType torch_dtype);
 
 int device_count();
 void startRuntime();

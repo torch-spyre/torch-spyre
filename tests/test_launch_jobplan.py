@@ -15,14 +15,17 @@
 """Tests for launching simple compiled ops through JobPlan execution."""
 
 import os
+import tempfile
 from typing import Tuple
 
 import pytest
 from torch.testing._internal.common_utils import TestCase
 import torch
 import torch._dynamo
+import torch_spyre
 
 from torch_spyre._inductor import config as _spyre_config
+from test_prepare_kernel import TestPrepareKernel as tpk
 
 
 def _run_compiled_op(op_name: str, symbolic_args: bool) -> None:
@@ -97,6 +100,48 @@ class TestLaunchJobPlan(TestCase):
     def test_mul_matches_cpu_with_symbols(self):
         """mul with symbolic_args=True (default path)."""
         _run_compiled_op("mul", symbolic_args=True)
+
+    def test_invalid_hcm_metadata_surfaces_on_synchronize(self):
+        """Host callback failures should surface as RuntimeError on stream synchronize."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job_exec_plan = [
+                {
+                    "command": "ComputeOnHost",
+                    "properties": {
+                        "ohandle": "output_buffer",
+                        "size": "1024",
+                        "ishape": ["0"],
+                        "ihandle": "",
+                        "hcm": {
+                            "vdci": {},
+                            "senConstants": [],
+                        },
+                    },
+                },
+                {
+                    "command": "DataTransfer",
+                    "properties": {
+                        "dirn": "false",
+                        "host_handle": "output_buffer",
+                        "dev_ptr": "120259084288",
+                        "size": "1024",
+                    },
+                },
+                {
+                    "command": "ComputeOnDevice",
+                    "properties": {"job_bin_ptr": "120259084288"},
+                },
+            ]
+            test_pk = tpk()
+            spyrecode_dir = test_pk.create_mock_spyrecode(
+                tmpdir, job_exec_plan=job_exec_plan
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+            stream = torch.Stream("spyre")
+
+            with stream:
+                with pytest.raises(RuntimeError, match="Expect one DCI"):
+                    torch_spyre._C.launch_jobplan(job_plan, [])
 
 
 if __name__ == "__main__":

@@ -80,7 +80,7 @@ device and backend registration without requiring an explicit import.
 :width: 40%
 :align: center
 
-The Spyre device allocator call chain. A `torch.empty(..., device="spyre")` call flows through `spyre_empty_strided` into `SpyreAllocator::allocate`, which calls `flex::FlexAllocator::allocate(nbytes)` ([`spyre_allocator.cpp:137`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_allocator.cpp#L137)).
+The Spyre device allocator call chain. A `torch.empty(..., device="spyre")` call flows through `spyre_empty_strided` into `SpyreAllocator::allocate`, which calls `flex_alloc->allocate(nbytes, directive)` ([`spyre_allocator.cpp:167`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_allocator.cpp#L167)).
 :::
 
 ## Memory Model
@@ -99,12 +99,16 @@ For the layout that lets the runtime actually walk one of those tensors, see [Te
 
 ### SpyreTensorImpl
 
-A standard PyTorch `(size, stride)` pair cannot describe a tiled device tensor, so Torch-Spyre defines `SpyreTensorImpl` as a subclass of `TensorImpl`. The subclass adds one piece of data, a `SpyreTensorLayout`, that captures everything the runtime needs:
+A standard PyTorch `(size, stride)` pair cannot describe a tiled device tensor, so Torch-Spyre defines `SpyreTensorImpl` as a subclass of `TensorImpl`. The subclass adds three members: a `SpyreTensorLayout` (`spyre_layout`) plus two standalone vectors, `dma_sizes` and `dma_strides`. Together they capture everything the runtime needs.
+
+The `SpyreTensorLayout` holds:
 
 - `device_size` — the tensor's shape on device, including the extra tiling and padding dims.
 - `stride_map` — the host stride for each device dim. A `-1` here means the dim is synthetic or fully padded.
 - `device_dtype` — the on-device data format, for example `SEN169_FP16`.
-- `dma_sizes` and `dma_strides` — a host-shape DMA descriptor used when copying views back to the host. They drive `copyAsync()` in `spyre_stream.cpp`.
+- `element_arrangement` — how elements are packed within a stick (defaults to `STANDARD`).
+
+Alongside the layout, `SpyreTensorImpl` carries `dma_sizes` and `dma_strides` directly — a host-shape DMA descriptor used when copying views back to the host. They drive `copyAsync()` in `spyre_stream.cpp`.
 
 Note that the handles returned to Python never carry a raw device pointer. That is a hard requirement on IBM Z.
 
@@ -113,7 +117,7 @@ Note that the handles returned to Python never carry a raw device pointer. That 
 :width: 80%
 :align: center
 
-What is behind a Spyre tensor, drawn as a stack of layers. Python only ever sees the outermost `at::Tensor` handle. Underneath, `c10::TensorImpl` carries the standard tensor metadata, and the Spyre subclass adds a `SpyreTensorLayout` that holds the device shape, the `stride_map`, the device dtype, and the DMA descriptor.
+What is behind a Spyre tensor, drawn as a stack of layers. Python only ever sees the outermost `at::Tensor` handle. Underneath, `c10::TensorImpl` carries the standard tensor metadata, and the Spyre subclass adds a `SpyreTensorLayout` (device shape, `stride_map`, device dtype, and `element_arrangement`) plus the standalone `dma_sizes`/`dma_strides` DMA descriptor.
 :::
 
 ### SpyreAllocator
@@ -129,6 +133,13 @@ What `flex_alloc->allocate(nbytes)` returns is a `flex::CompositeAddress`, a han
 
 What happens between a Python tensor going out of scope and the device allocation returning to the flex pool. The piece that connects the two ends is the `ReportAndDelete` callback that `SpyreAllocator` installs on every `c10::DataPtr` it hands out.
 :::
+
+When the allocator runs out of memory regions it invokes a registered
+memory-pressure callback. The torch-spyre callback releases the allocator mutex,
+calls `PyGC_Collect()` to free Python cyclic garbage, and re-acquires the mutex
+before returning — allowing the allocation to be retried. See
+[Memory Pressure and Python GC](memory_pressure_gc.md) for the full GIL
+interaction and lock-ordering details.
 
 Physical-frame (PF) and virtual-frame (VF) execution are *not* allocator strategies inside `SpyreAllocator`. The mode is picked by the `FLEX_DEVICE` environment variable, which configures the underlying flex runtime (see `csrc/spyre_device_enum.cpp`):
 
@@ -300,3 +311,11 @@ unsupported — the protocol overhead is high and call sites are rare.
 to a single Spyre device (typically `torch.device(f"spyre:{os.getenv('RANK', '0')}")`
 in the user code). The backend reuses the rank's existing flex runtime instance
 and default stream. It does not own a separate runtime context.
+
+## More in This Section
+
+```{toctree}
+:maxdepth: 1
+
+memory_pressure_gc
+```

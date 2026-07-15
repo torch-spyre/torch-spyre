@@ -61,6 +61,7 @@ from .op_spec import (
     TensorArg,
     UnimplementedOp as OpSpecUnimplementedOp,
 )
+from torch_spyre._inductor.provenance import build_debug_handle
 import logging
 
 logger = get_inductor_logger("spyre_kernel")
@@ -113,6 +114,12 @@ def _preserve_shared_weight_unit_bmm_dim(
         ]
 
     target_args = (args[0], args[-1])
+    # The unit-BMM marker is only valid for plain rank-3 BMMs after layout
+    # construction. If a target tensor still carries extra physical axes, such
+    # as attention heads from SDPA, rewriting one axis into the BMM iteration
+    # space can produce an illegal SDSC layout.
+    if any(len(arg.device_size) > 4 for arg in target_args):
+        return it_space
     unit_idxs_by_arg = [_unit_indices(arg) for arg in target_args]
 
     if all(len(unit_idxs) == 0 for unit_idxs in unit_idxs_by_arg):
@@ -665,6 +672,20 @@ class SpyreKernel(Kernel[CSEVariable]):
             if bounds is not None:
                 symbolic_dim_bounds[str(size_expr)] = bounds
 
+        # Provenance is a debug-only feature: a failure building the handle must
+        # never break a compile. build_debug_handle is best-effort, but guard the
+        # call site too so an unexpected node shape can't fail create_op_spec.
+        try:
+            debug_handle = build_debug_handle(ir_node)
+        except Exception:  # noqa: BLE001 - provenance must never fail the build
+            logger.warning(
+                "debug_handle construction failed for op %s; continuing without "
+                "provenance",
+                op,
+                exc_info=True,
+            )
+            debug_handle = None
+
         return OpSpec(
             op,
             is_reduction,
@@ -673,6 +694,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             op_info,
             tiled_symbols=tiled_syms,
             symbolic_dim_bounds=symbolic_dim_bounds,
+            debug_handle=debug_handle,
         )
 
     def remove_kernel_local_buffers(self) -> None:
@@ -727,13 +749,21 @@ class SpyreKernel(Kernel[CSEVariable]):
         # Pool buffers are intermediates whose address is baked into the TensorArg
         # allocation dict; registering them as outputs would overflow SEGMENT_OFFSETS.
         # (lx buffers are already excluded from spyre_kernel_args in _tensor_arg.)
-        if "pool" not in layout.allocation:
+        # Also skip buffers marked as removed by Inductor's optimizer (e.g., by LX )
+        # This can occur when SDPA decomposition creates intermediate
+        # buffers that later get marked as dead code.
+        real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
+        is_removed = real_dst_name in V.graph.removed_buffers
+        if "pool" not in layout.allocation and not is_removed:
             # Pass the alias here, not real_dst_name: args.output resolves the
             # mutation alias internally. (load() passes the pre-resolved real
             # name to args.input, which does not resolve.)
             _ = self.args.output(name)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        dst = TensorAccess(real_dst_name, index, layout)
+        dst = TensorAccess(name, index, layout)
+        if real_dst_name != name:
+            # Skip allocating an output buffer; this name is an alias to another buffer
+            V.graph.removed_buffers.add(name)
         op_info: dict[str, Any] = {}
         if logger.isEnabledFor(logging.DEBUG):
             value_type = type(value).__name__
@@ -1061,6 +1091,12 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                 buf.writeline(
                     f"symbolic_dim_bounds={_serialize_value(op_spec.symbolic_dim_bounds)},"
                 )
+                if op_spec.debug_handle is not None:
+                    # Source-to-kernel provenance must survive the OpSpec ->
+                    # generated-source -> exec round-trip. DebugHandle/SourceLoc
+                    # are frozen dataclasses, so repr() is eval-able; the
+                    # generated wrapper header imports both names.
+                    buf.writeline(f"debug_handle={op_spec.debug_handle!r},")
                 buf.writeline("args=[")
                 with buf.indent():
                     for arg in op_spec.args:

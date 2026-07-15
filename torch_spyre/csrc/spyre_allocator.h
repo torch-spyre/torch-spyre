@@ -21,6 +21,7 @@
 
 #include <flex/flex.hpp>
 #include <memory>
+#include <mutex>
 #include <utility>
 
 namespace spyre {
@@ -41,8 +42,14 @@ struct SpyreAllocator final : public c10::DeviceAllocator {
   static c10::CachingDeviceAllocator::DeviceStats stats_;
   static c10::CachingDeviceAllocator::StatTypes
       stat_types;  // {AGGREGATE, SMALL_POOL, LARGE_POOL}
+  static std::mutex stats_mutex_;
 
   static std::shared_ptr<flex::FlexAllocator> getFlexAllocator();
+
+  // Memory pressure callback for FlexAllocator
+  // Invoked when allocator exhausts all regions
+  // Releases mutex, triggers Python GC, re-acquires mutex
+  static void memoryPressureCallback(std::unique_lock<std::mutex>& lock);
 
  public:
   static SpyreAllocator& instance();
@@ -74,7 +81,7 @@ struct SpyreAllocator final : public c10::DeviceAllocator {
 
   void copy_data(void* dest, const void* src, std::size_t count) const final;
 
-  uint32_t segmentForRegion(uint64_t region_id) const;
+  uint64_t compositeAddressToDmva(const flex::CompositeAddress& addr) const;
 };
 
 }  // namespace spyre

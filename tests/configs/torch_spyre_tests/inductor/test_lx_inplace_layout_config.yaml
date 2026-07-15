@@ -1,0 +1,5 @@
+test_suite_config:
+  labels: [core, full]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_lx_inplace_layout.py
+      unlisted_test_mode: mandatory_success

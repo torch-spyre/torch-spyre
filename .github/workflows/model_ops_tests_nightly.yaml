@@ -1,0 +1,197 @@
+name: model-ops-tests-nightly
+
+on:
+  # Run on a schedule (nightly at 2 AM UTC)
+  schedule:
+    - cron: 0 2 * * *
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  checks: write
+  actions: read    # needed by push-model-ops-logs-to-clickhouse to fetch job logs
+
+jobs:
+  # Build the torch_spyre._C extension ONCE and publish it as a wheel; every
+  # matrix entry below installs that single wheel instead of recompiling per
+  # model (previously each of the ~14 model jobs ran its own build).
+  build:
+    name: Build torch-spyre wheel (once)
+    # Compile-only: needs the backend image + SDK toolchain but NO physical Spyre
+    # card, so it targets the cardless spyre_pf_x0 pool and leaves card runners
+    # for the test jobs.
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - linux
+      - image_spyre_backend
+    timeout-minutes: 40
+    steps:
+      - name: Checkout composite actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: torch-spyre
+
+      - uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
+
+      - name: Build torch-spyre wheel
+        uses: ./.github/actions/build-torch-spyre-wheel
+        with:
+          image_label: image_spyre_backend
+
+      - name: Upload torch-spyre wheel
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: torch-spyre-wheel
+          path: torch-spyre/dist/*.whl
+          if-no-files-found: error
+          retention-days: 5
+
+  model-ops-tests:
+    name: ${{ matrix.suite.name }}
+    needs: build
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - linux
+      - image_spyre_backend
+    timeout-minutes: 60
+    env:
+      # The CI env var is very important.
+      # GitHub actions automatically sets CI=true
+      # which causes the pytest inductor tests to fail with AssertionError
+      # due to a mix of fallbacks and decompositions.
+      # Here we set it to an empty string (or we could also unset it).
+      CI: ''
+
+    # ---------------------------------------------------------------------------
+    # To add a new model ops test suite, append an entry here:
+    #   - name: <human-readable label shown in the GHA UI>
+    #     config: <filename inside tests/configs/model_ops_tests/>
+    #
+    # The JUnit XML report is automatically named after the config file, e.g.:
+    #   granite-4.1-8b_spyre.yaml  ->  granite-4.1-8b_spyre.xml
+    # ---------------------------------------------------------------------------
+    strategy:
+      fail-fast: false   # run all suites even if one fails
+      matrix:
+        suite:
+          - name: GPT OSS 20B
+            config: gpt-oss-20b.yaml
+          - name: GPT OSS 20B Spyre
+            config: gpt-oss-20b_spyre.yaml
+          - name: Granite 3.3 8B Instruct FMS
+            config: granite-3.3-8b-instruct-fms.yaml
+          - name: Granite 3.3 8B Instruct FMS Spyre
+            config: granite-3.3-8b-instruct-fms_spyre.yaml
+          - name: Granite 3.3 8B Instruct
+            config: granite-3.3-8b-instruct.yaml
+          - name: Granite 3.3 8B Instruct Spyre
+            config: granite-3.3-8b-instruct_spyre.yaml
+          - name: Granite 4.1 8B
+            config: granite-4.1-8b.yaml
+          - name: Granite 4.1 8B Spyre
+            config: granite-4.1-8b_spyre.yaml
+          - name: Meta Llama 3.1 8B Instruct
+            config: Meta-Llama-3.1-8B-Instruct.yaml
+          - name: Meta Llama 3.1 8B Instruct Spyre
+            config: Meta-Llama-3.1-8B-Instruct_spyre.yaml
+          - name: Ministral 3 14B Instruct 2512
+            config: Ministral-3-14B-Instruct-2512.yaml
+          - name: Ministral 3 14B Instruct 2512 Spyre
+            config: Ministral-3-14B-Instruct-2512_spyre.yaml
+          - name: Mistral Small 3.2 24B Instruct 2506
+            config: Mistral-Small-3.2-24B-Instruct-2506.yaml
+          - name: Mistral Small 3.2 24B Instruct 2506 Spyre
+            config: Mistral-Small-3.2-24B-Instruct-2506_spyre.yaml
+
+    steps:
+      # Sparse checkout into the GHA workspace so the local composite
+      # actions under .github/actions/ are available.
+      - name: Checkout composite actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: torch-spyre
+
+      - uses: ./.github/actions/checkout-pytorch
+
+      - uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
+
+      - name: Install prebuilt torch-spyre
+        uses: ./.github/actions/install-prebuilt-torch-spyre
+
+      - name: Derive report paths
+        run: |
+          REPORT_NAME="${{ matrix.suite.config }}"; REPORT_NAME="${REPORT_NAME%.yaml}.xml"
+          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
+          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+
+      - name: Run ${{ matrix.suite.name }} model ops test suite
+        uses: ./.github/actions/run-test-suite
+        with:
+          suite_name: ${{ matrix.suite.name }}
+          config: tests/configs/model_ops_tests/${{ matrix.suite.config }}
+          extra_test_flags: -v
+          junit_xml_path: ${{ env.REPORT_PATH }}
+          report_name: ${{ env.REPORT_NAME }}
+          pre_run: |
+            # Clear the cached AIU setup guard and stale topo.json before
+            # every attempt so a card left in a bad state by a killed
+            # (stalled) previous attempt gets re-discovered cleanly instead
+            # of carrying stale state into the retry.
+            unset _IBM_AIU_SETUP
+            rm -rf /tmp/etc/ibm/spyre/topo.json
+            source /etc/profile.d/ibm-aiu-setup.sh
+
+      # ---------------------------------------------------------------------------
+      # Upload the JUnit XML as a GHA artifact so it can be downloaded and
+      # ingested by the Spyre dashboard.
+      #
+      # if: always() ensures the report is uploaded even when tests fail —
+      # a failed run is exactly when you most want the dashboard to show results.
+      #
+      # Artifact name matches the report filename so multiple matrix jobs don't
+      # overwrite each other (each config produces a distinct name).
+      # ---------------------------------------------------------------------------
+      - name: Upload JUnit XML report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.REPORT_NAME }}
+          path: ${{ env.REPORT_PATH }}
+          if-no-files-found: warn   # warn (not fail) if pytest itself crashed
+          retention-days: 10
+      # ---------------------------------------------------------------------------
+      # Write a brief summary to the job UI page.
+      # ---------------------------------------------------------------------------
+      - name: Annotate job with suite metadata
+        if: always()
+        run: |
+          {
+            echo "### Model-ops suite: ${{ matrix.suite.name }}"
+            echo "| Key | Value |"
+            echo "|---|---|"
+            echo "| Config | \`${{ matrix.suite.config }}\` |"
+            echo "| Report | \`${{ env.REPORT_NAME }}\` |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"

@@ -16,3 +16,6 @@ test_suite_config:
           mode: mandatory_success
           tags:
             - jobplan_no_symbolic_args
+        - names:
+            - TestLaunchJobPlan::test_invalid_hcm_metadata_surfaces_on_synchronize
+          mode: mandatory_success
