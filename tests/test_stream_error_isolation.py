@@ -26,16 +26,6 @@ import torch
 from torch_spyre import _C
 
 
-def _current_cdata():
-    dev = torch.device("spyre", torch.spyre.current_device())
-    return _C.current_stream(dev)
-
-
-def _pool_cdata(priority: int = 0):
-    dev = torch.device("spyre", torch.spyre.current_device())
-    return _C.get_stream_from_pool(dev, priority)
-
-
 def _import_conftest():
     """Import the tests/conftest.py module robustly regardless of sys.path."""
     # Prefer a cached import so repeated calls return the same module object.
@@ -54,36 +44,10 @@ def _import_conftest():
     raise ImportError("Could not locate tests/conftest.py")
 
 
-# AC4 — non-error path: synchronize() returns None, all error probes False.
-
-
-class TestNonErrorPath(unittest.TestCase):
-    def test_synchronize_returns_none_when_idle(self):
-        self.assertIsNone(torch.spyre.synchronize())
-
-    def test_stream_synchronize_returns_none_when_idle(self):
-        self.assertIsNone(torch.spyre.Stream().synchronize())
-
-    def test_has_any_stream_error_false_on_clean_runtime(self):
-        self.assertFalse(_C.has_any_stream_error())
-
-    def test_current_stream_has_no_error(self):
-        self.assertFalse(_current_cdata().has_stream_error())
-
-    def test_pool_stream_has_no_error(self):
-        self.assertFalse(_pool_cdata().has_stream_error())
-
-
 # AC1 — C++ exceptions from synchronize() cross the pybind11 boundary intact.
 
 
 class TestErrorVisibility(unittest.TestCase):
-    def test_pool_stream_reports_no_error(self):
-        self.assertFalse(_pool_cdata().has_stream_error())
-
-    def test_has_any_stream_error_false_on_clean_runtime(self):
-        self.assertFalse(_C.has_any_stream_error())
-
     # AC1 — RuntimeError from synchronize() reaches Python with message intact.
     def test_synchronize_propagates_error_message(self):
         sentinel = "Deferred Error First"
@@ -103,25 +67,7 @@ class TestErrorVisibility(unittest.TestCase):
         self.assertIn(sentinel, str(ctx.exception))
 
 
-# AC3a — pool streams are always clean on the non-error path.
-
-
-class TestOptionARecovery(unittest.TestCase):
-    def test_pool_streams_are_always_clean(self):
-        dev = torch.device("spyre", torch.spyre.current_device())
-        for _ in range(2):
-            self.assertFalse(_C.get_stream_from_pool(dev, 0).has_stream_error())
-
-    def test_torch_stream_is_clean_on_construction(self):
-        self.assertFalse(torch.spyre.Stream()._cdata.has_stream_error())
-
-    def test_multiple_streams_all_clean(self):
-        streams = [torch.spyre.Stream() for _ in range(4)]
-        self.assertTrue(all(not s._cdata.has_stream_error() for s in streams))
-        self.assertFalse(_C.has_any_stream_error())
-
-
-# AC2 + AC3c — stream_error_guard fixture: one FAILED test then skips the rest.
+# AC2 — stream_error_guard fixture: one FAILED test then skips the rest.
 
 
 class TestStreamErrorGuardLogic(unittest.TestCase):

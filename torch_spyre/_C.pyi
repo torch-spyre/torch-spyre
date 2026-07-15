@@ -205,10 +205,6 @@ class _SpyreStreamBase:
         """Check if all operations on this stream have completed"""
         ...
 
-    def has_stream_error(self) -> bool:
-        """Return True if the underlying flex stream is in error state"""
-        ...
-
     def device(self) -> torch.device:
         """Get the device associated with this stream"""
         ...

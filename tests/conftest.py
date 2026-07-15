@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 import yaml
 import pytest
-import re
+import regex as re
 
 import shared_config
 from oot_framework.oot_test_utilities import _RUNTIME_TAGS, _RUNTIME_SHAPES
@@ -491,10 +491,8 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
 
 
 # ── Stream error isolation ────────────────────────────────────────────────────
-# Option (a): getStreamFromPool() automatically destroys and recreates any
-# broken non-default handle, so subsequent tests on pool streams self-recover.
-# Option (c) fallback: if the default stream (unrecoverable) goes into error
-# state, all remaining tests are skipped with a clear message.
+# If any stream enters an error state, the device is considered unrecoverable
+# for this process. All subsequent tests are skipped with a clear message.
 
 _device_stream_broken: bool = False
 

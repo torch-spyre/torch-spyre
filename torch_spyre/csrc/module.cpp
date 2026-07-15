@@ -376,8 +376,6 @@ PYBIND11_MODULE(_C, m) {
            "Wait for all operations on this stream to complete")
       .def("query", &spyre::SpyreStream::query,
            "Check if all operations on this stream have completed")
-      .def("has_stream_error", &spyre::SpyreStream::hasStreamError,
-           "Return True if the underlying flex stream is in error state")
       .def("device", &spyre::SpyreStream::device,
            "Get the device associated with this stream")
       .def("id", &spyre::SpyreStream::id, "Get the stream ID")
