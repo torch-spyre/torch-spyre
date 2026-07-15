@@ -1,0 +1,5 @@
+test_suite_config:
+  labels: [smoke, core, full]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/test_stream_error_isolation.py
+      unlisted_test_mode: mandatory_success

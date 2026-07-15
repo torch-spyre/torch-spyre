@@ -357,12 +357,13 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
     idx = (idx + 1) % streams.size();
   }
 
-  // Create corresponding flex stream handle (if not exists)
-  if (pool.stream_handle_map.find(stream_id) == pool.stream_handle_map.end()) {
-    auto runtime = GlobalRuntime::get();
-    flex::RuntimeStreamPriority streamPriority =
-        priority < 0 ? flex::RuntimeStreamPriority::HIGH
-                     : flex::RuntimeStreamPriority::NORMAL;
+  auto runtime = GlobalRuntime::get();
+  flex::RuntimeStreamPriority streamPriority =
+      priority < 0 ? flex::RuntimeStreamPriority::HIGH
+                   : flex::RuntimeStreamPriority::NORMAL;
+
+  auto it = pool.stream_handle_map.find(stream_id);
+  if (it == pool.stream_handle_map.end()) {
     flex::RuntimeStream* flex_handle = runtime->createStream(streamPriority);
     pool.stream_handle_map[stream_id] = flex_handle;
   }

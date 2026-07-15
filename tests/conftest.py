@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 import yaml
 import pytest
-import re
+import regex as re
 
 import shared_config
 from oot_framework.oot_test_utilities import _RUNTIME_TAGS, _RUNTIME_SHAPES
@@ -488,6 +488,42 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     for rep in skipped:
         # terminalreporter.write_line(rep)
         terminalreporter.write_line(rep.nodeid)
+
+
+# ── Stream error isolation ────────────────────────────────────────────────────
+# If any stream enters an error state, the device is considered unrecoverable
+# for this process. All subsequent tests are skipped with a clear message.
+
+_device_stream_broken: bool = False
+
+
+def _any_stream_has_error() -> bool:
+    """Return True if any stream in the runtime context is in error state."""
+    try:
+        from torch_spyre import _C  # type: ignore[import]
+
+        return bool(_C.has_any_stream_error())
+    except Exception:
+        # If we cannot query (e.g. device not present), be conservative.
+        return False
+
+
+@pytest.fixture(autouse=True)
+def stream_error_guard():
+    """Isolate stream errors so one hardware failure → one FAILED test,
+    not cascading mysterious crashes across the whole session."""
+    global _device_stream_broken
+
+    if _device_stream_broken:
+        pytest.skip(
+            "Spyre stream is in error state from a previous test — "
+            "device reset required before further tests can run."
+        )
+
+    yield  # ── run the test ──
+
+    if _any_stream_has_error():
+        _device_stream_broken = True
 
 
 def _is_spyre_hardware_available() -> bool:

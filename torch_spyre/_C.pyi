@@ -16,6 +16,7 @@ __all__: list[str] = [
     "current_stream",
     "default_stream",
     "get_stream_from_pool",
+    "has_any_stream_error",
     "set_current_stream",
     "synchronize",
     "as_strided_with_layout",
@@ -271,6 +272,10 @@ def synchronize(device: torch.device | None = None) -> None:
     Args:
         device: The device to synchronize. If None, synchronizes all devices.
     """
+    ...
+
+def has_any_stream_error() -> bool:
+    """Return True if any stream in the runtime context is in error state."""
     ...
 
 def as_strided_with_layout(
