@@ -1135,7 +1135,7 @@ def generate_sdsc(
                                     ],
                                     "wordLength": num_bytes(tensor.data_format),
                                     "dataFormat_": tensor.data_format.name,
-                            "memOrg_": (
+                                    "memOrg_": (
                                         # Index tensors must reside in HBM; the Spyre
                                         # engine does not support indirect addressing
                                         # through LX scratchpad.

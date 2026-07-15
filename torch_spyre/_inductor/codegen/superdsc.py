@@ -522,7 +522,6 @@ def _create_sdsc_tensors(
             else CONV2D_LAYOUT_LABELS
         )
 
-
         if has_indirect_access:
             label = get_indirect_layout_label(
                 i,
