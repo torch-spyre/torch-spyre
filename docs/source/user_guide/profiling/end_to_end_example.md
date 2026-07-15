@@ -26,7 +26,6 @@ shrink. This page will be revised to the in-tree API once it ships.
 
 ## What you need
 
-
 **Prerequisites Step**
 
 Ensure that you have access a pod with spyre accelerator and torch spyre and spyre software stack installed.
@@ -45,7 +44,6 @@ installs, branch selection) depending on your platform and PyTorch
 build.
 
 ## Setup
-
 
 ```bash
 # Install fms and aiu-fms-testing-utils from the eager_spyre branch
@@ -183,7 +181,7 @@ print(f"wall-clock ms: mean={mean(wall_clock_ms):.3f} median={median(wall_clock_
 print(f"profiler-derived CPU ms (per run): {cpu_per_run_ms:.3f}")
 ```
 
-**Note** 
+**Note**
 Please ensure spyre time is present in report output in order to ensure to confirm correctness
 
 Three patterns to call out:
