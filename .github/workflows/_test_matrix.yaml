@@ -125,7 +125,8 @@ jobs:
     # Prebaked path: run ON the runner image so the matrix is computed from the
     # SAME PR-pinned configs baked into the dev image (not a re-fetch of main),
     # keeping content-addressed consistency.
-    runs-on: ${{ inputs.prebaked_image && fromJSON(format('["x86_64","spyre_pf_x0","{0}","{1}"]', inputs.runner_label, inputs.image_label)) || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.prebaked_image && fromJSON(format('["x86_64","spyre_pf_x0","{0}","{1}"]', inputs.runner_label, inputs.image_label)) || 'ubuntu-latest'
+      }}
     outputs:
       matrix: ${{ steps.filter.outputs.matrix }}
     steps:
