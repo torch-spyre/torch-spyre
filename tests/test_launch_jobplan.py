@@ -144,5 +144,48 @@ class TestLaunchJobPlan(TestCase):
                     torch_spyre._C.launch_jobplan(job_plan, [])
 
 
+class TestPipelineBarrierOpOrdering(TestCase):
+    """Regression tests verifying pipeline_barrier=true on DMA steps under OP_ORDERING.
+
+    Under STRICT_ORDERING the flex scheduler auto-inserts cross-pipeline barriers,
+    masking any missing per-op barrier flags. Under OP_ORDERING that auto-insertion
+    is disabled and the per-op pipeline_barrier_ flag is the sole ordering authority.
+
+    These tests set SPYRE_STREAM_OP_ORDERING=1 so new streams are created in
+    OP_ORDERING mode, then run a compiled op end-to-end and assert correctness.
+    If the H2D step's pipeline_barrier_ were false, device compute could start
+    before the transfer completes and produce wrong results.
+    """
+
+    def _run_op_ordering(self, op_name: str, symbolic_args: bool) -> None:
+        old_mode = os.environ.get("SPYRE_STREAM_OP_ORDERING")
+        try:
+            os.environ["SPYRE_STREAM_OP_ORDERING"] = "1"
+            _run_compiled_op(op_name, symbolic_args)
+        finally:
+            if old_mode is None:
+                os.environ.pop("SPYRE_STREAM_OP_ORDERING", None)
+            else:
+                os.environ["SPYRE_STREAM_OP_ORDERING"] = old_mode
+
+    def test_abs_op_ordering_no_symbols(self):
+        """abs produces correct results under OP_ORDERING with symbolic_args=False.
+
+        With SPYRE_STREAM_OP_ORDERING=1 the scheduler no longer auto-inserts the
+        H2D→Compute barrier. Correctness depends entirely on H2D carrying
+        pipeline_barrier_=true so the per-op flag triggers the barrier instead.
+        """
+        self._run_op_ordering("abs", symbolic_args=False)
+
+    def test_abs_op_ordering_with_symbols(self):
+        """abs produces correct results under OP_ORDERING with symbolic_args=True.
+
+        Exercises the program-correction path (HostCompute → H2D → Compute) under
+        OP_ORDERING. The H2D barrier is the load-bearing guard preventing device
+        compute from racing ahead of the correction transfer.
+        """
+        self._run_op_ordering("abs", symbolic_args=True)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
