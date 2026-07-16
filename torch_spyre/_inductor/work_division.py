@@ -21,6 +21,7 @@ from .ir import SpyreConstantFallback, SpyreEmptyFallback
 
 from torch._inductor.ir import (
     ComputedBuffer,
+    DeviceCopy,
     ExternKernel,
     FallbackKernel,
     MultiOutput,
@@ -34,7 +35,7 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 
 from .errors import Unsupported
-from .constants import BATCH_MATMUL_OP, TOPK_OPS
+from .constants import BATCH_MATMUL_OP, DEVICE_NAME, TOPK_OPS
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
@@ -47,6 +48,7 @@ from .pass_utils import (
     iteration_space_from_op,
     splits_by_index_coeff,
     apply_splits_from_index_coeff,
+    op_read_writes,
 )
 from .propagate_hints import get_op_hints
 from typing import Callable
@@ -57,8 +59,12 @@ import logging
 
 logger = get_inductor_logger("work_division")
 
-# Maximum memory access span per core: 256MB hardware limit
-MAX_SPAN_BYTES = 256 * 1024 * 1024
+# Maximum memory-access span per core.
+#
+# MVLOC supports a maximum value of 65535, with each entry representing
+# 4096 bytes. Therefore, the maximum addressable offset is:
+# 65535 * 4096 = 268431360 bytes (255.996 MiB).
+MAX_SPAN_BYTES = 65535 * 4096
 
 
 @dataclasses.dataclass
@@ -386,7 +392,7 @@ def warn_if_per_core_overflow(
             dl = td.layout.device_layout
             logger.critical(
                 f"{op_name}: per-core tensor span "
-                f"{per_core_span / (1024 * 1024):.2f} MB "
+                f"{per_core_span / (1024 * 1024):.3f} MB "
                 f"(shape={list(td.layout.size)}, dtype={td.layout.dtype}, "
                 f"device_size={list(dl.device_size)}, splits={splits}) "
                 f"exceeds hardware limit of {MAX_SPAN_BYTES / (1024 * 1024):.2f} MB"
@@ -617,7 +623,7 @@ def collect_tensor_deps(
 ) -> tuple[list[TensorDep], TensorDep]:
     """Build TensorDep lists for inputs and the output of op."""
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
-    rw = op.get_read_writes()
+    rw = op_read_writes(op)
     output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))
     return input_tds, output_td
 
@@ -635,11 +641,99 @@ def apply_splits(
     if cores_used <= 1:
         return
 
-    rw = op.get_read_writes()
+    rw = op_read_writes(op)
     write_index = output_td.dep.index
     first_read = next(iter(rw.reads), None)
     read_index = first_read.index if first_read is not None else write_index
     op.op_it_space_splits = splits_by_index_coeff(splits, write_index, read_index)
+
+
+def enumerate_work_division_candidates(
+    op: ComputedBuffer,
+    max_cores: int,
+) -> list[dict[Symbol, int]]:
+    """Return every permissible core-division split for ``op``.
+
+    A split (``dict[Symbol, int]``, same form as :func:`apply_splits`) is
+    permissible iff: each per-dim factor divides its dim's size,
+    ``prod(factors) <= max_cores``, every tensor's per-core span
+    ``<= MAX_SPAN_BYTES``, and at most one reduction (K) dim is split. A factor
+    of ``1`` means the dim is unsplit; the all-ones single-core split is
+    included when it is itself permissible.
+
+    Only ``Pointwise`` / ``Reduction`` ops have a divisible iteration space;
+    ``TOPK`` reductions run single-core, so they yield only the unsplit split.
+    """
+    # TODO: Enumerate compute bound ops and for seeds or compute optimized
+    # work division where HBM bandwidth can saturate compute.
+
+    it_space = iteration_space_from_op(op)
+
+    # TOPK reductions run single-core (see divide_reduction_op): the only
+    # permissible "division" is the unsplit one.
+    if isinstance(op.data, Reduction) and op.data.reduction_type in TOPK_OPS:
+        return [{v: 1 for v in it_space}]
+
+    input_tds, output_td = collect_tensor_deps(
+        op, get_mem_deps_from_rw(op_read_writes(op))
+    )
+    all_tds = input_tds + [output_td]
+
+    symbol_meta = _collect_symbol_metadata(it_space)
+    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(
+        it_space, all_tds, symbol_meta
+    )
+
+    # Reduction (K) dims are the iteration vars absent from the output tensor's
+    # device coordinates (mirrors prioritize_dimensions / splits_by_index_coeff).
+    coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
+    reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
+
+    # Per-dim candidate factors, mirroring must_split_vars.valid_splits but with
+    # no ``>= current_min`` floor (we want the full set, including 1).
+    def factors(v: Symbol) -> list[int]:
+        if v in symbol_meta:
+            basis = symbol_meta[v][1]  # granularity
+        elif v in stick_vars:
+            basis = concretize_expr(it_space_adjusted[v])  # stick count
+        else:
+            basis = concretize_expr(it_space[v])  # element count
+        return [int(s) for s in divisors(basis)]
+
+    def create_splits(axis_vars, combo):
+        return dict(zip(axis_vars, combo))
+
+    def valid_split(splits):
+        if math.prod(splits.values()) > max_cores:  # core budget
+            return False
+        if sum(1 for v in reduction_vars if splits[v] > 1) > 1:  # <= 1 K-split
+            return False
+        if any(  # per-core span <= MAX_SPAN_BYTES, on element-valued it_space
+            get_per_core_span(td, splits, it_space, symbol_meta) > MAX_SPAN_BYTES
+            for td in all_tds
+        ):
+            return False
+        if any(  # a coordinate-masked dim cannot be split across cores: the
+            # backend can't apply coordinate masking to a dimension spread over
+            # cores (ddc ddcv1.cpp:3433). Masking is applied to a dim that is
+            # padded, reduced, and the stick dim -- mirrors _get_coordinate_mask
+            # in codegen/superdsc.py. A stick var is guaranteed non-symbolic, so
+            # its element count concretizes; padded iff not stick-aligned.
+            splits[v] > 1
+            for v in reduction_vars
+            if v in stick_vars and concretize_expr(it_space[v]) % stick_vars[v] != 0
+        ):
+            return False
+        return True
+
+    vars_ = list(it_space_adjusted.keys())
+    candidates = [
+        splits
+        for combo in itertools.product(*(factors(v) for v in vars_))
+        if valid_split(splits := create_splits(vars_, combo))
+    ]
+
+    return candidates
 
 
 def _work_div_hint_by_name(op: ComputedBuffer) -> dict[str, int]:
@@ -759,7 +853,7 @@ def span_reduction_pass(
     args: list[SchedNodeArg],
     max_cores: int,
 ) -> None:
-    """Mandatory per-op pass: compute minimum splits to satisfy the 256MB span limit.
+    """Mandatory per-op pass: compute minimum splits to satisfy the MAX_SPAN_BYTES.
 
     Writes results to op.op_it_space_splits. If no span violation exists,
     op.op_it_space_splits is left unset (apply_splits is a no-op for splits <= 1).
@@ -788,7 +882,7 @@ def span_reduction_pass(
     if len(reduction_vars_to_split) > 1:
         raise Unsupported(
             f"Cannot satisfy hardware memory span limit "
-            f"({MAX_SPAN_BYTES // (1024 * 1024)}MB) without splitting "
+            f"({MAX_SPAN_BYTES / (1024**2):.3f}MB) without splitting "
             f"{len(reduction_vars_to_split)} reduction dimension(s) "
             f"({reduction_vars_to_split}), but the backend supports at most 1."
         )
@@ -877,7 +971,7 @@ def work_distribution_pass(
     # Recover splits committed by span_reduction_pass using the same
     # coeff-keyed encoding that codegen uses — stable across passes.
     if hasattr(op, "op_it_space_splits"):
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         write_index = next(iter(rw.writes)).index
         read_index = next((d.index for d in rw.reads), write_index)
         min_splits = apply_splits_from_index_coeff(
@@ -904,7 +998,7 @@ def work_distribution_pass(
                     f"work_division_hint: {op.get_name()} user hint reduces "
                     f"splits committed by span_reduction for dims {list(dropped)}. "
                     f"Applying strict user hint; this may violate the hardware "
-                    f"{MAX_SPAN_BYTES // (1024 * 1024)} MB span limit."
+                    f"{MAX_SPAN_BYTES / (1024**2):.3f} MB span limit."
                 )
             _commit_user_splits(op, user_splits, output_td)
 
@@ -1313,6 +1407,9 @@ def _iter_computed_buffers(operations: list[Operation]):
         if op.is_no_op():
             pass
         elif isinstance(op, ComputedBuffer):
+            layout = op.maybe_get_layout()
+            if layout is None or layout.device.type != DEVICE_NAME:
+                continue
             yield op
         elif isinstance(op, FallbackKernel):
             # FallbackKernel produces 0..N trailing MultiOutputs
@@ -1323,8 +1420,9 @@ def _iter_computed_buffers(operations: list[Operation]):
         elif isinstance(op, MultiOutput):
             pass
         elif isinstance(op, ExternKernel):
-            if isinstance(op, (SpyreConstantFallback, SpyreEmptyFallback)):
-                # Work division not supported on allocation/constant kernels
+            if isinstance(op, (SpyreConstantFallback, SpyreEmptyFallback, DeviceCopy)):
+                # Work division not supported on allocation/constant kernels, nor
+                # on DeviceCopy.
                 pass
             else:
                 logger.warning(f"unhandled node type {type(op)}")
@@ -1350,11 +1448,11 @@ def _apply_input_layout_overrides(
 
 
 def span_reduction(graph: GraphLowering) -> None:
-    """Pass 1: compute minimum per-op splits required by the 256MB span limit."""
+    """Pass 1: compute minimum per-op splits required by MAX_SPAN_BYTES."""
     operations = graph.operations
     max_cores = _validate_max_cores()
     for op in _iter_computed_buffers(operations):
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         args = _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw))
         if isinstance(op.data, Pointwise):
             divide_pointwise_op(op, args, max_cores, span_reduction_pass)
@@ -1376,7 +1474,7 @@ def work_distribution(
     for op in _iter_computed_buffers(operations):
         if op in preassigned_ops:
             continue
-        rw = op.get_read_writes()
+        rw = op_read_writes(op)
         args = _apply_input_layout_overrides(op, get_mem_deps_from_rw(rw))
         if isinstance(op.data, Pointwise):
             divide_pointwise_op(op, args, max_cores, work_distribution_pass)
@@ -1401,7 +1499,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
         # User hints take ownership of the split decision; do not override them.
         return False
 
-    rw = op.get_read_writes()
+    rw = op_read_writes(op)
     args = get_mem_deps_from_rw(rw)
     input_tds, output_td = collect_tensor_deps(op, args)
     all_tds = input_tds + [output_td]
