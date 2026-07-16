@@ -156,7 +156,7 @@ The IBM Spyre Accelerator chip (left) and IBM Telum II processor (right). *Image
 | Cores | 32 AI accelerator cores |
 | Technology | 5 nm |
 | LX scratchpad | 2 MB per core (SRAM, shared between corelets) |
-| Per-core memory span | 256 MB addressable contiguous device memory |
+| Per-core memory span | 255.996 MiB addressable contiguous device memory |
 | Memory per card | Up to 128 GB LPDDR5 |
 | Peak performance | >300 TOPS per card |
 | Supported data types | int4, int8, fp8, fp16 |
