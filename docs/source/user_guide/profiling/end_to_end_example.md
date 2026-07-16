@@ -113,7 +113,7 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 #     0, tokenizer.vocab_size, (1, 512), dtype=torch.int64,
 # ).to(DEVICE)
 raw_ids = tokenizer(
-    "What is the capital of Francw", return_tensors="pt"
+    "What is the capital of France", return_tensors="pt"
 )["input_ids"].squeeze(0)
 
 ids, kwargs = pad_input_ids(
@@ -135,14 +135,11 @@ with torch.no_grad():
     mask = kwargs["mask"].to(dtype=torch.float16).to(DEVICE)
     output = model(ids.to(DEVICE), position_ids=position_ids.to(DEVICE), mask=mask, selected_freqs=selected_freqs)
     generated_token_ids = torch.argmax(output, dim=-1)[0]
-    print(generated_token_ids)
-    print(type(generated_token_ids))
     response = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
 
 print("=" * 42)
 print("Inference completed.".center(42))
 print("=" * 42)
-print(response)
 
 # Warmup — first run is always slower due to JIT/compilation
 print("=" * 42)
@@ -182,7 +179,8 @@ print(f"profiler-derived CPU ms (per run): {cpu_per_run_ms:.3f}")
 ```
 
 **Note**
-Please ensure spyre time is present in report output in order to ensure to confirm correctness
+
+Ensure profiler report includes Spyre/Device time; otherwise the trace deos not confirm accelerator.
 
 Three patterns to call out:
 
