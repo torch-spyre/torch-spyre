@@ -581,8 +581,8 @@ def lower_convolution(x, w, bias, stride, padding, dilation, groups):
             "total_size_j": W_in_padded,
             "pad_dim_i": CONV2D_DIM_LABELS[2],
             "pad_dim_j": CONV2D_DIM_LABELS[3],
-            "window_dim_i": CONV2D_DIM_LABELS[-3],
-            "window_dim_j": CONV2D_DIM_LABELS[-2],
+            "window_dim_i": CONV2D_DIM_LABELS[-2],
+            "window_dim_j": CONV2D_DIM_LABELS[-1],
             "pad_type": "padded_fullspan_wunneeded"
             if (padding[0] == 0 and padding[1] == 0)
             else "padded_nozeropad",

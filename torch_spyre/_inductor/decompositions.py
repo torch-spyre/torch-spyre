@@ -839,6 +839,7 @@ def conv2d_via_bmm_decomp(
     Decompose 2D convolution into batch matrix multiplication using torch.nn.unfold.
     torch.nn.unfold directly returns (N, C_in * K_h * K_w, H_out * W_out), avoiding
     intermediate reshape/view/unsqueeze operations.
+    For depthwise convolutions (C_in = groups = C_out), invoke torch.spyre.conv2d directly.
     """
     if transposed:
         raise Unsupported("conv2d_via_bmm: transposed convolution not supported")
@@ -851,6 +852,12 @@ def conv2d_via_bmm_decomp(
 
     N, C_in, H_in, W_in = input.shape
     C_out, C_in_per_group, K_h, K_w = weight.shape
+
+    # For depthwise convolutions (C_in = groups = C_out), use torch.spyre.conv2d directly
+    if C_in == groups == C_out:
+        return torch.ops.spyre.conv2d(
+            input, weight, bias, stride, padding, dilation, groups
+        )
 
     stride_h, stride_w = stride[0], stride[1]
     pad_h, pad_w = padding[0], padding[1]
