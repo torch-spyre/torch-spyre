@@ -327,7 +327,6 @@ def _get_padded_iteration_space(
 def _is_matmul(op: str) -> bool:
     return op in ("matmul", "batchmatmul", "batchmatmulfp8")
 
-
 def _is_conv(op: str) -> bool:
     return op in ("depthwiseconv2dnative", "conv2d")
 
@@ -403,6 +402,22 @@ def _create_sdsc_tensors(
     dims = list(iteration_space.keys())
     layouts: dict = {}
     use_op_dims = not _is_matmul(op_spec.op) and not _is_conv(op_spec.op)
+
+    # Detect indirect access from device_coordinates: index tensors are those
+    # whose name is referenced by an IndirectAccess in another tensor's coordinates,
+    # and value tensors are those that contain IndirectAccess in their coordinates.
+    index_tensor_indices = {
+        i for i, arg in enumerate(op_spec.args) if is_index_tensor(arg, op_spec)
+    }
+    has_indirect_access = bool(index_tensor_indices)
+
+    # For indirect access: pre-compute index tensor layouts (first pass)
+    index_tensor_layouts: dict[int, tuple[list, Any]] = {}
+    index_active_dims: dict[int, set] = {}
+    if has_indirect_access:
+        index_tensor_layouts, index_active_dims = _collect_index_tensor_layouts(
+            op_spec, symbol_mapping, index_tensor_indices, logger
+        )
 
     # Detect indirect access from device_coordinates: index tensors are those
     # whose name is referenced by an IndirectAccess in another tensor's coordinates,
