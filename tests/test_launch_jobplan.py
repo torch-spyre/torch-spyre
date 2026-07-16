@@ -199,6 +199,7 @@ print("PASS")
         env=env,
         capture_output=True,
         text=True,
+        timeout=30,
     )
     assert result.returncode == 0, (
         f"OP_ORDERING subprocess failed (symbolic_args={symbolic_args}):\n"
