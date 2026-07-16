@@ -254,7 +254,8 @@ class JobPlanStep {
   }
 
  protected:
-  bool pipeline_barrier_ = false;
+  // true by default so DMA steps barrier; compute steps override to false.
+  bool pipeline_barrier_ = true;
 };
 
 /**
@@ -360,7 +361,9 @@ class JobPlanStepCompute final : public JobPlanStep {
       : program_address_(std::move(program_address)),
         bind_io_addresses_(bind_io_addresses),
         bootstrap_offset_(bootstrap_offset),
-        name_(std::move(name)) {}
+        name_(std::move(name)) {
+    pipeline_barrier_ = false;  // overlap-eligible; DMA barriers suffice
+  }
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
@@ -407,7 +410,9 @@ class JobPlanStepHostCompute final : public JobPlanStep {
       : hcm_(std::move(hcm)),
         output_buffer_(output_buffer),
         input_buffer_(input_buffer),
-        ishape_(ishape) {}
+        ishape_(ishape) {
+    pipeline_barrier_ = false;  // host callbacks are overlap-eligible
+  }
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 

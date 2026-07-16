@@ -482,6 +482,92 @@ class TestPrepareKernel:
             ):
                 torch_spyre._C.prepare_kernel(spyrecode_dir)
 
+    def test_pipeline_barrier_dma_steps_default_true(self):
+        """H2D step must carry pipeline_barrier=True by default.
+
+        H2D steps are produced by the DataTransfer translator, which requires
+        the host buffer to already exist in the pinned_buffer_map (written by a
+        preceding ComputeOnHost). The correction sequence
+        (HostCompute → H2D → Compute) is the canonical way to exercise an H2D
+        step, so we reuse create_mock_spyrecode and check step 1.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost"
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            assert job_plan.get_step_type(1) == "H2D"
+            assert job_plan.get_step_pipeline_barrier(1) is True, (
+                "H2D step must carry pipeline_barrier=True (safe-by-default "
+                "stopgap for async DMA / OP_ORDERING)"
+            )
+
+    def test_pipeline_barrier_compute_steps_false(self):
+        """Device-compute and host-compute steps must carry pipeline_barrier=False.
+
+        Keeping these false preserves the host/device overlap: the correction
+        callback for iteration N+1 runs on the host thread concurrently with
+        device compute for iteration N. Flipping either to true would inject a
+        synchronize() call and serialize that overlap away.
+
+        For the correction sequence (HostCompute → H2D → Compute):
+          - HostCompute barrier=False  (host/device overlap)
+          - H2D        barrier=True   (safe-by-default DMA barrier)
+          - Compute    barrier=False  (forward-looking: OP_ORDERING intent)
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost"
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            # Correction sequence: HostCompute(0) → H2D(1) → Compute(2)
+            assert job_plan.num_steps() == 3
+            assert job_plan.get_step_type(0) == "HostCompute"
+            assert job_plan.get_step_type(1) == "H2D"
+            assert job_plan.get_step_type(2) == "Compute"
+
+            assert job_plan.get_step_pipeline_barrier(0) is False, (
+                "HostCompute step must carry pipeline_barrier=False to preserve "
+                "host/device overlap (correction callback runs while prior device "
+                "compute is still in flight)"
+            )
+            assert job_plan.get_step_pipeline_barrier(1) is True, (
+                "H2D step must carry pipeline_barrier=True (safe-by-default "
+                "stopgap: prevents device compute racing ahead of DMA under "
+                "async DMA / OP_ORDERING)"
+            )
+            assert job_plan.get_step_pipeline_barrier(2) is False, (
+                "Compute step must carry pipeline_barrier=False (overlap-eligible; "
+                "under STRICT_ORDERING the scheduler auto-inserts the H2D→Compute "
+                "barrier regardless — this is a forward-looking OP_ORDERING intent)"
+            )
+
+    def test_pipeline_barrier_pure_compute_false(self):
+        """A standalone ComputeOnDevice step must carry pipeline_barrier=False.
+
+        Device compute is always overlap-eligible; it must never default-barrier.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            assert job_plan.num_steps() == 1
+            assert job_plan.get_step_type(0) == "Compute"
+            assert job_plan.get_step_pipeline_barrier(0) is False, (
+                "Compute step must carry pipeline_barrier=False"
+            )
+
+    def test_get_step_pipeline_barrier_out_of_range(self):
+        """get_step_pipeline_barrier must raise for an out-of-range index."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            with pytest.raises(RuntimeError, match="Step index out of range"):
+                job_plan.get_step_pipeline_barrier(999)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
