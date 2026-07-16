@@ -364,16 +364,7 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
     flex::RuntimeStreamPriority streamPriority =
         priority < 0 ? flex::RuntimeStreamPriority::HIGH
                      : flex::RuntimeStreamPriority::NORMAL;
-    // Allow OP_ORDERING mode via env var for testing and future use. Under
-    // OP_ORDERING the scheduler does not auto-insert cross-pipeline barriers,
-    // so per-op pipeline_barrier_ flags become the sole ordering authority.
-    const char* op_ordering_env = std::getenv("SPYRE_STREAM_OP_ORDERING");
-    flex::RuntimeStreamMode streamMode =
-        (op_ordering_env != nullptr && std::string(op_ordering_env) == "1")
-            ? flex::RuntimeStreamMode::OP_ORDERING
-            : flex::RuntimeStreamMode::STRICT_ORDERING;
-    flex::RuntimeStream* flex_handle =
-        runtime->createStream(streamPriority, streamMode);
+    flex::RuntimeStream* flex_handle = runtime->createStream(streamPriority);
     pool.stream_handle_map[stream_id] = flex_handle;
   }
 
