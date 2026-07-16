@@ -21,6 +21,62 @@ from torch_spyre._inductor.constants import DEPTHWISE_CONV2D_OP
 from sympy import Symbol
 
 
+def _build_padding_sizes_for_n(conv_params):
+  """Build paddingSizes_ for the N stage, only when conv_params is non-empty."""
+  if not conv_params:
+    return {}
+  return {
+      "paddingSizes_": {
+          str(conv_params["pad_dim_i"]): {
+              "totalSize_": conv_params["total_size_i"],
+              "stride_": conv_params["stride_i"],
+              "dilation_": conv_params["dilation_i"],
+              "windowDim_": conv_params["window_dim_i"],
+          },
+          str(conv_params["pad_dim_j"]): {
+              "totalSize_": conv_params["total_size_j"],
+              "stride_": conv_params["stride_j"],
+              "dilation_": conv_params["dilation_j"],
+              "windowDim_": conv_params["window_dim_j"],
+          },
+      }
+  }
+
+
+def _build_padding_sizes_for_stage(conv_params):
+  """Build paddingSizes_ for dataStageParam ss_ and el_ stages, only when conv_params is non-empty."""
+  if not conv_params:
+    return {}
+  return {
+      "paddingSizes_": {
+          str(conv_params["pad_dim_i"]): {
+              "totalSize_": conv_params["total_size_i"],
+              "stride_": conv_params["stride_i"],
+              "dilation_": conv_params["dilation_i"],
+              "windowDim_": conv_params["window_dim_i"],
+          },
+          str(conv_params["pad_dim_j"]): {
+              "totalSize_": conv_params["total_size_j"],
+              "stride_": conv_params["stride_j"],
+              "dilation_": conv_params["dilation_j"],
+              "windowDim_": conv_params["window_dim_j"],
+          },
+      }
+  }
+
+
+def _build_padding_for_tensor(conv_params):
+  """Build padding_ for tensor allocations, only when conv_params is non-empty."""
+  if not conv_params:
+    return {}
+  return {
+      "padding_": {
+          str(conv_params["pad_dim_i"]): conv_params["pad_type"],
+          str(conv_params["pad_dim_j"]): conv_params["pad_type"],
+      }
+  }
+
+
 @dataclasses.dataclass(frozen=True)
 class SymbolKind:
     """Classifies a symbol registered in the bundle symbol table.
@@ -810,38 +866,7 @@ def generate_sdsc(
                                     for dim, size in sdsc_spec.iteration_space.items()
                                 },
                                 **(
-                                    {
-                                        "paddingSizes_": {
-                                            str(sdsc_spec.conv_params["pad_dim_i"]): {
-                                                "totalSize_": sdsc_spec.conv_params[
-                                                    "total_size_i"
-                                                ],
-                                                "stride_": sdsc_spec.conv_params[
-                                                    "stride_i"
-                                                ],
-                                                "dilation_": sdsc_spec.conv_params[
-                                                    "dilation_i"
-                                                ],
-                                                "windowDim_": sdsc_spec.conv_params[
-                                                    "window_dim_i"
-                                                ],
-                                            },
-                                            str(sdsc_spec.conv_params["pad_dim_j"]): {
-                                                "totalSize_": sdsc_spec.conv_params[
-                                                    "total_size_j"
-                                                ],
-                                                "stride_": sdsc_spec.conv_params[
-                                                    "stride_j"
-                                                ],
-                                                "dilation_": sdsc_spec.conv_params[
-                                                    "dilation_j"
-                                                ],
-                                                "windowDim_": sdsc_spec.conv_params[
-                                                    "window_dim_j"
-                                                ],
-                                            },
-                                        }
-                                    }
+                                    _build_padding_sizes_for_n(sdsc_spec.conv_params)
                                     if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
                                     else {}
                                 ),
@@ -879,50 +904,6 @@ def generate_sdsc(
                                             // sdsc_spec.work_slices[dim]
                                             for dim, size in sdsc_spec.iteration_space.items()
                                         },
-                                        **(
-                                            {
-                                                "paddingSizes_": {
-                                                    str(
-                                                        sdsc_spec.conv_params[
-                                                            "pad_dim_i"
-                                                        ]
-                                                    ): {
-                                                        "totalSize_": sdsc_spec.conv_params[
-                                                            "total_size_i"
-                                                        ],
-                                                        "stride_": sdsc_spec.conv_params[
-                                                            "stride_i"
-                                                        ],
-                                                        "dilation_": sdsc_spec.conv_params[
-                                                            "dilation_i"
-                                                        ],
-                                                        "windowDim_": sdsc_spec.conv_params[
-                                                            "window_dim_i"
-                                                        ],
-                                                    },
-                                                    str(
-                                                        sdsc_spec.conv_params[
-                                                            "pad_dim_j"
-                                                        ]
-                                                    ): {
-                                                        "totalSize_": sdsc_spec.conv_params[
-                                                            "total_size_j"
-                                                        ],
-                                                        "stride_": sdsc_spec.conv_params[
-                                                            "stride_j"
-                                                        ],
-                                                        "dilation_": sdsc_spec.conv_params[
-                                                            "dilation_j"
-                                                        ],
-                                                        "windowDim_": sdsc_spec.conv_params[
-                                                            "window_dim_j"
-                                                        ],
-                                                    },
-                                                }
-                                            }
-                                            if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
-                                            else {}
-                                        ),
                                         # Per-dim symbolic bounds (per-core slice).
                                         # min_val / work_slices is the granularity that
                                         # the runtime must respect when choosing a batch size.
@@ -933,6 +914,11 @@ def generate_sdsc(
                                         "coreletSplit_": {},
                                         "rowSplit_": {},
                                         "peSfpSplit_": {},
+                                        "paddingSizes_": (
+                                            _build_padding_sizes_for_stage(sdsc_spec.conv_params).get("paddingSizes_", {})
+                                            if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
+                                            else {}
+                                        ),
                                     },
                                     "el_": {
                                         "name_": "core",
@@ -941,50 +927,6 @@ def generate_sdsc(
                                             // sdsc_spec.work_slices[dim]
                                             for dim, size in sdsc_spec.iteration_space.items()
                                         },
-                                        **(
-                                            {
-                                                "paddingSizes_": {
-                                                    str(
-                                                        sdsc_spec.conv_params[
-                                                            "pad_dim_i"
-                                                        ]
-                                                    ): {
-                                                        "totalSize_": sdsc_spec.conv_params[
-                                                            "total_size_i"
-                                                        ],
-                                                        "stride_": sdsc_spec.conv_params[
-                                                            "stride_i"
-                                                        ],
-                                                        "dilation_": sdsc_spec.conv_params[
-                                                            "dilation_i"
-                                                        ],
-                                                        "windowDim_": sdsc_spec.conv_params[
-                                                            "window_dim_i"
-                                                        ],
-                                                    },
-                                                    str(
-                                                        sdsc_spec.conv_params[
-                                                            "pad_dim_j"
-                                                        ]
-                                                    ): {
-                                                        "totalSize_": sdsc_spec.conv_params[
-                                                            "total_size_j"
-                                                        ],
-                                                        "stride_": sdsc_spec.conv_params[
-                                                            "stride_j"
-                                                        ],
-                                                        "dilation_": sdsc_spec.conv_params[
-                                                            "dilation_j"
-                                                        ],
-                                                        "windowDim_": sdsc_spec.conv_params[
-                                                            "window_dim_j"
-                                                        ],
-                                                    },
-                                                }
-                                            }
-                                            if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
-                                            else {}
-                                        ),
                                         "symbolicDimInfo_": _per_core_symbolic_dim_info(
                                             symbolic_dims, sdsc_spec.work_slices
                                         ),
@@ -992,6 +934,11 @@ def generate_sdsc(
                                         "coreletSplit_": {},
                                         "rowSplit_": {},
                                         "peSfpSplit_": {},
+                                        "paddingSizes_": (
+                                            _build_padding_sizes_for_stage(sdsc_spec.conv_params).get("paddingSizes_", {})
+                                            if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
+                                            else {}
+                                        ),
                                     },
                                 }
                             },
@@ -1017,16 +964,7 @@ def generate_sdsc(
                                     if "lx" in tensor.allocation
                                     else "hbm",
                                     **(
-                                        {
-                                            "padding_": {
-                                                str(
-                                                    sdsc_spec.conv_params["pad_dim_i"]
-                                                ): sdsc_spec.conv_params["pad_type"],
-                                                str(
-                                                    sdsc_spec.conv_params["pad_dim_j"]
-                                                ): sdsc_spec.conv_params["pad_type"],
-                                            }
-                                        }
+                                        _build_padding_for_tensor(sdsc_spec.conv_params)
                                         if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
                                         and i == 0
                                         else {}
@@ -1175,8 +1113,8 @@ def generate_sdsc(
                                             i == 0
                                             and sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
                                         )
-                                        else {"lx": {"isPresent": 1}},
-                                    ),
+                                        else {"lx": {"isPresent": 1}}
+                                    )
                                 }
                                 for i, tensor in enumerate(sdsc_spec.args)
                             ],
