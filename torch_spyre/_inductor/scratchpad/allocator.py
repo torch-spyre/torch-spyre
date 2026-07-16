@@ -491,8 +491,19 @@ def _op_short_name(op: Any) -> str:
 
 
 def _lx_planning_size() -> int:
-    """LX scratchpad bytes available to the layout solver."""
-    return int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
+    """LX scratchpad bytes available to the layout solver.
+
+    TEMPORARY GUARD: subtracts a 100KB safety margin from the frontend's
+    declared share. The backend compiler has been observed placing its own
+    internal LX allocations at a fixed address (~1587KB) inside the
+    frontend's nominal `dxp_lx_frac_avail` partition, silently corrupting
+    frontend data resident there once per-core usage gets close enough to
+    the partition boundary (see Issue 3222). This
+    margin keeps frontend buffers clear of that address until the backend
+    allocator itself is fixed to stay within its own reserved share.
+    """
+    lx_backend_spill_margin = 100 << 10
+    return int((2 << 20) * (1.0 - config.dxp_lx_frac_avail)) - lx_backend_spill_margin
 
 
 def _fixed_core_division(op: Operation) -> CoreDivision:
