@@ -59,8 +59,12 @@ import logging
 
 logger = get_inductor_logger("work_division")
 
-# Maximum memory access span per core: 256MB hardware limit
-MAX_SPAN_BYTES = 256 * 1024 * 1024
+# Maximum memory-access span per core.
+#
+# MVLOC supports a maximum value of 65535, with each entry representing
+# 4096 bytes. Therefore, the maximum addressable offset is:
+# 65535 * 4096 = 268431360 bytes (255.996 MiB).
+MAX_SPAN_BYTES = 65535 * 4096
 
 
 @dataclasses.dataclass
@@ -388,7 +392,7 @@ def warn_if_per_core_overflow(
             dl = td.layout.device_layout
             logger.critical(
                 f"{op_name}: per-core tensor span "
-                f"{per_core_span / (1024 * 1024):.2f} MB "
+                f"{per_core_span / (1024 * 1024):.3f} MB "
                 f"(shape={list(td.layout.size)}, dtype={td.layout.dtype}, "
                 f"device_size={list(dl.device_size)}, splits={splits}) "
                 f"exceeds hardware limit of {MAX_SPAN_BYTES / (1024 * 1024):.2f} MB"
@@ -849,7 +853,7 @@ def span_reduction_pass(
     args: list[SchedNodeArg],
     max_cores: int,
 ) -> None:
-    """Mandatory per-op pass: compute minimum splits to satisfy the 256MB span limit.
+    """Mandatory per-op pass: compute minimum splits to satisfy the MAX_SPAN_BYTES.
 
     Writes results to op.op_it_space_splits. If no span violation exists,
     op.op_it_space_splits is left unset (apply_splits is a no-op for splits <= 1).
@@ -878,7 +882,7 @@ def span_reduction_pass(
     if len(reduction_vars_to_split) > 1:
         raise Unsupported(
             f"Cannot satisfy hardware memory span limit "
-            f"({MAX_SPAN_BYTES // (1024 * 1024)}MB) without splitting "
+            f"({MAX_SPAN_BYTES / (1024**2):.3f}MB) without splitting "
             f"{len(reduction_vars_to_split)} reduction dimension(s) "
             f"({reduction_vars_to_split}), but the backend supports at most 1."
         )
@@ -994,7 +998,7 @@ def work_distribution_pass(
                     f"work_division_hint: {op.get_name()} user hint reduces "
                     f"splits committed by span_reduction for dims {list(dropped)}. "
                     f"Applying strict user hint; this may violate the hardware "
-                    f"{MAX_SPAN_BYTES // (1024 * 1024)} MB span limit."
+                    f"{MAX_SPAN_BYTES / (1024**2):.3f} MB span limit."
                 )
             _commit_user_splits(op, user_splits, output_td)
 
@@ -1444,7 +1448,7 @@ def _apply_input_layout_overrides(
 
 
 def span_reduction(graph: GraphLowering) -> None:
-    """Pass 1: compute minimum per-op splits required by the 256MB span limit."""
+    """Pass 1: compute minimum per-op splits required by MAX_SPAN_BYTES."""
     operations = graph.operations
     max_cores = _validate_max_cores()
     for op in _iter_computed_buffers(operations):

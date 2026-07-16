@@ -60,7 +60,7 @@ The compiler picks which buffers live where.
 | Usable LX per core | ~1.6 MB | `int((2<<20) * (1 - frac_avail))` |
 | Alignment | 128-byte (stick) | implicit |
 | Cores | 1 to 32 | `SENCORES` |
-| Per-core HBM span limit | 256 MB | hardware, separate from LX |
+| Per-core HBM span limit | (255.996 MiB) | hardware, separate from LX |
 | Inter-core data ring | yes | not yet used by compiler |
 | Inter-core reduce-sum ring | yes | not yet used by compiler |
 
@@ -142,7 +142,7 @@ dedup_and_promote_constants
 propagate_named_dims                  # named-dimension metadata
 assign_dim_hints
 coarse_tile                           # runs when hints produce groups
-span_reduction                        # work-division: enforce 256 MB span
+span_reduction                        # work-division: enforce 255.996 MiB span
 cost_model_matmul_division            # work-division: matmul cost model
 work_distribution                     # work-division: default distributor
 scratchpad_planning                   # ← THIS PASS, gated by config.lx_planning

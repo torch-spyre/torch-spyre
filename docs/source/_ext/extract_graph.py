@@ -108,7 +108,10 @@ def extract_decompositions(filepath):
             continue
         for dec in node.decorator_list:
             dec_name = _get_decorator_name(dec)
-            if dec_name and "register_spyre_decomposition" in dec_name:
+            if dec_name and (
+                "register_spyre_decomposition" in dec_name
+                or "register_decomposition" in dec_name
+            ):
                 if isinstance(dec, ast.Call) and dec.args:
                     ops = _extract_list_ops(dec.args[0])
                     decomp_id = f"decomp::{node.name}"
@@ -455,6 +458,35 @@ def extract_passes(filepath):
                                             "relationship": "contains_pass",
                                         }
                                     )
+            if isinstance(child, ast.Assign):
+                for target in child.targets:
+                    if (
+                        isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == "self"
+                        and target.attr == "passes"
+                        and isinstance(child.value, ast.List)
+                    ):
+                        for elt in child.value.elts:
+                            name = _resolve_attr(elt)
+                            if name:
+                                fn_id = f"passfn::{name}"
+                                nodes.append(
+                                    {
+                                        "id": fn_id,
+                                        "label": name,
+                                        "type": "pass_function",
+                                        "source_file": rel_path,
+                                        "line": getattr(elt, "lineno", node.lineno),
+                                    }
+                                )
+                                edges.append(
+                                    {
+                                        "source": group_id,
+                                        "target": fn_id,
+                                        "relationship": "contains_pass",
+                                    }
+                                )
 
     return nodes, edges
 
@@ -540,7 +572,11 @@ def extract_config(filepath):
         if not isinstance(node, ast.Call):
             continue
         func_name = _resolve_attr(node.func)
-        if func_name not in ("os.environ.get", "os.getenv"):
+        if func_name not in (
+            "os.environ.get",
+            "os.getenv",
+            "os.environ.setdefault",
+        ):
             continue
         if not node.args:
             continue
@@ -844,6 +880,11 @@ def build_graph(torch_spyre_root):
         n, e = _run_file_extractor(extract_config, config_path, repo_root)
         all_nodes.extend(n)
         all_edges.extend(e)
+    for extra_config in [root / "__init__.py", root / "logging_config.py"]:
+        if extra_config.exists():
+            n, e = _run_file_extractor(extract_config, extra_config, repo_root)
+            all_nodes.extend(n)
+            all_edges.extend(e)
 
     # --- Module dependency graph ---
     n, e = extract_modules(str(root), repo_root)

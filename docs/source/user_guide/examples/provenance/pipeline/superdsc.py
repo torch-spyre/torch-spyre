@@ -21,8 +21,10 @@ no iteration-space heuristics — the kernel→dir map is recorded by the compil
 itself ([async_compile.get_output_dir]).
 
 For each kernel we report how many ``sdsc_*.json`` files (one per OpSpec) it
-emitted and whether any provenance field appears anywhere in the serialized
-JSON. Confirmed absence is the Stage-6 finding.
+emitted and, as of Phase 2a (#2575), whether each carries a non-null
+``debug_handle_`` -- the source-to-kernel provenance record now serialized into
+the JSON. The handle's payload (source line, ATen op, IR chain, fusion lineage)
+is read back for the kernel -> source-line mapping in the report.
 """
 
 from __future__ import annotations
@@ -31,32 +33,46 @@ import json
 import pathlib
 from typing import Any
 
+from .fields import is_populated
+
 # Provenance field names we scan the serialized SDSC JSON for (issue #2574).
-# The first six are PyTorch's real FX node.meta / Inductor IR provenance keys;
-# "provenance" and "debug_handle" are forward-looking names for what Phase 2
-# (#2575) will thread through OpSpec/SDSC (debug_handle mirrors upstream's
-# _inductor_kernel_provenance_debug_handle).
+# The first six are PyTorch's real FX node.meta / Inductor IR provenance keys.
+# "debug_handle_" (trailing underscore) is the real key Phase 2a (#2575) now
+# serializes into every sdsc_*.json (mirrors upstream's
+# _inductor_kernel_provenance_debug_handle); "provenance" stays forward-looking.
+# The dedicated debug_handle reader below (read_bundle) is the primary check;
+# this generic scan just keeps the aggregate has_provenance flag honest.
 PROVENANCE_FIELD_NAMES = [
     "stack_trace",  # FX meta
     "original_aten",  # FX meta
-    "from_node",  # IR attribute
+    "from_node",  # FX meta
     "origins",  # IR attribute
     "origin_node",  # IR attribute
-    "traceback",  # FX meta
+    "traceback",  # IR attribute
     "provenance",  # forward-looking
-    "debug_handle",  # forward-looking
+    "debug_handle_",  # Phase 2a: the real serialized key
 ]
 
 
-def _is_populated(val: Any) -> bool:
-    """A provenance value counts as carried only if non-empty: ``0`` is
-    populated (a valid handle); ``None`` / empty collection / ``""`` are not.
-    Matches the population rule used at every other stage."""
-    if val is None:
-        return False
-    if isinstance(val, (list, tuple, set, dict, str)) and len(val) == 0:
-        return False
-    return True
+def _extract_debug_handle(obj: Any) -> tuple[bool, Any]:
+    """Find the first ``debug_handle_`` key anywhere in a parsed SDSC JSON.
+
+    The key is nested one level under the top-level ``<idx>_<op>`` entry. Returns
+    ``(present, value)`` where ``present`` distinguishes a missing key from one
+    serialized as ``null`` (a null handle is present-but-not-populated). ``value``
+    is the ``DebugHandle.to_dict()`` payload (``id`` / ``source`` / ``aten_op`` /
+    ``ir_chain`` / ``fused_from`` / ``fusion_context``) or None.
+    """
+    stack = [obj]
+    while stack:
+        o = stack.pop()
+        if isinstance(o, dict):
+            if "debug_handle_" in o:
+                return True, o["debug_handle_"]
+            stack.extend(o.values())
+        elif isinstance(o, list):
+            stack.extend(o)
+    return False, None
 
 
 def _scan_json_for_provenance(obj: Any) -> dict[str, bool]:
@@ -67,7 +83,7 @@ def _scan_json_for_provenance(obj: Any) -> dict[str, bool]:
     def walk(o):
         if isinstance(o, dict):
             for k, v in o.items():
-                if k in found and _is_populated(v):
+                if k in found and is_populated(v):
                     found[k] = True
                 walk(v)
         elif isinstance(o, list):
@@ -87,6 +103,10 @@ def read_bundle(kernel_name: str, output_dir: str) -> dict[str, Any]:
         "exists": d.is_dir(),
         "sdsc_files": [],
         "provenance_present": False,
+        # Phase 2a: how many of this kernel's sdsc_*.json carry a debug_handle_,
+        # and how many carry a non-null one (a null handle is present-not-carried).
+        "debug_handle_files": 0,
+        "debug_handle_nonnull_files": 0,
     }
     if not d.is_dir():
         return rec
@@ -99,13 +119,22 @@ def read_bundle(kernel_name: str, output_dir: str) -> dict[str, Any]:
             rec["sdsc_files"].append({"file": jf.name, "parse_error": str(e)})
             continue
         hits = _scan_json_for_provenance(data)
+        dh_present, dh_value = _extract_debug_handle(data)
+        dh_nonnull = dh_present and is_populated(dh_value)
         rec["sdsc_files"].append(
             {
                 "file": jf.name,
+                # Top-level <idx>_<op> entries -- the Spyre op(s) this file emits.
+                "op_keys": sorted(data.keys()) if isinstance(data, dict) else [],
                 "provenance_fields": {k: v for k, v in hits.items() if v},
                 "has_provenance": any(hits.values()),
+                "debug_handle_present": dh_present,
+                "debug_handle_nonnull": dh_nonnull,
+                "debug_handle": dh_value,
             }
         )
+        rec["debug_handle_files"] += int(dh_present)
+        rec["debug_handle_nonnull_files"] += int(dh_nonnull)
 
     rec["provenance_present"] = any(f.get("has_provenance") for f in rec["sdsc_files"])
     return rec
@@ -124,6 +153,8 @@ def run(output_dirs: dict[str, str]) -> dict[str, Any]:
           "total_kernels": int,
           "total_sdsc_files": int,
           "provenance_present": bool,            # any field in any bundle
+          "debug_handle_files": int,             # files carrying debug_handle_
+          "debug_handle_nonnull_files": int,     # ... with a non-null handle
         }
     """
     kernels = [read_bundle(name, d) for name, d in sorted(output_dirs.items())]
@@ -133,4 +164,8 @@ def run(output_dirs: dict[str, str]) -> dict[str, Any]:
         "total_kernels": len(kernels),
         "total_sdsc_files": total_files,
         "provenance_present": any(k["provenance_present"] for k in kernels),
+        "debug_handle_files": sum(k["debug_handle_files"] for k in kernels),
+        "debug_handle_nonnull_files": sum(
+            k["debug_handle_nonnull_files"] for k in kernels
+        ),
     }
