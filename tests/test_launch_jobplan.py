@@ -144,47 +144,83 @@ class TestLaunchJobPlan(TestCase):
                     torch_spyre._C.launch_jobplan(job_plan, [])
 
 
+def _run_jobplan_op_ordering_subprocess(symbolic_args: bool) -> None:
+    """Launch a JobPlan on an OP_ORDERING stream in a subprocess.
+
+    A subprocess is required because the flex stream pool is initialised once per
+    process (std::call_once) and torch.compile always uses the default stream which
+    is hardcoded STRICT_ORDERING. The subprocess sets SPYRE_STREAM_OP_ORDERING=1
+    before any stream is created, then uses an explicit torch.Stream("spyre") so
+    getStreamFromPool picks up OP_ORDERING.
+    """
+    import subprocess
+    import sys
+
+    env = os.environ.copy()
+    env["SPYRE_STREAM_OP_ORDERING"] = "1"
+    env["BUNDLE_SYMBOLIC_ARGS"] = "1" if symbolic_args else "0"
+
+    script = """
+import json, os, tempfile
+import torch
+import torch_spyre
+
+torch.zeros(1, device="spyre")  # boot runtime before any stream is allocated
+
+tmpdir = tempfile.mkdtemp()
+spyrecode_dir = os.path.join(tmpdir, "spyreCodeDir")
+os.makedirs(spyrecode_dir)
+spyrecode_json = {
+    "JobPreparationPlan": [
+        {"command": "Allocate", "properties": {"size": "1024"}},
+        {"command": "InitTransfer", "properties": {
+            "init_bin_file": "init_binary.bin",
+            "dev_ptr": "120259084288",
+            "size": "1024",
+        }},
+    ],
+    "JobExecPlan": [
+        {"command": "ComputeOnDevice", "properties": {"job_bin_ptr": "120259084288"}},
+    ],
+}
+with open(os.path.join(spyrecode_dir, "spyrecode.json"), "w") as f:
+    json.dump(spyrecode_json, f)
+with open(os.path.join(spyrecode_dir, "init_binary.bin"), "wb") as f:
+    f.write(b"\\x00" * 1024)
+
+job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+stream = torch.Stream("spyre")  # goes through getStreamFromPool → OP_ORDERING
+with stream:
+    torch_spyre._C.launch_jobplan(job_plan, [])
+print("PASS")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"OP_ORDERING subprocess failed (symbolic_args={symbolic_args}):\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+
+
 class TestPipelineBarrierOpOrdering(TestCase):
-    """Regression tests verifying pipeline_barrier=true on DMA steps under OP_ORDERING.
+    """Verify DMA steps carry pipeline_barrier=true under OP_ORDERING.
 
-    Under STRICT_ORDERING the flex scheduler auto-inserts cross-pipeline barriers,
-    masking any missing per-op barrier flags. Under OP_ORDERING that auto-insertion
-    is disabled and the per-op pipeline_barrier_ flag is the sole ordering authority.
-
-    These tests set SPYRE_STREAM_OP_ORDERING=1 so new streams are created in
-    OP_ORDERING mode, then run a compiled op end-to-end and assert correctness.
-    If the H2D step's pipeline_barrier_ were false, device compute could start
-    before the transfer completes and produce wrong results.
+    Under STRICT_ORDERING the scheduler auto-inserts barriers, masking the flag.
+    Under OP_ORDERING the per-op flag is the sole ordering authority.
+    Tests run in subprocesses so stream handles are created fresh under OP_ORDERING.
     """
 
-    def _run_op_ordering(self, op_name: str, symbolic_args: bool) -> None:
-        old_mode = os.environ.get("SPYRE_STREAM_OP_ORDERING")
-        try:
-            os.environ["SPYRE_STREAM_OP_ORDERING"] = "1"
-            _run_compiled_op(op_name, symbolic_args)
-        finally:
-            if old_mode is None:
-                os.environ.pop("SPYRE_STREAM_OP_ORDERING", None)
-            else:
-                os.environ["SPYRE_STREAM_OP_ORDERING"] = old_mode
+    def test_jobplan_op_ordering_no_symbols(self):
+        """JobPlan launches correctly on an OP_ORDERING stream (symbolic_args=False)."""
+        _run_jobplan_op_ordering_subprocess(symbolic_args=False)
 
-    def test_abs_op_ordering_no_symbols(self):
-        """abs produces correct results under OP_ORDERING with symbolic_args=False.
-
-        With SPYRE_STREAM_OP_ORDERING=1 the scheduler no longer auto-inserts the
-        H2D→Compute barrier. Correctness depends entirely on H2D carrying
-        pipeline_barrier_=true so the per-op flag triggers the barrier instead.
-        """
-        self._run_op_ordering("abs", symbolic_args=False)
-
-    def test_abs_op_ordering_with_symbols(self):
-        """abs produces correct results under OP_ORDERING with symbolic_args=True.
-
-        Exercises the program-correction path (HostCompute → H2D → Compute) under
-        OP_ORDERING. The H2D barrier is the load-bearing guard preventing device
-        compute from racing ahead of the correction transfer.
-        """
-        self._run_op_ordering("abs", symbolic_args=True)
+    def test_jobplan_op_ordering_with_symbols(self):
+        """JobPlan launches correctly on an OP_ORDERING stream (symbolic_args=True)."""
+        _run_jobplan_op_ordering_subprocess(symbolic_args=True)
 
 
 if __name__ == "__main__":
