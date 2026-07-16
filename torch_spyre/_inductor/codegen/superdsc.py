@@ -110,8 +110,8 @@ class SDSCSpec:
     layouts: dict[int, Any]
     args: list[SDSCArgs]
     constants: dict[str, Any]
-    conv_params: dict[str, Any]
     coordinate_masking: dict[Symbol, Any]
+    conv_params: dict[str, Any] = dataclasses.field(default_factory=dict)
     # maps SDSC dim name -> (pytorch_sym_name, granularity, max_val)
     symbolic_dims: dict[str, tuple[str, int, int]] = dataclasses.field(
         default_factory=dict
