@@ -22,37 +22,37 @@ from sympy import Symbol
 
 
 def _build_padding_sizes(conv_params):
-  """Build paddingSizes_ dict for conv operations, only when conv_params is non-empty."""
-  if not conv_params:
-    return {}
-  return {
-      "paddingSizes_": {
-          str(conv_params["pad_dim_i"]): {
-              "totalSize_": conv_params["total_size_i"],
-              "stride_": conv_params["stride_i"],
-              "dilation_": conv_params["dilation_i"],
-              "windowDim_": conv_params["window_dim_i"],
-          },
-          str(conv_params["pad_dim_j"]): {
-              "totalSize_": conv_params["total_size_j"],
-              "stride_": conv_params["stride_j"],
-              "dilation_": conv_params["dilation_j"],
-              "windowDim_": conv_params["window_dim_j"],
-          },
-      }
-  }
+    """Build paddingSizes_ dict for conv operations, only when conv_params is non-empty."""
+    if not conv_params:
+        return {}
+    return {
+        "paddingSizes_": {
+            str(conv_params["pad_dim_i"]): {
+                "totalSize_": conv_params["total_size_i"],
+                "stride_": conv_params["stride_i"],
+                "dilation_": conv_params["dilation_i"],
+                "windowDim_": conv_params["window_dim_i"],
+            },
+            str(conv_params["pad_dim_j"]): {
+                "totalSize_": conv_params["total_size_j"],
+                "stride_": conv_params["stride_j"],
+                "dilation_": conv_params["dilation_j"],
+                "windowDim_": conv_params["window_dim_j"],
+            },
+        }
+    }
 
 
 def _build_padding_for_tensor(conv_params):
-  """Build padding_ for tensor allocations, only when conv_params is non-empty."""
-  if not conv_params:
-    return {}
-  return {
-      "padding_": {
-          str(conv_params["pad_dim_i"]): conv_params["pad_type"],
-          str(conv_params["pad_dim_j"]): conv_params["pad_type"],
-      }
-  }
+    """Build padding_ for tensor allocations, only when conv_params is non-empty."""
+    if not conv_params:
+        return {}
+    return {
+        "padding_": {
+            str(conv_params["pad_dim_i"]): conv_params["pad_type"],
+            str(conv_params["pad_dim_j"]): conv_params["pad_type"],
+        }
+    }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -351,6 +351,7 @@ def get_conv_params(tensor_num, dim, opfunc, conv_params, size):
         ):
             total_size = conv_params["total_size_j"]
     return {"conv_padding": conv_padding, "total_size": total_size}
+
 
 def _per_core_symbolic_dim_info(symbolic_dims: dict, work_slices: dict) -> dict:
     """Per-core ``symbolicDimInfo_`` block: granularity_/maxSize_ divided by
@@ -893,7 +894,9 @@ def generate_sdsc(
                                         "rowSplit_": {},
                                         "peSfpSplit_": {},
                                         "paddingSizes_": (
-                                            _build_padding_sizes(sdsc_spec.conv_params).get("paddingSizes_", {})
+                                            _build_padding_sizes(
+                                                sdsc_spec.conv_params
+                                            ).get("paddingSizes_", {})
                                             if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
                                             else {}
                                         ),
@@ -913,7 +916,9 @@ def generate_sdsc(
                                         "rowSplit_": {},
                                         "peSfpSplit_": {},
                                         "paddingSizes_": (
-                                            _build_padding_sizes(sdsc_spec.conv_params).get("paddingSizes_", {})
+                                            _build_padding_sizes(
+                                                sdsc_spec.conv_params
+                                            ).get("paddingSizes_", {})
                                             if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
                                             else {}
                                         ),
@@ -1092,7 +1097,7 @@ def generate_sdsc(
                                             and sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
                                         )
                                         else {"lx": {"isPresent": 1}}
-                                    )
+                                    ),
                                 }
                                 for i, tensor in enumerate(sdsc_spec.args)
                             ],
