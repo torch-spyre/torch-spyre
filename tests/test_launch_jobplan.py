@@ -145,13 +145,11 @@ class TestLaunchJobPlan(TestCase):
 
 
 def _run_jobplan_op_ordering_subprocess(symbolic_args: bool) -> None:
-    """Launch a JobPlan on an OP_ORDERING stream in a subprocess.
+    """Run a JobPlan on an OP_ORDERING stream in a subprocess.
 
-    A subprocess is required because the flex stream pool is initialised once per
-    process (std::call_once) and torch.compile always uses the default stream which
-    is hardcoded STRICT_ORDERING. The subprocess sets SPYRE_STREAM_OP_ORDERING=1
-    before any stream is created, then uses an explicit torch.Stream("spyre") so
-    getStreamFromPool picks up OP_ORDERING.
+    Subprocess needed: stream pool is call_once so env var must be set before
+    process start; default stream is hardcoded STRICT_ORDERING so an explicit
+    torch.Stream("spyre") is used instead.
     """
     import subprocess
     import sys
@@ -165,7 +163,7 @@ import json, os, tempfile
 import torch
 import torch_spyre
 
-torch.zeros(1, device="spyre")  # boot runtime before any stream is allocated
+torch.zeros(1, device="spyre")
 
 tmpdir = tempfile.mkdtemp()
 spyrecode_dir = os.path.join(tmpdir, "spyreCodeDir")
@@ -189,7 +187,7 @@ with open(os.path.join(spyrecode_dir, "init_binary.bin"), "wb") as f:
     f.write(b"\\x00" * 1024)
 
 job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
-stream = torch.Stream("spyre")  # goes through getStreamFromPool → OP_ORDERING
+stream = torch.Stream("spyre")
 with stream:
     torch_spyre._C.launch_jobplan(job_plan, [])
 print("PASS")
@@ -201,26 +199,22 @@ print("PASS")
         text=True,
         timeout=30,
     )
-    assert result.returncode == 0, (
-        f"OP_ORDERING subprocess failed (symbolic_args={symbolic_args}):\n"
-        f"stdout: {result.stdout}\nstderr: {result.stderr}"
-    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"OP_ORDERING subprocess failed (symbolic_args={symbolic_args})\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
 
 
 class TestPipelineBarrierOpOrdering(TestCase):
-    """Verify DMA steps carry pipeline_barrier=true under OP_ORDERING.
-
-    Under STRICT_ORDERING the scheduler auto-inserts barriers, masking the flag.
-    Under OP_ORDERING the per-op flag is the sole ordering authority.
-    Tests run in subprocesses so stream handles are created fresh under OP_ORDERING.
-    """
+    """Verify DMA steps carry pipeline_barrier=true under OP_ORDERING."""
 
     def test_jobplan_op_ordering_no_symbols(self):
-        """JobPlan launches correctly on an OP_ORDERING stream (symbolic_args=False)."""
+        """JobPlan on OP_ORDERING stream, symbolic_args=False."""
         _run_jobplan_op_ordering_subprocess(symbolic_args=False)
 
     def test_jobplan_op_ordering_with_symbols(self):
-        """JobPlan launches correctly on an OP_ORDERING stream (symbolic_args=True)."""
+        """JobPlan on OP_ORDERING stream, symbolic_args=True."""
         _run_jobplan_op_ordering_subprocess(symbolic_args=True)
 
 
