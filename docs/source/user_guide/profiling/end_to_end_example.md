@@ -191,9 +191,6 @@ print(f"profiler-derived CPU ms (per run): {cpu_per_run_ms:.3f}")
 
 Ensure the profiler report includes Spyre/device time; otherwise the trace does not confirm the accelerator execution
 
-**Note**
-Please ensure spyre time is present in report output in order to ensure to confirm correctness
-
 Three patterns to call out:
 
 - **Run warmup iterations outside the timed loop**. The first few executions can include one-time runtime initialization, lazy setup, cache population, or other startup overhead. Excluding them keeps steady-state measurements representative.
