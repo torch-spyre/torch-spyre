@@ -483,15 +483,17 @@ class TestPrepareKernel:
                 torch_spyre._C.prepare_kernel(spyrecode_dir)
 
     def test_pipeline_barrier_dma_steps_default_true(self):
-        """H2D step must carry pipeline_barrier=True by default.
+        """H2D and D2H steps must carry pipeline_barrier=True by default.
 
-        H2D steps are produced by the DataTransfer translator, which requires
-        the host buffer to already exist in the pinned_buffer_map (written by a
-        preceding ComputeOnHost). The correction sequence
-        (HostCompute → H2D → Compute) is the canonical way to exercise an H2D
-        step, so we reuse create_mock_spyrecode and check step 1.
+        DMA steps barrier by default to prevent a race between DMA and device
+        compute on the seg-7 region once async DMA / multi-stream land.
+
+        H2D is exercised via the correction sequence (HostCompute → H2D →
+        Compute).  D2H is exercised via a standalone DataTransfer with
+        dirn="true".
         """
         with tempfile.TemporaryDirectory() as tmpdir:
+            # H2D: produced inside the correction sequence at step index 1
             spyrecode_dir = self.create_mock_spyrecode(
                 tmpdir, exec_command="ComputeOnHost"
             )
@@ -499,8 +501,30 @@ class TestPrepareKernel:
 
             assert job_plan.get_step_type(1) == "H2D"
             assert job_plan.get_step_pipeline_barrier(1) is True, (
-                "H2D step must carry pipeline_barrier=True (safe-by-default "
-                "stopgap for async DMA / OP_ORDERING)"
+                "H2D step must carry pipeline_barrier=True by default"
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # D2H: standalone DataTransfer with dirn="true"
+            job_exec_plan = [
+                {
+                    "command": "DataTransfer",
+                    "properties": {
+                        "dirn": "true",
+                        "host_handle": "output_buffer",
+                        "dev_ptr": "120259084288",
+                        "size": "1024",
+                    },
+                }
+            ]
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, job_exec_plan=job_exec_plan
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            assert job_plan.get_step_type(0) == "D2H"
+            assert job_plan.get_step_pipeline_barrier(0) is True, (
+                "D2H step must carry pipeline_barrier=True by default"
             )
 
     def test_pipeline_barrier_compute_steps_false(self):
@@ -514,7 +538,7 @@ class TestPrepareKernel:
         For the correction sequence (HostCompute → H2D → Compute):
           - HostCompute barrier=False  (host/device overlap)
           - H2D        barrier=True   (safe-by-default DMA barrier)
-          - Compute    barrier=False  (forward-looking: OP_ORDERING intent)
+          - Compute    barrier=False  (overlap-eligible; scheduler inserts barrier anyway under STRICT_ORDERING)
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = self.create_mock_spyrecode(
@@ -535,13 +559,13 @@ class TestPrepareKernel:
             )
             assert job_plan.get_step_pipeline_barrier(1) is True, (
                 "H2D step must carry pipeline_barrier=True (safe-by-default "
-                "stopgap: prevents device compute racing ahead of DMA under "
-                "async DMA / OP_ORDERING)"
+                "stopgap: prevents device compute racing ahead of DMA once "
+                "async DMA / multi-stream land)"
             )
             assert job_plan.get_step_pipeline_barrier(2) is False, (
                 "Compute step must carry pipeline_barrier=False (overlap-eligible; "
-                "under STRICT_ORDERING the scheduler auto-inserts the H2D→Compute "
-                "barrier regardless — this is a forward-looking OP_ORDERING intent)"
+                "the scheduler auto-inserts the H2D→Compute barrier under "
+                "STRICT_ORDERING regardless)"
             )
 
     def test_pipeline_barrier_pure_compute_false(self):
