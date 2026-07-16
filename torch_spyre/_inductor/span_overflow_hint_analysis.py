@@ -946,7 +946,7 @@ def _candidate_required_split_count(candidate: SpanOverflowCandidate) -> int:
     """Return the minimum split needed if this candidate's dim tiled alone.
 
     This is ``ceil(per_core_span / MAX_SPAN_BYTES)``: if a dim creates a
-    384 MB span and the limit is 256 MB, it needs at least split ``2`` when
+    384 MB span and the limit is 255.996 MB it needs at least split ``2`` when
     considered by itself.
 
     The combined search can still choose a different legal divisor or combine
@@ -1399,7 +1399,7 @@ def _search_min_cost_tile_plan(
     raise Unsupported(
         f"Cannot auto-tile {op.get_name()}: no combined split among host dims "
         f"{host_dims} makes all spans fit within "
-        f"{MAX_SPAN_BYTES / (1024**2):.0f} MB after trying at most "
+        f"{MAX_SPAN_BYTES / (1024**2):.3f} MB after trying at most "
         f"{_MAX_TILE_COMBOS} combinations."
     )
 

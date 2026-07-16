@@ -36,6 +36,7 @@ Coverage in this file:
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from torch_spyre._inductor.work_division import MAX_SPAN_BYTES
 
 import sympy
 import torch
@@ -701,7 +702,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         with (
             patch(
                 "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES",
-                256 * 1024 * 1024,
+                MAX_SPAN_BYTES,
             ),
             patch(
                 "torch_spyre._inductor.span_overflow_hint_analysis._output_span_candidates_from_op",
@@ -741,7 +742,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         with (
             patch(
                 "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES",
-                256 * 1024 * 1024,
+                MAX_SPAN_BYTES,
             ),
             patch(
                 "torch_spyre._inductor.span_overflow_hint_analysis._input_read_deps",
@@ -774,7 +775,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         with (
             patch(
                 "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES",
-                256 * 1024 * 1024,
+                MAX_SPAN_BYTES,
             ),
             patch(
                 "torch_spyre._inductor.span_overflow_hint_analysis._output_span_candidates_from_op",
@@ -816,7 +817,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         with (
             patch(
                 "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES",
-                256 * 1024 * 1024,
+                MAX_SPAN_BYTES,
             ),
             patch(
                 "torch_spyre._inductor.span_overflow_hint_analysis._input_read_deps",
@@ -868,7 +869,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         with (
             patch(
                 "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES",
-                256 * 1024 * 1024,
+                MAX_SPAN_BYTES,
             ),
             patch(
                 "torch_spyre._inductor.span_overflow_hint_analysis._output_span_candidates_from_op",
@@ -924,7 +925,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         with (
             patch(
                 "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES",
-                256 * 1024 * 1024,
+                MAX_SPAN_BYTES,
             ),
             patch(
                 "torch_spyre._inductor.span_overflow_hint_analysis._output_span_candidates_from_op",
@@ -1093,7 +1094,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         with (
             patch(
                 "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES",
-                256 * 1024 * 1024,
+                MAX_SPAN_BYTES,
             ),
             patch(
                 "torch_spyre._inductor.span_overflow_hint_analysis._input_read_deps",
@@ -1304,7 +1305,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
         layout = _fixed_tiled_layout((4_194_304, 64))
 
         with (
-            patch.object(soha, "MAX_SPAN_BYTES", 256 * 1024 * 1024),
+            patch.object(soha, "MAX_SPAN_BYTES", MAX_SPAN_BYTES),
             patch.object(soha, "_output_span_candidates_from_op", return_value=[]),
             patch.object(soha, "_input_read_deps", return_value=[(dep, layout)]),
             patch.object(soha, "_output_symbol_to_dim", return_value={m: 0}),
@@ -1330,7 +1331,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
         layout = _fixed_tiled_layout((8192, 8192, 64))
 
         with (
-            patch.object(soha, "MAX_SPAN_BYTES", 256 * 1024 * 1024),
+            patch.object(soha, "MAX_SPAN_BYTES", MAX_SPAN_BYTES),
             patch.object(soha, "_input_read_deps", return_value=[(dep, layout)]),
             patch.object(soha, "_output_symbol_to_dim", return_value={n: 0}),
         ):
@@ -1353,7 +1354,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
         layout = _fixed_tiled_layout((4_194_304, 64))
 
         with (
-            patch.object(soha, "MAX_SPAN_BYTES", 256 * 1024 * 1024),
+            patch.object(soha, "MAX_SPAN_BYTES", MAX_SPAN_BYTES),
             patch.object(
                 soha, "_input_read_deps", return_value=[(dep0, layout), (dep1, layout)]
             ),
@@ -1371,7 +1372,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
         layout = _fixed_tiled_layout((64,))
 
         with (
-            patch.object(soha, "MAX_SPAN_BYTES", 256 * 1024 * 1024),
+            patch.object(soha, "MAX_SPAN_BYTES", MAX_SPAN_BYTES),
             patch.object(soha, "_input_read_deps", return_value=[(dep, layout)]),
             patch.object(soha, "_output_symbol_to_dim", return_value={m: 0}),
         ):
@@ -1404,7 +1405,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
         )
 
         with (
-            patch.object(soha, "MAX_SPAN_BYTES", 256 * 1024 * 1024),
+            patch.object(soha, "MAX_SPAN_BYTES", MAX_SPAN_BYTES),
             patch.object(soha, "_input_read_deps", return_value=[(dep, layout)]),
             patch.object(soha, "_output_symbol_to_dim", return_value={p: 0, q: 1}),
             patch.object(
@@ -1459,7 +1460,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
         ]
 
         with (
-            patch.object(soha, "MAX_SPAN_BYTES", 256 * 1024 * 1024),
+            patch.object(soha, "MAX_SPAN_BYTES", MAX_SPAN_BYTES),
             patch.object(soha, "_input_read_deps", return_value=[(dep, layout)]),
             patch.object(
                 soha,
@@ -1533,7 +1534,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
         op.get_name.return_value = "buf0"
 
         with (
-            patch.object(soha, "MAX_SPAN_BYTES", 256 * 1024 * 1024),
+            patch.object(soha, "MAX_SPAN_BYTES", MAX_SPAN_BYTES),
             patch.object(soha, "_output_write_dep", return_value=out_dep),
             patch.object(soha, "_output_symbol_to_dim", return_value={p: 0, q: 1}),
             patch.object(
@@ -1562,9 +1563,9 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
         outside the initial candidate set.  With tiled ranges, the selected
         split validates against the same domain the real tiled kernel executes.
         """
-        op = _pointwise_op((4096, 4096, 4096, 64))
+        op = _pointwise_op((4096, 4032, 4032, 64))
 
-        with patch.object(soha, "MAX_SPAN_BYTES", 256 * 1024 * 1024):
+        with patch.object(soha, "MAX_SPAN_BYTES", MAX_SPAN_BYTES):
             plan = plan_span_overflow_tile(op, max_cores=1)
 
         self.assertIsNotNone(plan)
