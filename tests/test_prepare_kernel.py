@@ -483,15 +483,7 @@ class TestPrepareKernel:
                 torch_spyre._C.prepare_kernel(spyrecode_dir)
 
     def test_pipeline_barrier_dma_steps_default_true(self):
-        """H2D and D2H steps must carry pipeline_barrier=True by default.
-
-        DMA steps barrier by default to prevent a race between DMA and device
-        compute on the seg-7 region once async DMA / multi-stream land.
-
-        H2D is exercised via the correction sequence (HostCompute → H2D →
-        Compute).  D2H is exercised via a standalone DataTransfer with
-        dirn="true".
-        """
+        """H2D and D2H steps must carry pipeline_barrier=True by default."""
         with tempfile.TemporaryDirectory() as tmpdir:
             # H2D: produced inside the correction sequence at step index 1
             spyrecode_dir = self.create_mock_spyrecode(
@@ -528,17 +520,10 @@ class TestPrepareKernel:
             )
 
     def test_pipeline_barrier_compute_steps_false(self):
-        """Device-compute and host-compute steps must carry pipeline_barrier=False.
+        """Compute and HostCompute steps must carry pipeline_barrier=False.
 
-        Keeping these false preserves the host/device overlap: the correction
-        callback for iteration N+1 runs on the host thread concurrently with
-        device compute for iteration N. Flipping either to true would inject a
-        synchronize() call and serialize that overlap away.
-
-        For the correction sequence (HostCompute → H2D → Compute):
-          - HostCompute barrier=False  (host/device overlap)
-          - H2D        barrier=True   (safe-by-default DMA barrier)
-          - Compute    barrier=False  (overlap-eligible; scheduler inserts barrier anyway under STRICT_ORDERING)
+        Keeps host/device overlap: flipping either to true injects a
+        synchronize() and serializes the correction callback against device compute.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = self.create_mock_spyrecode(
@@ -569,10 +554,7 @@ class TestPrepareKernel:
             )
 
     def test_pipeline_barrier_pure_compute_false(self):
-        """A standalone ComputeOnDevice step must carry pipeline_barrier=False.
-
-        Device compute is always overlap-eligible; it must never default-barrier.
-        """
+        """A standalone ComputeOnDevice step must carry pipeline_barrier=False."""
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = self.create_mock_spyrecode(tmpdir)
             job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
