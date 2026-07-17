@@ -1296,10 +1296,17 @@ def _eager_view_input_layout(
     # transpose differs on both, but rewriting it to base size/stride
     # would silently strip the permutation -- it falls to the offset-only
     # branch instead.
+    #
+    # Stride equality alone isn't sufficient: a size-1 dimension has an
+    # arbitrary stride in PyTorch, so a transpose/permute touching one can
+    # coincidentally match its base's stride tuple too. A genuine
+    # sub-region can only shrink -- every dim of the view must be <= the
+    # same dim of base -- which a transpose/permute never satisfies.
     is_sub_region = (
         base is not None
         and tuple(real_input.stride()) == tuple(base.stride())
         and tuple(real_input.size()) != tuple(base.size())
+        and all(real_input.size(d) <= base.size(d) for d in range(real_input.dim()))
     )
     if not (is_sub_region or storage_offset != 0):
         return None
@@ -1314,10 +1321,10 @@ def _eager_view_input_layout(
         new_stride = list(real_input.stride())
 
     # Verify the offset is device-stick-aligned by computing the real
-    # device stick coordinate for a full read of this view, via the same
-    # device_coordinates()/is_stick_expr_offset_free() machinery
-    # compute_layouts() uses everywhere else (see _check_supported_input_sticks,
-    # _single_arg_op_layout). A flat host-offset heuristic can't see per-row
+    # device stick coordinate for a full read of this view, using the same
+    # device-coordinate machinery (compute_coordinates +
+    # is_stick_expr_offset_free) already relied on elsewhere in this module
+    # for equivalent checks. A flat host-offset heuristic can't see per-row
     # stick padding -- a row boundary can be device-stick-aligned even when
     # the row length itself isn't a multiple of elem_in_stick -- so the check
     # has to happen in device space, not host space.
