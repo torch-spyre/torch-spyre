@@ -25,6 +25,7 @@ from torch._inductor.ir import (
     ComputedBuffer,
     Operation,
     MutationLayoutSHOULDREMOVE,
+    ReinterpretView,
     Pointwise,
     Reduction,
     ExternKernel,
@@ -154,13 +155,8 @@ class ScratchpadAllocator:
             return False
         if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
             return False
-        return (
-            config.allow_all_ops_in_lx_planning
-            or (self._get_op_name(op) in OP_OUTPUT_GOOD_FOR_LX_REUSE)
-            # Clones are only pinned when the boundary-clone path is on; they
-            # are never in the whitelist, so without this they'd be ineligible
-            # and the inserted clones would not land in LX.
-            or (config.lx_boundary_clones and self._get_op_name(op) == "clone")
+        return config.allow_all_ops_in_lx_planning or (
+            self._get_op_name(op) in OP_OUTPUT_GOOD_FOR_LX_REUSE
         )
 
     def _op_inputs_good_for_lx_inplace(self, op: Any) -> list[str]:
@@ -241,6 +237,17 @@ class ScratchpadAllocator:
         in_place = {} if in_place is None else in_place
         buffers: list[LifetimeBoundBuffer] = []
         graph_output_names = set(graph.get_output_names())
+        # Graph outputs wrapped in a ReinterpretView (e.g. a transpose applied on
+        # top of an op's raw output, as SDPA does): output cloning
+        # (GraphEditor.change_graph_output / _replace_matching_buffer) does not
+        # currently know how to rewrap a ReinterpretView around the clone, so
+        # these must not be promoted as output-clone candidates below.
+        reinterp_buf_names = {
+            go.get_name()
+            for go in graph.graph_outputs
+            if isinstance(go, ReinterpretView)
+            or isinstance(getattr(go, "data", None), ReinterpretView)
+        }
         cloning_allowed = clone_at_graph_boundaries()
         for output_name, info in mem_usage.items():
             uses = lifetimes[output_name]
@@ -259,6 +266,9 @@ class ScratchpadAllocator:
                 # A pinned graph output is cloned for the HBM return; if a
                 # consumer reads it partially (sliced / multi-offset), SDSC
                 # mis-addresses the single-base LX buffer. Don't pin it.
+                continue
+            if output_name in reinterp_buf_names:
+                self.reject_reasons[output_name] = "graph output is a ReinterpretView"
                 continue
             if _would_produce_lx_back_gap(graph, output_name, uses):
                 self.reject_reasons[output_name] = "lx back gap"
@@ -481,8 +491,19 @@ def _op_short_name(op: Any) -> str:
 
 
 def _lx_planning_size() -> int:
-    """LX scratchpad bytes available to the layout solver."""
-    return int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
+    """LX scratchpad bytes available to the layout solver.
+
+    TEMPORARY GUARD: subtracts a 100KB safety margin from the frontend's
+    declared share. The backend compiler has been observed placing its own
+    internal LX allocations at a fixed address (~1587KB) inside the
+    frontend's nominal `dxp_lx_frac_avail` partition, silently corrupting
+    frontend data resident there once per-core usage gets close enough to
+    the partition boundary (see Issue 3222). This
+    margin keeps frontend buffers clear of that address until the backend
+    allocator itself is fixed to stay within its own reserved share.
+    """
+    lx_backend_spill_margin = 100 << 10
+    return int((2 << 20) * (1.0 - config.dxp_lx_frac_avail)) - lx_backend_spill_margin
 
 
 def _fixed_core_division(op: Operation) -> CoreDivision:

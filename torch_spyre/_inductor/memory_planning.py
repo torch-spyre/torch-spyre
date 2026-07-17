@@ -271,11 +271,14 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         size = _compute_size_bytes(name)
         offset = allocator.allocate(size)
 
-        # Assign HBM address directly to layout.allocation.
+        # Assign pool offset directly to layout.allocation.
         buf = V.graph.get_buffer(name)
         layout = buf.maybe_get_layout()
         assert isinstance(layout, FixedTiledLayout)
-        layout.allocation["pool"] = INTERMEDIATES_SEGMENT + offset
+        if config.bundle_symbolic_args:
+            layout.allocation["pool"] = offset
+        else:
+            layout.allocation["pool"] = INTERMEDIATES_SEGMENT + offset
 
         pending_frees.append((end, offset, size))
 

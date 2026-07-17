@@ -527,10 +527,30 @@ def generate_sdsc(
         # affine_strides[i] is a list of dicts, one per loop-nesting level
         # (outermost first), where each dict maps tiled_sym -> stride_bytes for
         # the symbols at that level that advance tensor i.  Empty list of dicts
-        # (i.e. [{}] * n_levels or []) for non-tiled / lx tensors.
+        # (i.e. [{}] * n_levels or []) for non-tiled tensors.
         affine_strides: list[list[dict]] = []
         for tensor in sdsc_spec.args:
             if "lx" in tensor.allocation:
+                # LX addresses are never registered as symbols in the SDSC JSON
+                # (isStartAddrSymbolic_ is always unset for lx, and bundle.py's
+                # _get_tensor_core_sym_id returns None for non-hbm components), so
+                # affine.apply can never target an LX address today. A tiled
+                # (advancing) lx tensor therefore has no way to express its
+                # per-iteration address change in this preserved-loop path.
+                # per_tile_fixed lx tensors are fine: they don't advance, same as
+                # non-tiled tensors, so [{}] * n_levels is correct either way.
+                is_tiled_lx = tensor.per_tile_fixed is False and any(
+                    s in tensor.strides and tensor.scales.get(s, 1) > 0
+                    for level_syms in tiled_symbols
+                    for s in level_syms
+                )
+                if is_tiled_lx:
+                    raise NotImplementedError(
+                        "Tiled (advancing) lx-allocated tensors are not supported "
+                        "in the symbolic preserved-loop path: LX addresses cannot "
+                        "be expressed as affine.apply symbols. Mark this tensor "
+                        "per_tile_fixed or set UNROLL_LOOPS=1."
+                    )
                 affine_strides.append([{} for _ in tiled_symbols])
                 continue
             nb = num_bytes(tensor.data_format)
@@ -595,19 +615,24 @@ def generate_sdsc(
             # whose stride describes element layout within one tile, not the advance
             # between tiles.  Tiling by a reduction-dim symbol would incorrectly
             # advance the base address of a pool output past its single allocated slot.
+            # per_tile_fixed tensors (tile-local scratch reused every iteration, see
+            # unroll.py) never advance either, regardless of allocation type.
             per_level_strides: list[dict] = []
             any_tiled = False
-            for level_syms in tiled_symbols:
-                tensor_tiled_at_level = [
-                    s
-                    for s in level_syms
-                    if s in tensor.strides and tensor.scales.get(s, 1) > 0
-                ]
-                strides_for_level: dict = {}
-                for s in tensor_tiled_at_level:
-                    strides_for_level[s] = _tiled_byte_stride(tensor, s)
-                    any_tiled = True
-                per_level_strides.append(strides_for_level)
+            if not tensor.per_tile_fixed:
+                for level_syms in tiled_symbols:
+                    tensor_tiled_at_level = [
+                        s
+                        for s in level_syms
+                        if s in tensor.strides and tensor.scales.get(s, 1) > 0
+                    ]
+                    strides_for_level: dict = {}
+                    for s in tensor_tiled_at_level:
+                        strides_for_level[s] = _tiled_byte_stride(tensor, s)
+                        any_tiled = True
+                    per_level_strides.append(strides_for_level)
+            else:
+                per_level_strides = [{} for _ in tiled_symbols]
             if not any_tiled:
                 # Non-tiled HBM: register per-core addresses.
                 for c in range(sdsc_spec.num_cores):
