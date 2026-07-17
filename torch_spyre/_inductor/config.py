@@ -61,6 +61,12 @@ ignore_work_division_hints: bool = (
 
 ignore_wsr_hints: bool = os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
 
+# Per-pass operation logging for CustomPreSchedulingPasses.
+# Set to "all" or "1" to log after every pass, or a comma-separated list of
+# pass function names (e.g., "split_multi_ops,insert_restickify") to log only
+# after specific passes. Set via SPYRE_LOG_PASSES env var or programmatically.
+log_passes: str = os.environ.get("SPYRE_LOG_PASSES", "")
+
 # Disable compiler-generated span-overflow coarse-tiling hints.  The global
 # SPYRE_INDUCTOR_IGNORE_HINTS flag also disables these so one switch can still
 # suppress all WSR/coarse-tiling hint paths.
