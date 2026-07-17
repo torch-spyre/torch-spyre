@@ -3,17 +3,14 @@
 #
 # Usage:
 #   cd torch-spyre/tests
-#   ./run_test.sh configs/test_distributed_config.yaml
+#   ./run_test.sh configs/distributed_tests/test_general.yaml
 #
 # The run_test.sh script automatically detects tests in the distributed/
 # directory and launches them with: torchrun --nproc-per-node $AIU_WORLD_SIZE
 
 test_suite_config:
+  labels: [full]
   files:
     # SpyreCCL Backend Availability Test
     - path: ${TORCH_DEVICE_ROOT}/tests/distributed/spyreccl_backend.py
       unlisted_test_mode: mandatory_success
-      tests:
-        - names:
-            - TestSpyreCCLBackend::test_spyreccl_device_to_backend
-          mode: mandatory_success

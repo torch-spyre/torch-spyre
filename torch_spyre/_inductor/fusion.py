@@ -17,24 +17,14 @@ from torch._inductor.scheduler import (
     FusedSchedulerNode,
     SchedulerNode,
 )
-from torch._inductor.virtualized import V
-from torch._inductor.ir import FallbackKernel
-from torch_spyre._inductor.logging_utils import _get_env_bool
-from .ir import FixedTiledLayout
-from .constants import SEGMENT_OFFSETS
+from . import config
+from .constants import DEVICE_NAME
 from .scheduler import CountedLoopSchedulerNode
 
-# TODO: Temporary hook to easily disable
-_FUSION_ENABLED = _get_env_bool("SPYRE_INDUCTOR_ENABLE_FUSION", True)
 
-
-def _max_bundle_tensors() -> int:
-    # Until https://github.com/torch-spyre/torch-spyre/issues/827 is completed.
-    has_pool = getattr(V.graph, "pool_size", 0) > 0
-    return len(SEGMENT_OFFSETS) - (2 if has_pool else 1)
-
-
-def _make_fused(nodes: list[SchedulerNode]) -> BaseSchedulerNode | None:
+def _make_fused(
+    nodes: list[SchedulerNode | CountedLoopSchedulerNode],
+) -> BaseSchedulerNode | None:
     if len(nodes) > 1:
         return FusedSchedulerNode(nodes[0].scheduler, nodes)
     elif len(nodes) == 1:
@@ -42,91 +32,40 @@ def _make_fused(nodes: list[SchedulerNode]) -> BaseSchedulerNode | None:
     return None
 
 
-def _is_non_intermediate(name: str) -> bool:
-    buf = V.graph.get_buffer(name)
-    if buf is None or isinstance(buf, FallbackKernel):
-        return False
-    # FallbackKernel may register companion buffers with NoneLayout /
-    # MultiOutputLayout (MutationOutput sentinels for void/in-place ops, the
-    # MultiOutputLayout buffer for tuple ops). These have no real tensor
-    # layout, can't be FixedTiledLayout, and shouldn't count toward the
-    # bundle's non-intermediate tensor budget.
-    layout = buf.maybe_get_layout()
-    return isinstance(layout, FixedTiledLayout) and not layout.allocation
-
-
-def _count_non_intermediate_tensors(node: BaseSchedulerNode) -> int:
-    """Count unique non-intermediate tensors referenced by node.
-
-    For a CountedLoopSchedulerNode, node.read_writes is the recursively
-    merged union of all inner nodes' read_writes (built by
-    FusedSchedulerNode.__init__ → init_group_node →
-    ReadWrites.merge_list).  Nested CountedLoopSchedulerNodes therefore
-    contribute their full tensor sets automatically; no manual recursion
-    is needed here.
-    """
-    names = {dep.name for dep in node.read_writes.reads_and_writes()}
-    return sum(1 for name in names if _is_non_intermediate(name))
+def _is_spyre_node(node: BaseSchedulerNode) -> bool:
+    """True if the node computes on the Spyre device."""
+    device = node.get_device()
+    return device is not None and device.type == DEVICE_NAME
 
 
 def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     """
     Fuse nodes together to form kernels without changing their order.
     Each kernel will be compiled into a single SuperDSC Bundle.
-    Fusion is limited by the following constraints.
-     1. We only want to fuse SchedulerNodes (ie, nodes that generate OpSpecs).
-     2. A SDSC Bundle can refer to at most 5 unique non-intermediate tensors
-        (graph inputs/outputs). Intermediates don't count toward this limit.
     """
-    if not _FUSION_ENABLED or len(nodes) == 0:
+    if len(nodes) == 0:
+        return nodes
+    if not config.bundle_symbolic_args:
+        # Without symbolic args, tensor addresses are baked-in constants from
+        # SEGMENT_OFFSETS, which has a fixed number of slots.  Fusing ops could
+        # exceed that slot count, so disable fusion when symbolic args are off.
         return nodes
 
-    max_tensors = _max_bundle_tensors()
     fused_nodes: list[BaseSchedulerNode] = []
-    cur_nodes: list[SchedulerNode] = []
-    cur_tensors: set[str] = set()
-    cur_non_intermediate_count: int = 0
+    cur_nodes: list[SchedulerNode | CountedLoopSchedulerNode] = []
 
     for n in nodes:
-        if isinstance(n, SchedulerNode):
-            n_tensors = {dep.name for dep in n.read_writes.reads_and_writes()}
-            new_tensors = n_tensors - cur_tensors
-            new_non_intermediate = sum(
-                1 for t in new_tensors if _is_non_intermediate(t)
-            )
-            if cur_non_intermediate_count + new_non_intermediate <= max_tensors:
-                # Ok to put in the current bundle
-                cur_nodes.append(n)
-                cur_tensors |= n_tensors
-                cur_non_intermediate_count += new_non_intermediate
-            else:
-                # Would be too many non-intermediate tensors; start a new bundle.
-                if fused := _make_fused(cur_nodes):
-                    fused_nodes.append(fused)
-                cur_nodes = [n]
-                cur_tensors = n_tensors
-                cur_non_intermediate_count = sum(
-                    1 for t in n_tensors if _is_non_intermediate(t)
-                )
-
+        if isinstance(n, (SchedulerNode, CountedLoopSchedulerNode)) and _is_spyre_node(
+            n
+        ):
+            cur_nodes.append(n)
         else:
-            # Other node types (eg Fallback nodes, CountedLoopSchedulerNode)
-            # force a bundle boundary.  For CountedLoopSchedulerNodes (atomic
-            # loop groups), verify the tensor budget since they cannot be split.
+            # Non-Spyre nodes (Fallback nodes, CPU SchedulerNodes) force a
+            # bundle boundary.
             if fused := _make_fused(cur_nodes):
                 fused_nodes.append(fused)
-            if isinstance(n, CountedLoopSchedulerNode):
-                non_intermediate = _count_non_intermediate_tensors(n)
-                if non_intermediate > max_tensors:
-                    raise RuntimeError(
-                        f"spyre_fuse_nodes: node {n.get_name()!r} references "
-                        f"{non_intermediate} non-intermediate tensors but the "
-                        f"bundle limit is {max_tensors}"
-                    )
             fused_nodes.append(n)
             cur_nodes = []
-            cur_tensors = set()
-            cur_non_intermediate_count = 0
 
     if fused := _make_fused(cur_nodes):
         fused_nodes.append(fused)

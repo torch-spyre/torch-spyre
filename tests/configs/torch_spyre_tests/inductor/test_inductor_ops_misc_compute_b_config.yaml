@@ -10,6 +10,7 @@
 # compute group, assign it to whichever shard keeps the two jobs balanced.
 
 test_suite_config:
+  labels: [core, full]
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops.py
       unlisted_test_mode: skip
@@ -61,4 +62,5 @@ test_suite_config:
             - TestOps::test_single_dim_reduction_invalid_dims_spyre.*
             # restickify add on padded dim tests
             - TestOps::test_restickify_add_transpose.*
+            - TestOps::test_prod.*
           mode: mandatory_success

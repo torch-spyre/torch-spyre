@@ -18,7 +18,9 @@
 # --parallel detects the number of Spyre cards from PCIDEVICE_IBM_COM_AIU_PF
 # (comma count+1) or torch.spyre.device_count(), then distributes the resolved
 # test files round-robin across cards, running each card's slice in a
-# background subshell with SPYRE_DEVICES=<card_idx>.  Falls back to serial
+# background subshell with SPYRE_DEVICES=<physical_device_id> (honouring an
+# already-set SPYRE_DEVICES list such as "1,5,7" rather than assuming
+# 0..N-1).  Falls back to serial
 # execution when only one card is detected.  JUnit XML shards from all cards
 # are merged into the single --junit-xml destination at the end.
 
@@ -1744,9 +1746,16 @@ _run_xdist_fallback() {
 #   1. PCIDEVICE_IBM_COM_AIU_PF: contains a comma-separated list of PCI bus IDs per card.
 #      Card count = number of commas + 1.
 #   2. torch.spyre.device_count(): runtime query via the flex driver.
-#      Respects the AIU_WORLD_SIZE / SPYRE_DEVICES if already set, so we clear
-#      those for the probe to get the raw hardware count.
-#   3. Falls back to 1 (serial) if neither source yields > 0.
+#      Inherits AIU_WORLD_SIZE / SPYRE_DEVICES from the environment as-is.
+#      flex::getNumDevices() (see spyre_device_enum.cpp) already narrows its
+#      count to those vars when either is set, so if the caller has
+#      restricted visible devices that restriction is naturally honoured
+#      here. Clearing them before the probe (as this used to do) would let
+#      --parallel spread tests across cards the caller never authorized for
+#      this run.
+#   3. Falls back to 1 (serial) if neither source yields > 0. On failure, the
+#      probe's stderr is surfaced so import/runtime errors are diagnosable
+#      instead of silently downgrading to serial execution.
 #
 # ---------------------------------------------------------------------------
 _detect_spyre_card_count() {
@@ -1757,22 +1766,30 @@ _detect_spyre_card_count() {
         return
     fi
 
-    # Alternately torch.spyre.device_count() without any env overrides
-    local _count
+    local _count _probe_err
+    _probe_err="/tmp/_spyre_card_probe_err_${$}.tmp"
     _count=$(
-        env -u AIU_WORLD_SIZE -u SPYRE_DEVICES \
         python3 -c "
-import torch_spyre, torch
+import sys
+import torch
 try:
     print(torch.spyre.device_count())
-except Exception:
+except Exception as e:
+    print(e, file=sys.stderr)
     print(0)
-" 2>/dev/null
+" 2>"$_probe_err"
     ) || true
     if [[ "$_count" =~ ^[0-9]+$ && "$_count" -gt 0 ]]; then
+        rm -f "$_probe_err"
         echo "$_count"
         return
     fi
+
+    if [[ -s "$_probe_err" ]]; then
+        echo "[torch_oot_device_tests_run] WARNING: Spyre card-count probe failed -- falling back to 1 card. Error was:" >&2
+        sed 's/^/[torch_oot_device_tests_run]     /' "$_probe_err" >&2
+    fi
+    rm -f "$_probe_err"
 
     # Fallback: single card serial
     echo 1
@@ -1783,7 +1800,9 @@ except Exception:
 #
 # Collects every test node ID from ALL resolved files, distributes them
 # round-robin across N Spyre cards, and runs each card's slice in a
-# background subshell with SPYRE_DEVICES=<card_idx>.
+# background subshell with SPYRE_DEVICES=<physical_device_id> -- the actual
+# device index (e.g. from an already-set SPYRE_DEVICES list such as
+# "1,5,7"), not the 0..N-1 round-robin slot.
 #
 # Splitting at the test-ID level (not the file level) is essential: when
 # multiple configs share a single test file (e.g. all inductor shard configs
@@ -1807,6 +1826,13 @@ _run_parallel_across_cards() {
     echo ""
     echo "[torch_oot_device_tests_run_parallel] --parallel: collecting test IDs from ${#RUN_FILES[@]} file(s) to distribute across ${_n_cards} card(s)..."
 
+    # Timestamp the collection phase so its cost is visible in the run log.
+    # Collection re-imports torch + each OOT wrapper per file, so this phase
+    # can dominate --parallel wall-clock; the elapsed line lets a pod run
+    # confirm the fan-out speedup empirically. SECONDS is a bash builtin
+    # (seconds since shell start) — no external `date` dependency.
+    local _collect_start=$SECONDS
+
     # -----------------------------------------------------------------------
     # Step 1: collect all test node IDs across every resolved file.
     #
@@ -1822,45 +1848,81 @@ _run_parallel_across_cards() {
     # Per-file collection is done with SPYRE_TEST_FILE set (so the OOT
     # framework can identify the config) but without SPYRE_DEVICES / hardware
     # initialisation so collection is fast even on a login node.
+    #
+    # Collection needs no hardware, so the per-file `--collect-only` probes
+    # are fanned out as background jobs (bounded to _n_cards concurrent) and
+    # each writes its raw node IDs to a per-file temp file. Running them
+    # serially and foreground here was the dominant cost of --parallel (every
+    # OOT wrapper re-imports torch + re-execs the module + regenerates the
+    # full device-type variant matrix), so parallelising the probes removes
+    # that serial bottleneck. The results are then read back in file order so
+    # _all_node_ids / _all_node_file_idx ordering is identical to the serial
+    # collection this replaces.
     # -----------------------------------------------------------------------
     # _all_node_ids: parallel arrays — node_id, file_idx (into RUN_FILES)
     local -a _all_node_ids=()
     local -a _all_node_file_idx=()
 
+    # Build the -m probe args once (identical for every file, same as serial path).
+    local -a _collect_args=()
+    local _has_m=0
+    for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
+        [[ "$_a" == "-m" ]] && { _has_m=1; break; }
+    done
+    if [[ $_has_m -eq 1 ]]; then
+        local _take_next=0
+        for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
+            if [[ $_take_next -eq 1 ]]; then
+                _collect_args+=("$_a"); _take_next=0; continue
+            fi
+            [[ "$_a" == "-m" ]] && { _collect_args+=("$_a"); _take_next=1; }
+        done
+    fi
+
+    # Fan out collection: one background probe per file, bounded to _n_cards
+    # concurrent jobs. Each writes matched node IDs to _collect_out_files[i].
+    local -a _collect_out_files=()
+    local -a _collect_pids=()
     for i in "${!RUN_FILES[@]}"; do
         local _rf="${RUN_FILES[$i]}"
-        local _of="${TEST_FILES[$i]}"
         local _rd _rb
         _rd="$(dirname "$_rf")"
         _rb="$(basename "$_rf")"
+        local _cout="/tmp/_spyre_collect_ids_${$}_${i}.tmp"
+        _collect_out_files+=("$_cout")
 
-        echo "[torch_oot_device_tests_run]   collecting: $(basename "$_of")"
+        echo "[torch_oot_device_tests_run]   collecting: $(basename "${TEST_FILES[$i]}")"
 
-        # Build the -m probe args (same as serial path).
-        local -a _collect_args=()
-        local _has_m=0
-        for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
-            [[ "$_a" == "-m" ]] && { _has_m=1; break; }
-        done
-        if [[ $_has_m -eq 1 ]]; then
-            local _take_next=0
-            for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
-                if [[ $_take_next -eq 1 ]]; then
-                    _collect_args+=("$_a"); _take_next=0; continue
-                fi
-                [[ "$_a" == "-m" ]] && { _collect_args+=("$_a"); _take_next=1; }
-            done
-        fi
-
-        local _raw_ids
-        _raw_ids=$(
+        (
             export SPYRE_TEST_FILE="$_rf"
             export OOT_TEST_FILE="$_rf"
             cd "$_rd" && python3 -m pytest "$_rb" \
                 "${_collect_args[@]+"${_collect_args[@]}"}" \
                 --collect-only -q --no-header 2>/dev/null \
-            | grep '\.py::' || true
-        )
+            | grep '\.py::' > "$_cout" || true
+        ) &
+        _collect_pids+=($!)
+
+        # Throttle to at most _n_cards concurrent probes.
+        while [[ "$(jobs -rp | wc -l)" -ge "$_n_cards" ]]; do
+            wait -n 2>/dev/null || true
+        done
+    done
+
+    # Wait for any remaining probes to finish before reading their output.
+    for _cpid in "${_collect_pids[@]+"${_collect_pids[@]}"}"; do
+        wait "$_cpid" 2>/dev/null || true
+    done
+
+    # Read back each file's collected IDs in file order, preserving the exact
+    # ordering the original serial loop produced.
+    for i in "${!RUN_FILES[@]}"; do
+        local _of="${TEST_FILES[$i]}"
+        local _cout="${_collect_out_files[$i]}"
+
+        local _raw_ids=""
+        [[ -f "$_cout" ]] && _raw_ids="$(< "$_cout")"
+        rm -f "$_cout"
 
         if [[ -z "$_raw_ids" ]]; then
             echo "[torch_oot_device_tests_run_serial]   WARNING: no test IDs collected from $(basename "$_of") -- it will be skipped in parallel mode." >&2
@@ -1885,6 +1947,9 @@ _run_parallel_across_cards() {
             _all_node_file_idx+=("$i")
         done <<< "$_raw_ids"
     done
+
+    local _collect_elapsed=$(( SECONDS - _collect_start ))
+    echo "[torch_oot_device_tests_run_parallel] Collection phase completed in ${_collect_elapsed}s (${#RUN_FILES[@]} file(s), up to ${_n_cards} concurrent probe(s))."
 
     local _total="${#_all_node_ids[@]}"
     if [[ $_total -eq 0 ]]; then
@@ -1916,12 +1981,36 @@ _run_parallel_across_cards() {
         echo "${_all_node_file_idx[$j]}:${_all_node_ids[$j]}" >> "${_card_id_files[$_k]}"
     done
 
+    # -----------------------------------------------------------------------
+    # Card-slot -> physical SPYRE_DEVICES index mapping.
+    #
+    # _n_cards is a count (e.g. 3), not a list of physical device indices.
+    # When the caller restricted visible devices with SPYRE_DEVICES (e.g.
+    # "1,5,7"), device_count() already narrows the detected count to match,
+    # but the physical indices are NOT 0..N-1 -- they are exactly the values
+    # listed. Each per-card subshell must export its real index, not its
+    # position in the round-robin loop, or it ends up targeting cards the
+    # caller never listed (e.g. card 0 when only 1,5,7 were authorized).
+    # -----------------------------------------------------------------------
+    local -a _CARD_DEVICE_IDS=()
+    if [[ -n "${SPYRE_DEVICES:-}" ]]; then
+        IFS=',' read -r -a _CARD_DEVICE_IDS <<< "${SPYRE_DEVICES}"
+    fi
+    if [[ "${#_CARD_DEVICE_IDS[@]}" -ne "$_n_cards" ]]; then
+        # No restriction (or a mismatched one) -- fall back to the natural
+        # 0..N-1 physical indexing.
+        _CARD_DEVICE_IDS=()
+        for (( _k=0; _k<_n_cards; _k++ )); do
+            _CARD_DEVICE_IDS+=("$_k")
+        done
+    fi
+
     # Print the assignment summary.
     for (( _k=0; _k<_n_cards; _k++ )); do
         local _cnt
         _cnt=$(wc -l < "${_card_id_files[$_k]}" 2>/dev/null || echo 0)
         _cnt="${_cnt// /}"   # trim whitespace
-        echo "[torch_oot_device_tests_run_parallel_info]   card ${_k} (SPYRE_DEVICES=${_k}): ${_cnt} test(s)"
+        echo "[torch_oot_device_tests_run_parallel_info]   card ${_k} (SPYRE_DEVICES=${_CARD_DEVICE_IDS[$_k]}): ${_cnt} test(s)"
     done
     echo ""
 
@@ -1952,6 +2041,7 @@ _run_parallel_across_cards() {
         : > "$_card_summary_file"
 
         local _subshell_card="$_k"
+        local _subshell_device_id="${_CARD_DEVICE_IDS[$_k]}"
         local _subshell_id_file="${_card_id_files[$_k]}"
         local _subshell_exit_tmp="$_card_exit_tmp"
         local _subshell_shard_list="$_card_shard_list"
@@ -1960,7 +2050,7 @@ _run_parallel_across_cards() {
 
         (
             set +euo pipefail
-            export SPYRE_DEVICES="${_subshell_card}"
+            export SPYRE_DEVICES="${_subshell_device_id}"
             # Isolate the Inductor / FxGraph cache per card so that concurrent
             # shutil.rmtree() calls from FxGraphCache.clear() in different card
             # subshells do not race on the same /tmp/torchinductor_*/fxgraph/
@@ -1996,7 +2086,7 @@ _run_parallel_across_cards() {
                 done <<< "${_file_to_ids[$_fidx]}"
 
                 echo "========================================================================"
-                echo "[torch_oot_device_tests_run] card ${_subshell_card} | SPYRE_DEVICES=${_subshell_card} | ${#_node_ids[@]} test(s)"
+                echo "[torch_oot_device_tests_run] card ${_subshell_card} | SPYRE_DEVICES=${_subshell_device_id} | ${#_node_ids[@]} test(s)"
                 if [[ "$run_file" != "$original_file" ]]; then
                     echo "[torch_oot_device_tests_run] Running (via OOT wrapper): $original_file"
                 else

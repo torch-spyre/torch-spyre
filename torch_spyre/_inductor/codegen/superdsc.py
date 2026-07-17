@@ -41,7 +41,12 @@ from torch_spyre._inductor.indirect_access import (
     is_indirect_value_tensor,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.op_spec import IndirectAccess, OpSpec, TensorArg
+from torch_spyre._inductor.op_spec import (
+    DebugHandle,
+    IndirectAccess,
+    OpSpec,
+    TensorArg,
+)
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
 from .compute_ops import SymbolKind, generate_sdsc
@@ -109,6 +114,7 @@ class SDSCSpec:
         default_factory=dict
     )
     indirect_access_indices: list[int] = dataclasses.field(default_factory=list)
+    debug_handle: DebugHandle | None = None
 
     def __str__(self) -> str:
         iter_space = ", ".join(f"{k}={v}" for k, v in self.iteration_space.items())
@@ -696,6 +702,13 @@ def _extend_matmul_k_to_padded(
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
     ndim = len(op_spec.iteration_space)
+    # Detect indirect access from device_coordinates: index tensors are those
+    # whose name is referenced by an IndirectAccess in another tensor's coordinates,
+    # and value tensors are those that contain IndirectAccess in their coordinates.
+    index_tensor_indices = {
+        i for i, arg in enumerate(op_spec.args) if is_index_tensor(arg, op_spec)
+    }
+    has_indirect_access = bool(index_tensor_indices)
 
     dim_labels = _get_op_dim_labels(ndim, is_matmul)
     symbol_mapping = {
@@ -725,12 +738,13 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             symbolic_dims[sdsc_dim_name] = (sym_str, granularity, max_val)
 
     dim_splits = {
-        symbol_mapping[dim]: value[-1] for dim, value in op_spec.iteration_space.items()
+        symbol_mapping[dim]: value[-1] if not has_indirect_access else 1
+        for dim, value in op_spec.iteration_space.items()
     }
     num_cores = math.prod(dim_splits.values())
 
     work_slices = {
-        symbol_mapping[sym]: wk_slice
+        symbol_mapping[sym]: wk_slice if not has_indirect_access else 1
         for sym, (_, wk_slice) in op_spec.iteration_space.items()
     }
 
@@ -878,6 +892,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             coordinate_masking=coordinate_masking,
             symbolic_dims=symbolic_dims,
             indirect_access_indices=indirect_access_indices,
+            debug_handle=op_spec.debug_handle,
         ),
         symbol_mapping,
     )
@@ -889,19 +904,21 @@ def compile_op_spec(
     symbols: list[int],
     symbol_id_offset: int = 0,
     use_symbols: bool = False,
-) -> tuple[Any, list[int], list[dict], list[SymbolKind]]:
+) -> tuple[Any, list[int], list[list[dict]], list[SymbolKind]]:
     sdsc_spec, symbol_mapping = parse_op_spec(op_spec)
     logger.debug("%s", sdsc_spec)
-    # Translate tiled_symbols from OpSpec's inductor symbols to the renamed
-    # SDSC symbols via the same mapping used to build sdsc_spec.
-    tiled_symbols = [
-        symbol_mapping[s] for s in op_spec.tiled_symbols if s in symbol_mapping
+    # Translate tiled_symbols from OpSpec's per-level inductor symbols (innermost-
+    # first) to the renamed SDSC symbols via the same mapping used to build
+    # sdsc_spec.  generate_sdsc expects outermost-first, so reverse.
+    tiled_symbols_per_level = [
+        [symbol_mapping[s] for s in level if s in symbol_mapping]
+        for level in reversed(op_spec.tiled_symbols)
     ]
     return generate_sdsc(
         idx,
         sdsc_spec,
         symbols,
         symbol_id_offset,
-        tiled_symbols=tiled_symbols,
+        tiled_symbols=tiled_symbols_per_level,
         use_symbols=use_symbols,
     )

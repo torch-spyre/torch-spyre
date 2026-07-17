@@ -1,0 +1,322 @@
+test_suite_config:
+
+  files:
+    - path: ${TORCH_ROOT}/test/nn/test_module_hooks.py
+      unlisted_test_mode: skip
+      tests:
+        # These tests exercise PyTorch's backward hooks and their behavior when no inputs require gradients.
+        # They are classified as mandatory_success because Spyre fully supports backward hooks and gradient computation.
+        # Relevant Spyre capabilities include full backward hook support and gradient computation without input requirements.
+        - names:
+            - TestModuleHookNN::test_hook_no_requires_grad
+          mode: mandatory_success
+        # These tests exercise various PyTorch module hooks and state dict hooks.
+        # They are classified as "skip" on the Spyre backend due to unsupported hook mechanisms.
+        # Spyre currently lacks support for custom hooks and state dict manipulation.
+        - names:
+            - TestModuleHookNN::test_hook_non_full_warning
+            - TestModuleGlobalHooks::test_global_and_local_hooks_order
+            - TestModuleGlobalHooks::test_module_backward_global_hook_writeable
+            - TestModuleGlobalHooks::test_module_forward_forward_hook_removable
+            - TestModuleGlobalHooks::test_module_forward_preforward_hook_removable
+            - TestModuleGlobalHooks::test_module_global_forward_preforward_hook_writeable
+            - TestModuleGlobalHooks::test_module_global_hook_invalid_outputs
+            - TestModuleGlobalHooks::test_module_global_hooks
+            - TestModuleGlobalHooks::test_module_global_hooks_with_kwargs
+            - TestModuleHookNN::test_backward_hooks_interaction
+            - TestModuleHookNN::test_hook_backward_size
+            - TestModuleHookNN::test_hook_backward_writeable
+            - TestModuleHookNN::test_hook_buffer_registration
+            - TestModuleHookNN::test_hook_cpp
+            - TestModuleHookNN::test_hook_extra_input
+            - TestModuleHookNN::test_hook_forward_preforward_writable
+            - TestModuleHookNN::test_hook_inplace
+            - TestModuleHookNN::test_hook_invalid_outputs
+            - TestModuleHookNN::test_hook_last_arg_requires_grad
+            - TestModuleHookNN::test_hook_parameter_registration
+            - TestModuleHookNN::test_hook_requires_grad
+            - TestModuleHookNN::test_hook_submodule_registration
+            - TestModuleHookNN::test_hooks
+            - TestModuleHooks::test_always_called_forward_hooks
+            - TestModuleHooks::test_bw_hook_warning_for_non_tensor_or_tuple
+            - TestModuleHooks::test_forward_hooks
+            - TestModuleHooks::test_forward_hooks_named_tuple_False
+            - TestModuleHooks::test_forward_hooks_named_tuple_True
+            - TestModuleHooks::test_forward_pre_hooks
+            - TestModuleHooks::test_forward_pre_hooks_named_tuple_False
+            - TestModuleHooks::test_forward_pre_hooks_named_tuple_True
+            - TestModuleHooks::test_full_backward_hooks
+            - TestModuleHooks::test_full_backward_hooks_named_tuple_False
+            - TestModuleHooks::test_full_backward_hooks_named_tuple_True
+            - TestModuleHooks::test_full_backward_pre_hooks
+            - TestModuleHooks::test_full_backward_pre_hooks_named_tuple_False
+            - TestModuleHooks::test_full_backward_pre_hooks_named_tuple_True
+            - TestModuleHooks::test_kwarg_hooks
+            - TestModuleHooks::test_mixed_hooks
+            - TestModuleHooks::test_mixed_hooks_named_tuple_False
+            - TestModuleHooks::test_mixed_hooks_named_tuple_True
+            - TestModuleHooks::test_remove_kwarg_hooks
+            - TestStateDictHooks::test_load_state_dict_module_pre_hook
+            - TestStateDictHooks::test_load_state_dict_module_pre_hook_swap_False
+            - TestStateDictHooks::test_load_state_dict_module_pre_hook_swap_True
+            - TestStateDictHooks::test_load_state_dict_post_hook
+            - TestStateDictHooks::test_load_state_dict_post_hook_backward_compatibility
+            - TestStateDictHooks::test_load_state_dict_post_hook_backward_compatibility_swap_False
+            - TestStateDictHooks::test_load_state_dict_post_hook_backward_compatibility_swap_True
+            - TestStateDictHooks::test_load_state_dict_post_hook_swap_False
+            - TestStateDictHooks::test_load_state_dict_post_hook_swap_True
+            - TestStateDictHooks::test_load_state_dict_pre_hook
+            - TestStateDictHooks::test_load_state_dict_pre_hook_swap_False
+            - TestStateDictHooks::test_load_state_dict_pre_hook_swap_True
+            - TestStateDictHooks::test_no_extra_ref_to_module
+            - TestStateDictHooks::test_pickled_hook
+            - TestStateDictHooks::test_register_state_dict_post_hook
+            - TestStateDictHooks::test_register_state_dict_post_hook_private_False
+            - TestStateDictHooks::test_register_state_dict_post_hook_private_True
+            - TestStateDictHooks::test_register_state_dict_pre_hook
+            - TestStateDictHooks::test_register_state_dict_pre_hook_backward_compat
+            - TestStateDictHooks::test_register_state_dict_pre_hook_lazy_module
+          mode: skip  # does not engage the torch-spyre layer
+
+  global:
+    supported_dtypes:
+      - name: bfloat16
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype

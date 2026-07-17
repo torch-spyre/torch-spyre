@@ -15,7 +15,14 @@
 from torch.fx.graph import Graph
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ops_handler import WrapperHandler
-from torch_spyre._inductor.pass_utils import copy_op_metadata
+from torch_spyre._inductor.pass_utils import (
+    apply_splits_from_index_coeff,
+    copy_op_metadata,
+    iteration_space_from_op,
+    splits_by_index_coeff,
+    op_read_writes,
+    invalidate_op_read_writes,
+)
 from torch._inductor.virtualized import V
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -169,14 +176,50 @@ class GraphEditor:
         self.lowering.register_operation(new_com_buf)
         new_buf_name = new_com_buf.name
 
-        # Step 2b: Propagate per-core splits to the clone.
-        # Users share the same per_core_view (pre-checked by core_div_mismatch guard).
-        # op_it_space_splits keys are stride-based coefficients, which are layout-
-        # invariant, so the first user's output_splits transfer without re-keying.
-        # Reduction splits are dropped: the clone is Pointwise with no reduction axis.
+        # Propagate per-core splits to the clone. Users share one per_core_view
+        # (core_div_mismatch guard), so the first user is representative.
         first_user = buffer_users[0]
-        user_out_splits, _ = getattr(first_user, "op_it_space_splits", ({}, {}))
-        new_com_buf.op_it_space_splits = (user_out_splits, {})
+        fu_splits: tuple[dict, dict] = getattr(
+            first_user, "op_it_space_splits", ({}, {})
+        )
+        clone_out_splits: dict = fu_splits[0]
+        if input:
+            # An input clone is inserted *before* its consumers and they read
+            # the clone, so the clone's split must match how they read it.
+            # op_it_space_splits keys are stride coefficients in the consumer's
+            # index space -- NOT layout-invariant: a key maps to the same
+            # physical dim only when the consumer's output shape matches the
+            # clone's (== the buffer's) shape. A reduction consumer's output
+            # drops the reduced dim, so copying its keys verbatim splits the
+            # wrong axis of the full-shape clone (wrong values / SDSC abort at
+            # multi-core).
+            #
+            # Re-key: recover the consumer's {symbol: split}, then encode it
+            # against the consumer's READ index on this buffer. The clone is a
+            # Pointwise copy writing the buffer with that same (identity) index,
+            # so buffer-stride coeffs are valid clone output-split keys. Every
+            # per-core split -- output-dim or reduction/k-split -- lands on the
+            # matching buffer axis.
+            fu_rw = op_read_writes(first_user)
+            read_dep = next((d for d in fu_rw.reads if d.name == buf_name), None)
+            clone_out_splits = {}
+            if read_dep is not None and any(
+                n > 1 for d in fu_splits for n in d.values()
+            ):
+                fu_write_index = next(iter(fu_rw.writes)).index
+                fu_read_index = next((d.index for d in fu_rw.reads), fu_write_index)
+                per_sym = apply_splits_from_index_coeff(
+                    fu_splits,
+                    fu_write_index,
+                    fu_read_index,
+                    iteration_space_from_op(first_user),
+                )
+                clone_out_splits, _ = splits_by_index_coeff(
+                    per_sym, read_dep.index, read_dep.index
+                )
+        # An output clone copies the produced buffer 1:1 (same shape/layout), so
+        # the consumer's output splits transfer directly without re-keying.
+        new_com_buf.op_it_space_splits = (clone_out_splits, {})
 
         if input:
             # Step 3: Update self.graph.name_to_users (a list of TensorBox), e.g., existing users of
@@ -253,6 +296,11 @@ class GraphEditor:
             old_loop.data, name_map={old_name: new_name}
         )
         old_loop.data = new_loop
+        # inner_fn now loads new_name in place of old_name, so this op's
+        # get_read_writes() changes; drop its memoized entry so any later
+        # op_read_writes() re-traces instead of returning the pre-swap reads.
+        # TODO: Contemplate automating there to make the cache opaque.
+        invalidate_op_read_writes(old_loop)
 
     class _NameSwapHandler(WrapperHandler):
         def __init__(self, inner, name_map: dict[str, str]):

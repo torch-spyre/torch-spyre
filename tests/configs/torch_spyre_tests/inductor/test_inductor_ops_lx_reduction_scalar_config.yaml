@@ -1,0 +1,31 @@
+# LX-planning shard: inductor_ops family 'reduction_scalar', both wrap classes
+# (LxPlanningTwoOpPointwiseAdditionTest '(x + x) / 2' and
+#  LxPlanningTwoOpReductionTest 'torch.sum(x, dim=0)').
+#
+# Auto-split of test_inductor_ops_lx_planning.py, mirroring the
+# test_inductor_ops.py config sharding. The full (non-truncated) test
+# set is enabled in CI via TEST_LX_PLANNING_FULL=1 + TEST_LX_PLANNING_RUN_SKIPS=1
+# (see .github/workflows/_test_matrix.yaml). The xfail lists below are
+# the source of truth for known LX-planning failures (the in-file .py
+# skip-lists were removed as duplicates).
+test_suite_config:
+  labels: [full]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_planning.py
+      unlisted_test_mode: skip
+      tests:
+        # Known LX-planning failures -- run and expected to fail. Non-strict
+        # xfail: an unexpected pass (XPASS) does not fail CI. Entries failing
+        # in both wraps collapse to (pointwise|reduction).
+        - names:
+            - LxPlanning.*::test_conv2d_1x3x32_ksize3_no_pad_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_conv2d_1x64_ksize3_depthwise_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_conv2d_2x32_ksize1_stride2_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_conv2d_2x3x32_ksize1_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_conv2d_mistral_model_lx_planning_(pointwise|reduction)
+          mode: xfail
+        - names:
+            - LxPlanning.*::test_(all_dim|any_dim|count_nonzero|cummax|cummin|cumprod|logcumsumexp|max_default|median|mode_|nanmean|nanmedian|nanquantile|nansum|quantile|std_|topk|conv2d|var_).*_lx_planning_(pointwise|reduction)
+          mode: mandatory_success
+          tags:
+            - ops__inductor-reduction

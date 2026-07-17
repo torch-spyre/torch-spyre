@@ -37,6 +37,72 @@ class IndirectAccess(Function):
         return None  # keep unevaluated
 
 
+# --- Source-to-kernel provenance schema -------------------------------------
+# These dataclasses live here with the other IR-op schema types; the logic that
+# builds them from Inductor IR lives in ``provenance.py``. They serialize into
+# the current OpSpec/SuperDSC JSON path, with field names lined up to MLIR
+# location attributes so the future KTIR (MLIR) migration is a low-friction
+# serializer change rather than a redesign.
+
+
+@dataclasses.dataclass(frozen=True)
+class SourceLoc:
+    """Structured source location attached to provenance handles.
+
+    Serialized into the current OpSpec/SuperDSC JSON path; the field names
+    mirror MLIR ``FileLineColRange`` (start/end line and column) so a future
+    KTIR (MLIR) migration maps 1:1 rather than requiring a reshape.
+    """
+
+    file: str
+    start_line: int
+    start_col: int = 0
+    end_line: int | None = None
+    end_col: int | None = None
+
+    def to_str(self) -> str:
+        return f"{self.file}:{self.start_line}:{self.start_col}"
+
+    def to_dict(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class DebugHandle:
+    """Source-to-kernel provenance handle.
+
+    Nestable to map onto MLIR locations: ``NameLoc(aten_op) -> SourceLoc``,
+    ``fused_from -> FusedLoc``, ``ir_chain -> CallSiteLoc`` lineage.
+
+    A ``None`` ``source`` or ``aten_op`` is a *normal, expected* value, not a
+    missing-data error: when an op fuses origins from several distinct source
+    lines there is no single honest headline, so both are set to ``None`` and the
+    full set is preserved in ``fused_from``. Consumers should fall back to
+    ``fused_from`` rather than treating a null headline as an error.
+    """
+
+    id: int
+    source: SourceLoc | None
+    aten_op: str | None
+    ir_chain: tuple[str, ...]
+    fused_from: tuple["DebugHandle", ...] = ()
+    fusion_context: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            # id is serialized as a string: a 63-bit value exceeds JS
+            # Number.MAX_SAFE_INTEGER (2**53-1), and JSON.parse would round it to
+            # float64 before a consumer could act. The dataclass field stays int
+            # for the MLIR/protobuf mapping (a separate serializer).
+            "id": str(self.id),
+            "source": self.source.to_dict() if self.source is not None else None,
+            "aten_op": self.aten_op,
+            "ir_chain": list(self.ir_chain),
+            "fused_from": [h.to_dict() for h in self.fused_from],
+            "fusion_context": self.fusion_context,
+        }
+
+
 @dataclasses.dataclass
 class TensorArg:
     """
@@ -73,10 +139,20 @@ class OpSpec:
         iteration_space: The iteration space of the operation. The values are tuples of (range, work_division).
         args: The input and output arguments to the operation.
         op_info: A dictionary of auxiliary information whose content is operation-specific.
-        tiled_symbols: Iteration-space symbols divided by the enclosing loop's count.
-            Empty for ops that are not inside a LoopSpec.  The runtime computes the
-            per-iteration tensor base offset for symbol ``s`` as
-            ``loop_var * iteration_space[s].range``.
+        tiled_symbols: Per-loop-level iteration-space symbols, innermost first.
+            ``tiled_symbols[0]`` lists the symbols tiled by the innermost enclosing
+            loop; ``tiled_symbols[1]`` lists those tiled by the next-outer loop; etc.
+            Empty for ops not inside any loop.
+            **Invariant:** every enclosing loop level must have an entry, even if
+            empty (``[]``).  An empty entry means the op is loop-invariant at that
+            level.  This keeps level indices aligned with nesting depth so that
+            ``compile_op_spec``'s reversal maps each level to the correct
+            ``loop_var_depth`` index in ``_collect_affine_maps``.
+            The unroller reads ``tiled_symbols[0]`` at each level and removes it
+            from the list after processing, leaving outer-level entries intact.
+            The bundle path (compile_op_spec / generate_sdsc) reverses this list to
+            outermost-first and builds per-level affine.apply stride maps, mapping
+            each level's strides to the correct loop variable by explicit index.
     """
 
     op: str
@@ -84,13 +160,14 @@ class OpSpec:
     iteration_space: dict[Symbol, tuple[Expr, int]]
     args: Sequence[TensorArg]
     op_info: dict[str, Any]
-    tiled_symbols: list[Symbol] = dataclasses.field(default_factory=list)
+    tiled_symbols: list[list[Symbol]] = dataclasses.field(default_factory=list)
     # Maps PyTorch symbol name (e.g. 's97') -> (max, granularity) bounds.
     # Populated by compute_symbolic_bounds during
     # create_op_spec; empty for concrete dims.
     symbolic_dim_bounds: dict[str, tuple[int, int]] = dataclasses.field(
         default_factory=dict
     )
+    debug_handle: DebugHandle | None = None
 
 
 @dataclasses.dataclass
@@ -106,18 +183,18 @@ class LoopSpec:
         count: Trip count of the loop. May be a symbolic shape expression.
         body: The operations to execute each iteration. Each element may be
             an OpSpec, UnimplementedOp, or a nested LoopSpec.
-        tiled_symbols: The iteration-space symbols divided by ``count`` at
-            *this* loop level.  Used by the unroller to advance HBM base
-            addresses by exactly the right stride for each nesting level.
-            Empty for LoopSpecs that do not carry per-level tiling info
-            (legacy path; falls back to OpSpec.tiled_symbols).
+
+    Each OpSpec in the body carries its own ``tiled_symbols`` list identifying
+    which of its iteration-space symbols are tiled by the loop that directly
+    contains it.  The unroller reads these per-op symbols rather than a shared
+    list, so ops with different iteration-space layouts in the same loop are
+    each advanced by the correct stride.
     """
 
     count: Expr
     # list[OpSpec | UnimplementedOp | LoopSpec], typed as Any to accommodate
     # the two distinct UnimplementedOp types (op_spec vs spyre_kernel).
     body: list[Any]
-    tiled_symbols: list[Symbol] = dataclasses.field(default_factory=list)
 
 
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):

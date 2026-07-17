@@ -37,15 +37,37 @@ std::vector<int32_t> generic_stick_dim_order(int32_t num_dims);
  * coordinates and some stick reduction operations (e.g., exx2) result in
  * multiple values in the stick.
  */
+// Explicit numeric values are assigned so that the integer encoding used by the
+// SpyreTensorLayout pickle in module.cpp is stable regardless of source order.
+// Never renumber an existing value; only append new ones with the next integer.
 enum class ElementArrangement {
-  STANDARD,      // sequential element order (default)
-  DL16_TO_FP32,  // non-sequential order produced by dl16->fp32 on-device
-                 // conversions
-  QFP8CH,        // non-sequential order produced by on-device fp8 channel
-                 // quantization (qfp8ch)
-  EXX2,          // reduction mode: two values per stick (vs. one for standard
-                 // reductions)
+  STANDARD = 0,      // sequential element order (default)
+  DL16_TO_FP32 = 1,  // non-sequential order produced by dl16->fp32 on-device
+                     // conversions
+  QFP8CH = 2,        // non-sequential order produced by on-device fp8 channel
+                     // quantization (qfp8ch)
+  EXX2 = 3,          // reduction mode: two values per stick (vs. one for
+                     // standard reductions)
+  FP32_TO_DL16 = 4,  // non-sequential order produced by fp32->dl16 on-device
+                     // conversions
 };
+
+inline std::string elementArrangementToString(ElementArrangement ea) {
+  switch (ea) {
+    case ElementArrangement::STANDARD:
+      return "STANDARD";
+    case ElementArrangement::DL16_TO_FP32:
+      return "DL16_TO_FP32";
+    case ElementArrangement::QFP8CH:
+      return "QFP8CH";
+    case ElementArrangement::EXX2:
+      return "EXX2";
+    case ElementArrangement::FP32_TO_DL16:
+      return "FP32_TO_DL16";
+    default:
+      DT_ERROR("Invalid ElementArrangement");
+  }
+}
 
 class SpyreTensorLayout {
  public:

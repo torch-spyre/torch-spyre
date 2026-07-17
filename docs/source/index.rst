@@ -47,6 +47,7 @@ It enables standard PyTorch models to run on the Spyre device with full
    :maxdepth: 2
 
    explorer/index
+   explorer/using_the_explorer
 
 Indices and tables
 ------------------

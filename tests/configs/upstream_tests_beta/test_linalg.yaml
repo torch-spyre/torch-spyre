@@ -1,21 +1,542 @@
 test_suite_config:
+
   files:
     - path: ${TORCH_ROOT}/test/test_linalg.py
       unlisted_test_mode: skip
       tests:
+        # These tests exercise matrix multiplication and related linear algebra operations with various tensor shapes and data types.
+        # They are classified as mandatory_success on the Spyre backend because they are critical for verifying the correctness and performance of matrix operations.
+        # The relevant Spyre capabilities include efficient handling of matrix multiplications and support for various tensor shapes and data types.
         - names:
+            - TestLinalg::test__int_mm
+            - TestLinalg::test__int_mm_errors
+            - TestLinalg::test_cross_error
+            - TestLinalg::test_eig_removed_error
             - TestLinalg::test_einsum_error_cases
-            - TestLinalg::test_lower_precision_accumulation_with_ref_path
+            - TestLinalg::test_linear_algebra_scalar_raises
+            - TestLinalg::test_lstsq_removed_error
+            - TestLinalg::test_matrix_exp_backward_input_validation
             - TestLinalg::test_matrix_rank_removed_error
-            - TestLinalg::test_permute_matmul
+            - TestLinalg::test_ormqr_errors_and_warnings
+            - TestLinalg::test_qr_error_cases
             - TestLinalg::test_solve_removed_error
-            - TestLinalg::test_vector_norm_decom_unbacked_checks
+            - TestLinalg::test_symeig_removed_error
           mode: mandatory_success
+        # These tests exercise a wide range of linear algebra operations, including matrix multiplications, norms, and decompositions, across various data types and tensor shapes.
+        # They are classified as xfail on the Spyre backend due to unsupported operations, data types, and tensor manipulations, as well as missing capabilities for handling certain error conditions and edge cases.
+        # The most relevant Spyre limitations include unsupported batch matrix multiplications, specific data type promotions, and constraints on tensor layout transformations.
+        - names:
+            - TestLinalg::test_baddbmm_input_dtypes_compatibility
+            - TestLinalg::test_outer_ger_addr_legacy_tests
+            - TestLinalg::test_1_sized_with_0_strided
+            - TestLinalg::test__int4_mm
+            - TestLinalg::test_addbmm
+            - TestLinalg::test_addmm
+            - TestLinalg::test_addmm_baddbmm_overflow
+            - TestLinalg::test_addmm_sizes
+            - TestLinalg::test_addmv
+            - TestLinalg::test_addr_type_promotion
+            - TestLinalg::test_blas_empty
+            - TestLinalg::test_bmm
+            - TestLinalg::test_broadcast_batched_matmul
+            - TestLinalg::test_broadcast_fused_matmul
+            - TestLinalg::test_cholesky
+            - TestLinalg::test_cholesky_ex
+            - TestLinalg::test_cholesky_inverse
+            - TestLinalg::test_cholesky_solve
+            - TestLinalg::test_cholesky_solve_batched
+            - TestLinalg::test_compile_int4_mm
+            - TestLinalg::test_cond_errors_and_warnings
+            - TestLinalg::test_eig_with_nan
+            - TestLinalg::test_eigh_errors_and_warnings
+            - TestLinalg::test_einsum_output_layout
+            - TestLinalg::test_foreach_powsum
+            - TestLinalg::test_foreach_powsum_dtype_kwarg
+            - TestLinalg::test_inner
+            - TestLinalg::test_kron
+            - TestLinalg::test_ldl_factor
+            - TestLinalg::test_ldl_solve
+            - TestLinalg::test_linalg_matrix_exp_batch
+            - TestLinalg::test_matrix_norm
+            - TestLinalg::test_norm_bfloat16_and_half
+            - TestLinalg::test_norm_dtype
+            - TestLinalg::test_norm_extreme_values
+            - TestLinalg::test_norm_fastpaths
+            - TestLinalg::test_norm_fro_2_equivalence_old
+            - TestLinalg::test_norm_fused_type_promotion
+            - TestLinalg::test_norm_matrix
+            - TestLinalg::test_norm_old
+            - TestLinalg::test_norm_old_nan_propagation
+            - TestLinalg::test_norm_vector
+            - TestLinalg::test_powsum
+            - TestLinalg::test_powsum_dtype_kwarg
+            - TestLinalg::test_powsum_dtype_kwarg_1d_reduction
+            - TestLinalg::test_renorm
+            - TestLinalg::test_strided_mm_bmm
+            - TestLinalg::test_tensordot
+            - TestLinalg::test_triangular_solve
+            - TestLinalg::test_triangular_solve_batched
+            - TestLinalg::test_vector_norm
+            - TestLinalg::test_vector_norm_dim_tuple_arg
+            - TestLinalg::test_vector_norm_extreme_values
+            - TestLinalg::test__int_mm_cpu
+          mode: xfail  # xfail: torch._inductor.exc.InductorError
+        # These tests exercise a variety of linear algebra operations, including matrix multiplications, tensor manipulations, and eigenvalue calculations, across different data types and tensor shapes.
+        # They are classified as xfail on the Spyre backend due to unsupported operations, missing features, or known issues with the backend's handling of certain data types and tensor operations.
+        # Relevant Spyre capabilities include support for bfloat16, float16, and float32 data types, but limitations exist in handling complex numbers, certain tensor operations, and unsupported data types like float8_e4m3fnuz.
+        - names:
+            - TestLinalg::test__dyn_quant_matmul_4bit
+            - TestLinalg::test__dyn_quant_pack_4bit_weight
+            - TestLinalg::test_addmm_mv
+            - TestLinalg::test_addmv_rowmajor_colmajor_incx_incy_lda
+            - TestLinalg::test_baddbmm_nan_input_with_zero_beta
+            - TestLinalg::test_cholesky_errors_and_warnings
+            - TestLinalg::test_cholesky_inverse_errors_and_warnings
+            - TestLinalg::test_cholesky_solve_batched_broadcasting
+            - TestLinalg::test_cholesky_solve_out_errors_and_warnings
+            - TestLinalg::test_compile_dyn_quant_matmul_4bit
+            - TestLinalg::test_corner_cases_of_cublasltmatmul
+            - TestLinalg::test_eig_cuda_complex_eigenvectors
+            - TestLinalg::test_eigh_svd_illcondition_matrix_input_should_not_crash
+            - TestLinalg::test_eigvalsh_errors_and_warnings
+            - TestLinalg::test_fp16_mv_transposed_first_argument_arm_cpu
+            - TestLinalg::test_householder_product_errors_and_warnings
+            - TestLinalg::test_linalg_cross_with_and_without_dim
+            - TestLinalg::test_linalg_lstsq_batch_broadcasting
+            - TestLinalg::test_linalg_matrix_exp_compare_with_taylor
+            - TestLinalg::test_linalg_solve_triangular_broadcasting
+            - TestLinalg::test_lu_solve_batched_broadcasting
+            - TestLinalg::test_matmul_out_kernel_errors_with_autograd
+            - TestLinalg::test_matmul_small_brute_force_1d_Nd
+            - TestLinalg::test_matmul_small_brute_force_2d_Nd
+            - TestLinalg::test_matmul_small_brute_force_3d_Nd
+            - TestLinalg::test_matrix_rank_out_errors_and_warnings
+            - TestLinalg::test_norm_complex_old
+            - TestLinalg::test_norm_matrix_degenerate_shapes
+            - TestLinalg::test_norm_vector_degenerate_shapes
+            - TestLinalg::test_nuclear_norm_axes_small_brute_force_old
+            - TestLinalg::test_rowwise_scaled_gemm_numerics_tunableop
+            - TestLinalg::test_tensordot_out_kernel_errors_with_autograd
+            - TestLinalg::test_tensorinv_errors_and_warnings
+            - TestLinalg::test_tensorsolve_errors_and_warnings
+            - TestLinalg::test_triangular_solve_out_errors_and_warnings
+            - TestLinalg::test_vector_norm_reduce_over_1D_vector
+          mode: xfail  # xfail: dxp_standalone not detected
+        # These tests exercise various linear algebra operations, including matrix multiplications, decompositions, and solving systems of equations, across different data types.
+        # They are classified as xfail on the Spyre backend due to missing or partially implemented operators, which are critical for these operations.
+        # The most relevant Spyre capabilities or limitations include the absence of support for certain operators and data types, leading to NotImplementedErrors.
+        - names:
+            - TestLinalg::test_addmm_gelu
+            - TestLinalg::test_addmm_relu
+            - TestLinalg::test_addr_bool
+            - TestLinalg::test_addr_integral
+            - TestLinalg::test_blas_alpha_beta_empty
+            - TestLinalg::test_blas_mv_large_input
+            - TestLinalg::test_blas_nan_out
+            - TestLinalg::test_cholesky_ex_non_pd
+            - TestLinalg::test_cond
+            - TestLinalg::test_cross
+            - TestLinalg::test_cross_with_and_without_dim
+            - TestLinalg::test_dot_vs_numpy
+            - TestLinalg::test_eig_identity
+            - TestLinalg::test_eig_out_variants
+            - TestLinalg::test_eigh
+            - TestLinalg::test_eigh_lower_uplo
+            - TestLinalg::test_eigh_lwork_lapack
+            - TestLinalg::test_eigvals_out_variants
+            - TestLinalg::test_eigvalsh
+            - TestLinalg::test_geqrf
+            - TestLinalg::test_householder_product
+            - TestLinalg::test_inv_errors_and_warnings
+            - TestLinalg::test_inv_ex_info_device
+            - TestLinalg::test_inv_ex_singular
+            - TestLinalg::test_inverse
+            - TestLinalg::test_inverse_errors
+            - TestLinalg::test_inverse_errors_large
+            - TestLinalg::test_kron_empty
+            - TestLinalg::test_kron_errors_and_warnings
+            - TestLinalg::test_lapack_empty
+            - TestLinalg::test_linalg_cross
+            - TestLinalg::test_linalg_lstsq
+            - TestLinalg::test_linalg_lstsq_input_checks
+            - TestLinalg::test_linalg_lu_cpu_errors
+            - TestLinalg::test_linalg_lu_family
+            - TestLinalg::test_linalg_lu_solve
+            - TestLinalg::test_linalg_matrix_exp_utils
+            - TestLinalg::test_linalg_qr_autograd
+            - TestLinalg::test_linalg_solve_triangular
+            - TestLinalg::test_lu_solve
+            - TestLinalg::test_lu_solve_batched
+            - TestLinalg::test_lu_solve_large_matrices
+            - TestLinalg::test_matrix_rank_basic
+            - TestLinalg::test_mm_empty_inputs_mixed_dtype_errors
+            - TestLinalg::test_nuclear_norm_out
+            - TestLinalg::test_ormqr
+            - TestLinalg::test_qr
+            - TestLinalg::test_qr_batched
+            - TestLinalg::test_qr_vs_numpy
+            - TestLinalg::test_slogdet
+            - TestLinalg::test_slogdet_errors_and_warnings
+            - TestLinalg::test_solve
+            - TestLinalg::test_solve_batched_broadcasting
+            - TestLinalg::test_svd_memory_allocation
+            - TestLinalg::test_tensorinv
+            - TestLinalg::test_tensorinv_empty
+            - TestLinalg::test_tensorinv_singular_input
+            - TestLinalg::test_tensorsolve
+            - TestLinalg::test_tensorsolve_empty
+            - TestLinalg::test_triangular_solve_large
+            - TestLinalg::test_vdot_vs_numpy
+          mode: xfail  # xfail: NotImplementedError
+        # These tests exercise the `addr` and `outer` operations across various dtypes, including unsupported ones like `bfloat16` and `int64`.
+        # They are classified as `xfail` due to Spyre's current limitations in handling unsupported dtypes and type conversions during tensor operations.
+        # Relevant Spyre limitations include lack of support for certain dtypes and type conversions during tensor copy operations.
+        - names:
+            - TestLinalg::test_addr_float_and_complex
+            - TestLinalg::test_outer
+          mode: xfail  # xfail: RuntimeError, torch._inductor.exc.InductorError
+        # These tests exercise matrix multiplication (baddbmm) and triangular operations (triu/tril) with various dtypes.
+        # They are classified as xfail due to missing support for 'aten::baddbmm.out' and 'aten::random_.from' in the Spyre backend.
+        # Relevant Spyre limitations include incomplete operator coverage and missing 'dxp_standalone' file.
+        - names:
+            - TestLinalg::test_baddbmm
+            - TestLinalg::test_triu_tril_extreme_k_values
+          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
+        # These tests exercise various linear algebra operations and their error handling, including matrix operations, eigenvalue calculations, and tensor manipulations.
+        # They are classified as xfail on the Spyre backend due to unsupported data types and memory alignment requirements.
+        # The most relevant Spyre limitations include lack of support for complex and double data types, and strict memory alignment constraints.
+        - names:
+            - TestLinalg::test_dot_invalid_args
+            - TestLinalg::test_eig_errors_and_warnings
+            - TestLinalg::test_eigvals_errors_and_warnings
+            - TestLinalg::test_einsum_corner_cases
+            - TestLinalg::test_grouped_mm_cpu_unaligned
+            - TestLinalg::test_matrix_rank
+            - TestLinalg::test_matrix_rank_atol
+            - TestLinalg::test_matrix_rank_empty
+            - TestLinalg::test_mm_bmm_non_memory_dense
+            - TestLinalg::test_mm_conjtranspose
+            - TestLinalg::test_multi_dot_errors
+            - TestLinalg::test_norm_complexhalf
+            - TestLinalg::test_nuclear_norm_exceptions_old
+            - TestLinalg::test_pca_lowrank
+            - TestLinalg::test_pinv
+            - TestLinalg::test_pinv_errors_and_warnings
+            - TestLinalg::test_pinverse
+            - TestLinalg::test_vdot_invalid_args
+          mode: xfail  # xfail: RuntimeError
+        # These tests exercise the `matmul` operation with `torch.half` dtype on large tensors.
+        # They are classified as `xfail` due to the Spyre backend not supporting CUDA compilation.
+        # The relevant Spyre limitation is the lack of CUDA support for tensor operations.
+        - names:
+            - TestLinalg::test_matmul_45724
+          mode: xfail  # xfail: AssertionError
+        # These tests exercise the `torch.linalg.norm` operation with various error conditions and unsupported parameters.
+        # They are classified as xfail due to the Spyre backend's inability to handle certain tensor dimensions and norm orders.
+        # The relevant Spyre limitation is its support for only specific tensor dimensions and norm orders in `linalg.norm`.
+        - names:
+            - TestLinalg::test_norm_errors
+          mode: xfail  # xfail: torch._dynamo.exc.TorchRuntimeError
+        # These tests exercise type promotion in outer product operations across various dtypes.
+        # They are classified as xfail due to Spyre's lack of support for type conversion during tensor operations.
+        # Relevant Spyre limitations include unsupported type conversions and missing dtype support for certain ops.
+        - names:
+            - TestLinalg::test_outer_type_promotion
+          mode: xfail  # xfail: RuntimeError
+        # These tests exercise various linear algebra operations, including matrix multiplications, singular value decompositions, and triangular solves, across different data types.
+        # They are classified as 'skip' on the Spyre backend due to missing or unsupported features, such as the absence of CUDA-specific tunable operations or the lack of CUDA support in the current build.
+        # Relevant Spyre limitations include the unavailability of certain CUDA-specific functions and the need for CUDA support to execute these tests effectively.
+        - names:
+            - TestLinalg::test_addmm_relu_tunableop_rocm
+            - TestLinalg::test_blaslog_tunableop
+            - TestLinalg::test_bmm_tunableop_rocm
+            - TestLinalg::test_call_count_tunableop
+            - TestLinalg::test_cholesky_solve_batched_many_batches
+            - TestLinalg::test_ck_blas_library
+            - TestLinalg::test_disable_tuning_tunableop
+            - TestLinalg::test_dump_results_on_exit_tunableop
+            - TestLinalg::test_gemm_bias_offline_tunableop
+            - TestLinalg::test_gemm_bias_tunableop
+            - TestLinalg::test_inverse_many_batches
+            - TestLinalg::test_large_bmm_backward
+            - TestLinalg::test_large_bmm_mm_backward
+            - TestLinalg::test_linalg_matrix_exp_analytic
+            - TestLinalg::test_linalg_matrix_exp_boundary_cases
+            - TestLinalg::test_linalg_matrix_exp_perverse_nan_values
+            - TestLinalg::test_linalg_solve_triangular_large
+            - TestLinalg::test_lower_precision_accumulation_with_ref_path
+            - TestLinalg::test_lu_solve_batched_many_batches
+            - TestLinalg::test_matmul_check_entries_tunableop
+            - TestLinalg::test_matmul_empty_existing_file_tunableop
+            - TestLinalg::test_matmul_mv
+            - TestLinalg::test_matmul_offline_mgpu_tunableop
+            - TestLinalg::test_matmul_offline_tunableop
+            - TestLinalg::test_matmul_small_brute_force_tunableop
+            - TestLinalg::test_minimum_tuning_iteration_tunableop
+            - TestLinalg::test_mm
+            - TestLinalg::test_mm_submatrix_offline_tunableop
+            - TestLinalg::test_norm_matrix_degenerate_shapes_old_numpy
+            - TestLinalg::test_numeric_check_leak_tunableop_rocm
+            - TestLinalg::test_numerical_check_accuracy_tunableop
+            - TestLinalg::test_numerical_check_python_binding_tunableop
+            - TestLinalg::test_offline_tuning_append_to_existing_file_tunableop
+            - TestLinalg::test_ops_append_to_existing_file_tunableop
+            - TestLinalg::test_permute_matmul
+            - TestLinalg::test_preferred_blas_library
+            - TestLinalg::test_preferred_linalg_library
+            - TestLinalg::test_renorm_ps
+            - TestLinalg::test_rotating_buffer_tunableop
+            - TestLinalg::test_scaled_gemm_offline_tunableop
+            - TestLinalg::test_scaled_gemm_tunableop
+            - TestLinalg::test_svd
+            - TestLinalg::test_tf32_offline_tunableop
+            - TestLinalg::test_tf32_tunableop
+            - TestLinalg::test_triangular_solve_batched_broadcasting
+            - TestLinalg::test_triangular_solve_batched_many_batches
+            - TestLinalg::test_triu_tril_large_matrix_64bit
+            - TestLinalg::test_validator_tunableop_rocm
+            - TestLinalg::test_vector_norm_decom_unbacked_checks
+          mode: skip  # does not engage the torch-spyre layer
+
   global:
     supported_dtypes:
-      - name: float16
-        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
-      - name: int64
-        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
       - name: bfloat16
-        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype

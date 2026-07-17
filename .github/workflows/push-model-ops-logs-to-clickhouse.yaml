@@ -1,0 +1,205 @@
+name: push-model-ops-logs-to-clickhouse
+
+# Triggers automatically when model-ops-tests completes, OR manually so you
+# can re-ingest any historical run by supplying its run ID.
+on:
+  workflow_run:
+    workflows:
+      - model-ops-tests-nightly
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      gha_run_id:
+        description: GHA run ID to parse and ingest
+        required: true
+        default: ''
+
+concurrency:
+  group: model-ops-ch-${{ github.event.workflow_run.id || inputs.gha_run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  ingest:
+    name: Parse model-ops logs -> ClickHouse
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - linux
+      - image_spyre_backend
+    timeout-minutes: 15
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion != 'cancelled'
+
+    env:
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+
+      TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id        || inputs.gha_run_id }}
+      TRIGGERING_WORKFLOW: ${{ github.event.workflow_run.name      || 'model-ops-tests' }}
+      TRIGGERING_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+      TRIGGERING_SHA: ${{ github.event.workflow_run.head_sha   || github.sha }}
+
+    steps:
+      # -----------------------------------------------------------------
+      # Sparse-checkout only the two scripts we need so the workspace is
+      # kept minimal (same pattern as push-hw-diagnostics-to-clickhouse).
+      # -----------------------------------------------------------------
+      - name: Checkout scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          sparse-checkout: |
+            .github/scripts/parse_model_ops_logs.py
+            .github/scripts/ingest_model_ops.py
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+      - name: Setup venv
+        run: |
+          uv venv
+          source .venv/bin/activate
+          echo "VIRTUAL_ENV $VIRTUAL_ENV"
+
+      - name: Install Python dependencies
+        run: |
+          source .venv/bin/activate
+          uv pip install clickhouse-connect regex
+
+      - name: Install gh CLI
+        run: |
+          wget -q https://github.com/cli/cli/releases/download/v2.92.0/gh_2.92.0_linux_amd64.tar.gz
+          tar -xzf gh_2.92.0_linux_amd64.tar.gz
+          echo "$PWD/gh_2.92.0_linux_amd64/bin" >> "${GITHUB_PATH}"
+          gh_2.92.0_linux_amd64/bin/gh --version
+
+      # -----------------------------------------------------------------
+      # Download one raw log file per matrix job from the triggering run.
+      # Each file is written to raw_logs/<idx>_<safe_job_name>.txt
+      # (identical structure to what push-hw-diagnostics-to-clickhouse uses).
+      # -----------------------------------------------------------------
+      - name: Download job logs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p raw_logs
+
+          gh api \
+            "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/jobs" \
+            --paginate \
+            --jq '.jobs[] | {id: .id, name: .name}' \
+          > /tmp/jobs.jsonl
+
+          python3 - << 'PYEOF'
+          import json, os, re, subprocess
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          jobs = [json.loads(l) for l in open("/tmp/jobs.jsonl") if l.strip()]
+
+          for idx, j in enumerate(jobs):
+              safe   = re.sub(r"[^\w\s\-]", "", j["name"]).strip()
+              out    = f"raw_logs/{idx}_{safe}.txt"
+              result = subprocess.run(
+                  ["gh", "api", f"/repos/{repo}/actions/jobs/{j['id']}/logs"],
+                  capture_output=True, env={**os.environ},
+              )
+              if result.returncode == 0 and result.stdout:
+                  open(out, "wb").write(result.stdout)
+                  print(f"  OK   {out}")
+              else:
+                  print(f"  SKIP {j['name']} (no log)")
+          PYEOF
+
+      # -----------------------------------------------------------------
+      # Parse the raw logs:
+      #   • model_ops_log.txt        — cleaned plain-text combined log
+      #   • $JSON_FILE               — structured JSON for ClickHouse
+      # -----------------------------------------------------------------
+      - name: Parse logs
+        run: |
+          source .venv/bin/activate
+
+          SAFE_WF=$(echo "${TRIGGERING_WORKFLOW}" | tr ' ' '_')
+          JSON_FILE="model_ops_${SAFE_WF}_${TRIGGERING_RUN_ID}.json"
+          echo "JSON_FILE=${JSON_FILE}" >> "$GITHUB_ENV"
+
+          LOG_FILE="model_ops_log_${TRIGGERING_SHA}_${TRIGGERING_RUN_ID}.txt"
+          echo "LOG_FILE=${LOG_FILE}" >> "$GITHUB_ENV"
+
+          python3 .github/scripts/parse_model_ops_logs.py \
+            --log-dir raw_logs \
+            --run-id  "${TRIGGERING_RUN_ID}" \
+            --out     "${JSON_FILE}" \
+            --log-out "${LOG_FILE}"
+
+      # -----------------------------------------------------------------
+      # Ingest the JSON into ClickHouse (creates the table if absent).
+      # -----------------------------------------------------------------
+      - name: Ingest into ClickHouse
+        run: |
+          source .venv/bin/activate
+          python3 .github/scripts/ingest_model_ops.py \
+            --json-file "${JSON_FILE}" \
+            --workflow  "${TRIGGERING_WORKFLOW}" \
+            --branch    "${TRIGGERING_BRANCH}" \
+            --sha       "${TRIGGERING_SHA}" \
+            --run-id    "${TRIGGERING_RUN_ID}"
+
+      # -----------------------------------------------------------------
+      # Upload both artefacts so you can inspect them without re-running.
+      # if: always() ensures upload even when the ingest step fails.
+      # -----------------------------------------------------------------
+      - name: Upload Logs artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: model_ops_log_${{ env.TRIGGERING_SHA }}_${{ env.TRIGGERING_RUN_ID }}
+          path: ${{ env.LOG_FILE }}
+          retention-days: 10
+
+      - name: Upload JSON artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ env.JSON_FILE }}
+          path: ${{ env.JSON_FILE }}
+          retention-days: 10
+
+      - name: Summary
+        if: always()
+        run: |-
+          SUITE_COUNT=$(python3 -c "
+          import json, sys
+          try:
+              data = json.load(open('${JSON_FILE}'))
+              passed  = sum(1 for r in data if r.get('outcome') == 'passed')
+              failed  = sum(1 for r in data if r.get('outcome') == 'failed')
+              error   = sum(1 for r in data if r.get('outcome') == 'error')
+              unknown = sum(1 for r in data if r.get('outcome') == 'unknown')
+              print(f'{len(data)}|{passed}|{failed}|{error}|{unknown}')
+          except Exception:
+              print('0|0|0|0|0')
+          " 2>/dev/null || echo '0|0|0|0|0')
+
+          IFS='|' read -r TOTAL PASSED FAILED ERROR UNKNOWN <<< "${SUITE_COUNT}"
+          {
+            echo "### Model-Ops ClickHouse Ingest Summary"
+            echo "| Key | Value |"
+            echo "|---|---|"
+            echo "| Triggering workflow | ${TRIGGERING_WORKFLOW} |"
+            echo "| Triggering run ID   | ${TRIGGERING_RUN_ID} |"
+            echo "| Branch              | ${TRIGGERING_BRANCH} |"
+            echo "| Commit SHA          | ${TRIGGERING_SHA:0:12} |"
+            echo "| Total suites        | ${TOTAL} |"
+            echo "| Passed              | ${PASSED} |"
+            echo "| Failed              | ${FAILED} |"
+            echo "| Error               | ${ERROR} |"
+            echo "| Unknown             | ${UNKNOWN} |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"

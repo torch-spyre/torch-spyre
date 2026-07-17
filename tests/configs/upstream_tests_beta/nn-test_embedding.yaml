@@ -1,0 +1,313 @@
+test_suite_config:
+
+  files:
+    - path: ${TORCH_ROOT}/test/nn/test_embedding.py
+      unlisted_test_mode: skip
+      tests:
+        # These tests exercise embedding operations with various modes and data types, including out-of-bounds index handling.
+        # They are classified as mandatory_success due to the critical nature of embedding ops in NLP models.
+        # Relevant Spyre capabilities include support for float32 and int64 dtypes, and handling of out-of-bounds indices.
+        - names:
+            - TestEmbeddingNN::test_move_sparse_half_embedding
+            - TestEmbeddingNNDeviceType::test_embedding_bag_out_of_bounds_idx
+            - TestEmbeddingNNDeviceType::test_embedding_scalar_weight_error
+          mode: mandatory_success
+        # These tests exercise various aspects of the `EmbeddingBag` operation, including different data types, tensor behaviors, and edge cases.
+        # They are classified as `xfail` on the Spyre backend due to unsupported data types, missing features, and unexpected stick expressions.
+        # The most relevant Spyre capabilities or limitations include unsupported data types like `Double` and `bfloat16`, and unsupported stick expressions in the backend.
+        - names:
+            - TestEmbeddingNNDeviceType::test_EmbeddingBag_empty_per_sample_weights_and_offsets
+            - TestEmbeddingNNDeviceType::test_EmbeddingBag_per_sample_weights_and_new_offsets
+            - TestEmbeddingNNDeviceType::test_EmbeddingBag_per_sample_weights_and_no_offsets
+            - TestEmbeddingNNDeviceType::test_EmbeddingBag_per_sample_weights_and_offsets
+            - TestEmbeddingNNDeviceType::test_EmbeddingBag_per_sample_weights_failures
+            - TestEmbeddingNNDeviceType::test_embedding_backward_atomic_accumulate_kernel
+            - TestEmbeddingNNDeviceType::test_embedding_backward_atomic_accumulate_kernel_with_padding_idx
+            - TestEmbeddingNNDeviceType::test_embedding_backward_large_batch_overflow
+            - TestEmbeddingNNDeviceType::test_embedding_bag_1D_padding_idx
+            - TestEmbeddingNNDeviceType::test_embedding_bag_2D_padding_idx
+            - TestEmbeddingNNDeviceType::test_embedding_bag_bfloat16
+            - TestEmbeddingNNDeviceType::test_embedding_bag_device
+            - TestEmbeddingNNDeviceType::test_embedding_bag_dimension_errors
+            - TestEmbeddingNNDeviceType::test_embedding_bag_empty_input
+            - TestEmbeddingNNDeviceType::test_embedding_bag_half
+            - TestEmbeddingNNDeviceType::test_embedding_bag_non_contiguous_weight
+            - TestEmbeddingNNDeviceType::test_embedding_bag_per_sample_weights_grad
+            - TestEmbeddingNNDeviceType::test_embedding_max_norm_backward
+            - TestEmbeddingNNDeviceType::test_embedding_max_norm_device
+            - TestEmbeddingNNDeviceType::test_embedding_max_norm_fwd_AD
+            - TestEmbeddingNNDeviceType::test_embedding_padding_idx
+          mode: xfail  # xfail: dxp_standalone not detected
+        # These tests exercise embedding and embedding bag operations across various dtypes and tensor configurations.
+        # They are classified as 'skip' on the Spyre backend because they do not engage the torch-spyre layer, indicating they bypass Spyre-specific optimizations or capabilities.
+        # The most relevant Spyre limitations include unsupported dtypes like Double, which caused a failure in the test_embedding_dense_grad.
+        - names:
+            - TestEmbeddingNN::test_embedding_bag_from_pretrained
+            - TestEmbeddingNN::test_embedding_bag_from_pretrained_padding_idx
+            - TestEmbeddingNN::test_embedding_bag_functional
+            - TestEmbeddingNN::test_embedding_bag_padding_idx_error
+            - TestEmbeddingNN::test_embedding_from_pretrained
+            - TestEmbeddingNN::test_embedding_from_pretrained_float32
+            - TestEmbeddingNN::test_embedding_from_pretrained_float64
+            - TestEmbeddingNN::test_embedding_from_pretrained_int16
+            - TestEmbeddingNN::test_embedding_from_pretrained_int32
+            - TestEmbeddingNN::test_embedding_from_pretrained_int64
+            - TestEmbeddingNN::test_embedding_from_pretrained_int8
+            - TestEmbeddingNN::test_embedding_from_pretrained_options
+            - TestEmbeddingNN::test_embedding_from_pretrained_padding_idx
+            - TestEmbeddingNN::test_embedding_from_pretrained_uint8
+            - TestEmbeddingNN::test_embedding_functional
+            - TestEmbeddingNN::test_embedding_max_norm
+            - TestEmbeddingNN::test_embedding_max_norm_unsorted_repeating_indices
+            - TestEmbeddingNN::test_embedding_sparse_basic
+            - TestEmbeddingNN::test_embedding_sparse_empty_tensor
+            - TestEmbeddingNN::test_embeddingbag_2d_include_last_offset
+            - TestEmbeddingNN::test_embeddingbag_from_pretrained
+            - TestEmbeddingNN::test_embeddingbag_from_pretrained_options
+            - TestEmbeddingNN::test_embeddingbag_include_last_offset
+            - TestEmbeddingNN::test_large_tensors
+            - TestEmbeddingNNDeviceType::test_embedding_dense_grad
+          mode: skip  # does not engage the torch-spyre layer
+
+  global:
+    supported_dtypes:
+      - name: bfloat16
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype

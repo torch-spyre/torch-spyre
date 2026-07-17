@@ -40,87 +40,6 @@ from .op_spec import LoopSpec
 logger = get_inductor_logger("scheduler")
 
 
-def _find_leaf_sched_node(node: BaseSchedulerNode):
-    """Recursively find the first leaf SchedulerNode inside a (possibly nested) node."""
-    for snode in node.get_nodes():
-        if isinstance(snode, SchedulerNode):
-            return snode
-        result = _find_leaf_sched_node(snode)
-        if result is not None:
-            return result
-    return None
-
-
-def _tiled_syms_for_sched_node_at_depth(sched_node: SchedulerNode, depth: int) -> list:
-    """Return the OpSpec iteration-space symbols tiled at ``depth``.
-
-    Uses ``loop_tiled_dims[depth]`` and ``loop_tiled_reduction_dims[depth]``
-    from the IR node and the SchedulerNode's ``iteration_space`` (which
-    produces the same symbols as ``create_op_spec`` uses to build
-    ``OpSpec.tiled_symbols``).
-
-    ``loop_tiled_dims`` stores *host-range* dimension indices (indices into
-    ``op.data.ranges``), which include unit-size batch dimensions that are
-    skipped in the iteration space.  We must map host-range indices to
-    iteration-space key indices by walking ``op.data.ranges`` and counting
-    only the non-unit entries.
-
-    For reduction-dimension tiling (``loop_tiled_reduction_dims``), the
-    reduction symbols follow the output symbols in the iteration space key
-    list (the scheduler produces keys from reads.ranges for Reduction nodes,
-    which has output dims first then reduction dims).  The offset is the
-    number of non-unit output-dim ranges; indices in
-    ``loop_tiled_reduction_dims`` are 0-based into the reduction portion.
-    """
-    ir_op = sched_node.node
-    if ir_op is None:
-        return []
-    loop_info = getattr(ir_op, "loop_info", None)
-    if loop_info is None:
-        return []
-    raw = loop_info.loop_tiled_dims
-    raw_rdims = getattr(loop_info, "loop_tiled_reduction_dims", [])
-    if not raw and not raw_rdims:
-        return []
-    dims_per_level: list[list[int]] = raw if raw else [[] for _ in raw_rdims]
-    rdims_per_level: list[list[int]] = raw_rdims if raw_rdims else [[] for _ in raw]
-    if depth >= len(dims_per_level):
-        return []
-    it_space = iteration_space(sched_node)
-    keys = list(it_space.keys())
-
-    # Build a map from host-range index → iteration-space key index.
-    # loop_tiled_dims is only stamped on ComputedBuffer ops (Pointwise/Reduction),
-    # so data.ranges is always present here.  The iteration space simply omits
-    # unit-size dims, so we walk ranges and count only non-unit entries.
-    host_to_it: dict[int, int] = {}
-    it_idx = 0
-    for host_idx, r in enumerate(ir_op.data.ranges):
-        if int(r) != 1:
-            host_to_it[host_idx] = it_idx
-            it_idx += 1
-
-    result = []
-    for d in dims_per_level[depth]:
-        mapped = host_to_it.get(d)
-        if mapped is not None and mapped < len(keys):
-            result.append(keys[mapped])
-
-    # Map reduction-dimension indices to iteration-space symbols.  For
-    # Reduction nodes the iteration space (from reads.ranges) has output-dim
-    # symbols first, then reduction-dim symbols.  The offset is the count of
-    # non-unit output-dim ranges.
-    rdims_at_depth = rdims_per_level[depth] if depth < len(rdims_per_level) else []
-    if rdims_at_depth:
-        n_output_syms = sum(1 for r in ir_op.data.ranges if int(r) != 1)
-        for rd in rdims_at_depth:
-            sym_idx = n_output_syms + rd
-            if sym_idx < len(keys):
-                result.append(keys[sym_idx])
-
-    return result
-
-
 class CountedLoopSchedulerNode(FusedSchedulerNode):
     """A group of SchedulerNodes to be executed inside a counted outer loop.
 
@@ -270,8 +189,8 @@ def build_loop_scheduler_nodes(
     Running before Inductor's fusion pass ensures CountedLoopSchedulerNodes are
     visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return False),
     so loop groups survive Inductor fusion intact.  spyre_fuse_nodes is separately
-    protected because it only fuses plain SchedulerNodes (isinstance check), causing
-    CountedLoopSchedulerNodes to force a bundle boundary.
+    aware of CountedLoopSchedulerNodes: they are accumulated alongside plain
+    SchedulerNodes and may share a bundle with adjacent ops.
     """
     result = _build_loop_group(nodes, depth=0)
 
@@ -352,6 +271,28 @@ class SuperDSCScheduling(BaseScheduling):
                 raise RuntimeError(f"Unexpected node type: {type(node)}")
         return node_schedule
 
+    def _collect_layout_restores(self, node_schedule) -> list:
+        """Select the layout restores to emit after a kernel call.
+
+        Walks the kernel's nodes for _emit_set_layout tags set by
+        insert_post_mutation_restickify and dedups them against the ones already
+        emitted by earlier kernels, so each target restores once across the whole
+        graph. Selection is the scheduler's job (it owns the node list and the
+        cross-kernel dedup state); the kernel just emits the returned list.
+        """
+        # Dedup is graph-scoped: a target's device layout must be restored
+        # exactly once across the whole generated program, not once per kernel.
+        # The state lives on V.graph (one GraphLowering per compilation), so it
+        # starts empty for each graph without any explicit reset.
+        emitted = V.graph.__dict__.setdefault("_emitted_layout_targets", set())
+        restores = []
+        for snode in node_schedule:
+            emit = getattr(getattr(snode, "node", None), "_emit_set_layout", None)
+            if emit is not None and emit[0] not in emitted:
+                emitted.add(emit[0])
+                restores.append(emit)
+        return restores
+
     def codegen_node(
         self, node: Union[FusedSchedulerNode, SchedulerNode, CountedLoopSchedulerNode]
     ) -> None:
@@ -364,37 +305,31 @@ class SuperDSCScheduling(BaseScheduling):
 
         assert self.scheduler
         nodes = [
-            node
-            for node in node.get_nodes()
-            if node.get_name() not in self.scheduler.removed_ops
+            n
+            for n in node.get_nodes()
+            if n.get_name() not in self.scheduler.removed_ops
         ]
         if len(nodes) == 0:
             return
 
-        node_schedule = self.generate_node_schedule(nodes)
         kernel = SpyreKernel()
+        all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
-            for node in node_schedule:
-                var_ranges = iteration_space(node)
-                vars = list(var_ranges.keys())
-                index_vars = [
-                    vars[: len(node._body.iter_vars)],
-                    vars[len(node._body.iter_vars) :],
-                ]
-                node.codegen(index_vars)
+            self._codegen_into_kernel(nodes, kernel, all_schedule_nodes)
 
         with V.set_kernel_handler(kernel):
             src_code = kernel.codegen_kernel()
-        kernel_name = self.define_kernel(src_code, node_schedule, kernel)
+        kernel_name = self.define_kernel(src_code, all_schedule_nodes, kernel)
         kernel.kernel_name = kernel_name
         kernel.code_hash = code_hash(src_code)
 
         with V.set_kernel_handler(kernel):
-            for node in node_schedule:
-                node.mark_run()
+            for snode in all_schedule_nodes:
+                snode.mark_run()
 
-        self.codegen_comment(node_schedule, kernel_name)
+        self.codegen_comment(all_schedule_nodes, kernel_name)
         kernel.call_kernel(kernel.kernel_name)
+        kernel.emit_layout_restores(self._collect_layout_restores(all_schedule_nodes))
 
         V.graph.removed_buffers |= kernel.removed_buffers
         V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
@@ -412,43 +347,12 @@ class SuperDSCScheduling(BaseScheduling):
         if len(inner_nodes) == 0:
             return
 
-        # Each snode in the group may itself be a CountedLoopSchedulerNode
-        # (nested loop) or a plain SchedulerNode.  Drive them all into the
-        # same SpyreKernel so their OpSpecs land in one op_specs list.
         kernel = SpyreKernel()
         all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
-            for inner in inner_nodes:
-                if isinstance(inner, CountedLoopSchedulerNode):
-                    # Recurse: codegen the inner loop into the same kernel,
-                    # which will call wrap_op_specs_in_loop on the inner body.
-                    # We temporarily redirect codegen to this kernel.
-                    self._codegen_loop_body(inner, kernel, all_schedule_nodes)
-                else:
-                    sched = self.generate_node_schedule([inner])
-                    all_schedule_nodes.extend(sched)
-                    for snode in sched:
-                        var_ranges = iteration_space(snode)
-                        vs = list(var_ranges.keys())
-                        index_vars = [
-                            vs[: len(snode._body.iter_vars)],
-                            vs[len(snode._body.iter_vars) :],
-                        ]
-                        snode.codegen(index_vars)
+            self._codegen_into_kernel(inner_nodes, kernel, all_schedule_nodes)
 
-        # Compute per-level tiled symbols for the outer (depth=0) LoopSpec.
-        # Find a leaf SchedulerNode to read loop_tiled_dims + iteration_space.
-        outer_tiled_syms: list = []
-        for inner in inner_nodes:
-            ref = _find_leaf_sched_node(inner)
-            if ref is not None:
-                outer_tiled_syms = _tiled_syms_for_sched_node_at_depth(ref, 0)
-                break
-
-        kernel.wrap_op_specs_in_loop(
-            node.loop_count,
-            tiled_symbols=outer_tiled_syms,
-        )
+        kernel.wrap_op_specs_in_loop(node.loop_count)
 
         with V.set_kernel_handler(kernel):
             src_code = kernel.codegen_kernel()
@@ -462,6 +366,7 @@ class SuperDSCScheduling(BaseScheduling):
 
         self.codegen_comment(all_schedule_nodes, kernel_name)
         kernel.call_kernel(kernel.kernel_name)
+        kernel.emit_layout_restores(self._collect_layout_restores(all_schedule_nodes))
 
         V.graph.removed_buffers |= kernel.removed_buffers
         V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
@@ -503,24 +408,37 @@ class SuperDSCScheduling(BaseScheduling):
                     ]
                     snode.codegen(index_vars)
 
-        # Determine this level's tiled symbols using the IR's loop_tiled_dims[depth].
-        ref_sched_node = _find_leaf_sched_node(node)
-        level_syms = (
-            _tiled_syms_for_sched_node_at_depth(ref_sched_node, depth)
-            if ref_sched_node is not None
-            else []
-        )
-
         # Wrap only the newly-added op_specs entries in this inner LoopSpec.
         body = kernel.op_specs[body_start:]
         kernel.op_specs = kernel.op_specs[:body_start]
-        kernel.op_specs.append(
-            LoopSpec(
-                count=node.loop_count,
-                body=body,
-                tiled_symbols=level_syms,
-            )
-        )
+        kernel.op_specs.append(LoopSpec(count=node.loop_count, body=body))
+
+    def _codegen_into_kernel(
+        self,
+        nodes: list[BaseSchedulerNode],
+        kernel: SpyreKernel,
+        all_schedule_nodes: list[SchedulerNode],
+    ) -> None:
+        """Codegen a sequence of nodes into an existing kernel in order.
+
+        Each CountedLoopSchedulerNode is driven via _codegen_loop_body so its
+        ops land as a LoopSpec entry in kernel.op_specs.  Plain SchedulerNodes
+        are codegenned flat.  The two types may appear in any order.
+        """
+        for node in nodes:
+            if isinstance(node, CountedLoopSchedulerNode):
+                self._codegen_loop_body(node, kernel, all_schedule_nodes)
+            else:
+                sched = self.generate_node_schedule([node])
+                all_schedule_nodes.extend(sched)
+                for snode in sched:
+                    var_ranges = iteration_space(snode)
+                    vs = list(var_ranges.keys())
+                    index_vars = [
+                        vs[: len(snode._body.iter_vars)],
+                        vs[len(snode._body.iter_vars) :],
+                    ]
+                    snode.codegen(index_vars)
 
     def define_kernel(self, src_code, node_schedule, kernel):
         """

@@ -1,0 +1,57 @@
+# LX-planning shard: inductor_ops family 'misc_shape_b1', both wrap classes
+# (LxPlanningTwoOpPointwiseAdditionTest '(x + x) / 2' and
+#  LxPlanningTwoOpReductionTest 'torch.sum(x, dim=0)').
+#
+# Auto-split of test_inductor_ops_lx_planning.py, mirroring the
+# test_inductor_ops.py config sharding. The full (non-truncated) test
+# set is enabled in CI via TEST_LX_PLANNING_FULL=1 + TEST_LX_PLANNING_RUN_SKIPS=1
+# (see .github/workflows/_test_matrix.yaml). The xfail lists below are
+# the source of truth for known LX-planning failures (the in-file .py
+# skip-lists were removed as duplicates).
+test_suite_config:
+  labels: [full]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_planning.py
+      unlisted_test_mode: skip
+      tests:
+        # Known LX-planning failures -- run and expected to fail. Non-strict
+        # xfail: an unexpected pass (XPASS) does not fail CI. Entries failing
+        # in both wraps collapse to (pointwise|reduction).
+        - names:
+            - LxPlanning.*::test_flatten_2d_full_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_flatten_3d_full_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_flatten_3d_mixed_dims_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_flatten_3d_neg_dims_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_flatten_3d_neg_full_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_flatten_3d_noncontig_full_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_flatten_3d_noncontig_partial_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_flatten_3d_trailing_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_flatten_4d_full_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_flatten_4d_large_full_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_flatten_4d_trailing_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unbind_1d_dim0_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unbind_2d_dim0_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unbind_2d_dim1_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unbind_2d_dimneg1_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unbind_3d_dim0_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unbind_3d_dim1_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unbind_3d_dim2_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unbind_3d_dimneg1_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unbind_4d_dim0_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unbind_4d_dim3_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_flatten_3d_leading_lx_planning_reduction
+            - LxPlanning.*::test_flatten_4d_leading_lx_planning_reduction
+            - LxPlanning.*::test_round_trip_to_dtype_add_float16_to_float32_4x8x128_lx_planning_reduction
+            - LxPlanning.*::test_round_trip_to_dtype_implicit_add_float16_to_float32_4x8x128_lx_planning_reduction
+            - LxPlanning.*::test_round_trip_to_dtype_mixed_ea_broadcast_add_fp16_2x4x64_bcast_fp32_2x4x1_lx_planning_(pointwise|reduction)
+          mode: xfail
+        - names:
+            - LxPlanning.*::test_to_dtype.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_round_trip_to_dtype.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_flatten.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_permute.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_unbind.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_size_one.*_lx_planning_(pointwise|reduction)
+          mode: mandatory_success
+          tags:
+            - ops__inductor_misc_shape

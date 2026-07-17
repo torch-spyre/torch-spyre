@@ -1,0 +1,278 @@
+test_suite_config:
+
+  files:
+    - path: ${TORCH_ROOT}/test/profiler/test_torch_tidy.py
+      unlisted_test_mode: skip
+      tests:
+        # These tests exercise various aspects of tensor operations, including allocation, memory management, and tensor properties.
+        # They are classified as mandatory_success because they validate core functionalities that are essential for the Spyre backend.
+        # Relevant Spyre capabilities include tensor allocation, memory management, and support for various tensor operations and data types.
+        - names:
+            - TestTorchTidyProfiler::test_allocation_id_uniqueness
+          mode: mandatory_success
+        - names:
+            - TestTorchTidyProfiler::test_allocation_ids
+            - TestTorchTidyProfiler::test_allocation_ids_with_other_ops
+            - TestTorchTidyProfiler::test_allocations
+            - TestTorchTidyProfiler::test_extra_fields
+            - TestTorchTidyProfiler::test_impl_reuse
+            - TestTorchTidyProfiler::test_mkldnn_tensors
+            - TestTorchTidyProfiler::test_module_and_optimizer_ids
+            - TestTorchTidyProfiler::test_nnmodule_params
+            - TestTorchTidyProfiler::test_optimizer
+            - TestTorchTidyProfiler::test_optimizer_parameters_adam
+            - TestTorchTidyProfiler::test_optimizer_parameters_sgd
+            - TestTorchTidyProfiler::test_pointers_and_ids
+            - TestTorchTidyProfiler::test_refcounts
+            - TestTorchTidyProfiler::test_scalar_ins
+            - TestTorchTidyProfiler::test_sparse_tensors
+            - TestTorchTidyProfiler::test_tensor_lists
+            - TestTorchTidyProfiler::test_tensor_properties
+            - TestTorchTidyProfiler::test_tensorimpl_invalidation_full
+            - TestTorchTidyProfiler::test_tensorimpl_invalidation_keep_alive
+            - TestTorchTidyProfiler::test_tensorimpl_invalidation_scalar_args
+            - TestTorchTidyProfiler::test_tensorimpl_invalidation_set
+          mode: skip
+
+  global:
+    supported_dtypes:
+      - name: bfloat16
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype
