@@ -122,12 +122,12 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      dtype: torch.float16
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L497 in forward,
                     code: patch_embeds = self.patch_conv(pixel_values.to(dtype=target_dtype))'
                   tags:
                     - torch.to.1_spyre
-                  kwargs:
-                    dtype: torch.float16
                 - name: torch.conv2d
                   sample_inputs_func:
                     args:
@@ -198,13 +198,13 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: -1
+                    kwargs:
+                      keepdim: true
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L292 in forward,
                     code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
                   tags:
                     - constant
                     - torch.mean.1_spyre
-                  kwargs:
-                    keepdim: true
                 - name: torch.add
                   sample_inputs_func:
                     args:
@@ -324,13 +324,13 @@ test_suite_config:
                           init: randint
                           init_args:
                             high: 1000
+                    kwargs:
+                      indexing: ij
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L41 in position_ids_in_meshgrid,
                     code: mesh = torch.meshgrid(torch.arange(height), torch.arange(width), indexing="ij")'
                   tags:
                     - tensorsoncpu
                     - torch.functional.meshgrid.1_spyre
-                  kwargs:
-                    indexing: ij
                 - name: torch.getitem
                   sample_inputs_func:
                     args:
@@ -370,14 +370,14 @@ test_suite_config:
                             init: randint
                             init_args:
                               high: 1000
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L42 in position_ids_in_meshgrid,
                     code: h_grid, v_grid = torch.stack(mesh, dim=-1).reshape(-1, 2).chunk(2, -1)'
                   tags:
                     - constant
                     - tensorsoncpu
                     - torch.stack.1_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.reshape
                   sample_inputs_func:
                     args:
@@ -579,25 +579,25 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      dtype: torch.float16
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L133 in forward,
                     code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
                   tags:
                     - torch.to.4_spyre
-                  kwargs:
-                    dtype: torch.float16
                 - name: torch.full
                   sample_inputs_func:
                     args:
                       - value: (1064, 1064)
+                    kwargs:
+                      fill_value: -65504.0
+                      dtype: torch.float16
+                      device: cuda:0
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L444 in generate_block_attention_mask,
                     code: causal_mask = torch.full((seq_len, seq_len), fill_value=d_min, dtype=dtype, device=device)'
                   tags:
                     - constant
                     - torch.full.1_spyre
-                  kwargs:
-                    fill_value: -65504.0
-                    dtype: torch.float16
-                    device: cuda:0
                 - name: torch.tensor
                   sample_inputs_func:
                     args:
@@ -754,13 +754,13 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/pixtral/modeling_pixtral.py#L141 in rotate_half,
                     code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - constant
                     - torch.cat.2_spyre
-                  kwargs:
-                    dim: -1
                 - name: torch.mul
                   sample_inputs_func:
                     args:
@@ -827,14 +827,14 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
+                    kwargs:
+                      dropout_p: 0.0
+                      scale: 0.125
+                      is_causal: false
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L92 in sdpa_attention_forward,
                     code: attn_output = torch.nn.functional.scaled_dot_product_attention('
                   tags:
                     - torch.nn.functional.scaled_dot_product_attention.1_spyre
-                  kwargs:
-                    dropout_p: 0.0
-                    scale: 0.125
-                    is_causal: false
                 - name: torch.transpose
                   sample_inputs_func:
                     args:
@@ -945,12 +945,12 @@ test_suite_config:
                           init: randint
                           init_args:
                             high: 1000
+                    kwargs:
+                      device: cuda:0
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L251 in torch_dynamo_resume_in_get_image_features_at_248,
                     code: (torch.as_tensor(image_sizes, device=image_features.device) // downsample_ratio).prod(dim=-1).tolist()'
                   tags:
                     - torch.as_tensor.1
-                  kwargs:
-                    device: cuda:0
                 - name: torch.floordiv
                   sample_inputs_func:
                     args:
@@ -981,12 +981,12 @@ test_suite_config:
                           init: randint
                           init_args:
                             high: 1000
+                    kwargs:
+                      dim: -1
                   description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/mistral3/modeling_mistral3.py#L251 in torch_dynamo_resume_in_get_image_features_at_248,
                     code: (torch.as_tensor(image_sizes, device=image_features.device) // downsample_ratio).prod(dim=-1).tolist()'
                   tags:
                     - torch.prod.1
-                  kwargs:
-                    dim: -1
                 - name: torch.squeeze
                   sample_inputs_func:
                     args:

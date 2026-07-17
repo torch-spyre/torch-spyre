@@ -1,0 +1,21 @@
+# LX-planning shard: inductor_ops family 'reduction_multidim1', both wrap classes
+# (LxPlanningTwoOpPointwiseAdditionTest '(x + x) / 2' and
+#  LxPlanningTwoOpReductionTest 'torch.sum(x, dim=0)').
+#
+# Auto-split of test_inductor_ops_lx_planning.py, mirroring the
+# test_inductor_ops.py config sharding. The full (non-truncated) test
+# set is enabled in CI via TEST_LX_PLANNING_FULL=1 + TEST_LX_PLANNING_RUN_SKIPS=1
+# (see .github/workflows/_test_matrix.yaml). The xfail lists below are
+# the source of truth for known LX-planning failures (the in-file .py
+# skip-lists were removed as duplicates).
+test_suite_config:
+  labels: [full]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_planning.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - LxPlanning.*::test_reduce_multidim_keepdim1.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_reduce_edge_multidim_keepdim1.*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_mean_layout_multidim_keepdim1.*_lx_planning_(pointwise|reduction)
+          mode: mandatory_success

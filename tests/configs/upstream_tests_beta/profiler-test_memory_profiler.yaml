@@ -1,0 +1,295 @@
+test_suite_config:
+
+  files:
+    - path: ${TORCH_ROOT}/test/profiler/test_memory_profiler.py
+      unlisted_test_mode: skip
+      tests:
+        # These tests exercise various memory profiling and data flow functionalities, including tensor operations, gradient extraction, and optimizer steps.
+        # They are classified as mandatory_success because they validate core functionalities that must work correctly on the Spyre backend.
+        # Relevant Spyre capabilities include support for common tensor operations and gradient handling, though some specific ops like _scaled_dot_product_fused_attention_overrideable are not yet supported.
+        - names:
+            - TestDataFlow::test_data_flow_graph_complicated
+          mode: mandatory_success
+        # These tests exercise memory profiling and tensor operations, including tensor creation and destruction.
+        # They are classified as xfail due to unsupported int64 dtype and mismatched memory allocation results.
+        # Relevant Spyre limitations include dtype support and memory profiling accuracy.
+        - names:
+            - TestMemoryProfilerTimeline::test_memory_timeline_no_id
+          mode: xfail  # xfail: dxp_standalone not detected
+
+        - names:
+            - TestDataFlow::test_data_flow_graph_non_op_allocations
+            - TestDataFlow::test_data_flow_graph_simple
+            - TestDataFlow::test_data_flow_graph_simple_backward
+            - TestDataFlow::test_data_flow_graph_simple_inplace
+            - TestDataFlow::test_data_flow_graph_stacked
+            - TestDataFlow::test_data_flow_graph_with_annotations
+            - TestDataFlow::test_match_schemas
+            - TestDataFlow::test_match_schemas_backward
+            - TestDataFlow::test_match_schemas_tensorlist
+            - TestIdentifyGradients::test_extract_gradients_from_module
+            - TestIdentifyGradients::test_extract_gradients_from_module_and_optimizer
+            - TestIdentifyGradients::test_extract_gradients_from_optimizer
+            - TestIdentifyGradients::test_extract_gradients_from_optimizer_set_to_none
+            - TestIdentifyGradients::test_extract_gradients_low_level
+            - TestMemoryProfilerE2E::test_categories_e2e_sequential_fwd
+            - TestMemoryProfilerE2E::test_categories_e2e_sequential_fwd_bwd
+            - TestMemoryProfilerE2E::test_categories_e2e_simple_fwd
+            - TestMemoryProfilerE2E::test_categories_e2e_simple_fwd_bwd
+            - TestMemoryProfilerE2E::test_categories_e2e_simple_fwd_bwd_step
+            - TestMemoryProfilerE2E::test_categories_e2e_simple_module_fwd
+            - TestMemoryProfilerE2E::test_categories_e2e_simple_module_fwd_bwd
+            - TestMemoryProfilerE2E::test_categories_e2e_simple_module_fwd_bwd_step
+            - TestMemoryProfilerE2E::test_inputs_fwd
+            - TestMemoryProfilerE2E::test_inputs_fwd_bwd
+            - TestMemoryProfilerE2E::test_inputs_fwd_lazy
+            - TestMemoryProfilerE2E::test_lazily_initialized
+            - TestMemoryProfilerE2E::test_manual_optimizer_step
+            - TestMemoryProfilerE2E::test_memory_timeline
+            - TestMemoryProfilerE2E::test_parameters_and_gradients
+            - TestMemoryProfilerE2E::test_parameters_and_gradients_set_to_none
+            - TestMemoryProfiler::test_config_check
+          mode: skip
+
+  global:
+    supported_dtypes:
+      - name: bfloat16
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype

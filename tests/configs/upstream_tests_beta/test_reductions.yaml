@@ -1,21 +1,526 @@
 test_suite_config:
+
   files:
     - path: ${TORCH_ROOT}/test/test_reductions.py
       unlisted_test_mode: skip
       tests:
+        # These tests exercise error handling for reduction ops like argmax, mean, and histogram across various dtypes and device mismatches.
+        # They are mandatory_success because Spyre correctly raises the expected RuntimeErrors for invalid inputs and device placements.
+        # Spyre's ability to propagate errors and handle dtype downcasting for int64 is relevant here.
         - names:
+            - TestReductions::test_dim_arg_reduction_scalar
+            - TestReductions::test_histc_min_max_errors
+            - TestReductions::test_histogram_error_handling
+            - TestReductions::test_max_mixed_devices
+            - TestReductions::test_min_mixed_devices
+            - TestReductions::test_mode_wrong_device
+            - TestReductions::test_quantile_error
+            - TestReductions::test_repeated_dim
+            - TestReductions::test_sum_cpu_device_mismatch
+          mode: mandatory_success
+        - names:
+            - TestReductions::test_dim_multi_duplicate
+            - TestReductions::test_empty_tensor_nonempty_slice
+          mode: mandatory_success
+          edits:
+            ops:
+              exclude:
+                - name: _scaled_dot_product_fused_attention_overrideable
+                - name: _scaled_mm
+                - name: add
+                - name: addmm
+                - name: bitwise_and
+                - name: bitwise_not
+                - name: bmm
+                - name: cat
+                - name: ceil
+                - name: clamp
+                - name: clamp_max
+                - name: clamp_min
+                - name: clone
+                - name: constant_pad_nd
+                - name: convolution
+                - name: copy_
+                - name: full
+                - name: gelu
+                - name: layer_norm
+                - name: linear
+                - name: logical_not
+                - name: max
+                - name: maximum
+                - name: min
+                - name: minimum
+                - name: mm
+                - name: mul
+                - name: new_ones
+                - name: ones
+                - name: rms_norm
+                - name: sign
+                - name: softplus
+                - name: sub
+                - name: topk
+                - name: where
+                - name: realdiv
+                - name: relufwd
+                - name: reciprocal
+                - name: layernormscale
+                - name: abs
+                - name: neg
+                - name: exp
+                - name: sigmoid
+                - name: exx2
+                - name: layernormnorm
+                - name: identity
+                - name: sqrt
+                - name: rsqrt
+                - name: topkvalue
+                - name: topkindex
+                - name: floor
+                - name: to_dtype
+
+        # These tests exercise reduction operations like all, any, min, max, mean, var, std, prod, and histogram functions across various dtypes.
+        # They are xfailed because Spyre lacks implementations for many reduction operators, including all, any, amin, amax, bincount, and variance functions.
+        # The missing aten ops like aten::all.all_out, aten::amin.out, and aten::var.correction reflect Spyre's limited reduction kernel support.
+        - names:
+            - TestReductions::test_all_any
+            - TestReductions::test_all_any_empty
+            - TestReductions::test_all_any_vs_numpy
+            - TestReductions::test_all_any_with_dim
+            - TestReductions::test_amax
+            - TestReductions::test_amin
+            - TestReductions::test_amin_amax_some_dims
+            - TestReductions::test_aminmax
+            - TestReductions::test_bincount
+            - TestReductions::test_bucketization
+            - TestReductions::test_count_nonzero
+            - TestReductions::test_histc
+            - TestReductions::test_histc_lowp
+            - TestReductions::test_histogram
+            - TestReductions::test_histogramdd
+            - TestReductions::test_max
+            - TestReductions::test_mean_int_with_optdtype
+            - TestReductions::test_median_corner_cases
+            - TestReductions::test_median_real_values
+            - TestReductions::test_min
+            - TestReductions::test_min_max_nan
+            - TestReductions::test_nanmean_integral_types
+            - TestReductions::test_nansum_vs_numpy
+            - TestReductions::test_prod
+            - TestReductions::test_prod_bool
+            - TestReductions::test_prod_gpu
+            - TestReductions::test_quantile
+            - TestReductions::test_quantile_backward
+            - TestReductions::test_reduction_empty_any_all
+            - TestReductions::test_std_correction_vs_numpy
+            - TestReductions::test_std_mean
+            - TestReductions::test_std_mean_all_dims
+            - TestReductions::test_std_mean_correction
+            - TestReductions::test_std_mean_some_dims
+            - TestReductions::test_std_vs_numpy
+            - TestReductions::test_tensor_compare_ops_empty
+            - TestReductions::test_var
+            - TestReductions::test_var_correction_vs_numpy
+            - TestReductions::test_var_large_input
+            - TestReductions::test_var_mean
+            - TestReductions::test_var_mean_all_dims
+            - TestReductions::test_var_mean_correction
+            - TestReductions::test_var_mean_some_dims
+            - TestReductions::test_var_stability
+            - TestReductions::test_var_stability2
+            - TestReductions::test_var_unbiased
+            - TestReductions::test_var_vs_numpy
+            - TestReductions::test_dim_multi_unsupported
+          mode: xfail  # xfail: NotImplementedError
+        # These tests exercise reduction operations like sum, mean, min, max, mode, and median across various dtypes and tensor layouts.
+        # They are xfailed due to missing Spyre support for key ops like mean on fp32, sum on int64, and handling of noncontiguous strides.
+        # The failures highlight Spyre's limited reduction op support and its strict stick-layout constraints for memory access patterns.
+        - names:
+            - TestReductions::test_argminmax_large_axis
+            - TestReductions::test_dim_default_mean
+            - TestReductions::test_dim_multi_keepdim_mean
+            - TestReductions::test_dim_multi_mean
+            - TestReductions::test_dim_multi_unsorted_keepdim_mean
+            - TestReductions::test_dim_multi_unsorted_mean
+            - TestReductions::test_dim_none_keepdim_mean
+            - TestReductions::test_dim_none_mean
+            - TestReductions::test_dim_reduction
+            - TestReductions::test_dim_reduction_lastdim
+            - TestReductions::test_dim_single_keepdim_mean
+            - TestReductions::test_dim_single_mean
+            - TestReductions::test_empty_tensor_empty_slice_mean
+            - TestReductions::test_identity_masked_norm
+            - TestReductions::test_max_with_inf
+            - TestReductions::test_median_nan_values
+            - TestReductions::test_min_with_inf
+            - TestReductions::test_mode
+            - TestReductions::test_mode_large
+            - TestReductions::test_nan_policy_omit_nansum
+            - TestReductions::test_noncontiguous_all_mean
+            - TestReductions::test_numpy_named_args
+            - TestReductions::test_prod_lowp
+            - TestReductions::test_reduce_dtype
+            - TestReductions::test_ref_scalar_input_mean
+            - TestReductions::test_ref_small_input_mean
+            - TestReductions::test_result_dtype_mean
+            - TestReductions::test_sum_all
+            - TestReductions::test_sum_noncontig_lowp
+            - TestReductions::test_sum_vs_numpy
+          mode: xfail  # xfail: torch._inductor.exc.InductorError
+        # These tests exercise reduction operations like argmin, argmax, all, any, sum, prod, nansum, and count_nonzero across various dtypes.
+        # They are xfail due to missing Spyre kernel support for these ops and unsupported stick expression patterns in the inductor.
+        # The failures highlight missing reduction kernels and the Spyre backend's constraints on tensor shape expressions.
+        - names:
+            - TestReductions::test_argminmax_multiple
+            - TestReductions::test_identity_all
+            - TestReductions::test_identity_any
+            - TestReductions::test_identity_count_nonzero
+            - TestReductions::test_identity_masked_prod
+            - TestReductions::test_identity_masked_sum
+            - TestReductions::test_identity_nansum
+            - TestReductions::test_identity_prod
+            - TestReductions::test_identity_sum
+            - TestReductions::test_nansum
+          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
+        # These tests exercise reduction ops like mean, sum, min, max, and mode across various dtypes and tensor ranks.
+        # They are xfail due to Spyre's 64-dimension limit, lack of double dtype support, and missing type conversion during copy.
+        # The relevant limitations are the max tensor rank of 64, unsupported dtypes like double and int16, and incomplete copy semantics.
+        - names:
+            - TestReductions::test_dim_ndim_limit_mean
+            - TestReductions::test_dim_reduction_less_than_64
+            - TestReductions::test_minmax_illegal_dtype
+            - TestReductions::test_mode_boolean
+            - TestReductions::test_mode_wrong_dtype
+          mode: xfail  # xfail: RuntimeError
+        # These tests exercise the mean reduction op with out-of-bounds dimension indices.
+        # They are xfail due to a TorchRuntimeError during fake tensor creation for invalid dims.
+        # This highlights a limitation in Spyre's graph compilation for error handling paths.
+        - names:
+            - TestReductions::test_dim_offbounds_mean
+          mode: xfail  # xfail: torch._dynamo.exc.TorchRuntimeError
+        # These tests exercise reduction operations like sum, mean, max, and histc across bfloat16, float16, float32, and int64 dtypes.
+        # They are xfailed because Spyre lacks support for many reduction ops and the histc function entirely.
+        # The failures highlight missing Spyre kernels for reductions and the dxp_standalone compiler tool.
+        - names:
+            - TestReductions::test_dim_reduction_fns_fn_name_amax
+            - TestReductions::test_dim_reduction_fns_fn_name_amin
+            - TestReductions::test_dim_reduction_fns_fn_name_max
+            - TestReductions::test_dim_reduction_fns_fn_name_mean
+            - TestReductions::test_dim_reduction_fns_fn_name_median
+            - TestReductions::test_dim_reduction_fns_fn_name_min
+            - TestReductions::test_dim_reduction_fns_fn_name_mode
+            - TestReductions::test_dim_reduction_fns_fn_name_nanmedian
+            - TestReductions::test_dim_reduction_fns_fn_name_norm
+            - TestReductions::test_dim_reduction_fns_fn_name_prod
+            - TestReductions::test_dim_reduction_fns_fn_name_std
+            - TestReductions::test_dim_reduction_fns_fn_name_sum
+            - TestReductions::test_dim_reduction_fns_fn_name_var
+            - TestReductions::test_histc_min_max_corner_cases
+            - TestReductions::test_histc_min_max_corner_cases_cuda
+            - TestReductions::test_histc_value_corner_cases
+            - TestReductions::test_identity_linalg_vector_norm
+            - TestReductions::test_mean_out_is_alias_of_return
+            - TestReductions::test_nan_policy_propagate_mean
+            - TestReductions::test_noncontiguous_expanded_mean
+            - TestReductions::test_noncontiguous_innermost_mean
+            - TestReductions::test_noncontiguous_outermost_mean
+            - TestReductions::test_noncontiguous_transposed_mean
+            - TestReductions::test_reduction_vectorize_along_input_corner
+            - TestReductions::test_reduction_vectorize_along_output
+            - TestReductions::test_ref_duplicate_values_mean
+            - TestReductions::test_ref_extremal_values_mean
+            - TestReductions::test_reference_masked_masked_amax
+            - TestReductions::test_reference_masked_masked_amin
+            - TestReductions::test_reference_masked_masked_argmax
+            - TestReductions::test_reference_masked_masked_argmin
+            - TestReductions::test_reference_masked_masked_mean
+            - TestReductions::test_reference_masked_masked_prod
+            - TestReductions::test_reference_masked_masked_std
+            - TestReductions::test_reference_masked_masked_sum
+            - TestReductions::test_reference_masked_masked_var
+            - TestReductions::test_tensor_compare_ops_argmax_argmix_kthvalue_dim_empty
+            - TestReductions::test_warn_invalid_degrees_of_freedom
+          mode: xfail  #  # xfail: dxp_standalone not detected
+        # These tests exercise reduction operations like sum, prod, all, any, and count_nonzero across bfloat16, float16, float32, bool, and int64 dtypes. They are xfail due to missing aten::random_.from support and Spyre's inductor limitation with unexpected stick expressions like 2*d0. The failures highlight missing random tensor initialization and constraints on dimension expressions in the Spyre backend.
+        - names:
+            - TestReductions::test_identity
+          mode: xfail  # xfail: NotImplementedError, torch._inductor.exc.InductorError
+        # These tests exercise the nanmean reduction op with nan_policy='omit' across bfloat16, float16, and float32 dtypes.
+        # They are xfail due to an Inductor error from an unsupported stick expression in the generated kernel.
+        # This reveals a limitation in Spyre's codegen for handling certain tensor dimension expressions in reduction patterns.
+        - names:
+            - TestReductions::test_nan_policy_omit_nanmean
+          mode: xfail  # xfail: torch._inductor.exc.InductorError
+        # These tests exercise reduction operations like sum, mean, var, std, logsumexp, prod, cumsum, and cumprod across various dtypes and tensor shapes.
+        # They are classified as skip because the torch-spyre layer does not support many of these reduction ops, particularly logsumexp and complex reductions.
+        # Spyre's limited op support for reductions and missing bfloat16/float16 handling for large tensors are the relevant limitations.
+        - names:
+            - TestReductions::test_nansum_out_dtype # Segmentation fault in xfail. Moved it to skip to prevent crashes.
+            - TestReductions::test_accreal_type
             - TestReductions::test_all_issue117215
             - TestReductions::test_argminmax_axis_with_dim_one
-            - TestReductions::test_dim_multi_unsupported
+            - TestReductions::test_cumprod_integer_upcast
+            - TestReductions::test_cumsum_integer_upcast
+            - TestReductions::test_dim_default_keepdim_mean
+            - TestReductions::test_dim_empty_keepdim_mean
+            - TestReductions::test_dim_empty_mean
+            - TestReductions::test_logsumexp
+            - TestReductions::test_logsumexp_dim
+            - TestReductions::test_logsumexp_integral_promotion
+            - TestReductions::test_max_elementwise
+            - TestReductions::test_mean_dim
+            - TestReductions::test_min_elementwise
+            - TestReductions::test_prod_integer_upcast
+            - TestReductions::test_reduction_split
+            - TestReductions::test_reductions_large_half_tensors
             - TestReductions::test_scalar_tensor_as_dim_argument
+            - TestReductions::test_std_dim
+            - TestReductions::test_sum_dim
+            - TestReductions::test_sum_integer_upcast
+            - TestReductions::test_sum_parallel
+            - TestReductions::test_tensor_reduce_ops_empty
+            - TestReductions::test_var_dim
             - TestReductions::test_scalar_tensor_dim_compiled_mode
-          mode: mandatory_success
+          mode: skip  # does not engage the torch-spyre layer
+
   global:
     supported_dtypes:
-      - name: float16
-        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
-      - name: int64
-        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
       - name: bfloat16
-        description: Supported by both Spyre and CPU. Required floating point dtype for the test.
-
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype

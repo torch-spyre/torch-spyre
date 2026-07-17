@@ -3,29 +3,17 @@
 #
 # Usage:
 #   cd torch-spyre/tests
-#   ./run_test.sh configs/test_distributed_config.yaml
+#   ./run_test.sh configs/distributed_tests/test_broadcast.yaml
 #
 # The run_test.sh script automatically detects tests in the distributed/
 # directory and launches them with: torchrun --nproc-per-node $AIU_WORLD_SIZE
 
 test_suite_config:
+  labels: [full]
   files:
     # Broadcast Tests
     - path: ${TORCH_DEVICE_ROOT}/tests/distributed/test_broadcast.py
       unlisted_test_mode: mandatory_success
-      tests:
-        - names:
-            - TestBroadcast::test_broadcast_from_rank_zero_float16
-            - TestBroadcast::test_broadcast_from_rank_zero_float32
-            - TestBroadcast::test_broadcast_from_rank_zero_2d_tensor
-            - TestBroadcast::test_broadcast_from_rank_zero_large_tensor
-            - TestBroadcast::test_broadcast_from_non_zero_root
-            - TestBroadcast::test_broadcast_from_last_rank
-            - TestBroadcast::test_broadcast_multiple_tensors_sequential
-            - TestBroadcast::test_broadcast_zero_tensor
-            - TestBroadcast::test_broadcast_negative_values
-            - TestBroadcast::test_broadcast_invalid_root_rank
-          mode: mandatory_success
 
   global:
     # Global configuration for distributed tests

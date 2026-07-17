@@ -879,6 +879,11 @@ def build_graph(torch_spyre_root):
         "metadata": {
             "source_commit": _get_git_sha(repo_root),
             "torch_spyre_root": str(root.relative_to(repo_root)),
+            # Canonical repo used to build "view source" links in the explorer.
+            # The JS pins links to source_commit when available and falls back
+            # to the default branch otherwise.
+            "repo_url": "https://github.com/torch-spyre/torch-spyre",
+            "default_branch": "main",
         },
         "nodes": list(seen.values()),
         "edges": valid_edges,

@@ -15,7 +15,6 @@
 import logging
 import math
 import time
-from abc import ABC, abstractmethod
 from typing import Any, Optional
 
 import sympy
@@ -34,6 +33,7 @@ from torch._inductor.dependencies import ReadWrites
 from torch_spyre._inductor.pass_utils import (
     apply_splits_from_index_coeff,
     concretize_expr,
+    device_coordinates,
     iteration_space_from_op,
     splits_by_index_coeff,
 )
@@ -51,6 +51,7 @@ from torch_spyre._inductor.scratchpad.passes import (
 )
 from torch_spyre._inductor.scratchpad.utils import (
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
+    buffer_not_read_in_full,
     clone_at_graph_boundaries,
     mem_usage_by_buf,
     calculate_liveness,
@@ -68,50 +69,144 @@ from torch_spyre._inductor.pass_utils import _is_matmul_op
 logger = get_inductor_logger("scratchpad.allocator")
 
 
-class ScratchpadAllocator(ABC):
+def _would_produce_lx_back_gap(
+    graph: GraphLowering,
+    buf_name: str,
+    uses: list[int],
+) -> bool:
+    """Check if pinning a buffer to LX would produce a backGapCore_.
+
+    A backGap fires when device_size[d] > it_dim_size for any device dimension d.
+    The backend supports backGap for HBM but not for LX, so buffers triggering
+    this condition must stay in HBM.
     """
-    Abstract class for all implementations of ScratchpadAllocator
+    buf = graph.get_buffer(buf_name)
+    stl = buf.layout.device_layout
+    device_size = stl.device_size
+
+    for use_idx in uses:
+        op = graph.operations[use_idx]
+        rw = op.get_read_writes()
+        for dep in rw.reads | rw.writes:
+            if dep.name != buf_name:
+                continue
+            try:
+                coords = device_coordinates(stl, dep, None)
+            except Exception:
+                continue
+            for d, coord_expr in enumerate(coords[:-1]):
+                syms = coord_expr.free_symbols
+                if not syms:
+                    if device_size[d] > 1:
+                        return True
+                    continue
+                sym = next(iter(syms))
+                it_dim_size = int(dep.ranges[sym])
+                if device_size[d] > it_dim_size:
+                    return True
+    return False
+
+
+class ScratchpadAllocator:
+    """
+    Class for allocating on scratchpad
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        layout_planning: MemoryPlanSolver | None = None,
+        pre_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
+        post_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
+    ):
+        """Configure the allocator with an optional solver and graph passes.
+
+        Args:
+            layout_planning: Solver that assigns LX addresses to lifetime-bound
+                buffers. Defaults to GreedyLayoutSolver sized to available LX memory.
+            pre_optimization_passes: Graph passes applied before layout planning.
+                Defaults to no passes.
+            post_optimization_passes: Graph passes applied after layout planning.
+                Defaults to no passes.
+        """
+        size = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
+        if layout_planning is None:
+            if config.layout_solver == "greedy":
+                layout_planning = GreedyLayoutSolver(size)
+            elif config.layout_solver == "bestfit":
+                layout_planning = BestFitLayoutSolver(size)
+            elif config.layout_solver == "firstfit":
+                layout_planning = FirstFitLayoutSolver(size)
+            else:
+                raise ValueError(
+                    f"Invalid layout_solver config option '{config.layout_solver}'."
+                )
+        if pre_optimization_passes is None:
+            pre_optimization_passes = []
+        if post_optimization_passes is None:
+            post_optimization_passes = []
+
         # Populated during plan_allocation: maps buffer/op name → reason string.
         # Stamped by _filter_ops, _build_bound_buffers, and plan_allocation
         # (for the solver decision). Reset at the start of each plan_allocation.
         self.reject_reasons: dict[str, str] = {}
+        self.pre_optimization_passes = pre_optimization_passes
+        self.post_optimization_passes = post_optimization_passes
+        self.layout_planning = layout_planning
 
-    @abstractmethod
     def plan_allocation(self, graph: GraphLowering):
-        """
-        Accepts a graph to be considered for scratchpad memory according
-        to its composition and the specific implementation used.
+        """Run pre-passes, assign LX addresses to eligible buffers, then run post-passes.
 
         Args:
-            graph (GraphLowering): Graph to be considered for scratchpad planning
+            graph: Lowered graph whose buffers will be assigned LX scratchpad
+                addresses where viable.
         """
-        pass
+        self.reject_reasons = {}
+        for p in self.pre_optimization_passes:
+            p.apply_pass(graph)
+        buffers = self._generate_buffers(graph)
+        allocation = self.layout_planning.plan_layout(buffers, log_lx_usage=True)
+        for b in allocation:
+            if b.address is None:
+                self.reject_reasons[b.name] = (
+                    f"no room on scratchpad (t={b.start_time}-{b.end_time},"
+                    f" size={b.size // 1024} KB)"
+                )
+        self._push_allocation(graph, allocation)
+        self._log_lx_pinning(graph)
+        for p in self.post_optimization_passes:
+            p.apply_pass(graph)
 
     def _get_op_name(self, op: Any) -> str:
-        target = getattr(getattr(op, "origin_node", None), "target", None)
-        org_op_name = (
-            getattr(target, "_opname", None)
-            or getattr(target, "__name__", None)
-            or getattr(target, "name", None)
-            or str(target)
-        )
-        return org_op_name
+        # Resolve the op's short name from its origin_node target first, then
+        # fall back to each fused fx node in op.origins. origin_node is always
+        # tried first (independent of origins, which may be empty), so a plain
+        # op still resolves; the origins fallback recovers a fused op like
+        # bmm+permute, whose origin_node target has no resolvable name and would
+        # otherwise resolve to "None" and be wrongly rejected as "op not allowed".
+        name = None
+        for fx_node in (getattr(op, "origin_node", None), *getattr(op, "origins", ())):
+            target = getattr(fx_node, "target", None)
+            name = (
+                getattr(target, "_opname", None)
+                or getattr(target, "__name__", None)
+                or getattr(target, "name", None)
+            )
+            if name is not None:
+                break
+        return name if name is not None else "None"
 
     def _op_output_good_for_lx_reuse(self, op: Any) -> bool:
+        if not isinstance(op, ComputedBuffer):
+            return False
+        if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+            return False
         return (
-            isinstance(op, ComputedBuffer)
-            and not isinstance(op.layout, MutationLayoutSHOULDREMOVE)
-            and (
-                config.allow_all_ops_in_lx_planning
-                or (self._get_op_name(op) in OP_OUTPUT_GOOD_FOR_LX_REUSE)
-                # Clones are only pinned when the boundary-clone path is on; they
-                # are never in the whitelist, so without this they'd be ineligible
-                # and the inserted clones would not land in LX.
-                or (config.lx_boundary_clones and self._get_op_name(op) == "clone")
-            )
+            config.allow_all_ops_in_lx_planning
+            or (self._get_op_name(op) in OP_OUTPUT_GOOD_FOR_LX_REUSE)
+            # Clones are only pinned when the boundary-clone path is on; they
+            # are never in the whitelist, so without this they'd be ineligible
+            # and the inserted clones would not land in LX.
+            or (config.lx_boundary_clones and self._get_op_name(op) == "clone")
         )
 
     def _op_inputs_good_for_lx_inplace(self, op: Any) -> list[str]:
@@ -131,7 +226,10 @@ class ScratchpadAllocator(ABC):
         cache: Optional[dict] = None,
         rw_cache: Optional[dict[str, ReadWrites]] = None,
     ) -> list[Operation]:
-        core_div_mismatch = get_ncores_for_buffers(graph, cache, rw_cache)
+        core_div_reasons: dict[str, str] = {}
+        core_div_mismatch = get_ncores_for_buffers(
+            graph, cache, rw_cache, core_div_reasons
+        )
         drop_list = set()
 
         # filter out by permitted operations
@@ -144,7 +242,23 @@ class ScratchpadAllocator(ABC):
         for key, mismatch in core_div_mismatch.items():
             if mismatch == -1:
                 drop_list.add(key)
-                self.reject_reasons[key] = "core div mismatch"
+                reason = core_div_reasons.get(key, "core div mismatch")
+                self.reject_reasons[key] = f"core div mismatch: {reason}"
+
+        # filter out intermediates read partially (sliced / multi-offset): the
+        # single-base LX path mis-addresses such reads (see
+        # buffer_not_read_in_full / compute_ops._start_addr_data), e.g. an
+        # inner-dim slice x[:, :, 32:96] feeding a chained op. _build_bound_buffers
+        # applies the same guard to graph input/output clones; this covers the
+        # intermediate buffers. Overrides allow_all_ops_in_lx_planning by design.
+        # Only check ops still eligible above: ops already dropped include
+        # non-ComputedBuffer outputs (e.g. multi-output) whose layouts have no
+        # size for buffer_not_read_in_full to inspect.
+        drop_list.update(
+            op.name
+            for op in graph.operations
+            if op.name not in drop_list and buffer_not_read_in_full(graph, op.name)
+        )
 
         if not clone_at_graph_boundaries():
             # Without clone support, graph outputs cannot be LX-pinned: the caller
@@ -180,6 +294,16 @@ class ScratchpadAllocator(ABC):
             if output_name in graph_output_names and not cloning_allowed:
                 self.reject_reasons[output_name] = "graph output (no clone)"
                 continue  # we can only allocate graph outputs if we're allowed to clone
+            if _would_produce_lx_back_gap(graph, output_name, uses):
+                self.reject_reasons[output_name] = "lx back gap"
+                continue
+            if output_name in graph_output_names and buffer_not_read_in_full(
+                graph, output_name
+            ):
+                # A pinned graph output is cloned for the HBM return; if a
+                # consumer reads it partially (sliced / multi-offset), SDSC
+                # mis-addresses the single-base LX buffer. Don't pin it.
+                continue
             buffers.append(
                 LifetimeBoundBuffer(
                     output_name,
@@ -191,7 +315,10 @@ class ScratchpadAllocator(ABC):
             )
 
         if cloning_allowed:
-            ncores = get_ncores_for_buffers(graph, cache)
+            core_div_reasons: dict[str, str] = {}
+            ncores = get_ncores_for_buffers(
+                graph, cache, reject_reasons_out=core_div_reasons
+            )
             for input_name in graph.graph_input_names:
                 uses = lifetimes[input_name]
                 if len(uses) <= 1:
@@ -202,9 +329,21 @@ class ScratchpadAllocator(ABC):
                     continue
                 if not GraphEditor.all_uses_are_rewritable(graph, uses):
                     continue
+                if buffer_not_read_in_full(graph, input_name):
+                    # A consumer reads this input partially -- a sliced/
+                    # multi-offset read (e.g. x[:, 0:512] + x[:, 512:1024], or
+                    # x[:, :, 0:64]). The clone would be pinned to LX, which
+                    # SDSC addresses by a single base, so partial reads
+                    # mis-address and produce wrong results.
+                    continue
                 num_cores = ncores.get(input_name, -1)
                 if num_cores < 0:
+                    reason = core_div_reasons.get(input_name, "core div mismatch")
+                    self.reject_reasons[input_name] = f"core div mismatch: {reason}"
                     continue  # core division mismatch across consumers
+                if _would_produce_lx_back_gap(graph, input_name, uses):
+                    self.reject_reasons[input_name] = "lx back gap"
+                    continue
                 buf = graph.get_buffer(input_name)
                 dev_layout = buf.layout.device_layout
                 dev_size = math.prod(dev_layout.device_size[:-1]) * 128
@@ -237,11 +376,11 @@ class ScratchpadAllocator(ABC):
             if not in_place_allowed[buf_name]:
                 continue
             out_start = lifetimes[buf_name][0]
-            out_ten_layout = graph.get_buffer(buf_name).layout.device_layout
+            out_ten_layout = graph.get_buffer(buf_name).get_layout().device_layout
             out_size = info["size_per_core"]
             for input_buf in info["op_inputs"]:
                 in_end = lifetimes[input_buf][-1]  # inclusive last use
-                in_ten_layout = graph.get_buffer(input_buf).layout.device_layout
+                in_ten_layout = graph.get_buffer(input_buf).get_layout().device_layout
                 in_size = mem_usage[input_buf]["size_per_core"]
                 inp_i_size_match = out_size == in_size
                 inp_i_lay_match = out_ten_layout == in_ten_layout
@@ -352,66 +491,6 @@ class ScratchpadAllocator(ABC):
     def _set_one_allocation(self, buf: TensorBox | ComputedBuffer, address: int):
         layout = buf.get_layout()
         layout.allocation["lx"] = address
-
-
-class DefaultAllocator(ScratchpadAllocator):
-    def __init__(
-        self,
-        layout_planning: MemoryPlanSolver | None = None,
-        pre_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
-        post_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
-    ):
-        """Configure the allocator with an optional solver and graph passes.
-
-        Args:
-            layout_planning: Solver that assigns LX addresses to lifetime-bound
-                buffers. Defaults to GreedyLayoutSolver sized to available LX memory.
-            pre_optimization_passes: Graph passes applied before layout planning.
-                Defaults to no passes.
-            post_optimization_passes: Graph passes applied after layout planning.
-                Defaults to no passes.
-        """
-        size = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
-        if layout_planning is None:
-            if config.layout_solver == "greedy":
-                layout_planning = GreedyLayoutSolver(size)
-            elif config.layout_solver == "bestfit":
-                layout_planning = BestFitLayoutSolver(size)
-            elif config.layout_solver == "firstfit":
-                layout_planning = FirstFitLayoutSolver(size)
-            else:
-                raise ValueError(
-                    f"Invalid layout_solver config option '{config.layout_solver}'."
-                )
-        if pre_optimization_passes is None:
-            pre_optimization_passes = []
-        if post_optimization_passes is None:
-            post_optimization_passes = []
-
-        super().__init__()
-        self.pre_optimization_passes = pre_optimization_passes
-        self.post_optimization_passes = post_optimization_passes
-        self.layout_planning = layout_planning
-
-    def plan_allocation(self, graph: GraphLowering):
-        """Run pre-passes, assign LX addresses to eligible buffers, then run post-passes.
-
-        Args:
-            graph: Lowered graph whose buffers will be assigned LX scratchpad
-                addresses where viable.
-        """
-        self.reject_reasons = {}
-        for p in self.pre_optimization_passes:
-            p.apply_pass(graph)
-        buffers = self._generate_buffers(graph)
-        allocation = self.layout_planning.plan_layout(buffers, log_lx_usage=True)
-        for b in allocation:
-            if b.address is None:
-                self.reject_reasons[b.name] = "no room on scratchpad"
-        self._push_allocation(graph, allocation)
-        self._log_lx_pinning(graph)
-        for p in self.post_optimization_passes:
-            p.apply_pass(graph)
 
 
 DEFAULT_VARIANT_CAP = 6
@@ -800,11 +879,11 @@ def _canonical_key(splits: tuple[dict, dict]) -> tuple:
     return (tuple(sorted(out.items())), tuple(sorted(red.items())))
 
 
-class StrategyBCoOptimizingAllocator(DefaultAllocator):
+class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
     """`Strategy B` assumes work_distribution committed one best option (seed). Here we
     first add a few variants based on the seed, pick the combination that minimizes HBM
-    bytes among all, then defer to DefaultAllocator's flow. As seed is in the search
-    space, the worst case matches DefaultAllocator.
+    bytes among all, then defer to ScratchpadAllocator's flow. As seed is in the search
+    space, the worst case matches ScratchpadAllocator.
     """
 
     def plan_allocation(self, graph: GraphLowering):
@@ -859,7 +938,7 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
             p.apply_pass(graph)
 
         # Standard downstream flow on the now-fixed winning splits. Mirrors
-        # DefaultAllocator.plan_allocation past the pre-passes. Reuse the search's
+        # ScratchpadAllocator.plan_allocation past the pre-passes. Reuse the search's
         # per-core-view cache + liveness only if the clone pass left the graph
         # unchanged: a clone insertion both appends an op (shifts the
         # position-indexed liveness) and rewrites input consumers' MemoryDep to read
@@ -874,7 +953,10 @@ class StrategyBCoOptimizingAllocator(DefaultAllocator):
         allocation = self.layout_planning.plan_layout(buffers, log_lx_usage=True)
         for b in allocation:
             if b.address is None:
-                self.reject_reasons[b.name] = "no room on scratchpad"
+                self.reject_reasons[b.name] = (
+                    f"no room on scratchpad (t={b.start_time}-{b.end_time},"
+                    f" size={b.size // 1024} KB)"
+                )
         self._push_allocation(graph, allocation)
         self._log_lx_pinning(graph)
         for p in self.post_optimization_passes:
@@ -1010,8 +1092,8 @@ def scratchpad_planning(
 
     Args:
         graph: Lowered graph to plan scratchpad memory for.
-        allocator: Allocator strategy to use. Defaults to DefaultAllocator.
+        allocator: Allocator strategy to use. Defaults to ScratchpadAllocator.
     """
     if allocator is None:
-        allocator = DefaultAllocator()
+        allocator = ScratchpadAllocator()
     allocator.plan_allocation(graph)

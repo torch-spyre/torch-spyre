@@ -34,7 +34,7 @@ at startup to discover the Spyre devices visible to the process.
 |---|---|
 | `PCIDEVICE_IBM_COM_AIU_PF` | Comma-separated list of PCI bus IDs assigned to the container (set by the OpenShift AIU operator or manually) |
 | `AIU_WORLD_RANK_<N>` | PCI bus ID bound to rank `N` |
-| `SPYRE_VISIBLE_DEVICES` | Override the device list explicitly (takes priority over `PCIDEVICE_IBM_COM_AIU_PF`) |
+| `SPYRE_DEVICES` | Comma-separated list of device indices to use (e.g., `0,2,3`); overrides the default enumeration |
 | `LOCAL_RANK` | Per-process rank set by `torchrun`; used to select the device for each child process |
 
 ## Runtime / driver (for `aiu-smi` and `aiu-trace-analyzer`)

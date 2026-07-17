@@ -21,6 +21,7 @@ __all__: list[str] = [
     "as_strided_with_layout",
     "empty_with_layout",
     "copy_tensor",
+    "fill_tensor",
     "encode_constant",
     "free_runtime",
     "get_device_dtype",
@@ -28,7 +29,6 @@ __all__: list[str] = [
     "get_elem_in_stick",
     "get_spyre_tensor_layout",
     "launch_jobplan",
-    "launch_kernel",
     "prepare_kernel",
     "set_downcast_warning",
     "set_spyre_tensor_layout",
@@ -291,6 +291,16 @@ def copy_tensor(
     """
     ...
 
+def fill_tensor(self: torch.Tensor, value: float) -> torch.Tensor:
+    """
+    Fill a spyre tensor with a scalar value using device-side FillDMA.
+
+    Args:
+        self: the spyre tensor to fill (in-place)
+        value: the fill value (converted to the tensor's dtype pattern)
+    """
+    ...
+
 def empty_with_layout(
     arg0: tuple[int, ...],
     arg1: SpyreTensorLayout,
@@ -340,9 +350,6 @@ def launch_jobplan(
     """
     ...
 
-def launch_kernel(
-    code_dir: str, args: collections.abc.Sequence[torch.Tensor]
-) -> None: ...
 def prepare_kernel(
     spyrecode_dir: str, stream: _SpyreStreamBase | None = None
 ) -> JobPlan:

@@ -206,6 +206,36 @@ class TestSpyreConfig(InductorTestCase):
             )
         self.assertIn("symbolic stick dim", str(cm.exception))
 
+    def test_inplace_op_run_call_deduplicates_args(self):
+        """An inplace op (x *= 2) must not pass the same tensor twice to .run().
+
+        With symbolic args, the MLIR bundle emits one input_arg param per unique
+        tensor.  Passing arg0_1 twice would cause a "Number of inputs mismatches"
+        error at launch time.  This test verifies the generated .run() call
+        contains no duplicate tensor arguments.
+        """
+
+        def fn(x):
+            x *= 2
+            return x
+
+        x = torch.randn((4, 128), dtype=torch.float16, device="spyre")
+        cfn = torch.compile(fn)
+        _, source_codes = run_and_get_code(cfn, x)
+        code = source_codes[0]
+        # Find the .run(...) call for the fused kernel
+        run_lines = [ln.strip() for ln in code.splitlines() if ".run(" in ln]
+        self.assertTrue(run_lines, "No .run(...) call found in generated code")
+        for line in run_lines:
+            # Extract the argument list between the outermost parentheses
+            args_str = line[line.index("(") + 1 : line.rindex(")")]
+            args = [a.strip() for a in args_str.split(",")]
+            self.assertEqual(
+                len(args),
+                len(set(args)),
+                f"Duplicate args in .run() call: {line}",
+            )
+
 
 class TestResolveSdscSize(InductorTestCase):
     """Unit tests for superdsc._resolve_sdsc_size."""
