@@ -519,11 +519,12 @@ class TestPrepareKernel:
                 "D2H step must carry pipeline_barrier=True by default"
             )
 
-    def test_pipeline_barrier_compute_steps_false(self):
-        """Compute and HostCompute steps must carry pipeline_barrier=False.
+    def test_pipeline_barrier_correction_sequence(self):
+        """Correction sequence: HostCompute=False, H2D=True, Compute=True.
 
-        Keeps host/device overlap: flipping either to true injects a
-        synchronize() and serializes the correction callback against device compute.
+        HostCompute opts out (overlap-eligible: runs while prior device compute
+        is in flight). H2D and Compute inherit the safe default True. Compute
+        must wait for H2D to close the RAW hazard on the seg-7 correction region.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = self.create_mock_spyrecode(
@@ -543,26 +544,28 @@ class TestPrepareKernel:
                 "compute is still in flight)"
             )
             assert job_plan.get_step_pipeline_barrier(1) is True, (
-                "H2D step must carry pipeline_barrier=True (safe-by-default "
-                "stopgap: prevents device compute racing ahead of DMA once "
-                "async DMA / multi-stream land)"
+                "H2D step must carry pipeline_barrier=True (safe default: "
+                "inherited from base class)"
             )
-            assert job_plan.get_step_pipeline_barrier(2) is False, (
-                "Compute step must carry pipeline_barrier=False (overlap-eligible; "
-                "the scheduler auto-inserts the H2D→Compute barrier under "
-                "STRICT_ORDERING regardless)"
+            assert job_plan.get_step_pipeline_barrier(2) is True, (
+                "Compute step must carry pipeline_barrier=True: it is a "
+                "consumer of H2D's seg-7 write (RAW hazard); Compute must "
+                "wait for H2D. Inert under STRICT_ORDERING; load-bearing "
+                "under OP_ORDERING."
             )
 
-    def test_pipeline_barrier_pure_compute_false(self):
-        """A standalone ComputeOnDevice step must carry pipeline_barrier=False."""
+    def test_pipeline_barrier_pure_compute_true(self):
+        """A standalone ComputeOnDevice step must carry pipeline_barrier=True."""
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = self.create_mock_spyrecode(tmpdir)
             job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
 
             assert job_plan.num_steps() == 1
             assert job_plan.get_step_type(0) == "Compute"
-            assert job_plan.get_step_pipeline_barrier(0) is False, (
-                "Compute step must carry pipeline_barrier=False"
+            assert job_plan.get_step_pipeline_barrier(0) is True, (
+                "Compute step must carry pipeline_barrier=True: consumer of "
+                "DMA'd inputs (RAW hazard). Inert under STRICT_ORDERING; "
+                "load-bearing under OP_ORDERING."
             )
 
     def test_get_step_pipeline_barrier_out_of_range(self):

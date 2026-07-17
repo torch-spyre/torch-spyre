@@ -254,7 +254,9 @@ class JobPlanStep {
   }
 
  protected:
-  // true by default so DMA steps barrier; compute steps override to false.
+  // true by default: every step is a potential consumer that should wait for
+  // prior ops. Steps that are genuinely overlap-eligible (HostCompute) opt out
+  // explicitly.
   bool pipeline_barrier_ = true;
 };
 
@@ -361,9 +363,7 @@ class JobPlanStepCompute final : public JobPlanStep {
       : program_address_(std::move(program_address)),
         bind_io_addresses_(bind_io_addresses),
         bootstrap_offset_(bootstrap_offset),
-        name_(std::move(name)) {
-    pipeline_barrier_ = false;  // overlap-eligible; DMA barriers suffice
-  }
+        name_(std::move(name)) {}
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
