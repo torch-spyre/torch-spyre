@@ -182,6 +182,14 @@ Each device keeps a fixed pool of streams (see `csrc/spyre_stream.cpp`). Stream 
 
 On input, `priority` is a binary switch: `0` selects the low-priority pool and any non-zero value selects the high-priority pool. The `Stream.priority` getter does not echo the constructor value back. It reports `0` for low-priority streams and `-1` for high-priority streams, matching `torch.cuda.Stream.priority`. The asymmetry is implemented in `csrc/spyre_stream.cpp` `SpyreStream::priority`.
 
+### SpyreStream internals
+
+For ownership, synchronization, and locking details see:
+
+```{toctree}
+ownership_model_spyrestream
+```
+
 ## SpyreCode and JobPlan
 
 A compiled artifact reaches the runtime as a **SpyreCode** directory: a JSON-based
