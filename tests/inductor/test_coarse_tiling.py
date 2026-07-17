@@ -29,7 +29,7 @@ Covers six areas, each in its own class group:
   5. generate_bundle MLIR output: loop structure, affine maps, symbol constants
      (TestGenerateBundleMlir, TestFindUnimplemented,
       TestGenerateBundleMlirSnapshot, TestGenerateBundleMlirWithAffineStrides,
-      TestGenerateBundleNestedTiling, TestGenerateBundleUnrollPath)
+      TestGenerateBundleNestedTiling, TestGenerateBundleAffineLoopPath)
   6. Buffer propagation: consumer analysis helpers for insert_tiling_propagation
      (TestCoarseTileBufferPropagation)
 
