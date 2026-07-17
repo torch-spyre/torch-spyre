@@ -363,6 +363,7 @@ The key elements of metadata are:
 - `device_size`: analogous to PyTorch's `size` but with padded values and extra dimensions for tiling.
 - `stride_map`: a vector of the same length as `device_size` giving the host stride for each device dimension (-1 for synthetic or padded dimensions).
 - `device_dtype`: the datatype of the Tensor.
+- `element_arrangement`: how elements are packed within a stick. Defaults to `STANDARD` and appears in the `repr` only when it is non-standard.
 
 As a concrete example, run the following program:
 
@@ -408,14 +409,15 @@ SpyreTensorLayout(device_size=[100, 3, 5, 64], stride_map =[150, 64, 15000, 1], 
 ```
 
 A second constructor of `SpyreTensorLayout` enables finer-grained control.
-It takes an additional `dim_order` allowing the programmer
-to fine-tune the layout based on their knowledge of how the Tensor will be used
-in computation.
+It takes the explicit `host_strides` and an additional `dim_order`, allowing
+the programmer to fine-tune the layout based on their knowledge of how the
+Tensor will be used in computation. (The minimal constructor computes the
+default contiguous strides for you; this one requires them explicitly.)
 
 For example, changing the constructor in the above program to
 
 ```
-stl = SpyreTensorLayout((5, 100, 150), torch.float16, [1,0,2])
+stl = SpyreTensorLayout((5, 100, 150), (15000, 150, 1), torch.float16, [1,0,2])
 ```
 
 yields a tensor with the tiling inverted:

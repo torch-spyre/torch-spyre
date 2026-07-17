@@ -268,7 +268,7 @@ class TestNormalizationScalarOperations:
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1722
         if dtype == torch.float32:
             pytest.xfail(
-                reason="view() + mean() triggers Cannot satisfy hardware memory span limit (256MB) without splitting reduction dimensions."
+                reason="view() + mean() triggers Cannot satisfy hardware memory span limit without splitting reduction dimensions."
             )
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1688
         if dtype == torch.float16:
@@ -296,7 +296,7 @@ class TestNormalizationScalarOperations:
     def test_groupnorm_affine(self, execution_mode):
         """Test GroupNorm with affine transformation."""
         pytest.xfail(
-            "view() + mean() triggers Cannot satisfy hardware memory span limit (256MB) without splitting reduction dimensions."
+            "view() + mean() triggers Cannot satisfy hardware memory span limit without splitting reduction dimensions."
         )
 
         eps = 1e-5

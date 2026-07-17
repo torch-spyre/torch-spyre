@@ -848,9 +848,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((3, 11, 2880)),
                     cached_xavier((2880, 2880)),
                 ),
-                "4d_B2_H2_M2048_K2048_N65536": (
+                "4d_B2_H2_M2048_K2048_N65472": (
                     cached_randn((2, 2, 2048, 2048)),
-                    cached_xavier((2, 2, 2048, 65536)),
+                    cached_xavier((2, 2, 2048, 65472)),
                 ),
             },
         },

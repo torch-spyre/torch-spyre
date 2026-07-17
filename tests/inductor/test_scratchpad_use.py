@@ -30,6 +30,13 @@ from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import config as ts_inductor_config
 
+try:
+    from ortools.sat.python import cp_model  # noqa: F401
+
+    _HAS_ORTOOLS = True
+except ImportError:
+    _HAS_ORTOOLS = False
+
 
 Ts = TypeVarTuple("Ts")
 
@@ -254,6 +261,11 @@ class _ParameterizedScratchpadMeta(type):
     the combo and check correctness, compare HBM off vs on, ...) is defined by
     the class, not baked into the metaclass.
 
+    A class may also define a static ``case_decorators(params) -> list`` hook.
+    Each decorator it returns is applied to the generated method for that combo
+    (e.g. mark the ``cpsat`` combos ``expectedFailure``). Absent hook -> no
+    per-case decoration.
+
     Generating methods rather than sibling classes keeps everything in the
     ``attrs`` dict handed to ``__new__`` — no module-namespace or ``sys.modules``
     access, so it is immune to the OOT runner's out-of-``sys.modules``
@@ -293,11 +305,19 @@ class _ParameterizedScratchpadMeta(type):
                 ]
             else:
                 combos = [{}]
+            # Optional per-combo decorator hook (e.g. mark cpsat as expectedFailure).
+            decorators_for = attrs.get("case_decorators")
+            if isinstance(decorators_for, staticmethod):
+                decorators_for = decorators_for.__func__
             for params in combos:
                 suffix = mcs._combo_suffix(params)
                 for label, factory in models:
                     test_name = f"test_{label}__{suffix}" if suffix else f"test_{label}"
-                    attrs[test_name] = mcs._make_case(params, factory)
+                    test_method = mcs._make_case(params, factory)
+                    if decorators_for is not None:
+                        for dec in decorators_for(params):
+                            test_method = dec(test_method)
+                    attrs[test_name] = test_method
         return super().__new__(mcs, name, bases, attrs)
 
     @staticmethod
@@ -340,7 +360,7 @@ class ParameterizedScratchpadUsage(
         return mlp, args, {"atol": 0.1, "rtol": 0.1}
 
     parameter_axes = {
-        "solver_method": ("greedy", "bestfit", "firstfit"),
+        "solver_method": ("greedy", "bestfit", "firstfit", "cpsat"),
         "sencores": (1, 32),
         "co_optimization": (False, True)
         if ts_inductor_config.co_optimizing_lx_planning
@@ -531,6 +551,106 @@ class TestCloneAtGraphBoundaries(BaseTestScratchpadUsage):
             "LX input clone changed the numerical result",
         )
 
+    # TODO: Update to expected pass on PR2907
+    @unittest.skipUnless(
+        _HAS_ORTOOLS, "joint CP-SAT boundary-clone xfail needs ortools"
+    )
+    @unittest.expectedFailure
+    def test_input_clone_unsupported_under_joint_cpsat(self):
+        """Boundary clone insertion is not yet supported by the joint CP-SAT
+        allocator (``layout_solver="cpsat"`` with ``co_optimizing_lx_planning``).
+
+        The joint allocator builds CoreDivisionBuffers only for graph *ops*:
+        graph inputs are never candidates (so an input read by multiple ops is
+        never cloned into LX) and graph outputs carry a "graph output" residency
+        reason (never pinned, so no output clone). The op count therefore does
+        not grow. This is an *expected failure* until the CP-SAT path grows
+        boundary-clone support; the greedy and placement-only CP-SAT paths handle
+        it (see ``test_input_clone_when_read_by_multiple_ops``).
+
+        Skipped without ortools: the allocator would then fall back to greedy,
+        which *does* clone, making the assertion pass (an unexpected success).
+        """
+        x = self.rand_device((64, 1024))
+
+        def fn(x):
+            # x read by both exp and add -> eligible for an input clone.
+            return torch.exp(x) + x
+
+        with ts_inductor_config.patch(lx_planning=False):
+            _, n_ops_no_lx, _ = self._compile_and_inspect(fn, (x,))
+
+        torch.compiler.reset()
+
+        with ts_inductor_config.patch(
+            lx_planning=True,
+            layout_solver="cpsat",
+            co_optimizing_lx_planning=True,
+        ):
+            _, n_ops_with_lx, _ = self._compile_and_inspect(fn, (x,))
+
+        # Holds on the greedy / placement-only paths (see the sibling test); the
+        # joint CP-SAT path inserts no boundary clone -> fails -> expected failure.
+        self.assertGreater(
+            n_ops_with_lx,
+            n_ops_no_lx,
+            "joint CP-SAT unexpectedly inserted a boundary clone "
+            f"({n_ops_no_lx} -> {n_ops_with_lx} ops)",
+        )
+
+    # TODO: Update to expected pass on PR2907
+    @unittest.skipUnless(
+        _HAS_ORTOOLS, "joint CP-SAT boundary-clone xfail needs ortools"
+    )
+    @unittest.expectedFailure
+    def test_output_clone_unsupported_under_joint_cpsat(self):
+        """Output boundary clone insertion is not yet supported by the joint
+        CP-SAT allocator (``layout_solver="cpsat"`` with
+        ``co_optimizing_lx_planning``).
+
+        Output-side counterpart to
+        ``test_input_clone_unsupported_under_joint_cpsat``. The joint allocator
+        builds CoreDivisionBuffers only for graph *ops* and tags graph outputs
+        with a "graph output" residency reason, so a buffer that is both a graph
+        output and read inside the graph is never pinned and no output clone is
+        inserted. The op count therefore does not grow. This is an *expected
+        failure* until the CP-SAT path grows boundary-clone support; the greedy
+        and placement-only CP-SAT paths handle it (see
+        ``test_output_clone_when_intermediate_is_also_graph_output``).
+
+        Skipped without ortools: the allocator would then fall back to greedy,
+        which *does* clone, making the assertion pass (an unexpected success).
+        """
+        x = self.rand_device((64, 1024))
+
+        def fn(x):
+            # y = exp(x) is both a graph output and read by add_op -> eligible
+            # for an output clone on the greedy / placement-only paths.
+            y = torch.exp(x)
+            z = y + 1
+            return y, z
+
+        with ts_inductor_config.patch(lx_planning=False):
+            _, n_ops_no_lx, _ = self._compile_and_inspect(fn, (x,))
+
+        torch.compiler.reset()
+
+        with ts_inductor_config.patch(
+            lx_planning=True,
+            layout_solver="cpsat",
+            co_optimizing_lx_planning=True,
+        ):
+            _, n_ops_with_lx, _ = self._compile_and_inspect(fn, (x,))
+
+        # Holds on the greedy / placement-only paths (see the sibling test); the
+        # joint CP-SAT path inserts no boundary clone -> fails -> expected failure.
+        self.assertGreater(
+            n_ops_with_lx,
+            n_ops_no_lx,
+            "joint CP-SAT unexpectedly inserted a boundary clone "
+            f"({n_ops_no_lx} -> {n_ops_with_lx} ops)",
+        )
+
     def test_output_clone_when_intermediate_is_also_graph_output(self):
         """A buffer that is both a graph output and read inside the graph is pinned to LX;
         a clone of it is inserted as the actual (HBM) graph output returned to the caller."""
@@ -691,17 +811,38 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
     plans which achieve desirable performance. New plans should be profiled
     before making these test more permissive.
 
+    NOTE: this suite is intentionally *disabled* today. Unlike
+    ``ParameterizedScratchpadUsage`` / ``TestCpSatAllocatorFallback`` it does not
+    set ``metaclass=_ParameterizedScratchpadMeta``, so no ``test_*`` methods are
+    generated and nothing is collected -- the co-optimization compiles are too
+    slow to run on every CI job. The ``parameter_axes`` / ``parameter_models`` /
+    ``case_decorators`` / ``run_case`` machinery below is ready; re-enable the
+    suite by attaching the metaclass once ``cpsat`` becomes the default
+    ``layout_solver``. (This omission is deliberate, not a dropped metaclass.)
+
+    When enabled: the acceptance criterion for each model (its prescribed
+    fingerprint) is defined *once* in that model's factory and swept over the
+    ``solver_method`` axis by ``_ParameterizedScratchpadMeta``. The prescribed
+    plans are the *greedy* StrategyB plans; the joint CP-SAT allocator
+    (``layout_solver="cpsat"``) optimises core division and placement jointly
+    and is expected to land on a different (not yet pinned-down) plan, so the
+    ``cpsat`` combos are marked ``expectedFailure`` via ``case_decorators``.
+    They guard against the CP-SAT path silently regressing to the greedy plan;
+    when CP-SAT's plans are profiled and stabilised, give ``cpsat`` its own
+    prescribed fingerprints.
+
     It extends :class:`BaseTestScratchpadUsage` for the shared helpers
     (``rand_device``, ``_simple_mlp``, ``pre_scheduling_iterating_pass`` and the
     pre-scheduling-pass setup) and applies its own config patches at the
-    test-case level in ``_allocation_fingerprint`` (greedy / sencores=32 /
-    co-optimization / boundary clones).
+    test-case level in ``_allocation_fingerprint`` (sencores=32 /
+    co-optimization / boundary clones); the solver is the swept axis.
     """
 
     def _allocation_fingerprint(
         self,
         model: Callable[[Unpack[Ts]], torch.Tensor],
         args: tuple[Unpack[Ts]],
+        layout_solver: str,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, _AllocEntry]]:
         """Compile ``model`` through the allocator (sencores=32, lx_planning on)
         and return ``(cpu_result, device_result, fingerprint)``.
@@ -737,7 +878,7 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
 
         with self.pre_scheduling_iterating_pass(visitor):
             with ts_inductor_config.patch(
-                layout_solver="greedy",
+                layout_solver=layout_solver,
                 sencores=32,
                 co_optimizing_lx_planning=True,
                 lx_boundary_clones=True,
@@ -752,11 +893,12 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
         model: Callable[[Unpack[Ts]], torch.Tensor],
         args: tuple[Unpack[Ts]],
         expected: dict[str, _AllocEntry],
+        layout_solver: str,
         atol: float = 0.1,
         rtol: float = 0.1,
     ) -> None:
         cpu_result, device_result, fingerprint = self._allocation_fingerprint(
-            model, args
+            model, args, layout_solver=layout_solver
         )
         self.assertEqual(
             fingerprint,
@@ -773,7 +915,11 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
             msg="prescribed-allocation result diverged from CPU",
         )
 
-    def test_softmax_prescribed_allocation(self):
+    # Model factories. Each returns ``(model, args, kwargs)`` where ``kwargs``
+    # carries the acceptance criterion for that model — its prescribed
+    # fingerprint (``expected``) plus optional tolerances — defined once and
+    # reused across every solver in ``parameter_axes``.
+    def _softmax_case(self):
         """softmax(dim=0) over (512, 1024). The desired plan keeps only the
         ``exp`` intermediate (buf1) resident in LX; the two reductions (buf0=max,
         buf3=sum) and the normalised bodies (buf2, buf4) spill to HBM. The
@@ -781,19 +927,21 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
         split of the reduced axis (``((1, 16),), ((1024, 2),)``); the pointwise
         ops take a full 32-way split of the stride-1024 axis (``((1024, 32),)``).
         """
-        self._assert_prescribed_allocation(
+        return (
             functools.partial(torch.softmax, dim=0),
             (self.rand_device((512, 1024)),),
             {
-                "buf0": ("HBM", 2048, (((1, 16),), ((1024, 2),))),
-                "buf1": ("LX", 1048576, (((1024, 32),), ())),
-                "buf2": ("HBM", 1048576, (((1024, 32),), ())),
-                "buf3": ("HBM", 2048, (((1, 16),), ((1024, 2),))),
-                "buf4": ("HBM", 1048576, (((1024, 32),), ())),
+                "expected": {
+                    "buf0": ("HBM", 2048, (((1, 16),), ((1024, 2),))),
+                    "buf1": ("LX", 1048576, (((1024, 32),), ())),
+                    "buf2": ("HBM", 1048576, (((1024, 32),), ())),
+                    "buf3": ("HBM", 2048, (((1, 16),), ((1024, 2),))),
+                    "buf4": ("HBM", 1048576, (((1024, 32),), ())),
+                }
             },
         )
 
-    def test_mlp_prescribed_allocation(self):
+    def _mlp_case(self):
         """Two-layer linear MLP (``nn.Linear -> silu -> nn.Linear``). With every
         op LX-eligible, the plan keeps two of the three hidden-width activations
         resident (buf0, buf1); the third hidden-width buffer (buf2), the two
@@ -801,20 +949,24 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
         (buf5, buf6) spill to HBM. The resident hidden-width ops take an 8x4
         split across two axes (``((1, 8), (1024, 4))``).
         """
-        self._assert_prescribed_allocation(
-            *self._simple_mlp(),
+        model, args = self._simple_mlp()
+        return (
+            model,
+            args,
             {
-                "buf0": ("LX", 262144, (((1, 8), (1024, 4)), ())),
-                "buf1": ("LX", 262144, (((1, 8), (1024, 4)), ())),
-                "buf2": ("HBM", 262144, (((1, 8), (1024, 4)), ())),
-                "buf3": ("HBM", 65536, (((1, 2), (256, 8)), ((1, 2),))),
-                "buf4": ("HBM", 65536, (((256, 32),), ())),
-                "buf5": ("HBM", 524288, (((1, 2), (256, 16)), ())),
-                "buf6": ("HBM", 524288, (((1, 16), (1024, 2)), ())),
+                "expected": {
+                    "buf0": ("LX", 262144, (((1, 8), (1024, 4)), ())),
+                    "buf1": ("LX", 262144, (((1, 8), (1024, 4)), ())),
+                    "buf2": ("HBM", 262144, (((1, 8), (1024, 4)), ())),
+                    "buf3": ("HBM", 65536, (((1, 2), (256, 8)), ((1, 2),))),
+                    "buf4": ("HBM", 65536, (((256, 32),), ())),
+                    "buf5": ("HBM", 524288, (((1, 2), (256, 16)), ())),
+                    "buf6": ("HBM", 524288, (((1, 16), (1024, 2)), ())),
+                }
             },
         )
 
-    def test_sdpa_prescribed_allocation(self):
+    def _sdpa_case(self):
         """4D scaled-dot-product attention. With every op LX-eligible, the plan
         keeps most of the matmul -> softmax -> matmul chain resident (buf0,
         buf2-buf8, all 32-way split); one matmul output (buf1), a normalised
@@ -824,7 +976,7 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
         (``((64, 4), (16384, 4))``) and the empty constant is undivided.
         """
         batch, heads, seq_len, head_dim = 1, 4, 256, 64
-        self._assert_prescribed_allocation(
+        return (
             torch.nn.functional.scaled_dot_product_attention,
             (
                 self.rand_device((batch, heads, seq_len, head_dim)),
@@ -832,23 +984,25 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
                 self.rand_device((batch, heads, seq_len, head_dim)),
             ),
             {
-                "buf0": ("LX", 131072, (((64, 32),), ())),
-                "buf1": ("HBM", 131072, (((64, 32),), ())),
-                "buf2": ("LX", 524288, (((256, 32),), ())),
-                "buf3": ("LX", 131072, (((1, 32),), ())),
-                "buf4": ("LX", 524288, (((256, 32),), ())),
-                "buf5": ("LX", 524288, (((256, 32),), ())),
-                "buf6": ("LX", 131072, (((1, 32),), ())),
-                "buf7": ("LX", 524288, (((256, 32),), ())),
-                "buf8": ("LX", 131072, (((64, 32),), ())),
-                "buf9": ("HBM", 131072, (((256, 32),), ())),
-                "buf10": ("HBM", 128, ((), ())),
-                # buf11 is eliminated in dedup_and_promote_constants
-                "buf12": ("HBM", 131072, (((64, 4), (16384, 4)), ())),
+                "expected": {
+                    "buf0": ("LX", 131072, (((64, 32),), ())),
+                    "buf1": ("HBM", 131072, (((64, 32),), ())),
+                    "buf2": ("LX", 524288, (((256, 32),), ())),
+                    "buf3": ("LX", 131072, (((1, 32),), ())),
+                    "buf4": ("LX", 524288, (((256, 32),), ())),
+                    "buf5": ("LX", 524288, (((256, 32),), ())),
+                    "buf6": ("LX", 131072, (((1, 32),), ())),
+                    "buf7": ("LX", 524288, (((256, 32),), ())),
+                    "buf8": ("LX", 131072, (((64, 32),), ())),
+                    "buf9": ("HBM", 131072, (((256, 32),), ())),
+                    "buf10": ("HBM", 128, ((), ())),
+                    # buf11 is eliminated in dedup_and_promote_constants
+                    "buf12": ("HBM", 131072, (((64, 4), (16384, 4)), ())),
+                }
             },
         )
 
-    def test_swiglu_prescribed_allocation(self):
+    def _swiglu_case(self):
         """A single SwiGLU layer: two parallel ``nn.Linear`` projections (each a
         ``mm`` GEMM plus a bias add) feeding ``silu(gate) * up``. The lowered
         graph is eight buffers:
@@ -875,18 +1029,58 @@ class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
         so the broadcast-read guard in ``get_ncores_for_buffers`` keeps ``x`` in
         HBM.
         """
-        self._assert_prescribed_allocation(
-            *self._swiglu(),
+        model, args = self._swiglu()
+        return (
+            model,
+            args,
             {
-                "buf6": ("HBM", 524288, (((1, 2), (256, 16)), ())),
-                "buf0": ("LX", 262144, (((1, 8), (1024, 4)), ())),
-                "buf1": ("LX", 262144, (((1, 8), (1024, 4)), ())),
-                "buf2": ("LX", 262144, (((1, 8), (1024, 4)), ())),
-                "buf7": ("HBM", 524288, (((1, 2), (256, 16)), ())),
-                "buf3": ("LX", 262144, (((1, 8), (1024, 4)), ())),
-                "buf4": ("LX", 262144, (((1, 8), (1024, 4)), ())),
-                "buf5": ("HBM", 262144, (((1, 8), (1024, 4)), ())),
+                "expected": {
+                    "buf6": ("HBM", 524288, (((1, 2), (256, 16)), ())),
+                    "buf0": ("LX", 262144, (((1, 8), (1024, 4)), ())),
+                    "buf1": ("LX", 262144, (((1, 8), (1024, 4)), ())),
+                    "buf2": ("LX", 262144, (((1, 8), (1024, 4)), ())),
+                    "buf7": ("HBM", 524288, (((1, 2), (256, 16)), ())),
+                    "buf3": ("LX", 262144, (((1, 8), (1024, 4)), ())),
+                    "buf4": ("LX", 262144, (((1, 8), (1024, 4)), ())),
+                    "buf5": ("HBM", 262144, (((1, 8), (1024, 4)), ())),
+                }
             },
+        )
+
+    parameter_axes = {"solver_method": ("greedy", "cpsat")}
+    parameter_models = (
+        ("softmax_prescribed_allocation", _softmax_case),
+        ("mlp_prescribed_allocation", _mlp_case),
+        ("sdpa_prescribed_allocation", _sdpa_case),
+        ("swiglu_prescribed_allocation", _swiglu_case),
+    )
+
+    # TODO: Update this when we have matching alloctions with CP-SAT or equally optimal plans
+    @staticmethod
+    def case_decorators(params):
+        """The greedy plans are prescribed exactly; CP-SAT is expected to differ,
+        so mark its combos ``expectedFailure`` (and skip when ortools is absent
+        since the joint CP-SAT path needs it)."""
+        if params["solver_method"] == "cpsat":
+            return [
+                unittest.expectedFailure,
+                unittest.skipUnless(
+                    _HAS_ORTOOLS, "joint CP-SAT prescribed xfail needs ortools"
+                ),
+            ]
+        return []
+
+    def run_case(self, params: dict, factory: Callable) -> None:
+        """Compile the factory's model through the co-optimising allocator on the
+        combo's solver and assert it matches the model's prescribed fingerprint."""
+        model, args, kwargs = factory(self)
+        self._assert_prescribed_allocation(
+            model,
+            args,
+            kwargs["expected"],
+            layout_solver=params["solver_method"],
+            atol=kwargs.get("atol", 0.1),
+            rtol=kwargs.get("rtol", 0.1),
         )
 
 
@@ -904,7 +1098,7 @@ class TestIntermediatePartialReadNotPinned(BaseTestScratchpadUsage):
 
     def test_sliced_intermediate_is_correct(self):
         # Both leading dims large so the chained ops divide cleanly across
-        # cores (no core-division mismatch) -- the case that would otherwise
+        # cores (no core-division mismatch) — the case that would otherwise
         # LX-pin the sliced intermediate. allow_all_ops_in_lx_planning makes
         # the intermediate LX-eligible; sencores=32 gives the multi-core split.
         x = self.rand_device((128, 192, 256))
@@ -934,8 +1128,161 @@ class TestIntermediatePartialReadNotPinned(BaseTestScratchpadUsage):
             cpu_result,
             atol=0.1,
             rtol=0.1,
-            msg="sliced intermediate miscompiled -- is the _filter_ops guard present?",
+            msg="sliced intermediate miscompiled — is the _filter_ops guard present?",
         )
+
+
+class TestCpSatAllocatorFallback(
+    BaseTestScratchpadUsage, metaclass=_ParameterizedScratchpadMeta
+):
+    """CP-SAT gracefully degrades to greedy placement when ortools is absent.
+
+    Forces the missing-ortools condition (``cp_model = None``) and drives the
+    ``layout_solver="cpsat"`` path over the model sweep, in both the joint
+    (``co_optimization=True``) and placement-only (``co_optimization=False``)
+    routings. In every combination the compile must succeed and LX planning must
+    still reduce HBM traffic (the greedy fallback is correct, just not
+    CP-SAT-optimal). The metaclass injects one ``test_<model>__<combo>`` method
+    per ``(model, config-combo)``.
+    """
+
+    # Models swept by the parameterized suites, as ``(label, factory)`` where
+    # ``factory(self) -> (model, args, kwargs)``. ``kwargs`` are forwarded to the
+    # per-case body (e.g. relaxed tolerances for fp16 matmul). SDPA is intentionally
+    # omitted — it is too slow under co-optimization.
+    def _softmax_case(self):
+        f = functools.partial(torch.softmax, dim=0)
+        x = self.rand_device((512, 1024))
+        return f, (x,), {}
+
+    def _mlp_case(self):
+        mlp, args = self._simple_mlp()
+        return mlp, args, {"atol": 0.1, "rtol": 0.1}
+
+    parameter_axes = {
+        "solver_method": ("cpsat",),
+        "sencores": (32,),
+        "co_optimization": (False, True),
+    }
+
+    parameter_models = (("softmax", _softmax_case), ("mlp", _mlp_case))
+
+    @contextmanager
+    def _ortools_absent(self):
+        """Force the missing-ortools condition: CpSatLayoutSolver.__init__ raises
+        ImportError (so the allocator falls back) exactly when cp_model is None,
+        which is how a real missing install presents."""
+        from torch_spyre._inductor.scratchpad import ilp_solver_ortools
+
+        saved = ilp_solver_ortools.cp_model
+        ilp_solver_ortools.cp_model = None
+        try:
+            yield
+        finally:
+            ilp_solver_ortools.cp_model = saved
+
+    def run_case(self, params: dict, factory: Callable) -> None:
+        """Run ``factory``'s model for correctness under this combo, applying
+        the combo's config at the test-case level (the inherited setUp only
+        applies invariants)."""
+        with self._ortools_absent():
+            with ts_inductor_config.patch(
+                layout_solver=params["solver_method"],
+                sencores=params["sencores"],
+                co_optimizing_lx_planning=params["co_optimization"],
+            ):
+                model, args, kwargs = factory(self)
+                torch.compiler.reset()
+                with ts_inductor_config.patch(lx_planning=False):
+                    result_without_lx, hbm_without_lx = self.measure_hbm_transfers(
+                        model, args
+                    )
+                torch.compiler.reset()
+                with ts_inductor_config.patch(lx_planning=True):
+                    result_with_lx, hbm_with_lx = self.measure_hbm_transfers(
+                        model, args
+                    )
+
+        self.assertLess(
+            hbm_with_lx,
+            hbm_without_lx,
+            f"Expected LX planning to reduce HBM transfers, but it did not "
+            f"({hbm_with_lx} vs {hbm_without_lx} bytes)",
+        )
+        # LX placement only moves buffers, so on/off should match within fp16
+        # rounding (the difference is a couple of ULP). Tolerances come from the
+        # model's kwargs, matching how the correctness path compares elsewhere.
+        atol = kwargs.get("atol", 1e-4)
+        rtol = kwargs.get("rtol", 1e-5)
+        self.assertTrue(
+            torch.allclose(result_without_lx, result_with_lx, atol=atol, rtol=rtol),
+            "Results do not match between LX planning on and off",
+        )
+
+
+class TestSelectAllocator(unittest.TestCase):
+    """select_allocator maps config -> (allocator, solver) so the allocators
+    never inspect config themselves. Pure dispatch, no device needed."""
+
+    def test_dispatch_by_config(self):
+        from torch_spyre._inductor.scratchpad.allocator import (
+            CoOptimizingAllocator,
+            ScratchpadAllocator,
+            StrategyBCoOptimizingAllocator,
+            select_allocator,
+        )
+        from torch_spyre._inductor.scratchpad.plan_solver import GreedyLayoutSolver
+        from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
+            BestFitLayoutSolver,
+        )
+
+        with ts_inductor_config.patch(
+            layout_solver="greedy", co_optimizing_lx_planning=False
+        ):
+            a = select_allocator()
+            self.assertIs(type(a), ScratchpadAllocator)
+            self.assertIsInstance(a.layout_planning, GreedyLayoutSolver)
+
+        with ts_inductor_config.patch(
+            layout_solver="bestfit", co_optimizing_lx_planning=False
+        ):
+            a = select_allocator()
+            self.assertIs(type(a), ScratchpadAllocator)
+            self.assertIsInstance(a.layout_planning, BestFitLayoutSolver)
+
+        with ts_inductor_config.patch(
+            layout_solver="greedy", co_optimizing_lx_planning=True
+        ):
+            self.assertIsInstance(select_allocator(), StrategyBCoOptimizingAllocator)
+
+        # cpsat + co-optimization routes to the joint allocator.
+        with ts_inductor_config.patch(
+            layout_solver="cpsat", co_optimizing_lx_planning=True
+        ):
+            self.assertIsInstance(select_allocator(), CoOptimizingAllocator)
+
+        # cpsat without co-optimization is placement-only: a ScratchpadAllocator
+        # driven by the CP-SAT solver on the pre-determined core divisions.
+        with ts_inductor_config.patch(
+            layout_solver="cpsat", co_optimizing_lx_planning=False
+        ):
+            a = select_allocator()
+            self.assertIs(type(a), ScratchpadAllocator)
+            if _HAS_ORTOOLS:
+                from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+                    CpSatLayoutSolver,
+                )
+
+                self.assertIsInstance(a.layout_planning, CpSatLayoutSolver)
+            else:
+                # ortools absent: falls back to greedy placement.
+                self.assertIsInstance(a.layout_planning, GreedyLayoutSolver)
+
+        with ts_inductor_config.patch(
+            layout_solver="bogus", co_optimizing_lx_planning=False
+        ):
+            with self.assertRaises(ValueError):
+                select_allocator()
 
 
 if __name__ == "__main__":
