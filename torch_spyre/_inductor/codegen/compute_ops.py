@@ -546,10 +546,7 @@ def generate_sdsc(
                 )
                 if is_tiled_lx:
                     raise NotImplementedError(
-                        "Tiled (advancing) lx-allocated tensors are not supported "
-                        "in the symbolic preserved-loop path: LX addresses cannot "
-                        "be expressed as affine.apply symbols. Mark this tensor "
-                        "per_tile_fixed instead."
+                        "Tiled (advancing) lx-allocated tensors are not yet supported."
                     )
                 affine_strides.append([{} for _ in tiled_symbols])
                 continue
