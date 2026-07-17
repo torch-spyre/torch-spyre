@@ -3,7 +3,7 @@
 ## Background
 
 Spyre kernels must keep each core's memory-address span within the hardware
-limit (`MAX_SPAN_BYTES`, normally 256 MiB).  Normal `work_division` splits work
+limit (`MAX_SPAN_BYTES`, (255.996 MiB)).  Normal `work_division` splits work
 across cores, but some physical layouts still expose a span that is too large
 for one core.  When that happens, backend compilation can fail with Work
 Division warnings, deeptools mutable-address failures, or immediate/EAR boundary
