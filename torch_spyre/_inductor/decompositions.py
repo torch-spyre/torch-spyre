@@ -658,7 +658,7 @@ def spyre__sdpa_overrideable(
                         )  # batch_size, num_heads, max_seqlen_q sparse
 
     output = torch.ops.spyre.copy_f(output / denominator.unsqueeze(-1), output)
-
+    output = output.contiguous().transpose(1, 2).contiguous().transpose(1, 2)
     logsumexp = torch.empty(
         (batch_size, num_heads, max_seqlen_q), dtype=torch.float32, device="spyre"
     )

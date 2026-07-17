@@ -32,6 +32,9 @@ MutationOutput sentinels that void fallbacks register.
 Plus `reinterpret_tensor` on the CPU buffers that fallbacks emit when a graph
 mixes Spyre and CPU-C++ kernels (TestReinterpretTensorCpuBuffer).
 
+Plus a traced spyre -> cpu -> spyre round-trip via plain `.to()`
+(TestTracedDeviceCopy).
+
 All tests run end-to-end through `torch.compile(..., backend="inductor")` on
 the Spyre device to guard against regressions.
 """
@@ -190,6 +193,31 @@ class TestFallbackKernelShape3Void(unittest.TestCase):
         torch.testing.assert_close(out, torch.full((4,), 6.0, dtype=DTYPE))
 
 
+class TestTracedDeviceCopy(unittest.TestCase):
+    """A traced spyre -> cpu -> spyre round-trip must not crash.
+
+    A plain `.to()` that Dynamo can trace lowers to an in-graph
+    `DeviceCopy`, so the schedule mixes Spyre and CPU nodes -- which used
+    to break the Spyre passes (propagate_layouts, work_division,
+    spyre_fuse_nodes) and the `SpyreAsyncCompile` stub. Sibling to the
+    custom-op test in the `reinterpret_device_fix` branch.
+    """
+
+    def test_cpu_slice_roundtrip_compiles(self):
+        def fn(x):
+            x_cpu = x.to("cpu")
+            d = x_cpu.shape[-1] // 2
+            x1 = x_cpu[..., :d].to(DEVICE)
+            x2 = x_cpu[..., d:].to(DEVICE)
+            return F.silu(x1) * x2
+
+        x = torch.randn(16, 256, dtype=DTYPE, device=DEVICE)
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
+        out = compiled(x)
+        self.assertEqual(out.device.type, DEVICE)
+        torch.testing.assert_close(out.cpu(), fn(x).cpu(), atol=0.01, rtol=0.01)
+
+
 class TestReinterpretTensorCpuBuffer(unittest.TestCase):
     """`reinterpret_tensor` on a CPU buffer must not crash.
 
@@ -218,7 +246,7 @@ class TestReinterpretTensorCpuBuffer(unittest.TestCase):
         compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
         out = compiled(x.to(spyre))
         self.assertEqual(out.device.type, DEVICE)
-        torch.testing.assert_close(out.cpu(), fn(x).cpu(), atol=0.1, rtol=0.1)
+        torch.testing.assert_close(out.cpu(), fn(x).cpu(), atol=0.01, rtol=0.01)
 
 
 class TestFallbackKernelPoolResidentArg(unittest.TestCase):
@@ -237,7 +265,7 @@ class TestFallbackKernelPoolResidentArg(unittest.TestCase):
         compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
         out = compiled(x.to(DEVICE))
         self.assertEqual(out.dtype, DTYPE)
-        torch.testing.assert_close(out.cpu(), fn(x), atol=0.1, rtol=0.1)
+        torch.testing.assert_close(out.cpu(), fn(x), atol=0.01, rtol=0.01)
 
     def test_inplace_arg_keeps_dtype(self):
         def fn(x):
@@ -252,7 +280,7 @@ class TestFallbackKernelPoolResidentArg(unittest.TestCase):
         compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
         out = compiled(x.clone().to(DEVICE))
         self.assertEqual(out.dtype, DTYPE)
-        torch.testing.assert_close(out.cpu(), fn(x.clone()), atol=0.1, rtol=0.1)
+        torch.testing.assert_close(out.cpu(), fn(x.clone()), atol=0.01, rtol=0.01)
 
 
 if __name__ == "__main__":

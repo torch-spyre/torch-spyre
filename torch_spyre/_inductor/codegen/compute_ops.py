@@ -745,6 +745,14 @@ def generate_sdsc(
     return (
         {
             f"{idx}_{sdsc_spec.opfunc}": {
+                # Source-to-kernel provenance. JSON key uses the SDSC
+                # trailing-underscore convention; the Python field stays
+                # `debug_handle`. dxp_standalone ignores unknown keys.
+                "debug_handle_": (
+                    sdsc_spec.debug_handle.to_dict()
+                    if sdsc_spec.debug_handle is not None
+                    else None
+                ),
                 "sdscFoldProps_": [{"factor_": 1, "label_": "time"}],
                 "sdscFolds_": {
                     "dim_prop_func": [{"Affine": {"alpha_": 1, "beta_": 0}}],

@@ -1,0 +1,111 @@
+name: Build torch-spyre wheel
+description: |
+  Compile the torch_spyre._C C++ extension exactly ONCE and package it as a
+  wheel. The caller uploads the wheel as an artifact and every test-matrix job
+  installs it (via the install-prebuilt-torch-spyre action) instead of
+  recompiling — replacing the ~100 identical per-job builds that used to run.
+
+  The wheel is built with `uv sync --no-install-project` (installs torch from
+  the pinned pytorch-cpu index + the `build` extra, but does NOT build the
+  project) followed by a non-isolated `uv build`, so the compiled _C.so links
+  against exactly the torch the test jobs install (ABI match). A cross-run
+  ccache keeps the single build fast when the C++ sources are unchanged.
+
+inputs:
+  torch_spyre_dir:
+    description: Path to the checked-out torch-spyre directory
+    required: false
+    default: torch-spyre
+  image_label:
+    description: |
+      Image scaleSetLabel the wheel is built for. Keys the ccache and documents
+      that the wheel is ABI-bound to this image's system libs + torch + Python.
+    required: false
+    default: image_spyre_backend
+
+outputs:
+  wheel_name:
+    description: Basename of the built wheel (found under <torch_spyre_dir>/dist).
+    value: ${{ steps.build.outputs.wheel_name }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+    - name: Restore ccache
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: ${{ github.workspace }}/.ccache
+        # Keyed on the C++ sources + build config. image_label discriminates the
+        # ABI/toolchain (it also fixes the Python version — each image ships one
+        # interpreter). An exact key => full hit; the prefix restore-key warm-
+        # starts a partial rebuild when only a few .cpp/.h files changed.
+        key: ts-ccache-${{ inputs.image_label }}-${{ hashFiles(format('{0}/torch_spyre/csrc/**', inputs.torch_spyre_dir), format('{0}/setup.py', inputs.torch_spyre_dir),
+          format('{0}/pyproject.toml', inputs.torch_spyre_dir), format('{0}/uv.lock', inputs.torch_spyre_dir)) }}
+        restore-keys: |
+          ts-ccache-${{ inputs.image_label }}-
+
+    - name: Build wheel
+      id: build
+      shell: bash
+      env:
+        TORCH_SPYRE_DIR: ${{ inputs.torch_spyre_dir }}
+      run: |
+        source "$HOME/.bashrc"
+        source /etc/profile.d/ibm-aiu-setup.sh
+
+        [[ "$TORCH_SPYRE_DIR" != /* ]] && TORCH_SPYRE_DIR="${PWD}/${TORCH_SPYRE_DIR}"
+        echo "TORCH_SPYRE_DIR $TORCH_SPYRE_DIR"
+
+        # Route ccache to the cached workspace dir. BASEDIR rewrites the absolute
+        # paths that -g bakes into debug info so entries stay valid across runs
+        # even when the compile happens under a different temporary directory;
+        # the sloppiness flags tolerate mtime/time-macro churn from fresh
+        # checkouts. The compiler on the image is already ccache-wrapped.
+        export CCACHE_DIR="${GITHUB_WORKSPACE}/.ccache"
+        export CCACHE_BASEDIR="${GITHUB_WORKSPACE}"
+        export CCACHE_SLOPPINESS="time_macros,include_file_ctime,include_file_mtime,locale"
+        export CCACHE_COMPILERCHECK=content
+        mkdir -p "$CCACHE_DIR"
+
+        cd "$TORCH_SPYRE_DIR"
+
+        # Populate .venv with torch (pinned CPU build) + the `build` extra
+        # (setuptools / ninja / wheel / ...) WITHOUT building the project, so the
+        # C++ extension is compiled exactly once — by the wheel build below.
+        uv sync --verbose --frozen --all-extras --no-install-project
+
+        ccache --zero-stats || true
+
+        # torch's cpp_extension (ninja backend) sizes its parallelism off
+        # os.cpu_count(), which reports the NODE's total cores, not this pod's
+        # actual CPU quota. On a CPU-limited runner that oversubscribes ninja
+        # jobs, starving each other for the same slice of CPU and inflating
+        # individual compile times. Detect the real quota from cgroup v2
+        # (cpu.max = "<quota> <period>", or "max" for unlimited) and cap
+        # MAX_JOBS to it; cpp_extension reads MAX_JOBS directly.
+        MAX_JOBS="$(nproc)"
+        if [[ -f /sys/fs/cgroup/cpu.max ]]; then
+          read -r cpu_quota cpu_period < /sys/fs/cgroup/cpu.max
+          if [[ "$cpu_quota" != "max" ]]; then
+            MAX_JOBS=$(( cpu_quota / cpu_period ))
+            [[ "$MAX_JOBS" -lt 1 ]] && MAX_JOBS=1
+          fi
+        fi
+        export MAX_JOBS
+        echo "MAX_JOBS $MAX_JOBS"
+
+        # Non-isolated wheel build reuses the just-synced .venv, guaranteeing the
+        # _C.so links against the same torch the test jobs install.
+        uv build --wheel --no-build-isolation --out-dir dist
+        ccache --show-stats || true
+
+        WHEEL="$(ls -1 dist/*.whl | head -1)"
+        if [[ -z "$WHEEL" ]]; then
+          echo "::error::No wheel produced under ${TORCH_SPYRE_DIR}/dist" >&2
+          exit 1
+        fi
+        echo "Built wheel: $WHEEL"
+        echo "wheel_name=$(basename "$WHEEL")" >> "$GITHUB_OUTPUT"

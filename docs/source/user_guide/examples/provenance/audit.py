@@ -15,18 +15,16 @@
 """
 audit.py — Source-to-Kernel Provenance Audit for SimpleMLP (issue #2574).
 
-PHASE A — capture only. Runs ONE cache-defeated torch.compile under the
-in-process capture layer (pipeline/captures.py) and writes the raw captured
-structure to provenance_capture_raw.json for inspection on the device. The
-report/diagram layer (Phase B) is built against this verified dump.
+Runs ONE cache-defeated torch.compile under the in-process capture layer
+(pipeline/captures.py), writes the raw captured structure to
+provenance_capture_raw.json, then renders the Markdown report.
 
 Usage:
     python audit.py [--raw provenance_capture_raw.json]
 
 Notes:
   * Caches are force-disabled and Dynamo is reset so codegen actually runs
-    (a cache hit silently skips create_op_spec / define_kernel — the bug that
-    produced an empty Boundary 2 earlier).
+    (a cache hit silently skips create_op_spec / define_kernel).
   * torch.export is intentionally NOT used: it is a separate front-end, not on
     the compile path. Every stage here reads the real compile-path object.
 """
@@ -58,32 +56,40 @@ def _stage_summary(results: dict) -> None:
     """Print a one-line fired/count summary per stage so mismatches are obvious."""
     s = results
     print("\nCapture summary (fired? / count):")
-    print(
-        f"  stage2_pre_grad  : {s['stage2_pre_grad']['fired']}  "
-        f"nodes={len(s['stage2_pre_grad']['nodes'])}"
+
+    def line(key: str, detail: str) -> None:
+        print(f"  {key:<25}: {detail}")
+
+    line(
+        "stage2_pre_grad",
+        f"{s['stage2_pre_grad']['fired']}  nodes={len(s['stage2_pre_grad']['nodes'])}",
     )
-    print(
-        f"  stage2_post_grad : {s['stage2_post_grad']['fired']}  "
-        f"nodes={len(s['stage2_post_grad']['nodes'])}"
+    line(
+        "stage2_post_grad",
+        f"{s['stage2_post_grad']['fired']}  "
+        f"nodes={len(s['stage2_post_grad']['nodes'])}",
     )
-    print(
-        f"  stage3_passes    : {s['stage3_passes']['fired']}  "
-        f"before={len(s['stage3_passes']['before'])} "
-        f"after={len(s['stage3_passes']['after'])}"
+    line(
+        "stage3_looplevel_prepass",
+        f"{s['stage3_looplevel_prepass']['fired']}  "
+        f"ops={len(s['stage3_looplevel_prepass']['operations'])}",
     )
-    print(
-        f"  stage4_looplevel : {s['stage4_looplevel']['fired']}  "
-        f"ops={len(s['stage4_looplevel']['operations'])}"
+    line(
+        "stage4_looplevel_postpass",
+        f"{s['stage4_looplevel_postpass']['fired']}  "
+        f"ops={len(s['stage4_looplevel_postpass']['operations'])}",
     )
-    print(
-        f"  stage5_opspec    : {s['stage5_opspec']['fired']}  "
+    line(
+        "stage5_opspec",
+        f"{s['stage5_opspec']['fired']}  "
         f"ops={len(s['stage5_opspec']['ops'])}  "
-        f"opspec_fields={s['stage5_opspec']['opspec_fields']}"
+        f"opspec_fields={s['stage5_opspec']['opspec_fields']}",
     )
-    print(
-        f"  stage6_kernels   : {s['stage6_kernels']['fired']}  "
+    line(
+        "stage6_kernels",
+        f"{s['stage6_kernels']['fired']}  "
         f"kernels={len(s['stage6_kernels']['kernels'])}  "
-        f"dirs={len(s['stage6_kernels']['output_dirs'])}"
+        f"dirs={len(s['stage6_kernels']['output_dirs'])}",
     )
     print(f"\n  _hooks: {json.dumps(s['_hooks'], indent=2)}")
 
@@ -105,7 +111,7 @@ def main() -> None:
     args = parser.parse_args()
 
     print("=" * 72)
-    print("  PROVENANCE CAPTURE (Phase A) — SimpleMLP")
+    print("  PROVENANCE AUDIT — SimpleMLP")
     print("  torch-spyre issue #2574")
     print("=" * 72)
     print(
@@ -145,9 +151,7 @@ def main() -> None:
 
     md = report.render(capture=results, bundles=bundles, model_name="SimpleMLP")
     args.output.write_text(md)
-    print(
-        f"  Audit report written to: {args.output}  (paste into the provenance issue)\n"
-    )
+    print(f"  Audit report written to: {args.output}\n")
 
 
 if __name__ == "__main__":

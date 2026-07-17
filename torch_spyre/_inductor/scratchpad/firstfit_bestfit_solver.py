@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import heapq
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import Optional, Callable
 
@@ -77,7 +78,7 @@ def _topological_sort(
     return result
 
 
-class FirstFitLayoutSolver(MemoryPlanSolver):
+class FirstFitLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
     """Allocates buffers by priority score, placing each in the first gap that fits.
 
     Buffers are sorted topologically (parents before children) with ties broken by ascending
@@ -175,7 +176,7 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
         return None
 
     def plan_layout(
-        self, buffers: list[LifetimeBoundBuffer], log_lx_usage: bool = False
+        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
     ) -> list[LifetimeBoundBuffer]:
         if not buffers:
             return []
@@ -221,7 +222,7 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
                     buffer.address = round_up_to_alignment(gap.start, self.alignment)
                     names_to_addresses[buffer.name] = buffer.address
 
-        return buffers
+        return list(buffers)
 
 
 class BestFitLayoutSolver(FirstFitLayoutSolver):

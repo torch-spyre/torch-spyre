@@ -109,9 +109,11 @@ import.
 
 ## Testing profiler changes
 
-The profiler test suite lives at `tests/profiler/`. The `conftest.py`
-exposes a `spyre_profiler_available` fixture that skips tests when the
-feature is compiled out, so the same suite works in both build modes.
+The profiler test suite lives at `tests/profiler/`. Tests that need the
+profiler are marked with `@pytest.mark.requires_spyre_profiler`; the
+top-level `tests/conftest.py` skips them automatically unless
+`USE_SPYRE_PROFILER=1` (and Spyre hardware is available), so the same
+suite works in both build modes.
 
 Run only the profiler tests:
 
