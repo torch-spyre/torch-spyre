@@ -30,7 +30,6 @@ import sys
 import os
 import regex as re
 
-import pytest
 import torch
 import unittest
 from unittest.mock import patch as mock_patch
@@ -770,10 +769,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         # is numerically wrong (~90% element mismatch).  Investigate and fix
         # before re-adding spyre_hint(num_tiles_per_dim={"Lk": lk_slices}).
         """
-        if not config.unroll_loops:
-            pytest.xfail(
-                "UNROLL_LOOPS=0: nested scf.for loops not yet correct in backend"
-            )
         import math
         from torch_spyre._inductor import spyre_hint
 
