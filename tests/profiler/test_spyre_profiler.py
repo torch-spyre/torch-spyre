@@ -282,5 +282,9 @@ class TestMemoryProfilerTimeline(TestCase):
             for (act_action, act_size), (exp_action, exp_size) in zip(actual, expected):
                 self.assertEqual(act_action, exp_action)
                 self.assertGreaterEqual(
+            self.assertGreaterEqual(len(actual), len(expected))
+            for (act_action, act_size), (exp_action, exp_size) in zip(actual, expected):
+                self.assertEqual(act_action, exp_action)
+                self.assertGreaterEqual(
                     act_size, exp_size, f"Expected at least {exp_size}, got {act_size}"
                 )
