@@ -469,7 +469,9 @@ class TestMeasureHBMUsageCoOptimizing(BaseTestScratchpadUsage):
         self.run_test(f, (x,))
 
 
-class TestCloneAtGraphBoundaries(BaseTestScratchpadUsage):
+class TestCloneAtGraphBoundaries(
+    BaseTestScratchpadUsage, metaclass=_ParameterizedScratchpadMeta
+):
     """End-to-end tests for clone insertion at graph input/output boundaries.
 
     The allocator now inserts clone ops on-demand inside _push_allocation rather than
@@ -482,6 +484,205 @@ class TestCloneAtGraphBoundaries(BaseTestScratchpadUsage):
     inserted clone outputs LX-eligible, so this class exercises that path
     directly.
     """
+
+    def _input_clone_when_read_by_multiple_ops(self):
+        """A graph input read by two different ops is cloned; the clone lands in LX."""
+        x = self.rand_device((64, 1024))
+
+        def fn(x):
+            # x is consumed by both exp_op and add_op → two reads → eligible for input clone
+            return torch.exp(x) + x
+
+        def assertion_fn(
+            result_with_lx,
+            n_ops_with_lx,
+            mem_usages_with_lx,
+            result_no_lx,
+            n_ops_no_lx,
+            mem_usages_no_lx,
+        ):
+            self.assertGreater(
+                n_ops_with_lx,
+                n_ops_no_lx,
+                f"Expected the input clone to add an op: {n_ops_no_lx} ops without LX, "
+                f"{n_ops_with_lx} with LX",
+            )
+            self.assertTrue(
+                any(u["location"] == "LX" for u in mem_usages_with_lx.values()),
+                "Expected at least one LX-allocated buffer after input cloning",
+            )
+            # Clone is an exact copy; LX planning must not change the numerical result.
+            self.assertTrue(
+                torch.equal(result_no_lx, result_with_lx),
+                "LX input clone changed the numerical result",
+            )
+
+        return fn, (x,), {"assertion_fn": assertion_fn}
+
+    def _output_clone_when_intermediate_is_also_graph_output(self):
+        """A buffer that is both a graph output and read inside the graph is pinned to LX;
+        a clone of it is inserted as the actual (HBM) graph output returned to the caller."""
+        x = self.rand_device((64, 1024))
+
+        def fn(x):
+            # After CSE, y = exp(x) is produced once.
+            # y is a graph output AND is read by add_op → eligible for output clone.
+            y = torch.exp(x)
+            z = y + 1  # add_op reads y
+            return y, z
+
+        def assertion_fn(
+            result_with_lx,
+            n_ops_with_lx,
+            mem_usages_with_lx,
+            result_no_lx,
+            n_ops_no_lx,
+            mem_usages_no_lx,
+        ):
+            lx_y, lx_z = result_with_lx
+            ref_y, ref_z = result_no_lx
+
+            self.assertGreater(
+                n_ops_with_lx,
+                n_ops_no_lx,
+                f"Expected the output clone to add an op: {n_ops_no_lx} ops without LX, "
+                f"{n_ops_with_lx} with LX",
+            )
+            self.assertTrue(
+                any(u["location"] == "LX" for u in mem_usages_with_lx.values()),
+                "Expected at least one LX-allocated buffer after output cloning",
+            )
+            # Clone is an exact copy; LX planning must not change the numerical result.
+            self.assertTrue(
+                torch.equal(ref_y, lx_y), "LX output clone changed result y"
+            )
+            self.assertTrue(
+                torch.equal(ref_z, lx_z), "LX output clone changed result z"
+            )
+
+        return fn, (x,), {"assertion_fn": assertion_fn}
+
+    def _input_read_at_multiple_offsets_is_correct(self):
+        """A graph input read by one op at two distinct offsets must not be
+        LX-pinned.
+
+        An LX-pinned buffer is addressed by a single base (SDSC start_address
+        = allocation["lx"]); per-access slice offsets are not folded into it.
+        Pinning ``x`` for ``x[:, 0:512] + x[:, 512:1024]`` made both reads
+        resolve to the LX base, so the op computed ``x0 + x0`` instead of
+        ``x0 + x1``. The allocator now skips such inputs (they stay in HBM,
+        where multi-offset reads work)."""
+        x = self.rand_device((64, 1024))
+
+        def fn(x):
+            # The fused add reads x at offset 0 and offset 512 -> two distinct
+            # offsets on the same buffer -> ineligible for LX pinning.
+            return x[:, 0:512] + x[:, 512:1024]
+
+        def assertion_fn(
+            result_with_lx,
+            n_ops_with_lx,
+            mem_usages_with_lx,
+            result_no_lx,
+            n_ops_no_lx,
+            mem_usages_no_lx,
+        ):
+            self.assertTrue(
+                torch.equal(result_no_lx, result_with_lx),
+                "Multi-offset input read produced wrong values under LX planning",
+            )
+
+        return fn, (x,), {"assertion_fn": assertion_fn}
+
+    def _input_feeding_reduction_is_cloned_and_correct(self):
+        """A graph input read by a reduction is LX-cloned, with the clone's
+        per-core split re-keyed correctly.
+
+        push_allocation_with_clone re-keys the consumer's op_it_space_splits
+        through the buffer's strides before assigning them to the clone. A reduction consumer's split is keyed to its
+        reduced-shape output; copied verbatim it would split the wrong axis of
+        the full-shape clone (wrong values / SDSC abort at multi-core). The
+        numerical failure only manifests when work is split across cores; here
+        (sencores=1) we assert the clone is inserted and the result is correct.
+        Multi-core numerical coverage lives in
+        tests/inductor/test_inductor_ops.py (max_sub_broadcast, aminmax,
+        softmax)."""
+        x = self.rand_device((64, 256))
+
+        def fn(x):
+            # x feeds the max reduction (and the sub) -> reduction consumer.
+            return x - torch.unsqueeze(torch.max(x, dim=1).values, dim=1)
+
+        def assertion_fn(
+            result_with_lx,
+            n_ops_with_lx,
+            mem_usages_with_lx,
+            result_no_lx,
+            n_ops_no_lx,
+            mem_usages_no_lx,
+        ):
+            self.assertGreater(
+                n_ops_with_lx,
+                n_ops_no_lx,
+                "Expected a boundary clone for the reduction-fed input, but the op "
+                f"count did not grow ({n_ops_no_lx} -> {n_ops_with_lx})",
+            )
+            self.assertTrue(
+                any(u["location"] == "LX" for u in mem_usages_with_lx.values()),
+                "Expected at least one LX-allocated buffer for the reduction input",
+            )
+            self.assertTrue(
+                torch.equal(result_no_lx, result_with_lx),
+                "Reduction-fed input changed result under LX planning",
+            )
+
+        return fn, (x,), {"assertion_fn": assertion_fn}
+
+    def _input_read_partially_is_correct(self):
+        """A graph input read only over a sub-extent (a slice) must not be
+        LX-pinned.
+
+        Strided partial reads of a multi-dim LX buffer mis-address against the
+        single LX base. Pinning ``x`` for ``add(x[:, :, 0:64].clone(),
+        x[:, :, 0:64])`` produced wrong values; the allocator now leaves such
+        inputs in HBM, where partial reads work."""
+        x = self.rand_device((3, 3, 192))
+
+        def fn(x):
+            s = x[:, :, 0:64]  # partial inner-dim slice -> sub-extent read
+            return torch.add(s.clone(), s)
+
+        def assertion_fn(
+            result_with_lx,
+            n_ops_with_lx,
+            mem_usages_with_lx,
+            result_no_lx,
+            n_ops_no_lx,
+            mem_usages_no_lx,
+        ):
+            self.assertTrue(
+                torch.equal(result_no_lx, result_with_lx),
+                "Partial input read produced wrong values under LX planning",
+            )
+
+        return fn, (x,), {"assertion_fn": assertion_fn}
+
+    parameter_axes = {
+        "solver_method": ("greedy", "bestfit", "firstfit", "cpsat"),
+        "sencores": (1, 32),
+        "co_optimization": (False, True),
+    }
+
+    parameter_models = (
+        ("multiple_ops_read", _input_clone_when_read_by_multiple_ops),
+        (
+            "output_is_intermediate",
+            _output_clone_when_intermediate_is_also_graph_output,
+        ),
+        ("multiple_offset_input_read", _input_read_at_multiple_offsets_is_correct),
+        ("input_reduction", _input_feeding_reduction_is_cloned_and_correct),
+        ("partial_input_read", _input_read_partially_is_correct),
+    )
 
     def _compile_and_inspect(
         self,
@@ -520,276 +721,36 @@ class TestCloneAtGraphBoundaries(BaseTestScratchpadUsage):
         n_ops = n_ops_captured[0] if n_ops_captured else 0
         return result, n_ops, mem_usages
 
-    def test_input_clone_when_read_by_multiple_ops(self):
-        """A graph input read by two different ops is cloned; the clone lands in LX."""
-        x = self.rand_device((64, 1024))
-
-        def fn(x):
-            # x is consumed by both exp_op and add_op → two reads → eligible for input clone
-            return torch.exp(x) + x
-
-        with ts_inductor_config.patch(lx_planning=False):
-            ref_result, n_ops_no_lx, _ = self._compile_and_inspect(fn, (x,))
-
-        torch.compiler.reset()
-
-        with ts_inductor_config.patch(lx_planning=True):
-            result, n_ops_with_lx, mem_usages = self._compile_and_inspect(fn, (x,))
-
-        self.assertGreater(
-            n_ops_with_lx,
-            n_ops_no_lx,
-            f"Expected the input clone to add an op: {n_ops_no_lx} ops without LX, "
-            f"{n_ops_with_lx} with LX",
-        )
-        self.assertTrue(
-            any(u["location"] == "LX" for u in mem_usages.values()),
-            "Expected at least one LX-allocated buffer after input cloning",
-        )
-        # Clone is an exact copy; LX planning must not change the numerical result.
-        self.assertTrue(
-            torch.equal(ref_result, result),
-            "LX input clone changed the numerical result",
-        )
-
-    # TODO: Update to expected pass on PR2907
-    @unittest.skipUnless(
-        _HAS_ORTOOLS, "joint CP-SAT boundary-clone xfail needs ortools"
-    )
-    @unittest.expectedFailure
-    def test_input_clone_unsupported_under_joint_cpsat(self):
-        """Boundary clone insertion is not yet supported by the joint CP-SAT
-        allocator (``layout_solver="cpsat"`` with ``co_optimizing_lx_planning``).
-
-        The joint allocator builds CoreDivisionBuffers only for graph *ops*:
-        graph inputs are never candidates (so an input read by multiple ops is
-        never cloned into LX) and graph outputs carry a "graph output" residency
-        reason (never pinned, so no output clone). The op count therefore does
-        not grow. This is an *expected failure* until the CP-SAT path grows
-        boundary-clone support; the greedy and placement-only CP-SAT paths handle
-        it (see ``test_input_clone_when_read_by_multiple_ops``).
-
-        Skipped without ortools: the allocator would then fall back to greedy,
-        which *does* clone, making the assertion pass (an unexpected success).
-        """
-        x = self.rand_device((64, 1024))
-
-        def fn(x):
-            # x read by both exp and add -> eligible for an input clone.
-            return torch.exp(x) + x
-
-        with ts_inductor_config.patch(lx_planning=False):
-            _, n_ops_no_lx, _ = self._compile_and_inspect(fn, (x,))
-
-        torch.compiler.reset()
-
+    def run_case(self, params: dict, factory: Callable) -> None:
+        """Run ``factory``'s model for correctness under this combo, applying
+        the combo's config at the test-case level (the inherited setUp only
+        applies invariants)."""
         with ts_inductor_config.patch(
-            lx_planning=True,
-            layout_solver="cpsat",
-            co_optimizing_lx_planning=True,
+            layout_solver=params["solver_method"],
+            sencores=params["sencores"],
+            co_optimizing_lx_planning=params["co_optimization"],
         ):
-            _, n_ops_with_lx, _ = self._compile_and_inspect(fn, (x,))
+            model, args, kwargs = factory(self)
+            torch.compiler.reset()
+            with ts_inductor_config.patch(lx_planning=True):
+                result_with_lx, n_ops_with_lx, mem_usages_with_lx = (
+                    self._compile_and_inspect(model, args)
+                )
+            torch.compiler.reset()
+            with ts_inductor_config.patch(lx_planning=False):
+                result_no_lx, n_ops_no_lx, mem_usages_no_lx = self._compile_and_inspect(
+                    model, args
+                )
 
-        # Holds on the greedy / placement-only paths (see the sibling test); the
-        # joint CP-SAT path inserts no boundary clone -> fails -> expected failure.
-        self.assertGreater(
-            n_ops_with_lx,
-            n_ops_no_lx,
-            "joint CP-SAT unexpectedly inserted a boundary clone "
-            f"({n_ops_no_lx} -> {n_ops_with_lx} ops)",
-        )
-
-    # TODO: Update to expected pass on PR2907
-    @unittest.skipUnless(
-        _HAS_ORTOOLS, "joint CP-SAT boundary-clone xfail needs ortools"
-    )
-    @unittest.expectedFailure
-    def test_output_clone_unsupported_under_joint_cpsat(self):
-        """Output boundary clone insertion is not yet supported by the joint
-        CP-SAT allocator (``layout_solver="cpsat"`` with
-        ``co_optimizing_lx_planning``).
-
-        Output-side counterpart to
-        ``test_input_clone_unsupported_under_joint_cpsat``. The joint allocator
-        builds CoreDivisionBuffers only for graph *ops* and tags graph outputs
-        with a "graph output" residency reason, so a buffer that is both a graph
-        output and read inside the graph is never pinned and no output clone is
-        inserted. The op count therefore does not grow. This is an *expected
-        failure* until the CP-SAT path grows boundary-clone support; the greedy
-        and placement-only CP-SAT paths handle it (see
-        ``test_output_clone_when_intermediate_is_also_graph_output``).
-
-        Skipped without ortools: the allocator would then fall back to greedy,
-        which *does* clone, making the assertion pass (an unexpected success).
-        """
-        x = self.rand_device((64, 1024))
-
-        def fn(x):
-            # y = exp(x) is both a graph output and read by add_op -> eligible
-            # for an output clone on the greedy / placement-only paths.
-            y = torch.exp(x)
-            z = y + 1
-            return y, z
-
-        with ts_inductor_config.patch(lx_planning=False):
-            _, n_ops_no_lx, _ = self._compile_and_inspect(fn, (x,))
-
-        torch.compiler.reset()
-
-        with ts_inductor_config.patch(
-            lx_planning=True,
-            layout_solver="cpsat",
-            co_optimizing_lx_planning=True,
-        ):
-            _, n_ops_with_lx, _ = self._compile_and_inspect(fn, (x,))
-
-        # Holds on the greedy / placement-only paths (see the sibling test); the
-        # joint CP-SAT path inserts no boundary clone -> fails -> expected failure.
-        self.assertGreater(
-            n_ops_with_lx,
-            n_ops_no_lx,
-            "joint CP-SAT unexpectedly inserted a boundary clone "
-            f"({n_ops_no_lx} -> {n_ops_with_lx} ops)",
-        )
-
-    def test_output_clone_when_intermediate_is_also_graph_output(self):
-        """A buffer that is both a graph output and read inside the graph is pinned to LX;
-        a clone of it is inserted as the actual (HBM) graph output returned to the caller."""
-        x = self.rand_device((64, 1024))
-
-        def fn(x):
-            # After CSE, y = exp(x) is produced once.
-            # y is a graph output AND is read by add_op → eligible for output clone.
-            y = torch.exp(x)
-            z = y + 1  # add_op reads y
-            return y, z
-
-        with ts_inductor_config.patch(lx_planning=False):
-            (ref_y, ref_z), n_ops_no_lx, _ = self._compile_and_inspect(fn, (x,))
-
-        torch.compiler.reset()
-
-        with ts_inductor_config.patch(lx_planning=True):
-            (result_y, result_z), n_ops_with_lx, mem_usages = self._compile_and_inspect(
-                fn, (x,)
+            assertion_fn = kwargs["assertion_fn"]
+            assertion_fn(
+                result_with_lx,
+                n_ops_with_lx,
+                mem_usages_with_lx,
+                result_no_lx,
+                n_ops_no_lx,
+                mem_usages_no_lx,
             )
-
-        self.assertGreater(
-            n_ops_with_lx,
-            n_ops_no_lx,
-            f"Expected the output clone to add an op: {n_ops_no_lx} ops without LX, "
-            f"{n_ops_with_lx} with LX",
-        )
-        self.assertTrue(
-            any(u["location"] == "LX" for u in mem_usages.values()),
-            "Expected at least one LX-allocated buffer after output cloning",
-        )
-        # Clone is an exact copy; LX planning must not change the numerical result.
-        self.assertTrue(
-            torch.equal(ref_y, result_y), "LX output clone changed result y"
-        )
-        self.assertTrue(
-            torch.equal(ref_z, result_z), "LX output clone changed result z"
-        )
-
-    def test_input_read_at_multiple_offsets_is_correct(self):
-        """A graph input read by one op at two distinct offsets must not be
-        LX-pinned.
-
-        An LX-pinned buffer is addressed by a single base (SDSC start_address
-        = allocation["lx"]); per-access slice offsets are not folded into it.
-        Pinning ``x`` for ``x[:, 0:512] + x[:, 512:1024]`` made both reads
-        resolve to the LX base, so the op computed ``x0 + x0`` instead of
-        ``x0 + x1``. The allocator now skips such inputs (they stay in HBM,
-        where multi-offset reads work)."""
-        x = self.rand_device((64, 1024))
-
-        def fn(x):
-            # The fused add reads x at offset 0 and offset 512 -> two distinct
-            # offsets on the same buffer -> ineligible for LX pinning.
-            return x[:, 0:512] + x[:, 512:1024]
-
-        with ts_inductor_config.patch(lx_planning=False):
-            ref, _, _ = self._compile_and_inspect(fn, (x,))
-
-        torch.compiler.reset()
-
-        with ts_inductor_config.patch(lx_planning=True):
-            result, _, _ = self._compile_and_inspect(fn, (x,))
-
-        self.assertTrue(
-            torch.equal(ref, result),
-            "Multi-offset input read produced wrong values under LX planning",
-        )
-
-    def test_input_feeding_reduction_is_cloned_and_correct(self):
-        """A graph input read by a reduction is LX-cloned, with the clone's
-        per-core split re-keyed correctly.
-
-        push_allocation_with_clone re-keys the consumer's op_it_space_splits
-        through the buffer's strides before assigning them to the clone. A reduction consumer's split is keyed to its
-        reduced-shape output; copied verbatim it would split the wrong axis of
-        the full-shape clone (wrong values / SDSC abort at multi-core). The
-        numerical failure only manifests when work is split across cores; here
-        (sencores=1) we assert the clone is inserted and the result is correct.
-        Multi-core numerical coverage lives in
-        tests/inductor/test_inductor_ops.py (max_sub_broadcast, aminmax,
-        softmax)."""
-        x = self.rand_device((64, 256))
-
-        def fn(x):
-            # x feeds the max reduction (and the sub) -> reduction consumer.
-            return x - torch.unsqueeze(torch.max(x, dim=1).values, dim=1)
-
-        with ts_inductor_config.patch(lx_planning=False):
-            ref, n_ops_no_lx, _ = self._compile_and_inspect(fn, (x,))
-
-        torch.compiler.reset()
-
-        with ts_inductor_config.patch(lx_planning=True):
-            result, n_ops_with_lx, mem_usages = self._compile_and_inspect(fn, (x,))
-
-        self.assertGreater(
-            n_ops_with_lx,
-            n_ops_no_lx,
-            "Expected a boundary clone for the reduction-fed input, but the op "
-            f"count did not grow ({n_ops_no_lx} -> {n_ops_with_lx})",
-        )
-        self.assertTrue(
-            any(u["location"] == "LX" for u in mem_usages.values()),
-            "Expected at least one LX-allocated buffer for the reduction input",
-        )
-        self.assertTrue(
-            torch.equal(ref, result),
-            "Reduction-fed input changed result under LX planning",
-        )
-
-    def test_input_read_partially_is_correct(self):
-        """A graph input read only over a sub-extent (a slice) must not be
-        LX-pinned.
-
-        Strided partial reads of a multi-dim LX buffer mis-address against the
-        single LX base. Pinning ``x`` for ``add(x[:, :, 0:64].clone(),
-        x[:, :, 0:64])`` produced wrong values; the allocator now leaves such
-        inputs in HBM, where partial reads work."""
-        x = self.rand_device((3, 3, 192))
-
-        def fn(x):
-            s = x[:, :, 0:64]  # partial inner-dim slice -> sub-extent read
-            return torch.add(s.clone(), s)
-
-        with ts_inductor_config.patch(lx_planning=False):
-            ref, _, _ = self._compile_and_inspect(fn, (x,))
-
-        torch.compiler.reset()
-
-        with ts_inductor_config.patch(lx_planning=True):
-            result, _, _ = self._compile_and_inspect(fn, (x,))
-
-        self.assertTrue(
-            torch.equal(ref, result),
-            "Partial input read produced wrong values under LX planning",
-        )
 
 
 # TODO: Remove hard coded core division. This test exists to check for
