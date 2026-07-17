@@ -225,14 +225,14 @@ def test_kineto_memcpy_and_memset_events_captured():
 
 class TestMemoryProfilerTimeline(TestCase):
     @unittest.skipIf(not Test_spyre, "spyre device required")
-    def test_memory_timeline_no_id(self, device="spyre") -> None:
+    def test_memory_timeline_no_id_spyre(self) -> None:
         # On CPU the default behavior is to simply forward to malloc. That
         # means that when we free `x` the allocator doesn't actually know how
         # many bytes are in the allocation, and thus there's no point to
         # calling `c10::reportMemoryUsageToProfiler`. So in order to test that
         # memory profiler processes this case correctly we need to use device
         # where we do always keep a record.
-        x = torch.ones((1024,), device=device)
+        x = torch.ones((1024,), device="spyre")
 
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
@@ -271,16 +271,55 @@ class TestMemoryProfilerTimeline(TestCase):
 
         actual = [(action, size) for _, action, _, size in memory_profile.timeline]
 
-        # See above.
-        if device == "cpu":
-            expected = expected[2:]
-            for event in expected:
-                self.assertTrue(
-                    event in actual, f"event: {event} was not found in actual."
-                )
-        else:
-            for (act_action, act_size), (exp_action, exp_size) in zip(actual, expected):
-                self.assertEqual(act_action, exp_action)
-                self.assertGreaterEqual(
-                    act_size, exp_size, f"Expected at least {exp_size}, got {act_size}"
-                )
+        self.assertGreaterEqual(len(actual), len(expected))
+
+        for (act_action, act_size), (exp_action, exp_size) in zip(actual, expected):
+            self.assertEqual(act_action, exp_action)
+            self.assertGreaterEqual(
+                act_size, exp_size, f"Expected at least {exp_size}, got {act_size}"
+            )
+            self.assertLessEqual(
+                act_size,
+                exp_size * 4,
+                f"Expected at most {exp_size * 4}, got {act_size}",
+            )
+
+    def test_memory_timeline_no_id_cpu(self) -> None:
+        x = torch.ones((1024,), device="cpu")
+
+        with profile(
+            activities=[ProfilerActivity.CPU],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) as prof:
+            # We never see `x` used so we don't know the storage is for a
+            # Tensor, but we do still see the free event.
+            del x
+
+            # For empty we see the allocation and free, but not any use.
+            # So this also cannot be identified as a Tensor.
+            y = torch.empty((64,))
+            del y
+
+            z = torch.empty((256,))
+            z.view_as(z)  # Show `z` to the profiler
+            del z
+
+        memory_profile = prof._memory_profile()
+
+        expected = [
+            #
+            # y
+            (_memory_profiler.Action.CREATE, 256),
+            (_memory_profiler.Action.DESTROY, 256),
+            #
+            # z
+            (_memory_profiler.Action.CREATE, 1024),
+            (_memory_profiler.Action.DESTROY, 1024),
+        ]
+
+        actual = [(action, size) for _, action, _, size in memory_profile.timeline]
+
+        for event in expected:
+            self.assertTrue(event in actual, f"event: {event} was not found in actual.")
