@@ -75,6 +75,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     GraphView,
     get_op_pointwise_inputs,
     _would_produce_lx_back_gap,
+    _is_tiled_advancing,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 
@@ -218,6 +219,15 @@ class ScratchpadAllocator:
             for op in graph.operations
             if op.name not in drop_list and buffer_not_read_in_full(graph, op.name)
         )
+
+        # filter out advancing (tiled, non-per_tile_fixed) buffers: LX
+        # addresses cannot be expressed as affine.apply symbols today (see
+        # compute_ops.py's is_tiled_lx check), so such a buffer must stay in
+        # HBM, where its per-iteration address advance is fully supported.
+        for op in graph.operations:
+            if op.name not in drop_list and _is_tiled_advancing(op):
+                drop_list.add(op.name)
+                self.reject_reasons[op.name] = "tiled (advancing), not per_tile_fixed"
 
         if not clone_at_graph_boundaries():
             # Without clone support, graph outputs cannot be LX-pinned: the caller
