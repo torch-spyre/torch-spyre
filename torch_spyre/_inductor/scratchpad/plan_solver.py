@@ -59,6 +59,10 @@ class LifetimeBoundBuffer:
     def end_time(self) -> int:
         return self.uses[-1] + 1
 
+    def overlaps_in_time(self, other: "LifetimeBoundBuffer") -> bool:
+        """Returns true iff self and other overlap in time."""
+        return self.start_time < other.end_time and other.start_time < self.end_time
+
 
 @dataclass
 class CoreDivision:

@@ -29,6 +29,7 @@ from unittest.mock import patch
 
 import torch
 from torch._inductor.virtualized import V
+from torch.spyre import SpyreTensorLayout
 
 import torch_spyre._inductor.optimize_restickify as _optimize_restickify
 from torch._inductor.exc import InductorError
@@ -65,21 +66,34 @@ def _compile_and_run_plan_capture(fn, *args):
     return spyre_result, captured.get("plan", {})
 
 
-def _compare(fn, *args, check_strides=True, optimal_cost=None, skip_correctness=False):
+def _compare(
+    fn,
+    *args,
+    device_args=None,
+    check_strides=True,
+    optimal_cost=None,
+    skip_correctness=False,
+):
     """Run fn on Spyre, assert correctness against CPU, and optionally assert the restickify
     plan has cost == optimal_cost.
+
+    device_args: if provided, used for the Spyre run instead of args (allows pre-placed
+    tensors with custom layouts). args are still used for the CPU reference.
     """
+    run_args = device_args if device_args is not None else args
     if optimal_cost is None:
-        spyre_result = _compile_and_run(fn, args, DEVICE)
+        spyre_result = _compile_and_run(fn, run_args, DEVICE)
     else:
-        spyre_result, plan = _compile_and_run_plan_capture(fn, *args)
+        spyre_result, plan = _compile_and_run_plan_capture(fn, *run_args)
         actual_cost = _compute_cost(plan)
         assert actual_cost == optimal_cost, (
             f"restickify cost: expected {optimal_cost}, got {actual_cost}"
         )
     if not skip_correctness:
         compare_with_cpu(fn, *args, target=spyre_result, run_eager=False)
-    if check_strides:
+    if (
+        check_strides and device_args is None
+    ):  # skip when device_args differ from CPU args: strides intentionally won't match
         cpu_result = fn(*args)
         assert cpu_result.stride() == spyre_result.stride(), (
             f"Stride mismatch: CPU {cpu_result.stride()} vs Spyre {spyre_result.stride()}"
@@ -848,14 +862,169 @@ def test_amax_full_and_amax_live_maximum():
 # ------- Unsupported stick configurations ---------
 
 
-def test_sparse_dense_pointwise_unsupported():
-    """a.sum(1) + b - pointwise of sparse and dense tensors not yet supported.
-
-    There is no restickify resolution for this configuration so we must catch this and report error
-    """
-    a = torch.randn((S, S), dtype=torch.float16).to(DEVICE)
+def test_sparse_dense_pointwise():
+    """a.sum(-1) + b - reduction followed by pointwise without broadcasting."""
+    a = torch.randn((S, S, S), dtype=torch.float16).to(DEVICE)
     b = torch.randn((S, S), dtype=torch.float16).to(DEVICE)
+
     with pytest.raises(
         InductorError, match="No mechanism to gather elements from multiple sticks"
     ):
-        _compare(lambda a, b: a.sum(1) + b, a, b)
+        _compare(lambda a, b: a.amin(-1) + b, a, b)
+
+
+def test_2d_sparse_broadcast_dense_pointwise():
+    """a.sum(-1) + b - reduction output broadcast into pointwise with dense b."""
+    a = torch.randn((S, S), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
+    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S * S)
+
+
+def test_3d_sparse_broadcast_dense_pointwise():
+    """a.sum(-1) + b - reduction output broadcast into pointwise with dense b."""
+    a = torch.randn((S, S, S), dtype=torch.float16)
+    b = torch.randn((S, S, S), dtype=torch.float16)
+    _compare(lambda a, b: a.amin(-1) + b, a, b, optimal_cost=S * S * S)
+
+
+def test_sparse_dense_pointwise_d0_stick():
+    """a.sum(-1) + b where b has a d0 stick — verifies sparse detection with alt-dim candidate."""
+
+    a = torch.randn((S, S, S), dtype=torch.float16).to(DEVICE)
+    b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
+    b = torch.randn((S, S), dtype=torch.float16).to(device_layout=b_layout)
+    with pytest.raises(
+        InductorError, match="No mechanism to gather elements from multiple sticks"
+    ):
+        _compare(lambda a, b: a.amin(-1) + b, a, b)
+
+
+def test_sparse_broadcast_dense_pointwise_d0_stick():
+    """a.sum(-1) + b where b has a d0 stick — verifies sparse detection with alt-dim candidate."""
+
+    a = torch.randn((S, S), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
+    b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
+    b_dev = b.to(device_layout=b_layout)
+    _compare(
+        lambda a, b: a.amin(-1) + b,
+        a,
+        b,
+        device_args=[a.to(DEVICE), b_dev],
+        optimal_cost=0,
+    )
+
+
+def test_broadcast_dense_pointwise():
+    a = torch.randn((S), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
+    _compare(lambda a, b: a + b, a, b, optimal_cost=0)
+
+
+def test_broadcast_3d_dense_pointwise():
+    a = torch.randn((S, S), dtype=torch.float16)
+    b = torch.randn((S, S, S), dtype=torch.float16)
+    _compare(lambda a, b: a + b, a, b, optimal_cost=0)
+
+
+def test_unsqueeze_broadcast_dense_pointwise():
+    """a.unsqueeze(-1) + b - unsqueeze broadcast followed by pointwise."""
+    a = torch.randn((S,), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
+    _compare(lambda a, b: a.unsqueeze(-1) + b, a, b, optimal_cost=S * S)
+
+
+def test_unsqueeze_broadcast_dense_pointwise_d0_stick():
+    """a.unsqueeze(-1) + b where b has a d0 stick — verifies sparse detection with alt-dim candidate."""
+
+    a = torch.randn((S,), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
+    b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
+    b_dev = b.to(device_layout=b_layout)
+    _compare(
+        lambda a, b: a.unsqueeze(-1) + b,
+        a,
+        b,
+        device_args=[a.to(DEVICE), b_dev],
+        optimal_cost=0,
+    )
+
+
+def test_unsqueeze_expand_broadcast_dense_pointwise():
+    """a.unsqueeze(-1).expand(S, S) + b - unsqueeze+expand broadcast followed by pointwise."""
+    a = torch.randn((S,), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
+    _compare(lambda a, b: a.unsqueeze(-1).expand(S, S) + b, a, b, optimal_cost=S * S)
+
+
+def test_unsqueeze_expand_broadcast_dense_pointwise_d0_stick():
+    """a.unsqueeze(-1).expand(S, S) + b where b has a d0 stick — verifies sparse detection with alt-dim candidate."""
+
+    a = torch.randn((S,), dtype=torch.float16)
+    b = torch.randn((S, S), dtype=torch.float16)
+    b_layout = SpyreTensorLayout([S, S], [S, 1], torch.float16, [1, 0])
+    b_dev = b.to(device_layout=b_layout)
+    _compare(
+        lambda a, b: a.unsqueeze(-1).expand(S, S) + b,
+        a,
+        b,
+        device_args=[a.to(DEVICE), b_dev],
+        optimal_cost=0,
+    )
+
+
+# ------- Broadcast outer-product tests ---------
+
+
+def test_broadcast_outer_diff():
+    """acs.unsqueeze(-1) - acs.unsqueeze(-2): outer-product subtraction over [BH, C].
+
+    Both reads of acs conflict (stick on d1 vs d2); the optimizer picks stick on
+    dim 0 (BH) at cost 2 * acs.numel() — two restickifies of the 2D input.
+    """
+    BH, C = 64, 64
+    acs = torch.randn((BH, C), dtype=torch.float16)
+    _compare(
+        lambda acs: torch.exp(acs.unsqueeze(-1) - acs.unsqueeze(-2)),
+        acs,
+        optimal_cost=2 * acs.numel(),
+        check_strides=False,
+    )
+
+
+def test_broadcast_expand_first():
+    """expand on unsqueeze(-1) only — one input expanded, one bare unsqueeze."""
+    BH, C = 64, 64
+    acs = torch.randn((BH, C), dtype=torch.float16)
+    _compare(
+        lambda acs: torch.exp(acs.unsqueeze(-1).expand(-1, -1, C) - acs.unsqueeze(-2)),
+        acs,
+        optimal_cost=2 * acs.numel(),
+        check_strides=False,
+    )
+
+
+def test_broadcast_expand_second():
+    """expand on unsqueeze(-2) only — one input expanded, one bare unsqueeze."""
+    BH, C = 64, 64
+    acs = torch.randn((BH, C), dtype=torch.float16)
+    _compare(
+        lambda acs: torch.exp(acs.unsqueeze(-1) - acs.unsqueeze(-2).expand(-1, C, -1)),
+        acs,
+        optimal_cost=2 * acs.numel(),
+        check_strides=False,
+    )
+
+
+def test_broadcast_expand_both():
+    """expand on both unsqueezes — both inputs fully expanded to [BH, C, C]."""
+    BH, C = 64, 64
+    acs = torch.randn((BH, C), dtype=torch.float16)
+    _compare(
+        lambda acs: torch.exp(
+            acs.unsqueeze(-1).expand(-1, -1, C) - acs.unsqueeze(-2).expand(-1, C, -1)
+        ),
+        acs,
+        optimal_cost=2 * acs.numel(),
+        check_strides=False,
+    )
