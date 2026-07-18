@@ -244,7 +244,12 @@ def spyre__copy_from(self, dst, non_blocking=False):
         torch_spyre._C.copy_tensor(self, dst, non_blocking)
         return dst
     elif self.device.type == "spyre" and self.device == dst.device:
-        torch.ops.spyre.copy_from_d2d(self, dst)
+        # Pass storage_offsets explicitly: a graph input's storage_offset is
+        # dropped by Inductor, so the lowering must re-introduce it in-graph
+        # (see copy_from_d2d in customops.py and lower_spyre_from_d2d).
+        torch.ops.spyre.copy_from_d2d(
+            self, dst, self.storage_offset(), dst.storage_offset()
+        )
         return dst
     else:
         if non_blocking:

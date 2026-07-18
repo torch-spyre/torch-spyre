@@ -16,6 +16,7 @@
 from contextlib import contextmanager
 from warnings import warn
 
+import sympy
 import torch
 
 from torch._inductor.ir import Reduction, Pointwise, StorageBox
@@ -815,8 +816,50 @@ def clone(x, *, memory_format=None):
     return result
 
 
+def _reoffset(node, offset):
+    """Re-introduce a storage_offset onto a graph-input node in-graph.
+
+    A tensor that was sliced OUTSIDE the compiled region (e.g. a
+    ``x.narrow(0, 2, 1)`` handed to a standalone-compiled op) reaches the
+    lowering as a placeholder whose FixedLayout carries the right size and
+    stride but ``offset == 0`` — upstream Inductor's placeholder path reads
+    ``static_sizes_strides`` only and drops ``storage_offset`` (see
+    torch/_inductor/graph.py). The Spyre SpyreTensorLayout likewise has no
+    offset field, so the compiled kernel binds the storage BASE pointer
+    (job_plan.cpp / spyre_stream.cpp use ``storage().data_ptr()``) and reads
+    from element 0 regardless of the view's true offset.
+
+    To make the offset survive into the SDSC binary it must live in the
+    in-graph coordinate: superdsc.py bakes a per-dim byte offset from the
+    coordinate's constant term (``as_coeff_Add()[0]``). We therefore rebuild
+    the node as a ReinterpretView over the same storage with the offset
+    installed on the layout — the same mechanism aten.slice / SliceView use.
+    Size and stride are preserved from the input's own layout, so this is
+    correct for arbitrary (including transposed / permuted) views as long as
+    the device layout preserved the stride.
+    """
+    if offset == 0:
+        return node
+    storage, old_layout = ir.as_storage_and_layout(node)
+    new_layout = ir.FixedLayout(
+        old_layout.device,
+        old_layout.dtype,
+        list(old_layout.size),
+        list(old_layout.stride),
+        sympy.expand(offset),
+    )
+    return ir.TensorBox(ir.ReinterpretView(data=storage, layout=new_layout))
+
+
 @register_spyre_lowering(torch.ops.spyre.copy_from_d2d)
-def lower_spyre_from_d2d(src, dst):
+def lower_spyre_from_d2d(src, dst, src_off, dst_off):
+    # A sliced src/dst reaches us as a graph input whose storage_offset was
+    # dropped (offset==0 on its layout). Re-introduce the offsets in-graph so
+    # they land in the coordinate that superdsc bakes into the kernel; without
+    # this the kernel reads/writes from the storage base and every offset
+    # silently returns the first call's data. See _reoffset above.
+    src = _reoffset(src, src_off)
+    dst = _reoffset(dst, dst_off)
     lowering.mutate_to(dst, src)
 
 
