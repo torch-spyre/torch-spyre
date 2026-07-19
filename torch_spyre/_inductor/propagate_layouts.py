@@ -467,7 +467,11 @@ def _single_arg_op_layout(
         )
         return [stl]
 
-    in_device_coords = device_coordinates(stl, dep, None)
+    try:
+        in_device_coords = device_coordinates(stl, dep, None)
+    except Unsupported:
+        # Candidate whose stick lands on a size-1 dim — not representable here.
+        return []
     stick_expr = in_device_coords[-1]
 
     # Try to preserve input layout, fall back to scanning all output dims
