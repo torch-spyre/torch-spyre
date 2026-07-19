@@ -29,7 +29,8 @@ on:
         description: Image scaleSetLabel to select (image_spyre_backend | image_spyre_backend_pr_<KEY>)
         required: false
         type: string
-        default: image_spyre_backend
+        # default: image_spyre_backend
+        default: image_spyre_backend_shadow
 
       # Flags appended to every `bash tests/run_test.sh <config>` call for the test job
       extra_test_flags:

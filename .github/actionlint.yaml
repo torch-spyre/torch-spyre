@@ -16,5 +16,6 @@ self-hosted-runner:
     - spyre_pf_x12
     - linux
     - image_spyre_backend
+    - image_spyre_backend_shadow
     - image_torch_spyre
     - image_spyre_inference

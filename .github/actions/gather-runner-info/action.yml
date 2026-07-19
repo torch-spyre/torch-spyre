@@ -33,8 +33,15 @@ runs:
         date
         pwd
         whoami
+        sudo whoami || true
         id
         echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
+        echo "GHA_RUNNER_POD_NAME $GHA_RUNNER_POD_NAME"
+        echo "GHA_RUNNER_POD_NAMESPACE $GHA_RUNNER_POD_NAMESPACE"
+        echo "GHA_RUNNER_POD_CPU_REQUEST $GHA_RUNNER_POD_CPU_REQUEST"
+        echo "GHA_RUNNER_POD_CPU_LIMIT $GHA_RUNNER_POD_CPU_LIMIT"
+        echo "GHA_RUNNER_POD_MEMORY_REQUEST $GHA_RUNNER_POD_MEMORY_REQUEST"
+        echo "GHA_RUNNER_POD_MEMORY_LIMIT $GHA_RUNNER_POD_MEMORY_LIMIT"
         echo "PATH $PATH"
         echo "HOME $HOME"
         echo "TORCH_ROOT ${TORCH_ROOT:-<unset>}"

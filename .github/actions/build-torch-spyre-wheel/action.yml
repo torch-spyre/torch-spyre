@@ -21,8 +21,8 @@ inputs:
       Image scaleSetLabel the wheel is built for. Keys the ccache and documents
       that the wheel is ABI-bound to this image's system libs + torch + Python.
     required: false
-    default: image_spyre_backend
-
+    # default: image_spyre_backend
+    default: image_spyre_backend_shadow
 outputs:
   wheel_name:
     description: Basename of the built wheel (found under <torch_spyre_dir>/dist).
