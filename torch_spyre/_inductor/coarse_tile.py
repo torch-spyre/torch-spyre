@@ -79,9 +79,10 @@ from .errors import Unsupported
 from .logging_utils import get_inductor_logger
 from .loop_info import CoarseTileInfo
 from .propagate_hints import DimHint
-from .pass_utils import op_out_coords
+from .pass_utils import op_out_coords, host_coordinates, indirect_sizes_from_op
 from .span_overflow_hint_analysis import (
     SpanOverflowTilePlan,
+    _is_batch_matmul_reduction,
     can_conform_pointwise_tile,
     plan_span_overflow_tile,
 )
@@ -119,6 +120,91 @@ def _auto_span_read_deps(op: ComputedBuffer) -> set[str]:
         }
     except (AttributeError, TypeError):
         return set()
+
+
+def _reduction_shares_group_tiled_dim(
+    op: ComputedBuffer,
+    signature: tuple[tuple[int, int, bool], ...],
+    current_group: list,
+) -> bool:
+    """True if a reduction's tiled output dim(s) are the *same logical dim(s)*
+    as the tiled dim(s) of the producer(s) it reads in the open group.
+
+    Joining ops into one group means they share a single loop nest: iteration
+    ``t`` computes tile ``t`` of every member.  For that to be correct, the
+    consumer's tiled dimension must be the dimension that — through its read of
+    the producer — indexes the producer's tiled dimension.  Matching split
+    counts is necessary but not sufficient (two unrelated dims could split into
+    the same count), so verify the loop-variable correspondence explicitly: the
+    symbol tiling the consumer's output dim must appear in the producer's tiled
+    coordinate as seen through the read.
+
+    Conservative: any failure to establish the correspondence returns False, so
+    an unverifiable pair is left to the normal (Unsupported) conflict path
+    rather than fused into a possibly-desynchronized loop.
+
+    This check itself is reduction-type-agnostic — what makes the join safe is
+    that the tiled dim is an **output range**, not the reduction range: tile
+    ``t`` of an output dim is self-contained (it reads only tile ``t`` of the
+    producer).  The caller currently gates the join to batch-matmul reductions
+    (only that path is hardware-validated; see the reduction-join branch in
+    ``span_overflow_groups``), so in practice ``op`` is always a matmul here,
+    but nothing in this function relies on that.
+
+    The automatic span-overflow planner only ever tiles output ranges (see
+    ``SpanOverflowTileLevel``: ``is_reduction`` is always False on the auto
+    path, because reduction-range tiling would require partial-result
+    accumulation), so every signature reaching here should already be
+    output-only.  We assert that invariant explicitly below and fail closed if
+    a future planner change ever emits a reduction-range tile — such a tile
+    would break the loop-carried accumulation this join assumes away.
+    """
+    # Guard: only output-range tiles may join.  A reduction (K) range tile
+    # would need cross-tile accumulation and cannot share a per-tile loop nest.
+    if any(is_reduction for _host_dim, _split, is_reduction in signature):
+        return False
+    try:
+        consumer_coords = op_out_coords(op)
+        reads = {
+            dep.name: dep
+            for dep in op.get_read_writes().reads
+            if isinstance(dep, MemoryDep)
+        }
+        indirect = indirect_sizes_from_op(op)
+    except (AttributeError, TypeError, ValueError, RuntimeError, KeyError, IndexError):
+        # op_out_coords internally calls host_coordinates, which can raise the
+        # same ValueError/RuntimeError/IndexError as the direct call below, so
+        # this list must cover that set too (plus AttributeError for the
+        # get_read_writes()/indirect_sizes_from_op attribute access).
+        return False
+
+    consumer_tiled_syms: set = set()
+    for host_dim, _split, _is_reduction in signature:
+        if host_dim >= len(consumer_coords):
+            return False
+        consumer_tiled_syms |= consumer_coords[host_dim].free_symbols
+    if not consumer_tiled_syms:
+        return False
+
+    group_by_name = {gop.get_name(): (gop, dims) for gop, dims in current_group}
+    verified_any = False
+    for name, dep in reads.items():
+        if name not in group_by_name:
+            continue
+        producer, producer_dims = group_by_name[name]
+        try:
+            producer_coords = host_coordinates(producer.get_layout(), dep, indirect)
+        except (TypeError, ValueError, RuntimeError, KeyError, IndexError):
+            return False
+        for host_dim_p, _split, _is_reduction in producer_dims:
+            if host_dim_p >= len(producer_coords):
+                return False
+            if not (producer_coords[host_dim_p].free_symbols & consumer_tiled_syms):
+                # Consumer's tiled loop var does not index this producer's tiled
+                # dim -> not the same logical dim -> unsafe to share a loop.
+                return False
+            verified_any = True
+    return verified_any
 
 
 def _dims_to_hints(
@@ -537,15 +623,26 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
         (``can_conform_pointwise_tile``) — the op then adopts the run's split
         instead of its own.
 
-    Reduction/BMM ops are never grouped (this pass is Pointwise-only for now)
-    and always get an independent singleton group. An op that reads a buffer
-    from an already-closed group, or from the open run without being
-    fusable into it, still raises ``Unsupported``: two independent loop nests
-    over the same span-overflow-sized data can desynchronize, and for ops
-    tiled specifically because their *full* buffer violates the hardware
-    span limit, falling back to materializing that full buffer for an
-    "outside consumer" would silently reintroduce the exact span violation
-    tiling was meant to prevent.
+    A Reduction/BMM op does not *start* or extend a Pointwise run.  A
+    **batch-matmul** reduction may **join** an open run's group when it reads a
+    producer in that run and tiles the same shared logical (output) dim at the
+    same split count — e.g. an F.linear matmul reading its auto-tiled
+    restickified weight (see the reduction-join branch below and
+    ``_reduction_shares_group_tiled_dim``).  The join is gated to matmul
+    because only that path is hardware-validated; the mechanism is otherwise
+    reduction-type-agnostic and extending it to other reductions is future work
+    (see the branch comment).  On joining, the group is flushed immediately, so
+    a matmul is always the last member of its group and each auto-tiled
+    producer feeds at most one matmul consumer.  A Reduction that cannot join
+    (including any non-matmul reduction) gets an independent singleton group or,
+    if it reads an auto-tiled producer, raises ``Unsupported``.  An op that
+    reads a buffer from an already-closed group, or from the open run without
+    being fusable into it, still raises ``Unsupported``: two independent loop
+    nests over the same span-overflow-sized data can desynchronize, and for ops
+    tiled specifically because their *full* buffer violates the hardware span
+    limit, falling back to materializing that full buffer for an "outside
+    consumer" would silently reintroduce the exact span violation tiling was
+    meant to prevent.
     """
     from . import config
 
@@ -565,6 +662,12 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
     groups: list[tuple] = []
     next_hint_id = _SPAN_OVERFLOW_HINT_ID
     auto_tiled_producers: set[str] = set()
+    # Producers whose group was closed by a Reduction consumer joining it (see
+    # the reduction-join branch below).  These are a subset of
+    # ``auto_tiled_producers``; tracked separately only so a *second* consumer
+    # reading such a producer gets a precise "multi-consumer not yet supported"
+    # error rather than the generic pointwise-only conflict message.
+    reduction_joined_producers: set[str] = set()
     # Producers already tiled by a user spyre_hint (assign_dim_hints runs
     # before this pass and leaves dim_hints set; hints_to_coarse_tile_groups
     # only reads it, it never clears it). An op reading one of these has the
@@ -576,15 +679,15 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
         if isinstance(op, ComputedBuffer) and getattr(op, "dim_hints", [])
     }
     _PwDims = tuple[tuple[int, int, bool], ...]
-    current_pw_group: list[tuple[ComputedBuffer, _PwDims]] = []
-    current_pw_signature: _PwDims | None = None
+    current_group: list[tuple[ComputedBuffer, _PwDims]] = []
+    current_signature: _PwDims | None = None
 
-    def flush_current_pw_group() -> None:
-        nonlocal next_hint_id, current_pw_group, current_pw_signature
-        if not current_pw_group:
+    def flush_current_group() -> None:
+        nonlocal next_hint_id, current_group, current_signature
+        if not current_group:
             return
 
-        signature = current_pw_signature
+        signature = current_signature
         assert signature is not None
         hint_ids = list(range(next_hint_id, next_hint_id + len(signature)))
         next_hint_id += len(signature)
@@ -596,7 +699,7 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
         ]
 
         group_ops: list[Operation] = []
-        for grouped_op, dims in current_pw_group:
+        for grouped_op, dims in current_group:
             grouped_op.dim_hints = _dims_to_hints(  # type: ignore[attr-defined]
                 grouped_op, dims, hint_ids
             )
@@ -610,30 +713,28 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
             [op.get_name() for op in group_ops],
             levels,
         )
-        current_pw_group = []
-        current_pw_signature = None
+        current_group = []
+        current_signature = None
 
     for op in graph.operations:
         if not isinstance(op, ComputedBuffer):
-            flush_current_pw_group()
+            flush_current_group()
             continue
         if not isinstance(op.data, (Pointwise, Reduction)):
-            flush_current_pw_group()
+            flush_current_group()
             continue
         if isinstance(op.data, Reduction) and not list(op.data.ranges):
-            flush_current_pw_group()
+            flush_current_group()
             continue
         if not isinstance(op.layout, FixedTiledLayout):
-            flush_current_pw_group()
+            flush_current_group()
             continue
         if getattr(op, "dim_hints", []):
-            flush_current_pw_group()
+            flush_current_group()
             continue
 
         read_deps = _auto_span_read_deps(op)
-        current_group_names = {
-            grouped_op.get_name() for grouped_op, _ in current_pw_group
-        }
+        current_group_names = {grouped_op.get_name() for grouped_op, _ in current_group}
 
         plan = plan_span_overflow_tile(op, config.sencores)
         if plan is None:
@@ -644,7 +745,7 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
             # plan_span_overflow_tile returning None here means that op's own
             # full-size reads/writes are already known not to overflow.
             logger.debug("[span-overflow groups] op=%s no auto plan", op.get_name())
-            flush_current_pw_group()
+            flush_current_group()
             continue
 
         signature = _auto_span_plan_signature(plan)
@@ -656,7 +757,7 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
         )
         logger.debug(
             "[span-overflow groups] op=%s read_deps=%s auto_tiled_producers=%s "
-            "current_pw_group=%s",
+            "current_group=%s",
             op.get_name(),
             sorted(read_deps),
             sorted(auto_tiled_producers),
@@ -672,6 +773,23 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
                 op.get_name(),
                 completed_conflicts,
             )
+            joined_conflicts = sorted(
+                set(completed_conflicts) & reduction_joined_producers
+            )
+            if joined_conflicts:
+                # The producer was already auto-tiled *and* joined into a
+                # synchronized loop by an earlier reduction consumer.  A single
+                # auto-tiled producer can currently feed only one reduction
+                # consumer; a second consumer would need its own tile loop over
+                # the same producer, which is not yet supported.
+                raise Unsupported(
+                    f"Cannot auto-tile {op.get_name()}: it reads producer(s) "
+                    f"{joined_conflicts} that were already auto-tiled and joined "
+                    "by another reduction consumer. A single auto-tiled producer "
+                    "can currently feed only one reduction consumer in one "
+                    "synchronized group; multiple consumers sharing one "
+                    "auto-tiled producer is not yet supported (#3217)."
+                )
             raise Unsupported(
                 f"Cannot auto-tile {op.get_name()}: it reads already auto-tiled "
                 f"producer(s) {completed_conflicts}. Automatic span-overflow "
@@ -681,14 +799,15 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
             )
 
         is_reduction_op = isinstance(op.data, Reduction)
+        is_matmul_reduction = _is_batch_matmul_reduction(op)
 
         can_join_pw_group = (
             not is_reduction_op
-            and current_pw_signature is not None
-            and signature == current_pw_signature
+            and current_signature is not None
+            and signature == current_signature
         )
         if can_join_pw_group:
-            current_pw_group.append((op, signature))
+            current_group.append((op, signature))
             logger.info(
                 "[span-overflow groups] op=%s joined_matching_signature=%s",
                 op.get_name(),
@@ -704,18 +823,17 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
         conform_dims: tuple[tuple[int, int, bool], ...] | None = None
         if (
             not is_reduction_op
-            and current_pw_signature is not None
+            and current_signature is not None
             and (read_deps & current_group_names)
         ):
             split_by_host_dim = {
-                host_dim: split_count
-                for host_dim, split_count, _ in current_pw_signature
+                host_dim: split_count for host_dim, split_count, _ in current_signature
             }
             if can_conform_pointwise_tile(op, split_by_host_dim, config.sencores):
-                conform_dims = current_pw_signature
+                conform_dims = current_signature
 
         if conform_dims is not None:
-            current_pw_group.append((op, conform_dims))
+            current_group.append((op, conform_dims))
             logger.info(
                 "[span-overflow groups] op=%s conformed_to_group_split=%s "
                 "(own_independent_plan_was=%s)",
@@ -725,8 +843,63 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
             )
             continue
 
+        # A batch-matmul consumer (e.g. an F.linear matmul reading its
+        # restickified weight) can join its tiled producer's open group when it
+        # tiles the same shared logical dimension at the same split count(s).
+        # The shared dim sits at a different position in the matmul's output
+        # ranges (the producer tiles its V output dim; the matmul tiles the
+        # corresponding output N dim), so signatures match on split_count, not
+        # host_dim.  Both are output-dim tiles, so they share one synchronized
+        # loop nest and the producer's per-tile slice feeds the consumer's
+        # per-tile compute — no unsynchronized second loop, no full-buffer
+        # materialization.
+        #
+        # Scope: the join is gated to batch-matmul reductions only. The join is
+        # correct-by-construction for *any* reduction tiled on a shared output
+        # range (tile t is self-contained, so sum/mean/max would pair
+        # slice-for-slice too), and the grouping logic here does not depend on
+        # the reduction type — but only the matmul path (the #1918 LM-head case)
+        # has been validated end-to-end on hardware. Extending to other
+        # reductions is future work: drop the _is_batch_matmul_reduction gate
+        # and validate a non-matmul reduction (e.g. a sum reading a
+        # span-overflowing pointwise producer) numerically on device. Until
+        # then, non-matmul reductions fall through to the fail-safe Unsupported
+        # path below rather than silently taking an unvalidated route.
+        #
+        # Split-count equality alone is insufficient: two unrelated dims could
+        # split into the same count.  _reduction_shares_group_tiled_dim verifies
+        # the consumer's tiled loop var actually indexes the producer's tiled dim
+        # through the read, so the shared loop pairs matching slices.  It also
+        # fails closed if the matmul tiles its reduction (K) range rather than an
+        # output range (see its docstring) — only output-range tiles may join.
+        #
+        # The group is flushed immediately after the matmul joins: a reduction
+        # terminates the extendable run (its output shape/tiling differs from
+        # the producers'), so nothing further can be folded into this loop nest.
+        # A consequence is one-consumer-per-group — a *second* op reading the
+        # same producer is rejected below.  Supporting several sibling matmuls
+        # sharing one auto-tiled producer is a deliberate non-goal here (matches
+        # the validated single-matmul LM-head case); see #3217.
+        if (
+            is_matmul_reduction
+            and current_signature is not None
+            and (read_deps & current_group_names)
+            and [s for _, s, _ in signature] == [s for _, s, _ in current_signature]
+            and _reduction_shares_group_tiled_dim(op, signature, current_group)
+        ):
+            current_group.append((op, signature))
+            reduction_joined_producers |= read_deps & current_group_names
+            logger.info(
+                "[span-overflow groups] op=%s joined_producer_group_as_reduction "
+                "split=%s",
+                op.get_name(),
+                list(signature),
+            )
+            flush_current_group()
+            continue
+
         pending_conflicts = sorted(read_deps & current_group_names)
-        flush_current_pw_group()
+        flush_current_group()
         if pending_conflicts:
             logger.warning(
                 "[span-overflow groups] op=%s rejected_conflicting_auto_producers=%s",
@@ -742,8 +915,8 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
             )
 
         if not is_reduction_op:
-            current_pw_group.append((op, signature))
-            current_pw_signature = signature
+            current_group.append((op, signature))
+            current_signature = signature
             logger.info(
                 "[span-overflow groups] op=%s started_new_pw_group split=%s",
                 op.get_name(),
@@ -751,8 +924,8 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
             )
             continue
 
-        # Reduction/BMM ops are never grouped in this pass: always an
-        # independent singleton group.
+        # A Reduction/BMM op that did not join an open producer group (above)
+        # gets an independent singleton group.
         hint_ids = list(range(next_hint_id, next_hint_id + len(signature)))
         next_hint_id += len(signature)
         op.dim_hints = _dims_to_hints(  # type: ignore[attr-defined]
@@ -786,7 +959,7 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
             max_span / (1024**2),
         )
 
-    flush_current_pw_group()
+    flush_current_group()
     return groups
 
 

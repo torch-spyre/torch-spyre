@@ -194,10 +194,14 @@ C[b, m, n] = reduce_k A[b, m, k] * B[b, k, n]
 ```
 
 Spans controlled by `b`, `m`, or `n` are output-range tileable.  Spans
-controlled by `k` are not.  In the LM-head lowering, the restickify producer can
-be auto-tiled independently.  The BMM consumer is not automatically fused with
-that producer yet, so current codegen coverage checks for a restickify
-`LoopSpec` plus a plain BMM consumer:
+controlled by `k` are not.  In the LM-head lowering, the restickify producer is
+auto-tiled on its vocab output dim, and the BMM consumer **joins that
+producer's group** (see [Adapter and Coarse
+Tiling](#adapter-and-coarse-tiling) below) when it tiles the
+corresponding output `n` dim at the same split count — one synchronized loop
+nest, the producer's per-tile weight slice feeding the consumer's per-tile
+matmul.  Codegen therefore sees a restickify `LoopSpec` and a BMM sharing that
+loop:
 
 ```text
 LoopSpec(
@@ -205,8 +209,22 @@ count=sympify('4')
 op='ReStickifyOpHBM'
 tiled_symbols=[[sympify('c0')]]
 
-op='batchmatmul'
+op='batchmatmul'   # same loop, tiled on the corresponding output n dim
 ```
+
+The join is gated: split counts must match *and* the consumer's tiled loop
+variable must actually index the producer's tiled dim through the read
+(`_reduction_shares_group_tiled_dim`), so unrelated dims that merely share a
+split count are not fused.  A matmul can only join on an **output**-range
+tile, never the reduction (`k`) range, and each auto-tiled producer feeds at
+most one matmul consumer.
+
+The join is currently restricted to batch-matmul reductions, because that is
+the only path validated end-to-end on hardware (the #1918 LM-head case). The
+grouping mechanism is reduction-type-agnostic, so extending it to other
+reductions (`sum`/`mean`/`max` tiled on a shared output dim) is future work
+that needs on-device numeric validation; until then a non-matmul reduction
+reading an auto-tiled producer falls back to the fail-safe `Unsupported` path.
 
 Code flow:
 
@@ -717,18 +735,31 @@ synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
    (b) an op's own plan disagrees but the op directly reads a buffer written
    by the open run and the run's split is *also* legal and sufficient for
    that op on its own (`can_conform_pointwise_tile`) — the op then adopts the
-   run's split instead of its own. Reduction/BMM ops are never grouped or
-   used as a conform target in this pass and always get an independent
-   singleton group;
+   run's split instead of its own. A Reduction/BMM op does not start or extend
+   a run and is never a conform target, but a **batch-matmul** reduction may
+   **join** an open run's group when it reads a producer in that run and tiles
+   the same shared output dim at the same split count(s) — verified by
+   `_reduction_shares_group_tiled_dim`, which confirms the consumer's tiled
+   loop variable actually indexes the producer's tiled dim through the read
+   (matching split counts alone do not qualify). Only output-range tiles may
+   join (never a reduction range). The join is gated to matmul because that is
+   the only hardware-validated path; the mechanism is reduction-type-agnostic
+   and extending it to other reductions is future work. On joining, the group
+   is flushed immediately, so a matmul is always the last member of its group
+   and each auto-tiled producer feeds at most one matmul consumer. A Reduction
+   that cannot join (including any non-matmul reduction) gets an independent
+   singleton group, or raises `Unsupported` if it reads an auto-tiled producer;
 6. rejects any op that reads a buffer from an already-closed auto-tiled
    group, from a producer already tiled by a user `spyre_hint` (checked via
    the same `dim_hints` attribute `assign_dim_hints` leaves behind, since
    this pass never clears it), or from the open run without being fusable
-   into it (mismatched signature and conform fails, or the reading op is a
-   Reduction/BMM), since two independent loop nests over the same
+   into it (mismatched signature and conform fails, or a Reduction/BMM that
+   cannot join per step 5), since two independent loop nests over the same
    span-overflow-sized data can desynchronize, and materializing a tiled
    Pointwise producer's full buffer for such an "outside consumer" can
-   reintroduce the exact span violation tiling was meant to prevent;
+   reintroduce the exact span violation tiling was meant to prevent. A second
+   consumer of a producer already joined by a matmul is rejected with a
+   distinct "multi-consumer not yet supported" message;
 7. creates synthetic `DimHint`s with ids starting at
    `_SPAN_OVERFLOW_HINT_ID = 10000`, shared across every op in a fused group;
 8. returns coarse-tile groups in the same format as user hints.
@@ -789,7 +820,13 @@ automatic output-range tile plan.  Common reasons:
 - `_resize_device_layout` cannot reconstruct the post-tile layout;
 - every tried combination still leaves output/input spans above the limit;
 - an automatically tiled op reads a producer that was already automatically
-  tiled, which would require producer-consumer loop fusion to be correct.
+  tiled and cannot be fused into that producer's loop (a Pointwise op whose
+  split does not conform, a non-matmul reduction — which is not yet eligible
+  to join — or a matmul that does not share the producer's tiled output dim),
+  since independent loop nests would require producer-consumer loop fusion to
+  stay synchronized;
+- a second consumer reads a producer that a matmul has already joined
+  (one auto-tiled producer currently feeds at most one matmul consumer).
 
 These failures are deliberate.  They avoid silently emitting a plan that still
 violates the hardware span limit or silently creates unsynchronized tile loops.

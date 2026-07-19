@@ -16,6 +16,7 @@
 
 import unittest
 from unittest import TestCase
+
 from torch_spyre._inductor.scratchpad.plan_solver import (
     MemoryPlanSolver,
     CoreDivision,
@@ -40,6 +41,9 @@ from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     FirstFitLayoutSolver,
     _assert_in_place_relationships,
     _topological_sort,
+)
+from torch_spyre._inductor.scratchpad.simulated_annealing import (
+    SimulatedAnnealingLayoutSolver,
 )
 
 LARGE_SIZE = 512
@@ -155,7 +159,9 @@ class BaseLayoutSolverTests:
             self.make_buffer("buffer1", 3, [0, 1]),
             self.make_buffer("buffer2", 4, [0, 1]),
         ]
-        self.verify_layout(buffers, [0, None, None], alignment=ALIGNMENT)
+        self.verify_layout(
+            buffers, {(0, None, None), (None, None, 0)}, alignment=ALIGNMENT
+        )
 
     def test_alignment_enforced(self):
         # Each buffer is placed at the next alignment boundary.
@@ -283,7 +289,7 @@ class BaseLayoutSolverTests:
                 self.make_buffer("b", 20, [0, 3]),
                 self.make_buffer("c", 30, [0, 3]),
             ],
-            [0, 10, None],
+            {(0, 10, None), (None, 0, 20)},
             size=50,
         )
 
@@ -832,6 +838,24 @@ class TestCpSatUnallocatedReads(TestCase):
 
 class TestGreedyLayoutSolver(BaseLayoutSolverTests, TestCase):
     solver_class = GreedyLayoutSolver
+
+
+class TestSimulatedAnnealingLayoutSolver(
+    ScoreOrderingTests, BaseLayoutSolverTests, TestCase
+):
+    solver_class = SimulatedAnnealingLayoutSolver
+
+    def test_largest_buffer_evicted_when_full(self):
+        # unlike other solvers, simulated annealing finds the optimal solution
+        self.verify_layout(
+            [
+                LifetimeBoundBuffer("a", 10, [0, 3]),
+                LifetimeBoundBuffer("b", 20, [0, 3]),
+                LifetimeBoundBuffer("c", 30, [0, 3]),
+            ],
+            [None, 0, 20],
+            size=50,
+        )
 
 
 class TestTopologicalSort(TestCase):

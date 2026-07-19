@@ -35,6 +35,7 @@ from torch_spyre._inductor.pass_utils import (
     device_coordinates,
 )
 from torch._inductor.ir import MutationLayoutSHOULDREMOVE, ComputedBuffer
+from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 
 # Op outputs eligible for LX-pinning. `amax` is the lowered form of
 # `max`; both names are listed to match whichever the IR shows.
@@ -44,7 +45,7 @@ OP_OUTPUT_GOOD_FOR_LX_REUSE = frozenset(
         "amax",
         "maximum",
         "sum",
-        # "clone",
+        "clone",
         "exp",
         "sub",
         "mul",
@@ -67,12 +68,12 @@ def clone_at_graph_boundaries() -> bool:
     """True when clone ops are eligible for LX, enabling clone insertion at graph
     input/output boundaries so those buffers can also be LX-pinned.
 
-    Gated by the dedicated ``lx_boundary_clones`` flag (or, legacy, by listing
-    "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE). It intentionally does NOT consult
-    ``allow_all_ops_in_lx_planning``: that flag widens intermediate-output
-    eligibility and is set broadly (e.g. the LX-planning op suite), so coupling
-    it here would silently turn on the not-yet-correct boundary clone path."""
-    return config.lx_boundary_clones or "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE
+    Gated by listing "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE. It intentionally
+    does NOT consult ``allow_all_ops_in_lx_planning``: that flag widens
+    intermediate-output eligibility and is set broadly (e.g. the LX-planning
+    op suite), so coupling it here would silently turn on the boundary clone
+    path in contexts that don't intend to exercise it."""
+    return "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE
 
 
 class GraphView:
@@ -94,10 +95,10 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
     at which that buffer is accessed (read or written).  Graph inputs are seeded with
     an empty list; unused inputs remain empty.
 
-    Note: previously, unused graph inputs did not appear in the returned dict at all.
-    Now they appear with an empty list.  Callers that skip buffers with ``len(uses) <= 1``
-    (e.g. ``_build_bound_buffers``) will still skip unused inputs correctly, since
-    ``len([]) == 0 <= 1``."""
+    Note: previously, unused graph inputs did not appear in the returned dict at
+    all.  Now they appear with an empty list.  Callers that skip buffers with
+    ``len(uses) <= 1`` (e.g. ``_build_bound_buffers``) will still skip unused inputs
+    correctly, since ``len([]) == 0 <= 1``."""
     liveness: dict[str, list[int]] = {}
     for input_name in graph.graph_input_names:
         liveness[input_name] = []
@@ -125,7 +126,6 @@ def mem_usage_by_buf(
     num_cores_per_op = get_ncores_for_buffers(graph, cache)
     mem_usage: dict = {}
 
-    buf_names = {op.name for op in graph.operations}
     for op in graph.operations:
         buf_name = op.name
         buf = graph.get_buffer(buf_name)
@@ -141,7 +141,7 @@ def mem_usage_by_buf(
                 # below carries validity, so no arithmetic on num_cores here.
                 "size_per_core": -1,
                 "core_div_mismatch": num_cores < 0,
-                "op_inputs": [dep.name for dep in rw.reads if dep.name in buf_names],
+                "op_inputs": [dep.name for dep in rw.reads],
             }
             continue
         dev_layout = layout.device_layout
@@ -152,7 +152,7 @@ def mem_usage_by_buf(
             "size": dev_size,
             "size_per_core": dev_size // num_cores,
             "core_div_mismatch": num_cores < 0,
-            "op_inputs": [dep.name for dep in rw.reads if dep.name in buf_names],
+            "op_inputs": [dep.name for dep in rw.reads],
         }
 
     return mem_usage
@@ -510,3 +510,116 @@ def _would_produce_lx_back_gap(
                 if device_size[d] > it_dim_size:
                     return True
     return False
+
+
+def plot_buffers(buffers: list[LifetimeBoundBuffer], max_height: int):
+    """Visualize a scratchpad allocation layout.
+
+    Allocated buffers are shown in blue; buffers that exceed the capacity
+    limit are shown in gray.  In-place parent/child pairs that share an
+    address are highlighted: a dark overlay spans the combined lifetime and
+    a green marker indicates the handoff tick.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+
+    name_to_index = {b.name: i for i, b in enumerate(buffers)}
+
+    fig, ax = plt.subplots()
+
+    for buffer in buffers:
+        addr = buffer.address
+        if addr is None:
+            continue
+        color = "b" if addr + buffer.size <= max_height else "lightgray"
+        rect = patches.Rectangle(
+            xy=(buffer.start_time, addr),
+            width=buffer.end_time - buffer.start_time,
+            height=buffer.size,
+            linewidth=0.3,
+            edgecolor="r",
+            facecolor=color,
+            fill=True,
+        )
+        ax.add_patch(rect)
+
+    for buffer in buffers:
+        addr = buffer.address
+        if addr is None:
+            continue
+        for p in buffer.in_place_parents:
+            pj = name_to_index.get(p)
+            if pj is None:
+                continue
+            parent = buffers[pj]
+            if parent.address is None:
+                continue
+            if addr == parent.address:
+                ax.add_patch(
+                    patches.Rectangle(
+                        xy=(parent.start_time, addr),
+                        width=buffer.end_time - parent.start_time,
+                        height=buffer.size,
+                        linewidth=0.3,
+                        edgecolor="r",
+                        facecolor="k",
+                        fill=True,
+                        alpha=0.25,
+                    )
+                )
+                ax.add_patch(
+                    patches.Rectangle(
+                        xy=(buffer.start_time, addr),
+                        width=1,
+                        height=buffer.size,
+                        linewidth=0.3,
+                        edgecolor="r",
+                        facecolor="g",
+                        fill=True,
+                    )
+                )
+
+    max_time = max((b.end_time for b in buffers), default=0)
+    ax.set_xlim(0, max_time)
+    ax.set_ylim(0, max_height)
+    return fig
+
+
+def quality_plot(
+    quality_logs: list[list[int]], temperature_logs: Optional[list[float]] = None
+):
+    """Plot quality (buffers allocated) over annealing steps.
+
+    Each run is drawn as a thin blue line; their smoothed average is drawn
+    in red.  When temperature data is available (typically recorded by
+    a method from an annealing schedule), the first run's temperature schedule is
+    overlaid on a log-scale right axis in green.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    fig, ax1 = plt.subplots()
+    for log in quality_logs:
+        ax1.plot(log, "b", lw=1, alpha=0.1)
+
+    if quality_logs:
+        average = np.array(quality_logs).mean(axis=0)
+        n_points = len(average)
+        if n_points >= 20:
+            n_smoothing = min(n_points // 10, 10)
+            smoothed = np.convolve(average, np.ones(n_smoothing) / n_smoothing, "valid")
+            ax1.plot(
+                [x + n_smoothing / 2 for x in range(len(smoothed))],
+                smoothed,
+                "r",
+                lw=3,
+            )
+        else:
+            ax1.plot(average, "r", lw=3)
+
+    if temperature_logs:
+        ax2 = ax1.twinx()
+        ax2.set_yscale("log")
+        ax2.plot(temperature_logs, "g", lw=1)
+
+    return fig

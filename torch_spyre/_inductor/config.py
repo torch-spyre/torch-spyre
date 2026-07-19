@@ -29,14 +29,6 @@ global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == 
 
 allow_all_ops_in_lx_planning: bool = False
 
-# Insert clone ops at graph input/output boundaries so those buffers can be
-# LX-pinned (see scratchpad.utils.clone_at_graph_boundaries). This path is not
-# yet correct for all op types (e.g. matmul/layernorm/split under multi-core
-# K-split) and is kept off by default. Deliberately separate from
-# allow_all_ops_in_lx_planning, which only widens *intermediate* output
-# eligibility and must not, on its own, enable boundary clone insertion.
-lx_boundary_clones: bool = os.environ.get("LX_BOUNDARY_CLONES", "0") == "1"
-
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
 
 sencores: int = int(os.getenv("SENCORES", "32"))
@@ -97,22 +89,18 @@ core_id_k_fast_emission: bool = (
 # into the SDSC JSON and bundle.mlir emits sdsc_execute with no operands.
 bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 
-# When True (default), LoopSpec nodes are fully unrolled into flat OpSpecs
-# before generate_bundle runs.  Set to False to pass LoopSpecs through intact
-# for the scf.for / affine.apply path.
-unroll_loops: bool = os.environ.get("UNROLL_LOOPS", "1") == "1"
-
 # Layout solver class used by default in scratchpad.allocator.ScratchpadAllocator.
 # Options:
-#  "greedy":   GreedyLayoutSolver (default),
-#  "bestfit":  BestFitLayoutSolver,
-#  "firstfit": FirstFitLayoutSolver,
+#  "greedy":       GreedyLayoutSolver (default),
+#  "bestfit":      BestFitLayoutSolver,
+#  "firstfit":     FirstFitLayoutSolver,
+#  "simulated_annealing":  SimulatedAnnealingLayoutSolver,
 #  "cpsat":    CpSatLayoutSolver (OR-Tools CP-SAT joint core-division +
 #              LX placement, minimizing HBM transfer traffic).
 
 # TODO(isuruf): Change to firstfit when deeptools PR4298 lands
-layout_solver: Literal["greedy", "bestfit", "firstfit", "cpsat"] = os.environ.get(
-    "LAYOUT_SOLVER", "greedy"
-)  # type: ignore[assignment]
+layout_solver: Literal[
+    "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
+] = os.environ.get("LAYOUT_SOLVER", "greedy")  # type: ignore[assignment]
 
 install_config_module(sys.modules[__name__])

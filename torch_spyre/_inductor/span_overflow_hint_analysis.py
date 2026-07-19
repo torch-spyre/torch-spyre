@@ -143,9 +143,9 @@ class SpanOverflowCandidate:
 _MAX_TILE_DIMS = 3
 _MAX_TILE_COMBOS = 512
 _MAX_SPLITS_PER_DIM = 16
-# Current LoopSpec lowering fully unrolls each coarse-tile loop into separate
-# SDSC specs, so keep automatic plans conservative.  Manual spyre_hint remains
-# user-controlled and can request larger counts explicitly.
+# Current LoopSpec lowering emits an scf.for loop per coarse-tile split, so
+# keep automatic plans conservative.  Manual spyre_hint remains user-controlled
+# and can request larger counts explicitly.
 _MAX_AUTO_TILE_SPLIT_COUNT = 64
 
 
@@ -436,14 +436,14 @@ def _coordinate_span_elems(
 
     This evaluates each tile as if its symbol always starts at 0, not at that
     tile's offset into the full tensor.  That is safe here: current automatic
-    coarse tiling fully unrolls each tile into its own separately generated
-    SDSC spec (see span_overflow_hint_analysis.md), and _divide_ranges only
-    shrinks the declared range for that spec -- it never rewrites the index
-    expression to add a tile offset.  So a symbol's value within any one
-    tile's generated spec is genuinely bounded by [0, per_tile_size) every
-    time; the tile's real position in the full tensor is resolved afterward,
-    by a separate physical address offset that this Mod computation never
-    sees.  A Mod term therefore cannot see a later tile's actual wraparound
+    coarse tiling shrinks each op's declared iteration range once via
+    _divide_ranges (see span_overflow_hint_analysis.md) -- it never rewrites
+    the index expression to add a tile offset.  So a symbol's value within
+    the shrunk range is genuinely bounded by [0, per_tile_size) every time;
+    the tile's real position in the full tensor is resolved afterward, by a
+    separate affine.apply-based physical address offset that this Mod
+    computation never sees.  A Mod term therefore cannot see a later tile's
+    actual wraparound
     window, because no later tile ever substitutes a shifted value here.
     """
     per_core_max = 0
