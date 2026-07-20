@@ -65,6 +65,7 @@ from torch_spyre._inductor.scratchpad.passes import (
 )
 from torch_spyre._inductor.scratchpad.utils import (
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
+    round_up_to_alignment,
     clone_at_graph_boundaries,
     mem_usage_by_buf,
     calculate_liveness,
@@ -84,6 +85,22 @@ from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.pass_utils import _is_matmul_op
 
 logger = get_inductor_logger("scratchpad.allocator")
+
+# Keep these values synchronized with Deeptools' LX memory tracker:
+#
+# * ``SenSystemDef`` removes 64 KiB of the physical 2 MiB LX for program and
+#   debug data (``dsc/sysdef.cpp``).
+# * ``MemTrackBundle::initializeMemoryTrackers`` uses one 128-byte stick as the
+#   LX allocation granularity (``sharedtools/mem_track_bundle.cpp``).
+#
+# Torch and DXP independently consume ``DXP_LX_FRAC_AVAIL``.  These constants
+# define the fixed part of that cross-compiler ownership contract.
+_LX_PHYSICAL_CAPACITY_BYTES = 2 << 20
+_LX_PROGRAM_DEBUG_RESERVATION_BYTES = 64 << 10
+_LX_TRACKER_CAPACITY_BYTES = (
+    _LX_PHYSICAL_CAPACITY_BYTES - _LX_PROGRAM_DEBUG_RESERVATION_BYTES
+)
+_LX_ALLOCATION_GRANULARITY_BYTES = 128
 
 
 class ScratchpadAllocator:
@@ -507,19 +524,23 @@ def _op_short_name(op: Any) -> str:
 
 
 def _lx_planning_size() -> int:
-    """LX scratchpad bytes available to the layout solver.
+    """Return the frontend LX reservation, matching Deeptools exactly.
 
-    TEMPORARY GUARD: subtracts a 100KB safety margin from the frontend's
-    declared share. The backend compiler has been observed placing its own
-    internal LX allocations at a fixed address (~1587KB) inside the
-    frontend's nominal `dxp_lx_frac_avail` partition, silently corrupting
-    frontend data resident there once per-core usage gets close enough to
-    the partition boundary (see Issue 3222). This
-    margin keeps frontend buffers clear of that address until the backend
-    allocator itself is fixed to stay within its own reserved share.
+    The shared Torch/DXP contract partitions Deeptools' allocatable LX capacity,
+    not the physical 2 MiB.  The frontend reserves
+    ``1 - DXP_LX_FRAC_AVAIL`` from address zero, truncates the fractional byte
+    count to an integer, and rounds that reservation up to the memory tracker's
+    128-byte allocation granularity.  DXP marks that interval unavailable and
+    allocates at or above the returned exclusive upper bound.  This is the
+    ownership boundary whose mismatch was reported in torch-spyre issue #3222,
+    not a safety margin.
     """
-    lx_backend_spill_margin = 100 << 10
-    return int((2 << 20) * (1.0 - config.dxp_lx_frac_avail)) - lx_backend_spill_margin
+    backend_fraction = config.dxp_lx_frac_avail
+    if not 0.0 <= backend_fraction <= 1.0:
+        raise ValueError("DXP_LX_FRAC_AVAIL must be >=0 and <=1")
+
+    frontend_reservation = int(_LX_TRACKER_CAPACITY_BYTES * (1.0 - backend_fraction))
+    return round_up_to_alignment(frontend_reservation, _LX_ALLOCATION_GRANULARITY_BYTES)
 
 
 def _fixed_core_division(op: Operation) -> CoreDivision:

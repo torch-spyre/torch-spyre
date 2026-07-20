@@ -22,16 +22,13 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     MemoryPlanSolver,
     _assert_in_place_relationships,
 )
+from torch_spyre._inductor.scratchpad.utils import round_up_to_alignment
 
 __all__ = [
     "FirstFitLayoutSolver",
     "BestFitLayoutSolver",
     "_assert_in_place_relationships",
 ]
-
-
-def round_up_to_alignment(arg: int, alignment: int) -> int:
-    return ((arg + alignment - 1) // alignment) * alignment
 
 
 @dataclass(frozen=True)
