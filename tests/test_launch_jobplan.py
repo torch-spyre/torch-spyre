@@ -142,6 +142,8 @@ class TestLaunchJobPlan(TestCase):
             with stream:
                 with pytest.raises(RuntimeError, match="Expect one DCI"):
                     torch_spyre._C.launch_jobplan(job_plan, [])
+                    # launch_jobplan only enqueues; sync to surface the error.
+                    torch_spyre._C.synchronize()
 
 
 if __name__ == "__main__":
