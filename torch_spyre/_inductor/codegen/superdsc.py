@@ -221,17 +221,28 @@ def _should_use_k_fast_mapping(
     return dim_splits[dim_list[-1]] > 1
 
 
-# Pointwise ops whose *output* stick-dim padding lanes must be seeded to a
-# deterministic value (rather than left as allocator garbage) because a
-# downstream op — notably the flash-attention numerator matmul (exp_scores @
-# value) — reads those lanes as a contraction operand. The value is chosen so
-# the padding is contraction-neutral: SAMV substitutes it at the masked input
-# coordinate before the op runs (same semantics as the reduction path, where
-# "max" uses -inf), so exp(-inf) = 0 → the padded lanes contribute nothing.
+# Pointwise ops whose *output* stick-dim padding lanes are seeded to a
+# deterministic value rather than left as allocator garbage. The mask covers
+# only the out-of-logical-range padding lanes of the final stick (see
+# _get_coordinate_mask), so seeding them is safe for ANY consumer:
+#   - a downstream contraction (matmul) reads them as an operand → the value is
+#     chosen contraction-neutral so they add nothing;
+#   - a downstream reduction masks its own padding anyway;
+#   - a direct host read-out never includes padding lanes.
 #
-# Without this, an unpadded kv sequence (seqlen_kv % stick_size != 0) leaves the
-# final kv-stick's padding lanes uninitialized; exp() of that garbage overflows
-# fp16 and poisons the numerator (see docs/flash_attn_causal_kv_padding_inf_*).
+# The motivating case is the flash-attention numerator matmul (exp_scores @
+# value): with an unpadded kv sequence (seqlen_kv % stick_size != 0) the final
+# kv-stick's padding lanes are uninitialized, exp() of that garbage overflows
+# fp16, and the overflow poisons the matmul. Value: SAMV substitutes it at the
+# masked input coordinate before the op runs (same semantics as the reduction
+# path, where "max" uses -inf), so exp(-inf) = 0 → the padded lanes contribute
+# nothing.
+#
+# NOTE: this masks EVERY op named here unconditionally (by op-name), not only
+# those that actually feed a contraction. That is safe (padding lanes are never
+# valid data), but slightly broader than necessary. A more precise version would
+# gate on whether the op's output feeds a contraction; that consumer analysis is
+# not currently available at this point in codegen. TODO(consumer-gating).
 _POINTWISE_PADDING_MASK_VALUE: dict[str, float] = {
     "exp": float("-inf"),  # exp(-inf) == 0
 }

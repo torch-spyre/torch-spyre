@@ -228,12 +228,23 @@ class TestBuildingBlocks(unittest.TestCase):
         lanes are uninitialized; the elementwise exp() over those garbage lanes
         overflows fp16 and poisons the numerator matmul, corrupting the output to
         inf. The fix seeds those lanes to exp(-inf)=0 via SAMV coordinate masking
-        (see torch_spyre/_inductor/codegen/superdsc.py and
-        docs/flash_attn_causal_kv_padding_inf_rootcause.md).
+        (see _POINTWISE_PADDING_MASK_VALUE in
+        torch_spyre/_inductor/codegen/superdsc.py).
 
-        The bug's signature is a non-finite output, so this test asserts
-        finiteness directly. S=13 and S=63 read back all-inf before the fix; S=64
-        (one full stick) was correct even before it.
+        Checks (per sequence length): (1) FINITENESS — no inf/nan, the property
+        the bug directly violated; (2) ACCURACY — closeness to the CPU reference.
+        The chosen tolerance (0.3) is deliberately loose: it comfortably passes
+        the correct fp16 result (measured max abs diff <= ~0.11 for these sizes)
+        while still catching a corrupted output, which manifests as inf or an
+        error of order ~5. A tighter fp16-precision bound would be flaky for a
+        reason unrelated to this fix.
+
+        Scope note: only single-stick / multiple-of-64 lengths are checked for
+        accuracy. Partial-multi-stick lengths (e.g. S=65) have a separate,
+        pre-existing accuracy issue that also affects the dense (non-causal)
+        path and is unrelated to this inf fix, so they are excluded from the
+        accuracy assertion. S=13 and S=63 read back all-inf before the fix; S=64
+        (one full stick) was already correct.
         """
         B, H, D = 1, 8, 128
 
@@ -245,12 +256,18 @@ class TestBuildingBlocks(unittest.TestCase):
             k = torch.randn(B, H, S, D, dtype=torch.float16)
             v = torch.randn(B, H, S, D, dtype=torch.float16)
             out = _compile_and_run(sdpa, (q, k, v), DEVICE)
+            # (1) Finiteness — the direct signature of the bug.
             self.assertTrue(
                 torch.isfinite(out).all(),
                 msg=f"causal SDPA produced non-finite output at seqlen_kv={S} "
                 f"(inf={int(torch.isinf(out).sum())}, "
                 f"nan={int(torch.isnan(out).sum())})",
             )
+            # (2) Accuracy — catches "finite but wrong" regressions. Reuses the
+            # already-computed `out` via target= (no recompile). Loose tolerance
+            # separates the correct result (<=~0.11) from corruption (~5); see
+            # docstring.
+            compare_with_pytorch(sdpa, sdpa, q, k, v, atol=0.3, rtol=0.3, target=out)
 
     def test_refactored_plain_bundle_codegen(self):
         """Pointwise ops fuse into one bundle via the refactored codegen path."""
