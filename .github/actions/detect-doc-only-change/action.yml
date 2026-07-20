@@ -1,0 +1,57 @@
+name: Detect doc-only change
+description: |
+  Determines whether the triggering pull_request or merge_group event only
+  touched doc paths (tests/docs/, docs/, README.md, CODEOWNERS). push and
+  workflow_dispatch events have nothing to diff against, so they always
+  report a code change.
+
+outputs:
+  code_changed:
+    description: >-
+      'true' if any file outside the doc paths changed (or there is nothing
+      to diff, e.g. push/workflow_dispatch); 'false' if only doc/CODEOWNERS
+      files changed.
+    value: ${{ steps.filter.outputs.code_changed }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check which paths changed
+      id: filter
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        # On pull_request events, fetch the full list of changed files via
+        # the GitHub API. On merge_group events (merge queue), there is no
+        # PR to query, so diff the queue's base against the temporary merge
+        # commit instead -- this yields the same file list a pull_request
+        # event would see. On push to main/tag or workflow_dispatch, assume
+        # tests should always run since we don't have anything to diff.
+        if [[ -n "${{ github.event.pull_request.number }}" ]]; then
+          FILES=$(gh pr view ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
+            --json files --jq '.files[].path')
+        elif [[ "${{ github.event_name }}" == "merge_group" ]]; then
+          FILES=$(gh api "repos/${{ github.repository }}/compare/${{ github.event.merge_group.base_sha }}...${{ github.event.merge_group.head_sha }}" \
+            --jq '.files[].filename')
+        else
+          # push to main, tag, or manual dispatch -- always run tests
+          FILES="non-doc-change"
+        fi
+
+        echo "Changed files:"
+        echo "$FILES"
+
+        # Check if any changed file is outside the doc directories.
+        # tests/docs/, docs/, README.md, and CODEOWNERS are the only paths
+        # that should skip tests.
+        NON_DOC=$(echo "$FILES" | grep -v '^tests/docs/' | grep -v '^docs/' | grep -v '^README\.md$' | grep -v '^CODEOWNERS$' || true)
+
+        if [[ -z "$NON_DOC" ]]; then
+          echo "Only doc files changed — skipping tests."
+          echo "code_changed=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "Non-doc files changed — running tests."
+          echo "code_changed=true" >> "$GITHUB_OUTPUT"
+        fi

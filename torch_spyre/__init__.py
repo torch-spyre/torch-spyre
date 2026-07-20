@@ -65,6 +65,9 @@ class _SpyreImpl:
             # it independently of this Python path; this remains for callers that
             # want explicit runtime init.
             self._C = importlib.import_module("torch_spyre._C")
+            from torch_spyre import logging_config
+
+            logging_config._sync_cpp_config()
             # Apply pending device index before runtime init
             pending = self._pending_device_idx
             if pending is not None:

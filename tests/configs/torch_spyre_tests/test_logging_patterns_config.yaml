@@ -1,5 +1,11 @@
 test_suite_config:
   labels: [core, full]
   files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/test_cpp_extension_available.py
+      unlisted_test_mode: mandatory_success
     - path: ${TORCH_DEVICE_ROOT}/tests/test_logging_patterns.py
+      unlisted_test_mode: mandatory_success
+    - path: ${TORCH_DEVICE_ROOT}/tests/test_legacy_cpp_logging.py
+      unlisted_test_mode: mandatory_success
+    - path: ${TORCH_DEVICE_ROOT}/tests/test_new_cpp_logging.py
       unlisted_test_mode: mandatory_success
