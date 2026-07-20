@@ -549,11 +549,11 @@ def lower_convolution(x, w, bias, stride, padding, dilation, groups):
         )
 
     if padding != [0, 0]:
-      raise Unsupported(
-          f"Depthwise conv2d currently only supports zero padding; got padding={padding}. "
-          "Support for non-zero padding requires changes to the Spyre runtime to handle "
-          "non-zero tensor allocation addresses."
-      )
+        raise Unsupported(
+            f"Depthwise conv2d currently only supports zero padding; got padding={padding}. "
+            "Support for non-zero padding requires changes to the Spyre runtime to handle "
+            "non-zero tensor allocation addresses."
+        )
 
     # Output spatial sizes
     H_out = (H_in + 2 * padding[0] - K_h) // stride[0] + 1
@@ -608,7 +608,7 @@ def lower_convolution(x, w, bias, stride, padding, dilation, groups):
         inner_fn=inner_fn,
         ranges=[N, C_out, H_out, W_out],
         reduction_ranges=red_ranges,
-        #reduction_ranges=[K_h, K_w, G],
+        # reduction_ranges=[K_h, K_w, G],
         op_info=op_info,
     )
 
