@@ -123,6 +123,96 @@ def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
     raise AssertionError(f"Node {node.get_name()} has no loop_count for depth {depth}")
 
 
+def _regroup_by_outer_loop_key(
+    nodes: list[BaseSchedulerNode],
+) -> list[BaseSchedulerNode]:
+    """Reorder ``nodes`` so every outermost loop_group_id run is contiguous.
+
+    Inductor's own ``Scheduler.topological_sort_schedule`` runs (twice) before
+    this pass ever sees the node list, via a plain DFS over
+    ``unmet_dependencies``.  That DFS only guarantees a *valid* topological
+    order — it does not preserve the original relative order of mutually
+    independent nodes, so it can interleave unrelated nodes into the middle
+    of what coarse_tile.py built as a single contiguous loop group.
+
+    A naive "stable sort by first occurrence of the group key" is unsound: it
+    can hoist a later group member forward past an interleaved node it
+    genuinely depends on, producing an invalid order. Instead, merge every
+    node sharing an outermost loop_group_id[0] key into one virtual unit for
+    ordering purposes — its dependency set is the union of its members' real
+    unmet_dependencies on buffers produced outside the group — and run a
+    dependency-respecting DFS (mirroring topological_sort_schedule's own
+    shape) over {merged units, ungrouped nodes}. Each unit then expands back
+    into its original members in their original relative order, which is
+    always safe because that intra-group order is coarse_tile's deliberate
+    op sequence, not something this pass reorders.
+
+    The result is a valid topological order (edges are the real edges of the
+    original graph) in which every outermost loop group is contiguous by
+    construction.
+    """
+    name_to_node: dict[str, BaseSchedulerNode] = {}
+    for node in nodes:
+        for name in node.get_buffer_names():
+            name_to_node[name] = node
+
+    outer_key_to_unit: dict[object, list[BaseSchedulerNode]] = {}
+    units: list[Union[BaseSchedulerNode, list[BaseSchedulerNode]]] = []
+    unit_of_node: dict[int, Union[BaseSchedulerNode, list[BaseSchedulerNode]]] = {}
+
+    for node in nodes:
+        gid = _loop_group_id(node)
+        outer_key = gid[0] if gid is not None else None
+        if outer_key is None:
+            units.append(node)
+            unit_of_node[id(node)] = node
+            continue
+        unit = outer_key_to_unit.get(outer_key)
+        if unit is None:
+            unit = []
+            outer_key_to_unit[outer_key] = unit
+            units.append(unit)
+        unit.append(node)
+        unit_of_node[id(node)] = unit
+
+    def unit_key(unit) -> int:
+        return id(unit) if isinstance(unit, list) else id(unit)
+
+    unit_deps: dict[int, OrderedSet] = {}
+    unit_members: dict[int, list[BaseSchedulerNode]] = {}
+    for unit in units:
+        members = unit if isinstance(unit, list) else [unit]
+        member_ids = {id(m) for m in members}
+        deps: OrderedSet = OrderedSet()
+        for member in members:
+            for dep in member.unmet_dependencies:
+                producer = name_to_node.get(dep.name)
+                if producer is None or id(producer) in member_ids:
+                    continue
+                deps.add(unit_key(unit_of_node[id(producer)]))
+        unit_deps[unit_key(unit)] = deps
+        unit_members[unit_key(unit)] = members
+
+    seen: set = set()
+    ordered_units: list = []
+
+    def visit(key: int) -> None:
+        if key in seen:
+            return
+        seen.add(key)
+        for dep_key in unit_deps[key]:
+            visit(dep_key)
+        ordered_units.append(key)
+
+    for unit in units:
+        visit(unit_key(unit))
+
+    result: list[BaseSchedulerNode] = []
+    for key in ordered_units:
+        result.extend(unit_members[key])
+    return result
+
+
 def _build_loop_group(
     nodes: list[BaseSchedulerNode], depth: int
 ) -> list[BaseSchedulerNode]:
@@ -130,6 +220,10 @@ def _build_loop_group(
 
     depth is the nesting level being processed (0 = outermost).  Each node's
     loop_group_id is a tuple; we group on element [depth].
+
+    Callers are expected to have already made outermost (depth 0) runs
+    contiguous via ``_regroup_by_outer_loop_key`` — this function itself only
+    scans linearly and does not tolerate gaps.
     """
     result: list[BaseSchedulerNode] = []
     i = 0
@@ -182,9 +276,11 @@ def build_loop_scheduler_nodes(
 
     loop_group_id is a tuple of ints encoding the nesting path, e.g.
     (0,) for an outermost group, (0, 1) for a nested group inside group 0.
-    Nodes sharing the same outermost key must be contiguous; a gap indicates
-    a data-flow dependency crossing the group boundary, which is a bug in
-    the tiling pass.
+    Nodes sharing the same outermost key are made contiguous by
+    ``_regroup_by_outer_loop_key`` before grouping, since Inductor's own
+    ``Scheduler.topological_sort_schedule`` (a DFS that runs twice before
+    this pass ever sees the node list) does not preserve the tiling pass's
+    intended contiguous ordering for mutually independent nodes.
 
     Running before Inductor's fusion pass ensures CountedLoopSchedulerNodes are
     visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return False),
@@ -192,9 +288,12 @@ def build_loop_scheduler_nodes(
     aware of CountedLoopSchedulerNodes: they are accumulated alongside plain
     SchedulerNodes and may share a bundle with adjacent ops.
     """
+    nodes = _regroup_by_outer_loop_key(nodes)
     result = _build_loop_group(nodes, depth=0)
 
-    # Verify contiguity: no loop_group_id should appear in two separate runs.
+    # _regroup_by_outer_loop_key guarantees outermost runs are contiguous by
+    # construction; this is a defensive check, not the primary correctness
+    # mechanism.  A failure here would indicate a bug in that construction.
     seen: dict[tuple, str] = {}
     for node in result:
         if isinstance(node, CountedLoopSchedulerNode):
@@ -204,8 +303,9 @@ def build_loop_scheduler_nodes(
                 name = node.get_name()
                 if key in seen and seen[key] != name:
                     raise RuntimeError(
-                        f"Loop group {key} is not contiguous in the scheduler node list. "
-                        "This indicates a data-flow dependency crossing a loop group boundary."
+                        f"Loop group {key} is not contiguous in the scheduler node list "
+                        "after _regroup_by_outer_loop_key. This indicates a bug in that "
+                        "regrouping, not a data-flow issue in the tiling pass."
                     )
                 seen[key] = name
 
