@@ -32,12 +32,64 @@ defaults:
 permissions:
   contents: read
   checks: write
+  pull-requests: read # so that gh pr view can fetch the file list
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Job: changes
+  #
+  # push and pull_request already skip doc-only changes via the workflow-level
+  # paths-ignore filter above. merge_group events, however, do not support
+  # paths-ignore, so without this job every merge-queue run would execute the
+  # full suite regardless of what changed. This job fetches the changed-file
+  # list (via the PR API for pull_request, or a base/head compare for
+  # merge_group) and downstream jobs are gated on the result.
+  #
+  # code_changed=true  --> non-doc files changed  --> run tests
+  # code_changed=false --> only doc/CODEOWNERS files changed --> skip tests
+  # ---------------------------------------------------------------------------
+  changes:
+    name: Detect changed files
+    runs-on: ubuntu-latest
+    outputs:
+      code_changed: ${{ steps.filter.outputs.code_changed }}
+    steps:
+      - name: Check which paths changed
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ -n "${{ github.event.pull_request.number }}" ]]; then
+            FILES=$(gh pr view ${{ github.event.pull_request.number }} \
+              --repo ${{ github.repository }} \
+              --json files --jq '.files[].path')
+          elif [[ "${{ github.event_name }}" == "merge_group" ]]; then
+            FILES=$(gh api "repos/${{ github.repository }}/compare/${{ github.event.merge_group.base_sha }}...${{ github.event.merge_group.head_sha }}" \
+              --jq '.files[].filename')
+          else
+            # push to main -- always run tests
+            FILES="non-doc-change"
+          fi
+
+          echo "Changed files:"
+          echo "$FILES"
+
+          NON_DOC=$(echo "$FILES" | grep -v '^tests/docs/' | grep -v '^docs/' | grep -v '^README\.md$' | grep -v '^CODEOWNERS$' || true)
+
+          if [[ -z "$NON_DOC" ]]; then
+            echo "Only doc files changed — skipping tests."
+            echo "code_changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Non-doc files changed — running tests."
+            echo "code_changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
   # Build the torch_spyre._C extension ONCE and publish it as a wheel; the
   # matrix job below installs that single wheel instead of recompiling per entry.
   build:
     name: Build torch-spyre wheel (once)
+    needs: changes
+    if: needs.changes.outputs.code_changed == 'true'
     # Compile-only: needs the backend image + SDK toolchain but NO physical Spyre
     # card, so it targets the cardless spyre_pf_x0 pool and leaves card runners
     # for the test jobs.
