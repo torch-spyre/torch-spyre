@@ -88,4 +88,6 @@ clean: ## Remove auto-generated OOT wrappers, conftest files, merged configs, an
 	@find tests/ -name '_spyre_merged_config_*.yaml' -delete
 	@find tests/ -name '*.markers.json' -delete
 	@find tests/ -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+	@rm -rf torch_spyre.egg-info
+	@rm -rf tests/oot_framework/oot_framework.egg-info
 	@echo "Cleaned auto-generated files under tests/"

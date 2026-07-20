@@ -343,13 +343,12 @@ class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
     compile_op_spec (parse_op_spec + generate_sdsc) into the emitted SDSC
     JSON's dimToSymbolMapping_ / symbolicDimInfo_ fields.
 
-    Fixture mirrors the [512, 256] fp16 stick-layout tensor used in
-    test_unroll_loop_specs.py, with the row dim made symbolic. Because
-    _resolve_sdsc_size resolves a symbolic dim to its declared max (512,
-    same as the concrete value the unrolling fixture uses), every
-    downstream computation (padding, stick-dim detection, core slicing)
-    runs identically to the already-exercised concrete case -- only the
-    symbolic_dims side-channel asserted on here differs.
+    Fixture uses a [512, 256] fp16 stick-layout tensor with the row dim
+    made symbolic. Because _resolve_sdsc_size resolves a symbolic dim to
+    its declared max (512), every downstream computation (padding,
+    stick-dim detection, core slicing) runs identically to the equivalent
+    concrete case -- only the symbolic_dims side-channel asserted on here
+    differs.
     """
 
     _DEVICE_SIZE = [4, 512, 64]
