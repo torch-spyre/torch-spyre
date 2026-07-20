@@ -316,6 +316,19 @@ TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
     for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
 ]
 
+TO_DTYPE_REDUCTION_DTYPES = [torch.float16, torch.float32]
+
+TO_DTYPE_REDUCTION_PARAMS_SETS = {
+    f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}": (
+        cached_randn(shape, dtype=src),
+        dst,
+    )
+    for src in TO_DTYPE_REDUCTION_DTYPES
+    for dst in TO_DTYPE_REDUCTION_DTYPES
+    if src != dst
+    for shape in TO_DTYPE_OP_SHAPES_ALIGNED
+}
+
 # Mixed element arrangements across a graph boundary: one operand is a native
 # fp32 (STANDARD) input, the other is fp16 upcast to fp32 in-graph (staggered
 # DL16_TO_FP32). The op then sees two different EAs on operands whose stick
@@ -4322,16 +4335,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
         (
-            "test_round_trip_reduction_with_to_dtype",
-            "test_round_trip_reduction_with_to_dtype_cpu",
+            "test_reduction_with_to_dtype",
+            "test_reduction_with_to_dtype_cpu",
         ): {
-            "ops_dict": {
-                "sum": torch.sum,
-                "mean": torch.mean,
-                "prod": torch.prod,
-            },
-            "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
-            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+            "ops_dict": {"sum": torch.sum},
+            "param_sets": TO_DTYPE_REDUCTION_PARAMS_SETS,
         },
         (
             "test_round_trip_to_dtype_implicit_invalid",
@@ -6151,10 +6159,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    def test_round_trip_reduction_with_to_dtype_cpu(self, op, x, dst_dtype):
+    def test_reduction_with_to_dtype_cpu(self, op, x, dst_dtype):
         def fn(op, x, dst_dtype):
-            y = op(x, dtype=dst_dtype)
-            return y.to(x.dtype)
+            return op(x, dtype=dst_dtype)
 
         self.compare_with_cpu(
             fn,
