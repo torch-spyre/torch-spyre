@@ -140,9 +140,9 @@ class TestLaunchJobPlan(TestCase):
             stream = torch.Stream("spyre")
 
             with stream:
+                # launch_jobplan only enqueues; assert on synchronize() alone.
+                torch_spyre._C.launch_jobplan(job_plan, [])
                 with pytest.raises(RuntimeError, match="Expect one DCI"):
-                    torch_spyre._C.launch_jobplan(job_plan, [])
-                    # launch_jobplan only enqueues; sync to surface the error.
                     torch_spyre._C.synchronize()
 
 
