@@ -163,6 +163,8 @@ def _make_output_stl(
     Returns None if the resulting stick expression has an offset.
     """
     stick_size = get_elem_in_stick(output.dtype)
+    if stick_dim >= 0 and c_size[stick_dim] == 1:
+        return None
     out_coords = host_coordinates(output, output_dep, None)
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
     stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
@@ -467,11 +469,7 @@ def _single_arg_op_layout(
         )
         return [stl]
 
-    try:
-        in_device_coords = device_coordinates(stl, dep, None)
-    except Unsupported:
-        # Candidate whose stick lands on a size-1 dim — not representable here.
-        return []
+    in_device_coords = device_coordinates(stl, dep, None)
     stick_expr = in_device_coords[-1]
 
     # Try to preserve input layout, fall back to scanning all output dims
