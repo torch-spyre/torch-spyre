@@ -607,10 +607,7 @@ def generate_sdsc(
                 )
                 if is_tiled_lx:
                     raise NotImplementedError(
-                        "Tiled (advancing) lx-allocated tensors are not supported "
-                        "in the symbolic preserved-loop path: LX addresses cannot "
-                        "be expressed as affine.apply symbols. Mark this tensor "
-                        "per_tile_fixed or set UNROLL_LOOPS=1."
+                        "Tiled (advancing) lx-allocated tensors are not yet supported."
                     )
                 affine_strides.append([{} for _ in tiled_symbols])
                 continue
@@ -630,10 +627,10 @@ def generate_sdsc(
                 # can emit the input_arg function parameter.
                 #
                 # On the symbolic path, tensor.start_address = arg_index + tile_offset_bytes,
-                # where tile_offset_bytes is the per-tile byte advance added by the loop
-                # unroller.  We always register the raw kernel symbol keyed by arg_index so
-                # that bundle.py emits exactly one !sdscbundle.input_arg parameter per logical
-                # tensor, regardless of how many tiles reference it.
+                # where tile_offset_bytes is the per-tile byte advance computed for the
+                # affine-stride path.  We always register the raw kernel symbol keyed by
+                # arg_index so that bundle.py emits exactly one !sdscbundle.input_arg
+                # parameter per logical tensor, regardless of how many tiles reference it.
                 raw_base = tensor.arg_index  # sentinel value for this arg
                 offset_as_symbol(
                     raw_base, SymbolKind.kernel(arg_index=tensor.arg_index)
@@ -644,11 +641,11 @@ def generate_sdsc(
                 # registered already by an earlier tensor in this SDSC, in which case
                 # the offset_as_symbol call above was a no-op.
                 kernel_sym_idx = abs(local_symbols[("kernel", tensor.arg_index)]) - 1
-                # tile_offset_bytes: the loop unroller advances arg.allocation['hbm']
-                # by i*stride for tile i, so start_address = arg_index + tile_offset.
-                # tile_offset_bytes == 0 for tile 0, positive for later tiles.
+                # tile_offset_bytes: arg.allocation['hbm'] advances by i*stride for
+                # tile i, so start_address = arg_index + tile_offset. tile_offset_bytes
+                # == 0 for tile 0, positive for later tiles.
                 tile_offset_bytes = tensor.start_address - tensor.arg_index
-                # total_slice_offset: combine the loop-unroll tile offset with any
+                # total_slice_offset: combine the per-tile byte offset with any
                 # device-coordinate compile-time slice offset (e.g. from z0+3 expressions).
                 # This is the total compile-time offset above the raw %arg_N base that the
                 # sliced-base SSA value represents in bundle.mlir.

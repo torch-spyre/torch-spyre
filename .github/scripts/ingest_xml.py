@@ -318,19 +318,24 @@ def extract_properties(tc_el):
     return props
 
 
-def extract_op_dtype(name: str, properties: list[tuple[str, str]]):
+def extract_op_dtype_platform(name: str, properties: list[tuple[str, str]]):
     op_name = ""
     dtype = ""
+    platform = ""
     for pname, pvalue in properties:
         if pname.startswith("op__"):
             op_name = pname[4:]
         elif pname.startswith("dtype__"):
             dtype = pname[7:]
+        elif pname.startswith("platform__"):
+            platform = pname[10:]
         elif pname == "tag":
             if pvalue.startswith("op__"):
                 op_name = pvalue[4:]
             elif pvalue.startswith("dtype__"):
                 dtype = pvalue[7:]
+            elif pvalue.startswith("platform__"):
+                platform = pvalue[10:]
 
     if not dtype:
         for d in [
@@ -350,7 +355,7 @@ def extract_op_dtype(name: str, properties: list[tuple[str, str]]):
             if d in name:
                 dtype = d
                 break
-    return op_name, dtype
+    return op_name, dtype, platform
 
 
 def promote_xpass(raw_cases, suite_attrs):
@@ -390,7 +395,9 @@ def parse_test_xml(xml_path: Path):
     for tc in suite.findall(".//testcase"):
         status, fail_msg = classify_testcase(tc)
         properties = extract_properties(tc)
-        op_name, dtype = extract_op_dtype(tc.get("name", ""), properties)
+        op_name, dtype, platform = extract_op_dtype_platform(
+            tc.get("name", ""), properties
+        )
         raw_cases.append(
             {
                 "case_id": str(uuid.uuid4()),
@@ -398,6 +405,7 @@ def parse_test_xml(xml_path: Path):
                 "name": tc.get("name", ""),
                 "op_name": op_name,
                 "dtype": dtype,
+                "platform": platform,
                 "status": status,
                 "duration_s": float(tc.get("time", 0) or 0),
                 "fail_message": fail_msg,
@@ -410,9 +418,11 @@ def parse_test_xml(xml_path: Path):
     promote_xpass(raw_cases, suite_attrs)
 
     counts = Counter(c["status"] for c in raw_cases)
+    platform = next((c["platform"] for c in raw_cases if c["platform"]), "")
     run = {
         "suite_name": suite_attrs.get("name", xml_path.stem),
         "filename": xml_path.name,
+        "platform": platform,
         "triggered_at": triggered_at,
         "total_tests": len(raw_cases),
         "passed": counts.get("passed", 0),
@@ -451,6 +461,7 @@ def insert_run(client, run_id: str, run: dict, args):
                 args.workflow,
                 run["suite_name"],
                 run["filename"],
+                run["platform"],
                 args.branch,
                 (args.sha or "").ljust(40)[:40],
                 int(args.pr_number) if args.pr_number.strip() else 0,
@@ -471,6 +482,7 @@ def insert_run(client, run_id: str, run: dict, args):
             "workflow",
             "suite_name",
             "filename",
+            "platform",
             "branch",
             "commit_sha",
             "pr_number",

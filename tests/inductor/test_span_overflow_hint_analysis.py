@@ -2101,7 +2101,6 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
     @config.patch(
         {
             "sencores": 4,
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
             "ignore_span_overflow_hints": False,
@@ -2131,7 +2130,6 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
     @config.patch(
         {
             "sencores": 4,
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
             "ignore_span_overflow_hints": False,
@@ -2161,7 +2159,6 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
     @config.patch(
         {
             "sencores": 4,
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
             "ignore_span_overflow_hints": False,
@@ -2240,7 +2237,6 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
     @config.patch(
         {
             "sencores": 4,
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
             "ignore_span_overflow_hints": False,

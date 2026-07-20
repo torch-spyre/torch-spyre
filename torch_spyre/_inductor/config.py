@@ -89,11 +89,6 @@ core_id_k_fast_emission: bool = (
 # into the SDSC JSON and bundle.mlir emits sdsc_execute with no operands.
 bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 
-# When True, LoopSpec nodes are fully unrolled into flat OpSpecs before
-# generate_bundle runs.  When False (default), LoopSpecs are passed through
-# intact for the scf.for / affine.apply path.
-unroll_loops: bool = os.environ.get("UNROLL_LOOPS", "0") == "1"
-
 # Layout solver class used by default in scratchpad.allocator.ScratchpadAllocator.
 # Options:
 #  "greedy":       GreedyLayoutSolver (default),

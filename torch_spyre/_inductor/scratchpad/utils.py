@@ -126,7 +126,6 @@ def mem_usage_by_buf(
     num_cores_per_op = get_ncores_for_buffers(graph, cache)
     mem_usage: dict = {}
 
-    buf_names = {op.name for op in graph.operations}
     for op in graph.operations:
         buf_name = op.name
         buf = graph.get_buffer(buf_name)
@@ -142,7 +141,7 @@ def mem_usage_by_buf(
                 # below carries validity, so no arithmetic on num_cores here.
                 "size_per_core": -1,
                 "core_div_mismatch": num_cores < 0,
-                "op_inputs": [dep.name for dep in rw.reads if dep.name in buf_names],
+                "op_inputs": [dep.name for dep in rw.reads],
             }
             continue
         dev_layout = layout.device_layout
@@ -153,7 +152,7 @@ def mem_usage_by_buf(
             "size": dev_size,
             "size_per_core": dev_size // num_cores,
             "core_div_mismatch": num_cores < 0,
-            "op_inputs": [dep.name for dep in rw.reads if dep.name in buf_names],
+            "op_inputs": [dep.name for dep in rw.reads],
         }
 
     return mem_usage
