@@ -529,8 +529,6 @@ def lower_bmm(x, y):
 
 
 @register_spyre_lowering(torch.ops.spyre.conv2d.default)
-# @register_spyre_lowering(torch.ops.aten.convolution.default)
-# def lower_convolution(x, w, bias, stride, padding, dilation, transposed, output_padding, groups):
 def lower_convolution(x, w, bias, stride, padding, dilation, groups):
     x = V.graph.get_buffer(x.realize())
     w = V.graph.get_buffer(w.realize())
@@ -550,6 +548,13 @@ def lower_convolution(x, w, bias, stride, padding, dilation, groups):
             f"Input and output channels and groups should all be equal for depthwiseconv2d: {C_in}, {C_out}, {groups}"
         )
 
+    if padding != [0, 0]:
+      raise Unsupported(
+          f"Depthwise conv2d currently only supports zero padding; got padding={padding}. "
+          "Support for non-zero padding requires changes to the Spyre runtime to handle "
+          "non-zero tensor allocation addresses."
+      )
+
     # Output spatial sizes
     H_out = (H_in + 2 * padding[0] - K_h) // stride[0] + 1
     W_out = (W_in + 2 * padding[1] - K_w) // stride[1] + 1
@@ -560,7 +565,7 @@ def lower_convolution(x, w, bias, stride, padding, dilation, groups):
         # Reduction indices: may be [kh, kw] or [kh, kw, g] depending on whether G is 1
         kh = reduction_index[0]
         kw = reduction_index[1]
-        g = reduction_index[2]  # if len(reduction_index) > 2 else 0
+        g = reduction_index[2] if len(reduction_index) > 2 else 0
 
         x_val = x_loader([n, c, ho, wo])
 
@@ -602,8 +607,8 @@ def lower_convolution(x, w, bias, stride, padding, dilation, groups):
         src_dtype=x.get_dtype(),
         inner_fn=inner_fn,
         ranges=[N, C_out, H_out, W_out],
-        # reduction_ranges=red_ranges,
-        reduction_ranges=[K_h, K_w, G],
+        reduction_ranges=red_ranges,
+        #reduction_ranges=[K_h, K_w, G],
         op_info=op_info,
     )
 

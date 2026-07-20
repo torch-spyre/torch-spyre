@@ -206,8 +206,11 @@ def gen_coord_info_value(
     elems_per_stick: int,
     is_stick_dim: bool,
     is_stick_reduction: bool = False,
-    conv_params={"conv_padding": "nopad", "total_size": -1},
+    conv_params=None
 ):
+    if conv_params is None:
+        conv_params = {"conv_padding": "nopad", "total_size": -1}
+
     return (
         {
             "spatial": 3,
