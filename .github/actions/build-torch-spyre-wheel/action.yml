@@ -78,6 +78,25 @@ runs:
         uv sync --verbose --frozen --all-extras --no-install-project
 
         ccache --zero-stats || true
+
+        # torch's cpp_extension (ninja backend) sizes its parallelism off
+        # os.cpu_count(), which reports the NODE's total cores, not this pod's
+        # actual CPU quota. On a CPU-limited runner that oversubscribes ninja
+        # jobs, starving each other for the same slice of CPU and inflating
+        # individual compile times. Detect the real quota from cgroup v2
+        # (cpu.max = "<quota> <period>", or "max" for unlimited) and cap
+        # MAX_JOBS to it; cpp_extension reads MAX_JOBS directly.
+        MAX_JOBS="$(nproc)"
+        if [[ -f /sys/fs/cgroup/cpu.max ]]; then
+          read -r cpu_quota cpu_period < /sys/fs/cgroup/cpu.max
+          if [[ "$cpu_quota" != "max" ]]; then
+            MAX_JOBS=$(( cpu_quota / cpu_period ))
+            [[ "$MAX_JOBS" -lt 1 ]] && MAX_JOBS=1
+          fi
+        fi
+        export MAX_JOBS
+        echo "MAX_JOBS $MAX_JOBS"
+
         # Non-isolated wheel build reuses the just-synced .venv, guaranteeing the
         # _C.so links against the same torch the test jobs install.
         uv build --wheel --no-build-isolation --out-dir dist

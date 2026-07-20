@@ -144,6 +144,72 @@ static std::string read_file_to_string(const std::filesystem::path& path) {
   return ss.str();
 }
 
+/**
+ * @brief Safely parse unsigned 64-bit integer from string with error context
+ * @param str String to parse
+ * @param field_name Name of the field being parsed (for error messages)
+ * @return Parsed value
+ * @throws torch::Error if parsing fails
+ */
+static uint64_t safe_stoull(const std::string& str,
+                            const std::string& field_name) {
+  try {
+    // Check for negative sign. stoull silently wraps negatives to large
+    // unsigned values, so reject them explicitly)
+    size_t start_pos = 0;
+    // Skip whitespace
+    while (start_pos < str.length() && std::isspace(str[start_pos])) {
+      ++start_pos;
+    }
+    if (start_pos < str.length() && str[start_pos] == '-') {
+      TORCH_CHECK(false, "Invalid ", field_name, " value '", str,
+                  "': negative value not allowed for unsigned integer");
+    }
+
+    size_t pos = 0;
+    uint64_t value = std::stoull(str, &pos);
+    TORCH_CHECK(pos == str.length(), "Invalid ", field_name, " value '", str,
+                "': contains non-numeric characters");
+    return value;
+  }
+  catch (const std::invalid_argument&) {
+    TORCH_CHECK(false, "Invalid ", field_name, " value '", str,
+                "': not a valid number");
+  }
+  catch (const std::out_of_range&) {
+    TORCH_CHECK(false, "Invalid ", field_name, " value '", str,
+                "': number out of range");
+  }
+  return 0;  // Unreachable
+}
+
+/**
+ * @brief Safely parse signed 64-bit integer from string with error context
+ * @param str String to parse
+ * @param field_name Name of the field being parsed (for error messages)
+ * @return Parsed value
+ * @throws torch::Error if parsing fails
+ */
+static int64_t safe_stoll(const std::string& str,
+                          const std::string& field_name) {
+  try {
+    size_t pos = 0;
+    int64_t value = std::stoll(str, &pos);
+    TORCH_CHECK(pos == str.length(), "Invalid ", field_name, " value '", str,
+                "': contains non-numeric characters");
+    return value;
+  }
+  catch (const std::invalid_argument&) {
+    TORCH_CHECK(false, "Invalid ", field_name, " value '", str,
+                "': not a valid number");
+  }
+  catch (const std::out_of_range&) {
+    TORCH_CHECK(false, "Invalid ", field_name, " value '", str,
+                "': number out of range");
+  }
+  return 0;  // Unreachable
+}
+
 JobPlanBuilder::JobPlanBuilder(const std::string& spyrecode_dir,
                                const SpyreStream* stream)
     : spyrecode_dir_(spyrecode_dir),
@@ -194,7 +260,7 @@ void JobPlanBuilder::executeAllocate(const nlohmann::json& cmd) {
               "Allocate command missing 'size' property");
 
   std::string size_str = allocate_props["size"].get<std::string>();
-  size_t size = std::stoull(size_str);
+  size_t size = safe_stoull(size_str, "Allocate size");
 
   auto& allocator = SpyreAllocator::instance();
   flex::AllocationDirective directive(flex::PlacementPolicy::Bind, {0},
@@ -230,13 +296,13 @@ void JobPlanBuilder::executeInitTransfer(const nlohmann::json& cmd) {
               "InitTransfer command missing 'dev_ptr' property");
 
   std::string dev_ptr_str = init_props["dev_ptr"].get<std::string>();
-  uint64_t dev_ptr = std::stoull(dev_ptr_str);
+  uint64_t dev_ptr = safe_stoull(dev_ptr_str, "InitTransfer dev_ptr");
 
   TORCH_CHECK(init_props.contains("size"),
               "InitTransfer command missing 'size' property");
 
   std::string init_size_str = init_props["size"].get<std::string>();
-  size_t init_size = std::stoull(init_size_str);
+  size_t init_size = safe_stoull(init_size_str, "InitTransfer size");
 
   job_allocation_.emplace_back(
       compute_offset_address(job_allocation_.at(0), dev_ptr, init_size));
@@ -270,7 +336,8 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
               "ComputeOnDevice command missing 'job_bin_ptr' property");
 
   std::string job_bin_ptr_str = cmd["job_bin_ptr"].get<std::string>();
-  uint64_t job_bin_ptr = std::stoull(job_bin_ptr_str);
+  uint64_t job_bin_ptr =
+      safe_stoull(job_bin_ptr_str, "ComputeOnDevice job_bin_ptr");
 
   // Kernel name surfaces in profiler events (PendingRequest::node_name →
   // aiupti activity name, FLEX JSON CBName). Prefer an explicit name from
@@ -333,8 +400,16 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHost(
   TORCH_CHECK(cmd.contains("size"),
               "ComputeOnHost command missing 'size' property");
   std::string size_str = cmd["size"].get<std::string>();
-  size_t buffer_size = std::stoull(size_str);
-  pinned_buffer_map_[ohandle] = HostBuffer(buffer_size);
+  size_t buffer_size = safe_stoull(size_str, "ComputeOnHost size");
+
+  try {
+    pinned_buffer_map_[ohandle] = HostBuffer(buffer_size);
+  }
+  catch (const std::bad_alloc&) {
+    TORCH_CHECK(false,
+                "Failed to allocate pinned buffer for host compute output '",
+                ohandle, "', size=", buffer_size, " bytes");
+  }
 
   // Parse ishape
   // TODO(jni): further discussion is required on "ishape". See #2522. For now,
@@ -349,7 +424,7 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHost(
     TORCH_CHECK(dim.is_string(),
                 "ComputeOnHost 'ishape' elements must be strings");
     std::string dim_str = dim.get<std::string>();
-    ishape.push_back(std::stoll(dim_str));
+    ishape.push_back(safe_stoll(dim_str, "ComputeOnHost ishape dimension"));
   }
 
   // Parse ihandle
@@ -373,8 +448,14 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHost(
   // Create Hcm object and import from JSON string
   auto hcm_data = std::make_unique<Hcm>();
   std::string hcm_json_str = hcm_json.dump();
-  bool import_success = hcm_data->importJsonStr(hcm_json_str);
-  TORCH_CHECK(import_success, "Failed to import Hcm from JSON");
+
+  try {
+    hcm_data->importJsonStr(hcm_json_str);
+  }
+  catch (const std::exception& e) {
+    TORCH_CHECK(false, "Failed to import Hcm for ohandle '", ohandle,
+                "': ", e.what());
+  }
 
   // Create and return JobPlanStepHostCompute
   return std::make_unique<JobPlanStepHostCompute>(
@@ -412,8 +493,9 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
       TORCH_CHECK(it != pinned_buffer_map_.end(), "Host handle '",
                   host_handle_str, "' not found in pinned buffer map");
       void* host_addr = it->second.data();
-      uint64_t device_ptr = std::stoull(dev_ptr_str);
-      size_t transfer_size = std::stoull(size_str);
+      uint64_t device_ptr =
+          safe_stoull(dev_ptr_str, "DataTransfer H2D dev_ptr");
+      size_t transfer_size = safe_stoull(size_str, "DataTransfer H2D size");
 
       // Compute CompositeAddress with offset
       flex::CompositeAddress comp_addr = compute_offset_address(
@@ -438,15 +520,23 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
                   "DataTransfer D2H missing 'host_handle' property");
       std::string host_handle_str = cmd["host_handle"].get<std::string>();
 
-      uint64_t device_ptr = std::stoull(dev_ptr_str);
-      size_t transfer_size = std::stoull(size_str);
+      uint64_t device_ptr =
+          safe_stoull(dev_ptr_str, "DataTransfer D2H dev_ptr");
+      size_t transfer_size = safe_stoull(size_str, "DataTransfer D2H size");
 
       // Allocate pinned buffer
       auto it = pinned_buffer_map_.find(host_handle_str);
       TORCH_CHECK(it == pinned_buffer_map_.end(), "Host handle '",
                   host_handle_str, "' already exists in pinned buffer map");
 
-      pinned_buffer_map_[host_handle_str] = HostBuffer(transfer_size);
+      try {
+        pinned_buffer_map_[host_handle_str] = HostBuffer(transfer_size);
+      }
+      catch (const std::bad_alloc&) {
+        TORCH_CHECK(false,
+                    "Failed to allocate pinned buffer for D2H transfer '",
+                    host_handle_str, "', size=", transfer_size, " bytes");
+      }
       void* host_addr = pinned_buffer_map_[host_handle_str].data();
 
       // Compute CompositeAddress with offset from device_addr

@@ -87,9 +87,28 @@ on:
         type: string
         default: full
 
+      # Spyre-Next integration path: test the PRE-BAKED dev image directly instead
+      # of checking out + rebuilding torch-spyre on the runner. The ephemeral ARC
+      # runner is FROM torch-spyre-dev, which already has the editable-installed
+      # torch_spyre + the full source tree (incl tests/, tests/configs/) + the
+      # shared venv at $PREBAKED_TORCH_SPYRE_DIR. When true: skip the product
+      # checkout, the build_torch_spyre wheel job, and install-prebuilt-torch-spyre;
+      # run the suite against the baked dir. DEFAULT false → the normal PR/nightly
+      # callers (tests.yml / tests-nightly.yml) are byte-for-byte unchanged.
+      prebaked_image:
+        description: Test the pre-baked torch-spyre-dev image (no checkout/build). Integration path only.
+        required: false
+        type: boolean
+        default: false
+
 defaults:
   run:
     shell: bash
+
+env:
+  # The baked torch-spyre source+venv dir in the dev image (runner is FROM
+  # torch-spyre-dev). Used by the prebaked_image path in place of a checkout.
+  PREBAKED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -102,11 +121,18 @@ jobs:
   # ---------------------------------------------------------------------------
   generate_matrix:
     name: Generate test matrix (${{ inputs.test_type || 'full' }})
-    runs-on: ubuntu-latest
+    # Normal path: ubuntu-latest with a fresh sparse checkout of the configs.
+    # Prebaked path: run ON the runner image so the matrix is computed from the
+    # SAME PR-pinned configs baked into the dev image (not a re-fetch of main),
+    # keeping content-addressed consistency.
+    runs-on: ${{ inputs.prebaked_image && fromJSON(format('["x86_64","spyre_pf_x0","{0}","{1}"]', inputs.runner_label, inputs.image_label)) || 'ubuntu-latest'
+      }}
     outputs:
       matrix: ${{ steps.filter.outputs.matrix }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # NORMAL: sparse-checkout the configs from github.com at the requested ref.
+      - if: ${{ !inputs.prebaked_image }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
@@ -119,7 +145,15 @@ jobs:
       - name: Filter configs by TEST_TYPE
         id: filter
         run: |
-          pip install pyyaml --quiet
+          # Prebaked: read the configs baked in the dev image; else the checkout cwd.
+          # cd into the source root so every path below stays repo-relative and
+          # byte-identical to the normal path (the CI-coverage scanner greps
+          # `--config-dir tests/configs/torch_spyre_tests` literally).
+          if [ "${{ inputs.prebaked_image }}" = "true" ]; then
+            cd "${PREBAKED_TORCH_SPYRE_DIR}"
+          else
+            pip install pyyaml --quiet
+          fi
           matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
             --config-dir tests/configs/torch_spyre_tests \
             --test-type "${{ inputs.test_type || 'full' }}" \
@@ -138,7 +172,10 @@ jobs:
   # ---------------------------------------------------------------------------
   build_torch_spyre:
     name: Build torch-spyre wheel (once)
-    if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
+    # Prebaked path skips the build entirely — torch_spyre is already editable-
+    # installed in the baked dev image. (Guarded first so the normal condition is
+    # only evaluated off the prebaked path.)
+    if: ${{ !inputs.prebaked_image && (inputs.rpm_names == '' || inputs.build_torch_spyre) }}
     # Compile-only: needs the backend image + SDK toolchain but NO physical Spyre
     # card, so it targets the cardless spyre_pf_x0 pool. This leaves the scarce
     # card runners (spyre_pf_x1/x2) for the test jobs below.
@@ -221,13 +258,21 @@ jobs:
       matrix: ${{ fromJSON(needs.generate_matrix.outputs.matrix) }}
 
     steps:
+      # Composite actions: on the prebaked path the baked dir already has
+      # .github/actions (full source is baked), so this checkout is only needed
+      # on the normal path.
       - name: Checkout composite actions
+        if: ${{ !inputs.prebaked_image }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           sparse-checkout: .github/actions
           sparse-checkout-cone-mode: false
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # Product source: NORMAL path checks out the PR ref. PREBAKED path uses the
+      # baked /home/senuser/torch-spyre (source + editable venv already in image)
+      # → no checkout, no runtime mkdir under $HOME (this was the collision).
+      - if: ${{ !inputs.prebaked_image }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           path: torch-spyre
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
@@ -240,12 +285,13 @@ jobs:
       - uses: ./.github/actions/gather-runner-info
         with:
           verbose: 'true'
+          torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
 
       # Install the wheel built once by build_torch_spyre — no recompile.
-      # Skipped on the RPM path (build_torch_spyre skipped), where the RPM
-      # provides torch-spyre exactly as before.
+      # Skipped on the RPM path (build_torch_spyre skipped) AND on the prebaked
+      # path (torch_spyre already editable-installed in the baked image).
       - name: Install prebuilt torch-spyre
-        if: ${{ needs.build_torch_spyre.result == 'success' }}
+        if: ${{ !inputs.prebaked_image && needs.build_torch_spyre.result == 'success' }}
         uses: ./.github/actions/install-prebuilt-torch-spyre
 
       - name: Derive report paths
@@ -261,6 +307,9 @@ jobs:
         with:
           suite_name: ${{ matrix.suite.name }}
           config: tests/configs/torch_spyre_tests/${{ matrix.suite.config }}
+          # Prebaked: run FROM the baked dir (its .venv + editable torch_spyre);
+          # normal: from the checkout (default 'torch-spyre').
+          torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
           extra_test_flags: ${{ inputs.extra_test_flags }}
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
@@ -331,12 +380,14 @@ jobs:
 
     steps:
       - name: Checkout composite actions
+        if: ${{ !inputs.prebaked_image }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           sparse-checkout: .github/actions
           sparse-checkout-cone-mode: false
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - if: ${{ !inputs.prebaked_image }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           path: torch-spyre
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
@@ -349,12 +400,12 @@ jobs:
       - uses: ./.github/actions/gather-runner-info
         with:
           verbose: 'true'
+          torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
 
       # Install the wheel built once by build_torch_spyre — no recompile.
-      # Skipped on the RPM path (build_torch_spyre skipped), where the RPM
-      # provides torch-spyre exactly as before.
+      # Skipped on the RPM path (build skipped) AND on the prebaked path.
       - name: Install prebuilt torch-spyre
-        if: ${{ needs.build_torch_spyre.result == 'success' }}
+        if: ${{ !inputs.prebaked_image && needs.build_torch_spyre.result == 'success' }}
         uses: ./.github/actions/install-prebuilt-torch-spyre
 
       - name: Derive report paths
@@ -369,6 +420,7 @@ jobs:
         with:
           suite_name: ${{ matrix.suite.name }}
           config: tests/configs/${{ matrix.suite.config }}
+          torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
           extra_test_flags: ${{ inputs.extra_test_flags_multi_spyre }}
           parallel: 'false'
           junit_xml_path: ${{ env.REPORT_PATH }}

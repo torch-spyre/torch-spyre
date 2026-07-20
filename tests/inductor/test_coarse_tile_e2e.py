@@ -30,7 +30,6 @@ import sys
 import os
 import regex as re
 
-import pytest
 import torch
 import unittest
 from unittest.mock import patch as mock_patch
@@ -98,7 +97,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -142,7 +140,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -204,7 +201,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -215,7 +211,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -294,125 +289,11 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         self.assertIn("1024", src, "Expected per-tile col count 1024")
 
     # ------------------------------------------------------------------
-    # Unrolled nested loops via hints: source calls sdsc
-    # ------------------------------------------------------------------
-
-    @config.patch(
-        {
-            "unroll_loops": True,
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
-    def test_hint_unrolled_source_calls_sdsc(self):
-        """Nested K=2 × M=4 hint tiling with unroll_loops=True compiles cleanly.
-
-        The generated wrapper passes a LoopSpec to async_compile.sdsc().
-        SpyreAsyncCompile.sdsc() calls unroll_loop_specs internally before
-        invoking generate_bundle.  The source must still contain LoopSpec (it
-        is part of the sdsc() call-site), and subprocess.run must be called
-        (the dxp_standalone invocation after successful unrolling+bundling).
-        """
-        from torch_spyre._inductor import spyre_hint
-
-        A, B = 1024, 4096
-        a = torch.randn(A, B, dtype=torch.float16)
-        b = torch.randn(A, B, dtype=torch.float16)
-        c = torch.randn(A, B, dtype=torch.float16)
-
-        def fn(a, b, c):
-            with spyre_hint(num_tiles_per_dim={"A": 2}):
-                with spyre_hint(num_tiles_per_dim={"B": 4}):
-                    y = a + b
-                    z = y * c
-                    return z
-
-        a_dev = a.to("spyre")
-        b_dev = b.to("spyre")
-        c_dev = c.to("spyre")
-        _declare_tensor_dim("A", A)
-        _declare_tensor_dim("B", B)
-        _name_tensor_dims(a_dev, ["A", "B"])
-        _name_tensor_dims(b_dev, ["A", "B"])
-        _name_tensor_dims(c_dev, ["A", "B"])
-
-        cfn = torch.compile(fn)
-        subprocess_calls = []
-
-        def _record_subprocess(*args, **kwargs):
-            subprocess_calls.append(args)
-
-        with (
-            mock_patch(_LAUNCH_JOBPLAN),
-            mock_patch(_PREPARE_KERNEL),
-            mock_patch("subprocess.run", side_effect=_record_subprocess),
-        ):
-            _, source_codes = run_and_get_code(cfn, a_dev, b_dev, c_dev)
-        self.assertTrue(len(source_codes) > 0)
-        src = source_codes[0]
-        self.assertIn("LoopSpec(", src)
-        self.assertTrue(
-            len(subprocess_calls) > 0,
-            "Expected subprocess.run to be called (dxp_standalone invocation)",
-        )
-
-    # ------------------------------------------------------------------
-    # Unrolled softmax-shaped execution via hints
-    # ------------------------------------------------------------------
-
-    @config.patch(
-        {
-            "unroll_loops": True,
-            "sencores": 1,
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
-        }
-    )
-    def test_hint_unrolled_softmax_shaped_execution(self):
-        """Unrolled K=4 hint-tiled softmax-shaped pointwise+reduce chain.
-
-        Tiles the batch dimension (dim 0) of a softmax-like computation using
-        spyre_hint(num_tiles_per_dim={"B": 4}).  sencores=1 avoids
-        core-division issues.  The reductions collapse dim 1 (D); the loop
-        tiles dim 0 (B), so no tiled dim overlaps with the reduction dim.
-
-        D=256 gives 4 sticks/row, exercising multi-stick address arithmetic
-        under row-tiling.  Narrower shapes (D=64, 1 stick/row) would not
-        catch per-tile device_size bugs that corrupt the inter-stick stride.
-        """
-        from torch_spyre._inductor import spyre_hint
-
-        B, D = 256, 256
-        x = torch.randn(B, D, dtype=torch.float16)
-
-        _declare_tensor_dim("B", B)
-        _declare_tensor_dim("D", D)
-        _name_tensor_dims(x, ["B", "D"])
-
-        def softmax_fn(x):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
-                max_val = x.amax(dim=-1, keepdim=True)
-                x_shifted = x - max_val
-                exp_x = x_shifted.exp()
-                sum_exp = exp_x.sum(dim=-1, keepdim=True)
-                return exp_x / sum_exp
-
-        compare_with_cpu(
-            softmax_fn,
-            x,
-            run_compile=True,
-            run_eager=False,
-            atol=0.1,
-            rtol=0.1,
-        )
-
-    # ------------------------------------------------------------------
     # Two ops in separate groups tiling different iteration dimensions
     # ------------------------------------------------------------------
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -495,7 +376,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -545,7 +425,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -598,7 +477,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -651,7 +529,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -770,10 +647,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         # is numerically wrong (~90% element mismatch).  Investigate and fix
         # before re-adding spyre_hint(num_tiles_per_dim={"Lk": lk_slices}).
         """
-        if not config.unroll_loops:
-            pytest.xfail(
-                "UNROLL_LOOPS=0: nested scf.for loops not yet correct in backend"
-            )
         import math
         from torch_spyre._inductor import spyre_hint
 
@@ -842,7 +715,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -895,7 +767,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -1155,7 +1026,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     def test_hint_h_tiling_elementwise(self):
         """spyre_hint(num_tiles_per_dim={"H": 2}) tiles elementwise multiply over the H dimension.
 
-        Regression test for a bug in _byte_stride_for_arg (unroll.py) where
+        Regression test for a bug in per-tile byte-stride computation where
         per-tile HBM base addresses advanced by the wrong amount when the tiled
         dimension was not the outermost host dimension (e.g. H in BHLD).
         """
@@ -1299,7 +1170,6 @@ class TestNamedDimsHint(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -1341,7 +1211,6 @@ class TestNamedDimsHint(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -1377,7 +1246,6 @@ class TestNamedDimsHint(InductorTestCase):
 
     @config.patch(
         {
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
@@ -1882,7 +1750,7 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         self.assertIn("sympify('2')", src, "Expected outer loop count 2")
         self.assertIn("sympify('4')", src, "Expected inner loop count 4")
 
-    @config.patch({"lx_planning": False, "unroll_loops": False})
+    @config.patch({"lx_planning": False})
     def test_nested_matmul_copy_after_inner_loop(self):
         """The accum→output copy op appears in generated source for nested K-tiling."""
         from torch_spyre._inductor import spyre_hint
@@ -1922,7 +1790,6 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         {
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
-            "unroll_loops": False,
         }
     )
     def test_nested_matmul_outer_M_inner_K_accum_in_lx(self):
@@ -1959,47 +1826,6 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
             src,
             "Expected tile-sized accum TensorArg with lx allocation for nested M+K tiling",
         )
-
-
-# ===========================================================================
-# UNROLL_LOOPS=0 variants
-#
-# Each class below inherits all test methods from its base.  The class-level
-# @config.patch sets unroll_loops=False for every inherited test.  Tests that
-# are known to give wrong results under the scf.for path already contain
-#   ``if not config.unroll_loops: pytest.xfail(...)``
-# guards, so they are reported as xfail here rather than FAILED.
-#
-# Tests whose method-level @config.patch overrides unroll_loops (e.g.
-# test_hint_unrolled_source_calls_sdsc explicitly sets unroll_loops=True)
-# are unaffected: the method decorator wins over the class decorator and
-# those tests run — and pass — with their own explicit setting.
-# ===========================================================================
-
-
-@config.patch({"unroll_loops": False})
-class TestCoarseTileSpyreHintsUnroll0(TestCoarseTileSpyreHints):
-    pass
-
-
-@config.patch({"unroll_loops": False})
-class TestNamedDimsHintUnroll0(TestNamedDimsHint):
-    pass
-
-
-@config.patch({"unroll_loops": False})
-class TestCoarseTileReductionE2EUnroll0(TestCoarseTileReductionE2E):
-    pass
-
-
-@config.patch({"unroll_loops": False})
-class TestCoarseTileReductionDim0E2EUnroll0(TestCoarseTileReductionDim0E2E):
-    pass
-
-
-@config.patch({"unroll_loops": False})
-class TestCoarseTileNestedReductionE2EUnroll0(TestCoarseTileNestedReductionE2E):
-    pass
 
 
 if __name__ == "__main__":

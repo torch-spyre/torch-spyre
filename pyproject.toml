@@ -33,7 +33,10 @@ requires-python = ">=3.11"
 dynamic = ["version"]
 
 [project.optional-dependencies]
-build = [ # no-isolation build 
+cpsat = [ # OR-Tools CP-SAT LX layout solver (layout_solver='cpsat' / LAYOUT_SOLVER=cpsat)
+    "ortools>=9.0",
+]
+build = [ # no-isolation build
     # any change here should be reflected in the build system above
     "build",  # only required to build torch_sendnn
     "cmake>=3.27,<4.0.0",

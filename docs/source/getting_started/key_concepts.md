@@ -343,7 +343,7 @@ Constraints that show up as compile-time errors or unexpected behavior:
 | **No HW scalar immediates** | Scalar constants in the FX graph are rewritten to size-1 tensors via `spyre::constant`. |
 | **Indivisible reduction dims** | Some reduction dimensions cannot be split across cores; work distribution honors this. |
 | **Static shapes** | Dynamic shapes are work-in-progress. Shape-polymorphic models may recompile per shape. |
-| **Per-core memory span (256 MB)** | Each core's contiguous device-memory footprint must fit within 256 MB of addressable range. Separate from the 2 MB LX scratchpad capacity. |
+| **Per-core memory span (255.996 MiB)** | Each core's contiguous device-memory footprint must fit within 255.996 MiB of addressable range. Separate from the 2 MB LX scratchpad capacity. |
 | **fp16 default** | int64 is down-cast to int32 with a warning. Set `TORCH_SPYRE_DOWNCAST_WARN=0` to suppress. |
 | **`SENCORES=32`** | Default core count; lowering it for debugging changes work-division decisions. |
 

@@ -79,6 +79,36 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
     return res
 
 
+def op_read_writes(op: Operation) -> ReadWrites:
+    """``op.get_read_writes()`` memoized on the op instance.
+
+    ``ComputedBuffer.get_read_writes`` re-runs sympy dependency extraction on
+    every call and is not cached upstream, yet its result does not depend on the
+    only thing the LX planner mutates (``op_it_space_splits``). The scratchpad
+    pass calls it hundreds of times, so we cache it under a private key only this
+    helper reads -- a non-planner caller (e.g. later-pass codegen) still goes
+    through the real method.
+    """
+    rw = op.__dict__.get("_ts_cached_read_writes")
+    if rw is None:
+        rw = op.get_read_writes()
+        op.__dict__["_ts_cached_read_writes"] = rw
+    return rw
+
+
+def invalidate_op_read_writes(op: Operation) -> None:
+    """Drop any memoized :func:`op_read_writes` result for ``op``.
+
+    Call this immediately after mutating an op's dependencies in place -- e.g.
+    swapping a load name in its ``inner_fn`` -- so the next
+    :func:`op_read_writes` re-traces instead of returning stale reads/writes.
+    The memo is keyed on the op instance and is otherwise never invalidated: its
+    result is independent of ``op_it_space_splits`` (the only thing the LX
+    planner normally mutates), so a plain split change needs no invalidation.
+    """
+    op.__dict__.pop("_ts_cached_read_writes", None)
+
+
 def concretize_expr(expr: Union[Expr, int]) -> int:
     """Concretize a sympy expression to a Python int.
 
@@ -760,7 +790,7 @@ def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
 def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr]:
     """Pre-scheduler version of iteration_space: uses op.get_read_writes() instead
     of SchedulerNode.read_writes."""
-    rw = op.get_read_writes()
+    rw = op_read_writes(op)
     if isinstance(op.data, Pointwise):
         return next(iter(rw.writes)).ranges.copy()
     elif isinstance(op.data, Reduction):
@@ -1310,24 +1340,22 @@ def lower_pad_sequence(
 class PerCoreView:
     """Geometric description of a buffer's per-core slicing.
 
-    - work_slice_dims: (host-dim index, (work_div_factor, tile_factor)) pairs,
-      one per split dim. Comparing both factors means two ops must agree on the
-      whole-tensor axis, its work division, AND its tiling (from spyre_hint).
-    - core_to_slot: (host-dim index, slice-index expression in core_id)
+    - work_slice_dims: (device-dim index, split factor) pairs, one per
+      split dim.
+    - core_to_slot: (device-dim index, slice-index expression in core_id)
       pairs giving each core's position along that split dim.
 
-    Both fields are keyed by the buffer's HOST-dim index — a buffer-intrinsic,
-    frame-stable identity shared by the writer and every reader — not by op-
-    local iter symbols, so the value depends only on how the buffer is sliced,
-    not on the (logical vs tiled) frame a given dep's index happens to be in.
+    Both fields are keyed by the buffer's device-dim index — not by op-
+    local iter symbols — so the value depends only on the buffer's
+    physical slicing.
 
-    Example: a 2D buffer split 4-ways on host dim 0 across 4 cores, untiled, has
-        work_slice_dims = ((0, (4, 1)),)
+    Example: a 2D buffer split 4-ways on dim 0 across 4 cores has
+        work_slice_dims = ((0, 4),)
         core_to_slot    = ((0, Mod(core_id, 4)),)
-    so core_id=2 owns slot 2 along host dim 0.
+    so core_id=2 owns slot 2 along dim 0.
     """
 
-    work_slice_dims: tuple[tuple[int, tuple[int, int]], ...]
+    work_slice_dims: tuple[tuple[int, int], ...]
     core_to_slot: tuple[tuple[int, Expr], ...]
 
 
@@ -1341,183 +1369,297 @@ def _is_matmul_op(op: Operation) -> bool:
 
 # TODO: refactor core assignment so the LX planner consumes determined
 # assignments instead of re-deriving them here.
-def _per_core_view_on_buf(
-    op: Operation,
-    dep: MemoryDep,
-    buf_name: str,
-    cache: Optional[dict] = None,
-) -> tuple[PerCoreView, bool]:
-    """Build a PerCoreView describing how `op` slices `buf_name` via `dep`.
+class _ViewPrep(NamedTuple):
+    """Candidate-invariant precompute shared across every core-division
+    candidate of one ``(op, dep, buf_name)``.
 
-    Returns `(view, has_partial_reduction)`. The flag is True when this
-    op's iteration space contains a reduction split — meaning the
-    producer leaves partial sums on most cores. Callers act on it only
-    for write-deps; a read-dep on a K-split input still has a valid work
-    slice.
-
-    Steps:
-      1. Recover {iter-symbol: split} from op.op_it_space_splits.
-      2. Map each split symbol to the HOST dim it slices, via
-         host_coordinates, producing work_slice_dims keyed by host-dim
-         index. Host-dim identity is buffer-intrinsic and frame-stable,
-         so the writer and every reader agree on it regardless of the
-         (possibly logical, possibly tiled) frame their dep index is in.
-      3. Build the core-to-slot mapping (k_fast-aware) and re-key it by
-         host-dim so it's independent of op-local symbol names.
-
-    Pass an optional `cache` dict to memoize results across calls,
-    keyed by (op name, op.op_it_space_splits, dep). op name is required:
-    the result also depends on op-derived write_index / read_index /
-    iter_space, so two ops sharing the same (splits, dep) — e.g. a matmul
-    producer and a pointwise consumer of the same buffer — must not alias
-    the same cache entry. buf_name is omitted because the sole caller
-    (get_ncores_for_buffers) always passes buf_name == dep.name, so the
-    frozen MemoryDep `dep` already carries it.
+    Everything here depends only on the op, its dep, and the target buffer (not
+    on ``op.op_it_space_splits``), so ``_prepare_per_core_view`` computes it once
+    and ``_per_core_view_from_prep`` reuses it per candidate -- hoisting the
+    sympy-heavy op-level work out of the per-candidate loop.
     """
-    coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
-    if cache is not None:
-        # dicts aren't hashable; freeze each into a frozenset of items so
-        # the key is hashable and order-independent.
-        out, red = coeff_splits
-        key = (op.get_name(), frozenset(out.items()), frozenset(red.items()), dep)
-        hit = cache.get(key)
-        if hit is not None:
-            return hit
 
-    # Step 1: recover {iter-symbol: split} from op.op_it_space_splits.
-    # The op-level write_index / read_index (for *any* buffer the op
-    # writes / reads, not necessarily buf_name) bridge stride-keyed
-    # coeff_splits back to scheduler symbols.
-    rw = op.get_read_writes()
-    empty_view = (PerCoreView(work_slice_dims=(), core_to_slot=()), False)
-    if not any(n > 1 for d in coeff_splits for n in d.values()):
-        # Single-core (unsplit) op owns the WHOLE buffer on one core. Encode as
-        # explicit all-factor-1 dims so it does NOT alias the broadcast empty_view
-        # a multi-core op yields when its splits all contract on this buffer (Step
-        # 2). Otherwise a 1-core producer and its 32-core consumers compare equal,
-        # the buffer is sized per-consumer-core (under-counted), and a too-large
-        # buffer gets wrongly LX-pinned. Real sliced views always carry a factor>1.
-        buf_layout = V.graph.get_buffer(buf_name).layout
-        if not isinstance(buf_layout, FixedTiledLayout):
-            result = empty_view
-        else:
-            # Key by host-dim count to match the multi-core path (which keys
-            # work_slice_dims by host-dim index). Explicit all-(work=1,tile=1)
-            # dims so a single-core view never aliases the broadcast empty_view.
-            ndims = len(buf_layout.size)
-            result = (
-                PerCoreView(
-                    work_slice_dims=tuple((i, (1, 1)) for i in range(ndims)),
-                    core_to_slot=(),
-                ),
-                False,
-            )
-        if cache is not None:
-            cache[key] = result
-        return result
+    iter_space: dict
+    write_index: "sympy.Expr"
+    read_index: "sympy.Expr"
+    # concretize_expr(dep.index.coeff(sym)) over the *full* iteration space, so
+    # the per-candidate path does a dict lookup instead of a sympy .coeff() call.
+    dep_coeff: dict
+    device_size: Any
+    stride_map: Any
+    elems_per_stick: int
+    device_stride_to_dim: dict
+    stick_host_stride: Optional[int]
+    num_stick_dim: Optional[int]
+    num_stick: int
+    num_stick_stride: int
+    is_matmul: bool
+
+
+def _prepare_per_core_view(
+    op: Operation, dep: MemoryDep, buf_name: str
+) -> Optional[_ViewPrep]:
+    """Compute the candidate-invariant pieces of a per-core view once.
+
+    Returns ``None`` when ``buf_name``'s layout is not a ``FixedTiledLayout`` --
+    the view is then unrepresentable for *every* candidate, so callers map
+    ``None`` to the unrepresentable result without entering the per-candidate
+    path.
+    """
+    # The op-level write_index / read_index (for *any* buffer the op writes /
+    # reads, not necessarily buf_name) bridge stride-keyed coeff_splits back to
+    # scheduler symbols.
+    rw = op_read_writes(op)
     write_index = next(iter(rw.writes)).index
     read_index = next((d.index for d in rw.reads), write_index)
     iter_space = iteration_space_from_op(op)
-    per_sym = apply_splits_from_index_coeff(
-        coeff_splits, write_index, read_index, iter_space
-    )
-
-    # Step 2: map each split symbol to the HOST dim it slices, via
-    # host_coordinates. The per-core view is keyed by host-dim index — a
-    # frame-stable, buffer-intrinsic identity shared by all users of the buffer
-    # (the writer and every reader index the same host dims). This avoids the
-    # logical-vs-physical device-stride ambiguity: deps reach the allocator in
-    # mixed frames (some logical, some partially tiled), but host_coordinates
-    # interprets each dep's index against the buffer's host layout, giving the
-    # same host-dim answer regardless. A size-1 host dim is never a split key —
-    # no loop var indexes it (compute_coordinates skips size-1 dims). The
-    # has_partial_reduction flag is op-level — set whenever the op has any
-    # reduction-axis split — independent of which dep we inspect.
-    has_partial_reduction = any(n > 1 for n in coeff_splits[1].values())
 
     buf_op = V.graph.get_buffer(buf_name)
     buf_layout = buf_op.layout
     if not isinstance(buf_layout, FixedTiledLayout):
-        return empty_view
-    ind_sizes = indirect_sizes_from_op(op)
-    # Guard: if dep.index contains an indirect symbol not covered by ind_sizes,
-    # host_coordinates would raise Unsupported. Fall back to empty_view so the
-    # buffer is conservatively kept off LX.
-    if ind_sizes is not None:
-        loop_vars = set(iteration_space_from_op(op).keys())
-        if not dep.index.free_symbols.issubset(loop_vars | ind_sizes.keys()):
-            return empty_view
-    host_coords = host_coordinates(buf_layout, dep, ind_sizes)
-    # host dim index -> the unique loop var whose coord expression covers it.
-    # (compute_coordinates yields one coord expr per host dim; a split var
-    # appears in exactly the host dim it strides.)
-    # Per-loop-var tile factor from op.dim_hints (spyre_hint). A loop var may
-    # carry several hint entries (e.g. a fused B/H axis: B split_count=1,
-    # H split_count=8) — the tile factor is their product (size-1 dims
-    # contribute ×1). Absent / untiled loop var → factor 1.
-    # Fall back to the producer's dim_hints when op has none (e.g. combine/fill
-    # inserted by _maybe_coarse_tile after assign_dim_hints ran).
-    # TODO: fix in coarse_tile.py — _insert_combine_op/_insert_reduction_copy_op
-    # /fill path should copy dim_hints from the tiled op onto inserted ops.
-    dim_hints = getattr(op, "dim_hints", None) or getattr(buf_op, "dim_hints", None)
-    tile_by_sym: dict = {}
-    for h in dim_hints or ():
-        if h.is_reduction or h.loop_var is None:
-            continue
-        tile_by_sym[h.loop_var] = tile_by_sym.get(h.loop_var, 1) * int(h.split_count)
+        return None
+    dev_layout = buf_layout.device_layout
+    device_size = dev_layout.device_size
+    stride_map = dev_layout.stride_map
+    elems_per_stick = dev_layout.device_dtype.elems_per_stick()
 
-    # host dim index -> the unique loop var whose coord expression covers it.
-    # (compute_coordinates yields one coord expr per host dim; a split var
-    # appears in exactly the host dim it strides.) work_slice_dims stores
-    # (work_div_factor, tile_factor) per host dim: comparing both means two ops
-    # must agree on the whole-tensor axis, its work division, AND its tiling.
-    sym_to_host_dim: dict["sympy.Symbol", int] = {}
-    work_slice_dims: dict[int, tuple[int, int]] = {}
+    # Device-dim placement maps -- depend only on the buffer layout.
+    device_stride_to_dim: dict[int, int] = {}
+    for i, s in enumerate(stride_map):
+        if s <= 0:
+            continue
+        prev = device_stride_to_dim.get(s)
+        if prev is None or device_size[i] != 1:
+            device_stride_to_dim[s] = i
+
+    stick_host_stride, num_stick_dim, num_stick, num_stick_stride = None, None, 0, 0
+    if stride_map[-1] > 0:
+        stick_host_stride = stride_map[-1]
+        num_stick_dim = device_stride_to_dim.get(stick_host_stride * elems_per_stick)
+        if num_stick_dim is not None:
+            num_stick = device_size[num_stick_dim]
+            num_stick_stride = stride_map[num_stick_dim]
+
+    # Per-symbol host stride on this buffer, over the full iteration space.
+    # ``apply_splits_from_index_coeff`` returns a dict keyed by exactly the
+    # iteration-space symbols, so precomputing the coeff for every iter symbol
+    # covers every symbol the per-candidate path can ask for.
+    dep_coeff = {sym: concretize_expr(dep.index.coeff(sym)) for sym in iter_space}
+
+    return _ViewPrep(
+        iter_space=iter_space,
+        write_index=write_index,
+        read_index=read_index,
+        dep_coeff=dep_coeff,
+        device_size=device_size,
+        stride_map=stride_map,
+        elems_per_stick=elems_per_stick,
+        device_stride_to_dim=device_stride_to_dim,
+        stick_host_stride=stick_host_stride,
+        num_stick_dim=num_stick_dim,
+        num_stick=num_stick,
+        num_stick_stride=num_stick_stride,
+        is_matmul=_is_matmul_op(op),
+    )
+
+
+def _per_core_view_from_prep(
+    prep: Optional[_ViewPrep], coeff_splits: tuple[dict, dict]
+) -> tuple[PerCoreView, bool, bool]:
+    """Evaluate a per-core view for one candidate division from a precomputed
+    ``_ViewPrep``. This is the only part that depends on ``coeff_splits``.
+
+    See ``_per_core_view_on_buf`` for the meaning of the returned tuple.
+    """
+    # 3-tuple: (view, has_partial_reduction, representable). ``representable`` is
+    # False only on the give-up returns below (a split that slices this buffer
+    # can't be placed on a device dim); cross-op view comparisons must treat it
+    # as "no match", since its empty view means "couldn't tell", not "whole".
+    unrepresentable = (PerCoreView(work_slice_dims=(), core_to_slot=()), False, False)
+    # No real split -> whole-buffer view, representable regardless of layout. Must
+    # precede the ``prep is None`` guard to match the original ordering.
+    if not any(n > 1 for d in coeff_splits for n in d.values()):
+        return (PerCoreView(work_slice_dims=(), core_to_slot=()), False, True)
+    if prep is None:
+        return unrepresentable
+
+    # Step 1: recover {iter-symbol: split} from the candidate coeff_splits.
+    per_sym = apply_splits_from_index_coeff(
+        coeff_splits, prep.write_index, prep.read_index, prep.iter_space
+    )
+
+    # Step 2: keep splits that actually slice this buffer, keyed by their host
+    # stride on buf (precomputed in ``dep_coeff``). host_stride == 0 means the
+    # split contracts an axis not present on this buffer (canonical case: a
+    # K-split's output dep) and is dropped from the geometry. The
+    # has_partial_reduction flag is op-level -- set whenever the op has any
+    # reduction-axis split -- and is independent of which dep we're inspecting.
+    has_partial_reduction = any(n > 1 for n in coeff_splits[1].values())
+    splits_by_stride: dict[int, tuple[int, "sympy.Symbol"]] = {}
     for sym, split in per_sym.items():
-        if split <= 1:
+        host_stride = prep.dep_coeff.get(sym, 0)
+        if split <= 1 or host_stride == 0:
             continue
-        dims = [i for i, c in enumerate(host_coords) if sym in c.free_symbols]
-        # A split axis must map to exactly one host dim. Zero dims means the
-        # split contracts an axis absent from this buffer (e.g. a K-split's
-        # output dep) — drop it. More than one host dim (a split spanning
-        # multiple host dims via a reshape/fold) can't be faithfully keyed by a
-        # single host-dim index; fail closed to empty_view (buffer stays HBM).
-        if len(dims) == 0:
-            continue
-        if len(dims) > 1 or dims[0] in work_slice_dims:
+        splits_by_stride[host_stride] = (int(split), sym)
+
+    device_size = prep.device_size
+    stride_map = prep.stride_map
+    device_stride_to_dim = prep.device_stride_to_dim
+    stick_host_stride = prep.stick_host_stride
+    num_stick_dim = prep.num_stick_dim
+    num_stick = prep.num_stick
+    num_stick_stride = prep.num_stick_stride
+    iter_space = prep.iter_space
+
+    # Step 3: place each split on a device dim via stride lookup.
+    #
+    # stride_map[i] is a device-dim → host-stride mapping. The stickified
+    # host dim decomposes into two device dims (per dim_map_to_stride_map in C++):
+    #   - within-stick dim: always at position n-1, with
+    #     stride_map[-1] = host_stride[stick_dim] and dev_size = elems_per_stick.
+    #   - outer-stick (num_stick) dim: stride = stride_map[-1] * elems_per_stick,
+    #     dev_size = ceil(host_size[stick_dim] / elems_per_stick).
+    # A split whose host stride h equals stick_host_stride lands on the
+    # stickified host dim; sticks are atomic, so it must use the outer-stick
+    # dim. Skip stride_map entries <= 0 — sentinels for collapsed or
+    # broadcast dims.
+    #
+    # Example: host [64, 128] sticked to device [2, 64, 64] with
+    # stride_map=[64, 128, 1] and elems_per_stick=64. stick_host_stride=1,
+    # num_stick_dim=dim 0 (stride 64). With M-split×4 (h=128) and N-split×2
+    # (h=1), N's h matches stick_host_stride → outer-stick dim 0; M's h=128
+    # → dim 1. Result: work_slice_dims={0: 2, 1: 4}.
+    # ``device_stride_to_dim`` and the stick vars are candidate-invariant and
+    # come from ``prep`` (bound above).
+    work_slice_dims: dict[int, int] = {}
+    sym_to_device_dim: dict["sympy.Symbol", int] = {}
+    for h, (split, sym) in sorted(splits_by_stride.items()):
+        dev_dim = device_stride_to_dim.get(h)
+        if h == stick_host_stride:
+            dev_dim = num_stick_dim
+        # Multi-stick-stride rescue: a consumer view subdivides the stickified
+        # axis at k sticks per step (h = k * num_stick_stride). Only safe when
+        # split*k fully covers num_stick_dim — partial coverage would
+        # misreport the per-dim factor. Example (test_view_unsqueeze_add):
+        # device_size=[2, 6, 1, 64], num_stick_dim=1 (stride 64); split=3,
+        # h=128, k=2, split*k=6 == device_size[1] → place on dim 1, factor 6.
+        if dev_dim is None and num_stick_stride > 0 and h % num_stick_stride == 0:
+            k = h // num_stick_stride
+            if split * k == num_stick:
+                dev_dim = num_stick_dim
+                split *= k
+        # TODO: two known unhandled failure modes fall through to the
+        # empty_view fallback (cases catalogued in
+        # per_core_view_failing_cases.md):
+        #   (A) Collapsed-axis info loss — device_layout built from a
+        #       higher-rank host tensor while dep is indexed via a lower-rank
+        #       reshape view; the work-split factor spans multiple device
+        #       dims but reaches us as a single (h, factor) (e.g.
+        #       test_matmul_tiled_y, test_qkv_attn_paths_fms_*_gqa).
+        #   (B) Multi-stick stride with partial coverage —
+        #       h = k * stride_map[num_stick_dim], k > 1, but
+        #       split * k < num_stick (rescue above only
+        #       handles the full-coverage case where they are equal).
+        # In both cases no single (dev_dim, factor) placement faithfully
+        # represents the per-core slicing; empty_view keeps the buffer on
+        # HBM via the caller's mismatch logic. Future work: extend the
+        # PerCoreView schema to express multi-dim or strided splits, or
+        # refuse the buffer earlier in scratchpad planning.
+        if (
+            dev_dim is None
+            or dev_dim in work_slice_dims
+            or device_size[dev_dim] % split != 0
+        ):
             logger.debug(
-                f"could not place split {sym} factor={split} on host_coords="
-                f"{host_coords}; returning empty_view"
+                f"could not place split h={h} factor={split} on "
+                f"stride_map={stride_map} device_size={device_size}; "
+                f"returning empty_view"
             )
-            return empty_view
-        work_slice_dims[dims[0]] = (int(split), tile_by_sym.get(sym, 1))
-        sym_to_host_dim[sym] = dims[0]
+            return unrepresentable
+        work_slice_dims[dev_dim] = split
+        sym_to_device_dim[sym] = dev_dim
 
     # Step 3: build the core→slot mapping using the same gate codegen uses
     # (_should_use_k_fast_mapping), so K-fast matmul ops compare under the
     # K-cohort-adjacent ordering they will actually emit.
     num_cores = int(math.prod(per_sym.values()))
-    is_matmul = _is_matmul_op(op)
+    is_matmul = prep.is_matmul
     if _should_use_k_fast_mapping(is_matmul, iter_space, per_sym):
         _mapping_func = _k_fast_core_to_slice_mapping
     else:
         _mapping_func = _get_core_to_slice_mapping
     core_to_slot_by_name = _mapping_func(iter_space, per_sym, num_cores)
-    # Re-key by the buffer's host-dim index (canonical) instead of the op's
+    # Re-key by the buffer's device-dim index (canonical) instead of the op's
     # iter symbol name. Two ops with the same per-core slicing on this buffer
     # compare equal even if they name their iter axes differently.
     pruned_core_to_slot: list[tuple[int, "Expr"]] = []
-    for sym, host_dim in sym_to_host_dim.items():
+    for sym, dev_dim in sym_to_device_dim.items():
         expr = core_to_slot_by_name.get(str(sym))
         if expr is not None:
-            pruned_core_to_slot.append((host_dim, expr))
+            pruned_core_to_slot.append((dev_dim, expr))
     pruned_core_to_slot.sort(key=lambda x: x[0])
 
     view = PerCoreView(
         work_slice_dims=tuple(sorted(work_slice_dims.items())),
         core_to_slot=tuple(pruned_core_to_slot),
     )
-    result = (view, has_partial_reduction)
+    return (view, has_partial_reduction, True)
+
+
+def _per_core_view_on_buf(
+    op: Operation,
+    dep: MemoryDep,
+    buf_name: str,
+    cache: Optional[dict] = None,
+) -> tuple[PerCoreView, bool, bool]:
+    """Build a PerCoreView describing how `op` slices `buf_name` via `dep`.
+
+    Thin wrapper over ``_prepare_per_core_view`` + ``_per_core_view_from_prep``,
+    reading the candidate division from ``op.op_it_space_splits``. Callers
+    sweeping many candidates of one op/edge should call those two directly to
+    amortize the op-level precompute.
+
+    Returns `(view, has_partial_reduction, representable)`. ``has_partial_reduction``
+    is True when the op has a reduction split (partial sums left on most cores);
+    callers act on it only for write-deps. ``representable`` is False only on the
+    give-up cases (a split that slices this buffer can't be placed on a device
+    dim), which cross-op comparisons must treat as a non-match. Pass `cache` to
+    memoize, keyed by (op name, op.op_it_space_splits, dep, buf_name).
+
+    The op name is part of the key because the result also depends on op-derived
+    write_index / read_index / iter_space / matmul-ness, not just (splits, dep,
+    buf_name): two different ops can share the same (splits, dep, buf_name) — e.g.
+    a producer's write-dep and a consumer's read-dep on the same buffer at the
+    same index — and must NOT alias the same entry (``_as_core_division_buffers``
+    shares one cache across a producer and consumer of the same buffer).
+    """
+    coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
+    if cache is not None:
+        # dicts aren't hashable; freeze each into a frozenset of items so
+        # the key is hashable and order-independent.
+        out, red = coeff_splits
+        key = (
+            op.get_name(),
+            frozenset(out.items()),
+            frozenset(red.items()),
+            dep,
+            buf_name,
+        )
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+
+    # No real split -> whole-buffer view, representable. Short-circuit before
+    # ``_prepare_per_core_view`` touches ``next(iter(rw.writes)).index``, which a
+    # StarDep write lacks.
+    if not any(n > 1 for d in coeff_splits for n in d.values()):
+        result = (PerCoreView(work_slice_dims=(), core_to_slot=()), False, True)
+        if cache is not None:
+            cache[key] = result
+        return result
+
+    prep = _prepare_per_core_view(op, dep, buf_name)
+    result = _per_core_view_from_prep(prep, coeff_splits)
     if cache is not None:
         cache[key] = result
     return result
