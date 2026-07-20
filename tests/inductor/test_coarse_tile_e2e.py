@@ -668,6 +668,9 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 device=queries.device,
                 dtype=torch.float16,
             )
+            denominator = torch.zeros(
+                (B, H, Lq), device=queries.device, dtype=torch.float16
+            )
             with spyre_hint(
                 num_tiles_per_dim={"B": 1}
             ):  # 3 nested scopes exercises multi-hint logic
@@ -675,9 +678,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                     # TODO: re-enable once numerical error with Lk tiling is fixed
                     # with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
                     keys_T = keys.transpose(-1, -2).contiguous()
-                    denominator = torch.zeros(
-                        (B, H, Lq), device=queries.device, dtype=torch.float16
-                    )
                     scores = torch.matmul(queries * scale, keys_T * scale)
                     scores = scores.transpose(-1, -2).contiguous()
                     block_max = torch.amax(scores, dim=-2)
@@ -916,15 +916,15 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 device=queries.device,
                 dtype=torch.float16,
             )
+            denominator = torch.zeros(
+                (B, H, Lq),
+                device=queries.device,
+                dtype=torch.float16,
+            )
             with spyre_hint(num_tiles_per_dim={"B": 1}):
                 with spyre_hint(num_tiles_per_dim={"H": 4}):
                     with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
                         keys_T = keys.transpose(-1, -2).contiguous()
-                        denominator = torch.zeros(
-                            (B, H, Lq),
-                            device=queries.device,
-                            dtype=torch.float16,
-                        )
                         scores = torch.matmul(queries * scale, keys_T * scale)
                         scores = scores.transpose(-1, -2).contiguous()
                         block_max = torch.amax(scores, dim=-2)
@@ -1069,14 +1069,14 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                     device=queries.device,
                     dtype=torch.float16,
                 )
+            with spyre_hint(named_dims=["B", "H", "Lq"]):
+                denominator = torch.zeros(
+                    (B, H, Lq), device=queries.device, dtype=torch.float16
+                )
             with spyre_hint(num_tiles_per_dim={"B": 1}):
                 with spyre_hint(num_tiles_per_dim={"H": 4}):
                     with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
                         keys_T = keys.transpose(-1, -2).contiguous()
-                        with spyre_hint(named_dims=["B", "H", "Lq"]):
-                            denominator = torch.zeros(
-                                (B, H, Lq), device=queries.device, dtype=torch.float16
-                            )
                         scores = torch.matmul(queries * scale, keys_T * scale)
                         scores = scores.transpose(-1, -2).contiguous()
                         block_max = torch.amax(scores, dim=-2)
