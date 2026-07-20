@@ -834,13 +834,35 @@ def _reoffset(node, offset):
     coordinate's constant term (``as_coeff_Add()[0]``). We therefore rebuild
     the node as a ReinterpretView over the same storage with the offset
     installed on the layout — the same mechanism aten.slice / SliceView use.
-    Size and stride are preserved from the input's own layout, so this is
-    correct for arbitrary (including transposed / permuted) views as long as
-    the device layout preserved the stride.
+    Size and stride are preserved from the input's own layout.
+
+    REQUIREMENT — the offset is a single *host-space* flat scalar (in host
+    elements). ``compute_coordinates`` (views.py) distributes it across dims
+    against the *device* ``stride_map``; the innermost (stick) dim holds
+    ``elems_per_stick`` elements (64 at fp16, 128 at fp8), and the backend has
+    no mechanism to bake an offset that lands *inside* a stick. So a re-injected
+    offset is only representable when it is a whole multiple of
+    ``elems_per_stick`` — i.e. it steps by complete sticks. This was measured
+    directly (see ``sweep_d2d_offsets.py`` / ``tests/inductor/
+    test_copy_from_d2d_offsets.py``): across contiguous ``narrow`` and
+    ``select`` views of every inner size, the copy is correct iff
+    ``offset % elems_per_stick == 0`` and otherwise the restickify pass raises
+    "no mechanism to resolve stick incompatibility". Notably this depends on the
+    OFFSET, not the inner-dim size: e.g. an inner dim of 96 (not a stick
+    multiple) still copies correctly at offset 192 (== 3 sticks) but errors at
+    offset 96 (== 1.5 sticks).
+
+    ``_validate_reoffset_supported`` converts the unaligned case into a clean,
+    actionable ``Unsupported`` at lowering time instead of the cryptic
+    restickify error deeper in the pipeline. It does NOT guard the separate
+    offset-*within*-the-stick-dim case (a column narrow, e.g.
+    ``x.narrow(1, 64, 64)``), which the backend still miscompiles silently — see
+    ``test_column_slice_inner_offset`` (tracked for the follow-up PR).
     """
     if offset == 0:
         return node
     storage, old_layout = ir.as_storage_and_layout(node)
+    _validate_reoffset_supported(old_layout, offset)
     new_layout = ir.FixedLayout(
         old_layout.device,
         old_layout.dtype,
@@ -849,6 +871,48 @@ def _reoffset(node, offset):
         sympy.expand(offset),
     )
     return ir.TensorBox(ir.ReinterpretView(data=storage, layout=new_layout))
+
+
+def _validate_reoffset_supported(layout, offset) -> None:
+    """Fail fast when a D2D-copy offset is not a whole number of sticks.
+
+    A re-injected storage_offset must step by complete sticks: the innermost
+    device dim holds ``elems_per_stick`` elements and the backend cannot bake an
+    offset that lands inside a stick. Measured behavior (``sweep_d2d_offsets.py``)
+    is unambiguous — across contiguous ``narrow`` / ``select`` views of every
+    inner size, the copy is correct iff ``offset % elems_per_stick == 0``; every
+    unaligned offset instead raises deep in the restickify pass ("no mechanism
+    to resolve stick incompatibility"). This check surfaces the same rejection
+    earlier with an actionable message rather than silently miscompiling or
+    emitting a cryptic downstream error.
+
+    Scope — this rule is keyed on the OFFSET alone, so it holds regardless of
+    rank reduction (``select`` drops the outer dim but the flat offset is
+    unchanged) and does not need the device layout, which is not attached to the
+    placeholder yet. It deliberately does NOT cover an offset that falls *inside*
+    the stick dimension itself (a column narrow): that case is
+    ``offset % elems_per_stick == 0`` yet still miscompiles, and detecting it
+    would require the base-storage layout that is unavailable here. It stays a
+    documented known limitation (``test_column_slice_inner_offset``).
+    """
+    try:
+        off = int(offset)
+    except (TypeError, ValueError):
+        # Symbolic offset: cannot check statically, let it through
+        # (specialize_int bakes concrete offsets, so this is the rare path).
+        return
+    if off == 0:
+        return
+    eps = get_elem_in_stick(layout.dtype)
+    if off % eps != 0:
+        raise Unsupported(
+            "spyre::copy_from_d2d of a sliced view requires a stick-aligned "
+            f"storage_offset: {off} is not a multiple of elems_per_stick={eps} "
+            f"(dtype {layout.dtype}). The offset must step by whole sticks; an "
+            "offset landing inside a stick cannot be baked into the kernel "
+            "coordinate. Re-slice on a stick-aligned boundary (a multiple of "
+            f"{eps} elements), or copy the full (unsliced) tensor."
+        )
 
 
 @register_spyre_lowering(torch.ops.spyre.copy_from_d2d)

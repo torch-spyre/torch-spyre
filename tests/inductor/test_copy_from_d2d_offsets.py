@@ -25,12 +25,29 @@ The fix re-introduces the offset in-graph in lower_spyre_from_d2d
 (torch_spyre/_inductor/lowering.py) via a ReinterpretView, so the offset lands
 in the coordinate that superdsc bakes into the SDSC binary.
 
+REQUIREMENT (not a missing feature): the re-injected offset must step by whole
+sticks. The innermost device dim holds elems_per_stick elements (64 at fp16) and
+the backend cannot bake an offset landing inside a stick. Measured on hardware
+(sweep_d2d_offsets.py): across contiguous narrow AND select views of every inner
+size, a copy is correct iff offset % elems_per_stick == 0, and every unaligned
+offset instead raises "no mechanism to resolve stick incompatibility" in the
+restickify pass — there is NO silent-wrong-data path for contiguous views. Note
+the rule keys on the OFFSET, not the inner-dim size: an inner dim of 96 (not a
+stick multiple) still copies correctly at offset 192 (3 sticks) but errors at
+offset 96 (1.5 sticks). _validate_reoffset_supported in lower_spyre_from_d2d
+surfaces this rejection early with an actionable message; see
+test_unaligned_offset_raises{,_select} and
+test_stick_multiple_offset_unaligned_inner_dim_ok.
+
+The one remaining silent-wrong-data case is an offset that falls INSIDE the
+stick dim (a column narrow) — see test_column_slice_inner_offset, a documented
+known limitation tracked for the follow-up PR.
+
 The transpose / permute / strided cases below deliberately exercise
-NON-contiguous views. They probe whether re-injecting only the scalar
-storage_offset onto the input's own (size, stride) layout is sufficient
-("Option 2"), or whether the full view (size + stride + offset) must be
-reconstructed from the base tensor ("Option 1"). If any strided case fails on
-hardware while the contiguous cases pass, Option 2 is insufficient.
+NON-contiguous views (see TestCopyFromD2DStridedViews). permute / select at
+stick-aligned offsets are carried by the offset fix; transpose / stepped-slice
+fail in the restickify layout pass (a pre-existing backend limitation, not a
+regression from this fix).
 """
 
 import unittest
@@ -86,17 +103,73 @@ class TestCopyFromD2DContiguousOffsets(unittest.TestCase):
     def test_column_slice_inner_offset(self):
         """Offset along the last (stick) dim: narrow columns at an offset.
 
-        KNOWN LIMITATION (silent wrong data). A storage_offset that falls in
-        the innermost / stick dimension is not correctly baked: the fix
-        re-introduces the flat offset onto the layout, but superdsc decomposes
-        per-dim offsets against device_size and does not split a stick-dim
-        offset correctly, so the read is off by the stick-dim component.
-        Tracked for the follow-up PR (stick-dim offset handling), distinct from
-        the row-offset bug fixed here."""
+        KNOWN LIMITATION — the SOLE remaining silent-wrong-data case. Here the
+        offset (64) IS a stick multiple, so _validate_reoffset_supported accepts
+        it, but it falls inside the stick DIMENSION: superdsc decomposes per-dim
+        offsets against device_size and does not split a stick-dim offset
+        correctly, so the read is off by the stick-dim component (measured WRONG
+        in sweep_d2d_offsets.py: got 0.0, expected 64.0). The offset%eps guard
+        cannot catch this (the offset is aligned); detecting it needs the
+        base-storage layout, which is unavailable at lowering. Tracked for the
+        follow-up PR (stick-dim offset handling), distinct from the row-offset
+        bug fixed here."""
         x = torch.arange(2 * 128, dtype=DTYPE, device=DEVICE).reshape(2, 128)
         # columns [64:128) -> nonzero offset within a row
         out = x.narrow(1, 64, 64).clone()
         torch.testing.assert_close(out.cpu(), x.cpu()[:, 64:128])
+
+    def test_unaligned_offset_raises(self):
+        """A storage_offset that is not a whole number of sticks is rejected.
+
+        REQUIREMENT (not a missing feature). The re-injected offset must step by
+        complete sticks: the innermost device dim holds elems_per_stick elements
+        (64 at fp16) and the backend cannot bake an offset landing inside a
+        stick. Measured on hardware (sweep_d2d_offsets.py): across contiguous
+        narrow / select views of every inner size, a copy is correct iff
+        offset % elems_per_stick == 0 and otherwise the restickify pass raises
+        "no mechanism to resolve stick incompatibility".
+
+        The rule keys on the OFFSET, not the inner-dim size. reshape(4, 100)
+        row 2 has offset 200 (200 % 64 != 0), so _validate_reoffset_supported in
+        lower_spyre_from_d2d raises Unsupported at lowering time — surfacing the
+        rejection early with an actionable message instead of the cryptic
+        downstream restickify error. Row 0 (offset 0) is always fine."""
+        x = torch.arange(4 * 100, dtype=DTYPE, device=DEVICE).reshape(4, 100)
+        # offset 0 -> guard no-op, must succeed and be correct
+        a = x.narrow(0, 0, 1).clone()
+        torch.testing.assert_close(a.cpu(), x.cpu()[0:1])
+        # offset 200 is not a stick multiple -> clean compile-time error
+        with self.assertRaises(Exception) as cm:
+            x.narrow(0, 2, 1).clone()
+        self.assertIn("stick", str(cm.exception).lower())
+
+    def test_unaligned_offset_raises_select(self):
+        """select (rank-reducing) with an unaligned offset is rejected too.
+
+        select(0, r) drops the outer dim, so the view handed to the op is 1-D
+        with the outer-dim offset baked into its storage_offset. The rule keys
+        on the offset alone, so rank reduction is irrelevant: reshape(4, 100)
+        select(0, 2) has offset 200 (not a stick multiple) and must raise, while
+        select(0, 0) (offset 0) succeeds. Guards against the earlier concern
+        that the select path could silently misread (it cannot: it either copies
+        correctly or errors)."""
+        x = torch.arange(4 * 100, dtype=DTYPE, device=DEVICE).reshape(4, 100)
+        torch.testing.assert_close(x.select(0, 0).clone().cpu(), x.cpu()[0])
+        with self.assertRaises(Exception) as cm:
+            x.select(0, 2).clone()
+        self.assertIn("stick", str(cm.exception).lower())
+
+    def test_stick_multiple_offset_unaligned_inner_dim_ok(self):
+        """A stick-multiple offset is accepted even if the inner dim is not.
+
+        Proves the rule is about the OFFSET, not the inner-dim size. reshape(
+        4, 96): 96 is not a stick multiple, but row 2 sits at offset 192 == 3
+        sticks, so the copy is representable and correct. (Row 1 at offset 96 ==
+        1.5 sticks would instead error — see test_unaligned_offset_raises.)
+        Verified on hardware in sweep_d2d_offsets.py."""
+        x = torch.arange(4 * 96, dtype=DTYPE, device=DEVICE).reshape(4, 96)
+        out = x.narrow(0, 2, 1).clone()  # offset 192 == 3 * 64
+        torch.testing.assert_close(out.cpu(), x.cpu()[2:3])
 
 
 class TestCopyFromD2DStridedViews(unittest.TestCase):
