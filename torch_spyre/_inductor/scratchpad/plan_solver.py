@@ -19,12 +19,19 @@ from typing import Generic, Optional, TypeVar
 from abc import ABC, abstractmethod
 import math
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+from enum import Enum
 
 logger = get_inductor_logger("scratchpad.plan_solver")
 
 
 class SolveError(Exception):
     """Raised when a solver is unable to find a solution"""
+
+
+class BufferType(Enum):
+    Intermediate = 0
+    Input = 1
+    Output = 2
 
 
 @dataclass
@@ -58,6 +65,10 @@ class LifetimeBoundBuffer:
     @property
     def end_time(self) -> int:
         return self.uses[-1] + 1
+
+    def overlaps_in_time(self, other: "LifetimeBoundBuffer") -> bool:
+        """Returns true iff self and other overlap in time."""
+        return self.start_time < other.end_time and other.start_time < self.end_time
 
 
 @dataclass
@@ -140,6 +151,7 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # residency gate are unchanged there.
     # TODO: Drop this and make other solvers use the placement = False flag
     unallocated_reads: int = 0
+    boundary: BufferType = BufferType.Intermediate
 
     @property
     def residency_allowed(self) -> bool:

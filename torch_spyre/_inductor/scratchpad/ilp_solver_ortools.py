@@ -36,14 +36,20 @@ constraint model over :class:`CoreDivisionBuffer`s:
   legally share an offset; the single-tick-overlap invariant
   (``_assert_in_place_relationships``) makes this exact (``_add_no_overlap_2d``).
 * **Objective** (two-phase lexicographic, in ``_run``). *Residency is the hard
-  priority.* Phase 1 minimizes total **HBM transfer traffic** -- spilling a
-  buffer forces each consumer to re-read it from HBM, so a spill costs
-  ``num_consumers * size`` -- putting as much in LX as possible and choosing
-  whatever division serves that (even no split, if that is what lets a buffer
-  match its consumers and reside). Phase 2 then *holds that residency optimum*
-  and maximizes total core usage (``sum_b cores_b``) so every buffer -- resident
-  or spilled, the latter free of the slicing gate -- takes its most parallel
-  division, which the allocator commits. Parallelism never costs a spill.
+  priority.* Phase 1 minimizes total **HBM transfer traffic** via
+  ``spill_cost(b) * (1 - in_buffer)`` -- the *differential* traffic a spill adds
+  over residency (resident buffers contribute 0). An intermediate costs
+  ``(num_consumers + 1) * size`` (the producer's HBM write, which residency turns
+  into a free LX write, plus one re-read per consumer); a graph input drops the
+  producer write it never had and the clone-in read residency cannot avoid
+  (``(num_consumers - 1) * size``); a graph output drops its unavoidable
+  write-out (``num_consumers * size``). Phase 1 puts as much in LX as possible
+  and chooses whatever division serves that (even no split, if that is what lets
+  a buffer match its consumers and reside). Phase 2 then *holds that residency
+  optimum* and maximizes total core usage (``sum_b cores_b``) so every buffer --
+  resident or spilled, the latter free of the slicing gate -- takes its most
+  parallel division, which the allocator commits. Parallelism never costs a
+  spill.
 
 After the solve, ``_justify`` slides each in-place-merged placement unit down to
 the lowest free address, squeezing out float gaps without raising the peak.
@@ -74,6 +80,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     MemoryPlanSolver,
     _assert_in_place_relationships,
     SolveError,
+    BufferType,
 )
 
 __all__ = ["CpSatLayoutSolver"]
@@ -210,7 +217,10 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
         # Solve on copies so we never mutate the caller's buffers.
         working = {
             b.name: _CoreDivisionBufferWithCpVars(
-                replace(b, size=int(np.ceil(b.size / self.alignment))),
+                replace(
+                    b,
+                    size=int(np.ceil(b.size / self.alignment)),
+                ),
                 model,
                 self._capacity_units,
             )
@@ -253,29 +263,14 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
 
         # TODO: Update objective to a maxmin optimization to optimize overall
         # throughput.
+        def spill_cost(sb: "_CoreDivisionBufferWithCpVars") -> int:
+            reads = len(children_of.get(sb.name, [])) + sb.buffer.unallocated_reads
+            if sb.buffer.boundary == BufferType.Input and reads > 0:
+                reads -= 1
+            writes = 1 if sb.buffer.boundary == BufferType.Intermediate else 0
+            return (reads + writes) * sb.buffer.size
 
-        # Two-phase lexicographic objective: residency is the hard priority and
-        # core division is chosen only in service of it.
-        #
-        # Phase 1 -- residency: put as much in LX as possible by minimizing HBM
-        # transfer traffic. Spilling a buffer forces each of its consumers to
-        # re-read it from HBM, so a spill costs ``num_consumers * size``. The
-        # division is whatever maximizes residency -- even no split at all, if
-        # that is what lets a buffer match its consumers and reside.
-        #
-        # ``unallocated_reads`` adds the consumers the solver never sees as
-        # candidates (filtered-out ops, graph outputs): they still read the
-        # buffer from LX when it resides, so they count toward its spill cost.
-        # It is 0 on the joint path, leaving this weight equal to the candidate
-        # consumer count there.
-        def _spill_weight(sb: "_CoreDivisionBufferWithCpVars") -> int:
-            return len(children_of.get(sb.name, [])) + sb.buffer.unallocated_reads
-
-        hbm_terms = [
-            weight * (1 - sb.in_buffer)
-            for sb in tensors.values()
-            if (weight := _spill_weight(sb) * sb.buffer.size)
-        ]
+        hbm_terms = [spill_cost(sb) * (1 - sb.in_buffer) for sb in tensors.values()]
         if hbm_terms:
             model.minimize(sum(hbm_terms))
             if solver.Solve(model) not in (cp_model.OPTIMAL, cp_model.FEASIBLE):

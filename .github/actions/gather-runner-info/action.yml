@@ -35,6 +35,44 @@ runs:
         whoami
         id
         echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
+        echo "GHA_RUNNER_POD_NAME $GHA_RUNNER_POD_NAME"
+        echo "GHA_RUNNER_POD_NAMESPACE $GHA_RUNNER_POD_NAMESPACE"
+        echo "GHA_RUNNER_POD_CPU_REQUEST $GHA_RUNNER_POD_CPU_REQUEST"
+        echo "GHA_RUNNER_POD_CPU_LIMIT $GHA_RUNNER_POD_CPU_LIMIT"
+        # Memory limits/requests are reported by the downward API in bytes.
+        # Show a human-readable value (KiB/MiB/GiB) alongside the raw bytes so
+        # it's easy to eyeball. Pure bash arithmetic, no external tools (the
+        # runner image may be a minimal UBI without coreutils' numfmt).
+        # Written to be safe under `set -euo pipefail`: only `if (( ))` and
+        # `scaled=$(( ))` assignment forms are used -- never a bare `(( ))`
+        # command, which returns exit status 1 when it evaluates to 0 and
+        # would abort the script under `set -e`.
+        human_bytes() {
+          local raw="$1" unit="B" scaled
+          # Empty/unset -> placeholder. Non-numeric (e.g. a k8s quantity like
+          # "24Gi", a negative, or a decimal) is already readable: echo as-is.
+          if [[ -z "$raw" ]]; then
+            echo "<unset>"
+            return 0
+          fi
+          if [[ ! "$raw" =~ ^[0-9]+$ ]]; then
+            echo "$raw"
+            return 0
+          fi
+          scaled="$raw"
+          for u in KiB MiB GiB TiB; do
+            if (( scaled < 1024 )); then
+              break
+            fi
+            # Round to nearest, one implicit decimal: *10, /1024, round, /10.
+            scaled=$(( (scaled * 10 / 1024 + 5) / 10 ))
+            unit="$u"
+          done
+          echo "$raw (${scaled}${unit})"
+          return 0
+        }
+        echo "GHA_RUNNER_POD_MEMORY_REQUEST $(human_bytes "${GHA_RUNNER_POD_MEMORY_REQUEST:-}")"
+        echo "GHA_RUNNER_POD_MEMORY_LIMIT $(human_bytes "${GHA_RUNNER_POD_MEMORY_LIMIT:-}")"
         echo "PATH $PATH"
         echo "HOME $HOME"
         echo "TORCH_ROOT ${TORCH_ROOT:-<unset>}"
