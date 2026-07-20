@@ -221,17 +221,46 @@ def _should_use_k_fast_mapping(
     return dim_splits[dim_list[-1]] > 1
 
 
+# Pointwise ops whose *output* stick-dim padding lanes must be seeded to a
+# deterministic value (rather than left as allocator garbage) because a
+# downstream op — notably the flash-attention numerator matmul (exp_scores @
+# value) — reads those lanes as a contraction operand. The value is chosen so
+# the padding is contraction-neutral: SAMV substitutes it at the masked input
+# coordinate before the op runs (same semantics as the reduction path, where
+# "max" uses -inf), so exp(-inf) = 0 → the padded lanes contribute nothing.
+#
+# Without this, an unpadded kv sequence (seqlen_kv % stick_size != 0) leaves the
+# final kv-stick's padding lanes uninitialized; exp() of that garbage overflows
+# fp16 and poisons the numerator (see docs/flash_attn_causal_kv_padding_inf_*).
+_POINTWISE_PADDING_MASK_VALUE: dict[str, float] = {
+    "exp": float("-inf"),  # exp(-inf) == 0
+}
+
+
 def _get_mask_value(op: str) -> float:
-    return float("-inf") if op == "max" else float("inf") if op == "min" else 0
+    if op == "max":
+        return float("-inf")
+    if op == "min":
+        return float("inf")
+    if op in _POINTWISE_PADDING_MASK_VALUE:
+        return _POINTWISE_PADDING_MASK_VALUE[op]
+    return 0
 
 
 def _get_coordinate_mask(
-    iteration_space: dict, arg: SDSCArgs, dim_padding: dict
+    iteration_space: dict, arg: SDSCArgs, dim_padding: dict, op: str = ""
 ) -> dict:
+    # Reduction path: mask the stick dim being reduced (scale == -2), so the
+    # padding lanes take the reduction identity.
+    # Pointwise path: for allowlisted ops (e.g. exp feeding a matmul), also mask
+    # the padded output stick dim so its lanes are contraction-neutral.
+    mask_pointwise = op in _POINTWISE_PADDING_MASK_VALUE
     return {
         dim: [[iteration_space[dim] - padding, padding]]
         for dim, padding in dim_padding.items()
-        if padding > 0 and dim in arg.scales and arg.scales[dim] == -2
+        if padding > 0
+        and dim in arg.scales
+        and (arg.scales[dim] == -2 or mask_pointwise)
     }
 
 
@@ -852,7 +881,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         num_cores = math.prod(dim_splits.values())
 
     constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
-    coordinate_masking = _get_coordinate_mask(sdsc_iteration_space, args[-1], padding)
+    coordinate_masking = _get_coordinate_mask(
+        sdsc_iteration_space, args[-1], padding, op_spec.op
+    )
     if coordinate_masking:
         constants["samv-maskvalue"] = _get_mask_value(op_spec.op)
 

@@ -22,7 +22,12 @@ import torch_spyre._inductor.propagate_named_dims as _pnd
 from torch._inductor.utils import run_and_get_code
 from torch_spyre._inductor import spyre_hint  # noqa: F401
 
-from utils_inductor import compare_with_cpu, compare_with_pytorch
+from utils_inductor import (
+    DEVICE,
+    _compile_and_run,
+    compare_with_cpu,
+    compare_with_pytorch,
+)
 
 
 class TestBuildingBlocks(unittest.TestCase):
@@ -214,6 +219,38 @@ class TestBuildingBlocks(unittest.TestCase):
             atol=0.1,
             rtol=0.1,
         )
+
+    def test_causal_sdpa_unpadded_kv_no_inf(self):
+        """Regression: causal SDPA must not produce inf when seqlen_kv % 64 != 0.
+
+        The flash-attention decomposition tiles the kv dimension into 64-wide
+        sticks. When seqlen_kv is not a multiple of 64 the final stick's padding
+        lanes are uninitialized; the elementwise exp() over those garbage lanes
+        overflows fp16 and poisons the numerator matmul, corrupting the output to
+        inf. The fix seeds those lanes to exp(-inf)=0 via SAMV coordinate masking
+        (see torch_spyre/_inductor/codegen/superdsc.py and
+        docs/flash_attn_causal_kv_padding_inf_rootcause.md).
+
+        The bug's signature is a non-finite output, so this test asserts
+        finiteness directly. S=13 and S=63 read back all-inf before the fix; S=64
+        (one full stick) was correct even before it.
+        """
+        B, H, D = 1, 8, 128
+
+        def sdpa(q, k, v):
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=1.0)
+
+        for S in (13, 63, 64):
+            q = torch.randn(B, H, S, D, dtype=torch.float16)
+            k = torch.randn(B, H, S, D, dtype=torch.float16)
+            v = torch.randn(B, H, S, D, dtype=torch.float16)
+            out = _compile_and_run(sdpa, (q, k, v), DEVICE)
+            self.assertTrue(
+                torch.isfinite(out).all(),
+                msg=f"causal SDPA produced non-finite output at seqlen_kv={S} "
+                f"(inf={int(torch.isinf(out).sum())}, "
+                f"nan={int(torch.isnan(out).sum())})",
+            )
 
     def test_refactored_plain_bundle_codegen(self):
         """Pointwise ops fuse into one bundle via the refactored codegen path."""
