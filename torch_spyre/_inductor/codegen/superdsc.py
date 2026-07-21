@@ -221,10 +221,11 @@ def _should_use_k_fast_mapping(
     return dim_splits[dim_list[-1]] > 1
 
 
-# Pointwise ops whose *output* stick-dim padding lanes are seeded to a
-# deterministic value rather than left as allocator garbage. The mask covers
-# only the out-of-logical-range padding lanes of the final stick (see
-# _get_coordinate_mask), so seeding them is safe for ANY consumer:
+# Pointwise ops whose *output* padding lanes are seeded to a deterministic value
+# rather than left as allocator garbage. The mask covers the out-of-logical-range
+# padding lanes of every padded output dim of the op (see _get_coordinate_mask:
+# for an allowlisted op it masks each dim with padding > 0, not only the stick
+# dim), so seeding them is safe for ANY consumer:
 #   - a downstream contraction (matmul) reads them as an operand → the value is
 #     chosen contraction-neutral so they add nothing;
 #   - a downstream reduction masks its own padding anyway;
@@ -238,18 +239,27 @@ def _should_use_k_fast_mapping(
 # path, where "max" uses -inf), so exp(-inf) = 0 → the padded lanes contribute
 # nothing.
 #
+# BANDAGE — scope is deliberately narrow, do not read this as general support:
+#   - Only "exp" is covered: it is the one pointwise op on the SDPA kv axis that
+#     turns garbage into a non-finite value. Other overflow-prone ops
+#     (reciprocal, rsqrt, ...) are NOT handled and CANNOT be by this mechanism —
+#     SAMV masks the op's INPUT, and for those ops no finite input maps to a
+#     neutral output (there is no x with 1/x == 0). See #3290.
+#   - Multi-dim masking is UNTESTED. SDPA only pads the stick dim, so in practice
+#     _get_coordinate_mask emits a single-dim mask here. The comprehension will
+#     emit a mask per padded dim if an op ever has more than one, but that path
+#     has no test coverage — treat multi-padded-dim pointwise ops as unverified.
+#   - Masking is unconditional by op-name, not gated on whether the output
+#     actually feeds a contraction (that consumer analysis is not available at
+#     this point in codegen). Safe (padding lanes are never valid data), but
+#     broader than necessary. TODO(consumer-gating).
+#
 # STOPGAP: this op allowlist bakes a consumer-specific neutral value at
 # production time because SpyreTensorLayout carries no record of the padded-stick
 # state. The principled replacement is a padded-stick-state enum on the layout
 # (set at DMA-in and at buffer allocation), which would let the compiler pick the
-# right neutral value per consumer and elide pad/zero copies — see the tracked
-# follow-up issue. Retire this dict once that lands.
-#
-# NOTE: this masks EVERY op named here unconditionally (by op-name), not only
-# those that actually feed a contraction. That is safe (padding lanes are never
-# valid data), but slightly broader than necessary. A more precise version would
-# gate on whether the op's output feeds a contraction; that consumer analysis is
-# not currently available at this point in codegen. TODO(consumer-gating).
+# right neutral value per consumer and elide pad/zero copies — tracked in #3290.
+# Retire this dict once that lands.
 _POINTWISE_PADDING_MASK_VALUE: dict[str, float] = {
     "exp": float("-inf"),  # exp(-inf) == 0
 }
@@ -271,7 +281,9 @@ def _get_coordinate_mask(
     # Reduction path: mask the stick dim being reduced (scale == -2), so the
     # padding lanes take the reduction identity.
     # Pointwise path: for allowlisted ops (e.g. exp feeding a matmul), also mask
-    # the padded output stick dim so its lanes are contraction-neutral.
+    # EVERY padded output dim so its lanes are contraction-neutral. In practice
+    # SDPA pads only the stick dim, so this emits a single-dim mask; the multi-dim
+    # case is unexercised (see the BANDAGE note on _POINTWISE_PADDING_MASK_VALUE).
     mask_pointwise = op in _POINTWISE_PADDING_MASK_VALUE
     return {
         dim: [[iteration_space[dim] - padding, padding]]
