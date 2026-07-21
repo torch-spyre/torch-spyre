@@ -997,6 +997,30 @@ def _multi_arg_pointwise_layouts(
             f"with size={output.size} and coordinates={out_coords}"
         )
 
+    # A multi-arg pointwise op with a broadcast operand (an input whose host
+    # shape differs from the output, e.g. `output / denominator.unsqueeze(-1)`)
+    # can spawn a degenerate sparse/bloated output candidate whose device
+    # footprint exceeds the host element count (from the sparse-stick sentinel
+    # path). When the op reads a coarse-tile full accumulator whose own layout
+    # is that same degenerate shape, the beam commits the bloated candidate;
+    # the operands then restickify into a dimension-collapsed layout and the
+    # cross-tile read is misaligned (silent wrong result -- flash-attention's
+    # out-of-tiling-scope `output / denominator` divide). If an exact-footprint
+    # (dense) candidate exists, drop the bloated ones so the dense layout is
+    # committed. Reduction-accumulate combines are same-shape (no broadcast
+    # operand) and keep their legitimately-bloated accumulator candidate.
+    if any(list(arg.layout.size) != list(output.size) for arg in args):
+        host_elems = (
+            math.prod([int(s) for s in output.size]) if output.size else 1
+        )
+        dense = [
+            r
+            for r in results
+            if math.prod([d for d in r.device_size if d > 0]) == host_elems
+        ]
+        if dense and len(dense) < len(results):
+            results = dense
+
     if len(results) > 1:
         logger.info(
             f"Multi-arg pointwise ({op.get_name()}): producing {len(results)} candidate output layouts."
