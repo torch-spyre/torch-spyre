@@ -27,6 +27,12 @@ hbm_pool_planning: bool = _get_env_bool("HBM_POOL_PLANNING", True)
 
 global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == "1"
 
+# Emit a native conv2d SDSC (opFuncName="conv2d" on the "pt" unit) instead of
+# the im2col+matmul decomposition (conv2d_via_bmm_decomp). Off by default: the
+# decomposition remains the default path and the fallback for cases the direct
+# lowering does not yet support (grouped/transposed/non-fp16).
+conv2d_direct_lowering: bool = os.environ.get("SPYRE_CONV2D_DIRECT", "0") == "1"
+
 allow_all_ops_in_lx_planning: bool = False
 
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
