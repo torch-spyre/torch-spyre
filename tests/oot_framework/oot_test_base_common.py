@@ -160,6 +160,29 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
         # calls generate the correct class name.
         OOTTestBase.device_type = "privateuse1"
 
+    @classmethod
+    def get_all_devices(cls):
+        # PrivateUse1TestBase.get_all_devices() builds non-primary device
+        # strings from cls.device_type, which setUpClass() above resets to
+        # "privateuse1" (for class-naming purposes) right after super()
+        # computes it as the real backend name (e.g. "spyre"). On a
+        # single-device host the resulting non-primary list is always empty
+        # so this never surfaces, but on a multi-device host (e.g. s390x with
+        # several Spyre devices) it produces invalid device strings like
+        # "privateuse1:1" that torch.device() rejects, since only the
+        # (correctly-cached) primary_device escapes the reset. Use the real
+        # registered backend name here instead of cls.device_type.
+        primary_device_idx = int(cls.get_primary_device().split(":")[1])
+        num_devices = cls.device_mod.device_count()
+        prim_device = cls.get_primary_device()
+        device_str = f"{_OOT_DEVICE_TYPE}:{{0}}"
+        non_primary_devices = [
+            device_str.format(idx)
+            for idx in range(num_devices)
+            if idx != primary_device_idx
+        ]
+        return [prim_device] + non_primary_devices
+
     # ------------------------------------------------------------------
     # Config loading  (called once per test run via instantiate_test)
     # ------------------------------------------------------------------

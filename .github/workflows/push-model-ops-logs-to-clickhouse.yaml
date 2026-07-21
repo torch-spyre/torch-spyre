@@ -104,7 +104,7 @@ jobs:
           jobs = [json.loads(l) for l in open("/tmp/jobs.jsonl") if l.strip()]
 
           for idx, j in enumerate(jobs):
-              safe   = re.sub(r"[^\w\s\-]", "", j["name"]).strip()
+              safe   = re.sub(r"[^\w\s\-\.]", "", j["name"]).strip()
               out    = f"raw_logs/{idx}_{safe}.txt"
               result = subprocess.run(
                   ["gh", "api", f"/repos/{repo}/actions/jobs/{j['id']}/logs"],
