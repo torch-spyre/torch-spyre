@@ -238,6 +238,13 @@ def _should_use_k_fast_mapping(
 # path, where "max" uses -inf), so exp(-inf) = 0 → the padded lanes contribute
 # nothing.
 #
+# STOPGAP: this op allowlist bakes a consumer-specific neutral value at
+# production time because SpyreTensorLayout carries no record of the padded-stick
+# state. The principled replacement is a padded-stick-state enum on the layout
+# (set at DMA-in and at buffer allocation), which would let the compiler pick the
+# right neutral value per consumer and elide pad/zero copies — see the tracked
+# follow-up issue. Retire this dict once that lands.
+#
 # NOTE: this masks EVERY op named here unconditionally (by op-name), not only
 # those that actually feed a contraction. That is safe (padding lanes are never
 # valid data), but slightly broader than necessary. A more precise version would
