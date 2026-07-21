@@ -829,8 +829,7 @@ def _multi_arg_pointwise_layouts(
         for arg in args
         for stl in arg.layouts
         if arg.dep.name not in ind_names
-        and (coords := try_device_coordinates(stl, arg.dep, ind_sizes))
-        is not None
+        and (coords := try_device_coordinates(stl, arg.dep, ind_sizes)) is not None
     }
 
     # If the indexing and device element size are identical
@@ -871,9 +870,7 @@ def _multi_arg_pointwise_layouts(
             # whole compile should abort -- so use try_device_coordinates and
             # treat None like a non-offset-free stick.
             coord = try_device_coordinates(in_stl, arg.dep, ind_sizes)
-            if coord is None or not is_stick_expr_offset_free(
-                coord[-1], stick_size
-            ):
+            if coord is None or not is_stick_expr_offset_free(coord[-1], stick_size):
                 return False
         return True
 
@@ -899,28 +896,12 @@ def _multi_arg_pointwise_layouts(
     elif not stick_exprs:
         _try_stick_dim(-1)
     else:
-        # A stick_expr of 0 (no free symbols) comes from a broadcast operand
-        # whose device stick maps to a size-1 host axis — it has no real dim
-        # to preserve. matching_dim (via _pick_stick_dim) already returns -1
-        # for such exprs, but that -1 is also the deliberate sentinel used by
-        # the `not stick_exprs` branch above to request a genuine sparse-stick
-        # layout (dim_order's trailing -1 protocol, see spyre_tensor_impl.cpp
-        # get_generic_stick_layout). Passing the broadcast operand's trivial 0
-        # through to _try_stick_dim would conflate the two, producing a bogus
-        # sparse-stick candidate for what is really a dense op. Drop
-        # zero-free-symbol exprs here so only genuine candidate stick dims
-        # reach _try_stick_dim.
         offset_free_stick_exprs = {
-            e
-            for e in stick_exprs
-            if e.free_symbols and is_stick_expr_offset_free(e, stick_size)
+            e for e in stick_exprs if is_stick_expr_offset_free(e, stick_size)
         }
-        if not offset_free_stick_exprs:
-            _try_stick_dim(-1)
-        else:
-            # Sort stick exprs for determinism
-            for stick_expr in sorted(offset_free_stick_exprs, key=iter_var_id):
-                _try_stick_dim(_pick_stick_dim(stick_expr, out_coords))
+        # Sort stick exprs for determinism
+        for stick_expr in sorted(offset_free_stick_exprs, key=iter_var_id):
+            _try_stick_dim(_pick_stick_dim(stick_expr, out_coords))
 
     # Always scan all dims so that dims absent from any input stick expression
     # (e.g. the outer broadcast dim) are also offered as candidates. Deduplicate
@@ -1010,9 +991,7 @@ def _multi_arg_pointwise_layouts(
     # committed. Reduction-accumulate combines are same-shape (no broadcast
     # operand) and keep their legitimately-bloated accumulator candidate.
     if any(list(arg.layout.size) != list(output.size) for arg in args):
-        host_elems = (
-            math.prod([int(s) for s in output.size]) if output.size else 1
-        )
+        host_elems = math.prod([int(s) for s in output.size]) if output.size else 1
         dense = [
             r
             for r in results
