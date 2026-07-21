@@ -705,13 +705,52 @@ def analyze(path):
     # can gate them via the YAML config, AND need cleanup so the raw star-imported
     # instance is not collected by pytest as a plain TestCase.
     class_level_parametrized_mixed = set()
+    # Transitive closure: a class counts as a TestCase subclass if any of its
+    # bases (directly or transitively, through locally-defined intermediate
+    # classes) is TestCase-like. This catches chains like
+    # `class FooBase(TestCase)` -> `class Foo(FooBase)` regardless of naming,
+    # e.g. TestPatternMatcher(TestPatternMatcherBase) in
+    # test_mkldnn_pattern_matcher.py, whose base name does not literally end
+    # in "TestBase" and was previously invisible to this scan entirely
+    # (see issue #3188).
+    _local_bases = {}
+    for _n in ast.iter_child_nodes(tree):
+        if isinstance(_n, ast.ClassDef):
+            _names = []
+            for _b in _n.bases:
+                if isinstance(_b, ast.Name):        _names.append(_b.id)
+                elif isinstance(_b, ast.Attribute): _names.append(_b.attr)
+            _local_bases[_n.name] = _names
+
+    def _is_testcase_like(name, _seen=None):
+        if "TestCase" in name or name.endswith("TestBase"):
+            return True
+        _seen = _seen or set()
+        if name in _seen:
+            return False
+        _seen.add(name)
+        return any(_is_testcase_like(_b, _seen) for _b in _local_bases.get(name, []))
+
+    # Classes whose TestCase-ness is established ONLY via the transitive
+    # closure above (their immediate base name does not itself contain
+    # "TestCase" / end in "TestBase") — e.g. TestPatternMatcher, whose direct
+    # base "TestPatternMatcherBase" does not match the direct check. These are
+    # newly-visible classes (see issue #3188) and are treated more carefully
+    # below when classifying standalone instantiate_parametrized_tests() calls,
+    # since long-established directly-visible classes (e.g. TestConvolutionNN
+    # in test_convolution.py, based directly on NNTestCase) must keep their
+    # existing classification to avoid changing behavior for unrelated suites.
+    transitive_only_classes = set()
+
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.ClassDef):
             for base in node.bases:
                 base_name = ""
                 if isinstance(base, ast.Name):        base_name = base.id
                 elif isinstance(base, ast.Attribute): base_name = base.attr
-                if "TestCase" in base_name or base_name.endswith("TestBase"):
+                if _is_testcase_like(base_name):
+                    if not ("TestCase" in base_name or base_name.endswith("TestBase")):
+                        transitive_only_classes.add(node.name)
                     has_device, all_parametrized, _ = class_methods_info(node, parametrize_names)
                     all_classes[node.name] = has_device
                     # Check for @instantiate_parametrized_tests as a class decorator.
@@ -787,7 +826,47 @@ def analyze(path):
             elif fname == "instantiate_parametrized_tests" and node.args:
                 arg = node.args[0]
                 if isinstance(arg, ast.Name):
-                    parametrized_instantiated.add(arg.id)
+                    cls_name = arg.id
+                    # Standalone-call form only expands @parametrize methods; it
+                    # says nothing about per-device dispatch. Treating it alone as
+                    # "fully handled" leaves upstream classes that are NEVER also
+                    # passed to instantiate_device_type_tests() completely
+                    # unwrapped, so TorchTestBase never sees them and YAML
+                    # mode:skip/xfail entries are silently ignored (see issue
+                    # #3188: TestPatternMatcher in test_mkldnn_pattern_matcher.py
+                    # hardcodes device="cpu" and is only ever passed to
+                    # instantiate_parametrized_tests()).
+                    #
+                    # Scope this correction to transitive_only_classes: classes
+                    # that are only newly visible to this analyzer via the
+                    # transitive-closure TestCase check above. Long-established
+                    # directly-visible classes using this same standalone-call
+                    # pattern (e.g. TestConvolutionNN in test_convolution.py,
+                    # TestLRScheduler in test_lrscheduler.py) keep their prior
+                    # "fully handled" classification unchanged, since other YAML
+                    # suites already depend on that behavior and default to
+                    # unlisted_test_mode: skip — reclassifying them here would
+                    # silently drop coverage for tests not explicitly listed in
+                    # those unrelated configs.
+                    if cls_name in transitive_only_classes:
+                        import os as _os
+                        torch_root = _os.environ.get("TORCH_ROOT", "")
+                        torch_device_root = _os.environ.get("TORCH_DEVICE_ROOT", "")
+                        is_upstream = (
+                            torch_root
+                            and _os.path.abspath(path).startswith(
+                                _os.path.abspath(torch_root)
+                            )
+                        )
+                        is_oot = (
+                            torch_device_root
+                            and _os.path.abspath(path).startswith(
+                                _os.path.abspath(torch_device_root)
+                            )
+                        )
+                        if is_upstream and not is_oot:
+                            continue  # leave out of parametrized_instantiated -> uncontrolled
+                    parametrized_instantiated.add(cls_name)
     # A class that appears in BOTH open and restricted sets (e.g. the file
     # calls instantiate_device_type_tests twice for the same class, once with
     # only_for and once without) is treated as open: the open call already
