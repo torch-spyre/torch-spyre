@@ -14,14 +14,7 @@
  * limitations under the License.
  */
 
-#include <logging.h>
+#include "logging.h"
 
-namespace spyre {
-
-const char* const kDebugVarName = SPYRE_DEBUG_ENV;
-
-bool g_debug_info_enabled = std::getenv(kDebugVarName) != nullptr
-                                ? std::atoi(std::getenv(kDebugVarName)) != 0
-                                : false;
-
-}  // namespace spyre
+// Intentionally empty — legacy globals (g_debug_info_enabled, kDebugVarName)
+// removed. The logging system now lives in logging_config.{h,cpp}.

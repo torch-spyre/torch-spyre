@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 The Torch-Spyre Authors.
+ * Copyright 2026 The Torch-Spyre Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,10 +16,14 @@
 
 #pragma once
 
-#include "logging_config.h"
-#include "logging_legacy.h"
+#include <pybind11/pybind11.h>
 
-// Re-export new logging interface
-using torch_spyre::logging::Logger;
-using torch_spyre::logging::LoggingConfig;
-using torch_spyre::logging::LogLevel;
+#include <string>
+
+namespace torch_spyre {
+namespace logging {
+
+void init_logging_bindings(pybind11::module_& m);
+
+}  // namespace logging
+}  // namespace torch_spyre
