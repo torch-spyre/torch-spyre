@@ -1181,6 +1181,102 @@ class TestCpSatAllocatorFallback(
         )
 
 
+@unittest.skipUnless(
+    _HAS_ORTOOLS, "forcing a CP-SAT timeout requires the real ortools solver"
+)
+class TestCpSatTimeoutFallback(BaseTestScratchpadUsage):
+    """CP-SAT gracefully degrades to greedy placement when the solve times out."""
+
+    @contextmanager
+    def _zero_solver_timeout(self):
+        """Force every CP-SAT solve to run with a 0-second budget so it returns
+        ``UNKNOWN`` and ``CpSatLayoutSolver`` raises ``SolveError`` -- the timeout
+        condition that must drive ``scratchpad_planning``'s greedy fallback.
+        """
+        from torch_spyre._inductor.scratchpad import ilp_solver_ortools
+
+        cp_model = ilp_solver_ortools.cp_model
+        original_solve = cp_model.CpSolver.Solve
+
+        def zero_timeout_solve(solver_self, *args, **kwargs):
+            solver_self.parameters.max_time_in_seconds = 0.0
+            return original_solve(solver_self, *args, **kwargs)
+
+        with patch.object(cp_model.CpSolver, "Solve", zero_timeout_solve):
+            yield
+
+    @contextmanager
+    def _count_greedy_plan_layouts(self):
+        """Count ``GreedyLayoutSolver.plan_layout`` invocations while still running
+        the real method.
+        """
+        from torch_spyre._inductor.scratchpad.plan_solver import GreedyLayoutSolver
+
+        original_plan_layout = GreedyLayoutSolver.plan_layout
+        calls = {"count": 0}
+
+        def counting_plan_layout(solver_self, *args, **kwargs):
+            calls["count"] += 1
+            return original_plan_layout(solver_self, *args, **kwargs)
+
+        with patch.object(GreedyLayoutSolver, "plan_layout", counting_plan_layout):
+            yield calls
+
+    def _assert_timeout_falls_back_to_greedy(
+        self,
+        model: Callable[[Unpack[Ts]], torch.Tensor],
+        args: tuple[Unpack[Ts]],
+        **kwargs,
+    ) -> None:
+        """Compile ``model`` on the CP-SAT solver with the solve forced to time
+        out, and assert the greedy fallback fires and still yields a correct,
+        HBM-reducing LX plan."""
+        with ts_inductor_config.patch(
+            layout_solver="cpsat",
+            sencores=32,
+            co_optimizing_lx_planning=False,
+        ):
+            torch.compiler.reset()
+            with ts_inductor_config.patch(lx_planning=False):
+                result_without_lx, hbm_without_lx = self.measure_hbm_transfers(
+                    model, args
+                )
+            torch.compiler.reset()
+            with (
+                self._zero_solver_timeout(),
+                self._count_greedy_plan_layouts() as greedy_calls,
+                ts_inductor_config.patch(lx_planning=True),
+            ):
+                result_with_lx, hbm_with_lx = self.measure_hbm_transfers(model, args)
+
+        self.assertGreater(
+            greedy_calls["count"],
+            0,
+            "Expected the CP-SAT timeout to trigger the greedy fallback, but "
+            "GreedyLayoutSolver.plan_layout was never called",
+        )
+        self.assertLess(
+            hbm_with_lx,
+            hbm_without_lx,
+            f"Expected the greedy fallback to still reduce HBM transfers, but it "
+            f"did not ({hbm_with_lx} vs {hbm_without_lx} bytes)",
+        )
+        # LX placement only moves buffers, so on/off should match within fp16
+        # rounding (the difference is a couple of ULP).
+        atol = kwargs.get("atol", 1e-4)
+        rtol = kwargs.get("rtol", 1e-5)
+        self.assertTrue(
+            torch.allclose(result_without_lx, result_with_lx, atol=atol, rtol=rtol),
+            "Results do not match between LX planning on and off",
+        )
+
+    def test_softmax_timeout_falls_back_to_greedy(self):
+        """A reduction chain (softmax(dim=0)) falls back cleanly on timeout."""
+        f = functools.partial(torch.softmax, dim=0)
+        x = self.rand_device((512, 1024))
+        self._assert_timeout_falls_back_to_greedy(f, (x,))
+
+
 class TestSelectAllocator(unittest.TestCase):
     """select_allocator maps config -> (allocator, solver) so the allocators
     never inspect config themselves. Pure dispatch, no device needed."""

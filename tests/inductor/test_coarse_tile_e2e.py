@@ -663,7 +663,13 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         def flash(queries, keys, values):
             output = torch.zeros_like(queries)
             M = torch.full(
-                (B, H, Lq), float("-inf"), device=queries.device, dtype=torch.float16
+                (B, H, Lq),
+                float("-inf"),
+                device=queries.device,
+                dtype=torch.float16,
+            )
+            denominator = torch.zeros(
+                (B, H, Lq), device=queries.device, dtype=torch.float16
             )
             with spyre_hint(
                 num_tiles_per_dim={"B": 1}
@@ -672,9 +678,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                     # TODO: re-enable once numerical error with Lk tiling is fixed
                     # with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
                     keys_T = keys.transpose(-1, -2).contiguous()
-                    denominator = torch.zeros(
-                        (B, H, Lq), device=queries.device, dtype=torch.float16
-                    )
                     scores = torch.matmul(queries * scale, keys_T * scale)
                     scores = scores.transpose(-1, -2).contiguous()
                     block_max = torch.amax(scores, dim=-2)
@@ -704,6 +707,105 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(values_dev, ["B", "H", "Lk", "D"])
 
         result = torch.compile(flash)(queries_dev, keys_dev, values_dev).cpu()
+        torch.testing.assert_close(
+            result,
+            ref,
+            equal_nan=True,
+            atol=0.01,
+            rtol=0.1,
+            msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
+        )
+
+    def test_hint_flash_attention_v2(self):
+        """Flash attention tiled over H (4 slices) via nested spyre_hints.
+
+        Variant of test_hint_flash_attention with a causal mask and an
+        explicit running-max (real_max) formulation that updates output and
+        denominator in place via copy_.
+        """
+        import math
+        from torch_spyre._inductor import spyre_hint
+
+        B, H, Lq, Lk, D = 1, 8, 256, 256, 64
+        block_size = 128
+
+        queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
+        keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        values_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        causal = torch.tril(torch.ones(Lq, Lk, dtype=torch.bool))
+        mask_t = torch.zeros(1, 1, Lq, Lk, dtype=torch.float16)
+        mask_t.masked_fill_(~causal, float("-inf"))
+        lq_slices = Lq // block_size
+
+        def flash(queries, keys, values, mask):
+            scale = 1.0 / math.sqrt(math.sqrt(D))
+            output = torch.zeros_like(queries)
+            real_max = torch.full(
+                (B, H, Lq, 64),
+                float("-inf"),
+                device=queries.device,
+                dtype=torch.float16,
+            )
+            real_max = real_max.amax(dim=-1)  # B, H, Lq sparse
+
+            denominator = torch.zeros(
+                (B, H, Lq, 64),
+                device=queries.device,
+                dtype=torch.float16,
+            )
+            denominator = denominator.amax(dim=-1)  # B, H, Lq sparse
+            with spyre_hint(
+                num_tiles_per_dim={"B": 1}
+            ):  # 3 nested scopes exercises multi-hint logic
+                with spyre_hint(num_tiles_per_dim={"H": 4}):
+                    with spyre_hint(num_tiles_per_dim={"Lq": lq_slices}):
+                        scaled_keys = keys * scale  # B, H, Lk, D
+                        keys_T = scaled_keys.transpose(-1, -2)  # B, H, D, Lk
+                        scores = torch.matmul(queries * scale, keys_T)  # B, H, Lq, Lk
+                        scores = scores + mask  # B, H, Lq, Lk
+
+                        block_max = torch.amax(scores, dim=-1)  # B, H, Lq sparse
+                        running_max = torch.maximum(
+                            real_max, block_max
+                        )  # B, H, Lq sparse
+
+                        exp_scores = torch.exp(
+                            scores - running_max.unsqueeze(-1)
+                        )  # B, H, Lq, Lk
+                        correction = torch.exp(
+                            real_max - running_max
+                        )  # B, H, Lq sparse
+
+                        denominator.copy_(
+                            denominator * correction + exp_scores.sum(dim=-1)
+                        )  # B, H, Lq sparse
+                        output.copy_(
+                            output * correction.unsqueeze(-1)
+                            + torch.matmul(exp_scores, values)
+                        )  # B, H, Lq, D
+
+                        real_max.copy_(running_max)  # B, H, Lq sparse
+
+            return output / denominator.unsqueeze(-1)
+
+        # CPU reference first, then device setup — matching the driver pattern exactly
+        ref = flash(queries_t, keys_t, values_t, mask_t)
+
+        queries_dev = queries_t.to("spyre")
+        keys_dev = keys_t.to("spyre")
+        values_dev = values_t.to("spyre")
+        mask_dev = mask_t.to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("Lk", Lk)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(queries_dev, ["B", "H", "Lq", "D"])
+        _name_tensor_dims(keys_dev, ["B", "H", "Lk", "D"])
+        _name_tensor_dims(values_dev, ["B", "H", "Lk", "D"])
+        _name_tensor_dims(mask_dev, ["B", "H", "Lq", "Lk"])
+
+        result = torch.compile(flash)(queries_dev, keys_dev, values_dev, mask_dev).cpu()
         torch.testing.assert_close(
             result,
             ref,
@@ -814,15 +916,15 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 device=queries.device,
                 dtype=torch.float16,
             )
+            denominator = torch.zeros(
+                (B, H, Lq),
+                device=queries.device,
+                dtype=torch.float16,
+            )
             with spyre_hint(num_tiles_per_dim={"B": 1}):
                 with spyre_hint(num_tiles_per_dim={"H": 4}):
                     with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
                         keys_T = keys.transpose(-1, -2).contiguous()
-                        denominator = torch.zeros(
-                            (B, H, Lq),
-                            device=queries.device,
-                            dtype=torch.float16,
-                        )
                         scores = torch.matmul(queries * scale, keys_T * scale)
                         scores = scores.transpose(-1, -2).contiguous()
                         block_max = torch.amax(scores, dim=-2)
@@ -958,20 +1060,23 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(values_dev, ["B", "H", "Lk", "D"])
 
         def flash(queries, keys, values):
-            output = torch.zeros_like(queries)
-            M = torch.full(
-                (B, H, Lq),
-                float("-inf"),
-                device=queries.device,
-                dtype=torch.float16,
-            )
+            with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
+                output = torch.zeros_like(queries)
+            with spyre_hint(named_dims=["B", "H", "Lq"]):
+                M = torch.full(
+                    (B, H, Lq),
+                    float("-inf"),
+                    device=queries.device,
+                    dtype=torch.float16,
+                )
+            with spyre_hint(named_dims=["B", "H", "Lq"]):
+                denominator = torch.zeros(
+                    (B, H, Lq), device=queries.device, dtype=torch.float16
+                )
             with spyre_hint(num_tiles_per_dim={"B": 1}):
                 with spyre_hint(num_tiles_per_dim={"H": 4}):
                     with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
                         keys_T = keys.transpose(-1, -2).contiguous()
-                        denominator = torch.zeros(
-                            (B, H, Lq), device=queries.device, dtype=torch.float16
-                        )
                         scores = torch.matmul(queries * scale, keys_T * scale)
                         scores = scores.transpose(-1, -2).contiguous()
                         block_max = torch.amax(scores, dim=-2)
@@ -1021,6 +1126,111 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             src[max_op_idx : max_op_idx + 500],
             "amax op has empty inner tiled_symbols — Lk reduction range not divided"
             " by _stamp_group (group-wide is_reduction_level flag bug)",
+        )
+
+    def test_hint_flash_attention_two_loop_levels_v2(self):
+        """Flash-attention graph: both H and Lq loop levels survive into codegen.
+
+        Variant of test_hint_flash_attention_two_loop_levels with a causal
+        mask and an explicit running-max (real_max) formulation that updates
+        output and denominator in place via copy_.
+        """
+        import math
+        from torch_spyre._inductor import spyre_hint
+
+        B, H, Lq, Lk, D = 1, 8, 256, 256, 64
+        block_size = 128
+        lq_slices = Lq // block_size  # 2
+
+        queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
+        keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        values_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        causal = torch.tril(torch.ones(Lq, Lk, dtype=torch.bool))
+        mask_t = torch.zeros(1, 1, Lq, Lk, dtype=torch.float16)
+        mask_t.masked_fill_(~causal, float("-inf"))
+        queries_dev = queries_t.to("spyre")
+        keys_dev = keys_t.to("spyre")
+        values_dev = values_t.to("spyre")
+        mask_dev = mask_t.to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("Lk", Lk)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(queries_dev, ["B", "H", "Lq", "D"])
+        _name_tensor_dims(keys_dev, ["B", "H", "Lk", "D"])
+        _name_tensor_dims(values_dev, ["B", "H", "Lk", "D"])
+        _name_tensor_dims(mask_dev, ["B", "H", "Lq", "Lk"])
+
+        def flash(queries, keys, values, mask):
+            scale = 1.0 / math.sqrt(math.sqrt(D))
+            output = torch.zeros_like(queries)
+            real_max = torch.full(
+                (B, H, Lq, 64),
+                float("-inf"),
+                device=queries.device,
+                dtype=torch.float16,
+            )
+            real_max = real_max.amax(dim=-1)  # B, H, Lq sparse
+            denominator = torch.zeros(
+                (B, H, Lq, 64),
+                device=queries.device,
+                dtype=torch.float16,
+            )
+            denominator = denominator.amax(dim=-1)  # B, H, Lq sparse
+            with spyre_hint(num_tiles_per_dim={"B": 1}):
+                with spyre_hint(num_tiles_per_dim={"H": 4}):
+                    with spyre_hint(num_tiles_per_dim={"Lq": lq_slices}):
+                        scaled_keys = keys * scale  # B, H, Lk, D
+                        keys_T = scaled_keys.transpose(-1, -2)  # B, H, D, Lk
+                        scores = torch.matmul(queries * scale, keys_T)  # B, H, Lq, Lk
+                        scores = scores + mask  # B, H, Lq, Lk
+
+                        block_max = torch.amax(scores, dim=-1)  # B, H, Lq sparse
+                        running_max = torch.maximum(
+                            real_max, block_max
+                        )  # B, H, Lq sparse
+
+                        exp_scores = torch.exp(
+                            scores - running_max.unsqueeze(-1)
+                        )  # B, H, Lq, Lk
+                        correction = torch.exp(
+                            real_max - running_max
+                        )  # B, H, Lq sparse
+
+                        denominator.copy_(
+                            denominator * correction + exp_scores.sum(dim=-1)
+                        )  # B, H, Lq sparse
+                        output.copy_(
+                            output * correction.unsqueeze(-1)
+                            + torch.matmul(exp_scores, values)
+                        )  # B, H, Lq, D
+
+                        real_max.copy_(running_max)  # B, H, Lq sparse
+            return output / denominator.unsqueeze(-1)
+
+        cfn = torch.compile(flash)
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(
+                cfn, queries_dev, keys_dev, values_dev, mask_dev
+            )
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec in generated source")
+        self.assertIn(
+            "count=sympify('4')",
+            src,
+            "Expected H loop count 4 as count= in LoopSpec",
+        )
+        self.assertIn(
+            "count=sympify('2')",
+            src,
+            "Expected Lq loop count 2 as count= in LoopSpec — _stamp_group must"
+            " divide Lq ranges on each op using that op's own dim role",
         )
 
     def test_hint_h_tiling_elementwise(self):
