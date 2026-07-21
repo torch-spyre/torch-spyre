@@ -27,11 +27,13 @@ from typing import Any, Callable, Union
 from .constants import (
     AVGPOOL2D_OP,
     BATCH_MATMUL_OP,
+    CONV2D_FWD_OP,
     COPY_BACK_CANDIDATE_ATTR,
     BATCH_MATMUL_FP8_OP,
     SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
+from . import config
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import (
@@ -824,6 +826,145 @@ def lower_avg_pool2d(
     # which only exists when the SpyreReduction is realized rather than fused into
     # a consumer.
     result.realize()
+    return result
+
+
+@register_spyre_lowering(torch.ops.aten.convolution.default)
+def lower_convolution(
+    x,
+    weight,
+    bias,
+    stride,
+    padding,
+    dilation,
+    transposed,
+    output_padding,
+    groups,
+):
+    """Direct lowering of fp16 conv2d to a native ``conv2d`` SDSC (PE array).
+
+    conv2d is a two-input reduction (activation + weight, weight->KERNEL layout,
+    ``pt`` execution unit, contraction over the input-channel dim ``in``) with
+    windowed spatial dims (``ki``/``kj`` mapping to output ``i``/``j`` via
+    stride/pad/dilation) -- a hybrid of the matmul (lower_mm/lower_bmm) and
+    avgpool (lower_avg_pool2d) patterns. Selected via config.conv2d_direct_lowering;
+    when off, aten.convolution decomposes to im2col+matmul (conv2d_via_bmm_decomp).
+
+    v1 scope: fp16, groups==1, non-transposed, 4D input. Bias (if present) is a
+    separate pointwise add, not a fused biasadd computeOp (follow-up).
+    """
+    if not config.conv2d_direct_lowering:
+        # Belt-and-suspenders: the decomposition only defers to this lowering
+        # when the flag is on, so we should never reach here otherwise.
+        raise Unsupported("conv2d direct lowering disabled (SPYRE_CONV2D_DIRECT=0)")
+    if transposed:
+        raise Unsupported("conv2d direct lowering: transposed convolution")
+    if any(op != 0 for op in output_padding):
+        raise Unsupported("conv2d direct lowering: output_padding")
+    if groups != 1:
+        raise Unsupported(f"conv2d direct lowering: groups={groups} (only groups==1)")
+    if any(p != 0 for p in padding):
+        raise Unsupported(f"conv2d direct lowering: padding={padding} (only 0)")
+    if any(d != 1 for d in dilation):
+        raise Unsupported(f"conv2d direct lowering: dilation={dilation} (only 1)")
+    if len(x.get_size()) != 4:
+        raise Unsupported(
+            f"conv2d direct lowering: expected 4D input, got {len(x.get_size())}D"
+        )
+    if x.get_dtype() != torch.float16:
+        raise Unsupported(f"conv2d direct lowering: dtype {x.get_dtype()} (fp16 only)")
+    if weight.get_size()[-2] == 1 and weight.get_size()[-1] == 1:
+        # A 1x1 kernel squeezes ki/kj to size-1, leaving the conv SDSC with no
+        # window dims -- which DDC's conv path rejects in dimension-mapping. A
+        # 1x1 conv is a channel matmul; it stays on the im2col+matmul
+        # decomposition (see _is_direct_conv_supported).
+        raise Unsupported("conv2d direct lowering: 1x1 kernel (use decomposition)")
+
+    x.realize()
+    weight.realize()
+    x_loader = x.make_loader()
+    weight_loader = weight.make_loader()
+
+    N, C_in, H_in, W_in = x.get_size()
+    C_out, C_in_per_group, kH, kW = weight.get_size()
+
+    sH, sW = stride[0], stride[1]
+    pH, pW = padding[0], padding[1]
+    dilH, dilW = dilation[0], dilation[1]
+
+    H_out = (H_in + 2 * pH - dilH * (kH - 1) - 1) // sH + 1
+    W_out = (W_in + 2 * pW - dilW * (kW - 1) - 1) // sW + 1
+
+    op_info = {
+        # opConsts_ in the emitted SDSC must stay {} for the plain fp16 conv op
+        # (fused epilog scalars live on separate computeOps). Conv geometry goes
+        # under conv_params, which superdsc reads to build padding_sizes/window
+        # fields -- it is NOT copied into opConsts.
+        "constants": {},
+        "conv_params": {
+            "kernel_h": kH,
+            "kernel_w": kW,
+            "stride_h": sH,
+            "stride_w": sW,
+            "pad_h": pH,
+            "pad_w": pW,
+            "dil_h": dilH,
+            "dil_w": dilW,
+        },
+        # Canonical size of each conv iteration-space dim, keyed by its
+        # conv-domain role.  The codegen layer owns the SDSC label names and maps
+        # these roles onto them (see CONV_DIM_LABELS / _CONV_ROLE_LABELS /
+        # _align_conv_dim_labels in codegen/superdsc.py), so SDSC naming never
+        # leaks above codegen -- mirroring the avgpool pool_dim_sizes contract.
+        #
+        # The pipeline drops statically size-1 dims from the iteration space
+        # before parse_op_spec runs (e.g. batch N==1, or ki/kj for a 1x1 kernel),
+        # so codegen uses these sizes to drop the corresponding labels and stay
+        # aligned with the surviving dims -- never inferring roles from sizes.
+        "conv_dim_sizes": {
+            "batch": N,
+            "out_h": H_out,
+            "out_w": W_out,
+            "channel": C_out,
+            "in_channel": C_in,
+            "win_h": kH,
+            "win_w": kW,
+        },
+    }
+
+    def inner_fn(index, reduction_index):
+        n, co, ho, wo = index
+        r_in, r_ki, r_kj = reduction_index
+        # Unclamped windowed input coordinates; zero-padding is expressed at the
+        # SDSC level via padFront_/padBack_ in padding_sizes (see superdsc
+        # _conv_sdsc_fields), mirroring the avgpool window mechanism.
+        hi = ho * sH - pH + r_ki * dilH
+        wi = wo * sW - pW + r_kj * dilW
+        act = x_loader([n, r_in, hi, wi])
+        # weight is [C_out, C_in_per_group, kH, kW]; groups==1 so C_in_per_group == C_in.
+        ker = weight_loader([co, r_in, r_ki, r_kj])
+        return (act, ker)
+
+    result = SpyreReduction.create(
+        reduction_type=CONV2D_FWD_OP,
+        input_node=[x, weight],
+        device=x.get_device(),
+        dst_dtype=x.get_dtype(),
+        src_dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=[N, C_out, H_out, W_out],
+        reduction_ranges=[C_in, kH, kW],
+        op_info=op_info,
+    )
+    result.realize()
+
+    if bias is not None:
+        # v1: separate pointwise add (broadcast bias [C_out] over NCHW) rather
+        # than a fused biasadd computeOp. Reshape to (1, C_out, 1, 1) for the
+        # channel-wise broadcast.
+        bias_reshaped = lowering.view(bias, [1, C_out, 1, 1])
+        result = lowering.add(result, bias_reshaped)
+
     return result
 
 

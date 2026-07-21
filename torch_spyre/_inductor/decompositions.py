@@ -34,7 +34,7 @@ import torch._decomp as decomp
 
 from .constants import DEVICE_NAME, FP8_E4M3_MAX
 from .errors import Unsupported
-
+from . import config
 from . import customops  # noqa: F401
 from . import spyre_hint
 from torch_spyre._C import DataFormats, get_device_dtype
@@ -680,6 +680,45 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
         )
 
 
+def _is_direct_conv_supported(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    transposed: bool,
+    output_padding: list[int],
+    padding: list[int],
+    dilation: list[int],
+    groups: int,
+) -> bool:
+    """Cases the native conv2d direct lowering (lower_convolution) handles.
+
+    Keep this in lock-step with the guards in lower_convolution so that whenever
+    the decomposition defers here, the lowering is guaranteed to accept the op.
+    Everything else stays on the im2col+matmul decomposition.  Excluded:
+    - 1x1 kernel: a 1x1 conv has size-1 kernel taps (ki/kj), which the pipeline
+      squeezes out so the emitted SDSC carries no window dims -- but DDC's conv
+      path expects windowed spatial dims and aborts in dimension-mapping
+      (ddl_conversion.cpp "Unknown primary dimension kind for a window
+      dimension").  A 1x1 conv is just a channel matmul, so it stays on the
+      im2col+matmul path, which handles it exactly;
+    - non-zero padding: the DDC zero-fill for a padded conv input is not wired
+      for regular conv2d, so pad>0 stays on the im2col+matmul path (which pads
+      correctly);
+    - dilated conv: the windowed-input SDSC fields reuse the avgpool builder,
+      which assumes dilation==1, so d>1 stays on the im2col+matmul path.
+    """
+    kH, kW = weight.shape[-2], weight.shape[-1]
+    return (
+        not transposed
+        and all(op == 0 for op in output_padding)
+        and all(p == 0 for p in padding)
+        and all(d == 1 for d in dilation)
+        and groups == 1
+        and input.dim() == 4
+        and input.dtype == torch.float16
+        and not (kH == 1 and kW == 1)
+    )
+
+
 @register_spyre_decompositions([torch.ops.aten.convolution.default])
 def conv2d_via_bmm_decomp(
     input: torch.Tensor,
@@ -697,6 +736,18 @@ def conv2d_via_bmm_decomp(
     torch.nn.unfold directly returns (N, C_in * K_h * K_w, H_out * W_out), avoiding
     intermediate reshape/view/unsqueeze operations.
     """
+    # When the direct-lowering flag is on and the case is supported, decline the
+    # decomposition (return NotImplemented) so aten.convolution.default survives
+    # in the FX/AOT graph and reaches the Spyre lowering (lower_convolution),
+    # which emits a native conv2d SDSC. Unsupported cases (grouped/transposed/
+    # non-fp16) fall through and decompose to im2col+matmul as before. This is
+    # the compile-path target; the flag defaults off so eager and default
+    # compile behavior are unchanged.
+    if config.conv2d_direct_lowering and _is_direct_conv_supported(
+        input, weight, transposed, output_padding, padding, dilation, groups
+    ):
+        return NotImplemented
+
     if transposed:
         raise Unsupported("conv2d_via_bmm: transposed convolution not supported")
 
