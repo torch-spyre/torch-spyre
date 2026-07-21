@@ -404,11 +404,23 @@ def finalize_layouts(graph: GraphLowering) -> None:
             restick_target = _fixed_tiled(in_layout, restick_stl)
             # restick_target's buffer is created fresh by _create_restickify_node
             # and consumed only by op's own inner_fn (see
-            # insert_restickify_on_node_inputs) — it can never have outside-loop
-            # consumers, so it is always safe to inherit in_layout's per_tile_fixed:
-            # if the source address doesn't advance across iterations, this private
-            # single-consumer copy of it doesn't need to either.
-            restick_target.per_tile_fixed = getattr(in_layout, "per_tile_fixed", False)
+            # insert_restickify_on_node_inputs), which also stamps it with op's
+            # own loop_info.  Its per_tile_fixed must agree with that loop_info
+            # (whether *this* restickify buffer's address advances across op's
+            # loop iterations) rather than blindly inheriting in_layout's flag:
+            # when op is itself an advancing accumulator write (e.g. the
+            # coarse-tiled-reduction copy-out into accum_full), the restickify
+            # buffer takes over accum_full's role and must advance too, even
+            # though its source (accum_tile) is per-tile-fixed scratch.
+            op_loop_info = getattr(op, "loop_info", None)
+            if op_loop_info is not None:
+                restick_target.per_tile_fixed = all(
+                    not dims for dims in op_loop_info.loop_tiled_dims
+                )
+            else:
+                restick_target.per_tile_fixed = getattr(
+                    in_layout, "per_tile_fixed", False
+                )
             logger.info(
                 f"Injecting restickify on {op.get_name()} input {edge.dep.name}: "
                 f"{list(in_stl.stride_map)} -> {list(target_stl.stride_map)}"

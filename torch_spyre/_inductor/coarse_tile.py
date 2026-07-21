@@ -2643,6 +2643,14 @@ def _propagate_tiled_reduction_op(
         accum_full = _allocate_full_buffer(
             op, full_output_ranges, operations, group_start_idx
         )
+        # _allocate_full_buffer never stamps loop_info on the buffer it
+        # returns. Without this, memory_planning's _advance_factor sees
+        # loop_info=None and sizes accum_full's pool allocation for a single
+        # outer tile instead of loop_count outer tiles, so the second outer
+        # tile's copy-out (which does carry outer_loop_info, see
+        # _insert_reduction_copy_op) overruns into the next pool buffer.
+        # Mirrors the equivalent stamp in _propagate_carry_op.
+        accum_full.loop_info = fill_loop_info  # type: ignore[attr-defined]
         group_start_idx_after_full = operations.index(accum_full) + 1
         accum_tile = _allocate_full_buffer(
             op, per_tile_ranges, operations, group_start_idx_after_full
