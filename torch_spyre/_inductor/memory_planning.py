@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import math
-from sympy import Symbol
+from sympy import Symbol, Integer
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
     ExternKernelSchedulerNode,
@@ -94,6 +94,39 @@ def _align_up(n: int, alignment: int) -> int:
     return ((n + alignment - 1) // alignment) * alignment
 
 
+def _advance_factor(buf, layout) -> int:
+    """Return how many tiles an advancing coarse-tiled buffer occupies.
+
+    A buffer's `device_size` reflects a single tile after coarse-tiling divides
+    the iteration ranges.  If the buffer is `per_tile_fixed=False`, the unroller
+    advances its base address once per loop iteration, so it actually occupies
+    `loop_count` tiles along each dimension it is tiled on — not one.  Sizing it
+    for a single tile lets the loop overrun into the next pooled buffer (the
+    last-iteration corruption seen in coarse-tiled flash attention: the
+    advancing softmax outputs clobber the `-inf` M fill that sits after them).
+
+    The factor is the product of `loop_count[level]` over exactly the levels
+    where this buffer carries a tiled dimension (`loop_tiled_dims[level]`
+    non-empty).  It is 1 for:
+      * `per_tile_fixed=True` buffers (base never advances — pinned scratch),
+      * buffers with no tiled dimension at any level (loop-invariant), and
+      * buffers with no coarse-tile `loop_info`.
+    Keying off the loop metadata rather than the `device_size` shape is
+    deliberate: the tiled dimension does not occupy a fixed device index
+    (e.g. it can be device dim 0 or dim 3), so a shape-based guess is wrong.
+    """
+    if getattr(layout, "per_tile_fixed", False):
+        return 1
+    loop_info = getattr(buf, "loop_info", None)
+    if loop_info is None:
+        return 1
+    factor = 1
+    for count, dims in zip(loop_info.loop_count, loop_info.loop_tiled_dims):
+        if dims and isinstance(count, (int, Integer)):
+            factor *= int(count)
+    return factor
+
+
 def _compute_size_bytes(name: str) -> int:
     """Return the stick-aligned device size in bytes for buffer `name`."""
     buf = V.graph.get_buffer(name)
@@ -103,7 +136,7 @@ def _compute_size_bytes(name: str) -> int:
     )
     dev_layout = layout.device_layout
     num_sticks = math.prod(dev_layout.device_size[:-1])
-    size_bytes = num_sticks * _STICK_BYTES
+    size_bytes = num_sticks * _STICK_BYTES * _advance_factor(buf, layout)
     return _align_up(size_bytes, _STICK_BYTES)
 
 
