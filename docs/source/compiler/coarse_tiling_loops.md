@@ -607,10 +607,18 @@ wrapped in private helpers tagged with `@_runs(...)` for cache-key purposes:
 ```python
 self.passes = [
     deadcode_elimination,
+    #
+    # Working Set Reduction (hint-driven, pre-stickification)
+    propagate_named_dims,
+    assign_dim_hints,
+    _maybe_coarse_tile_hints,      # reorder_unhinted_interlopers + hints_to_coarse_tile_groups
+                                   # + coarse_tile, on host-side FixedLayout
+    #
     # Tensor Layout (Stickification)
     split_multi_ops,
     propagate_spyre_tensor_layouts,
     validate_ops,
+    resolve_join_clusters,
     optimize_restickify_locations,
     finalize_layouts,
     insert_restickify,
@@ -618,11 +626,10 @@ self.passes = [
     insert_bmm_padding,
     #
     dedup_and_promote_constants,
-    # Working Set Reduction
-    propagate_named_dims,
-    assign_dim_hints,
-    _maybe_coarse_tile,           # reorder_unhinted_interlopers + hints_to_coarse_tile_groups
-                                  # + span_overflow_groups + coarse_tile
+    #
+    # Working Set Reduction (device-layout-aware, post-stickification)
+    _maybe_coarse_tile_span_overflow,  # span_overflow_groups + coarse_tile,
+                                       # needs FixedTiledLayout.device_layout
     # Core Division
     span_reduction,
     _distribute_work,             # calls cost_model_matmul_division + work_distribution
@@ -641,11 +648,34 @@ scope annotations (attached to FX nodes as `meta["custom"]`) to produce
 `op.dim_hints` — a flat list of `DimHint` objects consumed by
 `hints_to_coarse_tile_groups` to form the coarse tiling groups.
 
+**Coarse tiling is split into two slots, not one.** `_maybe_coarse_tile_hints`
+(hint-derived loop groups) runs immediately after dead-code elimination,
+before stickification: it only needs host-side `FixedLayout` (size/stride)
+and loop-variable ranges, and running it here means `_divide_ranges` never
+has to call a cross-phase `_resize_device_layout` correction step —
+stickification computes the correct `SpyreTensorLayout` directly from the
+already-divided ranges. This also removes a cross-phase contract that used
+to exist between `insert_restickify` and hint-copy forwarding
+(issue #3135). `_maybe_coarse_tile_span_overflow` (spans that overflow the
+hardware memory budget, detected independently of hints) stays in the old
+post-stickification slot below, because span arithmetic needs
+`FixedTiledLayout.device_layout` (device size, stride map), which does not
+exist yet pre-stickification.
+
+**`resolve_join_clusters` must run before `optimize_restickify_locations`.**
+Per-op-local, greedy restickify placement cannot jointly optimize sibling
+ops that feed a shared multi-input `AllSameNode` join (e.g. both operands of
+a `torch.maximum`) — placing one sibling's restickify greedily can foreclose
+a jointly-better placement for the other. `resolve_join_clusters` searches
+the joint candidate space for clustered siblings first, so
+`optimize_restickify_locations`'s later per-op placement only has to handle
+what joint resolution didn't already fix.
+
 **Must run after stickify and padding.**  `propagate_spyre_tensor_layouts`,
 `insert_restickify`, and `insert_bmm_padding` establish the final tiled
-memory layout for each tensor.  The tiling pass must see the post-stickify,
-post-padding shapes or it will split on the wrong dimension or produce a
-non-stick-aligned inner size.
+memory layout for each tensor.  The span-overflow half of coarse tiling
+must see the post-stickify, post-padding shapes or it will split on the
+wrong dimension or produce a non-stick-aligned inner size.
 
 **Must run before `work_distribution`.**  `work_distribution` stamps
 `op_it_space_splits` on each `ir.Operation` to assign per-core work
@@ -697,14 +727,45 @@ tile), the loop body reads from full HBM tensors using tile-sized windows
 via `affine.apply` — no conversion, just addressing.  Only producer-side
 crossings need adaptation.
 
-For each tiled `ComputedBuffer`, the pass classifies by consumer topology
-and applies the cheapest treatment that maintains correctness:
+For each tiled `ComputedBuffer`, the pass classifies by consumer *and
+input* topology and applies the cheapest treatment that maintains
+correctness:
 
-| Case | Inside consumers | Outside consumers | Treatment |
-|---|---|---|---|
-| 1 | ✓ | ✗ | Mark `per_tile_fixed` — flag only, no IR change |
-| 2 | ✓ | ✓ | Allocate full HBM buffer; insert a loop-tagged copy op that publishes each tile into the correct slice |
-| 3 | ✗ | ✓ | Rewire the tiled op to write directly into a full HBM buffer via `MutationLayoutSHOULDREMOVE` — a metadata redirect, zero added data movement |
+| Case | Inside consumers | Outside consumers | Loop-internal real input | Treatment |
+|---|---|---|---|---|
+| 1 | ✓ | ✗ | — | Mark `per_tile_fixed` — flag only, no IR change |
+| 2 | ✓ | ✓ | — | Allocate full HBM buffer; insert a loop-tagged copy op that publishes each tile into the correct slice |
+| 2 | ✗ | ✓ | ✓ | Same as above — a loop-internal real *input* forces the copy-op path even with zero inside consumers of this op's own output |
+| 3 | ✗ | ✓ | ✗ | Rewire the tiled op to write directly into a full HBM buffer via `MutationLayoutSHOULDREMOVE` — a metadata redirect, zero added data movement |
+
+The third row is not a corner case worth ignoring: the trigger is
+`_has_loop_internal_real_input(op, ...)` — true when *any* real
+(non-`SpyreConstantFallback`) input of `op` is itself a `ComputedBuffer`
+stamped with `loop_info` in the same outer loop group. Such an input is a
+tile-sized, loop-internal producer with its own tile-sized candidate
+layouts, which can never be made stick-compatible with a full-size
+`MutationLayoutSHOULDREMOVE` target under `AllSameNode`'s
+stick-compatibility rule. Routing through the copy-op path instead keeps
+the tiled op self-consistent — its own layout and its own real inputs stay
+tile-sized — and reuses the copy op's single-real-input path, which fuses
+the tiled op's own upstream computation via `make_loader()`. Without this
+row, Case 3 (rows 3 and 4's condition as originally stated, "no inside
+consumers → mutate directly") is necessary but not sufficient: an op with
+no inside consumers of its own output but a loop-internal input must still
+route through the copy-op path.
+
+This condition (from commit `8ac03da`) is deliberately narrower than an
+earlier version of the same idea, which forced the copy-op path for *any*
+tiled op with more than one real input (`_num_real_inputs(op) > 1`) — that
+rule over-triggered for ops whose several inputs were all external (e.g.
+two graph inputs), producing an unnecessary identity copy. The current rule
+only cares whether an input is loop-internal, not how many inputs there are.
+
+**Note on code-level naming**: `coarse_tile.py`'s own comments and debug
+logging call the copy-op path "Case 1" and the mutation path "Case 2" (a
+two-way split on treatment, ignoring the loop-internal/no-IR-change case
+covered separately above) — do not confuse this with the doc's three/four-row
+numbering above, which classifies by topology rather than by treatment.
 
 **Case 1** is where most of the working-set-reduction win comes from.  An
 intermediate like `y` in the small example flows from one tiled op to
@@ -733,6 +794,24 @@ existing storage in-place.  The full buffer's address is encoded in the
 `TensorArg` via the `tiled_symbols` offset; no copy op is needed.  A
 unified treatment that always inserted a copy would handle all three cases
 correctly but waste a copy op here.
+
+#### Read-side adaptation: full-buffer inputs to a loop-internal op
+
+The write-side perimeter above is not the whole story. `_propagate_tiled_op`
+checks, before any Case classification, whether `op` directly reads a
+full-size `SpyreEmptyFallback` buffer — typically an accumulator that an
+earlier Case-2/mutation rewrite (or a carry rewrite, below) already
+promoted to full size. A loop-internal op cannot read such a buffer
+directly: its own candidate layouts are tile-sized, and a full-size
+`SpyreEmptyFallback` has only one, full-size candidate layout, so the two
+can never be made stick-compatible. `_full_buffer_read_deps` detects this
+and `_insert_read_view_ops` splices in a tile-sized "view" `ComputedBuffer`
+per such read, rewriting `op`'s `inner_fn` (via a `WrapperHandler`
+subclass, per the wrap-never-reconstruct convention) to read the view
+instead of the full buffer. This means the "no conversion, just addressing"
+claim above holds only when the full buffer being read is a genuine graph
+input or other host-side tensor — not when it is itself the product of an
+earlier tile→full promotion inside the same compilation.
 
 #### Reduction tiling: stick and non-stick reduction dims
 
@@ -818,6 +897,97 @@ eliminated" case correctly.
 Nested tiling where outer level(s) tile output dims and the innermost level
 tiles a reduction dim (e.g. outer-B + inner-K for bmm) is fully supported
 and handled by the two-buffer pattern described above.
+
+The device layout for `accum_full`/`accum_tile`'s `MutationLayoutSHOULDREMOVE`
+target is not chosen uniformly: `propagate_spyre_tensor_layouts`
+(`propagate_layouts.py`) dispatches mutation-target layout computation three
+ways depending on what kind of op is writing into it — `BATCH_MATMUL_OP`
+reductions use `_matmul_layouts`, other `Reduction` ops use
+`_single_arg_op_layout`, and plain `Pointwise` ops (including the fill and
+combine ops this section describes) use `_multi_arg_pointwise_layouts`, the
+same `AllSameNode` stick-compatibility path used for ordinary Case 2/3
+routing above. A reduction accumulator write does not fit the broadcast
+relationship `_multi_arg_pointwise_layouts` otherwise assumes, which is why
+the `Reduction`-specific paths exist as separate cases rather than folding
+into the pointwise one.
+
+#### Sequential carry: online-softmax-style recurrences
+
+The fill/combine pattern above is a **monoid combine**: each tile's partial
+result is independent and can be merged into the accumulator in any order.
+Online-softmax-style kernels (flash-attention's running max and
+rescale-accumulate denominator/output) need something structurally
+different — a **true recurrence**, where the value one loop iteration
+writes must be visible, unmodified, as the *next* iteration's input. Re-
+running the traced Python's fill on every tile would silently reset the
+running max/denominator each iteration instead of carrying it forward. This
+fourth regime, "carry ops," is handled by `_seed_buffer_for_carry`,
+`_carry_terminal_op`, and `_propagate_carry_op` — entirely separate from
+the Case 1/2/3 classification and from the reduction accum pattern, even
+though it reuses some of the same buffer shapes.
+
+**Seed buffer.** The recurrence's pre-loop initializer (e.g.
+`M = torch.full((...), -inf)` for a running max) is not a fresh allocation —
+it is reused directly as `accum_full`. Detecting which pre-loop constant
+fill is a carry seed (as opposed to an ordinary hoisted constant) is
+closure-based, not op-local.
+
+**Closure.** `_seed_closure` returns every op in the same outer loop group
+that reads the seed *directly* — e.g. both `max_running = maximum(M,
+block_max)` and `correction = exp(M - max_running)` read `M` directly, so
+both are in `M`'s closure, even though only the first is the actual
+recurrence update. This is deliberately non-transitive: an op that reads a
+closure member but not the seed itself is an ordinary downstream consumer,
+not part of the closure.
+
+**Entry op vs. terminal op.** `_seed_buffer_for_carry` finds the unique
+closure member whose non-seed operands are all external to the closure —
+the entry op, which reads the seed directly (e.g. the multiply in
+`denominator = denominator * correction + tile_sum`). The traced Python's
+actual recurrence value is sometimes one or more ops further downstream:
+`_carry_terminal_op` walks forward from the entry op, through in-group
+Pointwise consumers that are loop-invariant at the same reduction level and
+do not themselves read the seed directly, to find the terminal op (the add,
+in the example above) whose *result* is what must persist as the next
+iteration's carry. Entry and terminal coincide whenever the update is a
+single op reading the seed directly (e.g. the running-max `maximum` itself).
+
+**`accum_tile` and `carry_prev`.** When the group also tiles an outer
+output dim (e.g. H) above the reduction-tiled level, the terminal op's own
+buffer is only tile-sized at that outer level and cannot write into
+`accum_full` (full-size) directly — the same stick-compatibility
+constraint that motivates Case 1/2 for ordinary tiled ops. `accum_tile` is
+a per-outer-tile scratch buffer, `per_tile_fixed=True`, that the entry op
+reads from and the terminal op mutates via `MutationLayoutSHOULDREMOVE`,
+mirroring the reduction pattern's `accum_tile`. It differs in one respect
+that the reduction pattern never needs: other closure members (e.g.
+`correction`) need the carry's value from *before* this iteration's update
+— the same pre-update value the entry op itself reads — but
+`MutationLayoutSHOULDREMOVE` is a plain storage alias with no versioning,
+so a sibling reader positioned after the terminal op in `operations` would
+observe the post-update write instead. `carry_prev` is a distinct
+per-inner-iteration scratch buffer that snapshots `accum_tile` before the
+terminal op's write, and sibling closure members are redirected to read it
+instead of the seed.
+
+**Copy-in/copy-out placement.** Once per outer tile, before the inner loop's
+first iteration, a copy-in op loads `accum_full`'s current outer-tile slice
+into `accum_tile`. Once per outer tile, after the inner loop's *last*
+iteration, a copy-out op writes `accum_tile` back into `accum_full`'s slice
+— reusing `_insert_reduction_copy_op`. The copy-out's insertion point is
+not simply "immediately after the terminal op": it must run after the last
+op in the seed's closure (found via `max(..., key=operations.index)`),
+since sibling closure members like `correction` still need to run inside
+the same inner-loop iteration after the terminal op's write.
+
+**Connection to `resolve_join_clusters`.** A closure with multiple external
+members feeding a shared multi-input `AllSameNode` join (e.g. flash-
+attention's `M = torch.maximum(M, block_max)` join) is exactly the shape
+`resolve_join_clusters` was introduced to optimize jointly — per-op-local
+greedy restickify placement cannot see that two sibling ops' candidate
+layouts should be chosen together. See
+[Groups derivation and placement in `CustomPreSchedulingPasses`](#groups-derivation-and-placement-in-custompreschedulingpasses)
+for where that pass runs relative to coarse tiling.
 
 ## Layer 2 — `CountedLoopSchedulerNode`
 
@@ -907,10 +1077,24 @@ any future fusion path that might otherwise merge across group boundaries.
 
 ### The grouping algorithm
 
-`build_loop_scheduler_nodes` scans the flat node list and groups
-contiguous runs sharing the same outermost `loop_group_id` key:
+`build_loop_scheduler_nodes` first calls `_regroup_by_outer_loop_key`, then
+scans the resulting node list and groups contiguous runs sharing the same
+outermost `loop_group_id` key. The regroup step is necessary because
+Inductor's own `Scheduler.topological_sort_schedule` runs (twice) before
+this pass ever sees the node list, via a plain DFS over
+`unmet_dependencies` — that DFS only guarantees a *valid* topological
+order, not that mutually independent nodes keep their original relative
+order, so it can interleave unrelated nodes into the middle of what
+`coarse_tile.py` built as a single contiguous loop group.
+`_regroup_by_outer_loop_key` merges every node sharing an outermost
+`loop_group_id[0]` key into one virtual unit (dependency set = the union of
+its members' real cross-group dependencies), runs a dependency-respecting
+DFS over `{merged units, ungrouped nodes}`, then expands each unit back
+into its original members in their original relative order — restoring
+contiguity while still producing a valid topological order:
 
 ```
+nodes = _regroup_by_outer_loop_key(nodes)
 result = []
 i = 0
 while i < len(nodes):
@@ -930,11 +1114,16 @@ while i < len(nodes):
 return result
 ```
 
-Key invariant: because the pre-scheduling pass runs in topological order
-and the scheduler's topological sort preserves that order, a loop group's
-`SchedulerNode`s will be contiguous in the post-fusion node list.  If they
-are not contiguous it means a data-flow constraint separates them, which is a
-bug in the tiling pass.  The post-fusion pass asserts contiguity.
+Key invariant: the pre-scheduling pass runs in topological order, but
+Inductor's own topological sort does **not** by itself guarantee that a
+loop group's `SchedulerNode`s stay contiguous — it only guarantees a valid
+order among mutually independent nodes, which can interleave. Contiguity
+is restored by `_regroup_by_outer_loop_key` before grouping runs. If
+`build_loop_scheduler_nodes` still finds a non-contiguous run after that
+call, it means either a bug in `_regroup_by_outer_loop_key` itself, or a
+genuine data-flow constraint that makes the group's own op sequence
+topologically invalid (which would be a tiling-pass bug). The post-fusion
+pass asserts contiguity.
 
 ## Layer 3 — `LoopSpec` and codegen
 
@@ -1233,7 +1422,8 @@ When backend support lands, `unroll_loops` will be flipped to default
 |---|---|
 | `torch_spyre/_inductor/loop_info.py` | Layer 1: `CoarseTileInfo` dataclass; `copy_op_metadata` |
 | `torch_spyre/_inductor/coarse_tile.py` | Layer 1: `reorder_unhinted_interlopers()` reorders interlopers before grouping; `coarse_tile()` stamps `loop_info` and rewrites ranges; `insert_tiling_propagation` handles the data perimeter |
-| `torch_spyre/_inductor/scheduler.py` | Layer 2: `CountedLoopSchedulerNode`, `build_loop_scheduler_nodes`, `_codegen_counted_loop` |
+| `torch_spyre/_inductor/insert_restickify.py` | Commits deferred `_pending_per_tile_fixed` flags in `finalize_layouts`; derives a restickify buffer's own `per_tile_fixed` from the *consuming* op's `loop_info` rather than inheriting the source layout's flag, needed when the restickify buffer takes over an advancing accumulator's role (reduction copy-out, carry-into-accumulator) |
+| `torch_spyre/_inductor/scheduler.py` | Layer 2: `CountedLoopSchedulerNode`, `build_loop_scheduler_nodes`, `_codegen_counted_loop`, `_regroup_by_outer_loop_key` |
 | `torch_spyre/_inductor/op_spec.py` | Layer 3: `LoopSpec` and `OpSpec` dataclasses |
 | `torch_spyre/_inductor/spyre_kernel.py` | Layer 3: serializes `LoopSpec` tree in `codegen_kernel()`; `wrap_op_specs_in_loop()` |
 | `torch_spyre/_inductor/codegen/bundle.py` | Layer 3: emits `scf.for` in `bundle.mlir` for the `unroll_loops=False` path |
