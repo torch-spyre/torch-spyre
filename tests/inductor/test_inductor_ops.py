@@ -29,6 +29,8 @@ from utils_inductor import (
     shapes2key,
 )
 import utils_inductor
+from unittest import mock
+from torch_spyre._inductor import config as inductor_config
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import IDENTITY_OP
 
@@ -4500,6 +4502,57 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        # conv2d exercising the native conv2d SDSC path (lower_convolution) with
+        # the direct-lowering flag on (config.conv2d_direct_lowering). Only
+        # kernels >=2x2 direct-lower: a 1x1 kernel has size-1 window taps that
+        # DDC's conv path rejects, so it falls back to the im2col+matmul
+        # decomposition -- 1x1 is covered by the ("test_conv2d", ...) case
+        # "2x3x32_ksize1" above (with NCHW input), so it is intentionally not
+        # duplicated here (this test feeds channel-last input, which suits direct
+        # lowering but not the decomposition's reshape path). Supported direct
+        # cases: fp16, groups==1, non-transposed, zero padding, dilation==1.
+        # Params are standard NCHW (x, weight[C_out,C_in,kH,kW], bias, stride);
+        # the test builds the channel-last device tensors and toggles the flag.
+        ("test_conv2d_direct", "test_conv2d_direct_base"): {
+            "param_sets": {
+                # 2x2 kernel, zero padding -- smallest direct-lowered window.
+                "1x64x8x8_k2": (
+                    cached_randn((1, 64, 8, 8)),
+                    cached_randn((64, 64, 2, 2)),
+                    None,
+                    (1, 1),
+                ),
+                # 3x3 kernel, zero padding -- the reference "working conv with
+                # zero padding" shape.
+                "1x64x8x8_k3": (
+                    cached_randn((1, 64, 8, 8)),
+                    cached_randn((64, 64, 3, 3)),
+                    None,
+                    (1, 1),
+                ),
+                # Batch N>1 with a 3x3 kernel.
+                "2x64x8x8_k3": (
+                    cached_randn((2, 64, 8, 8)),
+                    cached_randn((64, 64, 3, 3)),
+                    None,
+                    (1, 1),
+                ),
+                # Bias present: lowered as a separate channel-wise pointwise add.
+                "1x64x8x8_k3_bias": (
+                    cached_randn((1, 64, 8, 8)),
+                    cached_randn((64, 64, 3, 3)),
+                    cached_randn((64,)),
+                    (1, 1),
+                ),
+                # C_out != C_in (32 output channels), 3x3 kernel.
+                "1x64x8x8_k3_cout32": (
+                    cached_randn((1, 64, 8, 8)),
+                    cached_randn((32, 64, 3, 3)),
+                    None,
+                    (1, 1),
+                ),
+            },
+        },
         ("test_avg_pool2d", "test_avg_pool2d_base"): {
             "ops_dict": {
                 "k2s2": lambda x: F.avg_pool2d(x, kernel_size=2, stride=2),
@@ -6425,6 +6478,40 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             atol=0.5,
             rtol=0.1,
         )
+
+    def test_conv2d_direct_base(self, x, weight, bias, stride):
+        # Exercises the native conv2d SDSC (lower_convolution), not the
+        # im2col+matmul decomposition. Enabled via config.conv2d_direct_lowering
+        # so aten.convolution survives decomposition and reaches the lowering.
+        #
+        # Spyre stores C as the stick (innermost) dim, so the activation must be
+        # physically channel-last (NHWC) and the weight must stick on C_out.  We
+        # hand the harness channel-last-contiguous tensors (their layout is
+        # preserved by .to("spyre")) and permute back to the logical NCHW /
+        # [C_out,C_in,kH,kW] layouts inside fn, so the standard compare_with_cpu
+        # harness holds (cpu fn(x_nhwc, w_dev, b) == spyre fn(...)).
+        #
+        # run_eager=False: Spyre has no eager conv2d kernel; only the compiled
+        # (direct-lowering) path is valid here.
+        x_nhwc = x.permute(0, 2, 3, 1).contiguous()  # [N, H, W, C_in]
+        w_dev = weight.permute(1, 2, 3, 0).contiguous()  # [C_in, kH, kW, C_out]
+
+        def fn(xc, wc, b):
+            xn = xc.permute(0, 3, 1, 2)  # NHWC -> NCHW
+            wn = wc.permute(3, 0, 1, 2)  # [C_in,kH,kW,C_out] -> [C_out,C_in,kH,kW]
+            out = torch.conv2d(xn, wn, b, stride=stride, padding=0, groups=1)
+            return out.permute(0, 2, 3, 1)  # NCHW -> NHWC
+
+        with mock.patch.object(inductor_config, "conv2d_direct_lowering", True):
+            self.compare_with_cpu(
+                fn,
+                x_nhwc,
+                w_dev,
+                bias,
+                atol=0.5,
+                rtol=0.1,
+                run_eager=False,
+            )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_index_copy_cpu(self):
