@@ -278,6 +278,9 @@ class TestMemoryProfilerTimeline(TestCase):
             self.assertGreaterEqual(
                 act_size, exp_size, f"Expected at least {exp_size}, got {act_size}"
             )
+            # Allow generous allocator padding/alignment overhead. 4x is chosen as a
+            # middle ground: 2x risks false failures from allocator rounding, while
+            # 8x would allow large over-reporting bugs to pass unnoticed.
             self.assertLessEqual(
                 act_size,
                 exp_size * 4,
