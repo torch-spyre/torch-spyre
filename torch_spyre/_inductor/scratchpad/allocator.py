@@ -287,6 +287,15 @@ class ScratchpadAllocator:
             if _would_produce_lx_back_gap(graph, output_name, uses):
                 self.reject_reasons[output_name] = "lx back gap"
                 continue
+            # A buffer read by a restickifying consumer (spyre.restickify, or a
+            # transpose+contiguous that lowers to RESTICKIFY_OP) must stay in HBM:
+            # ReStickifyOpHBM addresses its input as HBM, so an LX-resident input
+            # is mis-read (silently wrong past the LX-representable region). The
+            # greedy path never applied this guard (only the CP-SAT residency path
+            # did, and it missed the clone case) -- see #3145 flash attention.
+            if _read_by_restickifying_consumer(graph, output_name, uses):
+                self.reject_reasons[output_name] = "read by restickify (cross-frame barrier)"
+                continue
 
             uses = lifetimes[output_name]
             parents = in_place.get(output_name, [])
@@ -504,6 +513,41 @@ def _op_short_name(op: Any) -> str:
         if name is not None:
             break
     return name if name is not None else "None"
+
+
+# Consumer op short-names that lower to a stick-dimension-moving read
+# (``RESTICKIFY_OP`` in codegen). A ``.contiguous()`` after a transpose lowers to
+# a ``clone`` whose store becomes ``RESTICKIFY_OP`` when it moves the stick dim
+# (see ``SpyreKernel.store``: ``op == RESTICKIFY_OP`` iff the input and output
+# innermost/stick device coordinates differ). A same-stick clone lowers to
+# ``IDENTITY_OP`` instead, but Inductor elides no-op clones, so treating any
+# surviving ``clone``/``restickify`` reader as a restickify hazard is correct and
+# not over-broad in practice.
+_RESTICKIFYING_READER_NAMES = ("restickify", "clone")
+
+
+def _read_by_restickifying_consumer(
+    graph: GraphLowering, buf_name: str, uses: Sequence[int]
+) -> bool:
+    """True if a *consumer* reads ``buf_name`` via an op that lowers to
+    ``RESTICKIFY_OP``.
+
+    Such a buffer must stay in HBM: ``ReStickifyOpHBM`` addresses its input as an
+    HBM (global) tensor, so an LX-resident input is mis-addressed and the read is
+    silently wrong past the LX-representable region. The producing op is skipped
+    -- a restickify's *output* is a normal core-local LX write and is not barred
+    (see ``ScratchpadAllocator._residency_reason``). We also confirm the op
+    actually reads ``buf_name`` (``uses`` is a liveness interval, not a read set).
+    """
+    for u in uses:
+        op = graph.operations[u]
+        if op.get_name() == buf_name:  # the producer (writes buf_name); skip it
+            continue
+        if _op_short_name(op) not in _RESTICKIFYING_READER_NAMES:
+            continue
+        if any(r.name == buf_name for r in op_read_writes(op).reads):
+            return True
+    return False
 
 
 def _lx_planning_size() -> int:
