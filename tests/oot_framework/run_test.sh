@@ -705,6 +705,20 @@ def analyze(path):
     # can gate them via the YAML config, AND need cleanup so the raw star-imported
     # instance is not collected by pytest as a plain TestCase.
     class_level_parametrized_mixed = set()
+    # is_upstream/is_oot for THIS file, computed once up front (reused below).
+    import os as _os
+    _torch_root = _os.environ.get("TORCH_ROOT", "")
+    _torch_device_root = _os.environ.get("TORCH_DEVICE_ROOT", "")
+    _is_upstream_file = bool(
+        _torch_root
+        and _os.path.abspath(path).startswith(_os.path.abspath(_torch_root))
+    )
+    _is_oot_file = bool(
+        _torch_device_root
+        and _os.path.abspath(path).startswith(_os.path.abspath(_torch_device_root))
+    )
+    _apply_transitive_closure = _is_upstream_file and not _is_oot_file
+
     # Transitive closure: a class counts as a TestCase subclass if any of its
     # bases (directly or transitively, through locally-defined intermediate
     # classes) is TestCase-like. This catches chains like
@@ -713,18 +727,33 @@ def analyze(path):
     # test_mkldnn_pattern_matcher.py, whose base name does not literally end
     # in "TestBase" and was previously invisible to this scan entirely
     # (see issue #3188).
+    #
+    # Scoped to upstream-only files: OOT-native files under TORCH_DEVICE_ROOT
+    # commonly use non-"TestCase"/"TestBase"-named helper base classes on
+    # purpose for classes that already hand-roll direct Spyre-device testing
+    # without any instantiate_device_type_tests() dispatch (e.g.
+    # BaseTestScratchpadUsage in test_scratchpad_use.py). Making those newly
+    # "visible" here sweeps them into needs_injection/uncontrolled below, and
+    # instantiate_device_type_tests() rebuilding them via multiple inheritance
+    # silently changes their setUp()/MRO — verified this regressed
+    # test_scratchpad_use.py from 109 passed (main) to 39 failed when the
+    # transitive check was applied unconditionally. So for non-upstream files
+    # we keep the original direct-only check.
     _local_bases = {}
-    for _n in ast.iter_child_nodes(tree):
-        if isinstance(_n, ast.ClassDef):
-            _names = []
-            for _b in _n.bases:
-                if isinstance(_b, ast.Name):        _names.append(_b.id)
-                elif isinstance(_b, ast.Attribute): _names.append(_b.attr)
-            _local_bases[_n.name] = _names
+    if _apply_transitive_closure:
+        for _n in ast.iter_child_nodes(tree):
+            if isinstance(_n, ast.ClassDef):
+                _names = []
+                for _b in _n.bases:
+                    if isinstance(_b, ast.Name):        _names.append(_b.id)
+                    elif isinstance(_b, ast.Attribute): _names.append(_b.attr)
+                _local_bases[_n.name] = _names
 
     def _is_testcase_like(name, _seen=None):
         if "TestCase" in name or name.endswith("TestBase"):
             return True
+        if not _apply_transitive_closure:
+            return False
         _seen = _seen or set()
         if name in _seen:
             return False
@@ -839,33 +868,19 @@ def analyze(path):
                     #
                     # Scope this correction to transitive_only_classes: classes
                     # that are only newly visible to this analyzer via the
-                    # transitive-closure TestCase check above. Long-established
-                    # directly-visible classes using this same standalone-call
-                    # pattern (e.g. TestConvolutionNN in test_convolution.py,
-                    # TestLRScheduler in test_lrscheduler.py) keep their prior
-                    # "fully handled" classification unchanged, since other YAML
-                    # suites already depend on that behavior and default to
-                    # unlisted_test_mode: skip — reclassifying them here would
-                    # silently drop coverage for tests not explicitly listed in
-                    # those unrelated configs.
+                    # transitive-closure TestCase check above (itself already
+                    # scoped to upstream-only files via _apply_transitive_closure).
+                    # Long-established directly-visible classes using this same
+                    # standalone-call pattern (e.g. TestConvolutionNN in
+                    # test_convolution.py, TestLRScheduler in
+                    # test_lrscheduler.py) keep their prior "fully handled"
+                    # classification unchanged, since other YAML suites already
+                    # depend on that behavior and default to unlisted_test_mode:
+                    # skip — reclassifying them here would silently drop
+                    # coverage for tests not explicitly listed in those
+                    # unrelated configs.
                     if cls_name in transitive_only_classes:
-                        import os as _os
-                        torch_root = _os.environ.get("TORCH_ROOT", "")
-                        torch_device_root = _os.environ.get("TORCH_DEVICE_ROOT", "")
-                        is_upstream = (
-                            torch_root
-                            and _os.path.abspath(path).startswith(
-                                _os.path.abspath(torch_root)
-                            )
-                        )
-                        is_oot = (
-                            torch_device_root
-                            and _os.path.abspath(path).startswith(
-                                _os.path.abspath(torch_device_root)
-                            )
-                        )
-                        if is_upstream and not is_oot:
-                            continue  # leave out of parametrized_instantiated -> uncontrolled
+                        continue  # leave out of parametrized_instantiated -> uncontrolled
                     parametrized_instantiated.add(cls_name)
     # A class that appears in BOTH open and restricted sets (e.g. the file
     # calls instantiate_device_type_tests twice for the same class, once with
