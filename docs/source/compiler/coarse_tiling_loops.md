@@ -200,6 +200,14 @@ Key points:
   address 0.  Because `y` is produced and fully consumed within the same tile
   iteration and its per-tile size fits in scratchpad, no HBM allocation is
   needed for it at all.
+- This snapshot is taken right after `coarse_tile`, before
+  `insert_tiling_propagation` classifies `buf1` and inserts its copy op (see
+  [Treatment by consumer topology](#treatment-by-consumer-topology) below).
+  `buf1`'s `Pointwise.inner_fn` shown here is what feeds that later
+  classification; the additional `coarse_tile_copy_buf1` op and the
+  `buf1`→pool / copy→HBM buffer split shown in the
+  [Generated OpSpec](#generated-opspec-python-wrapper-source) section below
+  are not yet present at this stage.
 
 ### Generated OpSpec (Python wrapper source)
 
@@ -299,6 +307,41 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                                     ],
                                     allocation={'hbm': <base_addr_c>},
                                 ),
+                                TensorArg(              # output z tile (pool: per-tile HBM)
+                                    is_input=False, arg_index=-1,
+                                    device_dtype=DataFormats.SEN169_FP16,
+                                    device_size=[16, 512, 64],
+                                    device_coordinates=[
+                                        sympify('floor(c1/64)'),
+                                        sympify('c0'),
+                                        sympify('Mod(c1, 64)'),
+                                    ],
+                                    allocation={'pool': 0},
+                                ),
+                            ]
+                        ),
+                        OpSpec(
+                            op='identity',                 # coarse_tile_copy_buf1
+                            is_reduction=False,
+                            iteration_space={
+                                sympify('c0'): (sympify('512'), 32),
+                                sympify('c1'): (sympify('1024'), 1),
+                            },
+                            op_info={},
+                            tiled_symbols=[[sympify('c1')], [sympify('c0')]],
+                            symbolic_dim_bounds={},
+                            args=[
+                                TensorArg(              # input: z tile (pool: per-tile HBM)
+                                    is_input=True, arg_index=-1,
+                                    device_dtype=DataFormats.SEN169_FP16,
+                                    device_size=[16, 512, 64],
+                                    device_coordinates=[
+                                        sympify('floor(c1/64)'),
+                                        sympify('c0'),
+                                        sympify('Mod(c1, 64)'),
+                                    ],
+                                    allocation={'pool': 0},
+                                ),
                                 TensorArg(              # output z (HBM, full tensor)
                                     is_input=False, arg_index=3,
                                     device_dtype=DataFormats.SEN169_FP16,
@@ -336,19 +379,35 @@ Key observations:
   fixed across iterations (no `affine.apply` advance).  Because `y` is
   produced and fully consumed within the same tile iteration, no HBM
   allocation is needed.
-- The final output `z` (output of `mul`) has `allocation={'hbm': ...}` and
-  `arg_index=3` — it lives in HBM.  Its `device_size=[64, 1024, 64]` is the
-  **full** tensor shape in Spyre stick layout: `insert_tiling_propagation`
-  applies Case 3 (mutation layout) here because `z` has no inside consumers,
-  so the tiled op writes directly into the full HBM buffer and
-  `per_tile_fixed` is not set.  The per-iteration write offset into the full
-  buffer is computed by `affine.apply` in `bundle.mlir` (see next section).
+- The final output `z` (output of `mul`) has no inside consumers, but
+  `mul`'s own input `y` is itself a loop-internal, tile-sized producer
+  (`buf0`), so `_has_loop_internal_real_input` forces `insert_tiling_propagation`
+  down the **Case 2** (copy-op) path — the row-2 variant that fires with zero
+  inside consumers of `z` — rather than Case 3.  Concretely, `mul` writes its
+  per-tile result into a separate HBM buffer (`allocation={'pool': 0}`) —
+  `pool` is not scratchpad; it is a bulk-allocated HBM region
+  (`memory_planning.py`'s `INTERMEDIATES_SEGMENT`) reserved for tensors used
+  within only a single kernel — and a separate loop-tagged `identity` op (the
+  third `OpSpec` above, generated from `coarse_tile_copy_buf1`) copies each
+  tile from that pool buffer into the correct slice of `z`'s own,
+  separately-allocated full HBM buffer (`allocation={'hbm': ...}`,
+  `arg_index=3`).  `mul`'s own output therefore does *not* have
+  `per_tile_fixed` set; the identity copy is the op whose
+  `MutationLayoutSHOULDREMOVE` targets the full buffer.  The per-iteration
+  copy offset into the full buffer is computed by `affine.apply` in
+  `bundle.mlir` (see next section).
 - HBM inputs `a`, `b`, `c` also have `device_size=[64, 1024, 64]` — the full
   tensor shape `[1024, 4096]` in Spyre stick layout.  Their
   `device_coordinates` use `c0` and `c1` to index the per-iteration tile
-  window into the full tensor.  The LX scratchpad tensor `y` has
-  `device_size=[16, 512, 64]`, the stick-layout shape for `[512, 1024]`
-  fp16: 16 sticks of 64 columns across 512 rows.
+  window into the full tensor.  The LX scratchpad tensor `y` and `mul`'s
+  per-tile `pool`-allocated output both have `device_size=[16, 512, 64]`,
+  the stick-layout shape for `[512, 1024]` fp16: 16 sticks of 64 columns
+  across 512 rows — but they live in different memories.  `y` uses
+  `allocation={'lx': ...}` (Case 1, produced and consumed entirely inside the
+  loop, so it gets a dedicated LX scratchpad slot, no HBM traffic at all);
+  `mul`'s per-tile output uses `allocation={'pool': ...}` (Case 2, an HBM
+  buffer sized for one tile, distinct from `z`'s full-size HBM buffer, that
+  the identity copy reads from once per iteration).
 
 ### Generated `bundle.mlir`
 
@@ -371,14 +430,18 @@ module {
         %sym_2 = arith.constant <base_addr_b> : index
         %sym_3 = arith.constant <base_addr_c> : index
         %sym_4 = arith.constant <base_addr_z> : index
+        %sym_5 = arith.constant <base_addr_pool> : index
         scf.for %i_0 = %c0 to %loop_bound_0 step %c1 {
             scf.for %i_1 = %c0 to %loop_bound_1 step %c1 {
                 %addr_0 = affine.apply #map_0(%i_0, %i_1)[%sym_1]
                 %addr_1 = affine.apply #map_0(%i_0, %i_1)[%sym_2]
                 sdscbundle.sdsc_execute (%addr_0, %addr_1) {sdsc_filename="sdsc_0.json", ...}  // add: a+b→y(lx)
                 %addr_2 = affine.apply #map_0(%i_0, %i_1)[%sym_3]
-                %addr_3 = affine.apply #map_0(%i_0, %i_1)[%sym_4]
-                sdscbundle.sdsc_execute (%addr_2, %addr_3) {sdsc_filename="sdsc_1.json", ...}  // mul: y(lx)*c→z
+                %addr_3 = affine.apply #map_0(%i_0, %i_1)[%sym_5]
+                sdscbundle.sdsc_execute (%addr_2, %addr_3) {sdsc_filename="sdsc_1.json", ...}  // mul: y(lx)*c→z_tile(pool)
+                %addr_4 = affine.apply #map_0(%i_0, %i_1)[%sym_5]
+                %addr_5 = affine.apply #map_0(%i_0, %i_1)[%sym_4]
+                sdscbundle.sdsc_execute (%addr_4, %addr_5) {sdsc_filename="sdsc_2.json", ...}  // identity: z_tile(pool)→z(hbm)
             }
         }
         return
@@ -386,12 +449,21 @@ module {
 }
 ```
 
-Both operations share the same affine map because they operate on tensors of
-the same shape and stride structure.  The scratchpad tensor `y` does not appear
-as a symbol — it has a fixed `lx` address that does not change between
-iterations.  Each inner-loop iteration dispatches `add` then `mul` at tile
-`(i_0, i_1)`, keeping the intermediate result `y` in scratchpad between the
-two dispatches.
+All three dispatches share the same affine map because they operate on
+tensors of the same shape and stride structure.  The LX scratchpad tensor
+`y` does not appear as a symbol — its `per_tile_fixed=True` flag tells the
+unroller its base address is fixed across iterations, so it needs no
+`affine.apply` at all.  `mul`'s `pool` output (`%sym_5`), by contrast, is
+real HBM (`memory_planning.py`'s `INTERMEDIATES_SEGMENT`, not scratchpad)
+and is *not* `per_tile_fixed`, so — like the other HBM operands `a`, `b`,
+`c`, `z` — it does need its own `affine.apply`-computed address each
+iteration, shared between the `mul` dispatch that writes it and the
+`identity` dispatch that reads it back.  Each inner-loop iteration
+dispatches `add`, then `mul`, then the `identity` copy at tile
+`(i_0, i_1)`: `add` keeps `y` in scratchpad for `mul` to consume
+immediately, and `mul` writes its result into that iteration's `pool` slot
+in HBM for the `identity` copy to drain into the correct slice of `z`'s
+full HBM buffer.
 
 ## Layer 1 — Pre-scheduling IR pass
 
