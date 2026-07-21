@@ -244,7 +244,14 @@ def spyre__copy_from(self, dst, non_blocking=False):
         torch_spyre._C.copy_tensor(self, dst, non_blocking)
         return dst
     elif self.device.type == "spyre" and self.device == dst.device:
-        torch.ops.spyre.copy_from_d2d(self, dst)
+        # When dst is a view (non-zero storage_offset), copy_from_d2d
+        # cannot target the correct device location. Route through the
+        # C++ copy_tensor path, which handles view offsets via D2H/H2D.
+        if dst.storage_offset() != 0:
+            src_cpu = self.cpu()
+            torch_spyre._C.copy_tensor(src_cpu, dst, non_blocking)
+        else:
+            torch.ops.spyre.copy_from_d2d(self, dst)
         return dst
     else:
         if non_blocking:

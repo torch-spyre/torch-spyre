@@ -661,6 +661,44 @@ class TestSpyre(TestCase):
             ),
         )
 
+    def test_h2d_copy_into_select_view(self):
+        """copy_() into a view produced by select must write to the correct
+        element of the underlying tensor, not element 0."""
+        x = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float16, device="spyre")
+        view = torch.ops.aten.select.int(x, 0, 2)
+        value = torch.tensor(1.0, dtype=torch.float16, device="spyre")
+        torch.ops.aten.copy_.default(view, value)
+        self.assertEqual(
+            x.cpu(),
+            torch.tensor([1.0, 2.0, 1.0, 4.0], dtype=torch.float16),
+        )
+
+    def test_h2d_copy_into_slice_view(self):
+        """copy_() into a slice view (non-zero storage_offset, size > 1)
+        must update exactly the sliced region."""
+        x = torch.tensor(
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=torch.float16, device="spyre"
+        )
+        src = torch.tensor([7.0, 8.0], dtype=torch.float16, device="spyre")
+        view = x[2:4]
+        torch.ops.aten.copy_.default(view, src)
+        self.assertEqual(
+            x.cpu(),
+            torch.tensor([0.0, 0.0, 7.0, 8.0, 0.0, 0.0], dtype=torch.float16),
+        )
+
+    def test_h2d_copy_into_view_from_cpu(self):
+        """copy_() from a CPU scalar into a select view on Spyre must land
+        at the correct index, not at element 0."""
+        x = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float16, device="spyre")
+        view = torch.ops.aten.select.int(x, 0, 3)
+        cpu_val = torch.tensor(9.0, dtype=torch.float16)
+        torch.ops.aten.copy_.default(view, cpu_val)
+        self.assertEqual(
+            x.cpu(),
+            torch.tensor([1.0, 2.0, 3.0, 9.0], dtype=torch.float16),
+        )
+
     def test_scalar_tensor(self):
         """Test to ensure we have scalar tensor on Spyre"""
         scalar = torch.tensor(3.14, dtype=torch.float16, device="spyre")

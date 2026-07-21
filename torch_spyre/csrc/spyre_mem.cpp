@@ -602,6 +602,46 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
 
   if (dst.is_privateuseone()) {
     stream = getCurrentStream(dst.device());
+
+    // H2D staging path for writes into a Spyre view: the DMA engine always
+    // writes to the base (element 0) of the device allocation and has no
+    // notion of storage_offset. When dst is a view (storage_offset != 0, or
+    // dma_numel > dst.numel()), we must:
+    //   1. D2H the full physical allocation to CPU.
+    //   2. Apply the write at the correct logical offset on the CPU side.
+    //   3. H2D the modified full allocation back to the device.
+    auto* dst_spyre_impl =
+        static_cast<SpyreTensorImpl*>(dst.unsafeGetTensorImpl());
+    int64_t dma_numel = 1;
+    for (auto s : dst_spyre_impl->dma_sizes) dma_numel *= s;
+    const bool dst_is_view =
+        (dst.storage_offset() != 0) || (dma_numel > dst.numel());
+
+    if (dst_is_view) {
+      c10::IntArrayRef alloc_sizes(dst_spyre_impl->dma_sizes);
+      c10::IntArrayRef alloc_strides(dst_spyre_impl->dma_strides);
+
+      // Step 1: D2H — read the full physical allocation for dst.
+      at::Tensor dst_alloc_view =
+          at::as_strided(dst, alloc_sizes, alloc_strides, /*storage_offset=*/0);
+      cpu_alloc =
+          at::empty(alloc_sizes, dst.options().device(c10::DeviceType::CPU));
+      SpyreStream d2h_stream = getCurrentStream(dst.device());
+      d2h_stream.copyAsync(dst_alloc_view, cpu_alloc);
+      d2h_stream.synchronize();
+
+      // Step 2: Apply the write at the logical view offset on the CPU side.
+      at::Tensor cpu_view = cpu_alloc.as_strided(dst.sizes(), dst.strides(),
+                                                 dst.storage_offset());
+      cpu_view.copy_(self.is_privateuseone() ? self.cpu() : self);
+
+      // Step 3: H2D — write the modified full allocation back.
+      stream.copyAsync(cpu_alloc, dst_alloc_view);
+      if (!non_blocking) {
+        stream.synchronize();
+      }
+      return dst;
+    }
   } else {
     stream = getCurrentStream(self.device());
     // D2H staging path: DMA the full physical allocation into a CPU buffer
