@@ -6268,8 +6268,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         spyre_compiled = torch.compile(fn)(
             x_dev, weight_dev, bias, padding, stride, groups
         ).cpu()
-        # spyre_eager = fn(x_dev, weight_dev, bias, padding, stride, groups).cpu()
-        print(torch.abs(cpu_result - spyre_compiled).amax())
+        spyre_eager = fn(x_dev, weight_dev, bias, padding, stride, groups).cpu()
         torch.testing.assert_close(
             spyre_compiled,
             cpu_result,
@@ -6278,10 +6277,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             rtol=0.1,
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
-        # torch.testing.assert_close(
-        #    spyre_eager,
-        #    cpu_result,
-        #    equal_nan=True,
+        torch.testing.assert_close(
+            spyre_eager,
+            cpu_result,
+            equal_nan=True,
+            atol=0.5,
+            rtol=0.1,
+            msg=lambda msg: f"eager mode spyre <-> cpu mismatch\n\n{msg}\n",
+        )
 
         # self.compare_with_cpu(
         #    fn,

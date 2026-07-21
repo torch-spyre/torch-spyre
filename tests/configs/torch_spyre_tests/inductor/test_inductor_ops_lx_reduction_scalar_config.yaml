@@ -23,7 +23,6 @@ test_suite_config:
             - LxPlanning.*::test_conv2d_2x32_ksize1_stride2_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_conv2d_2x3x32_ksize1_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_conv2d_mistral_model_lx_planning_(pointwise|reduction)
-            - LxPlanning.*::test_conv2d_mistral_model_lx_planning_(pointwise|reduction)
           mode: xfail
         - names:
             - LxPlanning.*::test_(all_dim|any_dim|count_nonzero|cummax|cummin|cumprod|logcumsumexp|max_default|median|mode_|nanmean|nanmedian|nanquantile|nansum|quantile|std_|topk|conv2d|dwise_conv2d|var_).*_lx_planning_(pointwise|reduction)
