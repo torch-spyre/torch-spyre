@@ -21,6 +21,8 @@ from sympy import Integer, Symbol, Expr
 from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.constants import (
+    CONV_DIM_LABELS,
+    CONV_OPS,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
     OUTPUT_DIM_LABELS,
@@ -346,12 +348,28 @@ def _is_pool(op: str) -> bool:
     return op in POOL_OPS
 
 
+def _is_conv(op: str) -> bool:
+    return op in CONV_OPS
+
+
 # Canonical avgpool iteration-space order (NHWC) -> SDSC labels.  Codegen owns
 # these label strings; survival of each role is read from the node's live output
 # ranges (see _align_pool_dim_labels), so no size info leaks above codegen.
 # Order matches POOL_DIM_LABELS and the emitted (NHWC) iteration space.
 _POOL_ROLE_LABELS = list(
     zip(["batch", "out_h", "out_w", "channel", "win_h", "win_w"], POOL_DIM_LABELS)
+)
+
+# Canonical conv2d iteration-space order -> SDSC labels, mirroring
+# _POOL_ROLE_LABELS.  Conv adds the ``in_channel`` contraction role between the
+# output channel and the kernel taps.  Codegen owns these strings; the lowering
+# supplies only per-role sizes (op_info["conv_dim_sizes"]).  Order matches
+# CONV_DIM_LABELS.
+_CONV_ROLE_LABELS = list(
+    zip(
+        ["batch", "out_h", "out_w", "channel", "in_channel", "win_h", "win_w"],
+        CONV_DIM_LABELS,
+    )
 )
 
 
@@ -399,6 +417,79 @@ def _align_pool_dim_labels(node_output_ranges, ndim: int) -> list[str]:
             "are out of sync with the emitted iteration space"
         )
     return labels
+
+
+def _align_conv_dim_labels(op_info: dict, ndim: int) -> list[str]:
+    """Return the conv dim labels aligned to the (possibly squeezed) iteration space.
+
+    Conv mirrors the pool contract: the lowering supplies ``conv_dim_sizes`` —
+    each conv-domain dim role (batch, out_h, out_w, channel, in_channel, win_h,
+    win_w) mapped to its canonical size — and codegen owns the SDSC label for
+    each role (``_CONV_ROLE_LABELS``).  The pipeline drops statically size-1 dims
+    (e.g. batch N=1, or ki/kj for a 1x1 kernel) before parse_op_spec runs, so a
+    role whose canonical size is 1 has no surviving dim and its label is filtered
+    out here.  Keeps labels aligned to the real iteration space without inferring
+    dim roles from sizes.
+    """
+    sizes = op_info.get("conv_dim_sizes", {})
+    labels = [
+        label
+        for role, label in _CONV_ROLE_LABELS
+        if not _is_static_one(sizes.get(role))
+    ]
+    if len(labels) != ndim:
+        raise ValueError(
+            f"conv dim label count {len(labels)} ({labels}) does not match "
+            f"iteration-space rank {ndim}; conv_dim_sizes in the lowering are "
+            "out of sync with the emitted iteration space"
+        )
+    return labels
+
+
+def _match_labels_by_size(
+    iteration_space: dict, dim_labels: list[str], dim_label_sizes: list
+) -> dict | None:
+    """Map each iteration-space symbol to a dim label by matching sizes.
+
+    A Reduction's iteration space appends its reduction axes in read-dep access
+    order (see iteration_space() in pass_utils), which is data-dependent -- for
+    conv2d the contraction dim (in) can land after the kernel taps (ki/kj)
+    instead of before them.  A purely positional label assignment then mislabels
+    dims (e.g. C_in -> kj, kernel width -> in), scrambling the SDSC.
+
+    Match by size instead, consuming the canonical labels in order so ties
+    (i==j, out==in, square kernels ki==kj) stay assigned in canonical order --
+    the output dims always precede the reduction dims in the iteration space, so
+    equal-sized output/reduction dims (e.g. out==in) resolve correctly, and the
+    kernel taps keep their canonical relative order.  ``dim_label_sizes`` are the
+    raw (pre-stick-padding) sizes, which is exactly what the iteration space
+    carries, so the comparison is exact.
+
+    Returns None (caller falls back to positional) if any size is non-static or
+    unmatched, so dynamic-shape ops keep their previous behaviour.
+    """
+    canonical: list[tuple[str, int]] = []
+    for lbl, sz in zip(dim_labels, dim_label_sizes):
+        try:
+            canonical.append((lbl, int(sz)))
+        except (TypeError, ValueError):
+            return None  # symbolic/dynamic dim -> fall back to positional
+    used = [False] * len(canonical)
+    mapping: dict = {}
+    for sym, raw in iteration_space.items():
+        size = raw[0] if isinstance(raw, tuple) else raw
+        try:
+            isize = int(size)
+        except (TypeError, ValueError):
+            return None
+        for k, (lbl, sz) in enumerate(canonical):
+            if not used[k] and sz == isize:
+                used[k] = True
+                mapping[sym] = Symbol(lbl)
+                break
+        else:
+            return None  # no matching label -> fall back
+    return mapping
 
 
 def _avgpool_sdsc_fields(iteration_space: dict, pool_params: dict) -> dict:
@@ -526,7 +617,10 @@ def _create_sdsc_tensors(
 ) -> tuple[list[SDSCArgs], dict, Symbol | None]:
     dims = list(iteration_space.keys())
     layouts: dict = {}
-    use_op_dims = not _is_matmul(op_spec.op)
+    # matmul and conv share the two-input tensor treatment: each arg keeps its
+    # own natural (per-tensor) dim order and the weight gets the KERNEL layout
+    # label. Reduced-dim appending (below) is a single-input-reduction concern.
+    use_op_dims = not (_is_matmul(op_spec.op) or _is_conv(op_spec.op))
 
     # Detect indirect access from device_coordinates: index tensors are those
     # whose name is referenced by an IndirectAccess in another tensor's coordinates,
@@ -680,11 +774,27 @@ def _create_sdsc_tensors(
             else:
                 max_dim_sizes[dim] = -1
 
+            # For a conv windowed input spatial dim (i/j, whose reduction window
+            # ki/kj is in the iteration space), dev_dim_size (the padded input
+            # extent) legitimately exceeds it_dim_size (the output count) by the
+            # window overlap.  That difference is already covered by the fullspan
+            # window read, so a backGap here is double-counting: DDC adds the gap
+            # to the input buffer size (getBufferCapacityForNodePerDim ->
+            # dimSize + gap), inflating the row stride by (kW-1) and mis-striding
+            # every ki>0 window tap.  Keep the offset/stride handling (needed for
+            # correct per-output-position stepping) but skip the backGap.
+            _window_of = {"i": "ki", "j": "kj"}
+            is_conv_windowed_spatial = (
+                _is_conv(op_spec.op)
+                and str(dim) in _window_of
+                and Symbol(_window_of[str(dim)]) in iteration_space
+            )
             dim_coord = arg.device_coordinates[-stride_idx - 2]
             if not isinstance(dim_coord, IndirectAccess) and dev_dim_size > it_dim_size:
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 offsets[dim] = dim_offset * dim_device_stride
-                backGap[dim] = dev_dim_size - it_dim_size
+                if not is_conv_windowed_spatial:
+                    backGap[dim] = dev_dim_size - it_dim_size
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
         if mb_sym is not None:
@@ -766,7 +876,7 @@ def _create_sdsc_tensors(
 
 
 def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
-    if _is_pool(op):
+    if _is_pool(op) or _is_conv(op):
         return op
     if (
         is_reduction
@@ -903,6 +1013,7 @@ def _extend_matmul_k_to_padded(
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
     is_pool = _is_pool(op_spec.op)
+    is_conv = _is_conv(op_spec.op)
     ndim = len(op_spec.iteration_space)
     # Detect indirect access from device_coordinates: index tensors are those
     # whose name is referenced by an IndirectAccess in another tensor's coordinates,
@@ -912,13 +1023,36 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     }
     has_indirect_access = bool(index_tensor_indices)
 
-    if is_pool:
+    symbol_mapping = None
+    if is_conv and op_spec.op_info:
+        # Conv supplies role-keyed conv_dim_sizes; codegen owns the labels
+        # (_CONV_ROLE_LABELS) and drops squeezed size-1 roles.  Unlike pool, conv
+        # is a Reduction whose iteration space appends its reduction axes
+        # (in/ki/kj) in data-dependent read-dep access order, so the contraction
+        # dim (in) can land after the kernel taps (ki/kj) and a positional label
+        # assignment mislabels dims.  Assign conv labels by matching each dim's
+        # raw (pre-padding) size, which the iteration space carries exactly;
+        # falls back to positional when sizes are non-static or unmatched.
+        dim_labels = _align_conv_dim_labels(op_spec.op_info, ndim)
+        conv_sizes = op_spec.op_info.get("conv_dim_sizes")
+        if conv_sizes is not None:
+            symbol_mapping = _match_labels_by_size(
+                op_spec.iteration_space,
+                [label for _role, label in _CONV_ROLE_LABELS],
+                [conv_sizes.get(role) for role, _label in _CONV_ROLE_LABELS],
+            )
+    elif is_pool:
+        # Pool survival is read from the node's live output ranges (NCHW); the
+        # lowering supplies no size snapshot.  Positional mapping (below) is
+        # correct because pool is a single-input reduction with a fixed
+        # iteration-space order.
         dim_labels = _align_pool_dim_labels(op_spec.node_output_ranges, ndim)
     else:
         dim_labels = _get_op_dim_labels(ndim, is_matmul)
-    symbol_mapping = {
-        sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)
-    }
+    if symbol_mapping is None:
+        symbol_mapping = {
+            sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)
+        }
     # Minted per-(op, level) tile-advance symbols (see spyre_kernel.py's
     # _get_or_mint_level_symbol) are not iteration-space dimensions -- they are
     # loop-nesting-level markers -- so they have no dim label to rename to.
@@ -1024,7 +1158,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     # In case of same type conversion (identity op) user gets compile time error & avoid
     # changing the padding logic here to fix errors with torch.split() for 3d shapes.
     is_dtype_op = DtypeOpTable.is_dtype_op(op_spec.op) and op_spec.op != IDENTITY_OP
-    if is_matmul or is_dtype_op:
+    if is_matmul or is_conv or is_dtype_op:
+        # Two-input reductions pad every arg so the activation (INPUT), weight
+        # (KERNEL) and output stick dims are each rounded to the stick boundary.
         pad_args, pad_sdsc_args, dim_order = (
             list(op_spec.args),
             args,
@@ -1096,7 +1232,11 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     if coordinate_masking:
         constants["samv-maskvalue"] = _get_mask_value(op_spec.op)
 
-    num_inputs = len(args[:-1]) if is_matmul or not op_spec.is_reduction else len(args)
+    num_inputs = (
+        len(args[:-1])
+        if is_matmul or is_conv or not op_spec.is_reduction
+        else len(args)
+    )
 
     if _is_topk(op_spec.op):
         num_inputs = 1  # topk has exactly 1 input tensor and 1 output tensor
@@ -1111,12 +1251,33 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                 work_slices[_k_sym] = 1
         num_cores = math.prod(dim_splits.values())
 
-    # Pool-specific SDSC field values.  Computed here (where the op is already
-    # identified) as plain data threaded onto SDSCSpec; generate_sdsc consumes
-    # them generically.  Empty for non-pool ops -> SDSCSpec defaults apply.
-    pool_sdsc_fields = (
-        _avgpool_sdsc_fields(sdsc_iteration_space, pool_params_out) if is_pool else {}
-    )
+    if is_conv:
+        # Conv accumulates the full kernel window per core; splitting ki/kj gives
+        # partial sums (same constraint as pool). The in-channel reduction MAY be
+        # core-split (like matmul K via psum accumulation), so it is left to the
+        # default work division.
+        for _k_sym in (Symbol("ki"), Symbol("kj")):
+            if _k_sym in dim_splits:
+                dim_splits[_k_sym] = 1
+                work_slices[_k_sym] = 1
+        num_cores = math.prod(dim_splits.values())
+
+    # Windowed-op SDSC field values (pool or conv).  Computed here as plain data
+    # threaded onto SDSCSpec; generate_sdsc consumes them generically.  Empty for
+    # other ops -> SDSCSpec defaults apply. is_pool and is_conv are mutually
+    # exclusive by op name.
+    if is_pool:
+        window_sdsc_fields = _avgpool_sdsc_fields(sdsc_iteration_space, pool_params_out)
+    elif is_conv and op_spec.op_info:
+        # Conv's windowed-input half is the same sliding-window pattern as pool
+        # (dilation==1 is guaranteed by the direct-lowering gate), so it reuses
+        # the avgpool builder rather than duplicating it.  conv_params carries the
+        # same kernel_/stride_/pad_ keys the builder reads.
+        window_sdsc_fields = _avgpool_sdsc_fields(
+            sdsc_iteration_space, op_spec.op_info.get("conv_params", {})
+        )
+    else:
+        window_sdsc_fields = {}
 
     # Project dim_splits into final SDSC iteration-space order; normalization
     # can add unit axes to either mapping independently.
@@ -1145,7 +1306,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     return (
         SDSCSpec(
             opfunc=_get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales),
-            execution_unit="pt" if is_matmul else "sfp",
+            execution_unit="pt" if (is_matmul or is_conv) else "sfp",
             data_format=args[
                 1 if indirect_access_indices else 0
             ].data_format,  # TODO: op_spec needs operation data format. Use value tensor (args[1]) for indirect access ops
@@ -1162,7 +1323,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             symbolic_dims=symbolic_dims,
             indirect_access_indices=indirect_access_indices,
             debug_handle=op_spec.debug_handle,
-            **pool_sdsc_fields,
+            **window_sdsc_fields,
         ),
         symbol_mapping,
     )

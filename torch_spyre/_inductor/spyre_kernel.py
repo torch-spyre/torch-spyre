@@ -35,6 +35,7 @@ from .constants import (
     SPYRE_FP32_OPS,
     BATCH_MATMUL_OP,
     BATCH_MATMUL_FP8_OP,
+    CONV2D_FWD_OP,
     IDENTITY_OP,
     POOL_OPS,
     RESTICKIFY_OP,
@@ -1114,7 +1115,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                 f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
             )
 
-        if value.op in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP]:
+        if value.op in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP, CONV2D_FWD_OP]:
+            # Two-input reductions: matmul (activation @ weight) and conv2d
+            # (activation * weight, reduced over in/ki/kj). Both build
+            # [input, weight, output] tensor args.
             if (
                 len(value.arguments) != 2
                 or (not isinstance(value.arguments[0], TensorAccess))

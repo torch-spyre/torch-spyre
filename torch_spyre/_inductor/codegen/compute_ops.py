@@ -240,7 +240,15 @@ def gen_coord_info_value(
     is_stick_dim: bool,
     is_stick_reduction: bool = False,
     padding: str = "nopad",
+    core_stride: int | None = None,
 ):
+    # How far the coordinate advances per core (the core_fold Affine alpha).
+    # Defaults to `size` (contiguous, non-overlapping tiling). For an overlapping
+    # reduction window (conv stride < kernel) the per-core window span (`size`)
+    # is larger than the per-core output stride, so the two must differ: cores
+    # step by `core_stride` (= out_per_core * stride) while each reads `size`
+    # (windowed) elements. See _coord_per_core_size / _coord_core_stride.
+    core_alpha = core_stride if core_stride is not None else size
     return (
         {
             "spatial": 3,
@@ -251,7 +259,7 @@ def gen_coord_info_value(
                 "dim_prop_func": [
                     {
                         "Affine": {
-                            "alpha_": size,
+                            "alpha_": core_alpha,
                             "beta_": 0,
                         }
                     },
@@ -1030,19 +1038,30 @@ def generate_sdsc(
                 for c in range(sdsc_spec.num_cores)
             }
 
-    def _filter_window_dims(dims: list) -> list:
-        """Drop the op's reduction-window dims (e.g. pool ki/kj) from a dim order.
+    def _filter_window_dims(dims: list, layout_key: str | None = None) -> list:
+        """Drop the op's reduction-window dims (e.g. pool/conv ki/kj) from a dim order.
 
         sdsc_spec.window_dims is empty for ops without a reduction window, so
         this is a no-op for them.
+
+        Exception: the KERNEL (weight) layout of conv2d carries ki/kj as explicit
+        physical axes (weight is [kj, ki, in, out]), so they must NOT be stripped
+        there.  For the activation (INPUT) and OUTPUT layouts ki/kj appear only as
+        folded window offsets and are correctly removed.
         """
+        if layout_key == "KERNEL":
+            return list(dims)
         return [d for d in dims if str(d) not in sdsc_spec.window_dims]
 
     def _tensor_layout_dims(layout_key: str) -> list:
         """Return the layout dim_order for a layout label, minus window dims."""
-        return _filter_window_dims(sdsc_spec.layouts[layout_key]["dim_order"])
+        return _filter_window_dims(
+            sdsc_spec.layouts[layout_key]["dim_order"], layout_key
+        )
 
-    def _tensor_sched_layout_dims(dim_order: list) -> list:
+    def _tensor_sched_layout_dims(
+        dim_order: list, layout_key: str | None = None
+    ) -> list:
         """Return a tensor's own dim_order for scheduleTree_, minus window dims.
 
         scheduleTree_ layoutDimOrder_ must use the per-tensor dim_order, NOT the
@@ -1050,13 +1069,70 @@ def generate_sdsc(
         symbol Counter, different ordering), so sdsc_spec.layouts[label]["dim_order"]
         is only correct for the tensor that created that label.
         """
-        return _filter_window_dims(dim_order)
+        return _filter_window_dims(dim_order, layout_key)
+
+    def _tensor_input_padding(tensor) -> dict:
+        """input_coord_padding restricted to the dims this tensor actually has.
+
+        For multi-input windowed ops (conv2d) only the activation carries the
+        padded spatial dims (i/j); the weight (KERNEL) has none, so it gets no
+        padding_ entry.  For single-input pools this is a no-op (the sole input
+        has i/j).
+        """
+        tdims = {
+            str(d) for d in _tensor_sched_layout_dims(tensor.dim_order, tensor.layout)
+        }
+        return {
+            dim: pad
+            for dim, pad in sdsc_spec.input_coord_padding.items()
+            if dim in tdims
+        }
 
     def _coord_size(dim, default: int, is_input: bool) -> int:
         """Per-dim coordinate size, overridable for input tensors (pool pads H/W)."""
         if is_input:
             return sdsc_spec.input_coord_sizes.get(str(dim), default)
         return default
+
+    def _coord_per_core_size(dim, is_input: bool) -> int:
+        """Per-core coordinate size for a tensor dim.
+
+        For a windowed conv input spatial dim (i/j, present in padding_sizes) the
+        per-core input footprint is the window span of the per-core output slice:
+        ``(out_per_core - 1)*stride + dilation*(k - 1) + 1``.  This is the number
+        of input elements the reduction window (ki/kj) is distributed over on
+        each core.  Dividing the *total* padded input span by the core count
+        instead (the plain path) undercounts for an overlapping window
+        (stride < kernel): e.g. in=8, cores=6 gives 1 < kernel, so the ki loop
+        has nothing to distribute.  Conv-only: avgpool keeps the plain path (for
+        its non-overlapping stride==kernel windows the two coincide anyway).
+        """
+        ws = sdsc_spec.work_slices.get(dim, 1)
+        ps = sdsc_spec.padding_sizes.get(str(dim)) if is_input else None
+        if sdsc_spec.opfunc == "conv2d" and ps is not None and "windowDim_" in ps:
+            out_per_core = sdsc_spec.iteration_space[dim] // ws
+            stride = int(ps.get("stride_", 1))
+            dilation = int(ps.get("dilation_", 1))
+            k = int(sdsc_spec.iteration_space.get(Symbol(ps["windowDim_"]), 1))
+            return (out_per_core - 1) * stride + dilation * (k - 1) + 1
+        return _coord_size(str(dim), sdsc_spec.iteration_space[dim], is_input) // ws
+
+    def _coord_core_stride(dim, is_input: bool) -> int | None:
+        """Core-fold stride (advance per core) for a windowed input spatial dim.
+
+        Returns ``out_per_core * stride`` -- how far the input window origin moves
+        between adjacent cores -- so overlapping windows (conv stride < kernel)
+        step correctly while each core still reads the full window span
+        (_coord_per_core_size).  Returns None for non-windowed dims (and for
+        avgpool), where gen_coord_info_value defaults the core stride to the
+        per-core size -- so avgpool's original behavior is unchanged.
+        """
+        ps = sdsc_spec.padding_sizes.get(str(dim)) if is_input else None
+        if sdsc_spec.opfunc == "conv2d" and ps is not None and "windowDim_" in ps:
+            ws = sdsc_spec.work_slices.get(dim, 1)
+            out_per_core = sdsc_spec.iteration_space[dim] // ws
+            return out_per_core * int(ps.get("stride_", 1))
+        return None
 
     def _coord_padding(dim, is_input: bool) -> str:
         """Per-dim coordinate padding tag, overridable for input tensors."""
@@ -1228,7 +1304,7 @@ def generate_sdsc(
                                     "layoutDimOrder_": [
                                         str(dim)
                                         for dim in _tensor_sched_layout_dims(
-                                            tensor.dim_order
+                                            tensor.dim_order, tensor.layout
                                         )
                                     ],
                                     "maxDimSizes_": [
@@ -1255,10 +1331,10 @@ def generate_sdsc(
                                         "data_": _start_addr_data(tensor),
                                     },
                                     **(
-                                        {"padding_": sdsc_spec.input_coord_padding}
+                                        {"padding_": _tensor_input_padding(tensor)}
                                         if (
                                             i < sdsc_spec.num_inputs
-                                            and sdsc_spec.input_coord_padding
+                                            and _tensor_input_padding(tensor)
                                         )
                                         else {}
                                     ),
@@ -1294,12 +1370,10 @@ def generate_sdsc(
                                         "coordInfo": {
                                             str(dim): gen_coord_info_value(
                                                 size=(
-                                                    _coord_size(
-                                                        str(dim),
-                                                        sdsc_spec.iteration_space[dim],
+                                                    _coord_per_core_size(
+                                                        dim,
                                                         i < sdsc_spec.num_inputs,
                                                     )
-                                                    // sdsc_spec.work_slices[dim]
                                                 )
                                                 if (tensor.scales[dim] == 1)
                                                 else 1,
@@ -1319,6 +1393,12 @@ def generate_sdsc(
                                                     str(dim),
                                                     i < sdsc_spec.num_inputs,
                                                 ),
+                                                core_stride=_coord_core_stride(
+                                                    dim,
+                                                    i < sdsc_spec.num_inputs,
+                                                )
+                                                if (tensor.scales[dim] == 1)
+                                                else None,
                                             )
                                             for dim in _tensor_layout_dims(
                                                 tensor.layout
