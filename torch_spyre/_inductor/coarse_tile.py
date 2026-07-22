@@ -82,7 +82,6 @@ from .propagate_hints import DimHint
 from .pass_utils import op_out_coords, host_coordinates, indirect_sizes_from_op
 from .span_overflow_hint_analysis import (
     SpanOverflowTilePlan,
-    _is_batch_matmul_reduction,
     can_conform_pointwise_tile,
     plan_span_overflow_tile,
 )
@@ -146,10 +145,9 @@ def _reduction_shares_group_tiled_dim(
     This check itself is reduction-type-agnostic — what makes the join safe is
     that the tiled dim is an **output range**, not the reduction range: tile
     ``t`` of an output dim is self-contained (it reads only tile ``t`` of the
-    producer).  The caller currently gates the join to batch-matmul reductions
-    (only that path is hardware-validated; see the reduction-join branch in
-    ``span_overflow_groups``), so in practice ``op`` is always a matmul here,
-    but nothing in this function relies on that.
+    producer).  The caller (the reduction-join branch in
+    ``span_overflow_groups``) applies this to any Reduction op, not just
+    batch-matmul.
 
     The automatic span-overflow planner only ever tiles output ranges (see
     ``SpanOverflowTileLevel``: ``is_reduction`` is always False on the auto
@@ -623,19 +621,20 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
         (``can_conform_pointwise_tile``) — the op then adopts the run's split
         instead of its own.
 
-    A Reduction/BMM op does not *start* or extend a Pointwise run.  A
-    **batch-matmul** reduction may **join** an open run's group when it reads a
-    producer in that run and tiles the same shared logical (output) dim at the
-    same split count — e.g. an F.linear matmul reading its auto-tiled
-    restickified weight (see the reduction-join branch below and
-    ``_reduction_shares_group_tiled_dim``).  The join is gated to matmul
-    because only that path is hardware-validated; the mechanism is otherwise
-    reduction-type-agnostic and extending it to other reductions is future work
-    (see the branch comment).  On joining, the group is flushed immediately, so
-    a matmul is always the last member of its group and each auto-tiled
-    producer feeds at most one matmul consumer.  A Reduction that cannot join
-    (including any non-matmul reduction) gets an independent singleton group or,
-    if it reads an auto-tiled producer, raises ``Unsupported``.  An op that
+    A Reduction op does not *start* or extend a Pointwise run.  Any Reduction
+    (matmul/BMM, sum, mean, ...) may **join** an open run's group when it
+    reads a producer in that run and tiles the same shared logical (output)
+    dim at the same split count — e.g. an F.linear matmul reading its
+    auto-tiled restickified weight, or a plain ``sum`` reading a tiled
+    pointwise producer (see the reduction-join branch below and
+    ``_reduction_shares_group_tiled_dim``).  The join is reduction-type-
+    agnostic: what makes it safe is that the tiled dim is an output range, not
+    the reduction range (tile ``t`` is self-contained either way).  On
+    joining, the group is flushed immediately, so a reduction is always the
+    last member of its group and each auto-tiled producer feeds at most one
+    reduction consumer.  A Reduction that cannot join gets an independent
+    singleton group or, if it reads an auto-tiled producer, raises
+    ``Unsupported``.  An op that
     reads a buffer from an already-closed group, or from the open run without
     being fusable into it, still raises ``Unsupported``: two independent loop
     nests over the same span-overflow-sized data can desynchronize, and for ops
@@ -799,7 +798,6 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
             )
 
         is_reduction_op = isinstance(op.data, Reduction)
-        is_matmul_reduction = _is_batch_matmul_reduction(op)
 
         can_join_pw_group = (
             not is_reduction_op
@@ -843,45 +841,43 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
             )
             continue
 
-        # A batch-matmul consumer (e.g. an F.linear matmul reading its
-        # restickified weight) can join its tiled producer's open group when it
-        # tiles the same shared logical dimension at the same split count(s).
-        # The shared dim sits at a different position in the matmul's output
-        # ranges (the producer tiles its V output dim; the matmul tiles the
+        # Any Reduction consumer (e.g. an F.linear matmul reading its
+        # restickified weight, or a plain sum reading a tiled pointwise
+        # producer) can join its tiled producer's open group when it tiles the
+        # same shared logical dimension at the same split count(s). The shared
+        # dim sits at a different position in the consumer's output ranges
+        # (the producer tiles its V output dim; the consumer tiles the
         # corresponding output N dim), so signatures match on split_count, not
         # host_dim.  Both are output-dim tiles, so they share one synchronized
         # loop nest and the producer's per-tile slice feeds the consumer's
         # per-tile compute — no unsynchronized second loop, no full-buffer
         # materialization.
         #
-        # Scope: the join is gated to batch-matmul reductions only. The join is
-        # correct-by-construction for *any* reduction tiled on a shared output
-        # range (tile t is self-contained, so sum/mean/max would pair
-        # slice-for-slice too), and the grouping logic here does not depend on
-        # the reduction type — but only the matmul path (the #1918 LM-head case)
-        # has been validated end-to-end on hardware. Extending to other
-        # reductions is future work: drop the _is_batch_matmul_reduction gate
-        # and validate a non-matmul reduction (e.g. a sum reading a
-        # span-overflowing pointwise producer) numerically on device. Until
-        # then, non-matmul reductions fall through to the fail-safe Unsupported
-        # path below rather than silently taking an unvalidated route.
+        # Scope: the join is reduction-type-agnostic — correct-by-construction
+        # for any reduction tiled on a shared output range, since tile t is
+        # self-contained (sum/mean/max pair slice-for-slice, same as matmul).
+        # Unit coverage: test_non_matmul_reduction_joins_tiled_producer_group.
+        # On-device numeric validation:
+        # TestSpanOverflowNumericValidation.
+        # test_pointwise_to_non_matmul_reduction_join_numeric.
         #
         # Split-count equality alone is insufficient: two unrelated dims could
         # split into the same count.  _reduction_shares_group_tiled_dim verifies
         # the consumer's tiled loop var actually indexes the producer's tiled dim
         # through the read, so the shared loop pairs matching slices.  It also
-        # fails closed if the matmul tiles its reduction (K) range rather than an
-        # output range (see its docstring) — only output-range tiles may join.
+        # fails closed if the consumer tiles its reduction (K) range rather than
+        # an output range (see its docstring) — only output-range tiles may join.
         #
-        # The group is flushed immediately after the matmul joins: a reduction
-        # terminates the extendable run (its output shape/tiling differs from
-        # the producers'), so nothing further can be folded into this loop nest.
-        # A consequence is one-consumer-per-group — a *second* op reading the
-        # same producer is rejected below.  Supporting several sibling matmuls
-        # sharing one auto-tiled producer is a deliberate non-goal here (matches
-        # the validated single-matmul LM-head case); see #3217.
+        # The group is flushed immediately after the reduction joins: a
+        # reduction terminates the extendable run (its output shape/tiling
+        # differs from the producers'), so nothing further can be folded into
+        # this loop nest. A consequence is one-consumer-per-group — a *second*
+        # op reading the same producer is rejected below.  Supporting several
+        # sibling reductions sharing one auto-tiled producer is a deliberate
+        # non-goal here (matches the validated single-consumer LM-head case);
+        # see #3217.
         if (
-            is_matmul_reduction
+            is_reduction_op
             and current_signature is not None
             and (read_deps & current_group_names)
             and [s for _, s, _ in signature] == [s for _, s, _ in current_signature]

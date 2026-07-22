@@ -256,7 +256,7 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
         if self._time_limit_seconds:
             solver.parameters.max_time_in_seconds = float(self._time_limit_seconds)
         solver.parameters.num_search_workers = (
-            1 if torch.are_deterministic_algorithms_enabled() else os.cpu_count()
+            1 if torch.are_deterministic_algorithms_enabled() else (os.cpu_count() or 1)
         )
         # Fixed seed so a given worker configuration is reproducible run-to-run.
         solver.parameters.random_seed = 0

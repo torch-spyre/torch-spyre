@@ -1028,3 +1028,19 @@ def test_broadcast_expand_both():
         optimal_cost=2 * acs.numel(),
         check_strides=False,
     )
+
+
+# ------- Single-arg op with a size-1 interior dim ---------
+
+
+def test_single_arg_size1_interior_dim():
+    """Slicing one position out of a [B, H, L, D] tensor yields a size-1 interior dim.
+
+    The size-1 seq dim is offered as a stick candidate for the single-arg op that
+    produces it; its stick expression concretizes to 1, which device_coordinates
+    rejects. That candidate must be skipped, not abort the compile. Mirrors the
+    per-position KV-cache write in decoder inference (input [1, 2, L, 128] ->
+    [1, 2, 1, 128]).
+    """
+    x = torch.randn((1, 2, T, 128), dtype=torch.float16)
+    _compare(lambda x: x[:, :, 1:2, :].contiguous(), x)

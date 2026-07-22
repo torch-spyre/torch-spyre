@@ -106,9 +106,14 @@ defaults:
     shell: bash
 
 env:
-  # The baked torch-spyre source+venv dir in the dev image (runner is FROM
+  # The baked torch-spyre source dir in the dev image (runner is FROM
   # torch-spyre-dev). Used by the prebaked_image path in place of a checkout.
   PREBAKED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
+  # The baked SHARED venv in the dev image. It lives at $HOME/.venv (the dev
+  # image exports it as $VIRTUAL_ENV), NOT nested under PREBAKED_TORCH_SPYRE_DIR
+  # — so run-test-suite's default relative '.venv' cannot resolve after it cd's
+  # into the source dir. The prebaked path passes this absolute path instead.
+  PREBAKED_VENV_PATH: /home/senuser/.venv
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -258,15 +263,24 @@ jobs:
       matrix: ${{ fromJSON(needs.generate_matrix.outputs.matrix) }}
 
     steps:
-      # Composite actions: on the prebaked path the baked dir already has
-      # .github/actions (full source is baked), so this checkout is only needed
-      # on the normal path.
+      # Composite actions: NORMAL path sparse-checks-out .github/actions into the
+      # workspace. PREBAKED path symlinks the baked .github into the workspace
+      # instead — `uses: ./.github/actions/*` resolves against $GITHUB_WORKSPACE
+      # (never the shell cwd or an arbitrary baked dir), so without this the
+      # baked-but-unlinked actions can't be found ("did you forget to run
+      # actions/checkout"). The symlink runs the EXACT baked harness — no fetch,
+      # preserving the prebaked provenance guarantee — and lives in the runner's
+      # disposable workspace, so the baked tree is only referenced, never mutated.
       - name: Checkout composite actions
         if: ${{ !inputs.prebaked_image }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           sparse-checkout: .github/actions
           sparse-checkout-cone-mode: false
+
+      - name: Expose baked composite actions in the workspace
+        if: ${{ inputs.prebaked_image }}
+        run: ln -sfn "${PREBAKED_TORCH_SPYRE_DIR}/.github" "${GITHUB_WORKSPACE}/.github"
 
       # Product source: NORMAL path checks out the PR ref. PREBAKED path uses the
       # baked /home/senuser/torch-spyre (source + editable venv already in image)
@@ -307,18 +321,25 @@ jobs:
         with:
           suite_name: ${{ matrix.suite.name }}
           config: tests/configs/torch_spyre_tests/${{ matrix.suite.config }}
-          # Prebaked: run FROM the baked dir (its .venv + editable torch_spyre);
-          # normal: from the checkout (default 'torch-spyre').
+          # Prebaked: run FROM the baked source dir + its SHARED venv at
+          # $HOME/.venv (a sibling of the source, not inside it); normal: the
+          # checkout (default 'torch-spyre') + its local '.venv'.
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
+          venv_path: ${{ inputs.prebaked_image && env.PREBAKED_VENV_PATH || '.venv' }}
           extra_test_flags: ${{ inputs.extra_test_flags }}
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
           pre_run: |
-            # Clear the cached AIU setup guard and stale topo.json so
-            # ibm-aiu-setup.sh re-discovers all cards on the x4 runner.
+            # Reset the AIU setup guard and stale topo so ibm-aiu-setup.sh
+            # re-discovers cards. set +u because the script references unset
+            # vars; || exit 1 because run-test-suite runs with set +e and a
+            # failed refresh must not let tests run with stale topology.
+            # Inlined into an eval single-quoted string: no apostrophes, no
+            # double-dash tokens.
+            set +u
             unset _IBM_AIU_SETUP
             rm -rf /tmp/etc/ibm/spyre/topo.json
-            source /etc/profile.d/ibm-aiu-setup.sh
+            source /etc/profile.d/ibm-aiu-setup.sh || exit 1
 
       - name: Upload JUnit XML report
         if: always()
@@ -379,12 +400,19 @@ jobs:
             config: distributed_tests/test_allgather.yaml
 
     steps:
+      # See the `test` job above: prebaked path symlinks the baked .github into
+      # $GITHUB_WORKSPACE so `uses: ./.github/actions/*` resolves to the baked
+      # harness (no fetch); normal path sparse-checks-out .github/actions.
       - name: Checkout composite actions
         if: ${{ !inputs.prebaked_image }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           sparse-checkout: .github/actions
           sparse-checkout-cone-mode: false
+
+      - name: Expose baked composite actions in the workspace
+        if: ${{ inputs.prebaked_image }}
+        run: ln -sfn "${PREBAKED_TORCH_SPYRE_DIR}/.github" "${GITHUB_WORKSPACE}/.github"
 
       - if: ${{ !inputs.prebaked_image }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -421,18 +449,23 @@ jobs:
           suite_name: ${{ matrix.suite.name }}
           config: tests/configs/${{ matrix.suite.config }}
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
+          venv_path: ${{ inputs.prebaked_image && env.PREBAKED_VENV_PATH || '.venv' }}
           extra_test_flags: ${{ inputs.extra_test_flags_multi_spyre }}
           parallel: 'false'
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
           pre_run: |
-            # Multi-Spyre tests require a fresh topology probe: clear the
-            # cached AIU setup guard and the stale topo.json so
-            # ibm-aiu-setup.sh re-discovers all attached cards.
-
+            # Multi-Spyre tests require a fresh topology probe: reset the AIU
+            # setup guard and stale topo so ibm-aiu-setup.sh re-discovers all
+            # attached cards. set +u because the script references unset vars;
+            # || exit 1 because run-test-suite runs with set +e and a failed
+            # refresh must not let tests run with stale topology.
+            # Inlined into an eval single-quoted string: no apostrophes, no
+            # double-dash tokens.
+            set +u
             unset _IBM_AIU_SETUP
             rm -rf /tmp/etc/ibm/spyre/topo.json
-            source /etc/profile.d/ibm-aiu-setup.sh
+            source /etc/profile.d/ibm-aiu-setup.sh || exit 1
 
       - name: Upload JUnit XML report
         if: always()

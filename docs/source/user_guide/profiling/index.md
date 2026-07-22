@@ -23,18 +23,20 @@ workloads running on the Spyre accelerator. The full design of the
 planned toolkit is in
 [RFC 0601 — Spyre Profiling Toolkit][rfc-0601].
 
-The in-tree `torch_spyre.profiler` package is currently a scaffold —
-`torch_spyre.profiler.is_available()` returns `False`, and there is no
-public API yet. Profiling today goes through `torch.profiler` plus the
-external integrations described on this page (`kineto-spyre`,
-`aiu-smi`, `aiu-trace-analyzer`); the in-tree API will be populated as
-RFC 0601 lands.
+The in-tree `torch_spyre.profiler` package is still mostly a scaffold —
+`torch_spyre.profiler.is_available()` returns `False`. One public API is
+already available: First Failure Data Capture (FFDC) via
+`torch.spyre.get_diagnostic_report` (see below). Broader profiling APIs
+will land with RFC 0601. Day-to-day performance work still goes through
+`torch.profiler` plus the external integrations on this page
+(`kineto-spyre`, `aiu-smi`, `aiu-trace-analyzer`).
 
 ## What can be profiled today
 
 | Capability | Status | Where |
 |---|---|---|
 | Compiler pipeline logs | Available | [Environment variables](environment_variables.md) |
+| FFDC diagnostic reports on Spyre compile/runtime/unimplemented failures | Available (`USE_SPYRE_PROFILER=1`) | [API: `get_diagnostic_report`](../../api/torch_spyre.rst) · [Environment variables](environment_variables.md) |
 | CPU-side timing with `torch.profiler` | Available | [PyTorch Profiler](pytorch_profiler.md) |
 | Device telemetry (power, temperature, bandwidth) | Available — PF and VF mode (IBM-internal distribution; public release tracked in [#1335][issue-1335]) | [Device monitoring](device_monitoring.md) |
 | Device-side kernel timing via `ProfilerActivity.PrivateUse1` | Preview (requires [`kineto-spyre`][kineto-spyre] wheel) | [PyTorch Profiler](pytorch_profiler.md) |
@@ -43,6 +45,24 @@ RFC 0601 lands.
 | Kineto bridge (`SpyreActivityProfiler`) | In progress — in-tree Kineto integration for `ProfilerActivity.PrivateUse1` device-side events (PR [#1856][pr-1856]) | upstream Kineto integration |
 | Scratchpad utilization metrics | Planned | [RFC 0601][rfc-0601] |
 | IR-instrumentation-based fine-grained profiler | Planned | [RFC 0601][rfc-0601] |
+
+### FFDC quick example
+
+When `USE_SPYRE_PROFILER=1`, Spyre compile, kernel-launch, and
+unimplemented-operation failures write a JSON diagnostic report
+(exception, env, nearby compile artifacts). Retrieve the newest
+report with:
+
+```python
+import torch
+
+report = torch.spyre.get_diagnostic_report()
+if report is not None:
+    print(report["failure"]["category"], report["failure"]["message"])
+```
+
+See the [API reference](../../api/torch_spyre.rst) for the default
+output directory and schema details.
 
 ### Memory API quick example
 
