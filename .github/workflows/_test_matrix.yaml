@@ -106,9 +106,14 @@ defaults:
     shell: bash
 
 env:
-  # The baked torch-spyre source+venv dir in the dev image (runner is FROM
+  # The baked torch-spyre source dir in the dev image (runner is FROM
   # torch-spyre-dev). Used by the prebaked_image path in place of a checkout.
   PREBAKED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
+  # The baked SHARED venv in the dev image. It lives at $HOME/.venv (the dev
+  # image exports it as $VIRTUAL_ENV), NOT nested under PREBAKED_TORCH_SPYRE_DIR
+  # — so run-test-suite's default relative '.venv' cannot resolve after it cd's
+  # into the source dir. The prebaked path passes this absolute path instead.
+  PREBAKED_VENV_PATH: /home/senuser/.venv
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -316,18 +321,25 @@ jobs:
         with:
           suite_name: ${{ matrix.suite.name }}
           config: tests/configs/torch_spyre_tests/${{ matrix.suite.config }}
-          # Prebaked: run FROM the baked dir (its .venv + editable torch_spyre);
-          # normal: from the checkout (default 'torch-spyre').
+          # Prebaked: run FROM the baked source dir + its SHARED venv at
+          # $HOME/.venv (a sibling of the source, not inside it); normal: the
+          # checkout (default 'torch-spyre') + its local '.venv'.
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
+          venv_path: ${{ inputs.prebaked_image && env.PREBAKED_VENV_PATH || '.venv' }}
           extra_test_flags: ${{ inputs.extra_test_flags }}
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
           pre_run: |
-            # Clear the cached AIU setup guard and stale topo.json so
-            # ibm-aiu-setup.sh re-discovers all cards on the x4 runner.
+            # Reset the AIU setup guard and stale topo so ibm-aiu-setup.sh
+            # re-discovers cards. set +u because the script references unset
+            # vars; || exit 1 because run-test-suite runs with set +e and a
+            # failed refresh must not let tests run with stale topology.
+            # Inlined into an eval single-quoted string: no apostrophes, no
+            # double-dash tokens.
+            set +u
             unset _IBM_AIU_SETUP
             rm -rf /tmp/etc/ibm/spyre/topo.json
-            source /etc/profile.d/ibm-aiu-setup.sh
+            source /etc/profile.d/ibm-aiu-setup.sh || exit 1
 
       - name: Upload JUnit XML report
         if: always()
@@ -437,18 +449,23 @@ jobs:
           suite_name: ${{ matrix.suite.name }}
           config: tests/configs/${{ matrix.suite.config }}
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
+          venv_path: ${{ inputs.prebaked_image && env.PREBAKED_VENV_PATH || '.venv' }}
           extra_test_flags: ${{ inputs.extra_test_flags_multi_spyre }}
           parallel: 'false'
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
           pre_run: |
-            # Multi-Spyre tests require a fresh topology probe: clear the
-            # cached AIU setup guard and the stale topo.json so
-            # ibm-aiu-setup.sh re-discovers all attached cards.
-
+            # Multi-Spyre tests require a fresh topology probe: reset the AIU
+            # setup guard and stale topo so ibm-aiu-setup.sh re-discovers all
+            # attached cards. set +u because the script references unset vars;
+            # || exit 1 because run-test-suite runs with set +e and a failed
+            # refresh must not let tests run with stale topology.
+            # Inlined into an eval single-quoted string: no apostrophes, no
+            # double-dash tokens.
+            set +u
             unset _IBM_AIU_SETUP
             rm -rf /tmp/etc/ibm/spyre/topo.json
-            source /etc/profile.d/ibm-aiu-setup.sh
+            source /etc/profile.d/ibm-aiu-setup.sh || exit 1
 
       - name: Upload JUnit XML report
         if: always()

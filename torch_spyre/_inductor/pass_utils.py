@@ -743,11 +743,10 @@ def try_device_coordinates(
     """Like ``device_coordinates`` but returns ``None`` instead of raising when
     the layout's stick expression is one the backend cannot represent.
 
-    Intended for callers that *enumerate* candidate layouts (e.g. matmul input
-    layout selection) and want to skip an unrepresentable candidate rather than
-    abort the whole compile. Callers that have already committed to a single
-    layout should keep using ``device_coordinates`` so an unrepresentable stick
-    remains a hard error.
+    Use this to probe whether a layout is representable under a given dep —
+    for example, when iterating candidate input STLs and wanting to skip any
+    whose stick concretizes to an unsupported expression (e.g. the literal 1
+    when the stick dimension is size-1 in the current op's loop ranges).
     """
     try:
         return device_coordinates(stl, dep, indirect_sizes)

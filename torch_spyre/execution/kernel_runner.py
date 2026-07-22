@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2025-2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,8 +13,13 @@
 # limitations under the License.
 
 import torch
-from torch_spyre._C import prepare_kernel, launch_jobplan
+from torch_spyre._C import launch_jobplan, prepare_kernel
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre.profiler._ffdc import (
+    CATEGORY_RUNTIME_LAUNCH,
+    CATEGORY_UNIMPLEMENTED,
+    with_ffdc,
+)
 
 logger = get_inductor_logger("kernel_runner")
 
@@ -24,9 +29,11 @@ class SpyreUnimplementedRunner:
         self.kernel_name = name
         self.op = op
 
+    @with_ffdc(CATEGORY_UNIMPLEMENTED, logger, code_dir_attr=None)
     def run(self, *args, **kw_args):
         raise RuntimeError(
-            f"Invoked {self.kernel_name} which contains unimplemented operation {self.op}"
+            f"Invoked {self.kernel_name} which contains"
+            f" unimplemented operation {self.op}"
         )
 
 
@@ -36,8 +43,8 @@ class SpyreSDSCKernelRunner:
         self.code_dir = code_dir
         self.jobplan = prepare_kernel(code_dir + "/spyreCodeDir")
 
+    @with_ffdc(CATEGORY_RUNTIME_LAUNCH, logger)
     def run(self, *args, **kw_args):
         logger.info("RUN: %s %s", self.kernel_name, self.code_dir)
-
         with torch.profiler.record_function(f"launch_jobplan:{self.kernel_name}"):
             launch_jobplan(self.jobplan, args)
