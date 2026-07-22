@@ -411,6 +411,8 @@ def get_conv_params(tensor_num, dim, opfunc, conv_params, size):
         ):
             total_size = conv_params["total_size_j"]
     return {"conv_padding": conv_padding, "total_size": total_size}
+
+
 def _symbolic_split_info(
     tensor,
     work_slices: dict,
