@@ -28,6 +28,7 @@ from torch._inductor.ops_handler import WrapperHandler
 import sympy
 
 from torch_spyre._inductor import config
+from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.pass_utils import (
     _per_core_view_on_buf,
     concretize_expr,
@@ -210,6 +211,28 @@ def buffer_not_read_in_full(graph: GraphLowering | GraphView, buf_name: str) -> 
             except (TypeError, ValueError, AttributeError):
                 return True
     return False
+
+
+def _is_tiled_advancing(op: Operation) -> bool:
+    """True if ``op``'s output advances its address across a coarse-tile loop.
+
+    LX addresses are never registered as ``affine.apply`` symbols in the SDSC
+    JSON (see ``compute_ops.py``'s ``is_tiled_lx`` check), so a buffer that
+    advances per loop iteration (tiled, and not ``per_tile_fixed``) has no way
+    to express its address change if pinned to LX. This mirrors that check,
+    but at IR time via ``loop_info`` instead of the later per-tensor strides
+    representation, letting the allocator exclude such buffers from LX
+    candidacy up front instead of crashing at codegen time.
+    """
+    layout = getattr(op, "layout", None)
+    if not isinstance(layout, FixedTiledLayout) or layout.per_tile_fixed:
+        return False
+    loop_info = getattr(op, "loop_info", None)
+    if loop_info is None:
+        return False
+    return any(dims for dims in loop_info.loop_tiled_dims) or any(
+        dims for dims in getattr(loop_info, "loop_tiled_reduction_dims", [])
+    )
 
 
 def _writes_at_constant_offset(op: Operation) -> bool:

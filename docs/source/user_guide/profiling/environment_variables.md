@@ -24,6 +24,12 @@ Debug-oriented variables (`TORCH_SPYRE_DEBUG`, `TORCH_COMPILE_DEBUG`,
 |---|---|
 | `SENCORES=<1..32>` | Number of Spyre cores to target (default 32) |
 
+## FFDC (First Failure Data Capture)
+
+| Variable | Effect |
+|---|---|
+| `USE_SPYRE_PROFILER=1` | Opt in to automatic FFDC JSON reports on Spyre compile / runtime / unimplemented failures. Retrieve with `torch.spyre.get_diagnostic_report()`. (Same name as the CMake profiler build flag; at runtime this env var alone gates capture.) |
+
 ## Device enumeration
 
 Read by torch-spyre
