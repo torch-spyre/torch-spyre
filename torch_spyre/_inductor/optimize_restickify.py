@@ -388,7 +388,8 @@ class BeamState:
     cost: float
 
 
-BEAM_WIDTH = 64
+BEAM_WIDTH = 200
+MAX_BEAM_STATES_LOGGED = 10
 
 
 class Frontier:
@@ -486,10 +487,13 @@ def beam_global_min_cost(operations: list) -> None:
         max_states = max(max_states, len(frontier.states))
         if logger.isEnabledFor(logging.DEBUG):
             lines = [f"beam after {op.get_name()} [{len(frontier.states)} states]:"]
-            for i, s in enumerate(frontier.states):
+            for i, s in enumerate(frontier.states[:MAX_BEAM_STATES_LOGGED]):
                 lines.append(f"  state {i} (cost={s.cost}):")
                 for name, stl in zip(frontier.buf_names, s.assignments):
                     lines.append(f"    {name}: stride_map={list(stl.stride_map)}")
+            extra = len(frontier.states) - MAX_BEAM_STATES_LOGGED
+            if extra > 0:
+                lines.append(f"    ... {extra} additional states not logged")
             logger.debug("\n".join(lines))
 
     logger.info(

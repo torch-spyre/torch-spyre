@@ -217,8 +217,9 @@ void SpyreAllocator::copy_data(void* dest, const void* src,
   // reinterpret_cast<spyre_ptr_t>(src));
 }
 
-uint32_t SpyreAllocator::segmentForRegion(uint64_t region_id) const {
-  return getFlexAllocator()->getIdToRegionMap().at(region_id)->segment_id();
+uint64_t SpyreAllocator::compositeAddressToDmva(
+    const flex::CompositeAddress& addr) const {
+  return getFlexAllocator()->compositeAddressToDmva(addr);
 }
 
 void SpyreAllocator::memoryPressureCallback(

@@ -163,6 +163,8 @@ def _make_output_stl(
     Returns None if the resulting stick expression has an offset.
     """
     stick_size = get_elem_in_stick(output.dtype)
+    if stick_dim >= 0 and c_size[stick_dim] == 1:
+        return None
     out_coords = host_coordinates(output, output_dep, None)
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
     stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
@@ -365,7 +367,12 @@ def _single_arg_op_layout(
             # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),
             # which becomes 64 FP32 elements when converted. We need to reflect this
             # in the output host size so the constructor creates the correct device layout.
-            in_stick_expr = device_coordinates(stl, dep, None)[-1]
+            try:
+                in_stick_expr = device_coordinates(stl, dep, None)[-1]
+            except Unsupported:
+                # Staggered-EA candidate whose physical stick depth differs from
+                # elems_per_stick — not a valid input for this conversion path.
+                return []
             if not is_stick_expr_offset_free(in_stick_expr, stl.elems_per_stick()):
                 return []
 
@@ -882,13 +889,26 @@ def _multi_arg_pointwise_layouts(
         for stick_expr in sorted(offset_free_stick_exprs, key=iter_var_id):
             _try_stick_dim(_pick_stick_dim(stick_expr, out_coords))
 
-    # Try alternative layouts if no valid layouts found
-    if not results:
-        for alt_stick_dim in range(len(output.size) - 1):
-            # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
-            if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
-                continue
-            _try_stick_dim(alt_stick_dim)
+    # Always scan all dims so that dims absent from any input stick expression
+    # (e.g. the outer broadcast dim) are also offered as candidates. Deduplicate
+    # against layouts already produced by the input-stick loop above.
+    # Skip for staggered-EA ops: their output layout is dictated by the staggered
+    # input EA and adding STANDARD candidates would corrupt downstream ops.
+    # EA omitted from key: the loop below is skipped for staggered ops, so all
+    # candidates added (and looked up) here use STANDARD EA — geometry suffices.
+    seen_keys = {(tuple(r.device_size), tuple(r.stride_map)) for r in results}
+    for alt_stick_dim in range(len(output.size)) if not staggered_inputs else []:
+        # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
+        if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
+            continue
+        pre_len = len(results)
+        _try_stick_dim(alt_stick_dim)
+        if len(results) > pre_len:
+            key = (tuple(results[-1].device_size), tuple(results[-1].stride_map))
+            if key in seen_keys:
+                results.pop()
+            else:
+                seen_keys.add(key)
 
     # LX in-place: promote a same-frame input's layout to FIRST so the beam
     # commits it on a cost tie, avoiding a free-but-in-place-defeating permutation
@@ -1258,6 +1278,11 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
             continue
         producer_layouts = getattr(producer, "layouts", None)
         if not producer_layouts or target_stl not in producer_layouts:
+            continue
+        # Only elide when the producer has a single unambiguous layout. With
+        # multiple candidates the optimizer may not commit to target_stl, so
+        # eliding the copy would be incorrect.
+        if len(producer_layouts) != 1:
             continue
 
         producer.layout = copy_op.layout

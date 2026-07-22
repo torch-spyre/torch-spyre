@@ -11,9 +11,10 @@ name: integration-tests
 #     --repo <org>/torch-spyre \
 #     -f triggering_repo=<repo link to deeptools/flex> \
 #     -f triggering_sha=${{ github.sha }} \
-#     -f pr_url_hash=$(echo -n "${{ github.event.pull_request.html_url }}" | sha256sum | cut -c1-16) \
-#     -f rpm_location=... \
-#     -f rpm_names=...
+#     -f pr_url_hash=$(echo -n "${{ github.event.pull_request.html_url }}" | sha256sum | cut -c1-16)
+#
+# Tests the PRE-BAKED torch-spyre-dev image (prebaked_image=true, default): no
+# checkout/build/RPM-install on the runner.
 # ---------------------------------------------------------------------------
 on:
   workflow_dispatch:
@@ -50,22 +51,15 @@ on:
         type: string
         default: ''
 
-      # ---- RPM / image overrides ------------------
-      rpm_location:
-        description: Artifactory location for RPM download
-        required: false
-        type: string
-        default: ''
-      rpm_names:
-        description: Space-separated list of RPM names to download and install
-        required: false
-        type: string
-        default: ''
-      build_torch_spyre:
-        description: Whether to re-build torch-spyre after installing the RPM
-        required: false
-        type: boolean
-        default: true
+      # ---- image override ------------------
+      # NOTE: rpm_location / rpm_names / build_torch_spyre are intentionally NOT
+      # exposed here. This entrypoint tests the PRE-BAKED torch-spyre-dev image
+      # (prebaked_image, default true) — nothing is built or RPM-installed on the
+      # runner, so those knobs are meaningless. _test_matrix.yaml still declares
+      # them (workflow_call, no input cap) for its legacy callers; on the
+      # prebaked_image=false fallback it uses their defaults (build_torch_spyre
+      # true, rpm_names ''). Dropping them also keeps this workflow_dispatch under
+      # the hard 10-input cap.
       runner_label:
         description: |
           Per-PR ephemeral runner-set IMAGE label
@@ -81,6 +75,15 @@ on:
         required: false
         type: string
         default: full
+      prebaked_image:
+        description: >-
+          Test the pre-baked torch-spyre-dev image directly (no checkout/build) —
+          the Spyre-Next default for this entrypoint. The ephemeral runner is FROM
+          torch-spyre-dev, which already has the editable torch_spyre + full source
+          + venv. Set false to fall back to the legacy checkout+build path.
+        required: false
+        type: boolean
+        default: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.html_url) || (github.event_name == 'workflow_dispatch'
@@ -110,7 +113,7 @@ jobs:
             echo "| Upstream commit | ${{ inputs.triggering_sha || '(not specified)' }} |"
             echo "| PR URL hash     | ${{ inputs.pr_url_hash || '(not specified)' }} |"
             echo "| torch-spyre ref | ${{ inputs.ref || github.sha }} |"
-            echo "| RPM names       | ${{ inputs.rpm_names || '(none)' }} |"
+            echo "| prebaked image  | ${{ inputs.prebaked_image }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
@@ -127,10 +130,8 @@ jobs:
       checkout_pytorch: false
       ref: ${{ inputs.ref || '' }}
       repository: ${{ inputs.repository || '' }}
-      rpm_location: ${{ inputs.rpm_location || '' }}
-      rpm_names: ${{ inputs.rpm_names || '' }}
-      build_torch_spyre: ${{ inputs.build_torch_spyre == true }}
       test_type: ${{ inputs.test_type || 'full' }}
+      prebaked_image: ${{ inputs.prebaked_image }}
 
   # ----------------------------------------------------------------------------------
   # Fan-in gate job which is similar to run-spyre-unit-tests in torch_spyre_tests.yaml
