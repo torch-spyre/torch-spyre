@@ -705,13 +705,81 @@ def analyze(path):
     # can gate them via the YAML config, AND need cleanup so the raw star-imported
     # instance is not collected by pytest as a plain TestCase.
     class_level_parametrized_mixed = set()
+    # is_upstream/is_oot for THIS file, computed once up front (reused below).
+    import os as _os
+    _torch_root = _os.environ.get("TORCH_ROOT", "")
+    _torch_device_root = _os.environ.get("TORCH_DEVICE_ROOT", "")
+    _is_upstream_file = bool(
+        _torch_root
+        and _os.path.abspath(path).startswith(_os.path.abspath(_torch_root))
+    )
+    _is_oot_file = bool(
+        _torch_device_root
+        and _os.path.abspath(path).startswith(_os.path.abspath(_torch_device_root))
+    )
+    _apply_transitive_closure = _is_upstream_file and not _is_oot_file
+
+    # Transitive closure: a class counts as a TestCase subclass if any of its
+    # bases (directly or transitively, through locally-defined intermediate
+    # classes) is TestCase-like. This catches chains like
+    # `class FooBase(TestCase)` -> `class Foo(FooBase)` regardless of naming,
+    # e.g. TestPatternMatcher(TestPatternMatcherBase) in
+    # test_mkldnn_pattern_matcher.py, whose base name does not literally end
+    # in "TestBase" and was previously invisible to this scan entirely
+    # (see issue #3188).
+    #
+    # Scoped to upstream-only files: OOT-native files under TORCH_DEVICE_ROOT
+    # commonly use non-"TestCase"/"TestBase"-named helper base classes on
+    # purpose for classes that already hand-roll direct Spyre-device testing
+    # without any instantiate_device_type_tests() dispatch (e.g.
+    # BaseTestScratchpadUsage in test_scratchpad_use.py). Making those newly
+    # "visible" here sweeps them into needs_injection/uncontrolled below, and
+    # instantiate_device_type_tests() rebuilding them via multiple inheritance
+    # silently changes their setUp()/MRO — verified this regressed
+    # test_scratchpad_use.py from 109 passed (main) to 39 failed when the
+    # transitive check was applied unconditionally. So for non-upstream files
+    # we keep the original direct-only check.
+    _local_bases = {}
+    if _apply_transitive_closure:
+        for _n in ast.iter_child_nodes(tree):
+            if isinstance(_n, ast.ClassDef):
+                _names = []
+                for _b in _n.bases:
+                    if isinstance(_b, ast.Name):        _names.append(_b.id)
+                    elif isinstance(_b, ast.Attribute): _names.append(_b.attr)
+                _local_bases[_n.name] = _names
+
+    def _is_testcase_like(name, _seen=None):
+        if "TestCase" in name or name.endswith("TestBase"):
+            return True
+        if not _apply_transitive_closure:
+            return False
+        _seen = _seen or set()
+        if name in _seen:
+            return False
+        _seen.add(name)
+        return any(_is_testcase_like(_b, _seen) for _b in _local_bases.get(name, []))
+
+    # Classes whose TestCase-ness is established ONLY via the transitive
+    # closure above (their immediate base name does not itself contain
+    # "TestCase" / end in "TestBase") — e.g. TestPatternMatcher, whose direct
+    # base "TestPatternMatcherBase" does not match the direct check. These are
+    # newly-visible classes (see issue #3188) and are treated more carefully
+    # below when classifying standalone instantiate_parametrized_tests() calls,
+    # since long-established directly-visible classes (e.g. TestConvolutionNN
+    # in test_convolution.py, based directly on NNTestCase) must keep their
+    # existing classification to avoid changing behavior for unrelated suites.
+    transitive_only_classes = set()
+
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.ClassDef):
             for base in node.bases:
                 base_name = ""
                 if isinstance(base, ast.Name):        base_name = base.id
                 elif isinstance(base, ast.Attribute): base_name = base.attr
-                if "TestCase" in base_name or base_name.endswith("TestBase"):
+                if _is_testcase_like(base_name):
+                    if not ("TestCase" in base_name or base_name.endswith("TestBase")):
+                        transitive_only_classes.add(node.name)
                     has_device, all_parametrized, _ = class_methods_info(node, parametrize_names)
                     all_classes[node.name] = has_device
                     # Check for @instantiate_parametrized_tests as a class decorator.
@@ -787,7 +855,33 @@ def analyze(path):
             elif fname == "instantiate_parametrized_tests" and node.args:
                 arg = node.args[0]
                 if isinstance(arg, ast.Name):
-                    parametrized_instantiated.add(arg.id)
+                    cls_name = arg.id
+                    # Standalone-call form only expands @parametrize methods; it
+                    # says nothing about per-device dispatch. Treating it alone as
+                    # "fully handled" leaves upstream classes that are NEVER also
+                    # passed to instantiate_device_type_tests() completely
+                    # unwrapped, so TorchTestBase never sees them and YAML
+                    # mode:skip/xfail entries are silently ignored (see issue
+                    # #3188: TestPatternMatcher in test_mkldnn_pattern_matcher.py
+                    # hardcodes device="cpu" and is only ever passed to
+                    # instantiate_parametrized_tests()).
+                    #
+                    # Scope this correction to transitive_only_classes: classes
+                    # that are only newly visible to this analyzer via the
+                    # transitive-closure TestCase check above (itself already
+                    # scoped to upstream-only files via _apply_transitive_closure).
+                    # Long-established directly-visible classes using this same
+                    # standalone-call pattern (e.g. TestConvolutionNN in
+                    # test_convolution.py, TestLRScheduler in
+                    # test_lrscheduler.py) keep their prior "fully handled"
+                    # classification unchanged, since other YAML suites already
+                    # depend on that behavior and default to unlisted_test_mode:
+                    # skip — reclassifying them here would silently drop
+                    # coverage for tests not explicitly listed in those
+                    # unrelated configs.
+                    if cls_name in transitive_only_classes:
+                        continue  # leave out of parametrized_instantiated -> uncontrolled
+                    parametrized_instantiated.add(cls_name)
     # A class that appears in BOTH open and restricted sets (e.g. the file
     # calls instantiate_device_type_tests twice for the same class, once with
     # only_for and once without) is treated as open: the open call already
@@ -1826,6 +1920,13 @@ _run_parallel_across_cards() {
     echo ""
     echo "[torch_oot_device_tests_run_parallel] --parallel: collecting test IDs from ${#RUN_FILES[@]} file(s) to distribute across ${_n_cards} card(s)..."
 
+    # Timestamp the collection phase so its cost is visible in the run log.
+    # Collection re-imports torch + each OOT wrapper per file, so this phase
+    # can dominate --parallel wall-clock; the elapsed line lets a pod run
+    # confirm the fan-out speedup empirically. SECONDS is a bash builtin
+    # (seconds since shell start) — no external `date` dependency.
+    local _collect_start=$SECONDS
+
     # -----------------------------------------------------------------------
     # Step 1: collect all test node IDs across every resolved file.
     #
@@ -1841,45 +1942,81 @@ _run_parallel_across_cards() {
     # Per-file collection is done with SPYRE_TEST_FILE set (so the OOT
     # framework can identify the config) but without SPYRE_DEVICES / hardware
     # initialisation so collection is fast even on a login node.
+    #
+    # Collection needs no hardware, so the per-file `--collect-only` probes
+    # are fanned out as background jobs (bounded to _n_cards concurrent) and
+    # each writes its raw node IDs to a per-file temp file. Running them
+    # serially and foreground here was the dominant cost of --parallel (every
+    # OOT wrapper re-imports torch + re-execs the module + regenerates the
+    # full device-type variant matrix), so parallelising the probes removes
+    # that serial bottleneck. The results are then read back in file order so
+    # _all_node_ids / _all_node_file_idx ordering is identical to the serial
+    # collection this replaces.
     # -----------------------------------------------------------------------
     # _all_node_ids: parallel arrays — node_id, file_idx (into RUN_FILES)
     local -a _all_node_ids=()
     local -a _all_node_file_idx=()
 
+    # Build the -m probe args once (identical for every file, same as serial path).
+    local -a _collect_args=()
+    local _has_m=0
+    for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
+        [[ "$_a" == "-m" ]] && { _has_m=1; break; }
+    done
+    if [[ $_has_m -eq 1 ]]; then
+        local _take_next=0
+        for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
+            if [[ $_take_next -eq 1 ]]; then
+                _collect_args+=("$_a"); _take_next=0; continue
+            fi
+            [[ "$_a" == "-m" ]] && { _collect_args+=("$_a"); _take_next=1; }
+        done
+    fi
+
+    # Fan out collection: one background probe per file, bounded to _n_cards
+    # concurrent jobs. Each writes matched node IDs to _collect_out_files[i].
+    local -a _collect_out_files=()
+    local -a _collect_pids=()
     for i in "${!RUN_FILES[@]}"; do
         local _rf="${RUN_FILES[$i]}"
-        local _of="${TEST_FILES[$i]}"
         local _rd _rb
         _rd="$(dirname "$_rf")"
         _rb="$(basename "$_rf")"
+        local _cout="/tmp/_spyre_collect_ids_${$}_${i}.tmp"
+        _collect_out_files+=("$_cout")
 
-        echo "[torch_oot_device_tests_run]   collecting: $(basename "$_of")"
+        echo "[torch_oot_device_tests_run]   collecting: $(basename "${TEST_FILES[$i]}")"
 
-        # Build the -m probe args (same as serial path).
-        local -a _collect_args=()
-        local _has_m=0
-        for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
-            [[ "$_a" == "-m" ]] && { _has_m=1; break; }
-        done
-        if [[ $_has_m -eq 1 ]]; then
-            local _take_next=0
-            for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
-                if [[ $_take_next -eq 1 ]]; then
-                    _collect_args+=("$_a"); _take_next=0; continue
-                fi
-                [[ "$_a" == "-m" ]] && { _collect_args+=("$_a"); _take_next=1; }
-            done
-        fi
-
-        local _raw_ids
-        _raw_ids=$(
+        (
             export SPYRE_TEST_FILE="$_rf"
             export OOT_TEST_FILE="$_rf"
             cd "$_rd" && python3 -m pytest "$_rb" \
                 "${_collect_args[@]+"${_collect_args[@]}"}" \
                 --collect-only -q --no-header 2>/dev/null \
-            | grep '\.py::' || true
-        )
+            | grep '\.py::' > "$_cout" || true
+        ) &
+        _collect_pids+=($!)
+
+        # Throttle to at most _n_cards concurrent probes.
+        while [[ "$(jobs -rp | wc -l)" -ge "$_n_cards" ]]; do
+            wait -n 2>/dev/null || true
+        done
+    done
+
+    # Wait for any remaining probes to finish before reading their output.
+    for _cpid in "${_collect_pids[@]+"${_collect_pids[@]}"}"; do
+        wait "$_cpid" 2>/dev/null || true
+    done
+
+    # Read back each file's collected IDs in file order, preserving the exact
+    # ordering the original serial loop produced.
+    for i in "${!RUN_FILES[@]}"; do
+        local _of="${TEST_FILES[$i]}"
+        local _cout="${_collect_out_files[$i]}"
+
+        local _raw_ids=""
+        [[ -f "$_cout" ]] && _raw_ids="$(< "$_cout")"
+        rm -f "$_cout"
 
         if [[ -z "$_raw_ids" ]]; then
             echo "[torch_oot_device_tests_run_serial]   WARNING: no test IDs collected from $(basename "$_of") -- it will be skipped in parallel mode." >&2
@@ -1904,6 +2041,9 @@ _run_parallel_across_cards() {
             _all_node_file_idx+=("$i")
         done <<< "$_raw_ids"
     done
+
+    local _collect_elapsed=$(( SECONDS - _collect_start ))
+    echo "[torch_oot_device_tests_run_parallel] Collection phase completed in ${_collect_elapsed}s (${#RUN_FILES[@]} file(s), up to ${_n_cards} concurrent probe(s))."
 
     local _total="${#_all_node_ids[@]}"
     if [[ $_total -eq 0 ]]; then

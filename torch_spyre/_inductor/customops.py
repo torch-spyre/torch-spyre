@@ -244,17 +244,83 @@ def _(input: torch.Tensor):
 def copy_from_d2d(
     src: torch.Tensor,
     dst: torch.Tensor,
+    src_off: int,
+    dst_off: int,
     compiled,
 ) -> None:
-    return compiled(src, dst)
+    # src_off/dst_off are the src/dst storage_offsets, passed as explicit ints
+    # because a sliced tensor's offset is invisible to the compiled kernel
+    # otherwise: a graph input's storage_offset is dropped by Inductor (its
+    # FixedLayout.offset is 0 and SpyreTensorLayout has no offset field), so the
+    # kernel binds the storage BASE pointer and reads from element 0. The
+    # lowering (lower_spyre_from_d2d) consumes these ints to re-introduce the
+    # offsets in-graph via a ReinterpretView, putting them into the coordinate
+    # that superdsc bakes into the SDSC binary.
+    #
+    # specialize_int=True is required on top of that: dynamo's TENSOR_MATCH
+    # guard keys on dtype/device/size/stride but NOT storage_offset, and its
+    # default auto-dynamic promotes the offset int to a symbol after the second
+    # distinct value — a symbolic offset cannot be baked as a constant into the
+    # coordinate. specialize_int installs int-equality guards so each distinct
+    # offset triggers a fresh trace and a fresh SDSC binary with the offset
+    # baked as a constant. This mirrors the spyre.overwrite fix above (PR
+    # #2084). Patch is call-scoped to leave process-wide dynamo behavior alone.
+    # Note: one compiled binary per unique (input shape, offsets) tuple;
+    # dynamo's cache_size_limit is bumped to 1024 in torch_spyre/__init__.py.
+    with torch._dynamo.config.patch(specialize_int=True):
+        return compiled(src, dst, src_off, dst_off)
 
 
 @copy_from_d2d.register_fake
 def _(
     src: torch.Tensor,
     dst: torch.Tensor,
+    src_off: int,
+    dst_off: int,
 ) -> None:
     pass
+
+
+# Copy src into dst in-place (the mutating primitive).
+# No @compile_once needed: the body calls aten::copy_ which dispatches
+# through spyre__copy_from → copy_from_d2d / copy_tensor — no cycle back
+# to spyre::copy_ itself.
+@torch.library.custom_op("spyre::copy_", mutates_args=("dst",), device_types="spyre")
+def copy_(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+    dst.copy_(src)
+    return dst
+
+
+@copy_.register_fake
+def _(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+    return dst
+
+
+@torch.library.register_kernel("spyre::copy_", ["cpu"])
+def copy__cpu(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+    dst.copy_(src)
+    return dst
+
+
+# Functional (out-of-place) wrapper for spyre::copy_.
+# Returns a new tensor equal to dst with src written into it.
+# The graph sees a pure value-producing node; Inductor's reinplacer will
+# rewrite copy_f → copy_ (in-place) wherever it is safe to do so.
+@torch.library.custom_op("spyre::copy_f", mutates_args=(), device_types="spyre")
+def copy_f(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+    result = dst.clone()
+    torch.ops.spyre.copy_(src, result)
+    return result
+
+
+@copy_f.register_fake
+def _(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+    return dst.clone()
+
+
+inplaceable_ops[torch.ops.spyre.copy_f.default] = InplaceableOp(
+    torch.ops.spyre.copy_.default, 1
+)
 
 
 # Copy input into output starting at offsets along dimensions dims and
@@ -649,6 +715,45 @@ def dequantize_fp8_with_scale(input: torch.Tensor, scale: torch.Tensor) -> torch
 def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     # Output is FP16 with same shape as input
     return torch.empty(input.size(), dtype=torch.float16, device=input.device)
+
+
+@torch.library.custom_op("spyre::causal_mask", mutates_args=(), device_types="spyre")
+def causal_mask(
+    seqlen_q: int,
+    seqlen_kv: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Build a causal additive mask on CPU and transfer to the target device.
+
+    Shape: [1, 1, seqlen_q, seqlen_kv] in natural orientation: query i attends
+    to keys 0..i.  Entries are 0.0 (keep) or -inf (masked).  The kept diagonal
+    guarantees no fully-masked row (no 0/0 NaN denominator).
+
+    Built entirely on CPU (tril + masked_fill_) so those in-place ops are
+    opaque to torch.compile — assert_functional_graph is satisfied and the
+    compiled graph only sees the resulting device tensor.  No device_types
+    restriction is set because there are no tensor arguments to dispatch on;
+    the device is an explicit parameter.
+    """
+    # Causal boolean lower-triangular pattern: True = attend, False = mask
+    causal_cpu = torch.tril(
+        torch.ones(seqlen_q, seqlen_kv, dtype=torch.bool, device="cpu")
+    )
+    mask_cpu = torch.zeros(1, 1, seqlen_q, seqlen_kv, dtype=dtype, device="cpu")
+    mask_cpu.masked_fill_(~causal_cpu, float("-inf"))
+    return mask_cpu.to(device=device)
+
+
+@causal_mask.register_fake
+def _(
+    seqlen_q: int,
+    seqlen_kv: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    return torch.empty(1, 1, seqlen_q, seqlen_kv, dtype=dtype, device=device)
 
 
 @torch.library.custom_op("spyre::prod_dim_int", mutates_args=(), device_types="spyre")

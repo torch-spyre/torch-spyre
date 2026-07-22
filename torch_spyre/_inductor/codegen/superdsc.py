@@ -42,7 +42,12 @@ from torch_spyre._inductor.indirect_access import (
     is_indirect_value_tensor,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.op_spec import IndirectAccess, OpSpec, TensorArg
+from torch_spyre._inductor.op_spec import (
+    DebugHandle,
+    IndirectAccess,
+    OpSpec,
+    TensorArg,
+)
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
 from .compute_ops import SymbolKind, generate_sdsc
@@ -65,6 +70,7 @@ class SDSCArgs:
     arg_index: int = -1
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
+    per_tile_fixed: bool = False
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -110,6 +116,7 @@ class SDSCSpec:
         default_factory=dict
     )
     indirect_access_indices: list[int] = dataclasses.field(default_factory=list)
+    debug_handle: DebugHandle | None = None
     # Generic pool/window fields.  Neutral defaults mean generate_sdsc treats a
     # non-pool op exactly as before; parse_op_spec fills these for pool ops via
     # _avgpool_sdsc_fields, so compute_ops.py stays free of op-specific logic.
@@ -674,6 +681,7 @@ def _create_sdsc_tensors(
                 arg_index=arg.arg_index,
                 is_index_tensor=is_idx_tensor,
                 related_value_tensor_idx=related_val_idx,
+                per_tile_fixed=arg.per_tile_fixed,
             )
         )
 
@@ -1045,6 +1053,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             coordinate_masking=coordinate_masking,
             symbolic_dims=symbolic_dims,
             indirect_access_indices=indirect_access_indices,
+            debug_handle=op_spec.debug_handle,
             **pool_sdsc_fields,
         ),
         symbol_mapping,

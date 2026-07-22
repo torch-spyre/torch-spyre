@@ -57,9 +57,10 @@ def create_module_inputs_func_from_yaml(item: Any) -> Callable:
                             seed=seed,
                             op_name=item.name,
                             test_device=test_device,
+                            dtype=dtype,
                         )
                         constructor_kwargs = constructor_spec.resolved_kwargs(
-                            test_device=test_device
+                            test_device=test_device, dtype=dtype
                         )
                     else:
                         constructor_args = []
@@ -75,10 +76,12 @@ def create_module_inputs_func_from_yaml(item: Any) -> Callable:
                             seed=fwd_seed,
                             op_name=item.name,
                             test_device=test_device,
+                            dtype=dtype,
                         )
                         forward_kwargs = forward_spec.resolved_kwargs(
                             test_device=test_device,
                             seed=fwd_seed,
+                            dtype=dtype,
                         )
                     else:
                         forward_args = []
@@ -100,6 +103,7 @@ def create_module_inputs_func_from_yaml(item: Any) -> Callable:
                         test_device=test_device,
                         FunctionInput=FunctionInput,
                         ModuleInput=ModuleInput,
+                        dtype=dtype,
                     )
                 ]
 
@@ -155,9 +159,10 @@ def create_module_inputs_func_from_config(config: Any) -> Callable:
                 seed=seed,
                 op_name=module_info.name,
                 test_device=test_device,
+                dtype=dtype,
             )
             constructor_kwargs = constructor_spec.resolved_kwargs(
-                test_device=test_device
+                test_device=test_device, dtype=dtype
             )
         else:
             constructor_args = []
@@ -179,9 +184,10 @@ def create_module_inputs_func_from_config(config: Any) -> Callable:
                             seed=fwd_seed,
                             op_name=module_info.name,
                             test_device=test_device,
+                            dtype=dtype,
                         )
                         forward_kwargs = spec.resolved_kwargs(
-                            test_device=test_device, seed=fwd_seed
+                            test_device=test_device, seed=fwd_seed, dtype=dtype
                         )
                     else:
                         forward_args = []
@@ -202,9 +208,10 @@ def create_module_inputs_func_from_config(config: Any) -> Callable:
                         seed=fwd_seed,
                         op_name=module_info.name,
                         test_device=test_device,
+                        dtype=dtype,
                     )
                     forward_kwargs = forward_spec.resolved_kwargs(
-                        test_device=test_device, seed=fwd_seed
+                        test_device=test_device, seed=fwd_seed, dtype=dtype
                     )
                 else:
                     forward_args = []

@@ -16,6 +16,17 @@ import sympy
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
+from torch._inductor.dependencies import MemoryDep
+from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.pass_utils import (
+    device_coordinates,
+    try_device_coordinates,
+)
+from torch_spyre._inductor.propagate_layouts import (
+    PropArg,
+    _check_supported_input_sticks,
+)
 from torch_spyre._inductor.views import compute_coordinates
 from torch.utils._sympy.functions import ModularIndexing
 
@@ -200,6 +211,64 @@ class TestCoordinates(TestCase):
             5760 * p0 + 384 * p1 + p2 + 128,
         )
         self.assertEqual(cx, [p1, p2 // 64 + 2, p0, p2 % 64])
+
+
+class TestUnrepresentableStickCandidates(TestCase):
+    """Cover the skip-unrepresentable-candidate behavior added for the
+    ``floor(var/N)`` cross-stick crash (transpose feeding a matmul).
+
+    A candidate device layout can have a stick expression the backend cannot
+    represent (e.g. ``floor(d2/128)``). ``device_coordinates`` raises
+    ``Unsupported`` on such sticks; the enumeration sites use
+    ``try_device_coordinates`` to skip them instead of aborting the compile
+    when another candidate is valid.
+    """
+
+    def _dtype(self):
+        # Device data format for fp16 (SEN169_FP16); read off a scratch STL so
+        # the test does not hard-code the enum value.
+        return SpyreTensorLayout([1, 1], torch.float16).device_dtype
+
+    def _traced_scenario(self):
+        """The exact (dep, unrepresentable STL, representable STL) triple from
+        the Granite SDPA linear-projection failure.
+
+        dep index ``4096*d0 + d2`` over ranges {d0:512, d1:4096, d2:4096}:
+          * bad  STL -> stick expr ``floor(d2/128)`` (cross-stick, unrepresentable)
+          * good STL -> stick expr ``d2`` (bare var, representable)
+        """
+        dev = self._dtype()
+        d0, d1, d2 = sympy.symbols("d0 d1 d2", integer=True, nonnegative=True)
+        dep = MemoryDep("buf", 4096 * d0 + d2, (d0, d1, d2), (512, 4096, 4096))
+        bad = SpyreTensorLayout([512, 128, 1, 1, 64], [4096, 1, 8192, -1, 128], dev)
+        good = SpyreTensorLayout([512, 1, 1, 64], [4096, -1, -1, 1], dev)
+        return dep, bad, good
+
+    def test_device_coordinates_raises_try_returns_none(self):
+        dep, bad, good = self._traced_scenario()
+        # The strict variant raises on the unrepresentable stick ...
+        with self.assertRaises(Unsupported):
+            device_coordinates(bad, dep, None)
+        # ... while the non-raising variant returns None for it.
+        self.assertIsNone(try_device_coordinates(bad, dep, None))
+        # A representable candidate still returns coordinates from both.
+        self.assertIsNotNone(try_device_coordinates(good, dep, None))
+        d2 = sympy.Symbol("d2", integer=True, nonnegative=True)
+        self.assertEqual(device_coordinates(good, dep, None)[-1].free_symbols, {d2})
+
+    def test_check_supported_input_sticks_tolerates_mixed_list(self):
+        # arg with one unrepresentable candidate and one valid one: the guard
+        # must not raise (it previously aborted the whole compile).
+        dep, bad, good = self._traced_scenario()
+        arg = PropArg(dep, None, [bad, good])
+        _check_supported_input_sticks([arg], "batchmatmul")  # must not raise
+
+    def test_check_supported_input_sticks_all_unrepresentable(self):
+        # When every candidate is unrepresentable the guard still does not
+        # raise here (the hard failure comes later, from layout selection).
+        dep, bad, _ = self._traced_scenario()
+        arg = PropArg(dep, None, [bad])
+        _check_supported_input_sticks([arg], "batchmatmul")  # must not raise
 
 
 if __name__ == "__main__":

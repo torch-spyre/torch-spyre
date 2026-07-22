@@ -1066,16 +1066,7 @@ def main() -> None:
         action="store_true",
         help="Write compact (non-indented) JSON",
     )
-    parser.add_argument(
-        "--ingest-json",
-        metavar="FILE",
-        default=None,
-        help=(
-            "Also write a flat-array JSON (one record per suite, all ingest fields "
-            "preserved) for use by ingest_model_ops.py.  "
-            "If omitted, only the dashboard-format --out file is written."
-        ),
-    )
+
     args = parser.parse_args()
 
     log_dir = Path(args.log_dir)
@@ -1144,29 +1135,9 @@ def main() -> None:
     # ── Write outputs ─────────────────────────────────────────────────────
     indent = None if args.compact else 2
 
-    # (1) Dashboard-compatible envelope {total_models, models:[...]}
-    #     Strips ingest-only fields so the dashboard JSON is clean.
-    dashboard_models = []
-    for rec in all_records:
-        dashboard_models.append(
-            {
-                "model_name": rec["model_name"],
-                "yaml_file": rec["yaml_file"],
-                "summary": rec["summary"],
-                "operations": rec["operations"],
-            }
-        )
-    dashboard_output = {
-        "total_models": len(dashboard_models),
-        "models": dashboard_models,
-    }
-    Path(args.out).write_text(json.dumps(dashboard_output, indent=indent))
-    print(f"[info]  Dashboard JSON  : {args.out}", file=sys.stderr)
-
-    # (2) Optional flat-array for ingest_model_ops.py (all fields preserved)
-    if args.ingest_json:
-        Path(args.ingest_json).write_text(json.dumps(all_records, indent=indent))
-        print(f"[info]  Ingest JSON     : {args.ingest_json}", file=sys.stderr)
+    # (1) Full flat-array consumed by ingest_model_ops.py — all fields preserved
+    Path(args.out).write_text(json.dumps(all_records, indent=indent))
+    print(f"[info]  Ingest JSON     : {args.out}", file=sys.stderr)
 
     Path(args.log_out).write_text("\n".join(log_sections))
     print(f"[info]  Log             : {args.log_out}", file=sys.stderr)

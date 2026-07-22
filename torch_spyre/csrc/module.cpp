@@ -41,6 +41,8 @@
 #endif
 
 #include "logging.h"
+#include "logging_bindings.h"
+#include "logging_config.h"
 #include "prepare_kernel.h"
 #include "spyre_allocator.h"
 #include "spyre_device_enum.h"
@@ -195,6 +197,9 @@ PYBIND11_MODULE(_C, m) {
   m.def("device_count", &spyre::getVisibleDeviceCount);
   m.def("encode_constant", &spyre::encodeConstant);
 
+  // Initialize logging bindings
+  torch_spyre::logging::init_logging_bindings(m);
+
   py::enum_<spyre::ElementArrangement>(m, "ElementArrangement")
       .value("STANDARD", spyre::ElementArrangement::STANDARD)
       .value("DL16_TO_FP32", spyre::ElementArrangement::DL16_TO_FP32)
@@ -339,6 +344,11 @@ PYBIND11_MODULE(_C, m) {
         "Copy tensor between host and device using DMA", py::arg("self"),
         py::arg("dst"), py::arg("non_blocking") = false);
 
+  // Device-side fill using FillDMA (no host buffer or H2D copy)
+  m.def("fill_tensor", &spyre::spyre_fill_tensor,
+        "Fill a spyre tensor with a scalar value using device-side FillDMA",
+        py::arg("self"), py::arg("value"));
+
   // Stream management functions
   m.def("get_stream_from_pool", &spyre::getStreamFromPool, py::arg("device"),
         py::arg("priority") = 0,
@@ -423,6 +433,14 @@ PYBIND11_MODULE(_C, m) {
             }
           },
           py::arg("idx"), "Get the type of step at the given index")
+      .def(
+          "get_step_pipeline_barrier",
+          [](const spyre::JobPlan& plan, size_t idx) {
+            TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");
+            return plan.steps[idx]->getPipelineBarrier();
+          },
+          py::arg("idx"),
+          "Get the pipeline_barrier flag for the step at the given index")
       .def("__repr__", [](const spyre::JobPlan& plan) {
         return "<JobPlan steps=" + std::to_string(plan.steps.size()) +
                " job_allocation_size=" +

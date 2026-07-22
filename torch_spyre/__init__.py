@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2025-2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -65,6 +65,9 @@ class _SpyreImpl:
             # it independently of this Python path; this remains for callers that
             # want explicit runtime init.
             self._C = importlib.import_module("torch_spyre._C")
+            from torch_spyre import logging_config
+
+            logging_config._sync_cpp_config()
             # Apply pending device index before runtime init
             pending = self._pending_device_idx
             if pending is not None:
@@ -187,6 +190,10 @@ def make_spyre_module() -> types.ModuleType:
     mod.set_device = lambda idx: impl.set_device(idx)
     mod._is_compiled = lambda: True
     mod.memory = memory
+
+    from torch_spyre.profiler._ffdc import get_diagnostic_report
+
+    mod.get_diagnostic_report = get_diagnostic_report
 
     import torch  # noqa: E402
 

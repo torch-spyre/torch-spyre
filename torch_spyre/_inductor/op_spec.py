@@ -37,6 +37,72 @@ class IndirectAccess(Function):
         return None  # keep unevaluated
 
 
+# --- Source-to-kernel provenance schema -------------------------------------
+# These dataclasses live here with the other IR-op schema types; the logic that
+# builds them from Inductor IR lives in ``provenance.py``. They serialize into
+# the current OpSpec/SuperDSC JSON path, with field names lined up to MLIR
+# location attributes so the future KTIR (MLIR) migration is a low-friction
+# serializer change rather than a redesign.
+
+
+@dataclasses.dataclass(frozen=True)
+class SourceLoc:
+    """Structured source location attached to provenance handles.
+
+    Serialized into the current OpSpec/SuperDSC JSON path; the field names
+    mirror MLIR ``FileLineColRange`` (start/end line and column) so a future
+    KTIR (MLIR) migration maps 1:1 rather than requiring a reshape.
+    """
+
+    file: str
+    start_line: int
+    start_col: int = 0
+    end_line: int | None = None
+    end_col: int | None = None
+
+    def to_str(self) -> str:
+        return f"{self.file}:{self.start_line}:{self.start_col}"
+
+    def to_dict(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class DebugHandle:
+    """Source-to-kernel provenance handle.
+
+    Nestable to map onto MLIR locations: ``NameLoc(aten_op) -> SourceLoc``,
+    ``fused_from -> FusedLoc``, ``ir_chain -> CallSiteLoc`` lineage.
+
+    A ``None`` ``source`` or ``aten_op`` is a *normal, expected* value, not a
+    missing-data error: when an op fuses origins from several distinct source
+    lines there is no single honest headline, so both are set to ``None`` and the
+    full set is preserved in ``fused_from``. Consumers should fall back to
+    ``fused_from`` rather than treating a null headline as an error.
+    """
+
+    id: int
+    source: SourceLoc | None
+    aten_op: str | None
+    ir_chain: tuple[str, ...]
+    fused_from: tuple["DebugHandle", ...] = ()
+    fusion_context: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            # id is serialized as a string: a 63-bit value exceeds JS
+            # Number.MAX_SAFE_INTEGER (2**53-1), and JSON.parse would round it to
+            # float64 before a consumer could act. The dataclass field stays int
+            # for the MLIR/protobuf mapping (a separate serializer).
+            "id": str(self.id),
+            "source": self.source.to_dict() if self.source is not None else None,
+            "aten_op": self.aten_op,
+            "ir_chain": list(self.ir_chain),
+            "fused_from": [h.to_dict() for h in self.fused_from],
+            "fusion_context": self.fusion_context,
+        }
+
+
 @dataclasses.dataclass
 class TensorArg:
     """
@@ -101,6 +167,7 @@ class OpSpec:
     symbolic_dim_bounds: dict[str, tuple[int, int]] = dataclasses.field(
         default_factory=dict
     )
+    debug_handle: DebugHandle | None = None
 
 
 @dataclasses.dataclass

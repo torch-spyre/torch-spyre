@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Regression tests for the three FallbackKernel output shapes.
+"""Regression tests for FallbackKernel lowering on the Spyre device.
 
-`FallbackKernel.create` in upstream PyTorch produces three shapes
-(see torch/_inductor/ir.py):
+Covers the three `FallbackKernel.create` output shapes (upstream
+torch/_inductor/ir.py):
 
   shape 1 (single tensor)  -> MultiOutputLayout + 1 trailing MultiOutput
   shape 2 (tuple of N)     -> MultiOutputLayout + N trailing MultiOutputs
@@ -29,13 +29,20 @@ non-intermediate counter. Shape 3 raised RuntimeError, shape 2 emitted
 propagation, and shape 3 separately tripped fusion via the NoneLayout
 MutationOutput sentinels that void fallbacks register.
 
-These tests exercise all three shapes end-to-end through `torch.compile(...,
-backend="inductor")` on the Spyre device to guard against regressions.
+Plus `reinterpret_tensor` on the CPU buffers that fallbacks emit when a graph
+mixes Spyre and CPU-C++ kernels (TestReinterpretTensorCpuBuffer).
+
+Plus a traced spyre -> cpu -> spyre round-trip via plain `.to()`
+(TestTracedDeviceCopy).
+
+All tests run end-to-end through `torch.compile(..., backend="inductor")` on
+the Spyre device to guard against regressions.
 """
 
 import unittest
 
 import torch
+import torch.nn.functional as F
 
 
 DEVICE = "spyre"
@@ -89,6 +96,17 @@ if not _ns_has_op("test_fk_s3", "inplace_add"):
     _LIB_S3._register_fake("inplace_add", lambda x, out: None)
 
 
+_LIB_CONV = torch.library.Library("test_fk_conv", "FRAGMENT")
+if not _ns_has_op("test_fk_conv", "convert"):
+    _LIB_CONV.define("convert(Tensor x, Device device) -> Tensor")
+    _LIB_CONV.impl(
+        "convert",
+        lambda x, d: x.to(device=d).contiguous(),
+        dispatch_key="CompositeExplicitAutograd",
+    )
+    _LIB_CONV._register_fake(
+        "convert", lambda x, d: torch.empty(x.shape, dtype=x.dtype, device=d)
+    )
 _LIB_POOL = torch.library.Library("test_fk_pool", "FRAGMENT")
 if not _ns_has_op("test_fk_pool", "norm"):
     _LIB_POOL.define("norm(Tensor x, Tensor residual) -> Tensor")
@@ -175,6 +193,62 @@ class TestFallbackKernelShape3Void(unittest.TestCase):
         torch.testing.assert_close(out, torch.full((4,), 6.0, dtype=DTYPE))
 
 
+class TestTracedDeviceCopy(unittest.TestCase):
+    """A traced spyre -> cpu -> spyre round-trip must not crash.
+
+    A plain `.to()` that Dynamo can trace lowers to an in-graph
+    `DeviceCopy`, so the schedule mixes Spyre and CPU nodes -- which used
+    to break the Spyre passes (propagate_layouts, work_division,
+    spyre_fuse_nodes) and the `SpyreAsyncCompile` stub. Sibling to the
+    custom-op test in the `reinterpret_device_fix` branch.
+    """
+
+    def test_cpu_slice_roundtrip_compiles(self):
+        def fn(x):
+            x_cpu = x.to("cpu")
+            d = x_cpu.shape[-1] // 2
+            x1 = x_cpu[..., :d].to(DEVICE)
+            x2 = x_cpu[..., d:].to(DEVICE)
+            return F.silu(x1) * x2
+
+        x = torch.randn(16, 256, dtype=DTYPE, device=DEVICE)
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
+        out = compiled(x)
+        self.assertEqual(out.device.type, DEVICE)
+        torch.testing.assert_close(out.cpu(), fn(x).cpu(), atol=0.01, rtol=0.01)
+
+
+class TestReinterpretTensorCpuBuffer(unittest.TestCase):
+    """`reinterpret_tensor` on a CPU buffer must not crash.
+
+    The Spyre `reinterpret_tensor` binding used to `static_cast` its input to
+    SpyreTensorImpl unconditionally and read `spyre_layout` — undefined
+    behaviour on the CPU buffers a graph produces when it mixes Spyre and
+    CPU-C++ kernels, crashing with `std::bad_array_new_length`. Here the host
+    slices `x_cpu[..., :d]` / `[..., d:]` lower to `reinterpret_tensor(cpu_buf,
+    ...)` views feeding the convert-back-to-Spyre fallbacks — the exact shape
+    that tripped the cast. The fix guards on device type and delegates
+    non-Spyre inputs to PyTorch's own `_reinterpret_tensor`.
+    """
+
+    def test_cpu_slice_roundtrip_compiles(self):
+        cpu = torch.device("cpu")
+        spyre = torch.device(DEVICE)
+
+        def fn(x):
+            x_cpu = torch.ops.test_fk_conv.convert(x, cpu)
+            d = x_cpu.shape[-1] // 2
+            x1 = torch.ops.test_fk_conv.convert(x_cpu[..., :d], spyre)
+            x2 = torch.ops.test_fk_conv.convert(x_cpu[..., d:], spyre)
+            return F.silu(x1) * x2
+
+        x = torch.randn(16, 256, dtype=DTYPE)
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
+        out = compiled(x.to(spyre))
+        self.assertEqual(out.device.type, DEVICE)
+        torch.testing.assert_close(out.cpu(), fn(x).cpu(), atol=0.01, rtol=0.01)
+
+
 class TestFallbackKernelPoolResidentArg(unittest.TestCase):
     """FallbackKernel consuming an intermediate buffer keeps the correct dtype."""
 
@@ -191,7 +265,7 @@ class TestFallbackKernelPoolResidentArg(unittest.TestCase):
         compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
         out = compiled(x.to(DEVICE))
         self.assertEqual(out.dtype, DTYPE)
-        torch.testing.assert_close(out.cpu(), fn(x), atol=0.1, rtol=0.1)
+        torch.testing.assert_close(out.cpu(), fn(x), atol=0.01, rtol=0.01)
 
     def test_inplace_arg_keeps_dtype(self):
         def fn(x):
@@ -206,7 +280,7 @@ class TestFallbackKernelPoolResidentArg(unittest.TestCase):
         compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
         out = compiled(x.clone().to(DEVICE))
         self.assertEqual(out.dtype, DTYPE)
-        torch.testing.assert_close(out.cpu(), fn(x.clone()), atol=0.1, rtol=0.1)
+        torch.testing.assert_close(out.cpu(), fn(x.clone()), atol=0.01, rtol=0.01)
 
 
 if __name__ == "__main__":

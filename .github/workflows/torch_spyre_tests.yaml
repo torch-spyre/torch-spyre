@@ -72,9 +72,9 @@ jobs:
   # ---------------------------------------------------------------------------
   # Job 1: changes
   #
-  # Runs on every PR. Uses gh CLI to fetch the full list of changed files
-  # and checks if any file outside tests/docs/, docs/, README.md, or
-  # CODEOWNERS was modified.
+  # Runs on every PR and merge-queue check. Delegates to the shared
+  # detect-doc-only-change composite action, which checks if any file outside
+  # tests/docs/, docs/, README.md, or CODEOWNERS was modified.
   #
   # code_changed=true  --> non-doc files changed  --> run tests
   # code_changed=false --> only doc/CODEOWNERS files changed --> skip tests
@@ -85,38 +85,15 @@ jobs:
     outputs:
       code_changed: ${{ steps.filter.outputs.code_changed }}
     steps:
+      - name: Checkout composite actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
       - name: Check which paths changed
         id: filter
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # On pull_request events, fetch the full list of changed files via
-          # the GitHub API. On push to main/tag or workflow_dispatch, assume
-          # tests should always run since we don't have a PR to query.
-          if [[ -n "${{ github.event.pull_request.number }}" ]]; then
-            FILES=$(gh pr view ${{ github.event.pull_request.number }} \
-              --repo ${{ github.repository }} \
-              --json files --jq '.files[].path')
-          else
-            # push to main, tag, or manual dispatch -- always run tests
-            FILES="non-doc-change"
-          fi
-
-          echo "Changed files:"
-          echo "$FILES"
-
-          # Check if any changed file is outside the doc directories.
-          # tests/docs/, docs/, README.md, and CODEOWNERS are the only paths
-          # that should skip tests.
-          NON_DOC=$(echo "$FILES" | grep -v '^tests/docs/' | grep -v '^docs/' | grep -v '^README\.md$' | grep -v '^CODEOWNERS$' || true)
-
-          if [[ -z "$NON_DOC" ]]; then
-            echo "Only doc files changed — skipping tests."
-            echo "code_changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "Non-doc files changed — running tests."
-            echo "code_changed=true" >> "$GITHUB_OUTPUT"
-          fi
+        uses: ./.github/actions/detect-doc-only-change
 
   # ---------------------------------------------------------------------------
   # Job 2: delegate to the shared test matrix

@@ -152,7 +152,13 @@ def _patch_tensor_for_spyre():
                 ):
                     return self
                 else:
-                    return torch.ops.spyre.copy_from_d2d(self, dst)
+                    # Pass storage_offsets explicitly: a graph input's
+                    # storage_offset is dropped by Inductor, so the lowering
+                    # must re-introduce it in-graph (see copy_from_d2d in
+                    # customops.py and lower_spyre_from_d2d).
+                    return torch.ops.spyre.copy_from_d2d(
+                        self, dst, self.storage_offset(), dst.storage_offset()
+                    )
 
     def spyre_empty(
         *args,

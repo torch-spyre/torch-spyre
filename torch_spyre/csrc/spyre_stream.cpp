@@ -226,6 +226,11 @@ void SpyreStream::launchHostCallback(flex::HostCallbackParams* params) const {
   resolveRuntimeHandle()->launchOperationHostCallback(params);
 }
 
+void SpyreStream::fillAsync(const flex::CompositeAddress* dst, double value,
+                            DataFormats dtype, bool use_dmai) const {
+  resolveRuntimeHandle()->fillAsync(dst, value, dtype, use_dmai);
+}
+
 void SpyreStream::launch(const JobPlan& plan,
                          const std::vector<at::Tensor>& args) const {
   // Validate all tensors are on Spyre device
