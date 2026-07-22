@@ -4,12 +4,6 @@ test_suite_config:
     - path: ${TORCH_ROOT}/test/inductor/test_mkldnn_pattern_matcher.py
       unlisted_test_mode: skip
       tests:
-        # These tests exercise the `conv2d` and `add` operations, focusing on tensor manipulations and scalar additions.
-        # They are classified as `mandatory_success` due to the critical nature of these operations in neural network computations.
-        # The relevance is high as these operations are fully supported by Spyre's capabilities, ensuring accurate and efficient tensor processing.
-        - names:
-            - TestPatternMatcher::test_conv2d_add_scalar
-          mode: mandatory_success
         # These tests exercise various convolution and transpose operations with dynamic shapes and broadcasting.
         # They are classified as xfail due to unsupported stick expressions and coordinate normalization errors.
         # The relevant Spyre limitations include unsupported stick expressions and complex coordinate normalization.
@@ -36,6 +30,7 @@ test_suite_config:
             - TestDynamicPatternMatcher::test_linear_unary
             - TestDynamicPatternMatcher::test_linear_unary_dynamic_shapes
             - TestDynamicPatternMatcherGeneric::test_multi_linear_share_same_input_dynamic
+            - TestPatternMatcher::test_conv2d_add_scalar
             - TestPatternMatcher::test_conv2d_binary
             - TestPatternMatcher::test_conv2d_binary_fusion_failed
             - TestPatternMatcher::test_conv2d_binary_inplace_fusion_failed_cpu

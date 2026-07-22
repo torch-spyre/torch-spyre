@@ -9,6 +9,16 @@ inputs:
     required: false
     type: string
     default: torch-spyre
+  venv_path:
+    description: >
+      Path to the Python virtualenv to activate, used verbatim. The venv
+      location is an image detail that varies, so the caller passes the full
+      path for its image — e.g. the shared /home/senuser/.venv for the prebaked
+      dev image. Absolute paths are used as-is; a relative path resolves
+      against the process working directory. Default '.venv'.
+    required: false
+    type: string
+    default: .venv
   suite_name:
     description: Human-readable label (used in echo/log output)
     required: true
@@ -55,6 +65,7 @@ runs:
       shell: bash
       env:
         TORCH_SPYRE_DIR: ${{ inputs.torch_spyre_dir }}
+        VENV_PATH: ${{ inputs.venv_path }}
         MAX_ATTEMPTS: ${{ inputs.max_attempts }}
         STALL_TIMEOUT_SECS: ${{ inputs.stall_timeout_secs }}
         STALL_CHECK_INTERVAL: ${{ inputs.stall_check_interval }}
@@ -69,7 +80,27 @@ runs:
         echo "TORCH_SPYRE_DIR $TORCH_SPYRE_DIR"
         cd "$TORCH_SPYRE_DIR" || exit 1
 
-        source .venv/bin/activate
+        # Activate the venv at VENV_PATH, used verbatim (no implicit base dir) so
+        # the caller has full control over where the venv lives — the venv
+        # location is an image detail that varies (e.g. <checkout>/.venv today,
+        # /home/senuser/.venv in the prebaked dev image) and may change again.
+        # The caller passes the full path for its image; a bare relative path
+        # (the default) resolves against the cwd set just above.
+        VENV_ACTIVATE="${VENV_PATH}/bin/activate"
+        echo "VENV_PATH $VENV_PATH (cwd $(pwd))"
+        if [[ ! -f "$VENV_ACTIVATE" ]]; then
+          echo "::error::venv activate script not found at '${VENV_ACTIVATE}'" \
+               "(VENV_PATH='${VENV_PATH}', resolved from cwd '$(pwd)')." \
+               "Set the run-test-suite 'venv_path' input to this image's venv:" \
+               "'.venv' for a normal checkout (<dir>/.venv), or an absolute path" \
+               "such as /home/senuser/.venv for the prebaked dev image."
+          echo "  contents of '${VENV_PATH}' (if any):"
+          ls -la "$VENV_PATH" 2>&1 | sed 's/^/    /' || true
+          exit 1
+        fi
+        # The action runs with `set +e`, so make activation fatal — otherwise a
+        # failed source is ignored and tests run against the global Python.
+        source "$VENV_ACTIVATE" || exit 1
 
         CONFIG="${{ inputs.config }}"
 
