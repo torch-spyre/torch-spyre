@@ -17,8 +17,7 @@ from collections.abc import Sequence
 import os
 import subprocess
 import torch
-import hashlib
-import time
+import uuid
 
 from torch._inductor.async_compile import AsyncCompile
 from torch._inductor.runtime.runtime_utils import cache_dir
@@ -38,7 +37,7 @@ logger = get_inductor_logger("sdsc_compile")
 def get_output_dir(kernel_name: str):
     spyre_dir = os.path.join(cache_dir(), "inductor-spyre")
     os.makedirs(spyre_dir, exist_ok=True)
-    digest = hashlib.sha1(str(time.time_ns()).encode()).hexdigest()[:8]
+    digest = uuid.uuid4().hex[:8]
     kernel_output_dir = tempfile.mkdtemp(
         dir=spyre_dir, prefix=f"{digest}_{kernel_name}_"
     )
