@@ -24,6 +24,7 @@ from unittest import TestCase
 from torch_spyre._inductor import config
 from torch_spyre._inductor.scratchpad.allocator import _lx_planning_size
 from torch_spyre._inductor.scratchpad.plan_solver import (
+    CoreDivisionLayoutSolver,
     MemoryPlanSolver,
     CoreDivision,
     CoreDivisionBuffer,
@@ -577,6 +578,9 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
     ``check_result`` validates the packing is legal and at least as full as the
     heuristic rather than asserting exact addresses.
     """
+
+    # Narrower than the base suite's: these tests drive the joint entry point.
+    solver_class: type[CoreDivisionLayoutSolver] = None  # type: ignore[assignment]
 
     def make_buffer(self, name, size, uses, **kwargs):
         # The joint solver requires every buffer to carry at least one core

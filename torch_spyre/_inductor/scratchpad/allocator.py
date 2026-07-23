@@ -16,7 +16,7 @@ import logging
 import math
 import time
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
 import sympy
 import torch
@@ -46,6 +46,7 @@ from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
     CoreDivisionBuffer,
+    CoreDivisionLayoutSolver,
     GreedyLayoutSolver,
     LifetimeBoundBuffer,
     MemoryPlanSolver,
@@ -62,14 +63,8 @@ from torch_spyre._inductor.scratchpad.simulated_annealing import (
 from torch_spyre._inductor.scratchpad.passes import (
     ScratchpadOptimizationPass,
 )
-
-if TYPE_CHECKING:
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
-        CpSatLayoutSolver,
-    )
 from torch_spyre._inductor.scratchpad.utils import (
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
-    round_up_to_alignment,
     clone_at_graph_boundaries,
     mem_usage_by_buf,
     calculate_liveness,
@@ -89,6 +84,7 @@ from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.pass_utils import _is_matmul_op
 
 logger = get_inductor_logger("scratchpad.allocator")
+
 
 # Keep these values synchronized with Deeptools' LX memory tracker:
 #
@@ -548,23 +544,19 @@ def _op_short_name(op: Any) -> str:
 
 
 def _lx_planning_size() -> int:
-    """Return the frontend LX reservation, matching Deeptools exactly.
+    """LX scratchpad bytes available to the layout solver.
 
-    The shared Torch/DXP contract partitions Deeptools' allocatable LX capacity,
-    not the physical 2 MiB.  The frontend reserves
-    ``1 - DXP_LX_FRAC_AVAIL`` from address zero, truncates the fractional byte
-    count to an integer, and rounds that reservation up to the memory tracker's
-    128-byte allocation granularity.  DXP marks that interval unavailable and
-    allocates at or above the returned exclusive upper bound.  This is the
-    ownership boundary whose mismatch was reported in torch-spyre issue #3222,
-    not a safety margin.
+    TEMPORARY GUARD: subtracts a 100KB safety margin from the frontend's
+    declared share. The backend compiler has been observed placing its own
+    internal LX allocations at a fixed address (~1587KB) inside the
+    frontend's nominal `dxp_lx_frac_avail` partition, silently corrupting
+    frontend data resident there once per-core usage gets close enough to
+    the partition boundary (see Issue 3222). This
+    margin keeps frontend buffers clear of that address until the backend
+    allocator itself is fixed to stay within its own reserved share.
     """
-    backend_fraction = config.dxp_lx_frac_avail
-    if not 0.0 <= backend_fraction <= 1.0:
-        raise ValueError("DXP_LX_FRAC_AVAIL must be >=0 and <=1")
-
-    frontend_reservation = int(_LX_TRACKER_CAPACITY_BYTES * (1.0 - backend_fraction))
-    return round_up_to_alignment(frontend_reservation, _LX_ALLOCATION_GRANULARITY_BYTES)
+    lx_backend_spill_margin = 100 << 10
+    return int((2 << 20) * (1.0 - config.dxp_lx_frac_avail)) - lx_backend_spill_margin
 
 
 def _fixed_core_division(op: Operation) -> CoreDivision:
@@ -1189,11 +1181,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # Greedy fallback for when CP-SAT is unavailable (ortools not installed).
         self._fallback = ScratchpadAllocator(layout_planning=GreedyLayoutSolver(size))
 
-        # Annotated as the concrete solver rather than ``MemoryPlanSolver``: this
-        # allocator drives the *joint* entry point
-        # (``plan_layout_and_core_divisions``), which only ``CpSatLayoutSolver``
-        # offers. Quoted + TYPE_CHECKING-only so the runtime import stays lazy.
-        self.layout_planning: Optional["CpSatLayoutSolver"]
+        # This allocator drives the *joint* entry point, so it needs the
+        # core-division interface rather than plain ``MemoryPlanSolver``.
+        self.layout_planning: Optional[CoreDivisionLayoutSolver]
         try:
             # Imported lazily so this module (and the greedy path) load even when
             # ortools is absent: CpSatLayoutSolver.__init__ raises ImportError
