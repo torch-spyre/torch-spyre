@@ -65,6 +65,7 @@ from torch_spyre._inductor.scratchpad.passes import (
 )
 from torch_spyre._inductor.scratchpad.utils import (
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
+    round_up_to_alignment,
     clone_at_graph_boundaries,
     mem_usage_by_buf,
     calculate_liveness,
@@ -555,8 +556,12 @@ def _lx_planning_size() -> int:
     margin keeps frontend buffers clear of that address until the backend
     allocator itself is fixed to stay within its own reserved share.
     """
-    lx_backend_spill_margin = 100 << 10
-    return int((2 << 20) * (1.0 - config.dxp_lx_frac_avail)) - lx_backend_spill_margin
+    backend_fraction = config.dxp_lx_frac_avail
+    if not 0.0 <= backend_fraction <= 1.0:
+        raise ValueError("DXP_LX_FRAC_AVAIL must be >=0 and <=1")
+
+    frontend_reservation = int(_LX_TRACKER_CAPACITY_BYTES * (1.0 - backend_fraction))
+    return round_up_to_alignment(frontend_reservation, _LX_ALLOCATION_GRANULARITY_BYTES)
 
 
 def _fixed_core_division(op: Operation) -> CoreDivision:
