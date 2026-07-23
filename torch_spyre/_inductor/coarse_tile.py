@@ -600,6 +600,34 @@ def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
     return groups
 
 
+def validate_coarse_tile_groups(groups: list[tuple]) -> None:
+    """Raise RuntimeError if any hint_id appears in more than one group.
+
+    Each spyre_hint scope has a unique hint_id.  All ops sharing a hint scope
+    must be contiguous in the operation list and therefore land in a single group.
+    A hint_id appearing in two groups means ops from the same hint scope were
+    split — e.g. because an unrelated op migrated into the middle of the run —
+    producing two separate loop nests over the same hint scope that would iterate
+    different tiles in an unsynchronized fashion.
+    """
+    hint_id_to_group: dict[int, int] = {}
+    for group_idx, (group_ops, _levels) in enumerate(groups):
+        group_hint_ids: set[int] = set()
+        for op in group_ops:
+            for h in getattr(op, "dim_hints", []):
+                group_hint_ids.add(h.hint_id)
+        for hint_id in group_hint_ids:
+            prior = hint_id_to_group.get(hint_id)
+            if prior is not None:
+                raise RuntimeError(
+                    f"coarse_tile: hint_id={hint_id} appears in both group {prior} "
+                    f"and group {group_idx}. Ops from the same hint scope were split "
+                    "across two separate loop nests, which would produce unsynchronized "
+                    "tiling."
+                )
+            hint_id_to_group[hint_id] = group_idx
+
+
 def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
     """Build coarse_tile() groups from automatic span-overflow plans.
 

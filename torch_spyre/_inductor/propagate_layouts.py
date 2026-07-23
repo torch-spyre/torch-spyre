@@ -469,7 +469,9 @@ def _single_arg_op_layout(
         )
         return [stl]
 
-    in_device_coords = device_coordinates(stl, dep, None)
+    in_device_coords = try_device_coordinates(stl, dep, None)
+    if in_device_coords is None:
+        return []
     stick_expr = in_device_coords[-1]
 
     # Try to preserve input layout, fall back to scanning all output dims
