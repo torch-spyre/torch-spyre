@@ -753,18 +753,23 @@ def lower_avg_pool2d(
             "pad_w": pW,
             "scaling_factor": 1.0 / (kH * kW),
         },
-        # Explicit SDSC dimension labels for the avgpool iteration space, whose
-        # order is [N, H_out, W_out, C, kH, kW] (the channel dim C is rearranged
-        # to sit after the spatial output dims).  Passed to superdsc.py so label
-        # assignment is never inferred from sizes (which is fragile for
-        # kernel_size=1, non-square outputs, or N==H_out).
+        # Canonical size of each avgpool iteration-space dim, keyed by its
+        # pooling-domain role.  The codegen layer owns the SDSC label names and
+        # maps these roles onto them (see POOL_DIM_LABELS / _align_pool_dim_labels
+        # in codegen/superdsc.py), so SDSC naming never leaks above codegen.
         #
-        # dim_label_sizes gives each label's canonical size in the SAME order.
-        # The pipeline drops size-1 dims from the iteration space before
-        # parse_op_spec runs (e.g. batch N=1), so superdsc filters the labels by
-        # these sizes to stay aligned with the surviving dims — no role guessing.
-        "dim_labels": ["mb", "i", "j", "out", "ki", "kj"],
-        "dim_label_sizes": [N, H_out, W_out, C, kH, kW],
+        # The pipeline drops statically size-1 dims from the iteration space
+        # before parse_op_spec runs (e.g. batch N=1), so codegen uses these sizes
+        # to drop the corresponding labels and stay aligned with the surviving
+        # dims — never inferring roles from sizes.
+        "pool_dim_sizes": {
+            "batch": N,
+            "out_h": H_out,
+            "out_w": W_out,
+            "channel": C,
+            "win_h": kH,
+            "win_w": kW,
+        },
     }
 
     def inner_fn(index, reduction_index):

@@ -27,6 +27,7 @@ from torch_spyre._inductor.constants import (
     LAYOUT_LABELS,
     MATMUL_DIM_LABELS,
     MATMUL_LAYOUT_LABELS,
+    POOL_DIM_LABELS,
     POOL_OPS,
     RESTICKIFY_OP,
     TOPK_OPS,
@@ -413,32 +414,44 @@ def _is_pool(op: str) -> bool:
 _POOL_NUM_CORELETS = 2
 
 
+# Canonical avgpool iteration-space order -> SDSC labels.  Codegen owns these
+# label strings; the lowering supplies only per-role sizes
+# (op_info["pool_dim_sizes"]), so SDSC naming never leaks above the codegen
+# layer.  Order matches POOL_DIM_LABELS and the emitted iteration space.
+_POOL_ROLE_LABELS = list(
+    zip(["batch", "out_h", "out_w", "channel", "win_h", "win_w"], POOL_DIM_LABELS)
+)
+
+
+def _is_static_one(sz) -> bool:
+    try:
+        return int(sz) == 1
+    except (TypeError, ValueError):
+        return False  # symbolic/dynamic dim: never dropped
+
+
 def _align_pool_dim_labels(op_info: dict, ndim: int) -> list[str]:
     """Return the pool dim labels aligned to the (possibly squeezed) iteration space.
 
-    The lowering supplies ``dim_labels`` in the canonical iteration-space order
-    together with ``dim_label_sizes`` (each label's canonical size).  The
+    The lowering supplies ``pool_dim_sizes`` — each pooling-domain dim role
+    (batch, out_h, out_w, channel, win_h, win_w) mapped to its canonical size.
+    Codegen owns the SDSC label for each role (``_POOL_ROLE_LABELS``).  The
     compilation pipeline drops statically size-1 dims (e.g. batch N=1) before
-    parse_op_spec runs, so a label whose canonical size is 1 has no surviving
-    dim and is filtered out here.  This keeps the labels aligned to the real
-    iteration space without inferring dim roles from sizes.
+    parse_op_spec runs, so a role whose canonical size is 1 has no surviving dim
+    and its label is filtered out here.  This keeps the labels aligned to the
+    real iteration space without inferring dim roles from sizes.
     """
-    labels = op_info["dim_labels"]
-    sizes = op_info.get("dim_label_sizes")
-    if sizes is not None:
-
-        def _is_static_one(sz) -> bool:
-            try:
-                return int(sz) == 1
-            except (TypeError, ValueError):
-                return False  # symbolic/dynamic dim: never dropped
-
-        labels = [lbl for lbl, sz in zip(labels, sizes) if not _is_static_one(sz)]
+    sizes = op_info.get("pool_dim_sizes", {})
+    labels = [
+        label
+        for role, label in _POOL_ROLE_LABELS
+        if not _is_static_one(sizes.get(role))
+    ]
     if len(labels) != ndim:
         raise ValueError(
             f"pool dim label count {len(labels)} ({labels}) does not match "
-            f"iteration-space rank {ndim}; dim_labels/dim_label_sizes in the "
-            "lowering are out of sync with the emitted iteration space"
+            f"iteration-space rank {ndim}; pool_dim_sizes in the lowering are "
+            "out of sync with the emitted iteration space"
         )
     return labels
 
@@ -954,12 +967,14 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         if is_pool:
             # Pool op where C fits in one stick (e.g. C=1): the "out" (channel)
             # dimension was dropped from the iteration space because its size is 1,
-            # but the SDSC still needs it.  Use the actual channel count from the
-            # output tensor's device layout: device_size[-3] = channel count C.
-            # (Using INPUT_DIM_LABELS[ndim] would collide with pool dim labels
-            # like "i", "j", "ki", "kj" supplied by the lowering.)
+            # but the SDSC still needs it.  Take the channel count from the
+            # op-domain pool_dim_sizes rather than reaching into the physical
+            # device layout.  (Using INPUT_DIM_LABELS[ndim] would collide with the
+            # pool dim labels "i", "j", "ki", "kj".)
             stick_sym = Symbol("out")
-            sdsc_iteration_space[stick_sym] = int(op_spec.args[1].device_size[-3])
+            sdsc_iteration_space[stick_sym] = int(
+                op_spec.op_info["pool_dim_sizes"]["channel"]
+            )
         else:
             stick_sym = Symbol(INPUT_DIM_LABELS[ndim])
             sdsc_iteration_space[stick_sym] = op_spec.args[
