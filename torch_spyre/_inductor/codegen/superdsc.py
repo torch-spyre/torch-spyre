@@ -270,6 +270,7 @@ def _get_layout_label(
     stick_dim_order: list,
     stick_size: list,
     layout_labels: list[str],
+    is_input: bool = True,
 ) -> str:
     for label, layout in layouts.items():
         if (
@@ -278,7 +279,21 @@ def _get_layout_label(
             and layout["stick_size"] == stick_size
         ):
             return label
-    label = layout_labels[len(layouts)]
+
+    # Label assignment must be role-aware, not purely discovery-order.
+    # layout_labels[0] is conventionally "OUTPUT" (or "INPUT" for matmul
+    # labels) — reserve it for the output arg specifically so that when an
+    # input arg's layout is discovered first (e.g. FP8 KERNEL args whose
+    # stick shape differs from the plain output), it doesn't steal the
+    # output's label. Fall back to positional assignment among the
+    # remaining unused labels otherwise.
+    available = [l for l in layout_labels if l not in layouts]
+    if not is_input and "OUTPUT" in available:
+        label = "OUTPUT"
+    else:
+        non_output = [l for l in available if l != "OUTPUT"]
+        label = non_output[0] if non_output else available[0]
+
     layouts[label] = {
         "dim_order": dim_order,
         "stick_dim_order": stick_dim_order,
@@ -413,7 +428,14 @@ def _create_sdsc_tensors(
     sdsc_args: list[SDSCArgs] = []
 
     for i, arg in enumerate(op_spec.args):
-        is_fp8_mm_kernel_arg = arg.element_arrangement == ElementArrangement.QFP8WT
+        # fp8todl16 (dequantize) uses an older DDL template (quantization_double_pad.ddl)
+        # that only supports a single-dim stick and cannot match a 2D-stick KERNEL
+        # operand. The 2D-stick QFP8WT layout is only valid for the FP8 matmul
+        # kernel path (batchmatmulfp8); gate it off for fp8todl16 specifically.
+        is_fp8_mm_kernel_arg = (
+            arg.element_arrangement == ElementArrangement.QFP8WT
+            and op_spec.op != "fp8todl16"
+        )
 
         # Step 1: Determine dimension order and stick dimension.
         # Index tensors use their pre-computed layout (their coords have no IndirectAccess).
@@ -535,6 +557,7 @@ def _create_sdsc_tensors(
                 effective_stick,
                 layout_stick_size,
                 layout_labels,
+                is_input=arg.is_input,
             )
 
         # Index tensors carry 32-bit integer indices; re-label as SENUINT32 since
