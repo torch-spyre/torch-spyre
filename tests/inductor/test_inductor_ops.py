@@ -4391,6 +4391,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
+        ("test_round_trip_to_dtype_copy", "test_round_trip_to_dtype_copy_cpu"): {
+            "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+        },
         (
             "test_round_trip_to_dtype_implicit",
             "test_round_trip_to_dtype_implicit_cpu",
@@ -6279,6 +6283,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             fn,
             x,
             dst_dtype,
+            cpu_compile=False,
+            run_eager=False,
+        )
+
+    def test_round_trip_to_dtype_copy_cpu(self, s, dst_dtype):
+        d = torch.zeros_like(s, dtype=dst_dtype)
+
+        def fn(d, s):
+            d.copy_(s)
+            return d.to(s.dtype)
+
+        self.compare_with_cpu(
+            fn,
+            d,
+            s,
             cpu_compile=False,
             run_eager=False,
         )
