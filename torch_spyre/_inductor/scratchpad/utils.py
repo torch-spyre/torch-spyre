@@ -65,6 +65,10 @@ OP_OUTPUT_GOOD_FOR_LX_REUSE = frozenset(
 )
 
 
+def round_up_to_alignment(arg: int, alignment: int) -> int:
+    return ((arg + alignment - 1) // alignment) * alignment
+
+
 def clone_at_graph_boundaries() -> bool:
     """True when clone ops are eligible for LX, enabling clone insertion at graph
     input/output boundaries so those buffers can also be LX-pinned.
