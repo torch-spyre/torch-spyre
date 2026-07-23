@@ -545,16 +545,16 @@ def _op_short_name(op: Any) -> str:
 
 
 def _lx_planning_size() -> int:
-    """LX scratchpad bytes available to the layout solver.
+    """Return the frontend LX reservation, matching Deeptools exactly.
 
-    TEMPORARY GUARD: subtracts a 100KB safety margin from the frontend's
-    declared share. The backend compiler has been observed placing its own
-    internal LX allocations at a fixed address (~1587KB) inside the
-    frontend's nominal `dxp_lx_frac_avail` partition, silently corrupting
-    frontend data resident there once per-core usage gets close enough to
-    the partition boundary (see Issue 3222). This
-    margin keeps frontend buffers clear of that address until the backend
-    allocator itself is fixed to stay within its own reserved share.
+    The shared Torch/DXP contract partitions Deeptools' allocatable LX capacity,
+    not the physical 2 MiB.  The frontend reserves
+    ``1 - DXP_LX_FRAC_AVAIL`` from address zero, truncates the fractional byte
+    count to an integer, and rounds that reservation up to the memory tracker's
+    128-byte allocation granularity.  DXP marks that interval unavailable and
+    allocates at or above the returned exclusive upper bound.  This is the
+    ownership boundary whose mismatch was reported in torch-spyre issue #3222,
+    not a safety margin.
     """
     backend_fraction = config.dxp_lx_frac_avail
     if not 0.0 <= backend_fraction <= 1.0:
