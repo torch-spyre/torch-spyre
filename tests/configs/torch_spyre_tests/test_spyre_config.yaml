@@ -1,5 +1,5 @@
 test_suite_config:
-  labels: [smoke, core, full]
+  labels: [smoke, core, full, device_critical]
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/test_spyre.py
       unlisted_test_mode: mandatory_success

@@ -101,7 +101,7 @@ SolverInitialOption: TypeAlias = (
 SolverScheduleOption: TypeAlias = CoolingSchedule | Literal["auto"]
 
 
-class SimulatedAnnealingLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
+class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
     """We can only do the full initialization when we know the list of buffers, so
     this class is just a shim to create the actual solver."""
 

@@ -22,16 +22,13 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     MemoryPlanSolver,
     _assert_in_place_relationships,
 )
+from torch_spyre._inductor.scratchpad.utils import round_up_to_alignment
 
 __all__ = [
     "FirstFitLayoutSolver",
     "BestFitLayoutSolver",
     "_assert_in_place_relationships",
 ]
-
-
-def round_up_to_alignment(arg: int, alignment: int) -> int:
-    return ((arg + alignment - 1) // alignment) * alignment
 
 
 @dataclass(frozen=True)
@@ -78,7 +75,7 @@ def _topological_sort(
     return result
 
 
-class FirstFitLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
+class FirstFitLayoutSolver(MemoryPlanSolver):
     """Allocates buffers by priority score, placing each in the first gap that fits.
 
     Buffers are sorted topologically (parents before children) with ties broken by ascending
@@ -152,7 +149,10 @@ class FirstFitLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
         placed_by_name = {b.name: b for b in placed}
         for i, gap in enumerate(gaps):
             new_parents = list(gap.in_place_parents)
-            for parent_name in parent_names:
+            # Don't use the set for iteration: plan_layout reuses in_place_parents[0], so a
+            # hash-ordered append here would pick a different in-place parent (hence
+            # a different address) run-to-run under PYTHONHASHSEED.
+            for parent_name in buffer.in_place_parents:
                 parent = placed_by_name.get(parent_name)
                 if parent is None or parent.address is None:
                     continue
