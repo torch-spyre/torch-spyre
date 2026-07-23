@@ -265,8 +265,13 @@ def gen_coord_info_value(
     is_stick_reduction: bool = False,
     conv_params=None,
 ):
+    """
+    Args:
+        conv_params: Dict with padding info for convolution ops; contains 'conv_padding' (pad type) and 'total_size' (per-core slice size for padding dims).
+        If conv_params is not specified, pad type should default to "nopad" and total_size to size.
+    """
     if conv_params is None:
-        conv_params = {"conv_padding": "nopad", "total_size": -1}
+        conv_params = {"conv_padding": "nopad", "total_size": size}
 
     return (
         {
@@ -1222,30 +1227,36 @@ def generate_sdsc(
                                     ),
                                     "coordinates_": {
                                         "coordInfo": {
-                                            str(dim): gen_coord_info_value(
-                                                size=sdsc_spec.iteration_space[dim]
-                                                // sdsc_spec.work_slices[dim]
+                                            str(dim): (
+                                                lambda dim_size, dim_nsplits: (
+                                                    gen_coord_info_value(
+                                                        size=dim_size // dim_nsplits,
+                                                        nsplits=dim_nsplits,
+                                                        elems_per_stick=tensor.data_format.elems_per_stick(),
+                                                        is_stick_dim=(
+                                                            sdsc_spec.layouts[
+                                                                tensor.layout
+                                                            ]["stick_dim_order"].has(
+                                                                dim
+                                                            )
+                                                        ),
+                                                        is_stick_reduction=(
+                                                            tensor.scales[dim] == -2
+                                                        ),
+                                                        conv_params=get_conv_params(
+                                                            i,
+                                                            dim,
+                                                            sdsc_spec.opfunc,
+                                                            sdsc_spec.conv_params,
+                                                            dim_size // dim_nsplits,
+                                                        ),
+                                                    )
+                                                )
+                                            )(
+                                                sdsc_spec.iteration_space[dim],
+                                                sdsc_spec.work_slices[dim]
                                                 if (tensor.scales[dim] == 1)
                                                 else 1,
-                                                nsplits=sdsc_spec.work_slices[dim]
-                                                if (tensor.scales[dim] == 1)
-                                                else 1,
-                                                elems_per_stick=tensor.data_format.elems_per_stick(),
-                                                is_stick_dim=(
-                                                    sdsc_spec.layouts[tensor.layout][
-                                                        "stick_dim_order"
-                                                    ].has(dim)
-                                                ),
-                                                is_stick_reduction=(
-                                                    tensor.scales[dim] == -2
-                                                ),
-                                                conv_params=get_conv_params(
-                                                    i,
-                                                    dim,
-                                                    sdsc_spec.opfunc,
-                                                    sdsc_spec.conv_params,
-                                                    sdsc_spec.iteration_space[dim],
-                                                ),
                                             )
                                             for dim in sdsc_spec.layouts[tensor.layout][
                                                 "dim_order"
