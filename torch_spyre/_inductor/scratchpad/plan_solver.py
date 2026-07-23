@@ -180,6 +180,7 @@ def _assert_in_place_relationships(
                     f"must be <= parent {parent_name}.size={parent.size}"
                 )
 
+
 class MemoryPlanSolver(ABC):
     """Solves *placement*: where, if anywhere, each buffer lives in scratchpad.
 
@@ -188,6 +189,7 @@ class MemoryPlanSolver(ABC):
     footprint to pack. :class:`CoreDivisionLayoutSolver` extends the contract for
     solvers that can also choose the division.
     """
+
     def __init__(self, size: int, alignment: int = 128):
         """Initialize the solver with a fixed scratchpad capacity and alignment.
 
