@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import pytest
 import unittest
 import torch
+import torch.nn.functional as F
 
 from utils_inductor import (
     ParameterizedTestMeta,
@@ -2551,6 +2553,65 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d": (cached_randn((64, 256, 128), dtype=torch.float16),),
                 "4d": (cached_randn((4, 17, 256, 128), dtype=torch.float16),),
             },
+        },
+        ("test_layernorm_functional", "test_layernorm_functional_cpu"): {
+            "param_sets": {
+                "weight_and_bias": (
+                    cached_randn((64, 256), dtype=torch.float16),
+                    torch.zeros((64, 256), dtype=torch.float16),
+                    cached_randn((256,), dtype=torch.float16),
+                    cached_randn((256,), dtype=torch.float16),
+                    None,
+                ),
+                "weight_bias_eps": (
+                    cached_randn((64, 256), dtype=torch.float16, differentiation=1),
+                    torch.zeros((64, 256), dtype=torch.float16),
+                    cached_randn((256,), dtype=torch.float16, differentiation=1),
+                    cached_randn((256,), dtype=torch.float16, differentiation=1),
+                    1e-3,
+                ),
+                "fused_residual": (
+                    cached_randn((64, 256), dtype=torch.float16, differentiation=2),
+                    cached_randn((64, 256), dtype=torch.float16, differentiation=3),
+                    cached_randn((256,), dtype=torch.float16, differentiation=2),
+                    cached_randn((256,), dtype=torch.float16, differentiation=2),
+                    None,
+                ),
+            },
+        },
+        ("test_rmsnorm_manual", "test_rmsnorm_manual_cpu"): {
+            "param_sets": {
+                "2d": (
+                    cached_randn((64, 256), dtype=torch.float16),
+                    torch.ones((256,), dtype=torch.float16),
+                ),
+            },
+        },
+        # TODO: aten::native_batch_norm not implemented for the 'spyre' backend
+        # (runtime NotImplementedError before compilation) (issue #1889)
+        ("test_batch_norm_functional", "test_batch_norm_functional_cpu"): {
+            "param_sets": {
+                "eval_mode": (
+                    cached_randn((64, 256), dtype=torch.float16),
+                    torch.zeros((256,), dtype=torch.float16),
+                    torch.ones((256,), dtype=torch.float16),
+                    torch.ones((256,), dtype=torch.float16),
+                    torch.zeros((256,), dtype=torch.float16),
+                ),
+            },
+            "expect_fail": ["eval_mode"],
+        },
+        # TODO: TorchInductor compilation failure in the Spyre lowering pass —
+        # KeyError 'No FX node for buf11' in split_multi_ops.py (issue #3287)
+        ("test_group_norm_functional", "test_group_norm_functional_cpu"): {
+            "param_sets": {
+                "8_groups": (
+                    cached_randn((64, 256, 16), dtype=torch.float16),
+                    cached_randn((256,), dtype=torch.float16),
+                    cached_randn((256,), dtype=torch.float16),
+                ),
+            },
+            "expect_fail": ["8_groups"],
         },
         ("test_softplus", "test_softplus_cpu"): {
             "param_sets": {
@@ -5688,6 +5749,44 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.nn.functional.softplus(input, beta, threshold)
 
         self.compare_with_cpu(fn, x)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_layernorm_functional_cpu(self, x, residual, weight, bias, eps):
+        # residual is a real (zero-filled where unused) tensor input so every
+        # variant traces the same add+layernorm shape; eps is a Python
+        # constant that only changes the kwargs passed to F.layer_norm.
+        def fn(x, residual, weight, bias):
+            x = x + residual
+            kwargs = {} if eps is None else {"eps": eps}
+            return F.layer_norm(x, x.shape[1:], weight=weight, bias=bias, **kwargs)
+
+        self.compare_with_cpu(fn, x, residual, weight, bias)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_rmsnorm_manual_cpu(self, x, weight):
+        def fn(x, weight):
+            rms = torch.sqrt((x**2).mean(dim=-1, keepdim=True) + 1e-5)
+            return x / rms * weight
+
+        self.compare_with_cpu(fn, x, weight)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_batch_norm_functional_cpu(
+        self, x, running_mean, running_var, weight, bias
+    ):
+        def fn(x, running_mean, running_var, weight, bias):
+            return torch.nn.functional.batch_norm(
+                x, running_mean, running_var, weight=weight, bias=bias, training=False
+            )
+
+        self.compare_with_cpu(fn, x, running_mean, running_var, weight, bias)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_group_norm_functional_cpu(self, x, weight, bias):
+        def fn(x, weight, bias):
+            return torch.nn.functional.group_norm(x, 8, weight=weight, bias=bias)
+
+        self.compare_with_cpu(fn, x, weight, bias)
 
     def test_view_permute_mul(self, x):
         """Create 3D tensor, view as 4D, permute, multiply by constant."""
