@@ -1028,3 +1028,57 @@ def test_broadcast_expand_both():
         optimal_cost=2 * acs.numel(),
         check_strides=False,
     )
+
+
+# ------- Single-arg op with a size-1 interior dim ---------
+
+
+def test_single_arg_size1_interior_dim():
+    """Slicing one position out of a [B, H, L, D] tensor yields a size-1 interior dim.
+
+    The size-1 seq dim is offered as a stick candidate for the single-arg op that
+    produces it; its stick expression concretizes to 1, which device_coordinates
+    rejects. That candidate must be skipped, not abort the compile. Mirrors the
+    per-position KV-cache write in decoder inference (input [1, 2, L, 128] ->
+    [1, 2, 1, 128]).
+    """
+    x = torch.randn((1, 2, T, 128), dtype=torch.float16)
+    _compare(lambda x: x[:, :, 1:2, :].contiguous(), x)
+
+
+def test_single_arg_size1_after_staggered_ea():
+    """RoPE output written into a KV cache at a single token position.
+
+    A RoPE-style mul+sum produces a staggered 7-dim device layout for k of
+    shape [1, NKV, T, HD]. The single-position KV write slices k to
+    [1, NKV, 1, HD] and scatters it into the cache via copy_. The mutation op
+    is a single-arg op whose output is [1, NKV, 1, HD]; when propagate_layouts
+    evaluates the staggered input STL against this op's dep, the stick
+    expression concretizes to the literal 1 (the size-1 seq dim). That
+    candidate must be skipped via try_device_coordinates, not abort the compile.
+
+    test_single_arg_size1_interior_dim does not cover this because its input
+    STL is plain row-major; here the input STL is a committed staggered-EA
+    layout from the RoPE op.
+    """
+    NKV, HD = 2, 128
+    half = HD // 2
+    KVLEN = 3 * T  # cache longer than one block
+
+    def fn(x, sf, kc):
+        # RoPE: [1, NKV, T, HD] -> staggered-EA output
+        B, H, L, D = x.shape
+        h = D // 2
+        x_ = x.transpose(1, 2).reshape(B, L, H, 2, h)
+        sf6 = sf[:, :, None, :, :, :]
+        k = sf6.mul(x_.unsqueeze(-3)).sum(4, keepdim=True).flatten(3)
+        k = k.transpose(1, 2)
+        # Single-position KV write: slice [1, NKV, 1, HD] into cache
+        kw = k[:, :, 1:2, :]
+        kc[:, :, T : T + 1, :] = kw
+        return kc
+
+    x = torch.randn((1, NKV, T, HD), dtype=torch.float16)
+    sf = torch.randn((1, T, 2, 2, half), dtype=torch.float16)
+    kc = torch.randn((1, NKV, KVLEN, HD), dtype=torch.float16)
+    _compare(fn, x, sf, kc)

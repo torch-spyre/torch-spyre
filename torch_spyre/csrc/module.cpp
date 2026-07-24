@@ -433,6 +433,14 @@ PYBIND11_MODULE(_C, m) {
             }
           },
           py::arg("idx"), "Get the type of step at the given index")
+      .def(
+          "get_step_pipeline_barrier",
+          [](const spyre::JobPlan& plan, size_t idx) {
+            TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");
+            return plan.steps[idx]->getPipelineBarrier();
+          },
+          py::arg("idx"),
+          "Get the pipeline_barrier flag for the step at the given index")
       .def("__repr__", [](const spyre::JobPlan& plan) {
         return "<JobPlan steps=" + std::to_string(plan.steps.size()) +
                " job_allocation_size=" +

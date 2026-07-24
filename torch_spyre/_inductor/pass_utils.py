@@ -743,11 +743,10 @@ def try_device_coordinates(
     """Like ``device_coordinates`` but returns ``None`` instead of raising when
     the layout's stick expression is one the backend cannot represent.
 
-    Intended for callers that *enumerate* candidate layouts (e.g. matmul input
-    layout selection) and want to skip an unrepresentable candidate rather than
-    abort the whole compile. Callers that have already committed to a single
-    layout should keep using ``device_coordinates`` so an unrepresentable stick
-    remains a hard error.
+    Use this to probe whether a layout is representable under a given dep —
+    for example, when iterating candidate input STLs and wanting to skip any
+    whose stick concretizes to an unsupported expression (e.g. the literal 1
+    when the stick dimension is size-1 in the current op's loop ranges).
     """
     try:
         return device_coordinates(stl, dep, indirect_sizes)
@@ -1630,8 +1629,9 @@ def _per_core_view_on_buf(
     write_index / read_index / iter_space / matmul-ness, not just (splits, dep,
     buf_name): two different ops can share the same (splits, dep, buf_name) — e.g.
     a producer's write-dep and a consumer's read-dep on the same buffer at the
-    same index — and must NOT alias the same entry (``_as_core_division_buffers``
-    shares one cache across a producer and consumer of the same buffer).
+    same index — and must NOT alias the same entry (both
+    ``ScratchpadAllocator._cd_parent_matches`` and ``get_ncores_for_buffers``
+    share one cache across a producer and consumer of the same buffer).
     """
     coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
     if cache is not None:

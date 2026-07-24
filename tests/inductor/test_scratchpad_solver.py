@@ -14,9 +14,15 @@
 
 """Tests for layout solvers"""
 
+import json
+import os
+import subprocess
+import sys
 import unittest
 from unittest import TestCase
 
+from torch_spyre._inductor import config
+from torch_spyre._inductor.scratchpad.allocator import _lx_planning_size
 from torch_spyre._inductor.scratchpad.plan_solver import (
     MemoryPlanSolver,
     CoreDivision,
@@ -49,6 +55,27 @@ from torch_spyre._inductor.scratchpad.simulated_annealing import (
 LARGE_SIZE = 512
 SMALL_SIZE = 10
 ALIGNMENT = 128
+
+
+class TestLxPlanningContract(TestCase):
+    def test_matches_deeptools_frontend_reservation(self):
+        # Deeptools removes 64 KiB for program/debug data before applying the
+        # frontend/backend partition, then rounds the frontend reservation up to
+        # its 128-byte allocation granularity.
+        cases = ((0.0, 2_031_616), (0.2, 1_625_344), (1.0, 0))
+        for fraction, expected in cases:
+            with self.subTest(fraction=fraction):
+                with config.patch({"dxp_lx_frac_avail": fraction}):
+                    self.assertEqual(_lx_planning_size(), expected)
+
+    def test_rejects_invalid_backend_fraction(self):
+        for fraction in (-0.01, 1.01, float("nan")):
+            with self.subTest(fraction=fraction):
+                with config.patch({"dxp_lx_frac_avail": fraction}):
+                    with self.assertRaisesRegex(
+                        ValueError, "DXP_LX_FRAC_AVAIL must be >=0 and <=1"
+                    ):
+                        _lx_planning_size()
 
 
 def _two_gap_buffers():
@@ -100,7 +127,7 @@ def _addr_overlap(a, b) -> bool:
 
 
 class BaseLayoutSolverTests:
-    solver_class: type[MemoryPlanSolver[LifetimeBoundBuffer]] = None  # type: ignore[assignment]
+    solver_class: type[MemoryPlanSolver] = None  # type: ignore[assignment]
 
     def make_buffer(self, name, size, uses, **kwargs):
         """Build the buffer flavour the solver under test consumes.
@@ -362,15 +389,56 @@ class BaseLayoutSolverTests:
             _assert_in_place_relationships([p, c])
 
 
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+_DETERMINISM_SNIPPET_TEMPLATE = """
+import json
+from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+from {solver_module} import {solver_class}
+def b(n, s, st, en, ipp=None):
+    return LifetimeBoundBuffer(name=n, size=s, uses=[st, en - 1], in_place_parents=ipp or [])
+# c has two in-place parents at distinct addresses, both in-place candidates for
+# its gap -> _build_gaps' iteration order decides in_place_parents[0].
+bufs = [b("pA", 100, 0, 3), b("pB", 80, 1, 3), b("c", 50, 2, 5, ["pA", "pB"])]
+{solver_class}(10_000, 1).plan_layout(bufs)
+print("RESULT " + json.dumps({{x.name: x.address for x in bufs}}))
+"""
+
+
+def _run_determinism_snippet(hashseed, solver_class_name, solver_module):
+    env = dict(
+        os.environ,
+        PYTHONHASHSEED=str(hashseed),
+        TORCH_DEVICE_BACKEND_AUTOLOAD="0",
+    )
+    snippet = _DETERMINISM_SNIPPET_TEMPLATE.format(
+        solver_class=solver_class_name, solver_module=solver_module
+    )
+    p = subprocess.run(
+        [sys.executable, "-c", snippet],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=_REPO_ROOT,
+        timeout=60,
+    )
+    assert p.returncode == 0, p.stderr
+    line = next(ln for ln in p.stdout.splitlines() if ln.startswith("RESULT "))
+    return json.loads(line[len("RESULT ") :])
+
+
 class ScoreOrderingTests:
-    """Tests for the priority-score ordering in FirstFit/BestFit.
+    """Tests for the priority-score ordering in FirstFit/BestFit, plus a
+    cross-process determinism check for in-place parent selection.
 
     Buffers are placed in ascending order of ``(span - discount) / len(uses)``
     (lower = placed first), where ``discount`` is 0.25 per in-place
     relationship. These tests isolate the two terms the old
     shortest-lifetime-first heuristic ignored: ``len(uses)`` and the in-place
-    discount. They do not apply to the Greedy solver, whose time-stepped
-    plan_layout does not score buffers.
+    discount, plus a regression check that in-place parent selection does not
+    depend on ``PYTHONHASHSEED``. They do not apply to the Greedy solver,
+    whose time-stepped plan_layout does not score buffers and does not share
+    the ``_build_gaps``/in-place-parent-selection logic being guarded here.
     """
 
     def test_higher_use_count_placed_first(self):
@@ -419,6 +487,18 @@ class ScoreOrderingTests:
         self.assertEqual(by_name["writer"], 0)
         self.assertIsNone(by_name["reader"])
 
+    def test_inplace_parent_choice_is_hashseed_independent(self):
+        """Placement must not depend on PYTHONHASHSEED (set-iteration order)."""
+        solver_class_name = self.solver_class.__name__
+        solver_module = self.solver_class.__module__
+        base = _run_determinism_snippet(0, solver_class_name, solver_module)
+        for hashseed in range(1, 10):
+            self.assertEqual(
+                _run_determinism_snippet(hashseed, solver_class_name, solver_module),
+                base,
+                f"PYTHONHASHSEED={hashseed}",
+            )
+
 
 class TestFirstFitLayoutSolver(ScoreOrderingTests, BaseLayoutSolverTests, TestCase):
     solver_class = FirstFitLayoutSolver
@@ -436,6 +516,49 @@ class TestBestFitLayoutSolver(ScoreOrderingTests, BaseLayoutSolverTests, TestCas
         result = self.solver_class(120, 1).plan_layout(_two_gap_buffers())
         x_addr = next(b.address for b in result if b.name == "x")
         self.assertEqual(x_addr, 100)
+
+
+def _assert_legal_packing(test, result, expected_addresses, size, alignment):
+    """Assert a CP-SAT layout is *valid* rather than address-for-address equal to
+    the gap heuristics' answer.
+
+    The solver is a satisfiability search, so it returns some legal packing, not
+    the specific addresses first-fit/best-fit pick. Shared by both CP-SAT entry
+    points: the joint suite and the placement-only suite check the same
+    invariants (aligned, within capacity, no overlap between live buffers) plus
+    "places at least as many buffers as the heuristic", which holds because the
+    solver minimises HBM traffic.
+    """
+    placed = [b for b in result if b.address is not None]
+    # A legal packing: every placed buffer is aligned and within capacity.
+    for b in placed:
+        test.assertEqual(b.address % alignment, 0, f"{b.name} misaligned")
+        test.assertLessEqual(b.address + b.size, size, f"{b.name} exceeds capacity")
+    # No two lifetime-overlapping buffers may share addresses, except in-place
+    # pairs, which intentionally share storage for the single tick their
+    # lifetimes touch.
+    for a in placed:
+        for c in placed:
+            if a.name == c.name:
+                continue
+            if not _lifetimes_overlap(a, c):
+                continue
+            if a.name in c.in_place_parents or c.name in a.in_place_parents:
+                continue
+            test.assertFalse(
+                _addr_overlap(a, c), f"{a.name} and {c.name} overlap in memory"
+            )
+    # Below one alignment unit of capacity the solver's unit model rounds to
+    # zero and can't represent any placement, so the count comparison does not
+    # apply.
+    if size // alignment >= 1:
+        expected = (
+            next(iter(expected_addresses))
+            if isinstance(expected_addresses, set)
+            else expected_addresses
+        )
+        min_placed = sum(1 for a in expected if a is not None)
+        test.assertGreaterEqual(len(placed), min_placed)
 
 
 class JointDivisionSolverTests(BaseLayoutSolverTests):
@@ -496,41 +619,13 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
             parents=names,
             cd_parent_matches={n: [(0, 0)] for n in names},
         )
-        result = self.solver_class(size, alignment).plan_layout(buffers + [sink])
+        result = self.solver_class(size, alignment).plan_layout_and_core_divisions(
+            buffers + [sink]
+        )
         return [b for b in result if b.name != "__sink__"]
 
     def check_result(self, result, expected_addresses, size, alignment):
-        placed = [b for b in result if b.address is not None]
-        # A legal packing: every placed buffer is aligned and within capacity.
-        for b in placed:
-            self.assertEqual(b.address % alignment, 0, f"{b.name} misaligned")
-            self.assertLessEqual(b.address + b.size, size, f"{b.name} exceeds capacity")
-        # No two lifetime-overlapping buffers may share addresses, except
-        # in-place pairs, which intentionally share storage for the single tick
-        # their lifetimes touch.
-        for a in placed:
-            for c in placed:
-                if a.name == c.name:
-                    continue
-                if not _lifetimes_overlap(a, c):
-                    continue
-                if a.name in c.in_place_parents or c.name in a.in_place_parents:
-                    continue
-                self.assertFalse(
-                    _addr_overlap(a, c), f"{a.name} and {c.name} overlap in memory"
-                )
-        # The solver minimises spilled HBM traffic, so it places at least as many buffers as the
-        # heuristic expectation. Below one alignment unit of capacity the solver's
-        # unit model rounds to zero and can't represent any placement, so the
-        # count comparison does not apply.
-        if size // alignment >= 1:
-            expected = (
-                next(iter(expected_addresses))
-                if isinstance(expected_addresses, set)
-                else expected_addresses
-            )
-            min_placed = sum(1 for a in expected if a is not None)
-            self.assertGreaterEqual(len(placed), min_placed)
+        _assert_legal_packing(self, result, expected_addresses, size, alignment)
 
     def test_layout_with_inplace(self):
         # A producer->consumer chain (A->B->...->TERMINAL) gives every buffer a
@@ -576,7 +671,9 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
         # parents chain, so P's in-place parents G/N need explicit pairs too.
         buffers_by_name["P"].cd_parent_matches.update({"G": [(0, 0)], "N": [(0, 0)]})
 
-        results = self.solver_class(size=120, alignment=1).plan_layout(buffers)
+        results = self.solver_class(
+            size=120, alignment=1
+        ).plan_layout_and_core_divisions(buffers)
         results_by_name = {b.name: b for b in results}
         # Every buffer is placed except the consumer-less chain tail TERMINAL.
         self.assertTrue(all(b.address is not None for b in results[:-1]))
@@ -594,7 +691,9 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
             CoreDivisionBuffer("y", 60, [1, 2]),
         ]
         with self.assertRaises(AssertionError):
-            self.solver_class(size=120, alignment=1).plan_layout(plain)
+            self.solver_class(size=120, alignment=1).plan_layout_and_core_divisions(
+                plain
+            )
 
     def test_picks_matching_division_to_fit(self):
         # Producer P (total 400) feeds consumer C (total 400); both overlap in
@@ -621,7 +720,9 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
         )
         result = {
             b.name: b
-            for b in self.solver_class(size=256, alignment=1).plan_layout([P, C, D])
+            for b in self.solver_class(
+                size=256, alignment=1
+            ).plan_layout_and_core_divisions([P, C, D])
         }
 
         self.assertIsNotNone(result["P"].address)
@@ -637,7 +738,9 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
         # A buffer that carries divisions but has no local consumer edge can
         # never match anything, so it is force-spilled even when it would fit.
         leaf = CoreDivisionBuffer("leaf", 40, [0, 1], core_divisions=_divs())
-        result = self.solver_class(size=256, alignment=1).plan_layout([leaf])
+        result = self.solver_class(
+            size=256, alignment=1
+        ).plan_layout_and_core_divisions([leaf])
         self.assertIsNone(result[0].address)
 
     def test_oversized_min_footprint_is_spilled(self):
@@ -653,7 +756,9 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
         )
         result = {
             b.name: b
-            for b in self.solver_class(size=200, alignment=1).plan_layout([P, C])
+            for b in self.solver_class(
+                size=200, alignment=1
+            ).plan_layout_and_core_divisions([P, C])
         }
         self.assertIsNone(result["P"].address)
 
@@ -693,7 +798,9 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             chain[i].cd_parent_matches = {chain[i - 1].name: [(0, 0)]}
         res = {
             b.name: b
-            for b in self.solver_class(size=150, alignment=1).plan_layout(chain)
+            for b in self.solver_class(
+                size=150, alignment=1
+            ).plan_layout_and_core_divisions(chain)
         }
         # The whole chain resides, sharing one address (the sink spills: no
         # consumer of its own).
@@ -728,7 +835,9 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         )
         res = {
             b.name: b
-            for b in self.solver_class(size=150, alignment=1).plan_layout([gp, c, sink])
+            for b in self.solver_class(
+                size=150, alignment=1
+            ).plan_layout_and_core_divisions([gp, c, sink])
         }
         self.assertIsNotNone(res["gp"].address, "single-use parent should reside")
         self.assertIsNotNone(res["c"].address, "child should reside")
@@ -751,7 +860,9 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             parents=["big"],
         )
         solver = self.solver_class(size=200, alignment=1)
-        result = {b.name: b for b in solver.plan_layout([leaf, big, C])}
+        result = {
+            b.name: b for b in solver.plan_layout_and_core_divisions([leaf, big, C])
+        }
 
         # All three spill; each carries a reason keyed by buffer name.
         self.assertIsNone(result["big"].address)
@@ -765,27 +876,117 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
 
 
 @unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")
+class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
+    """CP-SAT driven through ``plan_layout`` on plain ``LifetimeBoundBuffer``s.
+
+    This is the placement-only contract: the core division is already fixed
+    upstream, so the footprint is just ``size`` and the division-dependent parts
+    of the model drop out. Unlike the joint path there is no *slicing* gate --
+    a buffer needs no consumer edge to reside -- so the base suite's buffers
+    need no synthetic sink; the allocator's ``residency_reason`` bars still
+    apply on both paths. ``make_buffer`` is inherited from
+    :class:`BaseLayoutSolverTests`, so every shared test below runs against
+    plain buffers; only ``check_result`` is relaxed, because CP-SAT returns a
+    valid packing rather than the gap heuristics' exact addresses.
+    """
+
+    solver_class = CpSatLayoutSolver
+
+    def solve(self, buffers, size=LARGE_SIZE, alignment=1):
+        if not buffers:
+            return []
+        if size // alignment < 1:
+            # Below one alignment unit the unit-scaled capacity rounds to zero
+            # and the solver cannot represent any placement.
+            return buffers
+        return self.solver_class(size, alignment).plan_layout(buffers)
+
+    def check_result(self, result, expected_addresses, size, alignment):
+        _assert_legal_packing(self, result, expected_addresses, size, alignment)
+
+    def test_consumerless_buffer_still_resides(self):
+        # The joint path force-spills a buffer no one reads from LX (the slicing
+        # gate needs a consumer to match against). Placement-only has no such
+        # gate, so the same buffer resides. This is the behavioural difference
+        # between the two entry points.
+        solver = self.solver_class(256, 1)
+        (buf,) = solver.plan_layout([LifetimeBoundBuffer("solo", 40, [0, 1])])
+        self.assertIsNotNone(buf.address)
+        self.assertNotIn("solo", solver.spill_reasons)
+
+    def test_spilled_buffer_records_reason(self):
+        # A buffer larger than capacity is pinned out up front and carries the
+        # capacity cause; the one that fits resides with no reason.
+        small = LifetimeBoundBuffer("small", 40, [0, 1])
+        huge = LifetimeBoundBuffer("huge", 4000, [0, 1])
+        solver = self.solver_class(256, 1)
+        result = {b.name: b for b in solver.plan_layout([small, huge])}
+        self.assertIsNone(result["huge"].address)
+        self.assertIn("capacity", solver.spill_reasons["huge"])
+        self.assertIsNotNone(result["small"].address)
+        self.assertNotIn("small", solver.spill_reasons)
+
+    def test_allocator_residency_reason_is_honoured(self):
+        # The allocator's hard bars (e.g. the restickify cross-frame barrier)
+        # ride on the buffer itself, so the placement-only path force-spills the
+        # buffer up front and surfaces the allocator's reason verbatim -- the
+        # same treatment the joint path gives it.
+        barred = LifetimeBoundBuffer(
+            "barred",
+            40,
+            [0, 1],
+            residency_reason="read by restickify (cross-frame barrier)",
+        )
+        free = LifetimeBoundBuffer("free", 40, [0, 1])
+        solver = self.solver_class(256, 1)
+        result = {b.name: b for b in solver.plan_layout([barred, free])}
+        self.assertIsNone(result["barred"].address)
+        self.assertEqual(
+            solver.spill_reasons["barred"], "read by restickify (cross-frame barrier)"
+        )
+        self.assertIsNotNone(result["free"].address)
+
+    def test_inplace_child_shares_parent_address(self):
+        # In-place reuse is a placement-model feature (the merge relaxation of
+        # no-overlap), not a division feature, so it must still fire when there
+        # is no division to choose. Capacity fits only one of the two.
+        parent = LifetimeBoundBuffer("parent", 100, [0, 1])
+        child = LifetimeBoundBuffer("child", 100, [1, 2], in_place_parents=["parent"])
+        result = {b.name: b for b in self.solve([parent, child], size=150)}
+        self.assertIsNotNone(result["parent"].address)
+        self.assertEqual(result["parent"].address, result["child"].address)
+
+    def test_core_division_buffer_without_divisions_is_placement_only(self):
+        # ``_wrap`` dispatches on *having candidate divisions*, not on the class:
+        # a CoreDivisionBuffer with an empty candidate list has nothing to
+        # choose, so plan_layout treats it as placement-only instead of
+        # tripping the joint path's enumeration assert.
+        (buf,) = self.solve([CoreDivisionBuffer("x", 40, [0, 1])], size=256)
+        self.assertIsNotNone(buf.address)
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")
 class TestCpSatUnallocatedReads(TestCase):
     """Device-free coverage of the CP-SAT objective/residency gate for the
     placement-only path.
 
-    ``_as_core_division_buffers`` hands the solver single-fixed-division buffers
-    (the placement-only path: each buffer's only ``CoreDivision`` is the division
-    the upstream passes already committed, so the solver cannot re-divide -- it
-    only places) and records reads by consumers outside the candidate set
+    A caller may hand the solver single-fixed-division buffers (the
+    placement-only path: each buffer's only ``CoreDivision`` is the division the
+    upstream passes already committed, so the solver cannot re-divide -- it only
+    places) and record reads by consumers outside the candidate set
     (filtered-out ops, graph outputs) as ``unallocated_reads``. These check that
     such a read is enough to pin a buffer that has no candidate children, that a
     truly-unread buffer is still forced out, that an ordinary parent edge pins,
-    and -- since the conversion now derives each edge's match from the two ops'
-    fixed divisions -- that an edge whose divisions disagree (empty
-    ``cd_parent_matches``) does *not* pin the producer. All without a Spyre device.
+    and -- when each edge's match is derived from the two ops' fixed divisions
+    -- that an edge whose divisions disagree (empty ``cd_parent_matches``) does
+    *not* pin the producer. All without a Spyre device.
     """
 
     def _mk(self, name, uses, parents=(), unallocated_reads=0, matches=None):
-        """A single-fixed-division ``CoreDivisionBuffer`` as emitted by
-        ``_as_core_division_buffers``. ``matches`` overrides the per-parent match
-        pairs; by default every parent edge is compatible (``[(0, 0)]``), matching
-        a producer/consumer whose fixed divisions slice the buffer identically.
+        """A single-fixed-division ``CoreDivisionBuffer``. ``matches`` overrides
+        the per-parent match pairs; by default every parent edge is compatible
+        (``[(0, 0)]``), matching a producer/consumer whose fixed divisions slice
+        the buffer identically.
         """
         if matches is None:
             matches = {p: [(0, 0)] for p in parents}
@@ -801,7 +1002,7 @@ class TestCpSatUnallocatedReads(TestCase):
         )
 
     def _pinned(self, bufs):
-        out = CpSatLayoutSolver(1 << 20).plan_layout(bufs)
+        out = CpSatLayoutSolver(1 << 20).plan_layout_and_core_divisions(bufs)
         return {b.name for b in out if b.address is not None}
 
     def test_only_unallocated_reads_is_pinned(self):
@@ -823,8 +1024,8 @@ class TestCpSatUnallocatedReads(TestCase):
 
     def test_mismatched_fixed_divisions_do_not_pin(self):
         """When the producer and consumer fixed divisions slice the shared buffer
-        differently, ``_as_core_division_buffers`` records an *empty* match for
-        that edge. The producer then has no compatible child and no unallocated
+        differently, the caller records an *empty* match for that edge.
+        The producer then has no compatible child and no unallocated
         read, so the solver declines to pin it (it falls back to HBM) even though
         the consumer still lists it as a parent."""
         pinned = self._pinned(

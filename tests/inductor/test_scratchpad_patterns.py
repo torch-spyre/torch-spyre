@@ -25,6 +25,7 @@ import torch
 
 from torch_spyre._inductor.scratchpad.allocator import (
     LifetimeBoundBuffer,
+    _lx_planning_size,
 )
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     BestFitLayoutSolver,
@@ -38,10 +39,8 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     GreedyLayoutSolver,
     LifetimeBoundBuffer as Buffer,
 )
-from torch_spyre._inductor import config
 
-# From scratchpad.py
-AVAILABLE_LX_SIZE = int((2 << 20) * (1.0 - config.dxp_lx_frac_avail))
+AVAILABLE_LX_SIZE = _lx_planning_size()
 
 BYPASS_XFAIL = os.environ.get("SCRATCHPAD_PATTERN_BYPASS_XFAIL", "0") == "1"
 

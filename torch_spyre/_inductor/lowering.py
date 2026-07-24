@@ -16,6 +16,7 @@
 from contextlib import contextmanager
 from warnings import warn
 
+import sympy
 import torch
 
 from torch._inductor.ir import Reduction, Pointwise, StorageBox
@@ -815,8 +816,114 @@ def clone(x, *, memory_format=None):
     return result
 
 
+def _reoffset(node, offset):
+    """Re-introduce a storage_offset onto a graph-input node in-graph.
+
+    A tensor that was sliced OUTSIDE the compiled region (e.g. a
+    ``x.narrow(0, 2, 1)`` handed to a standalone-compiled op) reaches the
+    lowering as a placeholder whose FixedLayout carries the right size and
+    stride but ``offset == 0`` — upstream Inductor's placeholder path reads
+    ``static_sizes_strides`` only and drops ``storage_offset`` (see
+    torch/_inductor/graph.py). The Spyre SpyreTensorLayout likewise has no
+    offset field, so the compiled kernel binds the storage BASE pointer
+    (job_plan.cpp / spyre_stream.cpp use ``storage().data_ptr()``) and reads
+    from element 0 regardless of the view's true offset.
+
+    To make the offset survive into the SDSC binary it must live in the
+    in-graph coordinate: superdsc.py bakes a per-dim byte offset from the
+    coordinate's constant term (``as_coeff_Add()[0]``). We therefore rebuild
+    the node as a ReinterpretView over the same storage with the offset
+    installed on the layout — the same mechanism aten.slice / SliceView use.
+    Size and stride are preserved from the input's own layout.
+
+    REQUIREMENT — the offset is a single *host-space* flat scalar (in host
+    elements). ``compute_coordinates`` (views.py) distributes it across dims
+    against the *device* ``stride_map``; the innermost (stick) dim holds
+    ``elems_per_stick`` elements (64 at fp16, 128 at fp8), and the backend has
+    no mechanism to bake an offset that lands *inside* a stick. So a re-injected
+    offset is only representable when it is a whole multiple of
+    ``elems_per_stick`` — i.e. it steps by complete sticks. This was measured
+    directly (see ``sweep_d2d_offsets.py`` / ``tests/inductor/
+    test_copy_from_d2d_offsets.py``): across contiguous ``narrow`` and
+    ``select`` views of every inner size, the copy is correct iff
+    ``offset % elems_per_stick == 0`` and otherwise the restickify pass raises
+    "no mechanism to resolve stick incompatibility". Notably this depends on the
+    OFFSET, not the inner-dim size: e.g. an inner dim of 96 (not a stick
+    multiple) still copies correctly at offset 192 (== 3 sticks) but errors at
+    offset 96 (== 1.5 sticks).
+
+    ``_validate_reoffset_supported`` converts the unaligned case into a clean,
+    actionable ``Unsupported`` at lowering time instead of the cryptic
+    restickify error deeper in the pipeline. It does NOT guard the separate
+    offset-*within*-the-stick-dim case (a column narrow, e.g.
+    ``x.narrow(1, 64, 64)``), which the backend still miscompiles silently — see
+    ``test_column_slice_inner_offset`` (tracked for the follow-up PR).
+    """
+    if offset == 0:
+        return node
+    storage, old_layout = ir.as_storage_and_layout(node)
+    _validate_reoffset_supported(old_layout, offset)
+    new_layout = ir.FixedLayout(
+        old_layout.device,
+        old_layout.dtype,
+        list(old_layout.size),
+        list(old_layout.stride),
+        sympy.expand(offset),
+    )
+    return ir.TensorBox(ir.ReinterpretView(data=storage, layout=new_layout))
+
+
+def _validate_reoffset_supported(layout, offset) -> None:
+    """Fail fast when a D2D-copy offset is not a whole number of sticks.
+
+    A re-injected storage_offset must step by complete sticks: the innermost
+    device dim holds ``elems_per_stick`` elements and the backend cannot bake an
+    offset that lands inside a stick. Measured behavior (``sweep_d2d_offsets.py``)
+    is unambiguous — across contiguous ``narrow`` / ``select`` views of every
+    inner size, the copy is correct iff ``offset % elems_per_stick == 0``; every
+    unaligned offset instead raises deep in the restickify pass ("no mechanism
+    to resolve stick incompatibility"). This check surfaces the same rejection
+    earlier with an actionable message rather than silently miscompiling or
+    emitting a cryptic downstream error.
+
+    Scope — this rule is keyed on the OFFSET alone, so it holds regardless of
+    rank reduction (``select`` drops the outer dim but the flat offset is
+    unchanged) and does not need the device layout, which is not attached to the
+    placeholder yet. It deliberately does NOT cover an offset that falls *inside*
+    the stick dimension itself (a column narrow): that case is
+    ``offset % elems_per_stick == 0`` yet still miscompiles, and detecting it
+    would require the base-storage layout that is unavailable here. It stays a
+    documented known limitation (``test_column_slice_inner_offset``).
+    """
+    try:
+        off = int(offset)
+    except (TypeError, ValueError):
+        # Symbolic offset: cannot check statically, let it through
+        # (specialize_int bakes concrete offsets, so this is the rare path).
+        return
+    if off == 0:
+        return
+    eps = get_elem_in_stick(layout.dtype)
+    if off % eps != 0:
+        raise Unsupported(
+            "spyre::copy_from_d2d of a sliced view requires a stick-aligned "
+            f"storage_offset: {off} is not a multiple of elems_per_stick={eps} "
+            f"(dtype {layout.dtype}). The offset must step by whole sticks; an "
+            "offset landing inside a stick cannot be baked into the kernel "
+            "coordinate. Re-slice on a stick-aligned boundary (a multiple of "
+            f"{eps} elements), or copy the full (unsliced) tensor."
+        )
+
+
 @register_spyre_lowering(torch.ops.spyre.copy_from_d2d)
-def lower_spyre_from_d2d(src, dst):
+def lower_spyre_from_d2d(src, dst, src_off, dst_off):
+    # A sliced src/dst reaches us as a graph input whose storage_offset was
+    # dropped (offset==0 on its layout). Re-introduce the offsets in-graph so
+    # they land in the coordinate that superdsc bakes into the kernel; without
+    # this the kernel reads/writes from the storage base and every offset
+    # silently returns the first call's data. See _reoffset above.
+    src = _reoffset(src, src_off)
+    dst = _reoffset(dst, dst_off)
     lowering.mutate_to(dst, src)
 
 

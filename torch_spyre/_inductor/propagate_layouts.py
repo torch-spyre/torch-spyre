@@ -163,6 +163,8 @@ def _make_output_stl(
     Returns None if the resulting stick expression has an offset.
     """
     stick_size = get_elem_in_stick(output.dtype)
+    if stick_dim >= 0 and c_size[stick_dim] == 1:
+        return None
     out_coords = host_coordinates(output, output_dep, None)
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
     stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
@@ -467,7 +469,9 @@ def _single_arg_op_layout(
         )
         return [stl]
 
-    in_device_coords = device_coordinates(stl, dep, None)
+    in_device_coords = try_device_coordinates(stl, dep, None)
+    if in_device_coords is None:
+        return []
     stick_expr = in_device_coords[-1]
 
     # Try to preserve input layout, fall back to scanning all output dims
@@ -814,10 +818,12 @@ def _multi_arg_pointwise_layouts(
 
     ind_names, _, ind_sizes = indirect_info_from_op(op)
     stick_exprs = {
-        device_coordinates(stl, arg.dep, ind_sizes)[-1]
+        dc[-1]
         for arg in args
         for stl in arg.layouts
         if arg.dep.name not in ind_names
+        for dc in [try_device_coordinates(stl, arg.dep, ind_sizes)]
+        if dc is not None
     }
 
     # If the indexing and device element size are identical
@@ -853,8 +859,8 @@ def _multi_arg_pointwise_layouts(
             in_stl = SpyreTensorLayout(
                 c_in_size, c_in_stride, output.dtype, projected_dim_order, output_ea
             )
-            coord = device_coordinates(in_stl, arg.dep, ind_sizes)
-            if not is_stick_expr_offset_free(coord[-1], stick_size):
+            coord = try_device_coordinates(in_stl, arg.dep, ind_sizes)
+            if coord is None or not is_stick_expr_offset_free(coord[-1], stick_size):
                 return False
         return True
 
