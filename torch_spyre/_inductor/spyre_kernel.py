@@ -287,6 +287,10 @@ class SpyreOpFuncs:
         return PointwiseOp("qfp8wt", [x])
 
     @staticmethod
+    def quantscalepertokenfp8(x, scale_ub):
+        return ReductionOp("quantscalepertokenfp8", [x], {"scale_ub": scale_ub})
+
+    @staticmethod
     def relu(x):
         return PointwiseOp("relufwd", [x])
 

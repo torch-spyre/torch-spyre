@@ -14,6 +14,7 @@
 
 
 import dataclasses
+from typing import Any
 
 from sympy import Symbol
 
@@ -196,11 +197,52 @@ def num_bytes(df: DataFormats) -> int:
     return 128 // num_elems
 
 
-def generate_constant_info(data_format, constants, num_cores):
+def generate_constant_info(
+    data_format: DataFormats,
+    constants: dict[str, Any],
+    num_cores: int,
+    constants_raw: list[str] | None = None,
+) -> dict[str, Any]:
+    """Generate constant information for SDSC.
+
+    Args:
+        data_format: The data format for encoding constants
+        constants: Dictionary of constant name to value
+        num_cores: Number of cores
+        constants_raw: Optional list of constant names that should be treated as
+                      raw integers (not FP16-encoded). Used for constants that
+                      represent dimension sizes or other integer metadata.
+
+    Returns:
+        Dictionary of constant information for SDSC JSON
+    """
     if len(constants.keys()) == 0:
-        return "{}"
-    constant_info = {}
+        return {}
+    constants_raw = constants_raw or []
+
+    # Validate constants_raw references exist in constants
+    invalid_keys = set(constants_raw) - set(constants.keys())
+    if invalid_keys:
+        raise ValueError(
+            f"[generate_constant_info] constants_raw contains keys not in constants: {invalid_keys}. "
+            f"Available constants: {list(constants.keys())}"
+        )
+
+    constant_info: dict[str, Any] = {}
     for name, value in constants.items():
+        # For raw constants (integer values that should not be FP16-encoded).
+        # Example: clipMin in quantscalepertokenfp8 represents the hidden dimension size used for clipping.
+        if name in constants_raw:
+            try:
+                encoded_value = int(value)
+            except (ValueError, TypeError) as e:
+                raise ValueError(
+                    f"Cannot convert constant '{name}' with value {value} (type: {type(value).__name__}) "
+                    f"to int: {e}"
+                ) from e
+        else:
+            encoded_value = encode_constant(value, data_format)
+
         ci = {
             "dataFormat_": data_format.name,
             "name_": name,
@@ -211,7 +253,7 @@ def generate_constant_info(data_format, constants, num_cores):
                     {"factor_": 1, "label_": "corelet"},
                     {"factor_": 1, "label_": "time"},
                 ],
-                "data_": {"[0, 0, 0]": [encode_constant(value, data_format)]},
+                "data_": {"[0, 0, 0]": [encoded_value]},
             },
         }
         constant_info[f"{len(constant_info)}"] = ci
@@ -1634,6 +1676,7 @@ def generate_sdsc(
                                 sdsc_spec.data_format,
                                 sdsc_spec.constants,
                                 sdsc_spec.num_cores,
+                                sdsc_spec.constants_raw,
                             ),
                             "computeOp_": [
                                 {

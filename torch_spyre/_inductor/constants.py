@@ -185,6 +185,13 @@ FP8_E4M3FN_INFO = torch.finfo(torch.float8_e4m3fn)
 FP8_E4M3FN_MAX = float(FP8_E4M3FN_INFO.max)
 FP8_E4M3FN_MIN = float(FP8_E4M3FN_INFO.min)
 
+# FP16 maximum value encoded as integer for SDSC (65504.0 as FP16 = 32255 as int)
+# Used as clipMax in quantscalepertokenfp8 operation
+FP16_MAX_VALUE_ENCODED = 32255
+
+# Operation name for per-token FP8 quantization scale computation
+QUANTSCALEPERTOKENFP8_OP = "quantscalepertokenfp8"
+
 # Operations that directly handle FP8 dtypes (SEN143_FP8)
 SPYRE_FP8_OPS = {
     "qfp8ch",  # Channel-wise FP8 quantization (output: FP8)

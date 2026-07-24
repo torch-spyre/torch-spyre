@@ -21,6 +21,7 @@ from torch_spyre.ops.eager import compile_once
 from torch_spyre.ops.fallbacks import warn_fallback
 
 from .errors import Unsupported
+from .constants import FP8_E4M3_MAX
 
 aten = torch.ops.aten
 
@@ -814,6 +815,50 @@ def qfp8ch(input: torch.Tensor) -> torch.Tensor:
 def _(input: torch.Tensor) -> torch.Tensor:
     # Output is FP8 with same shape as input
     return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
+
+
+@torch.library.custom_op(
+    "spyre::quantscalepertokenfp8", mutates_args=(), device_types="spyre"
+)
+def quantscalepertokenfp8(
+    input: torch.Tensor, scale_ub: float = FP8_E4M3_MAX
+) -> torch.Tensor:
+    """
+    Compute per-token quantization scale for FP8 conversion.
+
+    Computes the scale for each token (row) as:
+    scale = amax(abs(input), dim=-1, keepdim=True) / scale_ub
+
+    This operation computes per-token quantization scales for FP8 conversion.
+    It performs a reduction from [batch, seq, hidden] to [batch, seq, 1].
+
+    Args:
+        input: Input tensor (FP16) to compute scales for, shape [batch, seq, hidden]
+        scale_ub: Upper bound for scaling (default: FP8_E4M3_MAX = 448.0, FP8 E4M3 max value)
+
+    Returns:
+        Per-token scale tensor (FP16), shape [batch, seq, 1]
+
+    Example:
+        >>> x = torch.randn(2, 4, 4096, dtype=torch.float16, device='spyre')
+        >>> scale = torch.ops.spyre.quantscalepertokenfp8(x)
+        >>> # scale.shape = [2, 4, 1]
+        >>> x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+
+    Note:
+        - Computes absolute maximum per token (last dimension)
+        - Returns scale = amax / scale_ub for direct use in quantization
+        - Maps to deeptools "quantscalepertokenfp8" operation
+    """
+    pass
+
+
+@quantscalepertokenfp8.register_fake
+def _(input: torch.Tensor, scale_ub: float = FP8_E4M3_MAX) -> torch.Tensor:
+    # Output has same shape as input except last dim becomes 1
+    out_shape = list(input.shape)
+    out_shape[-1] = 1
+    return torch.empty(out_shape, dtype=input.dtype, device=input.device)
 
 
 @torch.library.custom_op(

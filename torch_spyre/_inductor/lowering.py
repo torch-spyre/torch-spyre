@@ -26,6 +26,8 @@ from typing import Any, Callable, Union
 
 from .constants import (
     AVGPOOL2D_OP,
+    FP8_E4M3_MAX,
+    FP16_MAX_VALUE_ENCODED,
     BATCH_MATMUL_OP,
     CONV2D_FWD_OP,
     COPY_BACK_CANDIDATE_ATTR,
@@ -1850,6 +1852,66 @@ def lower_qfp8wt(x):
     )
     pw.realize()
     return pw
+
+
+@register_spyre_lowering(torch.ops.spyre.quantscalepertokenfp8)
+def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3_MAX):
+    """
+    Lower quantscalepertokenfp8 as a Reduction operation.
+
+    Maps to deeptools quantscalepertokenfp8 fused operator.
+    Uses standard reduction inner_fn pattern like exx2 and mean.
+    """
+    from torch_spyre._C import encode_constant, DataFormats
+
+    # Get reduction parameters - use standard inner_fn
+    kwargs = lowering._make_reduction_inner(
+        x, axis=[-1], keepdims=True, dtype=x.get_dtype(), override_return_dtype=None
+    )
+
+    # Pre-encode constants as raw integers
+    mul_const = 1.0 / scale_ub
+    hidden_dim = x.get_size()[-1]
+
+    # Handle symbolic dimensions - get concrete value using size_hint
+    from torch._inductor.virtualized import V
+
+    if isinstance(
+        hidden_dim, (sympy.Basic, sympy.Expr)
+    ):  # Resolve symbolic dimension to concrete value for SDSC constant generation
+        hidden_dim_int = V.graph.sizevars.size_hint(hidden_dim)
+        if hidden_dim_int is None:
+            raise ValueError(
+                f"Could not resolve symbolic dimension for hidden_dim: {hidden_dim}. "
+                f"This may indicate an issue with dynamic shape tracking."
+            )
+    else:
+        hidden_dim_int = int(hidden_dim)
+
+    try:
+        mul_const_encoded = encode_constant(mul_const, DataFormats.SEN169_FP16)
+    except (ValueError, TypeError) as e:
+        raise ValueError(
+            f"Cannot encode constant 'mulConst' with value {mul_const} "
+            f"(type: {type(mul_const).__name__}) to FP16: {e}"
+        ) from e
+
+    op_info = {
+        "constants": {
+            "mulConst": mul_const_encoded,
+            "clipMin": hidden_dim_int,
+            "clipMax": FP16_MAX_VALUE_ENCODED,
+        },
+        "constants_raw": ("mulConst", "clipMin", "clipMax"),
+    }
+
+    # Use same pattern as exx2 - pass all kwargs including inner_fn
+    result = SpyreReduction.create(
+        reduction_type="quantscalepertokenfp8", input_node=x, op_info=op_info, **kwargs
+    )
+
+    result.realize()
+    return result
 
 
 @register_spyre_lowering(
