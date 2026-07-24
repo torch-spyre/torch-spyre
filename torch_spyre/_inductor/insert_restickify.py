@@ -19,6 +19,7 @@ import torch
 
 from .constants import ELIDED_COPY_BACK_ATTR
 from .ir import FixedTiledLayout
+from .optimize_restickify import EdgeCostMap
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
 from .pass_utils import copy_fx_custom_meta
@@ -287,6 +288,13 @@ def finalize_layouts(graph: GraphLowering) -> None:
             restick_stl = edge.layout(in_stl, target_stl)
             if restick_stl is None:
                 continue
+            if restick_stl is EdgeCostMap.INFEASIBLE:
+                raise AssertionError(
+                    f"finalize_layouts: restickify needed but infeasible for "
+                    f"op={op.get_name()!r} input={edge.dep.name!r}: "
+                    f"in_stl.stride_map={list(in_stl.stride_map)} "
+                    f"target_stl.stride_map={list(target_stl.stride_map)}"
+                )
             restick_target = _fixed_tiled(in_layout, restick_stl)
             logger.info(
                 f"Injecting restickify on {op.get_name()} input {edge.dep.name}: "

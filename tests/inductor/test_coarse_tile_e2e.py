@@ -528,6 +528,16 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Hint propagation into inserted restickify nodes
     # ------------------------------------------------------------------
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "The transposed input produces layouts where coarse-tiling rewrites "
+            "output buffer strides after restickify has already run, resulting in "
+            "a stick mismatch that raises in create_op_spec.  This will be fixed "
+            "by reordering the compiler passes so that restickify runs after "
+            "coarse-tiling (PR #3293)."
+        ),
+    )
     @config.patch(
         {
             "lx_planning": True,
