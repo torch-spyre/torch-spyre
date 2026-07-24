@@ -34,6 +34,12 @@ class BufferType(Enum):
     Output = 2
 
 
+def ceil_div(a: int, b: int) -> int:
+    """Integer ceiling division. Used wherever a footprint is divided down by a
+    core count, so every such site rounds identically (no float intermediate)."""
+    return -(-a // b)
+
+
 @dataclass
 class LifetimeBoundBuffer:
     """
@@ -57,14 +63,14 @@ class LifetimeBoundBuffer:
     first_use_is_read: bool = False
     address: Optional[int] = None
     in_place_parents: list[str] = field(default_factory=list)
-    # Why the buffer may not be made resident, or ``None`` if it may. A non-None
-    # reason (e.g. "lx back gap", "single use") pins it out of LX up front and is
-    # surfaced as its spill cause; ``None`` means residency is allowed. The buffer
-    # is handed to the solver either way so it still participates in matching and
-    # in-place chains -- a forced-out consumer keeps its producers' residency
-    # viable instead of orphaning them. Only :class:`CpSatLayoutSolver` honours
-    # this; the gap heuristics ignore it, as they always have.
+    # define the reason for excluding the buffer based on allocator
+    # or solver logic paths.
     residency_reason: Optional[str] = None
+
+    @property
+    def read_count(self) -> int:
+        """Reports the number of reads base on the number of uses."""
+        return max(0, len(self.uses) - 1)
 
     @property
     def start_time(self) -> int:
@@ -73,6 +79,11 @@ class LifetimeBoundBuffer:
     @property
     def end_time(self) -> int:
         return self.uses[-1] + 1
+
+    @property
+    def min_footprint(self) -> int:
+        """Smallest LX footprint the buffer can take, for the capacity check"""
+        return self.size
 
     def overlaps_in_time(self, other: "LifetimeBoundBuffer") -> bool:
         """Returns true iff self and other overlap in time."""
@@ -141,17 +152,18 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # the merge/residency across that edge.
     cd_parent_matches: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
     chosen_division: Optional[int] = None
-    # Count of reads of this buffer by consumers the solver never sees as
-    # candidates -- ops filtered out of the candidate set or graph outputs.
-    # Such a consumer still reads this buffer *from LX* when it resides,
-    # so the read counts toward the buffer's spill cost even though no ``parents``
-    # edge represents it, and it lets the buffer reside despite having no resident
-    # (candidate) consumer to match a division against. Zero for the joint
-    # allocator, where every consumer is a candidate, so the objective and
-    # residency gate are unchanged there.
-    # TODO: Drop this and make other solvers use the placement = False flag
-    unallocated_reads: int = 0
     boundary: BufferType = BufferType.Intermediate
+
+    @property
+    def min_footprint(self) -> int:
+        """Smallest per-core footprint any candidate division allows. With no
+        candidates there is nothing to divide by, so it falls back to ``size``
+        (the placement-only case ``_wrap`` also dispatches on)."""
+        if not self.core_divisions:
+            return self.size
+        return min(
+            ceil_div(self.size, cd.output_partition) for cd in self.core_divisions
+        )
 
 
 def _assert_in_place_relationships(
@@ -161,24 +173,25 @@ def _assert_in_place_relationships(
     buf_by_name = {b.name: b for b in buffers}
     for child in buffers:
         for parent_name in child.in_place_parents:
-            parent = buf_by_name[parent_name]
-            assert parent.end_time == child.start_time + 1, (
-                f"In-place parent {parent_name}.end_time={parent.end_time} must equal "
-                f"child {child.name}.start_time+1={child.start_time + 1}"
-            )
-            # With core_divisions ``size`` is the *total* footprint, so a static
-            # size check doesn't apply; the per-core match is enforced against the
-            # chosen division in ``CpSatLayoutSolver._add_inplace_relaxation``. Only
-            # the division-fixed case (plain ``LifetimeBoundBuffer``, no
-            # ``core_divisions``) keeps the static check.
-            if not (
-                getattr(parent, "core_divisions", None)
-                or getattr(child, "core_divisions", None)
-            ):
-                assert child.size <= parent.size, (
-                    f"In-place child {child.name}.size={child.size} "
-                    f"must be <= parent {parent_name}.size={parent.size}"
+            parent = buf_by_name.get(parent_name)
+            if parent:
+                assert parent.end_time == child.start_time + 1, (
+                    f"In-place parent {parent_name}.end_time={parent.end_time} must equal "
+                    f"child {child.name}.start_time+1={child.start_time + 1}"
                 )
+                # With core_divisions ``size`` is the *total* footprint, so a static
+                # size check doesn't apply; the per-core match is enforced against the
+                # chosen division in ``CpSatLayoutSolver._add_inplace_relaxation``. Only
+                # the division-fixed case (plain ``LifetimeBoundBuffer``, no
+                # ``core_divisions``) keeps the static check.
+                if not (
+                    getattr(parent, "core_divisions", None)
+                    or getattr(child, "core_divisions", None)
+                ):
+                    assert child.size <= parent.size, (
+                        f"In-place child {child.name}.size={child.size} "
+                        f"must be <= parent {parent_name}.size={parent.size}"
+                    )
 
 
 class MemoryPlanSolver(ABC):
@@ -203,6 +216,46 @@ class MemoryPlanSolver(ABC):
         """
         self.limit = size
         self.alignment = alignment
+        self.spill_reasons: dict[str, str] = {}
+
+    def excluded(self, buffer: "LifetimeBoundBuffer") -> Optional[str]:
+        """Why ``buffer`` may not reside in LX, or ``None`` if it may."""
+        if buffer.residency_reason is not None:
+            return buffer.residency_reason
+        if buffer.min_footprint > self.limit:
+            return (
+                f"min footprint {buffer.min_footprint} B > LX capacity {self.limit} B"
+            )
+        return None
+
+    def record_exclusions(
+        self, buffers: Sequence["LifetimeBoundBuffer"]
+    ) -> dict[str, str]:
+        """Compute, store, and return the ``name -> reason`` map of every buffer
+        barred from LX residency.
+
+        This is the piece a solver that keeps barred buffers in its model (e.g.
+        CP-SAT, which pins them non-resident rather than dropping them) needs on
+        its own; :meth:`partition` layers the placeable/excluded split on top.
+        The returned map is also stored in :attr:`spill_reasons`.
+        """
+        self.spill_reasons = {
+            buffer.name: reason
+            for buffer in buffers
+            if (reason := self.excluded(buffer)) is not None
+        }
+        return self.spill_reasons
+
+    def partition(
+        self, buffers: Sequence["LifetimeBoundBuffer"]
+    ) -> tuple[list["LifetimeBoundBuffer"], list["LifetimeBoundBuffer"]]:
+        """Split ``buffers`` into ``(placeable, excluded)``, recording every
+        exclusion in :attr:`spill_reasons` via :meth:`record_exclusions`.
+        """
+        excluded_reasons = self.record_exclusions(buffers)
+        placeable = [b for b in buffers if b.name not in excluded_reasons]
+        excluded = [b for b in buffers if b.name in excluded_reasons]
+        return placeable, excluded
 
     @abstractmethod
     def plan_layout(
@@ -258,159 +311,3 @@ class CoreDivisionLayoutSolver(MemoryPlanSolver):
         Returns:
             The same buffers, with placements and chosen divisions defined.
         """
-
-
-class GreedyLayoutSolver(MemoryPlanSolver):
-    def __init__(self, size: int, alignment: int = 128):
-        super().__init__(size, alignment)
-        # `usage` tracks live placements during planning. It is specific to the
-        # greedy time-stepping algorithm; the gap-based solvers don't use it.
-        self.usage: list[LifetimeBoundBuffer] = []
-
-    def _get_lowest_addr_in_use(self):
-        return min(
-            (rec.address for rec in self.usage if rec.address is not None),
-            default=0,
-        )
-
-    def _get_highest_addr_in_use(self):
-        return max(
-            (rec.address + rec.size for rec in self.usage if rec.address is not None),
-            default=0,
-        )
-
-    def _find_free_block(self, size_needed: int) -> Optional[int]:
-        assert all(x.address is not None for x in self.usage)
-        curr_lo = self._get_lowest_addr_in_use()
-        curr_hi = self._get_highest_addr_in_use()
-        if self.limit < size_needed:
-            return None
-
-        if not self.usage or curr_lo >= size_needed:
-            return 0
-
-        address = math.ceil(curr_hi / self.alignment) * self.alignment
-        if address + size_needed <= self.limit:
-            return address
-
-        # Search for a gap between existing allocations
-        self.usage.sort(key=lambda x: (x.address is None, x.address))
-        for i in range(len(self.usage) - 1):
-            assert (current_address := self.usage[i].address) is not None
-            assert (next_address := self.usage[i + 1].address) is not None
-            frag_st = (
-                math.ceil((current_address + self.usage[i].size) / self.alignment)
-                * self.alignment
-            )
-            if next_address - frag_st >= size_needed:
-                return frag_st
-
-        return None
-
-    def _try_allocate(self, buffer: LifetimeBoundBuffer):
-        # Check if the current buffer can be in-placed
-        for in_place_opt in buffer.in_place_parents:
-            matched_obj = next((u for u in self.usage if u.name == in_place_opt), None)
-            if matched_obj is not None and buffer.size <= matched_obj.size:
-                buffer.address = matched_obj.address
-                self.usage.append(buffer)
-                self.usage.remove(matched_obj)
-                return None
-
-        # Decide where to allocate the block from
-        addr = self._find_free_block(buffer.size)
-
-        # Push the allocation result to the buffer and the usage table
-        if addr is not None:
-            buffer.address = addr
-            self.usage.append(buffer)
-        else:
-            buffer.address = None
-
-    def _try_deallocate(self, bufs: list[LifetimeBoundBuffer] | LifetimeBoundBuffer):
-        if isinstance(bufs, LifetimeBoundBuffer):
-            bufs = [bufs]
-
-        for buf in bufs:
-            if buf in self.usage:
-                self.usage.remove(buf)
-
-    def plan_layout(
-        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
-    ) -> list[LifetimeBoundBuffer]:
-        """Allocates addresses to the provided buffer list
-
-        Accepts a set of buffers with pre-defined sizes and lifetimes. These buffers are
-        allocated addresses with 0 -> `limit` where the maximum starting address of
-        buffers are at most `self.limit` - `LifetimeBoundBuffer.size` - 1. The algorithm
-        increments through logical time where time increments 1 unit for each
-        step in a computation graph. At each step the lifetimes of all buffers are
-        evaluated for allocation and deallocation based on its lifetime relative
-        to the time being evaluated. As an optimization, times where no buffers
-        enter or exit scope are not evaluated.
-
-        When a buffer enters scope, the current usage is evaluated in the following
-        manner:
-            1. Check if there is a permissible in-place buffer already allocated
-            2. Is there enough space from address 0 -> first usage.
-            3. Is there enough space for the current buffer from the max address
-                to the maximum memory address. Allocate as current_max + 1 + alignment.
-            4. Is there space between allocations. Check for gaps between current
-                allocations and find where gaps exceed current size. Allocate if
-                current gap is larger than current size + alignment.
-
-        Args:
-            buffers (list[LifetimeBoundBuffer]): The set of buffers to be planned.
-
-        Returns:
-            list[LifetimeBoundBuffer]: The supplied buffers with addresses assigned.
-        """
-        if not buffers:
-            return []
-        assert all(buf.address is None for buf in buffers), (
-            "Buffers cannot be previously or partially planned"
-        )
-        _assert_in_place_relationships(buffers)
-
-        self.usage = []
-
-        # Walk through all transition points in chronological order.
-        # Include end_time + 1 so deallocation fires even when no other
-        # buffer starts or ends at that tick.
-        times = set()
-        for b in buffers:
-            times.add(b.start_time)
-            times.add(b.end_time)
-        sorted_times = sorted(times)
-
-        for idx in sorted_times:
-            # Deallocate all expired buffers before allocating new ones so that
-            # freed slots are immediately available at the same time step.
-            for buffer in buffers:
-                if idx == buffer.end_time:
-                    self._try_deallocate(buffer)
-
-            for buffer in buffers:
-                if idx == buffer.start_time:
-                    self._try_allocate(buffer)
-
-        if log_lx_usage and logger.isEnabledFor(10):  # logging.DEBUG
-            logger.debug("scratchpad limit: %d KB", self.limit // 1024)
-            for idx in range(sorted_times[0], sorted_times[-1]):
-                live = []
-                # Sum by distinct address: an in-place reuse places two buffers
-                # (a dying parent and its just-born child) at the same address
-                # for one overlapping tick, and the child's region is contained
-                # in the parent's. Counting both would double-count the shared
-                # slot, so track the max size per address and sum those.
-                size_by_addr: dict[int, int] = {}
-                for b in buffers:
-                    if b.address is not None and b.start_time <= idx < b.end_time:
-                        live.append(f"{b.name}_{b.size // 1024}KB@{hex(b.address)}")
-                        size_by_addr[b.address] = max(
-                            size_by_addr.get(b.address, 0), b.size
-                        )
-                used = sum(size_by_addr.values())
-                logger.debug("t=%d: %d KB  [%s]", idx, used // 1024, ", ".join(live))
-
-        return list(buffers)
