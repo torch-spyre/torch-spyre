@@ -1629,8 +1629,9 @@ def _per_core_view_on_buf(
     write_index / read_index / iter_space / matmul-ness, not just (splits, dep,
     buf_name): two different ops can share the same (splits, dep, buf_name) — e.g.
     a producer's write-dep and a consumer's read-dep on the same buffer at the
-    same index — and must NOT alias the same entry (``_as_core_division_buffers``
-    shares one cache across a producer and consumer of the same buffer).
+    same index — and must NOT alias the same entry (both
+    ``ScratchpadAllocator._cd_parent_matches`` and ``get_ncores_for_buffers``
+    share one cache across a producer and consumer of the same buffer).
     """
     coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
     if cache is not None:

@@ -27,7 +27,7 @@ constraint model over :class:`CoreDivisionBuffer`s:
   same per-core slicing as *every* consumer's, using the precomputed
   ``cd_parent_matches`` pairs over the ``parents`` (producer/consumer) edges; a
   buffer with no consumer, or a consumer with no compatible pair, can never
-  reside (``_implicate_core_division``).
+  reside (``_CoreDivisionBufferWithCpVars.constrain_residency``).
 * **Placement** is a global ``AddNoOverlap2D`` over optional rectangles
   (``[start_time, end_time) x [offset, offset + eff_size)``, present iff
   resident). In-place reuse (``in_place_parents`` -> per-edge ``merge_vars``) is
@@ -53,6 +53,19 @@ constraint model over :class:`CoreDivisionBuffer`s:
 
 After the solve, ``_justify`` slides each in-place-merged placement unit down to
 the lowest free address, squeezing out float gaps without raising the peak.
+
+The same model also serves plain :class:`LifetimeBoundBuffer`s via
+``plan_layout`` (the ``MemoryPlanSolver`` contract the placement-only allocator
+calls). Those buffers carry no candidate divisions, so the division-dependent
+pieces -- per-core sizing, the slicing-match gate, the merge division gate and
+the phase-2 parallelism objective -- simply drop out: the footprint is the
+buffer's ``size`` and the solve reduces to minimising HBM traffic under the 2D
+no-overlap with in-place reuse. Residency is then gated only by capacity and by
+the allocator's own ``residency_reason`` bars (which both paths honour, since
+that field lives on the base buffer). That specialisation
+lives on the buffer wrappers (``_LifetimeBufferWithCpVars`` and its joint
+subclass ``_CoreDivisionBufferWithCpVars``), so the solver methods below are
+written once against whichever wrapper ``_wrap`` chose.
 """
 
 from __future__ import annotations
@@ -61,7 +74,7 @@ import logging
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Generic, TypeVar, cast
 import torch
 import numpy as np
 
@@ -77,10 +90,11 @@ else:
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
-    MemoryPlanSolver,
-    _assert_in_place_relationships,
+    CoreDivisionLayoutSolver,
+    LifetimeBoundBuffer,
     SolveError,
     BufferType,
+    _assert_in_place_relationships,
 )
 
 __all__ = ["CpSatLayoutSolver"]
@@ -92,6 +106,10 @@ logger = logging.getLogger(__name__)
 # there was no room once higher-value buffers were placed. Shared so the DEBUG
 # log and the reasons surfaced to the allocator agree.
 _SOLVER_CHOSE_SPILL = "spilled by solver (no residency benefit / no room)"
+
+# Buffer type the wrapper carries: the base placement wrapper holds any
+# LifetimeBoundBuffer; the joint subclass binds this to CoreDivisionBuffer.
+_BufT = TypeVar("_BufT", bound=LifetimeBoundBuffer)
 
 
 @dataclass
@@ -106,32 +124,47 @@ class _PlacementUnit:
     justified_offset: int = 0  # final justified offset
 
 
-def _assert_core_divisions_enumerated(buffers: Sequence[CoreDivisionBuffer]):
-    """Assert that all buffers have enumerated core divisions."""
-    for b in buffers:
-        assert len(b.core_divisions) != 0, (
-            "All buffers must have at least 1 valid core division"
-        )
+def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
+    """Enforce, when ``enforce_lit`` is true, that ``(src_div, dst_div)`` is
+    one of the ``compatible`` (i, j) pairs. With no compatible pairs the
+    relation is unsatisfiable, so ``enforce_lit`` is forced false."""
+    if not compatible:
+        model.Add(enforce_lit == 0)
+        return
+    pair_lits = []
+    for i, j in compatible:
+        lit = model.NewBoolVar("")
+        model.Add(src_div == i).OnlyEnforceIf(lit)
+        model.Add(dst_div == j).OnlyEnforceIf(lit)
+        pair_lits.append(lit)
+    model.AddBoolOr(pair_lits).OnlyEnforceIf(enforce_lit)
 
 
 @dataclass
-class _CoreDivisionBufferWithCpVars:
-    """A :class:`CoreDivisionBuffer` bundled with the CP-SAT variables the solver
-    creates for it, so one object flows through the solve instead of a buffer
-    list shadowed by a parallel ``name -> {var}`` dict.
+class _LifetimeBufferWithCpVars(Generic[_BufT]):
+    """A :class:`LifetimeBoundBuffer` bundled with the CP-SAT variables the
+    solver creates for it, so one object flows through the solve instead of a
+    buffer list shadowed by a parallel ``name -> {var}`` dict.
+
+    This is the *placement-only* wrapper backing :meth:`plan_layout`: the
+    buffer's core division is already fixed upstream, so its footprint is the
+    constant ``size`` (which the 2D no-overlap and capacity constraints accept
+    wherever a var would go) and there is no division to choose. Every
+    division-aware hook below is therefore a no-op or a fixed-size answer;
+    :class:`_CoreDivisionBufferWithCpVars` overrides them to add the joint
+    core-division model. Keeping the hooks on the wrapper is what lets ``_run``
+    and its helpers serve both entry points unchanged.
 
     The buffer spans ``[buffer.start_time, buffer.end_time)``; the vars encode
-    where (``offset``) and whether (``in_buffer``) it resides in LX, and the
-    chosen core division (``division``) with its per-core footprint
-    (``eff_size``) and total core usage (``cores`` = ``cores_used``, including
-    any reduction-axis split). ``merge_vars`` maps each in-place parent name to
-    the merge bool for that parent->this edge.
+    where (``offset``) and whether (``in_buffer``) it resides in LX.
+    ``merge_vars`` maps each in-place parent name to the merge bool for that
+    parent->this edge.
 
     CP-SAT variables must be created against a model, so this wrapper takes the
     model and the unit capacity ``M`` and creates only the variables here; the
     constraints tying them together are added by the solver methods."""
 
-    buffer: CoreDivisionBuffer
+    buffer: _BufT
     model: "cp_model.CpModel"
     capacity_units: int
 
@@ -147,6 +180,82 @@ class _CoreDivisionBufferWithCpVars:
         # offset domain [0, M-1]; the resident => offset+eff_size<=M bound is
         # added in the in-place relaxation pass.
         self.offset = m.new_int_var(0, max(0, M - 1), f"off_{b.name}")
+        # Fixed footprint -- no division to pick, so a constant stands in for
+        # the joint solver's eff_size var.
+        self.eff_size: object = b.size
+        # Nothing to parallelise without candidate divisions; ``_run`` skips
+        # phase 2 when no buffer offers a core-usage term.
+        self.cores = None
+        self.merge_vars = {
+            parent: m.new_bool_var(f"merge_{parent}_{b.name}")
+            for parent in b.in_place_parents
+        }
+
+    # -- producer/consumer edges (joint model only; none when division-fixed) --
+    @property
+    def parents(self) -> list[str]:
+        return []
+
+    def match_pairs(self, parent: str) -> list[tuple[int, int]]:
+        return []
+
+    # ------------------------------ residency ------------------------------
+    @property
+    def min_footprint(self) -> int:
+        """Smallest footprint the buffer can take, for the capacity trim."""
+        return self.buffer.size
+
+    @property
+    def residency_reason(self) -> "str | None":
+        """Allocator-supplied reason the buffer may not reside, if any. Carried
+        on the buffer itself, so both entry points honour the allocator's
+        hard bars (e.g. the restickify cross-frame barrier) identically."""
+        return self.buffer.residency_reason
+
+    def spill_cost(self, num_children: int) -> int:
+        """Differential HBM traffic a spill adds over residency. Without the
+        producer/consumer edges of the joint model, the accesses are read
+        straight off ``uses``: the producer's write (absent for a graph input,
+        whose first use is a read) plus one re-read per later use."""
+        b = self.buffer
+        writes = 0 if b.first_use_is_read else 1
+        reads = len(b.uses) - writes
+        return (reads + writes) * b.size
+
+    def constrain_residency(self, model, kids, bufs) -> "str | None":
+        """Placement-only: any buffer may reside, so there is no slicing gate."""
+        return None
+
+    def constrain_merge(self, model, parent: "_LifetimeBufferWithCpVars", edge) -> None:
+        """Extra conditions on an active in-place merge. None when the division
+        is fixed: ``_assert_in_place_relationships`` already checks the child
+        fits in the parent's slot."""
+
+    # ------------------------------- extract -------------------------------
+    def footprint(self, solver: "cp_model.CpSolver") -> int:
+        return self.buffer.size
+
+    def record_division(self, solver: "cp_model.CpSolver") -> None:
+        """Write the chosen division back onto the buffer (nothing to record
+        when the division is fixed)."""
+
+
+@dataclass
+class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer]):
+    """The joint-model wrapper: a :class:`CoreDivisionBuffer` plus the vars for
+    its chosen core division (``division``), the per-core footprint that
+    division implies (``eff_size``) and its total core usage (``cores`` =
+    ``cores_used``, including any reduction-axis split).
+
+    On top of the base placement vars it supplies the division-aware pieces of
+    the model: the slicing-match residency gate, the division gate on an
+    in-place merge, and the edge-counted spill cost. The ``buffer`` field is
+    narrowed to :class:`CoreDivisionBuffer` via the base's type parameter."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        b = self.buffer
+        m = self.model
 
         per_core = [
             int(np.ceil(b.size / cd.output_partition)) for cd in b.core_divisions
@@ -159,18 +268,86 @@ class _CoreDivisionBufferWithCpVars:
         self.eff_size = m.new_int_var(0, max(per_core), f"eff_size_{b.name}")
         # total cores this op uses under the chosen div
         self.cores = m.new_int_var(0, max(cores_used), f"occ_{b.name}")
-        self.merge_vars = {
-            parent: m.new_bool_var(f"merge_{parent}_{b.name}")
-            for parent in b.in_place_parents
-        }
 
         # tie per-core footprint (output split only) and total core usage to the
         # chosen division index
-        self.model.add_element(self.division, per_core, self.eff_size)
-        self.model.add_element(self.division, cores_used, self.cores)
+        m.add_element(self.division, per_core, self.eff_size)
+        m.add_element(self.division, cores_used, self.cores)
+
+    @property
+    def parents(self) -> list[str]:
+        return self.buffer.parents
+
+    def match_pairs(self, parent: str) -> list[tuple[int, int]]:
+        return self.buffer.cd_parent_matches.get(parent, [])
+
+    @property
+    def min_footprint(self) -> int:
+        t = self.buffer
+        return min(
+            int(np.ceil(t.size / cd.output_partition)) for cd in t.core_divisions
+        )
+
+    def spill_cost(self, num_children: int) -> int:
+        b = self.buffer
+        reads = num_children + b.unallocated_reads
+        if b.boundary == BufferType.Input and reads > 0:
+            reads -= 1
+        writes = 1 if b.boundary == BufferType.Intermediate else 0
+        return (reads + writes) * b.size
+
+    def constrain_residency(self, model, kids, bufs) -> "str | None":
+        """Slicing-consistency gate: a resident buffer's division must match
+        *every* consumer's division under the ``cd_parent_matches`` pairs. A
+        buffer with no consumer edge, or with a consumer that has no compatible
+        pair, can never reside; the reason returned here is surfaced to the
+        allocator as the buffer's drop cause."""
+        t = self.buffer
+        if not kids:
+            if t.unallocated_reads:
+                # Read only by consumers the solver never sees (filtered-out
+                # ops / graph outputs). They still read it from LX when it
+                # resides, so residency is worthwhile; there is no resident
+                # consumer to constrain the division against, so no gate.
+                # TODO: Remove this when the other solvers are brought to parity
+                return None
+            # Nothing consumes this buffer from LX -> it can never reside.
+            model.add(self.in_buffer == 0)
+            return "no consumer reads it from LX"
+        for child, compatible in kids:
+            if not compatible:
+                # This child can never match -> the buffer cannot reside.
+                model.add(self.in_buffer == 0)
+                return f"consumer {child} has no slicing-compatible core division"
+            _gate_divisions(
+                model, compatible, self.division, bufs[child].division, self.in_buffer
+            )
+        return None
+
+    def constrain_merge(self, model, parent, edge) -> None:
+        """An active merge means the child reuses the parent's exact per-core
+        storage, so their chosen divisions must have equal per-core footprints
+        and must induce the same per-core slicing of that storage (the
+        ``cd_parent_matches`` pairs; no pairs => merge forbidden)."""
+        model.add(self.eff_size == parent.eff_size).OnlyEnforceIf(edge)
+        _gate_divisions(
+            model,
+            self.match_pairs(parent.name),
+            parent.division,
+            self.division,
+            edge,
+        )
+
+    def footprint(self, solver: "cp_model.CpSolver") -> int:
+        t = self.buffer
+        cd = t.core_divisions[solver.Value(self.division)]
+        return int(np.ceil(t.size / cd.output_partition))
+
+    def record_division(self, solver: "cp_model.CpSolver") -> None:
+        self.buffer.chosen_division = solver.Value(self.division)
 
 
-class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
+class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     """Joint core-division + LX placement via an OR-Tools CP-SAT search
     (``config.layout_solver == "cpsat"``). See the module docstring for the
     model (joint division, slicing-match residency gate, 2D no-overlap with
@@ -202,42 +379,90 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
         self.spill_reasons: dict[str, str] = {}
 
     def plan_layout(
-        self, buffers: Sequence[CoreDivisionBuffer], log_lx_usage: bool = False
+        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
+    ) -> list[LifetimeBoundBuffer]:
+        """Place buffers on their already-fixed core divisions (placement-only).
+
+        Same model as :meth:`plan_layout_and_core_divisions` minus the joint
+        division choice: each buffer's footprint is its ``size``, so there is no
+        slicing gate on residency and no parallelism phase -- the solve reduces
+        to minimising HBM traffic under the 2D no-overlap with in-place reuse.
+        Dispatch is per buffer and keys on whether it carries candidate
+        divisions, not on its class, so a :class:`CoreDivisionBuffer` with an
+        empty candidate list is placed here rather than divided."""
+        return cast(
+            "list[LifetimeBoundBuffer]", list(self._plan_layout_generic(buffers))
+        )
+
+    def plan_layout_and_core_divisions(
+        self, buffers: Sequence[CoreDivisionBuffer]
     ) -> list[CoreDivisionBuffer]:
+        """Jointly choose each buffer's core division and its LX placement.
+
+        The full model described in the module docstring. Every buffer must
+        carry enumerated candidate divisions; the chosen index is written back
+        to ``chosen_division`` for the allocator to commit."""
+        assert all(len(b.core_divisions) != 0 for b in buffers), (
+            "All buffers must have at least 1 valid core division"
+        )
+        return cast(
+            "list[CoreDivisionBuffer]", list(self._plan_layout_generic(buffers))
+        )
+
+    def _wrap(
+        self, model: "cp_model.CpModel", buffer: LifetimeBoundBuffer
+    ) -> _LifetimeBufferWithCpVars:
+        """Bundle a *copy* of ``buffer`` with its CP-SAT vars, scaled into the
+        alignment units the solver works in.
+
+        A buffer carrying enumerated core divisions gets the joint wrapper (its
+        ``size`` is the total device footprint, divided down by the chosen
+        division); anything else -- a plain :class:`LifetimeBoundBuffer`, or a
+        :class:`CoreDivisionBuffer` with nothing to choose from -- gets the
+        placement-only wrapper, whose footprint is ``size`` as given."""
+        units = int(np.ceil(buffer.size / self.alignment))
+        if isinstance(buffer, CoreDivisionBuffer) and buffer.core_divisions:
+            return _CoreDivisionBufferWithCpVars(
+                replace(buffer, size=units), model, self._capacity_units
+            )
+        return _LifetimeBufferWithCpVars(
+            replace(buffer, size=units), model, self._capacity_units
+        )
+
+    def _plan_layout_generic(
+        self,
+        buffers: Sequence[LifetimeBoundBuffer | CoreDivisionBuffer],
+        log_lx_usage: bool = False,
+    ) -> list[LifetimeBoundBuffer | CoreDivisionBuffer]:
         self.spill_reasons = {}
         if not buffers:
             return []
         assert all(b.address is None for b in buffers), (
             "Buffers cannot be previously or partially planned"
         )
+
         _assert_in_place_relationships(buffers)
-        _assert_core_divisions_enumerated(buffers)
 
         model = cp_model.CpModel()
         # Solve on copies so we never mutate the caller's buffers.
-        working = {
-            b.name: _CoreDivisionBufferWithCpVars(
-                replace(
-                    b,
-                    size=int(np.ceil(b.size / self.alignment)),
-                ),
-                model,
-                self._capacity_units,
-            )
-            for b in buffers
-        }
+        working = {b.name: self._wrap(model, b) for b in buffers}
 
-        offsets, spilled, chosen_div, forced_reasons = self._run(model, working)
-        offsets = {k: v * self.alignment for k, v in offsets.items()}
+        solved, forced_reasons = self._run(model, working)
+        spilled = {name for name, sb in solved.items() if sb.address is None}
         # Surface a drop cause for every spilled buffer: the pre-solve forced
         # reason when we have one, otherwise the solver chose to spill it.
         self.spill_reasons = {
             name: forced_reasons.get(name, _SOLVER_CHOSE_SPILL) for name in spilled
         }
 
+        # Copy the solved results back onto the caller's buffers. Offsets come
+        # back in alignment units (the solver works in aligned units), so scale
+        # the address to bytes on the way out.
         for b in buffers:
-            b.address = None if b.name in spilled else offsets.get(b.name)
-            b.chosen_division = chosen_div.get(b.name, b.chosen_division)
+            sb = solved[b.name]
+            b.address = None if sb.address is None else sb.address * self.alignment
+            if isinstance(b, CoreDivisionBuffer) and isinstance(sb, CoreDivisionBuffer):
+                b.chosen_division = sb.chosen_division
         return list(buffers)
 
     # ------------------------------------------------------------------
@@ -246,8 +471,8 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
     def _run(
         self,
         model: "cp_model.CpModel",
-        tensors: dict[str, _CoreDivisionBufferWithCpVars],
-    ) -> tuple[dict[str, int], set[str], dict[str, int], dict[str, str]]:
+        tensors: dict[str, _LifetimeBufferWithCpVars],
+    ) -> tuple[dict[str, LifetimeBoundBuffer], dict[str, str]]:
         children_of = self._get_children(tensors)
         self._add_inplace_relaxation(model, tensors)
         forced_reasons = self._add_core_division(model, tensors, children_of)
@@ -263,17 +488,15 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
 
         # TODO: Update objective to a maxmin optimization to optimize overall
         # throughput.
-        def spill_cost(sb: "_CoreDivisionBufferWithCpVars") -> int:
-            reads = len(children_of.get(sb.name, [])) + sb.buffer.unallocated_reads
-            if sb.buffer.boundary == BufferType.Input and reads > 0:
-                reads -= 1
-            writes = 1 if sb.buffer.boundary == BufferType.Intermediate else 0
-            return (reads + writes) * sb.buffer.size
-
-        hbm_terms = [spill_cost(sb) * (1 - sb.in_buffer) for sb in tensors.values()]
+        hbm_terms = [
+            sb.spill_cost(len(children_of.get(sb.name, []))) * (1 - sb.in_buffer)
+            for sb in tensors.values()
+        ]
+        status = cp_model.INFEASIBLE
         if hbm_terms:
             model.minimize(sum(hbm_terms))
-            if solver.Solve(model) not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            status = solver.Solve(model)
+            if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 raise SolveError("CP-SAT memory planner found no feasible plan")
             # Lock in the residency optimum (the traffic value, not just the
             # count) so phase 2 can never trade a spill for parallelism.
@@ -284,20 +507,27 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
 
         # Phase 2 -- parallelism: holding the residency optimum, maximize total
         # core usage so every buffer (resident or spilled) takes its most
-        # parallel division.
-        model.maximize(sum(sb.cores for sb in tensors.values()))
-        status = solver.Solve(model)
-        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            raise SolveError("CP-SAT memory planner found no feasible plan")
+        # parallel division. Placement-only buffers have no division to choose
+        # and so contribute no term; with none at all there is nothing to
+        # maximize, so we skip the re-solve and the extract below reads the
+        # phase-1 assignment still held by ``solver``.
+        core_terms = [sb.cores for sb in tensors.values() if sb.cores is not None]
+        if core_terms:
+            model.maximize(sum(core_terms))
+            status = solver.Solve(model)
+            if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                raise SolveError("CP-SAT memory planner found no feasible plan")
 
-        offsets, spilled, chosen_div = self._extract(solver, tensors)
+        final_tensors = self._extract(solver, tensors)
 
         if logger.isEnabledFor(logging.DEBUG):
+            spilled = [n for n, t in final_tensors.items() if t.address is None]
             logger.debug(
-                "[CP-SAT layout solver] tensors=%d resident=%d occupancy=%d "
+                "[CP-SAT layout solver] tensors=%d resident=%d %s=%d "
                 "status=%s walltime=%.2f ms",
                 len(tensors),
                 len(tensors) - len(spilled),
+                "occupancy" if core_terms else "hbm_traffic",
                 round(solver.ObjectiveValue()),
                 solver.StatusName(status),
                 solver.WallTime() * 1e3,
@@ -312,12 +542,12 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
                     forced_reasons.get(name, _SOLVER_CHOSE_SPILL),
                 )
 
-        return offsets, spilled, chosen_div, forced_reasons
+        return final_tensors, forced_reasons
 
     def _add_inplace_relaxation(
         self,
         model: "cp_model.CpModel",
-        bufs: dict[str, _CoreDivisionBufferWithCpVars],
+        bufs: dict[str, _LifetimeBufferWithCpVars],
     ) -> None:
         """In-place reuse as a relaxation of the no-overlap constraint: each
         parent->child edge gets a merge bool that, when active, pins the pair to
@@ -344,11 +574,11 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
                 model.add(src_v.offset == dst_v.offset).OnlyEnforceIf(edge)
                 model.add_implication(edge, src_v.in_buffer)
                 model.add_implication(edge, dst_v.in_buffer)
-                # active merge => child reuses the parent's exact per-core storage,
-                # so their chosen divisions must have equal per-core footprints.
-                model.add(dst_v.eff_size == src_v.eff_size).OnlyEnforceIf(edge)
-                # active merge => parent and child must pick slicing-compatible divisions
-                self._constrain_merge_division(model, bufs, src, dst, edge)
+                # active merge => the child must be able to take over the
+                # parent's exact storage (joint model: equal per-core footprints
+                # under slicing-compatible divisions; nothing extra when the
+                # division is fixed).
+                dst_v.constrain_merge(model, src_v, edge)
                 outgoing.setdefault(src, []).append(edge)
                 incoming.setdefault(dst, []).append(edge)
 
@@ -362,43 +592,10 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
 
         self._add_no_overlap_2d(model, bufs, outgoing)
 
-    def _constrain_merge_division(
-        self,
-        model: "cp_model.CpModel",
-        bufs: dict[str, _CoreDivisionBufferWithCpVars],
-        src: str,
-        dst: str,
-        m,
-    ) -> None:
-        """Gate an in-place merge on slicing-compatible divisions: when ``m`` is
-        active, parent (``src``) and child (``dst``) must pick divisions that
-        induce the same per-core slicing of the shared storage. Uses the
-        precomputed ``cd_parent_matches`` pairs (see ``_implicate_core_division``);
-        no pairs => merge forbidden."""
-        pv, cv = bufs[src], bufs[dst]
-        compatible = bufs[dst].buffer.cd_parent_matches.get(src, [])
-        self._gate_divisions(model, compatible, pv.division, cv.division, m)
-
-    @staticmethod
-    def _gate_divisions(model, compatible, src_div, dst_div, enforce_lit) -> None:
-        """Enforce, when ``enforce_lit`` is true, that ``(src_div, dst_div)`` is
-        one of the ``compatible`` (i, j) pairs. With no compatible pairs the
-        relation is unsatisfiable, so ``enforce_lit`` is forced false."""
-        if not compatible:
-            model.Add(enforce_lit == 0)
-            return
-        pair_lits = []
-        for i, j in compatible:
-            lit = model.NewBoolVar("")
-            model.Add(src_div == i).OnlyEnforceIf(lit)
-            model.Add(dst_div == j).OnlyEnforceIf(lit)
-            pair_lits.append(lit)
-        model.AddBoolOr(pair_lits).OnlyEnforceIf(enforce_lit)
-
     def _add_no_overlap_2d(
         self,
         model: "cp_model.CpModel",
-        bufs: dict[str, _CoreDivisionBufferWithCpVars],
+        bufs: dict[str, _LifetimeBufferWithCpVars],
         outgoing: dict[str, list],
     ) -> None:
         """Global 2D no-overlap: each resident buffer is an optional rectangle
@@ -459,24 +656,24 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
         model.add_no_overlap_2d(x_intervals, y_intervals)
 
     def _get_children(
-        self, bufs: dict[str, _CoreDivisionBufferWithCpVars]
+        self, bufs: dict[str, _LifetimeBufferWithCpVars]
     ) -> dict[str, list[tuple[str, list[tuple[int, int]]]]]:
         """parent name -> list of (child name, match_pairs), where ``match_pairs``
         is the child's ``cd_parent_matches[parent]`` (empty when the edge has no
-        compatible division). The child's ``parents`` define the edges."""
+        compatible division). The child's ``parents`` define the edges; a
+        placement-only buffer declares none, so the map is empty there."""
         children_of: dict[str, list[tuple[str, list[tuple[int, int]]]]] = {}
         for sb in bufs.values():
-            t = sb.buffer
-            for parent in t.parents:
+            for parent in sb.parents:
                 children_of.setdefault(parent, []).append(
-                    (t.name, t.cd_parent_matches.get(parent, []))
+                    (sb.name, sb.match_pairs(parent))
                 )
         return children_of
 
     def _trim_oversized_tensors(
         self,
         model: "cp_model.CpModel",
-        bufs: dict[str, _CoreDivisionBufferWithCpVars],
+        bufs: dict[str, _LifetimeBufferWithCpVars],
     ) -> dict[str, str]:
         """Pin out of LX the buffers whose non-residency is fixed up front: those
         whose *smallest* candidate footprint still exceeds capacity, and those
@@ -485,83 +682,34 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
         logging), using the allocator's specific reason when it has one."""
         forced: dict[str, str] = {}
         for sb in bufs.values():
-            t = sb.buffer
-            min_size = min(
-                int(np.ceil(t.size / cd.output_partition)) for cd in t.core_divisions
-            )
+            min_size = sb.min_footprint
             if min_size > self._capacity_units:
-                forced[t.name] = (
+                forced[sb.name] = (
                     f"min per-core footprint {min_size} > LX capacity "
                     f"{self._capacity_units} (alignment units)"
                 )
                 model.add(sb.in_buffer == 0)
-            elif not t.residency_allowed:
-                forced[t.name] = (
-                    t.residency_reason or "residency not allowed by allocator"
-                )
+            elif sb.residency_reason is not None:
+                forced[sb.name] = sb.residency_reason
                 model.add(sb.in_buffer == 0)
-        return forced
-
-    def _implicate_core_division(
-        self,
-        model: "cp_model.CpModel",
-        children_of: dict[str, list[tuple[str, list[tuple[int, int]]]]],
-        bufs: dict[str, _CoreDivisionBufferWithCpVars],
-    ) -> dict[str, str]:
-        """Slicing-consistency gate: a resident buffer's division must match
-        *every* consumer's division under the ``cd_parent_matches`` pairs. A
-        buffer with no consumer edge, or with a consumer that has no compatible
-        pair, can never reside. Returns ``name -> reason`` for the buffers the
-        gate forces out (drop-cause debug logging)."""
-        forced: dict[str, str] = {}
-        for sb in bufs.values():
-            t = sb.buffer
-            kids = children_of.get(t.name, [])
-            if not kids:
-                if t.unallocated_reads:
-                    # Read only by consumers the solver never sees (filtered-out
-                    # ops / graph outputs). They still read it from LX when it
-                    # resides, so residency is worthwhile; there is no resident
-                    # consumer to constrain the division against, so no gate.
-                    # TODO: Remove this when the other solvers are brought to parity
-                    continue
-                # Nothing consumes this buffer from LX -> it can never reside.
-                forced.setdefault(t.name, "no consumer reads it from LX")
-                model.add(sb.in_buffer == 0)
-                continue
-            for _child, compatible in kids:
-                if not compatible:
-                    # This child can never match -> the buffer cannot reside.
-                    forced.setdefault(
-                        t.name,
-                        f"consumer {_child} has no slicing-compatible core division",
-                    )
-                    model.add(sb.in_buffer == 0)
-                    break
-                pair_lits = []
-                for i, j in compatible:
-                    lit = model.new_bool_var("")
-                    model.add(sb.division == i).OnlyEnforceIf(lit)
-                    model.add(bufs[_child].division == j).OnlyEnforceIf(lit)
-                    pair_lits.append(lit)
-                model.add_bool_or(pair_lits).OnlyEnforceIf(sb.in_buffer)
         return forced
 
     def _add_core_division(
         self,
         model: "cp_model.CpModel",
-        bufs: dict[str, _CoreDivisionBufferWithCpVars],
+        bufs: dict[str, _LifetimeBufferWithCpVars],
         children_of: dict[str, list[tuple[str, list[tuple[int, int]]]]],
     ) -> dict[str, str]:
-        """Wire up forced spills and the slicing-match gate. Returns ``name ->
-        reason`` for every buffer pinned non-resident up front, so the solve can
-        log why each buffer was dropped to HBM. Matching is driven entirely by the
-        precomputed ``cd_parent_matches`` pairs."""
+        """Wire up forced spills and the per-buffer residency gate. Returns
+        ``name -> reason`` for every buffer pinned non-resident up front, so the
+        solve can log why each buffer was dropped to HBM. In the joint model the
+        gate is the slicing match, driven entirely by the precomputed
+        ``cd_parent_matches`` pairs; placement-only buffers have no gate."""
         forced = self._trim_oversized_tensors(model, bufs)
-        for name, why in self._implicate_core_division(
-            model, children_of, bufs
-        ).items():
-            forced.setdefault(name, why)
+        for sb in bufs.values():
+            why = sb.constrain_residency(model, children_of.get(sb.name, []), bufs)
+            if why is not None:
+                forced.setdefault(sb.name, why)
         return forced
 
     # ------------------------------------------------------------------
@@ -570,65 +718,71 @@ class CpSatLayoutSolver(MemoryPlanSolver[CoreDivisionBuffer]):
     def _extract(
         self,
         solver: "cp_model.CpSolver",
-        bufs: dict[str, _CoreDivisionBufferWithCpVars],
-    ) -> tuple[dict[str, int], set[str], dict[str, int]]:
-        """Read the solution into (offsets, spilled, chosen_div). When
-        bottom_justify is set, slide each placement unit down to the lowest free
-        address (preserving in-place merges, never raising the peak)."""
+        bufs: dict[str, _LifetimeBufferWithCpVars],
+    ) -> dict[str, LifetimeBoundBuffer]:
+        """Read the solution back onto each buffer and return ``name -> buffer``.
+
+        Every buffer gets its ``chosen_division`` (a no-op for a placement-only
+        buffer, whose division was fixed upstream) and, when resident, its LX
+        ``address`` (in alignment units, as the solver works them; the caller
+        scales to bytes). A spilled buffer gets ``address = None``. When
+        bottom_justify is set, each in-place-merged placement unit is slid down
+        to the lowest free address (preserving merges, never raising the
+        peak)."""
         by_name = {name: sb.buffer for name, sb in bufs.items()}
         spilled = {
             name for name, sb in bufs.items() if not solver.BooleanValue(sb.in_buffer)
         }
-        chosen_div = {name: solver.Value(sb.division) for name, sb in bufs.items()}
+        footprint = {name: sb.footprint(solver) for name, sb in bufs.items()}
 
-        def footprint(t: CoreDivisionBuffer) -> int:
-            return int(
-                np.ceil(t.size / t.core_divisions[chosen_div[t.name]].output_partition)
-            )
+        if self._bottom_justify:
+            # A placement unit is a connected component of active merge edges: its
+            # members share one base (the merge equalities), so the component
+            # slides as a single block and in-place reuse is preserved.
+            resident = [n for n in by_name if n not in spilled]
+            parent = {n: n for n in resident}
 
-        if not self._bottom_justify:
-            return (
-                {
-                    name: solver.Value(sb.offset)
-                    for name, sb in bufs.items()
-                    if solver.BooleanValue(sb.in_buffer)
-                },
-                spilled,
-                chosen_div,
-            )
+            def find(x: str) -> str:
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
 
-        # A placement unit is a connected component of active merge edges: its
-        # members share one base (the merge equalities), so the component slides
-        # as a single block and in-place reuse is preserved.
-        resident = [n for n in by_name if n not in spilled]
-        parent = {n: n for n in resident}
+            for dst, c in bufs.items():
+                for src, edge in c.merge_vars.items():
+                    if solver.BooleanValue(edge):
+                        parent[find(src)] = find(dst)
 
-        def find(x: str) -> str:
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
+            components: dict[str, list[str]] = {}
+            for n in resident:
+                components.setdefault(find(n), []).append(n)
 
-        for dst, c in bufs.items():
-            for src, edge in c.merge_vars.items():
-                if solver.BooleanValue(edge):
-                    parent[find(src)] = find(dst)
+            units = [
+                _PlacementUnit(
+                    members=names,
+                    footprint=max(footprint[n] for n in names),
+                    start_time=min(by_name[n].start_time for n in names),
+                    end_time=max(by_name[n].end_time for n in names),
+                    original_offset=solver.Value(bufs[names[0]].offset),
+                )
+                for names in components.values()
+            ]
+            offsets = self._justify(units)
+        else:
+            offsets = {
+                name: solver.Value(sb.offset)
+                for name, sb in bufs.items()
+                if name not in spilled
+            }
 
-        components: dict[str, list[str]] = {}
-        for n in resident:
-            components.setdefault(find(n), []).append(n)
-
-        units = [
-            _PlacementUnit(
-                members=names,
-                footprint=max(footprint(by_name[n]) for n in names),
-                start_time=min(by_name[n].start_time for n in names),
-                end_time=max(by_name[n].end_time for n in names),
-                original_offset=solver.Value(bufs[names[0]].offset),
-            )
-            for names in components.values()
-        ]
-        return self._justify(units), spilled, chosen_div
+        for name, sb in bufs.items():
+            t = sb.buffer
+            sb.record_division(solver)
+            if name in spilled:
+                t.address = None
+            else:
+                t.address = offsets[name]
+        return by_name
 
     @staticmethod
     def _justify(units: list[_PlacementUnit]) -> dict[str, int]:

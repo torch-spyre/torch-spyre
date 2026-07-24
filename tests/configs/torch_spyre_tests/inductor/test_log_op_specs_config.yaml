@@ -1,5 +1,5 @@
 test_suite_config:
   labels: [core, full]
   files:
-    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_matmul.py
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_log_op_specs.py
       unlisted_test_mode: mandatory_success

@@ -109,10 +109,46 @@ _SIGNAL_NAMES = {
     "15": "SIGTERM",
 }
 
-# Hardware environment variables (appear only in final attempt's DTLOG dump)
-RE_NODE_NAME = re.compile(r"GHA_RUNNER_POD_NODE_NAME\s*->\s*(?P<v>\S+)")
-RE_PCI_DEVICE = re.compile(r"PCIDEVICE_IBM_COM_AIU_PF\s*->\s*(?P<v>[0-9a-f:.]+)")
-RE_AIU_RANK0 = re.compile(r"AIU_WORLD_RANK_0\s*->\s*(?P<v>[0-9a-f:.]+)")
+# Hardware environment variables.
+# Two independent sources feed these fields:
+#   1. The "Gather runner info" composite action
+#      (.github/actions/gather-runner-info) echoes
+#      "GHA_RUNNER_POD_NODE_NAME <value>" / "GHA_RUNNER_POD_NAME <value>" /
+#      "PCIDEVICE_IBM_COM_AIU_PF <value>" on every attempt, and its verbose
+#      env dump additionally prints "PCIDEVICE_IBM_COM_AIU_PF=<value>" style
+#      lines. This is the reliable source: it fires on every attempt.
+#   2. The Spyre runtime's own DTLOG_LEVEL=Info dump, which only fires on the
+#      FINAL attempt and uses a "KEY -> value" format.
+# These patterns accept a plain space, "=", or "->" separator so either
+# source matches. `(?!\w)` after the var name stops "GHA_RUNNER_POD_NAME"
+# from matching as a prefix of "GHA_RUNNER_POD_NAMESPACE". Separators use
+# `[ \t]*`, not `\s*` — `\s*` also matches newlines, which lets an empty
+# value (var echoed with nothing after it) swallow the following line's key
+# as its own value.
+# The value character class is restricted (not `\S+`) to keep two things out:
+#   - `$` and `"`: GHA prints a "script preview" line before a step runs,
+#     containing the step's literal source text -- e.g.
+#     `echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"` -- which
+#     appears BEFORE the real output in the log and would otherwise be the
+#     first (wrong) match `_first_env` finds, capturing garbage like
+#     `$GHA_RUNNER_POD_NODE_NAME"` off the `$`-prefixed variable reference.
+#   - ANSI escape bytes from that same preview line's syntax highlighting.
+# `*` IS included: GHA's own secret redaction can replace a substring
+# in-place with a literal "***" (e.g. a pod name containing a token that
+# happens to match a registered secret), so real values can legitimately
+# contain it -- excluding it would truncate the value at the mask.
+RE_NODE_NAME = re.compile(
+    r"GHA_RUNNER_POD_NODE_NAME(?!\w)[ \t]*(?:->|=)?[ \t]*(?P<v>[\w.*-]+)"
+)
+RE_POD_NAME = re.compile(
+    r"GHA_RUNNER_POD_NAME(?!\w)[ \t]*(?:->|=)?[ \t]*(?P<v>[\w.*-]+)"
+)
+RE_PCI_DEVICE = re.compile(
+    r"PCIDEVICE_IBM_COM_AIU_PF(?!\w)[ \t]*(?:->|=)?[ \t]*(?P<v>[0-9a-fA-F:.,]+)"
+)
+RE_AIU_RANK0 = re.compile(
+    r"AIU_WORLD_RANK_0(?!\w)[ \t]*(?:->|=)?[ \t]*(?P<v>[0-9a-fA-F:.,]+)"
+)
 RE_PCI_DEV_ID = re.compile(
     r"pcidevid\.cpp.*?Device id \(for card idx \d+\):\s*(?P<v>[0-9a-f:.]+)"
 )
@@ -510,13 +546,27 @@ def parse_log(text: str, run_id: str, suite_hint: str = "") -> list[dict[str, An
             rec["failure_phase"] = "execution"
 
         # ---------------- Hardware identifiers ------------------------
-        rec["node_name"] = _first_env(RE_NODE_NAME, chunk)
+        # node_name/pod_name/pci_device/aiu_rank0 come from the "Gather
+        # runner info" action, which runs ONCE per job as its own step,
+        # BEFORE the "=== Attempt N/M ===" banners emitted by the test-runner
+        # step. That output sits outside every per-attempt `chunk` (chunks
+        # start at each banner line), so these fields are searched against
+        # the full per-job log `text`, not `chunk` — they're job-wide
+        # constants (same runner pod for every attempt) anyway, and `text`
+        # is a superset of `chunk` so the old DTLOG-based match still works.
+        #
+        # Prefer the k8s node name; fall back to the runner pod name when the
+        # node name env var isn't populated (e.g. some clusters only expose
+        # GHA_RUNNER_POD_NAME via the downward API, not the node name).
+        rec["node_name"] = _first_env(RE_NODE_NAME, text) or _first_env(
+            RE_POD_NAME, text
+        )
         rec["pci_device"] = (
-            _first_env(RE_PCI_DEVICE, chunk)
+            _first_env(RE_PCI_DEVICE, text)
             or _first_env(RE_PCI_DEV_ID, chunk)
             or _first_env(RE_OPENED, chunk)
         )
-        rec["aiu_world_rank0"] = _first_env(RE_AIU_RANK0, chunk)
+        rec["aiu_world_rank0"] = _first_env(RE_AIU_RANK0, text)
         rec["card_serial"] = _first_env(RE_CARD_SERIAL, chunk)
         rec["chip_ecid_raw"] = _first_env(RE_RAW_ECID, chunk)
         rec["chip_wafer_id"] = _first_env(RE_WAFER_ID, chunk)

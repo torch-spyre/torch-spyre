@@ -13,3 +13,4 @@ For compiler-specific patterns such as adding new operation support, see
    guidelines
    op_enablement
    profiling
+   is_power_z_dev_label_guide

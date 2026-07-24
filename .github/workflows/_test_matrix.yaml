@@ -79,10 +79,16 @@ on:
         default: true
       test_type:
         description: >-
-          Suite subset to run: smoke | core | full | suite_<group> | <label>.
-          Selects configs whose test_suite_config.labels array contains this
-          value, or (for suite_<group>) whose path sits under that directory.
-          Default: full (every config).
+          Suite subset to run: smoke | core | full | device_critical |
+          suite_<group> | <label>. Selects configs whose
+          test_suite_config.labels array contains this value, or (for
+          suite_<group>) whose path sits under that directory.
+          device_critical covers the device-layer surfaces flex and
+          deeptools/dxp_standalone exercise most (streams, job launch
+          plans, codegen, LX/scratchpad planning, tensor layout,
+          allocator/GC, D2D copies). Default: full (every config) -- callers
+          that want the narrower CI default (e.g. integration-tests.yaml)
+          pass test_type explicitly.
         required: false
         type: string
         default: full
@@ -355,6 +361,10 @@ jobs:
   #
   # Only runs for test_type values that include the distributed suite:
   #   full              — includes everything
+  #   device_critical    — used as the reduced default by integration-tests.yaml;
+  #                        distributed comms (streams/barrier/broadcast/gather/
+  #                        allgather) are exactly the device-layer surface this
+  #                        label exists to protect, so it always runs alongside it
   #   suite_distributed — targets the distributed_tests/ directory directly
   #   (empty)           — same as full
   # For smoke / core / suite_<other> the distributed job is skipped entirely
@@ -372,6 +382,7 @@ jobs:
       !cancelled() &&
       (inputs.test_type == '' ||
        inputs.test_type == 'full' ||
+       inputs.test_type == 'device_critical' ||
        inputs.test_type == 'suite_distributed') &&
       (needs.build_torch_spyre.result == 'success' ||
        needs.build_torch_spyre.result == 'skipped')
