@@ -140,8 +140,6 @@ jobs:
             config: inductor-test_exc_lowering_stack_trace.yaml
           - name: Inductor fuzzer
             config: inductor-test_fuzzer.yaml
-          - name: Inductor mkldnn pattern matcher
-            config: inductor-test_mkldnn_pattern_matcher.yaml
           - name: Inductor move constructor to gpu
             config: inductor-test_move_constructors_to_gpu.yaml
           - name: Inductor pattern matcher
@@ -167,6 +165,11 @@ jobs:
           #   config: inductor-test_op_dtype_prop.yaml
           # - name: NeuralNet convolution
           #   config: nn-test_convolution.yaml
+          # All xfail/skip tests (no mandatory_success entries). Will result in
+          # zero tests collected in "not xfail" mode.
+          # Retaining the yaml for future use as new spyre capabilities are added.
+          # - name: Inductor mkldnn pattern matcher
+          #   config: inductor-test_mkldnn_pattern_matcher.yaml
 
     steps:
       # Sparse checkout into the GHA workspace so the local composite

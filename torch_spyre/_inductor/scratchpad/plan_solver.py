@@ -15,7 +15,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Generic, Optional, TypeVar
+from typing import Optional
 from abc import ABC, abstractmethod
 import math
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -57,6 +57,14 @@ class LifetimeBoundBuffer:
     first_use_is_read: bool = False
     address: Optional[int] = None
     in_place_parents: list[str] = field(default_factory=list)
+    # Why the buffer may not be made resident, or ``None`` if it may. A non-None
+    # reason (e.g. "lx back gap", "single use") pins it out of LX up front and is
+    # surfaced as its spill cause; ``None`` means residency is allowed. The buffer
+    # is handed to the solver either way so it still participates in matching and
+    # in-place chains -- a forced-out consumer keeps its producers' residency
+    # viable instead of orphaning them. Only :class:`CpSatLayoutSolver` honours
+    # this; the gap heuristics ignore it, as they always have.
+    residency_reason: Optional[str] = None
 
     @property
     def start_time(self) -> int:
@@ -133,17 +141,9 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # the merge/residency across that edge.
     cd_parent_matches: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
     chosen_division: Optional[int] = None
-    # Why the buffer may not be made resident, or ``None`` if it may. A non-None
-    # reason (e.g. "lx back gap", "single use") pins it out of LX up front and is
-    # surfaced as its spill cause; ``None`` means residency is allowed. The buffer
-    # is handed to the solver either way so it participates in matching -- a
-    # forced-out consumer keeps its producers' residency viable instead of
-    # orphaning them.
-    residency_reason: Optional[str] = None
     # Count of reads of this buffer by consumers the solver never sees as
-    # candidates -- ops filtered out of the candidate set (e.g. under the
-    # placement-only conversion in ``_as_core_division_buffers``) or graph
-    # outputs. Such a consumer still reads this buffer *from LX* when it resides,
+    # candidates -- ops filtered out of the candidate set or graph outputs.
+    # Such a consumer still reads this buffer *from LX* when it resides,
     # so the read counts toward the buffer's spill cost even though no ``parents``
     # edge represents it, and it lets the buffer reside despite having no resident
     # (candidate) consumer to match a division against. Zero for the joint
@@ -152,11 +152,6 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # TODO: Drop this and make other solvers use the placement = False flag
     unallocated_reads: int = 0
     boundary: BufferType = BufferType.Intermediate
-
-    @property
-    def residency_allowed(self) -> bool:
-        """True iff the buffer carries no blocking ``residency_reason``."""
-        return self.residency_reason is None
 
 
 def _assert_in_place_relationships(
@@ -186,20 +181,13 @@ def _assert_in_place_relationships(
                 )
 
 
-_BufferT = TypeVar("_BufferT", bound=LifetimeBoundBuffer)
+class MemoryPlanSolver(ABC):
+    """Solves *placement*: where, if anywhere, each buffer lives in scratchpad.
 
-
-class MemoryPlanSolver(ABC, Generic[_BufferT]):
-    """
-    An abstract class for defining algorithms which solve
-    memory layout patterns based on provided sizes, lifetimes.
-
-    Parameterized by the buffer type the solver consumes: the placement-only
-    solvers work on :class:`LifetimeBoundBuffer`, while :class:`CpSatLayoutSolver`
-    reads the richer :class:`CoreDivisionBuffer` metadata. Since
-    ``CoreDivisionBuffer`` subclasses ``LifetimeBoundBuffer``, the allocator always
-    hands over ``CoreDivisionBuffer``s and every solver accepts them (LSP): the
-    placement solvers simply ignore the extra fields.
+    Every solver implements this. Each buffer's core division is already fixed
+    by the time a placement-only solver sees it, so the buffer's ``size`` is the
+    footprint to pack. :class:`CoreDivisionLayoutSolver` extends the contract for
+    solvers that can also choose the division.
     """
 
     def __init__(self, size: int, alignment: int = 128):
@@ -209,37 +197,70 @@ class MemoryPlanSolver(ABC, Generic[_BufferT]):
             size (int): Total scratchpad size in bytes. Buffers whose aligned
                 placement would exceed this limit are evicted (address=None).
             alignment (int): Byte alignment boundary. Every buffer is placed at
-                the next address that is a multiple of this value. Defaults to 128
-                (one Spyre stick).
+                the next address that is a multiple of this value. Defaults to
+                128 (one Spyre stick), which is also what every concrete solver
+                defaults to.
         """
         self.limit = size
         self.alignment = alignment
 
     @abstractmethod
     def plan_layout(
-        self, buffers: Sequence[_BufferT], log_lx_usage: bool = False
-    ) -> list[_BufferT]:
+        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
+    ) -> list[LifetimeBoundBuffer]:
         """
         Utilizes an implementation defined algorithm to determine
         if and where buffers should be placed in scratchpad memory based
         on their attributes.
 
-        ``buffers`` is a :class:`Sequence` (not ``list``) so a caller may pass a
-        ``list`` of a *subtype* -- e.g. the allocator always converts to
-        ``CoreDivisionBuffer`` and hands the same list to any solver (LSP);
-        covariance lets that type-check against every solver's element type.
+        ``buffers`` is a :class:`Sequence` (not ``list``) because ``Sequence`` is
+        covariant in its element type: that lets a caller hand over a
+        ``list[CoreDivisionBuffer]`` -- a subtype of ``LifetimeBoundBuffer`` -- and
+        still type-check.
 
         Args:
-            buffers (list[LifetimeBoundBuffer]): The set of candidate buffers for memory planning
+            buffers (Sequence[LifetimeBoundBuffer]): The set of candidate buffers
+                for memory planning
             log_lx_usage (bool): If True, emit per-timestep scratchpad usage at DEBUG level.
 
         Returns:
-            list[_BufferT]: The set of buffers with their placements defined.
+            list[LifetimeBoundBuffer]: The set of buffers with their placements defined.
         """
-        pass
 
 
-class GreedyLayoutSolver(MemoryPlanSolver[LifetimeBoundBuffer]):
+class CoreDivisionLayoutSolver(MemoryPlanSolver):
+    """A solver that chooses each buffer's *core division* jointly with its
+    placement, rather than accepting a division fixed upstream.
+
+    The two decisions are coupled: the division sets the per-core footprint the
+    placement has to fit, and residency requires a producer and its consumers to
+    slice the shared buffer the same way. Solving them together lets a buffer
+    take the division that lets it reside.
+
+    Such a solver still satisfies :meth:`plan_layout` -- placement-only is the
+    special case where there is nothing to choose.
+    """
+
+    @abstractmethod
+    def plan_layout_and_core_divisions(
+        self, buffers: Sequence[CoreDivisionBuffer]
+    ) -> list[CoreDivisionBuffer]:
+        """Choose each buffer's core division and its LX placement together.
+
+        On top of the :meth:`plan_layout` contract, implementations write the
+        index of the chosen division back to ``chosen_division`` for the
+        allocator to commit.
+
+        Args:
+            buffers: Candidate buffers, each carrying its enumerated candidate
+                core divisions.
+
+        Returns:
+            The same buffers, with placements and chosen divisions defined.
+        """
+
+
+class GreedyLayoutSolver(MemoryPlanSolver):
     def __init__(self, size: int, alignment: int = 128):
         super().__init__(size, alignment)
         # `usage` tracks live placements during planning. It is specific to the

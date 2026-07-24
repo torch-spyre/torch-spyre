@@ -1,5 +1,5 @@
 test_suite_config:
-  labels: [core, full]
+  labels: [core, full, device_critical]
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/tensor/test_coordinates.py
       unlisted_test_mode: mandatory_success
