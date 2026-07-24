@@ -5470,7 +5470,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         import torch._inductor.lowering as inductor_lowering
         from torch._inductor.utils import fresh_cache
 
-        lib = torch.library.Library("spyre_test", "FRAGMENT")  # noqa: TOR901
+        lib = torch.library.Library("spyre_test", "FRAGMENT")
         lib.define("clone_identity(Tensor x) -> Tensor")
         op = torch.ops.spyre_test.clone_identity.default
         lib.impl("clone_identity", lambda x: x.clone(), "CPU")

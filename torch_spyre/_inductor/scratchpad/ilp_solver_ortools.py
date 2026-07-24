@@ -90,8 +90,8 @@ else:
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
+    CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
-    MemoryPlanSolver,
     SolveError,
     BufferType,
     _assert_in_place_relationships,
@@ -347,7 +347,7 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         self.buffer.chosen_division = solver.Value(self.division)
 
 
-class CpSatLayoutSolver(MemoryPlanSolver):
+class CpSatLayoutSolver(CoreDivisionLayoutSolver):
     """Joint core-division + LX placement via an OR-Tools CP-SAT search
     (``config.layout_solver == "cpsat"``). See the module docstring for the
     model (joint division, slicing-match residency gate, 2D no-overlap with

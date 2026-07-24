@@ -60,6 +60,7 @@ from .op_spec import (
     OpSpec,
     TensorArg,
     UnimplementedOp as OpSpecUnimplementedOp,
+    format_op_spec_list,
 )
 from torch_spyre._inductor.provenance import build_debug_handle
 import logging
@@ -918,8 +919,21 @@ class SpyreKernel(Kernel[CSEVariable]):
             if self.indirect_vars
             else None
         )
+
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "OP SPECS AFTER CREATION/LOOP-WRAPPING\n%s",
+                format_op_spec_list(self.op_specs),
+            )
+
         for op_spec in _iter_op_specs(self.op_specs):
             simplify_op_spec(op_spec, self.indirect_sizes, indirect_access_subs)
+
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "OP SPECS AFTER SIMPLIFICATION\n%s",
+                format_op_spec_list(self.op_specs),
+            )
 
         def sympy_str(x: sympy.Expr) -> str:
             if isinstance(x, IndirectAccess):

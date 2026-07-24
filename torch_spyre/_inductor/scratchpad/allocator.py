@@ -16,7 +16,7 @@ import logging
 import math
 import time
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
 import sympy
 import torch
@@ -46,6 +46,7 @@ from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
     CoreDivisionBuffer,
+    CoreDivisionLayoutSolver,
     GreedyLayoutSolver,
     LifetimeBoundBuffer,
     MemoryPlanSolver,
@@ -62,11 +63,6 @@ from torch_spyre._inductor.scratchpad.simulated_annealing import (
 from torch_spyre._inductor.scratchpad.passes import (
     ScratchpadOptimizationPass,
 )
-
-if TYPE_CHECKING:
-    from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
-        CpSatLayoutSolver,
-    )
 from torch_spyre._inductor.scratchpad.utils import (
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
     round_up_to_alignment,
@@ -89,6 +85,7 @@ from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.pass_utils import _is_matmul_op
 
 logger = get_inductor_logger("scratchpad.allocator")
+
 
 # Keep these values synchronized with Deeptools' LX memory tracker:
 #
@@ -1189,11 +1186,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # Greedy fallback for when CP-SAT is unavailable (ortools not installed).
         self._fallback = ScratchpadAllocator(layout_planning=GreedyLayoutSolver(size))
 
-        # Annotated as the concrete solver rather than ``MemoryPlanSolver``: this
-        # allocator drives the *joint* entry point
-        # (``plan_layout_and_core_divisions``), which only ``CpSatLayoutSolver``
-        # offers. Quoted + TYPE_CHECKING-only so the runtime import stays lazy.
-        self.layout_planning: Optional["CpSatLayoutSolver"]
+        # This allocator drives the *joint* entry point, so it needs the
+        # core-division interface rather than plain ``MemoryPlanSolver``.
+        self.layout_planning: Optional[CoreDivisionLayoutSolver]
         try:
             # Imported lazily so this module (and the greedy path) load even when
             # ortools is absent: CpSatLayoutSolver.__init__ raises ImportError

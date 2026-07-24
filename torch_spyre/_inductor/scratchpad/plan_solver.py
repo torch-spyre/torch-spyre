@@ -182,16 +182,12 @@ def _assert_in_place_relationships(
 
 
 class MemoryPlanSolver(ABC):
-    """
-    An abstract class for defining algorithms which solve
-    memory layout patterns based on provided sizes, lifetimes.
+    """Solves *placement*: where, if anywhere, each buffer lives in scratchpad.
 
-    ``plan_layout`` is the placement-only contract and works on
-    :class:`LifetimeBoundBuffer`s, which is what :class:`ScratchpadAllocator`
-    builds. The richer :class:`CoreDivisionBuffer` metadata is *not* part of this
-    interface: the joint core-division + placement solve lives on
-    :meth:`CpSatLayoutSolver.plan_layout_and_core_divisions`, driven by the
-    co-optimizing allocator.
+    Every solver implements this. Each buffer's core division is already fixed
+    by the time a placement-only solver sees it, so the buffer's ``size`` is the
+    footprint to pack. :class:`CoreDivisionLayoutSolver` extends the contract for
+    solvers that can also choose the division.
     """
 
     def __init__(self, size: int, alignment: int = 128):
@@ -201,8 +197,9 @@ class MemoryPlanSolver(ABC):
             size (int): Total scratchpad size in bytes. Buffers whose aligned
                 placement would exceed this limit are evicted (address=None).
             alignment (int): Byte alignment boundary. Every buffer is placed at
-                the next address that is a multiple of this value. Defaults to 128
-                (one Spyre stick).
+                the next address that is a multiple of this value. Defaults to
+                128 (one Spyre stick), which is also what every concrete solver
+                defaults to.
         """
         self.limit = size
         self.alignment = alignment
@@ -229,7 +226,38 @@ class MemoryPlanSolver(ABC):
         Returns:
             list[LifetimeBoundBuffer]: The set of buffers with their placements defined.
         """
-        pass
+
+
+class CoreDivisionLayoutSolver(MemoryPlanSolver):
+    """A solver that chooses each buffer's *core division* jointly with its
+    placement, rather than accepting a division fixed upstream.
+
+    The two decisions are coupled: the division sets the per-core footprint the
+    placement has to fit, and residency requires a producer and its consumers to
+    slice the shared buffer the same way. Solving them together lets a buffer
+    take the division that lets it reside.
+
+    Such a solver still satisfies :meth:`plan_layout` -- placement-only is the
+    special case where there is nothing to choose.
+    """
+
+    @abstractmethod
+    def plan_layout_and_core_divisions(
+        self, buffers: Sequence[CoreDivisionBuffer]
+    ) -> list[CoreDivisionBuffer]:
+        """Choose each buffer's core division and its LX placement together.
+
+        On top of the :meth:`plan_layout` contract, implementations write the
+        index of the chosen division back to ``chosen_division`` for the
+        allocator to commit.
+
+        Args:
+            buffers: Candidate buffers, each carrying its enumerated candidate
+                core divisions.
+
+        Returns:
+            The same buffers, with placements and chosen divisions defined.
+        """
 
 
 class GreedyLayoutSolver(MemoryPlanSolver):
