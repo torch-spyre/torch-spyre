@@ -1119,6 +1119,7 @@ def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
     output: FixedLayout = op.get_layout()
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
+    stick_size = get_elem_in_stick(output.dtype)
     layouts = [
         SpyreTensorLayout(
             c_size,
@@ -1127,7 +1128,7 @@ def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
             [d for d in range(len(c_size)) if d != stick_dim] + [stick_dim],
         )
         for stick_dim in range(len(c_size))
-        if c_size[stick_dim] > 1  # no sticks of size 1
+        if c_size[stick_dim] % stick_size == 0 and c_size[stick_dim] >= stick_size
     ]
     if not layouts:
         layouts = [generic_layout(op)]

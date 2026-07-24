@@ -12,22 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import contextmanager
 from .constants import DEVICE_NAME
-from .patches import enable_spyre_context
+from .patches import enable_spyre_context, patch_inductor_fusions
 from . import config
 
 import threading
 from functools import wraps
 
-from .propagate_hints import spyre_hint, get_op_hints, _reset_counter  # noqa: F401
+from .propagate_hints import spyre_hint, get_op_hints  # noqa: F401
 from torch_spyre.profiler._ffdc import CATEGORY_COMPILE, try_collect
 
 _autoload_lock = threading.Lock()
 
 
 def enable_spyre_compile_fx_wrapper():
-    from torch._dynamo.repro.after_dynamo import WrapBackendDebug
     import torch._inductor.compile_fx as cfx
     import torch.fx as fx
     import torch
@@ -37,6 +35,9 @@ def enable_spyre_compile_fx_wrapper():
     with _autoload_lock:
         if getattr(cfx, "_spyre_wrapped", False):
             return
+
+        patch_inductor_fusions()
+
         _orig = cfx.compile_fx
         from torch_spyre._inductor.logging_utils import get_inductor_logger
 
@@ -130,18 +131,6 @@ def enable_spyre_compile_fx_wrapper():
                 if uses_spyre:
                     try_collect(exc, logger=logger, failure_category=CATEGORY_COMPILE)
                 raise
-
-        # Reset the global counter after each
-        # run to prevent recompilation
-        @contextmanager
-        def backend_context():
-            _reset_counter()
-            yield
-
-        def backend_ctx_ctor(self):
-            return backend_context
-
-        setattr(WrapBackendDebug, "backend_ctx_ctor", property(backend_ctx_ctor))
 
         cfx.compile_fx = _wrapper
         cfx._spyre_wrapped = True
