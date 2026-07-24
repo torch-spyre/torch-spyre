@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import logging
 import os
 from collections.abc import Sequence
 from typing import Any
@@ -22,7 +23,7 @@ import sympy
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec
-from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
+from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, format_op_spec_list
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
 
@@ -72,6 +73,12 @@ def generate_bundle(
         use_symbols = _spyre_config.bundle_symbolic_args
 
     specs_list: list = list(specs)
+
+    if logger.isEnabledFor(logging.INFO):
+        logger.info(
+            "OP SPECS FOR BUNDLE GENERATION\n%s",
+            format_op_spec_list(specs_list),
+        )
 
     # -----------------------------------------------------------------------
     # Pass 1: compile all OpSpecs depth-first.

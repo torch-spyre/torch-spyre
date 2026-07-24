@@ -48,6 +48,7 @@ from .coarse_tile import (
     hints_to_coarse_tile_groups,
     reorder_unhinted_interlopers,
     span_overflow_groups,
+    validate_coarse_tile_groups,
 )
 from . import config
 from .propagate_hints import (
@@ -295,6 +296,7 @@ def _runs(*passes: Callable) -> Callable[[Callable], Callable]:
     reorder_unhinted_interlopers,
     hints_to_coarse_tile_groups,
     span_overflow_groups,
+    validate_coarse_tile_groups,
     coarse_tile,
 )
 def _maybe_coarse_tile(graph: GraphLowering) -> None:
@@ -307,6 +309,7 @@ def _maybe_coarse_tile(graph: GraphLowering) -> None:
     if groups:
         op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
         groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
+        validate_coarse_tile_groups(groups)
         coarse_tile(graph, groups=groups)
 
 

@@ -30,6 +30,7 @@ import sys
 import os
 import regex as re
 
+import pytest
 import torch
 import unittest
 from unittest.mock import patch as mock_patch
@@ -2036,6 +2037,161 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
             src,
             "Expected tile-sized accum TensorArg with lx allocation for nested M+K tiling",
         )
+
+
+# ===========================================================================
+# New tests appended below — do not modify the code above this line.
+# ===========================================================================
+
+
+@pytest.mark.xfail(strict=True, reason="SpyreEmptyFallback / ct_fill STL bug")
+def test_tiled_in_place_accumulator():
+    """Minimal reproducer for the SpyreEmptyFallback / ct_fill STL bug.
+
+    CURRENT STATUS (to delete when reorder-passes-clean is merged)
+      - Fails on main
+      - Fails on reorder-passes-clean but passes with patch XYZ and SENCORES=1
+    """
+    from torch_spyre._inductor import spyre_hint
+
+    torch.manual_seed(0xAFFE)
+    _pnd.reset()
+
+    B, H, Lq, D = 1, 8, 256, 64
+    lq_slices = Lq // 128
+
+    x_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
+    scale_t = torch.randn(B, H, Lq, 1, dtype=torch.float16)
+    # acc is a real graph input (not zeros_like) so there is no ct_fill
+    # zeroing the tile each iteration — each tile genuinely accumulates.
+    acc_t = torch.zeros(B, H, Lq, D, dtype=torch.float16)
+
+    def fn(x, scale, acc):
+        with spyre_hint(num_tiles_per_dim={"H": 4}):
+            with spyre_hint(num_tiles_per_dim={"Lq": lq_slices}):
+                block_max = torch.amax(x, dim=-1, keepdim=True)
+                acc.copy_(acc + block_max * scale)
+        return acc
+
+    ref = fn(x_t, scale_t, acc_t.clone())
+
+    x_dev = x_t.to("spyre")
+    scale_dev = scale_t.to("spyre")
+    acc_dev = acc_t.to("spyre")
+    _declare_tensor_dim("B", B)
+    _declare_tensor_dim("H", H)
+    _declare_tensor_dim("Lq", Lq)
+    _declare_tensor_dim("D", D)
+    _name_tensor_dims(x_dev, ["B", "H", "Lq", "D"])
+    _name_tensor_dims(scale_dev, ["B", "H", "Lq", "D"])
+    _name_tensor_dims(acc_dev, ["B", "H", "Lq", "D"])
+
+    result = torch.compile(fn)(x_dev, scale_dev, acc_dev).cpu()
+    torch.testing.assert_close(result, ref, atol=0.01, rtol=0.1)
+
+
+def test_sum_reduce_with_explicit_zero_accumulator():
+    """Tiled sum with an explicit zeros accumulator (z += sum(a, dim=0))."""
+    from torch_spyre._inductor import spyre_hint
+
+    torch.manual_seed(0)
+    _pnd.reset()
+
+    A, B = 1024, 4096
+    a_t = torch.randn(A, B, dtype=torch.float16) * 0.01
+
+    def f(a):
+        z = torch.zeros(B, device=a.device, dtype=torch.float16)
+        with spyre_hint(num_tiles_per_dim={"A": 2}):
+            y = torch.sum(a, dim=0)
+            z += y
+        return z
+
+    ref = f(a_t)
+
+    a_dev = a_t.to("spyre")
+    _declare_tensor_dim("A", A)
+    _declare_tensor_dim("B", B)
+    _name_tensor_dims(a_dev, ["A", "B"])
+
+    result = torch.compile(f)(a_dev).cpu()
+    torch.testing.assert_close(result, ref, atol=0.01, rtol=0.1)
+
+
+def test_sum_reduce_implicit_accumulator():
+    """Tiled sum where the reduction output is returned directly (no explicit zero buffer)."""
+    from torch_spyre._inductor import spyre_hint
+
+    torch.manual_seed(0)
+    _pnd.reset()
+
+    A, B = 1024, 4096
+    a_t = torch.randn(A, B, dtype=torch.float16) * 0.01
+
+    def f_implicit(a):
+        with spyre_hint(num_tiles_per_dim={"A": 2}):
+            z = torch.sum(a, dim=0)
+        return z
+
+    ref = f_implicit(a_t)
+
+    a_dev = a_t.to("spyre")
+    _declare_tensor_dim("A", A)
+    _declare_tensor_dim("B", B)
+    _name_tensor_dims(a_dev, ["A", "B"])
+
+    result = torch.compile(f_implicit)(a_dev).cpu()
+    torch.testing.assert_close(result, ref, atol=0.01, rtol=0.1)
+
+
+@pytest.mark.xfail(
+    strict=False,
+    reason="zeros with named_dims hint acquires wrong layout in tiled scope",
+)
+def test_zeros_named_dims_hint_correctness():
+    """zeros with explicit named_dims hint inside a tiled scope should be correct.
+
+    CURRENT STATUS (to delete when reorder-passes-clean is merged)
+      - Passes on maim
+      - Fails on reorder-passes-clean
+    """
+    from torch_spyre._inductor import spyre_hint
+
+    torch.manual_seed(0)
+    _pnd.reset()
+
+    B, H, Lk, Lq = 1, 8, 256, 256
+    x_t = torch.randn(B, H, Lk, Lq, dtype=torch.float16)
+    cval_t = torch.randn(B, H, Lq, dtype=torch.float16)
+
+    def f(x, cval):
+        with spyre_hint(named_dims=["B", "H", "Lq"]):
+            denom_named = torch.zeros((B, H, Lq), device=x.device, dtype=torch.float16)
+        with spyre_hint(num_tiles_per_dim={"H": 4}):
+            corr = torch.exp(cval)
+            denom_likecval = torch.zeros_like(cval)
+            s_simple = x.sum(dim=-2)
+            s_named = denom_named * corr + x.sum(dim=-2)
+            s_likecval = denom_likecval * corr + x.sum(dim=-2)
+        return s_simple, s_named, s_likecval
+
+    ref_simple, ref_named, ref_likecval = f(x_t, cval_t)
+
+    xd = x_t.to("spyre")
+    cd = cval_t.to("spyre")
+    _declare_tensor_dim("B", B)
+    _declare_tensor_dim("H", H)
+    _declare_tensor_dim("Lk", Lk)
+    _declare_tensor_dim("Lq", Lq)
+    _name_tensor_dims(xd, ["B", "H", "Lk", "Lq"])
+    _name_tensor_dims(cd, ["B", "H", "Lq"])
+
+    got_simple, got_named, got_likecval = torch.compile(f)(xd, cd)
+
+    torch.testing.assert_close(got_simple.cpu(), ref_simple, atol=0.5, rtol=0.1)
+    # s_named is expected to fail — zeros with explicit named_dims hint is broken
+    torch.testing.assert_close(got_named.cpu(), ref_named, atol=0.5, rtol=0.1)
+    torch.testing.assert_close(got_likecval.cpu(), ref_likecval, atol=0.5, rtol=0.1)
 
 
 if __name__ == "__main__":

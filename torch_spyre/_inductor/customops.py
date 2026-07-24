@@ -244,15 +244,39 @@ def _(input: torch.Tensor):
 def copy_from_d2d(
     src: torch.Tensor,
     dst: torch.Tensor,
+    src_off: int,
+    dst_off: int,
     compiled,
 ) -> None:
-    return compiled(src, dst)
+    # src_off/dst_off are the src/dst storage_offsets, passed as explicit ints
+    # because a sliced tensor's offset is invisible to the compiled kernel
+    # otherwise: a graph input's storage_offset is dropped by Inductor (its
+    # FixedLayout.offset is 0 and SpyreTensorLayout has no offset field), so the
+    # kernel binds the storage BASE pointer and reads from element 0. The
+    # lowering (lower_spyre_from_d2d) consumes these ints to re-introduce the
+    # offsets in-graph via a ReinterpretView, putting them into the coordinate
+    # that superdsc bakes into the SDSC binary.
+    #
+    # specialize_int=True is required on top of that: dynamo's TENSOR_MATCH
+    # guard keys on dtype/device/size/stride but NOT storage_offset, and its
+    # default auto-dynamic promotes the offset int to a symbol after the second
+    # distinct value — a symbolic offset cannot be baked as a constant into the
+    # coordinate. specialize_int installs int-equality guards so each distinct
+    # offset triggers a fresh trace and a fresh SDSC binary with the offset
+    # baked as a constant. This mirrors the spyre.overwrite fix above (PR
+    # #2084). Patch is call-scoped to leave process-wide dynamo behavior alone.
+    # Note: one compiled binary per unique (input shape, offsets) tuple;
+    # dynamo's cache_size_limit is bumped to 1024 in torch_spyre/__init__.py.
+    with torch._dynamo.config.patch(specialize_int=True):
+        return compiled(src, dst, src_off, dst_off)
 
 
 @copy_from_d2d.register_fake
 def _(
     src: torch.Tensor,
     dst: torch.Tensor,
+    src_off: int,
+    dst_off: int,
 ) -> None:
     pass
 

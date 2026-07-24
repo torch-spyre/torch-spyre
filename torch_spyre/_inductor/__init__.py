@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2025-2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ import threading
 from functools import wraps
 
 from .propagate_hints import spyre_hint, get_op_hints, _reset_counter  # noqa: F401
+from torch_spyre.profiler._ffdc import CATEGORY_COMPILE, try_collect
 
 _autoload_lock = threading.Lock()
 
@@ -37,6 +38,9 @@ def enable_spyre_compile_fx_wrapper():
         if getattr(cfx, "_spyre_wrapped", False):
             return
         _orig = cfx.compile_fx
+        from torch_spyre._inductor.logging_utils import get_inductor_logger
+
+        logger = get_inductor_logger("compile_fx_wrapper")
 
         # Iterate over producer nodes (supports nested containers of nodes)
         def iter_nodes(x):
@@ -99,27 +103,33 @@ def enable_spyre_compile_fx_wrapper():
             decomps = kwargs.setdefault(
                 "decompositions", torch._inductor.decomposition.decompositions
             )
+            uses_spyre = _uses_spyre(gm, example_inputs)
 
-            if _uses_spyre(gm, example_inputs):
-                torch.spyre._impl._lazy_init()
+            try:
+                if uses_spyre:
+                    torch.spyre._impl._lazy_init()
 
-                with enable_spyre_context(
-                    example_inputs, decomps=decomps
-                ) as spyre_context_decompositions:
-                    # The `decomps` is the updated in the context manager
-                    # with the appropriate spyre decompositions
-                    # and yielded as `spyre_context_decompositions` from the CM
+                    with enable_spyre_context(
+                        example_inputs, decomps=decomps
+                    ) as spyre_context_decompositions:
+                        # The `decomps` is the updated in the context manager
+                        # with the appropriate spyre decompositions
+                        # and yielded as `spyre_context_decompositions` from the CM
 
-                    kwargs["decompositions"] = spyre_context_decompositions
+                        kwargs["decompositions"] = spyre_context_decompositions
+                        return _orig(
+                            gm,
+                            example_inputs,
+                            *args,
+                            **kwargs,
+                        )
 
-                    return _orig(
-                        gm,
-                        example_inputs,
-                        *args,
-                        **kwargs,
-                    )
-
-            return _orig(gm, example_inputs, *args, **kwargs)
+                # Non-Spyre graphs: no FFDC — avoids capturing unrelated CPU compiles.
+                return _orig(gm, example_inputs, *args, **kwargs)
+            except Exception as exc:
+                if uses_spyre:
+                    try_collect(exc, logger=logger, failure_category=CATEGORY_COMPILE)
+                raise
 
         # Reset the global counter after each
         # run to prevent recompilation
