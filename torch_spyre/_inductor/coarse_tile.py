@@ -55,6 +55,7 @@ sites depend on.
 from __future__ import annotations
 
 
+import dataclasses
 import logging
 from collections import Counter
 from typing import NamedTuple
@@ -1480,6 +1481,9 @@ def _propagate_tiled_op(
         op, loop_group_id, operations
     )
 
+    # Capture before either branch below overwrites op.layout.
+    old_stride = tuple(op.layout.stride)
+
     if has_inside or has_loop_internal_input:
         # Case 1: keep tiled op writing to small buffer; insert copy op.
         # Ops with a loop-internal real input must take this path even with
@@ -1532,7 +1536,8 @@ def _propagate_tiled_op(
 
     # Patch outside consumers and graph outputs to read full_buf.
     full_name = full_buf.get_name()
-    _patch_consumers(outside_consumers, buf_name, full_name, operations)
+    retile_info = _RetiledBufferInfo(old_stride, tuple(full_buf.layout.stride))
+    _patch_consumers(outside_consumers, buf_name, full_name, operations, retile_info)
     if is_graph_output:
         _patch_graph_outputs(buf_name, full_buf)
 
@@ -2020,6 +2025,8 @@ def _propagate_carry_op(
         # op's own buffer already spans the full extent, so it can carry
         # directly in accum_full with no per-tile scratch needed.
         op.layout = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(accum_full)))
+        # No stride change, so no consumer index rewrite needed.
+        retile_info = None
     else:
         per_tile_ranges = list(op.data.ranges)
         outer_key = op_loop_info.loop_group_id[0]
@@ -2236,8 +2243,11 @@ def _propagate_carry_op(
         # directly at all (e.g. buf17 reads buf13/buf16, neither of which is
         # the seed), so no inner_fn rewrite is needed here — only the layout
         # mutation.
+        # Capture before the mutation below overwrites op.layout.
+        old_stride = tuple(op.layout.stride)
         op.layout = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(accum_tile)))
         V.graph.name_to_buffer[op.get_name()] = op
+        retile_info = _RetiledBufferInfo(old_stride, tuple(accum_full.layout.stride))
 
         # The copy-out must run once per outer tile after the inner loop's
         # LAST iteration — i.e. after every op sharing op's own (full,
@@ -2273,7 +2283,7 @@ def _propagate_carry_op(
 
     buf_name = op.get_name()
     seed_name = accum_full.get_name()
-    _patch_consumers(outside_consumers, buf_name, seed_name, operations)
+    _patch_consumers(outside_consumers, buf_name, seed_name, operations, retile_info)
     if is_graph_output:
         _patch_graph_outputs(buf_name, accum_full)
 
@@ -2476,11 +2486,14 @@ def _insert_copy_op(
 ) -> None:
     """Insert a copy op after tiled_op that writes each tile into full_buf.
 
-    The copy op carries the same loop metadata as tiled_op so it executes
-    inside the same loop body.  Its layout is MutationLayoutSHOULDREMOVE
-    pointing at full_buf so store_output writes into full_buf.  Because
-    loop_tiled_dims is set, SpyreKernel stamps tiled_symbols on the OpSpec
-    and bundle.mlir emits affine.apply for the per-iteration output address.
+    The copy op carries the same loop metadata as tiled_op (so it executes
+    inside the same loop body) but its own freshly-derived
+    tile_advance_exprs/output_tile_advance_expr, since its reads/write don't
+    correspond positionally to tiled_op's. Its layout is
+    MutationLayoutSHOULDREMOVE pointing at full_buf so store_output writes
+    into full_buf; loop_tiled_dims being set makes SpyreKernel stamp
+    tiled_symbols on the OpSpec and bundle.mlir emit affine.apply for the
+    per-iteration output address.
     """
     copy_data = Pointwise(
         device=tiled_op.get_device(),
@@ -2498,8 +2511,36 @@ def _insert_copy_op(
     copy_buf.origins = tiled_op.origins
     copy_buf.operation_name = copy_name
 
-    # Stamp with the same loop metadata so this op is inside the same loop.
-    copy_buf.loop_info = tiled_op.loop_info  # type: ignore[attr-defined]
+    # Fresh tile_advance_exprs/output_tile_advance_expr from copy_buf's own
+    # reads/write (positionally different from tiled_op's). Use
+    # dataclasses.replace, not a shared/shallow-copied loop_info: a later
+    # pass (_zero_fixed_tile_advance_exprs) mutates these fields in place,
+    # and aliasing would leak those mutations onto copy_buf.
+    tiled_op_info = tiled_op.loop_info  # type: ignore[attr-defined]
+    tiled_dim_extents = {
+        d: copy_buf.data.ranges[d]
+        for level_dims in tiled_op_info.loop_tiled_dims
+        for d in level_dims
+    }
+    copy_reads = [
+        dep for dep in copy_buf.get_read_writes().reads if isinstance(dep, MemoryDep)
+    ]
+    copy_writes = [
+        dep for dep in copy_buf.get_read_writes().writes if isinstance(dep, MemoryDep)
+    ]
+    tile_advance_exprs = [
+        _tile_advance_expr_from_dep(dep, tiled_dim_extents) for dep in copy_reads
+    ]
+    output_tile_advance_expr = (
+        _tile_advance_expr_from_dep(copy_writes[0], tiled_dim_extents)
+        if copy_writes
+        else sympy.Integer(0)
+    )
+    copy_buf.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
+        tiled_op_info,
+        tile_advance_exprs=tile_advance_exprs,
+        output_tile_advance_expr=output_tile_advance_expr,
+    )
 
     V.graph.name_to_buffer[copy_name] = copy_buf
 
@@ -2964,7 +3005,10 @@ def _propagate_tiled_reduction_op(
         buf_name, loop_group_id, operations
     )
     accum_name = accum_full.get_name()
-    _patch_consumers(outside_consumers, buf_name, accum_name, operations)
+    retile_info = _RetiledBufferInfo(
+        tuple(op.layout.stride), tuple(accum_full.layout.stride)
+    )
+    _patch_consumers(outside_consumers, buf_name, accum_name, operations, retile_info)
     if is_graph_output:
         _patch_graph_outputs(buf_name, accum_full)
 
@@ -2989,11 +3033,19 @@ def _patch_consumers(
     old_name: str,
     new_name: str,
     operations: list[Operation],
+    retile_info: _RetiledBufferInfo | None = None,
 ) -> None:
     """Redirect outside consumers from old_name to new_name.
 
-    Patches each consumer's inner_fn via NameSwapHandler and reconstructs
-    the ComputedBuffer to invalidate the sizes cache.
+    Patches each consumer's inner_fn via NameSwapHandler (or
+    _NameAndIndexSwapHandler, when retile_info's old/new strides differ) and
+    reconstructs the ComputedBuffer to invalidate the sizes cache.
+
+    retile_info carries the old (tile-local) and new (full-size) strides of
+    the renamed buffer, needed whenever new_name isn't addressing-equivalent
+    to old_name (e.g. a coarse-tiled dim's stride scaled up for the full
+    buffer) — plain NameSwapHandler forwards the load index unmodified,
+    which computes wrong addresses when the strides differ.
     """
     if not consumers or old_name == new_name:
         return
@@ -3002,11 +3054,22 @@ def _patch_consumers(
     from .pass_utils import replace_computed_buffer_body
 
     name_map = {old_name: new_name}
+    rewrites = _stride_rewrite_map(retile_info) if retile_info is not None else {}
+
     for consumer in consumers:
         orig_inner = consumer.data.inner_fn
 
-        def new_inner_fn(*args, _map=name_map, _orig=orig_inner):
-            with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
+        def new_inner_fn(
+            *args,
+            _map=name_map,
+            _rewrites_by_old_name={old_name: rewrites} if rewrites else {},
+            _orig=orig_inner,
+        ):
+            if _rewrites_by_old_name:
+                handler = _NameAndIndexSwapHandler(V.ops, _map, _rewrites_by_old_name)
+            else:
+                handler = NameSwapHandler(V.ops, _map)
+            with V.set_ops_handler(handler):
                 return _orig(*args)
 
         object.__setattr__(consumer.data, "inner_fn", new_inner_fn)
@@ -3118,6 +3181,32 @@ class _RetileLoadIndexHandler(WrapperHandler):
                 name, index, self._rewrites_by_name[name]
             )
         return super().load(name, index)
+
+
+class _NameAndIndexSwapHandler(WrapperHandler):
+    """Redirect ops.load(name, index) to a new name and rewrite its index.
+
+    Rewrites index while `name` is still the old name (its coefficients are
+    in the old buffer's strides), then swaps the name. Reuses
+    _retile_load_index_from_strides.
+    """
+
+    def __init__(
+        self,
+        inner,
+        name_map: dict[str, str],
+        rewrites_by_old_name: dict[str, dict[Expr, Expr]],
+    ):
+        super().__init__(inner)
+        self._name_map = name_map
+        self._rewrites_by_old_name = rewrites_by_old_name
+
+    def load(self, name, index):
+        if name in self._rewrites_by_old_name:
+            index = _retile_load_index_from_strides(
+                name, index, self._rewrites_by_old_name[name]
+            )
+        return super().load(self._name_map.get(name, name), index)
 
 
 def _should_patch_retiled_load_indexes(
