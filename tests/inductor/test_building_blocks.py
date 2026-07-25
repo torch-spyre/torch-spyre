@@ -15,6 +15,7 @@
 import dataclasses
 import math
 import unittest
+from unittest import mock
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -319,6 +320,50 @@ class TestBuildingBlocks(unittest.TestCase):
 
         cpu_result = fn(x_cpu)
         torch.testing.assert_close(spyre_result.cpu(), cpu_result, atol=1e-3, rtol=1e-3)
+
+    def test_tiled_symbol_trip_counts_populated_via_compile(self):
+        """OpSpec.tiled_symbol_trip_counts reflects each tiled symbol's own
+        loop trip count after a real coarse-tiled compilation.
+        """
+        from torch_spyre._inductor import spyre_kernel, spyre_hint as sh
+
+        T, D = 128, 64
+        x_cpu = torch.randn(T, D, dtype=torch.float16)
+
+        # Named dims must be set on the device tensor so propagation can map
+        # the hint's "T" name to the loop variable at compile time.
+        x_dev = x_cpu.to("spyre")
+        _pnd.declare_tensor_dim("T", T)
+        _pnd.declare_tensor_dim("D", D)
+        _pnd.name_tensor_dims(x_dev, ["T", "D"])
+
+        def fn(x):
+            with sh(num_tiles_per_dim={"T": 2}):
+                return x + x
+
+        captured_op_specs = []
+        original_create_op_spec = spyre_kernel.SpyreKernel.create_op_spec
+
+        def _capturing_create_op_spec(self, *args, **kwargs):
+            op_spec = original_create_op_spec(self, *args, **kwargs)
+            captured_op_specs.append(op_spec)
+            return op_spec
+
+        with mock.patch.object(
+            spyre_kernel.SpyreKernel,
+            "create_op_spec",
+            _capturing_create_op_spec,
+        ):
+            compiled = torch.compile(fn)
+            compiled(x_dev)
+
+        tiled_specs = [s for s in captured_op_specs if s.tiled_symbols]
+        self.assertTrue(tiled_specs, "expected at least one tiled OpSpec")
+        op_spec = tiled_specs[0]
+        tiled_syms = {s for level in op_spec.tiled_symbols for s in level}
+        self.assertTrue(tiled_syms.issubset(op_spec.tiled_symbol_trip_counts.keys()))
+        for sym in tiled_syms:
+            self.assertEqual(op_spec.tiled_symbol_trip_counts[sym], 2)
 
 
 def test_tensor_arg_has_tile_advance_fields():

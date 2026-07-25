@@ -874,6 +874,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # host_to_it and n_output_it_syms call int() on data.ranges entries,
         # which throws on symbolic dimensions.  They are only needed when this
         # op is inside a tiling loop, so skip the computation for non-tiled ops.
+        tiled_symbol_trip_counts: dict = {}
         tiled_syms: list[list] = []
         if n_levels > 0:
             # Build host-range-index → iteration-space-key-index map by walking
@@ -902,6 +903,8 @@ class SpyreKernel(Kernel[CSEVariable]):
                 if int(r) != 1
             )
 
+            loop_count = li.loop_count if li is not None else []
+
             tiled_syms_per_level_outermost: list[list] = []
             for lvl in range(n_levels):
                 level_syms: list = []
@@ -916,6 +919,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                         if sym_idx < len(it_space_keys):
                             level_syms.append(it_space_keys[sym_idx])
                 tiled_syms_per_level_outermost.append(level_syms)
+                if lvl < len(loop_count):
+                    trip_count = int(loop_count[lvl])
+                    for sym in level_syms:
+                        tiled_symbol_trip_counts[sym] = trip_count
             # Reverse so index 0 = innermost level.
             tiled_syms = list(reversed(tiled_syms_per_level_outermost))
 
@@ -975,6 +982,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             args,
             op_info,
             tiled_symbols=tiled_syms,
+            tiled_symbol_trip_counts=tiled_symbol_trip_counts,
             symbolic_dim_bounds=symbolic_dim_bounds,
             debug_handle=debug_handle,
         )

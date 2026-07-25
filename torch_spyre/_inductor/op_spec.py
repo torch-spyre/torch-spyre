@@ -172,6 +172,15 @@ class OpSpec:
             The bundle path (compile_op_spec / generate_sdsc) reverses this list to
             outermost-first and builds per-level affine.apply stride maps, mapping
             each level's strides to the correct loop variable by explicit index.
+        tiled_symbol_trip_counts: Maps each symbol appearing in tiled_symbols
+            to its own nesting level's trip count (CoarseTileInfo.loop_count
+            for that level). Used by SDSC codegen to compute each tiled
+            tensor's full pre-tiling extent as
+            (per-unit-step device element advance) * trip_count, without
+            needing a separately tracked full-extent field on TensorArg.
+            Only correct when a symbol belongs to exactly one nesting level
+            (see docs/superpowers/specs/2026-07-25-device-tile-advance-codegen-design.md
+            for the scope decision) -- empty for non-tiled ops.
     """
 
     op: str
@@ -180,6 +189,9 @@ class OpSpec:
     args: Sequence[TensorArg]
     op_info: dict[str, Any]
     tiled_symbols: list[list[Symbol]] = dataclasses.field(default_factory=list)
+    tiled_symbol_trip_counts: dict[Symbol, int] = dataclasses.field(
+        default_factory=dict
+    )
     # Maps PyTorch symbol name (e.g. 's97') -> (max, granularity) bounds.
     # Populated by compute_symbolic_bounds during
     # create_op_spec; empty for concrete dims.
