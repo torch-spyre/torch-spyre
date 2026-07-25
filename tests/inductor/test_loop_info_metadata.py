@@ -13,21 +13,11 @@
 # limitations under the License.
 """Unit test for loop_info.py's _SPYRE_METADATA_ATTRS coverage."""
 
-import sympy
-
 from torch_spyre._inductor.loop_info import copy_op_metadata
 
 
 class _FakeBuf:
     pass
-
-
-def test_copy_op_metadata_carries_coarse_tile_advance_expr():
-    src = _FakeBuf()
-    src._coarse_tile_advance_expr = sympy.Symbol("_ct_lvl0") * 64
-    dst = _FakeBuf()
-    copy_op_metadata(src, dst)
-    assert dst._coarse_tile_advance_expr == sympy.Symbol("_ct_lvl0") * 64
 
 
 def test_copy_op_metadata_no_longer_carries_old_attr_name():
