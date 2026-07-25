@@ -3594,7 +3594,8 @@ def _apply_fill_name_swap(
                 return _orig(*args)
 
         object.__setattr__(op.data, "inner_fn", new_inner_fn)
-        replace_computed_buffer_body(op, op.data, operations)
+        new_op = replace_computed_buffer_body(op, op.data, operations)
+        V.graph.name_to_buffer[new_op.get_name()] = new_op
 
 
 def _is_constant_fill(op: ComputedBuffer) -> bool:
