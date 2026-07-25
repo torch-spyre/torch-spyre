@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+import math
 import pytest
 import unittest
 import torch
@@ -4732,6 +4732,56 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             b[tiny_value_mask] = FP16_EPS
 
         self.compare_with_cpu(op, a, b)
+
+    def test_binary_op_stick_crossing_last_dim(self):
+        """A pointwise binary op whose stick (last) dim spans multiple sticks
+        with an extent coprime with the committed core split must stay
+        bit-exact.
+
+        When the stick dim occupies S>1 sticks and the outer dims are too small
+        to absorb the core split, work division splits the stick dim across S
+        cores. If the element count N is coprime with S (e.g. N=67 over S=2
+        sticks, or N=130 over S=3), the iteration-space realignment used to
+        re-intersect that split against N instead of S and collapse it to a
+        single core -- the layout the backend then miscompiled, corrupting
+        every element past the first stick.
+        """
+
+        # neg keeps both add operands LX-resident: the collapsed single-core
+        # layout only misaddresses the second stick when its operands come from
+        # LX (single per-core base). Feeding the add plain graph inputs would
+        # keep them in HBM, whose per-core addressing masks the bug even when
+        # the split still collapses.
+        def fn(x, y):
+            return torch.neg(x) + torch.neg(y)
+
+        # Last dim > 64 and coprime with the core split; outer dims kept small
+        # so work division divides the stick dim, not the outer.
+        shapes = [
+            (67,),  # 1D, 2 sticks, odd -> gcd(2,67)=1
+            (127,),  # 1D, 2 sticks, odd
+            (130,),  # 1D, 3 sticks, gcd(3,130)=1
+            (193,),  # 1D, 4 sticks, gcd(4,193)=1
+            (3, 67),  # 2D, stick dim split across cores
+            (4, 193),  # 2D, 4-stick coprime last dim
+            (2, 3, 67),  # 3D
+            (3, 5, 127),  # 3D
+            (2, 3, 2, 127),  # 4D
+        ]
+
+        for shape in shapes:
+            with self.subTest(shape=shape):
+                n = math.prod(shape)
+                # Distinct exact-fp16 integer patterns so a per-element
+                # permutation or a dropped trailing stick shows up as a value
+                # mismatch rather than washing out.
+                x = (torch.arange(n) % 251).to(torch.float16).reshape(shape)
+                y = ((torch.arange(n) + 100) % 251).to(torch.float16).reshape(shape)
+
+                result = torch.compile(fn, dynamic=False)(
+                    x.to("spyre"), y.to("spyre")
+                ).cpu()
+                torch.testing.assert_close(result, fn(x, y))
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_binary_op_cpu(self, op, x, y):

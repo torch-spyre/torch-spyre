@@ -32,6 +32,7 @@ test_suite_config:
           mode: xfail
         - names:
             - LxPlanning.*::test_(pointwise|sqrt|rsqrt|log_|alias_operands|cmp|logical_not|bool|eq_scalar|scalar_(comparison|multidim|vs_tensor)_base|scalar_comparison_simple1|eq_scalar_constant_int).*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_binary_op_stick_crossing_last_dim_lx_planning_(pointwise|reduction)
           mode: mandatory_success
           tags:
             - ops__inductor-pointwise
