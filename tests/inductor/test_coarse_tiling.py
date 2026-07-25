@@ -2068,6 +2068,12 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
     def test_tiled_tensor_affine_strides_correct(self):
         s = Symbol("s")
         sdsc_spec = _make_sdsc_spec(s, iter_range=64, device_stride=128)
+        # _make_sdsc_spec predates device_tile_advance_expr and never sets it,
+        # so generate_sdsc's `if arg.device_tile_advance_expr is not None`
+        # guard (compute_ops.py) is never entered unless we set it here.
+        # coeff(s) == 128 matches device_stride=128's semantics: tile_size =
+        # int(coeff) * arg_elem_bytes = 128 * 2 == the stride asserted below.
+        sdsc_spec.args[0].device_tile_advance_expr = 128 * s
         symbols: list[int] = []
         _, _, affine_strides, _ = generate_sdsc(
             0,
@@ -2079,6 +2085,23 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
         )
         # affine_strides[tensor_idx] is list[dict] (per level, outermost first).
         # With one tiling level, affine_strides[0] = [{s: stride}].
+        self.assertEqual(len(affine_strides), 1)
+        self.assertIn(s, affine_strides[0][0])
+        self.assertEqual(affine_strides[0][0][s], 128 * 2)
+
+    def test_tiled_tensor_affine_strides_correct_via_device_tile_advance_expr(self):
+        s = Symbol("s")
+        sdsc_spec = _make_sdsc_spec(s, iter_range=64, device_stride=128)
+        sdsc_spec.args[0].device_tile_advance_expr = 128 * s
+        symbols: list[int] = []
+        _, _, affine_strides, _ = generate_sdsc(
+            0,
+            sdsc_spec,
+            symbols,
+            symbol_id_offset=0,
+            tiled_symbols=[[s]],
+            use_symbols=True,
+        )
         self.assertEqual(len(affine_strides), 1)
         self.assertIn(s, affine_strides[0][0])
         self.assertEqual(affine_strides[0][0][s], 128 * 2)
@@ -2224,6 +2247,21 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
         c1 = Symbol("c1")
         c2 = Symbol("c2")
         fp16 = _FP16
+        # compile_op_spec (superdsc.parse_op_spec) renames the 3 iteration-space
+        # symbols, in insertion order, to INPUT_DIM_LABELS[:2] + OUTPUT_DIM_LABELS[:1]
+        # == ["mb", "x", "out"] for a 3-dim non-matmul op (constants.py). i.e.
+        # c0 -> mb, c1 -> x, c2 -> out. generate_sdsc's per-level affine-stride
+        # loop looks up device_tile_advance_expr.coeff(s) using these *renamed*
+        # symbols (it receives tiled_symbols already translated through
+        # symbol_mapping), so device_tile_advance_expr must be expressed in the
+        # renamed space here to produce nonzero strides through this call path.
+        mb = Symbol("mb")
+        x = Symbol("x")
+        # device-element-offset expression for a C-contiguous [2, 4, 64] device
+        # layout: offset = mb*(4*64) + x*64 + out. Only the tiled dims (mb, x)
+        # need nonzero coefficients here since device_tile_advance_expr.coeff(s)
+        # is only consulted for symbols in op_spec.tiled_symbols (translated).
+        tile_advance_expr = 4 * 64 * mb + 64 * x
         tensor_in = TensorArg(
             is_input=True,
             arg_index=0,
@@ -2231,6 +2269,7 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
             device_size=[2, 4, 64],
             device_coordinates=[c0, c1, c2],
             allocation={"hbm": 0x1000},
+            device_tile_advance_expr=tile_advance_expr,
         )
         tensor_out = TensorArg(
             is_input=False,
@@ -2239,6 +2278,7 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
             device_size=[2, 4, 64],
             device_coordinates=[c0, c1, c2],
             allocation={"hbm": 0x2000},
+            device_tile_advance_expr=tile_advance_expr,
         )
         return OpSpec(
             op="add",
@@ -2251,6 +2291,10 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
             args=[tensor_in, tensor_out],
             op_info={},
             tiled_symbols=[[c0, c1]],
+            # Trip counts for the tiled symbols, taken from iteration_space above
+            # (c0's range is 2, c1's range is 4). Used by _create_sdsc_tensors /
+            # generate_sdsc to compute each tiled tensor's full pre-tiling extent.
+            tiled_symbol_trip_counts={c0: 2, c1: 4},
         )
 
     def test_two_tiled_symbols_produce_two_stride_entries(self):
@@ -2278,6 +2322,24 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
             for level_strides in per_level:
                 for sym, stride in level_strides.items():
                     self.assertGreater(stride, 0)
+
+    def test_two_tiled_symbols_strides_match_device_tile_advance_expr(self):
+        # Direct before/after value check: the fixture's device_tile_advance_expr
+        # is 4*64*mb + 64*x elements for a C-contiguous [2, 4, 64] device layout,
+        # so with fp16 (2 bytes/elem) the expected byte strides are
+        # mb -> 4*64*2 == 512 and x -> 64*2 == 128, for both tensors' single
+        # tiling level.
+        op_spec = self._make_3d_op_spec()
+        symbols: list[int] = []
+        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        mb = Symbol("mb")
+        x = Symbol("x")
+        self.assertEqual(len(affine_strides), 2)
+        for per_level in affine_strides:
+            self.assertEqual(len(per_level), 1)
+            level_strides = per_level[0]
+            self.assertEqual(level_strides.get(mb), 512)
+            self.assertEqual(level_strides.get(x), 128)
 
 
 class TestCompileOpSpecSymbolMapping(unittest.TestCase):
@@ -2791,6 +2853,68 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
             "\t\t\t%addr_0 = affine.apply #map_0(%i_0)[%sym_1]\n"
             '\t\t\tsdscbundle.sdsc_execute (%addr_0) {sdsc_filename="sdsc_0.json",'
             ' "symbol_ids"=[-1]}\n'
+            "\t\t}\n"
+            "\t\treturn\n"
+            "\t}\n"
+            "}\n"
+        )
+        self.assertEqual(mlir, expected)
+
+    def test_tiled_snapshot_via_device_tile_advance_expr(self):
+        # Same MLIR shape as test_tiled_snapshot above, but exercises the real
+        # (unmocked) compile_op_spec -> _create_sdsc_tensors -> generate_sdsc
+        # pipeline via device_tile_advance_expr + tiled_symbol_trip_counts,
+        # instead of stubbing compile_op_spec's return value directly.
+        #
+        # compile_op_spec (superdsc.parse_op_spec) renames the sole
+        # iteration-space symbol c0 to OUTPUT_DIM_LABELS[0] == "out" for this
+        # 1-dim non-matmul op (constants.py), so device_tile_advance_expr must
+        # be expressed in terms of "out" (see
+        # TestCompileOpSpecTwoTiledSymbols._make_3d_op_spec for the same
+        # renaming rule with a worked multi-dim example). device_size=[2, 64]
+        # with device_coordinates=[0, c0] and a device_tile_advance_expr of
+        # 64*out (elements) gives a byte stride of 64*2 == 128 at fp16.
+        c0 = Symbol("c0")
+        out = Symbol("out")
+        tensor_in = TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=_FP16,
+            device_size=[2, 64],
+            device_coordinates=[Integer(0), c0],
+            allocation={"hbm": 0x1000},
+            device_tile_advance_expr=64 * out,
+        )
+        op = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={c0: (Integer(128), 1)},
+            args=[tensor_in],
+            op_info={},
+            tiled_symbols=[[c0]],
+            tiled_symbol_trip_counts={c0: 128},
+        )
+        loop = LoopSpec(count=Integer(4), body=[op])
+        generate_bundle("test_kernel", self.tmpdir, [loop], use_symbols=True)
+        mlir = _read_mlir(self.tmpdir)
+
+        expected = (
+            "#map_0 = affine_map<(d0)[s0] -> (s0 + 128*d0)>\n"
+            "module {\n"
+            "\tfunc.func @sdsc_bundle(%arg_0_base_addr: "
+            "!sdscbundle.input_arg<index>) {\n"
+            "\t\t%arg_0 = sdscbundle.input_arg_extract value from "
+            "%arg_0_base_addr : !sdscbundle.input_arg<index> -> index\n"
+            "\t\t%c0 = arith.constant 0 : index\n"
+            "\t\t%c1 = arith.constant 1 : index\n"
+            "\t\t%loop_bound_0 = arith.constant 4 : index\n"
+            "\t\t%arg_0_slice_offset_4096 = arith.constant 4096 : index\n"
+            "\t\t%arg_0_slice_4096 = arith.addi %arg_0, "
+            "%arg_0_slice_offset_4096 : index\n"
+            "\t\tscf.for %i_0 = %c0 to %loop_bound_0 step %c1 {\n"
+            "\t\t\t%addr_0 = affine.apply #map_0(%i_0)[%arg_0_slice_4096]\n"
+            '\t\t\tsdscbundle.sdsc_execute (%addr_0) {sdsc_filename="sdsc_0.json",'
+            ' "symbol_ids"=[-2]}\n'
             "\t\t}\n"
             "\t\treturn\n"
             "\t}\n"
