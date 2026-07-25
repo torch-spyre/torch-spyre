@@ -24,7 +24,7 @@ Covers six areas, each in its own class group:
      (TestHelpers, TestBuildLoopSchedulerNodes, TestTiledSymsForSchedNode,
       TestSpyreFuseNodesLoopFusion)
   4. generate_sdsc and compile_op_spec symbol/affine-stride paths
-     (TestTiledByteStride, TestGenerateSdscTiledSymbols,
+     (TestGenerateSdscTiledSymbols,
       TestCompileOpSpecTwoTiledSymbols, TestCompileOpSpecSymbolMapping)
   5. generate_bundle MLIR output: loop structure, affine maps, symbol constants
      (TestGenerateBundleMlir, TestFindUnimplemented,
@@ -56,10 +56,7 @@ from torch.utils._ordered_set import OrderedSet
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.codegen.bundle import generate_bundle
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
-from torch_spyre._inductor.codegen.compute_ops import (
-    _tiled_byte_stride,
-    generate_sdsc,
-)
+from torch_spyre._inductor.codegen.compute_ops import generate_sdsc
 from torch_spyre._inductor.codegen.superdsc import (
     SDSCArgs,
     SDSCSpec,
@@ -2065,59 +2062,6 @@ class TestSpyreFuseNodesLoopFusion(unittest.TestCase):
 # ===========================================================================
 # 4. generate_sdsc and compile_op_spec — symbol/affine-stride paths
 # ===========================================================================
-
-
-class TestTiledByteStride(unittest.TestCase):
-    def test_fp16_one_core(self):
-        s = Symbol("s")
-        tensor = SDSCArgs(
-            layout="A",
-            dim_order=[s],
-            data_format=_FP16,
-            scales={s: 1},
-            strides={s: 128},
-            offsets={s: 0},
-            max_dim_sizes={s: -1},
-            allocation={"hbm": 0},
-            start_address=0,
-            backGap={},
-        )
-        stride = _tiled_byte_stride(tensor, s)
-        self.assertEqual(stride, 128 * 2)
-
-    def test_fp16_larger_stride(self):
-        s = Symbol("s")
-        tensor = SDSCArgs(
-            layout="A",
-            dim_order=[s],
-            data_format=_FP16,
-            scales={s: 1},
-            strides={s: 512},
-            offsets={s: 0},
-            max_dim_sizes={s: -1},
-            allocation={"hbm": 0},
-            start_address=0,
-            backGap={},
-        )
-        stride = _tiled_byte_stride(tensor, s)
-        self.assertEqual(stride, 512 * 2)
-
-    def test_stride_one(self):
-        s = Symbol("s")
-        tensor = SDSCArgs(
-            layout="A",
-            dim_order=[s],
-            data_format=_FP16,
-            scales={s: 1},
-            strides={s: 1},
-            offsets={s: 0},
-            max_dim_sizes={s: -1},
-            allocation={"hbm": 0},
-            start_address=0,
-            backGap={},
-        )
-        stride = _tiled_byte_stride(tensor, s)
-        self.assertEqual(stride, 1 * 2)
 
 
 class TestGenerateSdscTiledSymbols(unittest.TestCase):

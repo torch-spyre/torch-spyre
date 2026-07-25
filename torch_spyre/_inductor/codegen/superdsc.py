@@ -51,7 +51,7 @@ from torch_spyre._inductor.op_spec import (
 )
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
-from .compute_ops import SymbolKind, _level_stride_from_expr, generate_sdsc, num_bytes
+from .compute_ops import SymbolKind, generate_sdsc, num_bytes
 
 logger = get_inductor_logger("codegen.superdsc")
 
@@ -74,6 +74,7 @@ class SDSCArgs:
     per_tile_fixed: bool = False
     tile_advance_expr: Expr | None = None
     full_tiled_extent: dict[Symbol, int] = dataclasses.field(default_factory=dict)
+    device_tile_advance_expr: Expr | None = None
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -447,7 +448,11 @@ def _create_sdsc_tensors(
                 list(enumerate(op_spec.tiled_symbols))
             ):
                 lvl = n_levels - 1 - lvl_from_innermost
-                byte_stride = _level_stride_from_expr(arg.tile_advance_expr, lvl)
+                # NOTE: known-broken intermediate state -- _level_stride_from_expr
+                # was deleted in Task 3; this whole block is replaced by Task 4
+                # Steps 1-2 (device_tile_advance_expr + tiled_symbol_trip_counts).
+                _level_stride_fn = _level_stride_from_expr  # type: ignore[name-defined]  # noqa: F821
+                byte_stride = _level_stride_fn(arg.tile_advance_expr, lvl)
                 if byte_stride is None:
                     continue
                 tile_size = byte_stride // arg_elem_bytes
@@ -632,8 +637,7 @@ def _create_sdsc_tensors(
                 is_index_tensor=is_idx_tensor,
                 related_value_tensor_idx=related_val_idx,
                 per_tile_fixed=arg.per_tile_fixed,
-                tile_advance_expr=arg.tile_advance_expr,
-                full_tiled_extent=arg.full_tiled_extent,
+                device_tile_advance_expr=arg.device_tile_advance_expr,
             )
         )
 

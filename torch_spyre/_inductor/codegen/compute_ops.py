@@ -15,7 +15,6 @@
 
 import dataclasses
 
-import sympy
 from torch_spyre._C import encode_constant, DataFormats
 from torch_spyre._inductor.errors import Unsupported
 from sympy import Symbol
@@ -411,36 +410,6 @@ def _per_core_symbolic_dim_info(symbolic_dims: dict, work_slices: dict) -> dict:
     return info
 
 
-def _tiled_byte_stride(tensor, tiled_sym) -> int:
-    """Byte stride per loop iteration for a single tiled dimension.
-
-    ``tensor.strides[tiled_sym]`` is already the per-tile element stride
-    (``_create_sdsc_tensors`` receives the per-tile iteration space, since
-    ``coarse_tile.py`` has already divided the op ranges by ``loop_count``
-    before ``create_op_spec`` runs).  Multiplying by bytes-per-element
-    gives the correct per-iteration byte advance for the ``affine.apply``
-    in the ``scf.for`` loop body.
-    """
-    return int(tensor.strides[tiled_sym] * num_bytes(tensor.data_format))
-
-
-def _level_stride_from_expr(expr, level_idx: int) -> int | None:
-    """Extract nesting-level ``level_idx``'s coefficient from ``expr``.
-
-    ``expr`` is a sympy.Expr with one term per nesting level,
-    ``Symbol(f"_ct_lvl{lvl}") * device_stride`` summed (see
-    ``TensorArg.tile_advance_expr``). Returns ``None`` when ``expr`` is
-    ``None`` or has no term for ``level_idx`` (that level is not part of
-    this op's coarse-tiled advance).
-    """
-    if expr is None:
-        return None
-    sym = Symbol(f"_ct_lvl{level_idx}")
-    if sym not in expr.free_symbols:
-        return None
-    return int(sympy.Poly(expr, sym).coeff_monomial(sym))
-
-
 def _find_index_tensor_for_value(sdsc_spec, value_tensor_idx: int) -> int:
     """Find the index of the index tensor that references the given value tensor.
 
@@ -546,21 +515,13 @@ def generate_sdsc(
     IDs in the JSON and their values appended to ``symbols``, enabling
     ``affine.apply`` address computation in ``bundle.mlir`` for tiled loops.
 
-    ``tensor.tile_advance_expr``: each tensor's own ``sympy.Expr | None``, one
-    term per nesting level (``Symbol(f"_ct_lvl{lvl}") * device_stride``,
-    summed). Only relevant for a symbol tiled at *more than one* nesting
-    level (e.g. a flattened 1-D tensor tiled by two independent coarse-tiling
-    hints that both land on the same host dim) -- for such a symbol,
-    ``tensor.strides[sym]`` is a single flat value that already matches the
-    *innermost* overridden level's tile_size, but cannot also represent an
-    outer level's larger advance. For a symbol tiled at only one level,
-    ``tensor.strides[sym]`` (via ``_tiled_byte_stride``) is already exactly
-    right and the expression's coefficient for that level is not consulted.
-    For a multi-level symbol, each level's coefficient is read directly out
-    of ``tensor.tile_advance_expr`` via ``_level_stride_from_expr`` -- no
-    ratio-scaling arithmetic needed. Each tensor supplies its own expression
-    (derived from its own device layout), not one shared value for the whole
-    op -- see the per-arg-tile-advance design doc.
+    ``tensor.device_tile_advance_expr``: each tensor's own device-element-
+    offset ``sympy.Expr | None``, symbolic in the real Inductor iteration
+    symbols. For a symbol tiled at exactly one nesting level (the only case
+    this function handles correctly -- see
+    docs/superpowers/specs/2026-07-25-device-tile-advance-codegen-design.md),
+    ``expr.coeff(sym)`` is that level's byte stride once multiplied by
+    ``num_bytes(tensor.data_format)``.
     """
     # tiled_symbols is list[list[Symbol]], outermost-first per nesting level.
     if tiled_symbols is None:
@@ -825,21 +786,6 @@ def generate_sdsc(
             per_level_strides: list[dict] = []
             any_tiled = False
             if not tensor.per_tile_fixed:
-                # A symbol tiled at only one level needs no correction:
-                # _tiled_byte_stride's tensor.strides[s] lookup is already
-                # exactly right there. Only a symbol tiled at *multiple*
-                # levels needs help, since tensor.strides[s] is one flat
-                # value and can't distinguish one level's advance from
-                # another's. For such a symbol, read that level's advance
-                # coefficient directly out of tile_advance_expr via
-                # _level_stride_from_expr.
-                levels_per_symbol: dict = {}
-                for level_idx, level_syms in enumerate(tiled_symbols):
-                    for s in level_syms:
-                        levels_per_symbol.setdefault(s, []).append(level_idx)
-                multi_level_syms = {
-                    s for s, levels in levels_per_symbol.items() if len(levels) > 1
-                }
                 for level_idx, level_syms in enumerate(tiled_symbols):
                     tensor_tiled_at_level = [
                         s
@@ -848,16 +794,12 @@ def generate_sdsc(
                     ]
                     strides_for_level: dict = {}
                     for s in tensor_tiled_at_level:
-                        level_stride = None
-                        if s in multi_level_syms:
-                            level_stride = _level_stride_from_expr(
-                                tensor.tile_advance_expr, level_idx
-                            )
-                        strides_for_level[s] = (
-                            level_stride
-                            if level_stride is not None
-                            else _tiled_byte_stride(tensor, s)
+                        coeff = (
+                            tensor.device_tile_advance_expr.coeff(s)
+                            if tensor.device_tile_advance_expr is not None
+                            else 0
                         )
+                        strides_for_level[s] = int(coeff) * nb
                         any_tiled = True
                     per_level_strides.append(strides_for_level)
             else:
