@@ -72,8 +72,6 @@ class SDSCArgs:
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
     per_tile_fixed: bool = False
-    tile_advance_expr: Expr | None = None
-    full_tiled_extent: dict[Symbol, int] = dataclasses.field(default_factory=dict)
     device_tile_advance_expr: Expr | None = None
 
     def __str__(self) -> str:
@@ -441,32 +439,19 @@ def _create_sdsc_tensors(
         # tile_size; the full extent is that tile_size times every level's
         # supertile_count for that dim.
         sdsc_dim_advance: dict[Symbol, tuple[int, int]] = {}
-        if arg.tile_advance_expr is not None:
-            n_levels = len(op_spec.tiled_symbols)
+        if arg.device_tile_advance_expr is not None:
             arg_elem_bytes = num_bytes(arg.device_dtype)
-            for lvl_from_innermost, level_syms in reversed(
-                list(enumerate(op_spec.tiled_symbols))
-            ):
-                lvl = n_levels - 1 - lvl_from_innermost
-                # NOTE: known-broken intermediate state -- _level_stride_from_expr
-                # was deleted in Task 3; this whole block is replaced by Task 4
-                # Steps 1-2 (device_tile_advance_expr + tiled_symbol_trip_counts).
-                _level_stride_fn = _level_stride_from_expr  # type: ignore[name-defined]  # noqa: F821
-                byte_stride = _level_stride_fn(arg.tile_advance_expr, lvl)
-                if byte_stride is None:
-                    continue
-                tile_size = byte_stride // arg_elem_bytes
+            for level_syms in op_spec.tiled_symbols:
                 for sym in level_syms:
                     if sym not in symbol_mapping:
                         continue
+                    coeff = arg.device_tile_advance_expr.coeff(sym)
+                    if not coeff:
+                        continue
+                    tile_size = int(coeff) * arg_elem_bytes
+                    trip_count = op_spec.tiled_symbol_trip_counts.get(sym, 1)
                     sdsc_sym = symbol_mapping[sym]
-                    full_extent = arg.full_tiled_extent.get(sym)
-                    supertile_count = (
-                        full_extent // tile_size
-                        if full_extent is not None and tile_size
-                        else 1
-                    )
-                    sdsc_dim_advance[sdsc_sym] = (tile_size, supertile_count)
+                    sdsc_dim_advance[sdsc_sym] = (tile_size, trip_count)
 
         scales: dict = {}
         strides: dict = {}
