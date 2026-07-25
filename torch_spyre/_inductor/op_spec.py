@@ -116,22 +116,13 @@ class TensorArg:
         device_coordinates: The sympy Exprs that describe how elements in the Tensor are accessed.
                 Free variables in device_coordinates refer to entries in the OpSpec's iteration_space.
         allocation: If present, the offset in scratchpad memory assigned to the Tensor.
-        tile_advance_expr: This arg's own device-byte-stride sympy.Expr for a Case 2
-            (MutationLayoutSHOULDREMOVE) op's coarse-tiled dims' per-iteration base-address
-            advance, derived from this arg's own device_coordinates (not shared across args).
-            One term per nesting level, summed: ``sum(Symbol(f"_ct_lvl{lvl}") * device_stride[lvl]
-            for lvl in tiled_levels)``. ``None`` for args without this metadata.
-        full_tiled_extent: This arg's own full (untiled) element extent of each coarse-tiled
-            dim, keyed by the same Inductor symbol as OpSpec.iteration_space. Empty for args
-            without coarse-tiled dims.
         device_tile_advance_expr: This arg's own device-*element*-offset sympy.Expr for one
             unit step of each tiled Inductor iteration symbol (d0, d1, ...), derived from
             CoarseTileInfo.tile_advance_exprs / output_tile_advance_expr (host-element-offset,
             unconditional across every tiled op/Case) via
             views.tiling_expr_to_device_expr, using this arg's own device_size/stride_map.
-            A parallel, more general mechanism to tile_advance_expr above (which is
-            device-byte, Case-2/MutationLayoutSHOULDREMOVE-only, and _ct_lvl{n}-keyed) --
-            it does not replace it. ``None`` for ops without loop_info/coarse tiling.
+            This is the sole tile-advance mechanism. ``None`` for ops without
+            loop_info/coarse tiling.
     """
 
     is_input: bool
@@ -142,8 +133,6 @@ class TensorArg:
     allocation: Any
     per_tile_fixed: bool = False
     name: str | None = None
-    tile_advance_expr: Expr | None = None
-    full_tiled_extent: dict[Symbol, int] = dataclasses.field(default_factory=dict)
     device_tile_advance_expr: Expr | None = None
 
 

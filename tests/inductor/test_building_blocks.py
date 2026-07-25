@@ -366,19 +366,12 @@ class TestBuildingBlocks(unittest.TestCase):
             self.assertEqual(op_spec.tiled_symbol_trip_counts[sym], 2)
 
 
-def test_tensor_arg_has_tile_advance_fields():
+def test_tensor_arg_has_no_tile_advance_fields():
     from torch_spyre._inductor.op_spec import TensorArg
 
-    arg = TensorArg(
-        is_input=True,
-        arg_index=0,
-        device_dtype=None,
-        device_size=[4],
-        device_coordinates=[],
-        allocation={},
-    )
-    assert arg.tile_advance_expr is None
-    assert arg.full_tiled_extent == {}
+    field_names = {f.name for f in dataclasses.fields(TensorArg)}
+    assert "tile_advance_expr" not in field_names
+    assert "full_tiled_extent" not in field_names
 
 
 def test_op_spec_has_no_tile_advance_fields():

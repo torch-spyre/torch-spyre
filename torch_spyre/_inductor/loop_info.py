@@ -65,9 +65,7 @@ class CoarseTileInfo:
         once a later compilation stage substitutes a concrete tile-index
         value for each ``d{i}``.  ``sympy.Integer(0)`` means that input
         does not advance (broadcast, or none of its dims are ever tiled).
-        This is a parallel, more general mechanism to
-        ``_coarse_tile_advance_expr`` (unconditional, host-element-offset,
-        dim-indexed) -- it does not replace it.
+        This is the sole tile-advance mechanism.
     output_tile_advance_expr:
         The analogous single ``Expr`` for this op's own output/write side,
         derived the same way from this op's pre-division write
@@ -102,11 +100,6 @@ _SPYRE_METADATA_ATTRS = (
     # coarse_tile._propagate_tiled_reduction_op, read by finalize_layouts in
     # insert_restickify.py to overwrite accum_full's generic layout.
     "_tiled_reduction_accum_name",
-    # Host-stride sympy.Expr for a Case 2 (MutationLayoutSHOULDREMOVE) op's
-    # coarse-tiled dims' per-iteration base-address advance; set by
-    # coarse_tile._propagate_tiled_op, read by spyre_kernel.create_op_spec to
-    # drive each arg's own TensorArg.tile_advance_expr.
-    "_coarse_tile_advance_expr",
 )
 
 
