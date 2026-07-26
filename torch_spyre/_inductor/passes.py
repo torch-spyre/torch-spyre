@@ -43,7 +43,7 @@ from .temp_passes import (
     mark_direct_unit_bmm_pass,
     mm_to_bmm_pass,
 )
-from .coarse_tile import (
+from .wsr.coarse_tile import (
     hints_to_coarse_tile_groups,
     reorder_unhinted_interlopers,
     span_overflow_groups,
@@ -54,7 +54,7 @@ from .propagate_hints import (
     collect_spyre_hints,
     recover_spyre_hints,
 )
-from .propagate_named_dims import propagate_named_dims, assign_dim_hints
+from .wsr.propagate_named_dims import propagate_named_dims, assign_dim_hints
 from .propagate_layouts import (
     propagate_mutation_layouts,
     propagate_spyre_tensor_layouts,
@@ -80,7 +80,7 @@ from .scheduler import build_loop_scheduler_nodes
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
-from .coarse_tile import coarse_tile
+from .wsr.coarse_tile import coarse_tile
 from .split_multi_ops import split_multi_ops, validate_ops
 
 
