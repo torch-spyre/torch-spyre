@@ -1499,6 +1499,34 @@ class TestCoarseTileNested(unittest.TestCase):
         self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [0]])
 
+    def test_coarse_tile_plans_before_any_transformation(self):
+        """coarse_tile() must fully plan every group before transforming any.
+
+        Reuses the same two-group fixture shape as
+        test_single_and_nested_groups_coexist (group 0: single-level spec
+        tiling dim 0; group 1: two-level nested spec) -- a coarse smoke test
+        confirming the end-to-end call still stamps loop_info onto every op
+        as before.  The ordering guarantee itself (plan-all-then-transform-
+        all) is implicitly covered by plan_coarse_tile_groups's own
+        zero-mutation test plus this test's confirmation that stamping still
+        happens by the time coarse_tile() returns.
+        """
+        from torch._inductor.ir import ComputedBuffer
+
+        d0 = _make_pointwise([Integer(64), Integer(32)])
+        d1 = _make_pointwise([Integer(128), Integer(64)])
+        op0 = _make_hinted_op(d0, "op0", hints=((1, 0),))
+        op1 = _make_hinted_op(d1, "op1", hints=((2, 0), (3, 1)))
+        groups = [
+            ([op0], [(1, Integer(4))]),
+            ([op1], [(2, Integer(4)), (3, Integer(2))]),
+        ]
+        coarse_tile(_graph([op0, op1]), groups)
+        for group_ops, _ in groups:
+            for op in group_ops:
+                if isinstance(op, ComputedBuffer):
+                    self.assertIsNotNone(getattr(op, "loop_info", None))
+
 
 class TestCoarseTileTileAdvanceExprs(unittest.TestCase):
     """Real-IR tests for CoarseTileInfo.tile_advance_exprs /

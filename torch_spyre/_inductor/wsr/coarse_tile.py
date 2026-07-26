@@ -192,19 +192,85 @@ def _clear_cache(obj: object, key: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _apply_plan(
+    ops: list[Operation],
+    stamped_group_id: tuple[int, ...],
+    levels: list[tuple],
+    op_to_position: dict[str, int],
+    plan: dict[int, CoarseTileInfo],
+) -> dict[str, _RetiledBufferInfo]:
+    """Apply planning's decisions: divide ranges and stamp loop_info.
+
+    This is transformation's mutation step, replacing _stamp_group. All
+    decisions (which dims/reduction levels are tiled, tile_advance_exprs)
+    already exist in `plan` (keyed by id(op) -- Operation/ComputedBuffer are
+    unhashable, see plan_coarse_tile_groups) -- this function only performs
+    the IR mutation _divide_ranges/_divide_reduction_ranges and the
+    loop_info attribute assignment, using the plan's values instead of
+    recomputing them.
+
+    `stamped_group_id` is the caller's own group_id (with group_idx_offset
+    and trailing per-level zeros already applied) -- it is NOT the same
+    value plan_coarse_tile_groups used internally to compute each
+    CoarseTileInfo.loop_group_id (that numbering starts at 0 and has no
+    offset). This function overwrites loop_group_id with the caller's real
+    value via dataclasses.replace before stamping, so the offset is never
+    lost. Every other field of `info` is planning's decision, unchanged.
+    """
+    if not ops:
+        return {}
+
+    _validate_contiguous(ops, op_to_position, stamped_group_id)
+
+    retiled_infos: dict[str, _RetiledBufferInfo] = {}
+    for op in ops:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        info = plan.get(id(op))
+        if info is None:
+            continue
+
+        for level_idx, (_, count) in enumerate(levels):
+            opos_list = info.loop_tiled_dims[level_idx]
+            rpos_list = info.loop_tiled_reduction_dims[level_idx]
+            retiled_info = _divide_ranges(op, count, opos_list)
+            if retiled_info is not None:
+                name = op.get_name()
+                prior = retiled_infos.get(name)
+                retiled_infos[name] = (
+                    _RetiledBufferInfo(prior.old_stride, retiled_info.new_stride)
+                    if prior is not None
+                    else retiled_info
+                )
+            if isinstance(op.data, Reduction):
+                _divide_reduction_ranges(op, count, rpos_list)
+
+        op.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
+            info, loop_group_id=stamped_group_id
+        )
+
+        logger.debug(
+            "coarse_tile: applied plan for %s loop_group_id=%s",
+            op.get_operation_name(),
+            stamped_group_id,
+        )
+
+    return retiled_infos
+
+
 def coarse_tile(
     graph: GraphLowering,
     groups: list[tuple],
     group_idx_offset: int = 0,
 ) -> None:
-    """Stamp loop_group_id / loop_count on operations and scale their ranges.
+    """Plan then transform: stamp loop_group_id / loop_count and scale ranges.
 
     Parameters
     ----------
     operations:
         The full ordered list of IR operations (as seen by
-        CustomPreSchedulingPasses).  Modified in-place when
-        insert_tiling_propagation inserts new buffer/copy ops.
+        CustomPreSchedulingPasses).  Modified in-place when the
+        transformation phase inserts new buffer/copy ops.
     groups:
         Sequence of ``(ops, levels)`` tuples produced by
         ``hints_to_coarse_tile_groups``.  ``levels`` is a list of
@@ -216,30 +282,37 @@ def coarse_tile(
         earlier call (e.g. hint-driven groups stamped pre-stickification).
     """
     operations = graph.operations
+
+    # Planning: decide every op's tiling attributes with zero mutation.
+    # If any op needs carry propagation or requests disabled reduction
+    # tiling, this raises Unsupported before any transformation runs.
+    # plan_coarse_tile_groups numbers groups starting at 0 internally, but
+    # only uses that numbering to build each op's nested loop_group_id
+    # shape (group_id + trailing zeros) -- it never compares group_id
+    # values across calls, so an un-offset numbering here is safe. The
+    # *real* group_id stamped onto ops (with group_idx_offset applied) is
+    # recomputed below in the transformation loop and overwrites
+    # info.loop_group_id via _apply_plan before it's ever read back out.
+    plan = plan_coarse_tile_groups(operations, groups)
+
+    # Transformation: apply the plan. Only reached if planning didn't raise.
     op_to_position: dict[str, int] = {
         op.get_operation_name(): i for i, op in enumerate(operations)
     }
-
     retiled_infos_by_group: list[
         tuple[tuple[int, ...], list[Operation], dict[str, _RetiledBufferInfo]]
     ] = []
     for group_idx, (group_ops, levels) in enumerate(groups, start=group_idx_offset):
         group_id: tuple[int, ...] = (group_idx,)
-        # Phase 1: create tile-sized fills and insert them before the group.
-        # Returns name_map without patching group ops (patching is deferred to
-        # phase 2 so replace_computed_buffer_body runs after _stamp_group and
-        # therefore copies the already-stamped loop_info onto the new object).
         name_map = _replace_constant_fill_predecessors(
             group_ops, levels, operations, group_id
         )
-        # Rebuild op_to_position after potential insertions from fill replacement.
         op_to_position = {op.get_operation_name(): i for i, op in enumerate(operations)}
-        retiled_infos = _stamp_group(group_ops, group_id, levels, op_to_position)
-        # Phase 2: patch group ops to read tile-sized fills.  Done after
-        # _stamp_group so loop_info is already present on each op when
-        # replace_computed_buffer_body copies metadata to the reconstructed object.
-        _apply_fill_name_swap(group_ops, name_map, operations)
         stamped_group_id = group_id + (0,) * (len(levels) - 1)
+        retiled_infos = _apply_plan(
+            group_ops, stamped_group_id, levels, op_to_position, plan
+        )
+        _apply_fill_name_swap(group_ops, name_map, operations)
         retiled_infos_by_group.append((stamped_group_id, group_ops, retiled_infos))
 
     insert_tiling_propagation(operations, groups)
