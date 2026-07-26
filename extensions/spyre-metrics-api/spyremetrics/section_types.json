@@ -1,12 +1,12 @@
 {
     "copyright" : "Copyright 2026 The Torch-Spyre Authors.",
-    "lisence" : "SPDX-License-Identifier: Apache-2.0",
+    "license" : "SPDX-License-Identifier: Apache-2.0",
     "version" : "1.0.0.1",
     "section_type": [
         { "name": "invalid",      "id": "0x0000", "long_name": "Invalid section ID" },
         { "name": "host_metrics", "id": "0x0001", "long_name": "Host resource usage" },
         { "name": "runtime",      "id": "0x0010", "long_name": "Runtime metrics" },
-        { "name": "perf_counter", "id": "0x0020", "long_name": "Performanc counters" }
+        { "name": "perf_counter", "id": "0x0020", "long_name": "Performance counters" }
     ],
     "metric_type": [
         { "section": "invalid",      "name": "invalid",  "id": "0x0000", "type": "invalid", "summarizer": "invalid", "long_name": "Invalid data type ID" },
@@ -15,11 +15,11 @@
         { "section": "host_metrics", "name": "hostmem",  "id": "0x0002", "type": "int", "summarizer": "avg",   "long_name": "Host memory utilization" },
         { "section": "host_metrics", "name": "hstrxnet", "id": "0x0003", "type": "KiB", "summarizer": "sum",   "long_name": "Host network receive" },
         { "section": "host_metrics", "name": "hsttxnet", "id": "0x0004", "type": "KiB", "summarizer": "sum",   "long_name": "Host network send" },
-        { "section": "host_metrics", "name": "hstrdblk", "id": "0x0005", "type": "KiB", "summarizer": "sum",   "long_name": "Host block storate read" },
-        { "section": "host_metrics", "name": "hstwrblk", "id": "0x0006", "type": "KiB", "summarizer": "sum",   "long_name": "Host block storate write" },
+        { "section": "host_metrics", "name": "hstrdblk", "id": "0x0005", "type": "KiB", "summarizer": "sum",   "long_name": "Host block storage read" },
+        { "section": "host_metrics", "name": "hstwrblk", "id": "0x0006", "type": "KiB", "summarizer": "sum",   "long_name": "Host block storage write" },
 
         { "section": "perf_counter", "name": "pwr",      "id": "0x0010", "type": "fdec1", "summarizer": "first", "long_name": "Power consumption" },
-        { "section": "perf_counter", "name": "tempr",    "id": "0x0011", "type": "fdec1", "summarizer": "max",   "long_name": "Device temperatrure" },
+        { "section": "perf_counter", "name": "tempr",    "id": "0x0011", "type": "fdec1", "summarizer": "max",   "long_name": "Device temperature" },
         { "section": "perf_counter", "name": "rdmem",    "id": "0x0012", "type": "KiB",   "summarizer": "sum",   "long_name": "Device memory read" },
         { "section": "perf_counter", "name": "wrmem",    "id": "0x0013", "type": "KiB",   "summarizer": "sum",   "long_name": "Device memory write" },
         { "section": "perf_counter", "name": "rxpci",    "id": "0x0014", "type": "KiB",   "summarizer": "sum",   "long_name": "Host-to-device read" },
@@ -43,7 +43,7 @@
         { "name": "invalid", "id": "0x0000", "long_name": "Invalid summarizer" },
         { "name": "first",   "id": "0x0001", "long_name": "Take the first element of a data array" },
         { "name": "last",    "id": "0x0002", "long_name": "Take the last element of a data array" },
-        { "name": "sum",     "id": "0x0011", "long_name": "Accumurate values in a data array" },
+        { "name": "sum",     "id": "0x0011", "long_name": "Accumulate values in a data array" },
         { "name": "avg",     "id": "0x0012", "long_name": "Calculate an average of values in a data array" },
         { "name": "max",     "id": "0x0013", "long_name": "Pick the maximum element in a data array" }
     ]

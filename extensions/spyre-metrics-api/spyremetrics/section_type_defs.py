@@ -107,7 +107,7 @@ class ValueType:
                 object.__setattr__(self, "python_type", float)
                 object.__setattr__(self, "scale", 0.1)
             case _:
-                raise ValueError(f"Unexpected vlue_type name: {self.name}")
+                raise ValueError(f"Unexpected value_type name: {self.name}")
 
     def adjust(self, data) -> int | float:
         return data * self.scale

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-Load definitions of section and data types either from generaged Python code or JSON file.
+Load definitions of section and data types either from generated Python code or JSON file.
 """
 
 import json
@@ -80,7 +80,7 @@ def _load_section_types(
                 break  # Use the first available config file
             except json.JSONDecodeError as e:
                 print(
-                    f"ERROR: Failed to load secton type config file: {str(abs_path)}\n  MSG: {e.msg}",
+                    f"ERROR: Failed to load section type config file: {str(abs_path)}\n  MSG: {e.msg}",
                     file=sys.stderr,
                 )
                 if ignore_json_error:
@@ -149,7 +149,7 @@ Try to import generated map of SectionType etc. objects
 try:
     from .generated_section_types import (
         VERSION,
-        ## Singleton objetcts are added in the global map in generated_section_types.py
+        ## Singleton objects are added in the global map in generated_section_types.py
     )
 
     _config_version = VERSION
@@ -163,7 +163,7 @@ except (ImportError, ValueError) as e:
 
     if isinstance(e, ValueError):
         print(
-            "Warning: Error occured while loading the pre-converted config file.",
+            "Warning: Error occurred while loading the pre-converted config file.",
             file=sys.stderr,
         )
         ## print_tb(e.__traceback__, file=sys.stderr)

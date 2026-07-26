@@ -21,8 +21,8 @@ File format (64bit aligned):
 - Last update time (64bit)
 - Reserved (64bit)
 - Section size table:
-  - Type ID of Section #0 (32bit) + Size of Sectio #0 (32bit)
-  - Type ID of Section #1 (32bit) + Size of Sectio #1 (32bit)
+  - Type ID of Section #0 (32bit) + Size of Section #0 (32bit)
+  - Type ID of Section #1 (32bit) + Size of Section #1 (32bit)
   - ...
 - Section header and contents of Section #0
 - Section header and contents of Section #1
@@ -119,7 +119,7 @@ class MetricFileFormat(IntEnum):
 class MetricFetcher:
     """
     Each instance is responsible to fetch read metric data of a given type from a metric file.
-    It holds the offset from the beginning of the file, so that it can directry load the data
+    It holds the offset from the beginning of the file, so that it can directory load the data
     without walking through the file and section headers.
     """
 
@@ -172,7 +172,7 @@ class HostMetricFetcher(MetricFetcher):
 @dataclass
 class SectionHeader:
     """
-    Data class for the fixed-part of section header structure, i.e., section header except data tabel.
+    Data class for the fixed-part of section header structure, i.e., section header except data table.
 
     Use a static method try_parse_header() to create an instance from the section header in a metric file.
     """
@@ -287,7 +287,7 @@ class MetricSection:
         Register a list of MetricFetcher objects to read data from this section.
         Unneeded data types will be skipped if filter is set.
 
-        Default is all avialable data types in this section.
+        Default is all available data types in this section.
         """
         f_list: list[MetricFetcher] = []
         index = self._data_start_index
@@ -392,7 +392,7 @@ class MetricSection:
 @dataclass
 class FileHeader:
     """
-    Data class for the fixed-part of file header structure, i.e., section header except section tabel.
+    Data class for the fixed-part of file header structure, i.e., section header except section table.
 
     Use a static method try_parse_header() to create an instance from the contents of a metric file.
     """
@@ -492,7 +492,7 @@ class FileHeader:
 
     @classmethod
     def init_null_header(cls):
-        """Initalizer of static variables, as Python data classes cannot define static initalizaers."""
+        """Initializer of static variables, as Python data classes cannot define static initializers."""
         cls.null_file_header = FileHeader(
             file_format=MetricFileFormat.UNKNOWN,
             version=[0, 0, 0, 0],
@@ -525,7 +525,7 @@ class MetricFile:
     This is the main class of spyremetrics API.
 
     Iterators:
-    - read_metrics: Read all avialable metric data, or the set of data filtered by set_filters().
+    - read_metrics: Read all available metric data, or the set of data filtered by set_filters().
     - metric_types: Enlist MetricDataType objects that will be read from a metric file.
     - sections:     Iterate through sections in this metric file.
 
@@ -534,7 +534,7 @@ class MetricFile:
     - metric_file_format: NEW or OLD if the metric file exists, or UNKNOWN if not created yet.
     - is_old_format:      True if the file format is OLD. Note that False is returned if format is UNKNOWN.
     - path:               pathlib.Path object of the metric file.
-    - nsections:          Number of sections in the metric file. Note that generated host_metric section is not inclouded.
+    - nsections:          Number of sections in the metric file. Note that generated host_metric section is not included.
     - version:            Version numbers as a 4-entry list of uint8_t: [ major, minor, mod, fix ].
     """
 
@@ -574,7 +574,7 @@ class MetricFile:
             filters:         List of metric data type to filter out other metrics. The list element can be metric name
                              in string, metric type ID, or MetricDataType object.
         Keyword-only Args:
-            local_host_metrics: True if cliet allows this API to insert host_metrics pseudo section if it is not in
+            local_host_metrics: True if client allows this API to insert host_metrics pseudo section if it is not in
                                 the metric file. The data of host_metrics pseudo section are measured in by this API,
                                 not in the workload process.
             new_format_only:    True if MetricFile does not handle a metric file in the old format
@@ -728,7 +728,7 @@ class MetricFile:
         Register a list of metric data types that are interested in the program using this API.
         This can be an optimization to filter out unneeded metric data types.
 
-        Default is all avialable data types in the metric file.
+        Default is all available data types in the metric file.
         """
         self._filters = MetricDataType.normalize(filters)
         self._metric_fetchers = self._collect_fetchers()
@@ -758,7 +758,7 @@ class MetricFile:
 
     @property
     def nsections(self) -> int:
-        """Number of sections in the metric file. Note that generated host_metric section is not inclouded."""
+        """Number of sections in the metric file. Note that generated host_metric section is not included."""
         self._ensure_metric_file()
         return len(self._sections)
 
@@ -773,14 +773,14 @@ class MetricFile:
         Enlist MetricDataType objects that will be read from a metric file.
 
         Yields:
-            MetricDataType supported by the current metric fileter.
+            MetricDataType supported by the current metric file.
         """
         self._ensure_metric_file()
         yield from [f.data_type for f in self._metric_fetchers]
 
     def read_metrics(self) -> Iterable[tuple[MetricDataType, int | float]]:
         """
-        Read all avialable metric data, or the set of data filtered by set_filters().
+        Read all available metric data, or the set of data filtered by set_filters().
 
         Yields:
             A pair of MetricDataType and the data read from the metric file.
@@ -800,7 +800,7 @@ class MetricFile:
             if failedImportForOldFormat:
                 return  # Finish generator with not data
 
-            # Old format: Use libaiusmi.so to read it
+            # Old format: Use libaiumonitor.so to read it
             try:
                 from .old_metric_file import read_old_metrics
 
@@ -835,7 +835,7 @@ class MetricFile:
         local_host_metrics: bool = False,
         new_format_only: bool = False,
     ) -> list["MetricFile"]:
-        """A factory method to create MetricFile, with expaning "%BUSID" magic keyword. Since "%BUSID" can be expanded to
+        """A factory method to create MetricFile, with expanding "%BUSID" magic keyword. Since "%BUSID" can be expanded to
         multiple device IDs, this method returns a list of MetricFile objects.
 
         Args:
@@ -843,7 +843,7 @@ class MetricFile:
             filters:         List of metric data type to filter out other metrics. The list element can be metric name in string,
                              metric type ID, or MetricDataType object.
         Keyword-only Args:
-            local_host_metrics: True if cliet allows this API to insert host_metrics pseudo section if it is not in the metric file
+            local_host_metrics: True if client allows this API to insert host_metrics pseudo section if it is not in the metric file
                                 The data of host_metrics pseudo section are measured in by this API, not in the workload process.
             new_format_only:    True if MetricFile does not handle a metric file in the old format
         """

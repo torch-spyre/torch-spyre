@@ -29,7 +29,7 @@ try:
         SummarizerType,
         ValueType,
         VERSION,
-        ## Singleton objetcts are added in the global map in generated_section_types.py
+        ## Singleton objects are added in the global map in generated_section_types.py
     )
 
     config_version = VERSION
@@ -57,7 +57,7 @@ except ImportError as e:
 
         print("Loaded type definitions from JSON config", file=sys.stderr)  # For debug
     except Exception as e:
-        print(f"ERROR: Excetion is thrown: {str(e)}", file=sys.stderr)
+        print(f"ERROR: Exception is thrown: {str(e)}", file=sys.stderr)
         print_tb(e.__traceback__, file=sys.stderr)
         sys.exit(1)
 

@@ -81,12 +81,16 @@ readme = {file = ["README.rst", "USAGE.rst"]}
 
 [tool.ruff]
 line-length = 88
-# Always exclude "extensions" to isolate torch-spyre and extension projects
+# Always exclude "extensions" to isolate torch-spyre and extension projects.
+# Enable pre-commit checks for each of sub-projects by modify GitHub workflow settings to
+# run the check explicitly when the sub-project is ready.
 exclude = ["extensions"]
 
 [tool.mypy]
 ignore_missing_imports = true
-# Always exclude "extensions" to isolate torch-spyre and extension projects
+# Always exclude "extensions" to isolate torch-spyre and extension projects.
+# Enable pre-commit checks for each of sub-projects by modify GitHub workflow settings to
+# run the check explicitly when the sub-project is ready.
 exclude=["tests/inductor", "extensions"]
 
 [[tool.mypy.overrides]]
