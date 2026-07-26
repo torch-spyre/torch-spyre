@@ -3812,6 +3812,32 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
             consumers, _ = _find_outside_consumers("op0", (0,), [tiled, other_group])
         self.assertEqual(consumers, [other_group])
 
+    def test_carry_propagation_functions_removed(self):
+        """_carry_terminal_op/_propagate_carry_op are deleted.
+
+        _seed_buffer_for_carry is deliberately NOT checked here: it remains
+        live, called from plan_coarse_tile_groups (Task 3) as the
+        carry-detection predicate behind its Unsupported raise — only the
+        transformation-time carry mechanism (_carry_terminal_op,
+        _propagate_carry_op, and _propagate_tiled_op's carry-trigger branch
+        that called all three) is dead code and removed by this task.
+        """
+        import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_module
+
+        for name in (
+            "_carry_terminal_op",
+            "_propagate_carry_op",
+        ):
+            self.assertFalse(
+                hasattr(coarse_tile_module, name),
+                f"{name} should have been deleted",
+            )
+        self.assertTrue(
+            hasattr(coarse_tile_module, "_seed_buffer_for_carry"),
+            "_seed_buffer_for_carry must stay defined -- plan_coarse_tile_groups "
+            "still calls it as its carry-detection predicate",
+        )
+
 
 def _make_tiled_reduction_op(
     name,

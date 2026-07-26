@@ -354,25 +354,13 @@ def insert_tiling_propagation(
     In both cases the existing tiled_symbols / affine.apply machinery in
     SpyreKernel and bundle.py handles the per-iteration address offset.
     """
-    # A carry dispatch (see _propagate_tiled_op's loop-invariant branch) fully
-    # rewrites its terminal op as a side effect of processing the entry op —
-    # e.g. processing buf13 (entry) also rewires buf17 (terminal) to own
-    # accum_tile's storage and redirects buf17's outside consumers to
-    # accum_full. buf17 is itself a later member of group_ops and would
-    # otherwise be visited again at its own position, re-running Case 1/2
-    # logic on top of the already-correct carry rewrite and clobbering it
-    # (e.g. re-patching outside consumers to a second, wrong full buffer).
-    # Track terminal names claimed by a carry dispatch and skip them here.
-    carry_terminal_names: set[str] = set()
     for group_ops, _ in groups:
         for idx, op in enumerate(group_ops):
             if not isinstance(op, ComputedBuffer):
                 continue
             if not isinstance(op.data, (Pointwise, Reduction)):
                 continue
-            if op.get_name() in carry_terminal_names:
-                continue
-            _propagate_tiled_op(op, operations, carry_terminal_names)
+            _propagate_tiled_op(op, operations)
             # _propagate_tiled_op (and the Case 1/2/carry rewrites it may
             # delegate to) can replace op with a new ComputedBuffer object
             # spliced into `operations` under the same name (see
@@ -527,15 +515,8 @@ def _tile_advance_expr_from_dep(
 def _propagate_tiled_op(
     op: ComputedBuffer,
     operations: list[Operation],
-    carry_terminal_names: set[str] | None = None,
 ) -> None:
-    """Handle buffer propagation for a single tiled Pointwise or Reduction op.
-
-    carry_terminal_names, when provided, is populated with the name of any
-    op's carry terminal_op found during dispatch — see the comment in
-    insert_tiling_propagation's driver loop for why the driver must not
-    re-process an op already claimed this way.
-    """
+    """Handle buffer propagation for a single tiled Pointwise or Reduction op."""
     loop_info = getattr(op, "loop_info", None)
 
     # A tiled op — Pointwise or Reduction, loop-internal or not — may read a
@@ -568,50 +549,6 @@ def _propagate_tiled_op(
     outside_consumers, is_graph_output = _find_outside_consumers(
         buf_name, loop_group_id, operations
     )
-
-    # A Pointwise op that is loop-invariant at the group's reduction-tiled
-    # level(s) may be an online-softmax-style sequential carry (running max,
-    # rescale-accumulate) even though it is genuinely tiled at other, outer,
-    # non-reduction levels (e.g. H) — check that shape first.
-    if _is_loop_invariant_at_reduction_levels_stamped(op, loop_group_id, operations):
-        seed_buf = _seed_buffer_for_carry(op, loop_group_id, operations)
-        if seed_buf is not None:
-            # op reads the seed directly, but the traced Python's actual
-            # recurrence value may be one or more ops further downstream
-            # (e.g. `denominator = denominator * correction +
-            # exp_scores.sum(...)` — op is the multiply, the add is the
-            # real per-iteration carry value). Find that terminal op before
-            # computing outside_consumers/is_graph_output and dispatching:
-            # those must describe the terminal value, not op's own
-            # (possibly partial) one, since the terminal op — not op — is
-            # what accum_tile must hold and what outside readers/graph
-            # outputs actually mean by the recurrence variable.
-            terminal_op = _carry_terminal_op(
-                op, seed_buf.get_name(), loop_group_id, operations
-            )
-            if terminal_op is not None:
-                terminal_name = terminal_op.get_name()
-                terminal_outside_consumers, terminal_is_graph_output = (
-                    _find_outside_consumers(terminal_name, loop_group_id, operations)
-                )
-                _propagate_carry_op(
-                    op,
-                    terminal_op,
-                    seed_buf,
-                    terminal_outside_consumers,
-                    terminal_is_graph_output,
-                    operations,
-                )
-                # terminal_op (e.g. buf17) is fully rewired above as a side
-                # effect of processing op (e.g. buf13/entry_op) — it must not
-                # be independently re-processed when the driver later reaches
-                # its own position in group_ops (see insert_tiling_propagation).
-                if carry_terminal_names is not None:
-                    carry_terminal_names.add(terminal_name)
-                return
-        # Not a carry (e.g. a genuinely shared read-only broadcast input at
-        # the reduction level) — fall through to the loop-invariant/Case 1/2
-        # logic below using the op's actual loop_tiled_dims.
 
     # If no dims were tiled (loop_tiled_dims all empty), the op is loop-invariant.
     if all(not dims for dims in loop_info.loop_tiled_dims):
@@ -890,20 +827,6 @@ def _group_reduction_tiled_levels(
     return levels
 
 
-def _is_loop_invariant_at_reduction_levels_stamped(
-    op: ComputedBuffer, loop_group_id: tuple, operations: list[Operation]
-) -> bool:
-    """Post-stamp equivalent of _is_loop_invariant_at_reduction_levels, using
-    already-stamped loop_info instead of raw dim_hints."""
-    loop_info = getattr(op, "loop_info", None)
-    if loop_info is None or not isinstance(op.data, Pointwise):
-        return False
-    levels = _group_reduction_tiled_levels(loop_group_id, operations)
-    if not levels:
-        return False
-    return all(not loop_info.loop_tiled_dims[i] for i in levels)
-
-
 def _group_reduction_tiled_levels_in_group(
     group_ops: list[Operation],
     levels: list[tuple],
@@ -944,10 +867,9 @@ def _plan_is_loop_invariant_at_reduction_levels(
     group_reduction_tiled_levels: set[int],
 ) -> bool:
     """True if op is loop-invariant at every level where some Reduction op
-    in the same group tiles a reduction dim -- planning-time equivalent of
-    _is_loop_invariant_at_reduction_levels_stamped, using the group's
-    own ops (already available during planning) instead of a flat-list
-    post-stamp scan."""
+    in the same group tiles a reduction dim -- planning-time check using the
+    group's own ops (already available during planning) instead of a
+    flat-list post-stamp scan."""
     if not isinstance(op.data, Pointwise):
         return False
     if not group_reduction_tiled_levels:
@@ -1049,8 +971,8 @@ def _seed_buffer_for_carry(
          closures with more than one externally-fed member (not hit by any
          current test).
 
-    Caller (_propagate_tiled_op) is responsible for the shape gate
-    (_is_loop_invariant_at_reduction_levels_stamped); this function only
+    Caller (plan_coarse_tile_groups) is responsible for the shape gate
+    (_plan_is_loop_invariant_at_reduction_levels); this function only
     checks the seed-buffer data-flow shape.
     """
     if not isinstance(op.data, Pointwise):
@@ -1099,411 +1021,6 @@ def _seed_buffer_for_carry(
         return None
 
     return seed_buf if external_candidates[0] == op.get_name() else None
-
-
-def _carry_terminal_op(
-    entry_op: ComputedBuffer,
-    seed_name: str,
-    loop_group_id: tuple,
-    operations: list[Operation],
-) -> ComputedBuffer | None:
-    """Walk forward from entry_op to the op whose value is the new carry.
-
-    entry_op reads the seed directly (e.g. `denominator * correction`), but
-    the traced Python's recurrence value is often one or more ops further
-    downstream — e.g. `denominator = denominator * correction +
-    exp_scores.sum(...)` chains a second op (the add) that combines
-    entry_op's result with a fresh, externally-derived value. That add has
-    no direct read of the seed, so it is not itself in the seed's closure
-    (_seed_closure is deliberately non-transitive — see its docstring) and
-    _seed_buffer_for_carry never considers it as `op`. Its RESULT, not
-    entry_op's, is what must be written into accum_tile and carried to the
-    next outer-tile iteration / copied out at the end.
-
-    The terminal op is found by following chain-link steps forward from
-    entry_op. At each step, in-group consumers of `current` are filtered
-    down to "chain candidates": Pointwise ops, loop-invariant at the
-    reduction level (same shape family as current), that do NOT themselves
-    read seed_name directly. Consumers failing this filter are downstream
-    USES of current's value, not further links in the update chain, and are
-    simply not followed — current may have any number of them without
-    making the search ambiguous. Examples: `correction = exp(M -
-    max_running)` reads M directly, so it is filtered out as a sibling, not
-    a chain link; `scores - max_running.unsqueeze(-2)` is tiled at the
-    reduction level (unlike max_running itself), so it is filtered out by
-    the shape gate. The walk stops (returning `current`) as soon as zero
-    chain candidates remain. Returns entry_op unchanged if entry_op itself
-    has no chain-candidate consumers (M's case: `max_running = maximum(M,
-    block_max)` is itself the terminal value). Returns None if the chain is
-    ambiguous (a step has more than one chain-candidate consumer) rather
-    than guessing.
-    """
-    outer_key = loop_group_id[0]
-    current = entry_op
-    while True:
-        in_group_consumers = [
-            o
-            for o in operations
-            if isinstance(o, ComputedBuffer)
-            and (li := getattr(o, "loop_info", None)) is not None
-            and li.loop_group_id[0] == outer_key
-            and current.get_name() in _op_reads(o)
-        ]
-        # Consumers that read the seed directly (siblings, e.g. `correction
-        # = exp(M - max_running)`) or that aren't loop-invariant at the
-        # reduction level (e.g. `scores - max_running.unsqueeze(-2)`, tiled
-        # over Lk) are downstream USES of current's value, not further links
-        # in the update chain — current may have any number of these; they
-        # don't make the terminal-op search ambiguous and are simply not
-        # followed.
-        chain_candidates = [
-            o
-            for o in in_group_consumers
-            if seed_name not in _op_reads(o)
-            and isinstance(o.data, Pointwise)
-            and _is_loop_invariant_at_reduction_levels_stamped(
-                o, loop_group_id, operations
-            )
-        ]
-        if not chain_candidates:
-            return current
-        if len(chain_candidates) != 1:
-            return None
-        (current,) = chain_candidates
-
-
-def _propagate_carry_op(
-    entry_op: ComputedBuffer,
-    op: ComputedBuffer,
-    seed_buf: ComputedBuffer,
-    outside_consumers: list[ComputedBuffer],
-    is_graph_output: bool,
-    operations: list[Operation],
-) -> None:
-    """Rewire a sequential-carry chain for correct per-tile carry at the
-    reduction-tiled level, keeping seed_buf as the persistent accumulator.
-
-    entry_op is the seed-closure member that reads seed_buf directly
-    (_seed_buffer_for_carry's result); op is the terminal op of the update
-    chain rooted at entry_op (_carry_terminal_op's result) — the op whose
-    RESULT is the traced Python's actual per-iteration recurrence value.
-    These coincide (entry_op is op) whenever the recurrence update is a
-    single op reading the seed directly (e.g. `max_running = maximum(M,
-    block_max)`); they differ when the update chains a second op onto
-    entry_op's result (e.g. `denominator = denominator * correction +
-    exp_scores.sum(...)` — entry_op is the multiply, op is the add).
-
-    seed_buf (accum_full) already holds the correct identity value and full
-    (pre-outer-tiling) shape from the traced Python (e.g. torch.full(-inf)
-    for a running max) — reused directly, no new full-size allocation.  But
-    op's own buffer is tile-sized at any outer output-dim level (e.g. H) that
-    the group also tiles, so op cannot simply write into seed_buf directly
-    (stick-compatibility: seed_buf's candidate layouts are sized to the full
-    tensor, op's are sized to one outer tile — mirrors why Case 1/2 exist for
-    ordinary tiled ops).  Structure, mirroring
-    _propagate_tiled_reduction_op's nested (outer output-dim + inner
-    reduction-dim) branch:
-
-      1. accum_tile: new per-outer-tile scratch buffer, per_tile_fixed=True,
-         shaped like op's own (already outer-tile-sized) output.
-      2. Copy-in op (outer loop_info only): accum_full's current outer-tile
-         slice -> accum_tile, runs once per outer tile before the inner
-         (reduction-tiled) loop's first iteration.
-      3. entry_op is rewired (via NameSwapHandler) to read accum_tile
-         wherever it read seed_buf — entry_op runs before op in the same
-         inner-loop iteration and nothing mutates accum_tile in between, so
-         it correctly observes the previous iteration's carry value with no
-         snapshot needed. op itself is rewired to write into accum_tile via
-         MutationLayoutSHOULDREMOVE, keeping op's own (inner) loop_info —
-         each inner-loop iteration now reads what the previous inner-loop
-         iteration wrote, the actual carry fix. A no-op rewrite (NameSwapHandler
-         with an empty map) when entry_op is op.
-      4. Copy-out op (outer loop_info only, reusing
-         _insert_reduction_copy_op): accum_tile -> accum_full's current
-         outer-tile slice, runs once per outer tile after the inner loop's
-         last iteration.
-      5. Outside consumers / graph outputs (of op, the terminal value)
-         redirected to accum_full.
-    """
-    from ..insert_restickify import NameSwapHandler
-    from ..pass_utils import replace_computed_buffer_body
-
-    accum_full = seed_buf
-    op_loop_info = op.loop_info
-    outer_loop_info = _compute_fill_loop_info(op)
-
-    if outer_loop_info is None:
-        # Flat (no outer output-dim tiling above the reduction-tiled level):
-        # op's own buffer already spans the full extent, so it can carry
-        # directly in accum_full with no per-tile scratch needed.
-        op.layout = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(accum_full)))
-        # No stride change, so no consumer index rewrite needed.
-        retile_info = None
-    else:
-        per_tile_ranges = list(op.data.ranges)
-        outer_key = op_loop_info.loop_group_id[0]
-        group_start_idx = next(
-            i
-            for i, o in enumerate(operations)
-            if isinstance(o, ComputedBuffer)
-            and getattr(getattr(o, "loop_info", None), "loop_group_id", (None,))[0]
-            == outer_key
-        )
-        # accum_full may itself be an in-group seed (its Python-source
-        # torch.zeros/torch.full sits inside the tiled scope, so the generic
-        # stamping pass tagged it at the inner (reduction-tiled) level, same
-        # as op). Left alone, it would re-run — and re-initialize the
-        # accumulator — on every inner-loop iteration instead of once per
-        # outer tile. Re-stamp it to the outer level, matching copy_in_buf
-        # below, so it runs exactly once per outer tile before the inner
-        # loop starts. A no-op when accum_full is already hoisted
-        # (loop_info=None outside any group).
-        accum_full_was_in_group = getattr(accum_full, "loop_info", None) is not None
-        if accum_full_was_in_group:
-            accum_full.loop_info = outer_loop_info  # type: ignore[attr-defined]
-        # accum_tile's own allocation (a SpyreEmptyFallback ExternKernel) is
-        # never stamped with loop_info, so — unlike copy_in_buf below — it
-        # must sit before the group starts, at group_start_idx, regardless of
-        # where accum_full sits: interposing an untagged allocation inside
-        # the group's contiguous loop_group_id run breaks scheduler
-        # contiguity (build_loop_scheduler_nodes requires every node sharing
-        # an outer loop_group_id key to be adjacent).
-        accum_tile = _allocate_full_buffer(
-            op, per_tile_ranges, operations, group_start_idx
-        )
-        if isinstance(accum_tile.layout, FixedTiledLayout):
-            accum_tile.layout.per_tile_fixed = True
-        else:
-            accum_tile._pending_per_tile_fixed = True  # type: ignore[attr-defined]
-
-        # If accum_full was itself an in-group member (a real ComputedBuffer
-        # sitting inside the (0,0)-tagged run, not a hoisted SpyreConstantFallback
-        # seed), its position in `operations` must move alongside its new
-        # outer loop_info: _build_loop_group (scheduler.py) groups purely by
-        # positional contiguity of loop_group_id at each depth, so an
-        # outer-only ((0,)-shaped) op left in its ORIGINAL position — inside
-        # the (0,0) run — still splits that run in two, even though the
-        # depth-0 prefix matches. It must sit fully before the run starts,
-        # not merely after its old neighbors.
-        if accum_full_was_in_group:
-            # accum_full's own read-dependencies (e.g. the SpyreConstantFallback
-            # its fill loads from) were created at accum_full's ORIGINAL position
-            # in the group, which may be arbitrarily deep — _replace_constant_
-            # fill_predecessors only hoists fills whose closure escapes the
-            # carry (Part C), and denominator's own seed fill is intentionally
-            # left in place since it IS the carry seed. Moving accum_full alone
-            # would leave it reading a dependency that now comes later in
-            # `operations`, violating topological order for downstream passes
-            # (e.g. optimize_restickify's beam search, which assumes
-            # dependencies are registered before their readers). Move any such
-            # dependency to sit immediately before accum_full at its new
-            # position too, preserving their relative order.
-            deps_to_move = [
-                o
-                for o in operations
-                if o.get_name() in _op_reads(accum_full) and o is not accum_full
-            ]
-            for dep in deps_to_move:
-                operations.remove(dep)
-            insert_at = operations.index(accum_tile) + 1
-            for dep in deps_to_move:
-                operations.insert(insert_at, dep)
-                insert_at += 1
-            operations.remove(accum_full)
-            operations.insert(insert_at, accum_full)
-
-        copy_in_data = Pointwise(
-            device=op.get_device(),
-            dtype=op.get_dtype(),
-            inner_fn=accum_full.make_loader(),
-            ranges=per_tile_ranges,
-        )
-        copy_in_name = V.graph.qualify_name(f"coarse_tile_carry_load_{op.get_name()}")
-        copy_in_buf = ComputedBuffer(
-            name=copy_in_name,
-            layout=MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(accum_tile))),
-            data=copy_in_data,
-        )
-        copy_in_buf.origins = op.origins
-        copy_in_buf.operation_name = copy_in_name
-        copy_op_metadata(op, copy_in_buf)
-        copy_in_buf.loop_info = outer_loop_info  # type: ignore[attr-defined]
-        V.graph.name_to_buffer[copy_in_name] = copy_in_buf
-
-        # copy_in_buf reads accum_full directly (accum_full.make_loader()), so
-        # propagate_spyre_tensor_layouts (which walks operations in order)
-        # requires accum_full to already have a layout assigned by the time
-        # it's reached — insert right after accum_full's (possibly just
-        # moved) position. Because accum_full now always sits before
-        # group_start_idx (either originally hoisted, or just moved above),
-        # copy_in_buf lands there too — fully before the (0,0) run, so its
-        # shorter ((0,)-shaped) loop_group_id never interposes inside it.
-        accum_full_idx = operations.index(accum_full)
-        operations.insert(accum_full_idx + 1, copy_in_buf)
-
-        seed_name = accum_full.get_name()
-        tile_name = accum_tile.get_name()
-
-        # Other members of the seed's closure (e.g. correction = exp(M -
-        # max_running), which reads M directly alongside op's own result)
-        # need the value of the carry from BEFORE this inner iteration's
-        # update — the same value op itself reads as input. accum_tile has
-        # no snapshot/versioning semantics: MutationLayoutSHOULDREMOVE is a
-        # plain storage alias, and any reader positioned after op in
-        # `operations` would observe op's POST-update write instead (see
-        # scheduler.py's mutation_renames). So capture the pre-update value
-        # into a distinct per-inner-iteration scratch buffer (carry_prev)
-        # BEFORE op is rewired to mutate accum_tile, and redirect those
-        # sibling closure members to read carry_prev instead of the seed.
-        # _seed_closure matches on the outer loop_group_id key only, so it
-        # also catches copy_in_buf itself (loop_info=outer_loop_info, reads
-        # accum_full directly) — copy_in_buf is scaffolding inserted above,
-        # not a Python-source sibling, and it must keep reading the seed
-        # (once per outer tile, before the inner loop's first iteration),
-        # not carry_prev (which is defined inside the inner loop and would
-        # be a forward reference at copy_in_buf's outer-loop position).
-        # Restrict to op's own inner loop_group_id so only true per-inner-
-        # iteration closure members are rewired.
-        sibling_names = {
-            name
-            for name in _seed_closure(seed_name, op_loop_info.loop_group_id, operations)
-            if getattr(V.graph.name_to_buffer[name], "loop_info", None) is not None
-            and V.graph.name_to_buffer[name].loop_info.loop_group_id
-            == op_loop_info.loop_group_id
-        } - {op.get_name(), entry_op.get_name()}
-        if sibling_names:
-            # carry_prev_alloc, like accum_tile, is an untagged SpyreEmptyFallback
-            # allocation — it must sit at group_start_idx (before the whole
-            # outer group), not interposed mid-group, or it breaks the
-            # scheduler's outer loop_group_id contiguity requirement (see the
-            # comment on accum_tile's own allocation above).
-            carry_prev_alloc = _allocate_full_buffer(
-                op, per_tile_ranges, operations, group_start_idx
-            )
-            if isinstance(carry_prev_alloc.layout, FixedTiledLayout):
-                carry_prev_alloc.layout.per_tile_fixed = True
-            else:
-                carry_prev_alloc._pending_per_tile_fixed = True  # type: ignore[attr-defined]
-
-            carry_prev_data = Pointwise(
-                device=op.get_device(),
-                dtype=op.get_dtype(),
-                inner_fn=accum_tile.make_loader(),
-                ranges=per_tile_ranges,
-            )
-            carry_prev_name = V.graph.qualify_name(
-                f"coarse_tile_carry_prev_{op.get_name()}"
-            )
-            carry_prev_copy = ComputedBuffer(
-                name=carry_prev_name,
-                layout=MutationLayoutSHOULDREMOVE(
-                    TensorBox(StorageBox(carry_prev_alloc))
-                ),
-                data=carry_prev_data,
-            )
-            carry_prev_copy.origins = op.origins
-            carry_prev_copy.operation_name = carry_prev_name
-            copy_op_metadata(op, carry_prev_copy)
-            carry_prev_copy.loop_info = op_loop_info  # type: ignore[attr-defined]
-            V.graph.name_to_buffer[carry_prev_name] = carry_prev_copy
-            operations.insert(operations.index(op), carry_prev_copy)
-
-            prev_name = carry_prev_name
-            for sibling_name in sibling_names:
-                sibling = V.graph.name_to_buffer[sibling_name]
-                orig_sibling_inner = sibling.data.inner_fn
-
-                def new_sibling_inner_fn(
-                    *args, _map={seed_name: prev_name}, _orig=orig_sibling_inner
-                ):
-                    with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
-                        return _orig(*args)
-
-                object.__setattr__(sibling.data, "inner_fn", new_sibling_inner_fn)
-                sibling_loop_info = sibling.loop_info
-                sibling = replace_computed_buffer_body(
-                    sibling, sibling.data, operations
-                )
-                sibling.loop_info = sibling_loop_info  # type: ignore[attr-defined]
-                V.graph.name_to_buffer[sibling.get_name()] = sibling
-
-        # entry_op reads the seed directly — redirect that read to accum_tile
-        # (the read-side fix). entry_op runs before op/terminal in the same
-        # inner-loop iteration and nothing mutates accum_tile in between, so
-        # it correctly observes the previous iteration's carry value. This is
-        # a no-op rewrite (empty _map) when entry_op is op, since seed_name
-        # then equals tile_name's counterpart on the SAME op that also gets
-        # the write-side mutation below.
-        orig_entry_inner = entry_op.data.inner_fn
-
-        def new_entry_inner_fn(
-            *args, _map={seed_name: tile_name}, _orig=orig_entry_inner
-        ):
-            with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
-                return _orig(*args)
-
-        object.__setattr__(entry_op.data, "inner_fn", new_entry_inner_fn)
-        entry_loop_info = entry_op.loop_info
-        entry_op = replace_computed_buffer_body(entry_op, entry_op.data, operations)
-        entry_op.loop_info = entry_loop_info  # type: ignore[attr-defined]
-        V.graph.name_to_buffer[entry_op.get_name()] = entry_op
-
-        # op (the terminal value) owns accum_tile's storage — the write-side
-        # fix. When entry_op is op, this mutates the very buffer whose
-        # inner_fn was just rewired above (the pre-existing single-op
-        # behavior); when entry_op is not op, op does not read the seed
-        # directly at all (e.g. buf17 reads buf13/buf16, neither of which is
-        # the seed), so no inner_fn rewrite is needed here — only the layout
-        # mutation.
-        # Capture before the mutation below overwrites op.layout.
-        old_stride = tuple(op.layout.stride)
-        op.layout = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(accum_tile)))
-        V.graph.name_to_buffer[op.get_name()] = op
-        retile_info = _RetiledBufferInfo(old_stride, tuple(accum_full.layout.stride))
-
-        # The copy-out must run once per outer tile after the inner loop's
-        # LAST iteration — i.e. after every op sharing op's own (full,
-        # inner-tiled) loop_group_id, not just after the seed's closure
-        # (_seed_closure only covers direct readers of the seed, e.g.
-        # {buf10, buf11} for M — it excludes downstream siblings like
-        # exp_scores/denominator/output-accumulate that read op's result
-        # rather than the seed directly, but that still belong to the same
-        # inner loop). The copy-out's own loop_group_id is outer-only
-        # (shorter than op's) — inserting it anywhere before the inner
-        # loop's true last member leaves a same-depth contiguous run split
-        # in two on either side of it (see _build_loop_group in
-        # scheduler.py, which groups by contiguous loop_group_id runs).
-        last_member = max(
-            (
-                o
-                for o in operations
-                if isinstance(o, ComputedBuffer)
-                and getattr(o, "loop_info", None) is not None
-                and o.loop_info.loop_group_id == op_loop_info.loop_group_id
-            ),
-            key=operations.index,
-        )
-        _insert_reduction_copy_op(
-            op,
-            accum_tile,
-            accum_full,
-            outer_loop_info,
-            operations,
-            insert_after=last_member,
-            force_live=not outside_consumers and not is_graph_output,
-        )
-
-    buf_name = op.get_name()
-    seed_name = accum_full.get_name()
-    _patch_consumers(outside_consumers, buf_name, seed_name, operations, retile_info)
-    if is_graph_output:
-        _patch_graph_outputs(buf_name, accum_full)
-
-    logger.debug(
-        "coarse_tile: propagated carry op %s → seed %s",
-        buf_name,
-        seed_name,
-    )
 
 
 def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
@@ -1969,8 +1486,7 @@ def _insert_reduction_copy_op(
     instead — needed when tiled_op has sibling closure members later in the
     same inner loop group (the carry case): the copy must run once per
     outer tile after the *last* inner-loop iteration, i.e. after every
-    closure member has executed, not immediately after tiled_op itself. See
-    _propagate_carry_op.
+    closure member has executed, not immediately after tiled_op itself.
 
     force_live: set for a carry copy-out whose seed has no outside
     consumers or graph-output status (e.g. online-softmax running state
@@ -2615,14 +2131,14 @@ def _replace_constant_fill_predecessors(
             # seed (e.g. `M`, read directly by both
             # `max_running = maximum(M, block_max)` and
             # `correction = exp(M - max_running)`), and every op in the
-            # closure must keep reading it directly so _propagate_carry_op
-            # (which runs after _stamp_group) can find it.  Skip the
-            # tile-sized-copy rewrite for this (old_name, op) pair.  Checked
-            # via dim_hints directly (not stamped loop_info, which does not
-            # exist yet at this point in the pass pipeline — this function
-            # runs before _stamp_group).  A closure of size > 1 is not itself
-            # a disqualifying signal (see _seed_buffer_for_carry) — only "is
-            # every closure member carry-shaped" matters here.
+            # closure must keep reading it directly so plan_coarse_tile_groups's
+            # _seed_buffer_for_carry check can find it and raise Unsupported.
+            # Skip the tile-sized-copy rewrite for this (old_name, op) pair.
+            # Checked via dim_hints directly (not stamped loop_info, which
+            # does not exist yet at this point in the pass pipeline — this
+            # function runs before _stamp_group).  A closure of size > 1 is
+            # not itself a disqualifying signal (see _seed_buffer_for_carry)
+            # — only "is every closure member carry-shaped" matters here.
             closure = _seed_closure_pre_stamp(old_name, group_ops)
             if closure and all(
                 _is_loop_invariant_at_reduction_levels(
