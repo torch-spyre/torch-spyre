@@ -4606,7 +4606,9 @@ class TestReorderUnhintedInterlopers(unittest.TestCase):
     """reorder_unhinted_interlopers moves unhinted ops out of hint-group runs."""
 
     def _run(self, ops):
-        from torch_spyre._inductor.wsr.coarse_tile import reorder_unhinted_interlopers
+        from torch_spyre._inductor.wsr.coarse_tile_hints import (
+            reorder_unhinted_interlopers,
+        )
 
         graph = SimpleNamespace(operations=list(ops))
         reorder_unhinted_interlopers(graph)
@@ -4812,7 +4814,7 @@ class TestHintsLevels(unittest.TestCase):
     def test_size1_hint_dropped(self):
         """A single hint with split_count=1 produces an empty levels list."""
         import sympy
-        from torch_spyre._inductor.wsr.coarse_tile import _hints_levels
+        from torch_spyre._inductor.wsr.coarse_tile_hints import _hints_levels
 
         op = self._make_op([(0, 1, sympy.Symbol("c0"))])
         self.assertEqual(_hints_levels([op]), [])
@@ -4822,24 +4824,24 @@ class TestHintsLevels(unittest.TestCase):
         import logging
         import logging.handlers
         import sympy
-        import torch_spyre._inductor.wsr.coarse_tile as ct_mod
-        from torch_spyre._inductor.wsr.coarse_tile import _hints_levels
+        import torch_spyre._inductor.wsr.coarse_tile_hints as cth_mod
+        from torch_spyre._inductor.wsr.coarse_tile_hints import _hints_levels
 
         op = self._make_op([(7, 1, sympy.Symbol("c0"))])
 
-        original_level = ct_mod.hints_logger.level
-        ct_mod.hints_logger.setLevel(logging.DEBUG)
+        original_level = cth_mod.hints_logger.level
+        cth_mod.hints_logger.setLevel(logging.DEBUG)
         handler = logging.handlers.MemoryHandler(
             capacity=100, flushLevel=logging.CRITICAL
         )
-        ct_mod.hints_logger.addHandler(handler)
+        cth_mod.hints_logger.addHandler(handler)
         try:
             result = _hints_levels([op])
             handler.flush()
             messages = [r.getMessage() for r in handler.buffer]
         finally:
-            ct_mod.hints_logger.removeHandler(handler)
-            ct_mod.hints_logger.setLevel(original_level)
+            cth_mod.hints_logger.removeHandler(handler)
+            cth_mod.hints_logger.setLevel(original_level)
 
         self.assertEqual(result, [])
         self.assertTrue(
@@ -4850,7 +4852,7 @@ class TestHintsLevels(unittest.TestCase):
     def test_nonunit_hint_kept(self):
         """A hint with split_count > 1 is retained normally."""
         import sympy
-        from torch_spyre._inductor.wsr.coarse_tile import _hints_levels
+        from torch_spyre._inductor.wsr.coarse_tile_hints import _hints_levels
 
         c0 = sympy.Symbol("c0")
         op = self._make_op([(3, 4, c0)])
@@ -4863,7 +4865,7 @@ class TestHintsLevels(unittest.TestCase):
     def test_mixed_hints_drops_only_size1(self):
         """When one hint is size-1 and another is size>1, only the size>1 survives."""
         import sympy
-        from torch_spyre._inductor.wsr.coarse_tile import _hints_levels
+        from torch_spyre._inductor.wsr.coarse_tile_hints import _hints_levels
 
         c0, c1 = sympy.Symbol("c0"), sympy.Symbol("c1")
         op = self._make_op([(0, 1, c0), (1, 8, c1)])
@@ -4876,7 +4878,7 @@ class TestHintsLevels(unittest.TestCase):
     def test_all_size1_hints_dropped_falls_through_to_next_op(self):
         """If every hint on op0 is size-1, _hints_levels tries op1 next."""
         import sympy
-        from torch_spyre._inductor.wsr.coarse_tile import _hints_levels
+        from torch_spyre._inductor.wsr.coarse_tile_hints import _hints_levels
 
         c0 = sympy.Symbol("c0")
         op0 = self._make_op([(0, 1, c0)])
@@ -4923,25 +4925,25 @@ def _run_htctg_and_capture_log(ops):
     import logging
     import logging.handlers
     from types import SimpleNamespace
-    from torch_spyre._inductor.wsr.coarse_tile import hints_to_coarse_tile_groups
-    import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_mod
+    from torch_spyre._inductor.wsr.coarse_tile_hints import hints_to_coarse_tile_groups
+    import torch_spyre._inductor.wsr.coarse_tile_hints as coarse_tile_hints_mod
 
     graph = SimpleNamespace(operations=list(ops))
 
     # Temporarily force the module-level hints_logger to INFO so the logging
     # block inside hints_to_coarse_tile_groups actually runs.
-    original_level = coarse_tile_mod.hints_logger.level
-    coarse_tile_mod.hints_logger.setLevel(logging.INFO)
+    original_level = coarse_tile_hints_mod.hints_logger.level
+    coarse_tile_hints_mod.hints_logger.setLevel(logging.INFO)
 
     handler = logging.handlers.MemoryHandler(capacity=1000, flushLevel=logging.CRITICAL)
-    coarse_tile_mod.hints_logger.addHandler(handler)
+    coarse_tile_hints_mod.hints_logger.addHandler(handler)
     try:
         hints_to_coarse_tile_groups(graph)
         handler.flush()
         return "\n".join(r.getMessage() for r in handler.buffer)
     finally:
-        coarse_tile_mod.hints_logger.removeHandler(handler)
-        coarse_tile_mod.hints_logger.setLevel(original_level)
+        coarse_tile_hints_mod.hints_logger.removeHandler(handler)
+        coarse_tile_hints_mod.hints_logger.setLevel(original_level)
 
 
 class TestHintsToCoarseTileGroupsLogging(unittest.TestCase):

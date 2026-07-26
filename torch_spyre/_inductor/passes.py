@@ -44,10 +44,12 @@ from .temp_passes import (
     mm_to_bmm_pass,
 )
 from .wsr.coarse_tile import (
-    hints_to_coarse_tile_groups,
-    reorder_unhinted_interlopers,
     span_overflow_groups,
     validate_coarse_tile_groups,
+)
+from .wsr.coarse_tile_hints import (
+    hints_to_coarse_tile_groups,
+    reorder_unhinted_interlopers,
 )
 from . import config
 from .propagate_hints import (
