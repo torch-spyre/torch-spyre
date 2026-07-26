@@ -533,7 +533,6 @@ def lower_bmm(x, y):
 def lower_convolution(x, w, bias, stride, padding, dilation, groups):
     x = V.graph.get_buffer(x.realize())
     w = V.graph.get_buffer(w.realize())
-
     x_loader = x.make_loader()
     w_loader = w.make_loader()
 
@@ -549,12 +548,14 @@ def lower_convolution(x, w, bias, stride, padding, dilation, groups):
             f"Input and output channels and groups should all be equal for depthwiseconv2d: {C_in}, {C_out}, {groups}"
         )
 
+    '''
     if tuple(padding) != (0, 0):
         raise Unsupported(
             f"Depthwise conv2d currently only supports zero padding; got padding={padding}. "
             "Support for non-zero padding requires changes to the Spyre runtime to handle "
             "non-zero tensor allocation addresses."
         )
+    '''
 
     # Output spatial sizes
     H_out = (H_in + 2 * padding[0] - K_h) // stride[0] + 1
@@ -585,6 +586,8 @@ def lower_convolution(x, w, bias, stride, padding, dilation, groups):
             "dilation_j": dilation[1],
             "total_size_i": H_in_padded,
             "total_size_j": W_in_padded,
+            "kernel_h": K_h,
+            "kernel_w": K_w,
             "pad_dim_i": CONV2D_DIM_LABELS[2],
             "pad_dim_j": CONV2D_DIM_LABELS[3],
             "window_dim_i": CONV2D_DIM_LABELS[-2],
@@ -594,7 +597,6 @@ def lower_convolution(x, w, bias, stride, padding, dilation, groups):
             else "padded_nozeropad",
         }
     }
-
     # Only include G in reduction_ranges if it's not 1 (size-1 dims get simplified away anyway)
     red_ranges = [K_h, K_w]
     if G != 1:

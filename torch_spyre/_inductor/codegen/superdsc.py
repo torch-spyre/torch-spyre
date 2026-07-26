@@ -990,6 +990,7 @@ def compile_op_spec(
     symbol_id_offset: int = 0,
     use_symbols: bool = False,
 ) -> tuple[Any, list[int], list[list[dict]], list[SymbolKind]]:
+
     sdsc_spec, symbol_mapping = parse_op_spec(op_spec)
     logger.debug("%s", sdsc_spec)
     # Translate tiled_symbols from OpSpec's per-level inductor symbols (innermost-

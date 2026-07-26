@@ -35,7 +35,7 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 
 from .errors import Unsupported
-from .constants import BATCH_MATMUL_OP, DEVICE_NAME, TOPK_OPS
+from .constants import BATCH_MATMUL_OP, DEPTHWISE_CONV2D_OP, DEVICE_NAME, TOPK_OPS
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
@@ -960,6 +960,13 @@ def work_distribution_pass(
     Reads op.op_it_space_splits written by span_reduction_pass (if any) to
     recover the already-committed splits, then fills remaining cores by priority.
     """
+
+    print(f"work_distribution_pass: op: {op} args: {args}")
+    # Conv1d (3D tensors) for depthwise_conv2d cannot be analyzed with device_coordinates
+    if isinstance(op.data, Reduction) and op.data.reduction_type == DEPTHWISE_CONV2D_OP:
+        if args and len(args[0].layout.size) == 3:
+            return
+
     it_space = iteration_space_from_op(op)
     input_tds, output_td = collect_tensor_deps(op, args)
     all_tds = input_tds + [output_td]
@@ -1389,6 +1396,10 @@ def divide_reduction_op(
                 f"work_division_hint: {op.get_name()} ignores work_div hint "
                 f"because TOPK reductions run single-core."
             )
+        return
+
+    # Conv1d (3D tensors) for depthwise_conv2d cannot be analyzed with device_coordinates
+    if red.reduction_type == DEPTHWISE_CONV2D_OP and args and len(args[0].layout.size) == 3:
         return
 
     pass_fn(op, args, max_cores)
