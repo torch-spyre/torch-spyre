@@ -10,7 +10,8 @@ Usage (called by the GHA workflow):
         --workflow  "tests" \
         --branch    "main" \
         --sha       "abc123..." \
-        --run-id    "74526099734"
+        --run-id    "74526099734" \
+        --run-link  "https://github.com/org/repo/actions/runs/74526099734"
 """
 
 import argparse
@@ -94,6 +95,7 @@ def build_row(rec: dict, args) -> list:
         _str(args.workflow),
         _str(args.branch),
         _str(args.sha)[:40].ljust(40)[:40],  # normalise to ≤40 chars
+        _str(args.run_link),
         _str(rec.get("suite_name")),
         _int(rec.get("attempt"), 1),
         _int(rec.get("total_attempts"), 1),
@@ -147,6 +149,7 @@ COLUMN_NAMES = [
     "workflow",
     "branch",
     "commit_sha",
+    "run_link",
     "suite_name",
     "attempt",
     "total_attempts",
@@ -224,6 +227,7 @@ def ensure_extra_columns(client) -> None:
         ("workflow", "LowCardinality(String) DEFAULT ''"),
         ("branch", "LowCardinality(String) DEFAULT ''"),
         ("commit_sha", "String DEFAULT ''"),
+        ("run_link", "String DEFAULT ''"),
         ("failure_reason_detail", "String DEFAULT '{}'"),
         ("ras_category", "LowCardinality(String) DEFAULT ''"),
         ("ras_severity", "LowCardinality(String) DEFAULT ''"),
@@ -266,6 +270,11 @@ def main() -> None:
         "--run-id",
         default="",
         help="GHA run ID — used as run_id if JSON records lack one",
+    )
+    parser.add_argument(
+        "--run-link",
+        default="",
+        help="URL to the triggering GHA run (e.g. '<server>/<repo>/actions/runs/<id>')",
     )
     parser.add_argument(
         "--table",
