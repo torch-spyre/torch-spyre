@@ -68,7 +68,7 @@ from torch_spyre._inductor.constants import (
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
 from torch_spyre._inductor.loop_info import CoarseTileInfo
-from torch_spyre._inductor.coarse_tile import (
+from torch_spyre._inductor.wsr.coarse_tile import (
     _LOOPS_FREE_SYMS_KEY,
     _REDUCTION_FREE_SYMS_KEY,
     _RetiledBufferInfo,
@@ -698,7 +698,7 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         )
 
     def test_extracts_coefficient_for_tiled_dim(self):
-        from torch_spyre._inductor.coarse_tile import _tile_advance_expr_from_dep
+        from torch_spyre._inductor.wsr.coarse_tile import _tile_advance_expr_from_dep
 
         d0 = sympy_index_symbol("d0")
         d1 = sympy_index_symbol("d1")
@@ -707,7 +707,7 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         self.assertEqual(simplify(expr - Integer(4096) * Integer(512) * d0), 0)
 
     def test_untiled_dim_contributes_zero(self):
-        from torch_spyre._inductor.coarse_tile import _tile_advance_expr_from_dep
+        from torch_spyre._inductor.wsr.coarse_tile import _tile_advance_expr_from_dep
 
         d0 = sympy_index_symbol("d0")
         d1 = sympy_index_symbol("d1")
@@ -716,7 +716,7 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         self.assertEqual(expr, Integer(0))
 
     def test_broadcast_dim_not_in_index_contributes_zero(self):
-        from torch_spyre._inductor.coarse_tile import _tile_advance_expr_from_dep
+        from torch_spyre._inductor.wsr.coarse_tile import _tile_advance_expr_from_dep
 
         d0 = sympy_index_symbol("d0")
         d1 = sympy_index_symbol("d1")
@@ -726,7 +726,7 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         self.assertEqual(simplify(expr - Integer(4096) * Integer(512) * d0), 0)
 
     def test_sums_multiple_tiled_dims(self):
-        from torch_spyre._inductor.coarse_tile import _tile_advance_expr_from_dep
+        from torch_spyre._inductor.wsr.coarse_tile import _tile_advance_expr_from_dep
 
         d0 = sympy_index_symbol("d0")
         d1 = sympy_index_symbol("d1")
@@ -750,7 +750,7 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         casing for non-affine forms: it produces the exact substituted
         expression.
         """
-        from torch_spyre._inductor.coarse_tile import _tile_advance_expr_from_dep
+        from torch_spyre._inductor.wsr.coarse_tile import _tile_advance_expr_from_dep
 
         d0 = sympy_index_symbol("d0")
         d1 = sympy_index_symbol("d1")
@@ -777,7 +777,7 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         d0's, 1) must produce that exact pairing rather than assuming d0
         always carries the larger stride.
         """
-        from torch_spyre._inductor.coarse_tile import _tile_advance_expr_from_dep
+        from torch_spyre._inductor.wsr.coarse_tile import _tile_advance_expr_from_dep
 
         d0 = sympy_index_symbol("d0")
         d1 = sympy_index_symbol("d1")
@@ -1267,7 +1267,7 @@ class TestDivideRanges(unittest.TestCase):
         [1, 128] grow dim0 -> [4, 128]: the size-1 non-stick device dim must
         update to device_size=4, not remain frozen at 1."""
         from torch_spyre._C import SpyreTensorLayout
-        from torch_spyre._inductor.coarse_tile import _resize_device_layout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
 
         # Per-tile buffer is [1, 128] — dim0 was tiled to extent 1.
         # device_size=[2, 1, 64], stride_map=[64, -1, 1].
@@ -1285,7 +1285,7 @@ class TestDivideRanges(unittest.TestCase):
         sticks) rather than silently producing a wrong result.
         """
         from torch_spyre._C import SpyreTensorLayout
-        from torch_spyre._inductor.coarse_tile import _resize_device_layout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
 
         # Build a real [2, 2] STL (stick on dim1, stride_map[-1] == 1).
         # Then call the helper with a synthetic old_host_size=[1, 1] whose
@@ -1300,7 +1300,7 @@ class TestDivideRanges(unittest.TestCase):
         has no unmatched dim.  _resize_device_layout must handle this gracefully
         by leaving the tile-count and inner-stick entries frozen."""
         from torch_spyre._C import SpyreTensorLayout
-        from torch_spyre._inductor.coarse_tile import _resize_device_layout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
 
         # [128] reduction output: SpyreTensorLayout([128], [1], fp16, [0]).
         # device_size=[1, 128, 64], stride_map=[-1, 1, -1] — tile-count dim is
@@ -1330,7 +1330,7 @@ class TestDivideRanges(unittest.TestCase):
         stride_map / stick untouched.
         """
         from torch_spyre._C import SpyreTensorLayout
-        from torch_spyre._inductor.coarse_tile import _resize_device_layout
+        from torch_spyre._inductor.wsr.coarse_tile import _resize_device_layout
 
         dev = SpyreTensorLayout([1, 1], torch.float16).device_dtype
         # Transposed QK^T output: Skv (host dim 3) is the stick; Sq (host dim 2)
@@ -1358,7 +1358,7 @@ def _mock_op_out_coords(op):
 class TestCoarseTile(unittest.TestCase):
     def setUp(self):
         self._patch = patch(
-            "torch_spyre._inductor.coarse_tile.op_out_coords",
+            "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
             side_effect=_mock_op_out_coords,
         )
         self._patch.start()
@@ -1422,7 +1422,7 @@ class TestCoarseTileNested(unittest.TestCase):
 
     def setUp(self):
         self._patch = patch(
-            "torch_spyre._inductor.coarse_tile.op_out_coords",
+            "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
             side_effect=_mock_op_out_coords,
         )
         self._patch.start()
@@ -1519,7 +1519,7 @@ class TestCoarseTileTileAdvanceExprs(unittest.TestCase):
 
     def setUp(self):
         self._patch = patch(
-            "torch_spyre._inductor.coarse_tile.op_out_coords",
+            "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
             side_effect=_mock_op_out_coords,
         )
         self._patch.start()
@@ -1745,7 +1745,7 @@ class TestZeroFixedTileAdvanceExprs(unittest.TestCase):
     """Unit tests for _zero_fixed_tile_advance_exprs."""
 
     def test_no_fixed_ops_is_noop(self):
-        from torch_spyre._inductor.coarse_tile import _zero_fixed_tile_advance_exprs
+        from torch_spyre._inductor.wsr.coarse_tile import _zero_fixed_tile_advance_exprs
 
         d0 = sympy_index_symbol("d0")
         op = _make_fixed_flag_op(
@@ -1762,7 +1762,7 @@ class TestZeroFixedTileAdvanceExprs(unittest.TestCase):
         )
 
     def test_pending_per_tile_fixed_zeros_own_output(self):
-        from torch_spyre._inductor.coarse_tile import _zero_fixed_tile_advance_exprs
+        from torch_spyre._inductor.wsr.coarse_tile import _zero_fixed_tile_advance_exprs
 
         d0 = sympy_index_symbol("d0")
         op = _make_fixed_flag_op(
@@ -1775,7 +1775,7 @@ class TestZeroFixedTileAdvanceExprs(unittest.TestCase):
         self.assertEqual(op.loop_info.output_tile_advance_expr, Integer(0))
 
     def test_committed_layout_per_tile_fixed_zeros_own_output(self):
-        from torch_spyre._inductor.coarse_tile import _zero_fixed_tile_advance_exprs
+        from torch_spyre._inductor.wsr.coarse_tile import _zero_fixed_tile_advance_exprs
 
         d0 = sympy_index_symbol("d0")
         op = _make_fixed_flag_op(
@@ -1788,7 +1788,7 @@ class TestZeroFixedTileAdvanceExprs(unittest.TestCase):
         self.assertEqual(op.loop_info.output_tile_advance_expr, Integer(0))
 
     def test_reader_of_fixed_buffer_has_its_read_advance_zeroed(self):
-        from torch_spyre._inductor.coarse_tile import _zero_fixed_tile_advance_exprs
+        from torch_spyre._inductor.wsr.coarse_tile import _zero_fixed_tile_advance_exprs
 
         d0 = sympy_index_symbol("d0")
         fixed_op = _make_fixed_flag_op(
@@ -1816,7 +1816,7 @@ class TestZeroFixedTileAdvanceExprs(unittest.TestCase):
         )
 
     def test_op_without_loop_info_is_skipped(self):
-        from torch_spyre._inductor.coarse_tile import _zero_fixed_tile_advance_exprs
+        from torch_spyre._inductor.wsr.coarse_tile import _zero_fixed_tile_advance_exprs
 
         fixed_op = _make_fixed_flag_op(
             "fixed0",
@@ -3485,11 +3485,11 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_no_consumers_returns_empty(self):
-        from torch_spyre._inductor.coarse_tile import _find_outside_consumers
+        from torch_spyre._inductor.wsr.coarse_tile import _find_outside_consumers
 
         op = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
         with patch(
-            "torch_spyre._inductor.coarse_tile._graph_output_names",
+            "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
             return_value=set(),
         ):
             consumers, is_out = _find_outside_consumers("op0", (0,), [op])
@@ -3497,12 +3497,12 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         self.assertFalse(is_out)
 
     def test_outside_consumer_detected(self):
-        from torch_spyre._inductor.coarse_tile import _find_outside_consumers
+        from torch_spyre._inductor.wsr.coarse_tile import _find_outside_consumers
 
         tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
         consumer = _make_consumer_op("out0", "op0")  # no loop_group_id → outside
         with patch(
-            "torch_spyre._inductor.coarse_tile._graph_output_names",
+            "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
             return_value=set(),
         ):
             consumers, is_out = _find_outside_consumers("op0", (0,), [tiled, consumer])
@@ -3510,11 +3510,11 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         self.assertFalse(is_out)
 
     def test_graph_output_detected(self):
-        from torch_spyre._inductor.coarse_tile import _find_outside_consumers
+        from torch_spyre._inductor.wsr.coarse_tile import _find_outside_consumers
 
         tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
         with patch(
-            "torch_spyre._inductor.coarse_tile._graph_output_names",
+            "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
             return_value={"op0"},
         ):
             consumers, is_out = _find_outside_consumers("op0", (0,), [tiled])
@@ -3522,12 +3522,12 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         self.assertTrue(is_out)
 
     def test_inside_consumer_not_counted_as_outside(self):
-        from torch_spyre._inductor.coarse_tile import _find_outside_consumers
+        from torch_spyre._inductor.wsr.coarse_tile import _find_outside_consumers
 
         tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
         inside = _make_inside_consumer_op("op1", "op0", (0,))
         with patch(
-            "torch_spyre._inductor.coarse_tile._graph_output_names",
+            "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
             return_value=set(),
         ):
             consumers, is_out = _find_outside_consumers("op0", (0,), [tiled, inside])
@@ -3535,7 +3535,7 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         self.assertFalse(is_out)
 
     def test_has_inside_consumer_true(self):
-        from torch_spyre._inductor.coarse_tile import _has_inside_consumers
+        from torch_spyre._inductor.wsr.coarse_tile import _has_inside_consumers
 
         tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
         inside = _make_inside_consumer_op("op1", "op0", (0,))
@@ -3543,7 +3543,7 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         self.assertTrue(result)
 
     def test_has_inside_consumer_false_when_only_outside(self):
-        from torch_spyre._inductor.coarse_tile import _has_inside_consumers
+        from torch_spyre._inductor.wsr.coarse_tile import _has_inside_consumers
 
         tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
         outside = _make_consumer_op("out0", "op0")
@@ -3551,7 +3551,7 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         self.assertFalse(result)
 
     def test_compute_full_ranges_flat(self):
-        from torch_spyre._inductor.coarse_tile import _compute_full_ranges
+        from torch_spyre._inductor.wsr.coarse_tile import _compute_full_ranges
 
         op = _make_tiled_op("op0", [Integer(16), Integer(8)], (0,), [Integer(4)], [[0]])
         full = _compute_full_ranges(op)
@@ -3560,7 +3560,7 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         self.assertEqual(full[1], Integer(8))
 
     def test_compute_full_ranges_nested(self):
-        from torch_spyre._inductor.coarse_tile import _compute_full_ranges
+        from torch_spyre._inductor.wsr.coarse_tile import _compute_full_ranges
 
         # Nested: outer K=4 tiles dim 0, inner K=2 tiles dim 1
         op = _make_tiled_op(
@@ -3577,14 +3577,14 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
 
     def test_different_loop_group_id_is_outside(self):
         """Op in loop group 1 should be seen as outside consumer of group 0."""
-        from torch_spyre._inductor.coarse_tile import _find_outside_consumers
+        from torch_spyre._inductor.wsr.coarse_tile import _find_outside_consumers
 
         tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
         other_group = _make_tiled_op("op1", [Integer(16)], (1,), [Integer(4)], [[0]])
         # Make op1 read op0
         other_group.get_read_writes.return_value = _make_rw_with_reads("op0")
         with patch(
-            "torch_spyre._inductor.coarse_tile._graph_output_names",
+            "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
             return_value=set(),
         ):
             consumers, _ = _find_outside_consumers("op0", (0,), [tiled, other_group])
@@ -3626,7 +3626,7 @@ class TestCoarseTileReductionPropagation(unittest.TestCase):
     """Tests for insert_tiling_propagation Reduction support."""
 
     def test_reduction_tiled_reduction_dim_nested_ok(self):
-        from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
 
         # Nested: outer tiles output dim, inner tiles reduction dim — now supported
         op = _make_tiled_reduction_op(
@@ -3642,7 +3642,7 @@ class TestCoarseTileReductionPropagation(unittest.TestCase):
         _validate_reduction_tiling(op)  # must not raise
 
     def test_reduction_output_dim_tiled_ok(self):
-        from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
 
         # ranges=[M], reduction_ranges=[K]; tiled_dim=0 is an output dim → no error
         op = _make_tiled_reduction_op(
@@ -3659,7 +3659,7 @@ class TestCoarseTileReductionPropagation(unittest.TestCase):
 
     def test_nested_fill_gets_outer_loop_info(self):
         """Fill op gets outer-level loop_info for nested output+reduction tiling."""
-        from torch_spyre._inductor.coarse_tile import _compute_fill_loop_info
+        from torch_spyre._inductor.wsr.coarse_tile import _compute_fill_loop_info
 
         op = _make_tiled_reduction_op(
             "red0",
@@ -3679,7 +3679,7 @@ class TestCoarseTileReductionPropagation(unittest.TestCase):
 
     def test_flat_fill_has_no_loop_info(self):
         """Fill op gets no loop_info for flat (pure) reduction tiling."""
-        from torch_spyre._inductor.coarse_tile import _compute_fill_loop_info
+        from torch_spyre._inductor.wsr.coarse_tile import _compute_fill_loop_info
 
         op = _make_tiled_reduction_op(
             "red0",
@@ -3700,7 +3700,7 @@ class TestComputeFillLoopInfo(unittest.TestCase):
 
     def test_flat_reduction_returns_none(self):
         """Pure reduction tiling (no output-dim level) → None (fill before all loops)."""
-        from torch_spyre._inductor.coarse_tile import _compute_fill_loop_info
+        from torch_spyre._inductor.wsr.coarse_tile import _compute_fill_loop_info
 
         op = _make_tiled_reduction_op(
             "red0",
@@ -3717,7 +3717,7 @@ class TestComputeFillLoopInfo(unittest.TestCase):
 
     def test_nested_outer_output_inner_reduction(self):
         """Outer tiles dim 0 (output), inner tiles reduction dim 0 → fill gets outer loop_info."""
-        from torch_spyre._inductor.coarse_tile import _compute_fill_loop_info
+        from torch_spyre._inductor.wsr.coarse_tile import _compute_fill_loop_info
 
         op = _make_tiled_reduction_op(
             "red0",
@@ -3761,14 +3761,14 @@ class TestValidateReductionTiling(unittest.TestCase):
 
     def test_pure_reduction_tile_ok(self):
         """Single level, only reduction dim tiled — Stage 1 supported case."""
-        from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
 
         op = self._make_op(loop_tiled_dims=[[]], loop_tiled_reduction_dims=[[0]])
         _validate_reduction_tiling(op)  # must not raise
 
     def test_pure_output_tile_ok(self):
         """Single level, only output dim tiled — existing supported case."""
-        from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
 
         op = self._make_op(loop_tiled_dims=[[0]], loop_tiled_reduction_dims=[[]])
         _validate_reduction_tiling(op)  # must not raise
@@ -3776,7 +3776,7 @@ class TestValidateReductionTiling(unittest.TestCase):
     def test_no_loop_info_ok(self):
         """Op with no loop_info is not tiled — no error."""
         from torch._inductor.ir import ComputedBuffer, Reduction
-        from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
 
         data = MagicMock(spec=Reduction)
         data.ranges = [Integer(128)]
@@ -3788,7 +3788,7 @@ class TestValidateReductionTiling(unittest.TestCase):
 
     def test_mixed_same_level_raises(self):
         """Both output and reduction dim tiled at the same level — Stage 2, raises."""
-        from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
 
         op = self._make_op(loop_tiled_dims=[[0]], loop_tiled_reduction_dims=[[0]])
         with self.assertRaises(RuntimeError, msg="mixed same-level should raise"):
@@ -3797,7 +3797,7 @@ class TestValidateReductionTiling(unittest.TestCase):
     def test_mixed_different_levels_allowed(self):
         """Outer output-dim tiling + inner reduction-dim tiling — now supported."""
         from torch._inductor.ir import ComputedBuffer, Reduction
-        from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
 
         data = MagicMock(spec=Reduction)
         data.ranges = [Integer(128)]
@@ -3818,7 +3818,7 @@ class TestValidateReductionTiling(unittest.TestCase):
     def test_multiple_reduction_dims_same_level_raises(self):
         """Multiple reduction dims tiled at one level — Stage 2, raises."""
         from torch._inductor.ir import ComputedBuffer, Reduction
-        from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
 
         data = MagicMock(spec=Reduction)
         data.ranges = [Integer(128)]
@@ -3840,7 +3840,7 @@ class TestValidateReductionTiling(unittest.TestCase):
     def test_stick_dim_reduction_tiling_allowed(self):
         """Tiling a reduction over the stick dimension is now supported."""
         from torch._inductor.ir import ComputedBuffer, Reduction
-        from torch_spyre._inductor.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
 
         data = MagicMock(spec=Reduction)
         data.ranges = [Integer(64)]  # [B] output
@@ -4408,7 +4408,7 @@ class TestDivideReductionRanges(unittest.TestCase):
         return op
 
     def test_basic_halves_reduction_range(self):
-        from torch_spyre._inductor.coarse_tile import _divide_reduction_ranges
+        from torch_spyre._inductor.wsr.coarse_tile import _divide_reduction_ranges
 
         op = self._make_reduction_op(
             ranges=[Integer(128)], reduction_ranges=[Integer(256)]
@@ -4418,7 +4418,7 @@ class TestDivideReductionRanges(unittest.TestCase):
         self.assertEqual(op.data.ranges[0], Integer(128))  # output ranges untouched
 
     def test_empty_tiled_dims_is_noop(self):
-        from torch_spyre._inductor.coarse_tile import _divide_reduction_ranges
+        from torch_spyre._inductor.wsr.coarse_tile import _divide_reduction_ranges
 
         op = self._make_reduction_op(
             ranges=[Integer(128)], reduction_ranges=[Integer(64)]
@@ -4427,7 +4427,7 @@ class TestDivideReductionRanges(unittest.TestCase):
         self.assertEqual(op.data.reduction_ranges[0], Integer(64))  # unchanged
 
     def test_not_divisible_raises(self):
-        from torch_spyre._inductor.coarse_tile import _divide_reduction_ranges
+        from torch_spyre._inductor.wsr.coarse_tile import _divide_reduction_ranges
 
         op = self._make_reduction_op(
             ranges=[Integer(128)], reduction_ranges=[Integer(100)]
@@ -4436,7 +4436,7 @@ class TestDivideReductionRanges(unittest.TestCase):
             _divide_reduction_ranges(op, Integer(3), [0])
 
     def test_divides_second_reduction_dim(self):
-        from torch_spyre._inductor.coarse_tile import _divide_reduction_ranges
+        from torch_spyre._inductor.wsr.coarse_tile import _divide_reduction_ranges
 
         op = self._make_reduction_op(
             ranges=[Integer(32)], reduction_ranges=[Integer(64), Integer(128)]
@@ -4492,7 +4492,9 @@ class TestLoopVarToReductionRangesPos(unittest.TestCase):
         return op, red_syms
 
     def test_finds_reduction_symbol(self):
-        from torch_spyre._inductor.coarse_tile import _loop_var_to_reduction_ranges_pos
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _loop_var_to_reduction_ranges_pos,
+        )
 
         i0 = sympy.Symbol("i0")
         r0 = sympy.Symbol("r0")
@@ -4501,7 +4503,9 @@ class TestLoopVarToReductionRangesPos(unittest.TestCase):
         self.assertEqual(result, 0)
 
     def test_returns_none_for_output_symbol(self):
-        from torch_spyre._inductor.coarse_tile import _loop_var_to_reduction_ranges_pos
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _loop_var_to_reduction_ranges_pos,
+        )
 
         i0 = sympy.Symbol("i0")
         r0 = sympy.Symbol("r0")
@@ -4514,7 +4518,7 @@ class TestReductionIdentityValues(unittest.TestCase):
     """_reduction_identity_value returns the correct monoid identity per reduction type."""
 
     def _identity(self, reduction_type):
-        from torch_spyre._inductor.coarse_tile import _reduction_identity_value
+        from torch_spyre._inductor.wsr.coarse_tile import _reduction_identity_value
         import torch
 
         return _reduction_identity_value(reduction_type, torch.float16)
@@ -4538,7 +4542,7 @@ class TestReductionIdentityValues(unittest.TestCase):
         self.assertEqual(self._identity("min"), float("inf"))
 
     def test_unknown_raises(self):
-        from torch_spyre._inductor.coarse_tile import _reduction_identity_value
+        from torch_spyre._inductor.wsr.coarse_tile import _reduction_identity_value
         import torch
 
         with self.assertRaises(RuntimeError):
@@ -4602,7 +4606,7 @@ class TestReorderUnhintedInterlopers(unittest.TestCase):
     """reorder_unhinted_interlopers moves unhinted ops out of hint-group runs."""
 
     def _run(self, ops):
-        from torch_spyre._inductor.coarse_tile import reorder_unhinted_interlopers
+        from torch_spyre._inductor.wsr.coarse_tile import reorder_unhinted_interlopers
 
         graph = SimpleNamespace(operations=list(ops))
         reorder_unhinted_interlopers(graph)
@@ -4808,7 +4812,7 @@ class TestHintsLevels(unittest.TestCase):
     def test_size1_hint_dropped(self):
         """A single hint with split_count=1 produces an empty levels list."""
         import sympy
-        from torch_spyre._inductor.coarse_tile import _hints_levels
+        from torch_spyre._inductor.wsr.coarse_tile import _hints_levels
 
         op = self._make_op([(0, 1, sympy.Symbol("c0"))])
         self.assertEqual(_hints_levels([op]), [])
@@ -4818,8 +4822,8 @@ class TestHintsLevels(unittest.TestCase):
         import logging
         import logging.handlers
         import sympy
-        import torch_spyre._inductor.coarse_tile as ct_mod
-        from torch_spyre._inductor.coarse_tile import _hints_levels
+        import torch_spyre._inductor.wsr.coarse_tile as ct_mod
+        from torch_spyre._inductor.wsr.coarse_tile import _hints_levels
 
         op = self._make_op([(7, 1, sympy.Symbol("c0"))])
 
@@ -4846,7 +4850,7 @@ class TestHintsLevels(unittest.TestCase):
     def test_nonunit_hint_kept(self):
         """A hint with split_count > 1 is retained normally."""
         import sympy
-        from torch_spyre._inductor.coarse_tile import _hints_levels
+        from torch_spyre._inductor.wsr.coarse_tile import _hints_levels
 
         c0 = sympy.Symbol("c0")
         op = self._make_op([(3, 4, c0)])
@@ -4859,7 +4863,7 @@ class TestHintsLevels(unittest.TestCase):
     def test_mixed_hints_drops_only_size1(self):
         """When one hint is size-1 and another is size>1, only the size>1 survives."""
         import sympy
-        from torch_spyre._inductor.coarse_tile import _hints_levels
+        from torch_spyre._inductor.wsr.coarse_tile import _hints_levels
 
         c0, c1 = sympy.Symbol("c0"), sympy.Symbol("c1")
         op = self._make_op([(0, 1, c0), (1, 8, c1)])
@@ -4872,7 +4876,7 @@ class TestHintsLevels(unittest.TestCase):
     def test_all_size1_hints_dropped_falls_through_to_next_op(self):
         """If every hint on op0 is size-1, _hints_levels tries op1 next."""
         import sympy
-        from torch_spyre._inductor.coarse_tile import _hints_levels
+        from torch_spyre._inductor.wsr.coarse_tile import _hints_levels
 
         c0 = sympy.Symbol("c0")
         op0 = self._make_op([(0, 1, c0)])
@@ -4919,8 +4923,8 @@ def _run_htctg_and_capture_log(ops):
     import logging
     import logging.handlers
     from types import SimpleNamespace
-    from torch_spyre._inductor.coarse_tile import hints_to_coarse_tile_groups
-    import torch_spyre._inductor.coarse_tile as coarse_tile_mod
+    from torch_spyre._inductor.wsr.coarse_tile import hints_to_coarse_tile_groups
+    import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_mod
 
     graph = SimpleNamespace(operations=list(ops))
 

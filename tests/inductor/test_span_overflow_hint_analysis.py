@@ -57,7 +57,7 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP, RESTICKIFY_OP
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.propagate_hints import DimHint
-from torch_spyre._inductor.coarse_tile import (
+from torch_spyre._inductor.wsr.coarse_tile import (
     _SPAN_OVERFLOW_HINT_ID,
     coarse_tile,
     span_overflow_groups,
@@ -67,7 +67,7 @@ from torch_spyre._inductor.scheduler import (
     CountedLoopSchedulerNode,
     build_loop_scheduler_nodes,
 )
-from torch_spyre._inductor.span_overflow_hint_analysis import (
+from torch_spyre._inductor.wsr.span_overflow_hint_analysis import (
     ChunkingInfo,
     SpanOverflowTileLevel,
     SpanOverflowTilePlan,
@@ -78,8 +78,8 @@ from torch_spyre._inductor.span_overflow_hint_analysis import (
     _input_stick_alignment_error,
     plan_span_overflow_tile,
 )
-import torch_spyre._inductor.propagate_named_dims as _pnd
-import torch_spyre._inductor.span_overflow_hint_analysis as soha
+import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+import torch_spyre._inductor.wsr.span_overflow_hint_analysis as soha
 
 
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
@@ -189,7 +189,9 @@ def _run_span_overflow_groups(op):
     """Run span_overflow_groups with op_out_coords patched for one test op."""
     graph = _graph([op])
 
-    with patch("torch_spyre._inductor.coarse_tile.op_out_coords", _out_coords_for_bhld):
+    with patch(
+        "torch_spyre._inductor.wsr.coarse_tile.op_out_coords", _out_coords_for_bhld
+    ):
         return span_overflow_groups(graph)
 
 
@@ -292,7 +294,7 @@ class TestSpanOverflowGroups(InductorTestCase):
         op1 = _pointwise_op(_E2E_SHAPE, name="buf1")
 
         with patch(
-            "torch_spyre._inductor.coarse_tile.op_out_coords", _out_coords_for_bhld
+            "torch_spyre._inductor.wsr.coarse_tile.op_out_coords", _out_coords_for_bhld
         ):
             with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
                 groups = span_overflow_groups(_graph([op0, op1]))
@@ -325,7 +327,7 @@ class TestSpanOverflowGroups(InductorTestCase):
         )
 
         with patch(
-            "torch_spyre._inductor.coarse_tile.op_out_coords", _out_coords_for_bhld
+            "torch_spyre._inductor.wsr.coarse_tile.op_out_coords", _out_coords_for_bhld
         ):
             with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
                 groups = span_overflow_groups(_graph([op0, op1]))
@@ -391,10 +393,12 @@ class TestSpanOverflowGroups(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.coarse_tile.plan_span_overflow_tile", fake_plan
+                "torch_spyre._inductor.wsr.coarse_tile.plan_span_overflow_tile",
+                fake_plan,
             ),
             patch(
-                "torch_spyre._inductor.coarse_tile.op_out_coords", _out_coords_for_bhld
+                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+                _out_coords_for_bhld,
             ),
             config.patch({"sencores": 4, "ignore_span_overflow_hints": False}),
         ):
@@ -437,15 +441,17 @@ class TestSpanOverflowGroups(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.coarse_tile.plan_span_overflow_tile", fake_plan
+                "torch_spyre._inductor.wsr.coarse_tile.plan_span_overflow_tile",
+                fake_plan,
             ),
             patch(
-                "torch_spyre._inductor.coarse_tile.op_out_coords", _out_coords_for_bhld
+                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+                _out_coords_for_bhld,
             ),
             # Through the read, the matmul's tiled symbol (l) indexes the
             # producer's tiled dim (host_dim=1) -> same logical dim -> join.
             patch(
-                "torch_spyre._inductor.coarse_tile.host_coordinates",
+                "torch_spyre._inductor.wsr.coarse_tile.host_coordinates",
                 lambda layout, dep, indirect: [
                     sympy.Symbol("b"),
                     sympy.Symbol("l"),
@@ -454,7 +460,7 @@ class TestSpanOverflowGroups(InductorTestCase):
                 ],
             ),
             patch(
-                "torch_spyre._inductor.coarse_tile.indirect_sizes_from_op",
+                "torch_spyre._inductor.wsr.coarse_tile.indirect_sizes_from_op",
                 lambda op: {},
             ),
             config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
@@ -498,15 +504,17 @@ class TestSpanOverflowGroups(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.coarse_tile.plan_span_overflow_tile", fake_plan
+                "torch_spyre._inductor.wsr.coarse_tile.plan_span_overflow_tile",
+                fake_plan,
             ),
             patch(
-                "torch_spyre._inductor.coarse_tile.op_out_coords", _out_coords_for_bhld
+                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+                _out_coords_for_bhld,
             ),
             # Producer's tiled dim (host_dim=1) is indexed by 'z', NOT the
             # matmul's tiled symbol 'l' -> unrelated dims -> must not join.
             patch(
-                "torch_spyre._inductor.coarse_tile.host_coordinates",
+                "torch_spyre._inductor.wsr.coarse_tile.host_coordinates",
                 lambda layout, dep, indirect: [
                     sympy.Symbol("b"),
                     sympy.Symbol("z"),
@@ -515,7 +523,7 @@ class TestSpanOverflowGroups(InductorTestCase):
                 ],
             ),
             patch(
-                "torch_spyre._inductor.coarse_tile.indirect_sizes_from_op",
+                "torch_spyre._inductor.wsr.coarse_tile.indirect_sizes_from_op",
                 lambda op: {},
             ),
             config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
@@ -558,15 +566,17 @@ class TestSpanOverflowGroups(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.coarse_tile.plan_span_overflow_tile", fake_plan
+                "torch_spyre._inductor.wsr.coarse_tile.plan_span_overflow_tile",
+                fake_plan,
             ),
             patch(
-                "torch_spyre._inductor.coarse_tile.op_out_coords", _out_coords_for_bhld
+                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+                _out_coords_for_bhld,
             ),
             # Through the read, the reduction's tiled symbol (l) indexes the
             # producer's tiled dim (host_dim=1) -> same logical dim -> join.
             patch(
-                "torch_spyre._inductor.coarse_tile.host_coordinates",
+                "torch_spyre._inductor.wsr.coarse_tile.host_coordinates",
                 lambda layout, dep, indirect: [
                     sympy.Symbol("b"),
                     sympy.Symbol("l"),
@@ -575,7 +585,7 @@ class TestSpanOverflowGroups(InductorTestCase):
                 ],
             ),
             patch(
-                "torch_spyre._inductor.coarse_tile.indirect_sizes_from_op",
+                "torch_spyre._inductor.wsr.coarse_tile.indirect_sizes_from_op",
                 lambda op: {},
             ),
             config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
@@ -620,15 +630,17 @@ class TestSpanOverflowGroups(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.coarse_tile.plan_span_overflow_tile", fake_plan
+                "torch_spyre._inductor.wsr.coarse_tile.plan_span_overflow_tile",
+                fake_plan,
             ),
             patch(
-                "torch_spyre._inductor.coarse_tile.op_out_coords", _out_coords_for_bhld
+                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+                _out_coords_for_bhld,
             ),
             # Producer's tiled dim (host_dim=1) is indexed by 'z', NOT the
             # reduction's tiled symbol 'l' -> unrelated dims -> must not join.
             patch(
-                "torch_spyre._inductor.coarse_tile.host_coordinates",
+                "torch_spyre._inductor.wsr.coarse_tile.host_coordinates",
                 lambda layout, dep, indirect: [
                     sympy.Symbol("b"),
                     sympy.Symbol("z"),
@@ -637,7 +649,7 @@ class TestSpanOverflowGroups(InductorTestCase):
                 ],
             ),
             patch(
-                "torch_spyre._inductor.coarse_tile.indirect_sizes_from_op",
+                "torch_spyre._inductor.wsr.coarse_tile.indirect_sizes_from_op",
                 lambda op: {},
             ),
             config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
@@ -712,13 +724,15 @@ class TestSpanOverflowGroups(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.coarse_tile.plan_span_overflow_tile", fake_plan
+                "torch_spyre._inductor.wsr.coarse_tile.plan_span_overflow_tile",
+                fake_plan,
             ),
             patch(
-                "torch_spyre._inductor.coarse_tile.op_out_coords", _out_coords_for_bhld
+                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+                _out_coords_for_bhld,
             ),
             patch(
-                "torch_spyre._inductor.coarse_tile.host_coordinates",
+                "torch_spyre._inductor.wsr.coarse_tile.host_coordinates",
                 lambda layout, dep, indirect: [
                     sympy.Symbol("b"),
                     sympy.Symbol("l"),
@@ -727,7 +741,7 @@ class TestSpanOverflowGroups(InductorTestCase):
                 ],
             ),
             patch(
-                "torch_spyre._inductor.coarse_tile.indirect_sizes_from_op",
+                "torch_spyre._inductor.wsr.coarse_tile.indirect_sizes_from_op",
                 lambda op: {},
             ),
             config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
@@ -770,13 +784,15 @@ class TestSpanOverflowGroups(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.coarse_tile.plan_span_overflow_tile", fake_plan
+                "torch_spyre._inductor.wsr.coarse_tile.plan_span_overflow_tile",
+                fake_plan,
             ),
             patch(
-                "torch_spyre._inductor.coarse_tile.op_out_coords", _out_coords_for_bhld
+                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+                _out_coords_for_bhld,
             ),
             patch(
-                "torch_spyre._inductor.coarse_tile.host_coordinates",
+                "torch_spyre._inductor.wsr.coarse_tile.host_coordinates",
                 lambda layout, dep, indirect: [
                     sympy.Symbol("b"),
                     sympy.Symbol("l"),
@@ -785,7 +801,7 @@ class TestSpanOverflowGroups(InductorTestCase):
                 ],
             ),
             patch(
-                "torch_spyre._inductor.coarse_tile.indirect_sizes_from_op",
+                "torch_spyre._inductor.wsr.coarse_tile.indirect_sizes_from_op",
                 lambda op: {},
             ),
             config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
@@ -811,10 +827,12 @@ class TestSpanOverflowGroups(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.coarse_tile.plan_span_overflow_tile", fake_plan
+                "torch_spyre._inductor.wsr.coarse_tile.plan_span_overflow_tile",
+                fake_plan,
             ),
             patch(
-                "torch_spyre._inductor.coarse_tile.op_out_coords", _out_coords_for_bhld
+                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+                _out_coords_for_bhld,
             ),
             config.patch({"sencores": 4, "ignore_span_overflow_hints": False}),
         ):
@@ -885,21 +903,22 @@ class TestSpanOverflowGroups(InductorTestCase):
         # weight producer's tiled dim0 -- the same logical vocab dim.
         with (
             patch(
-                "torch_spyre._inductor.coarse_tile.plan_span_overflow_tile", fake_plan
+                "torch_spyre._inductor.wsr.coarse_tile.plan_span_overflow_tile",
+                fake_plan,
             ),
             patch(
-                "torch_spyre._inductor.coarse_tile.op_out_coords",
+                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
                 lambda op: [sympy.Symbol("d0"), sympy.Symbol("d1")],
             ),
             patch(
-                "torch_spyre._inductor.coarse_tile.host_coordinates",
+                "torch_spyre._inductor.wsr.coarse_tile.host_coordinates",
                 lambda layout, dep, indirect: [
                     sympy.Symbol("d1"),
                     sympy.Symbol("d0"),
                 ],
             ),
             patch(
-                "torch_spyre._inductor.coarse_tile.indirect_sizes_from_op",
+                "torch_spyre._inductor.wsr.coarse_tile.indirect_sizes_from_op",
                 lambda op: {},
             ),
             config.patch({"sencores": 4, "ignore_span_overflow_hints": False}),
@@ -948,7 +967,8 @@ class TestSpanOverflowGroups(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.coarse_tile.op_out_coords", _out_coords_for_bhld
+                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+                _out_coords_for_bhld,
             ),
             config.patch({"sencores": 4, "ignore_span_overflow_hints": False}),
         ):
@@ -1028,7 +1048,7 @@ class TestSpanOverflowGroups(InductorTestCase):
 
         with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
             with patch(
-                "torch_spyre._inductor.coarse_tile.op_out_coords",
+                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
                 _out_coords_for_bhld,
             ):
                 groups = span_overflow_groups(_graph([hinted_op, unhinted_op]))
@@ -1079,7 +1099,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         op = _pointwise_op(_E2E_SHAPE)
 
         with patch(
-            "torch_spyre._inductor.span_overflow_hint_analysis.indirect_info_from_op",
+            "torch_spyre._inductor.wsr.span_overflow_hint_analysis.indirect_info_from_op",
             return_value=({"arg1"}, {}, {sympy.Symbol("indirect0"): 8}),
         ):
             plan = plan_span_overflow_tile(op, max_cores=4)
@@ -1116,23 +1136,23 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
                 MAX_SPAN_BYTES,
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._output_span_candidates_from_op",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._output_span_candidates_from_op",
                 return_value=[],
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._input_read_deps",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._input_read_deps",
                 return_value=[(input_dep, input_layout)],
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._output_symbol_to_dim",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._output_symbol_to_dim",
                 return_value={m: 0},
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._remaining_span_candidates_after_tile",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._remaining_span_candidates_after_tile",
                 return_value=[],
             ),
         ):
@@ -1156,15 +1176,15 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
                 MAX_SPAN_BYTES,
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._input_read_deps",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._input_read_deps",
                 return_value=[(input_dep, input_layout)],
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._output_symbol_to_dim",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._output_symbol_to_dim",
                 return_value={n: 0},
             ),
         ):
@@ -1189,23 +1209,23 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
                 MAX_SPAN_BYTES,
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._output_span_candidates_from_op",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._output_span_candidates_from_op",
                 return_value=[],
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._input_read_deps",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._input_read_deps",
                 return_value=[(rhs_dep, rhs_layout)],
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._output_symbol_to_dim",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._output_symbol_to_dim",
                 return_value={b: 0, m: 1, n: 2},
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._remaining_span_candidates_after_tile",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._remaining_span_candidates_after_tile",
                 return_value=[],
             ),
         ):
@@ -1231,15 +1251,15 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
                 MAX_SPAN_BYTES,
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._input_read_deps",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._input_read_deps",
                 return_value=[(lhs_dep, lhs_layout)],
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._output_symbol_to_dim",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._output_symbol_to_dim",
                 return_value={b: 0, m: 1, n: 2},
             ),
         ):
@@ -1283,19 +1303,19 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
                 MAX_SPAN_BYTES,
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._output_span_candidates_from_op",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._output_span_candidates_from_op",
                 return_value=[output_candidate],
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._input_span_candidates",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._input_span_candidates",
                 return_value=[input_candidate],
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._remaining_span_candidates_after_tile",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._remaining_span_candidates_after_tile",
                 side_effect=remaining_after_tile,
             ),
         ):
@@ -1339,15 +1359,15 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
                 MAX_SPAN_BYTES,
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._output_span_candidates_from_op",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._output_span_candidates_from_op",
                 return_value=candidates,
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._remaining_span_candidates_after_tile",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._remaining_span_candidates_after_tile",
                 side_effect=remaining_after_tile,
             ),
         ):
@@ -1373,11 +1393,11 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis.V",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis.V",
                 SimpleNamespace(graph=SimpleNamespace(get_buffer=lambda name: name)),
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._fixed_read_layout",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._fixed_read_layout",
                 side_effect=fake_fixed_read_layout,
             ),
         ):
@@ -1426,7 +1446,8 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         op = _pointwise_op((1, 17, 16, 64))
 
         with patch(
-            "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES", 32768
+            "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+            32768,
         ):
             plan = plan_span_overflow_tile(op, max_cores=4)
 
@@ -1440,7 +1461,8 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         op = _reduction_op((1, 17, 16, 64))
 
         with patch(
-            "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES", 32768
+            "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+            32768,
         ):
             with self.assertRaisesRegex(Unsupported, "no combined split"):
                 plan_span_overflow_tile(op, max_cores=4)
@@ -1449,7 +1471,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         op = _pointwise_op(_E2E_SHAPE)
 
         with patch(
-            "torch_spyre._inductor.span_overflow_hint_analysis._remaining_span_candidates_after_tile",
+            "torch_spyre._inductor.wsr.span_overflow_hint_analysis._remaining_span_candidates_after_tile",
             return_value=[object()],
         ):
             with self.assertRaisesRegex(Unsupported, "no combined split"):
@@ -1459,7 +1481,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         op = _reduction_op(_E2E_SHAPE)
 
         with patch(
-            "torch_spyre._inductor.span_overflow_hint_analysis.indirect_info_from_op",
+            "torch_spyre._inductor.wsr.span_overflow_hint_analysis.indirect_info_from_op",
             return_value=({"arg1"}, {}, {sympy.Symbol("indirect0"): 8}),
         ):
             plan = plan_span_overflow_tile(op, max_cores=4)
@@ -1479,15 +1501,15 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis.indirect_info_from_op",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis.indirect_info_from_op",
                 return_value=({"arg0"}, {}, {sympy.Symbol("indirect0"): 8}),
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._input_read_deps",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._input_read_deps",
                 return_value=[(input_dep, input_layout)],
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._output_symbol_to_dim",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._output_symbol_to_dim",
                 return_value={m: 0, n: 1},
             ),
         ):
@@ -1508,23 +1530,23 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
                 MAX_SPAN_BYTES,
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._input_read_deps",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._input_read_deps",
                 return_value=[(input_dep, input_layout)],
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._output_symbol_to_dim",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._output_symbol_to_dim",
                 return_value={m: 0, n: 1},
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._device_coordinates_for_span",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._device_coordinates_for_span",
                 return_value=[k, m, n],
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._remaining_span_candidates_after_tile",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._remaining_span_candidates_after_tile",
                 return_value=[],
             ),
         ):
@@ -1545,7 +1567,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         dep1 = MemoryDep("rhs", k1 * 64 + n, (k1, n), (64, 64))
 
         with patch(
-            "torch_spyre._inductor.span_overflow_hint_analysis._output_symbol_to_dim",
+            "torch_spyre._inductor.wsr.span_overflow_hint_analysis._output_symbol_to_dim",
             return_value={b: 0, m: 1, n: 2},
         ):
             symbol_to_dim = _bmm_output_symbol_to_dim(
@@ -1571,11 +1593,11 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._input_read_deps",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._input_read_deps",
                 return_value=[(input_dep, input_layout)],
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._output_symbol_to_dim",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._output_symbol_to_dim",
                 return_value={m: 0, n: 1},
             ),
         ):
@@ -1606,15 +1628,15 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._input_read_deps",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._input_read_deps",
                 return_value=[(input_dep, input_layout)],
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis._output_symbol_to_dim",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._output_symbol_to_dim",
                 return_value={m: 0, n: 1},
             ),
             patch(
-                "torch_spyre._inductor.span_overflow_hint_analysis.host_coordinates",
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis.host_coordinates",
                 return_value=[k, m + n],
             ),
         ):
@@ -1639,7 +1661,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         self.assertEqual(_candidate_host_dims(candidates), [0, 2, 1])
 
-    @patch("torch_spyre._inductor.coarse_tile.op_out_coords", _out_coords_for_bhld)
+    @patch("torch_spyre._inductor.wsr.coarse_tile.op_out_coords", _out_coords_for_bhld)
     def test_adapter_creates_dim_hint_and_group(self):
         op = _pointwise_op(_E2E_SHAPE)
 
@@ -1655,7 +1677,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertEqual(op.dim_hints[0].loop_var, sympy.Symbol("h"))
 
     @patch(
-        "torch_spyre._inductor.coarse_tile.op_out_coords",
+        "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
         _out_coords_for_symbolic_bhld,
     )
     def test_adapter_handles_nontrivial_batch_coord(self):
@@ -1671,8 +1693,8 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertEqual(op.dim_hints[0].loop_var, sympy.Symbol("h"))
         self.assertEqual(groups[0][1][0][1], sympy.Integer(_E2E_SPLIT_COUNT))
 
-    @patch("torch_spyre._inductor.coarse_tile.insert_tiling_propagation")
-    @patch("torch_spyre._inductor.coarse_tile.op_out_coords", _out_coords_for_bhld)
+    @patch("torch_spyre._inductor.wsr.coarse_tile.insert_tiling_propagation")
+    @patch("torch_spyre._inductor.wsr.coarse_tile.op_out_coords", _out_coords_for_bhld)
     def test_coarse_tile_consumes_auto_group_and_stamps_op(
         self,
         _mock_insert_tiling_propagation,
@@ -2092,10 +2114,12 @@ class TestSpanOverflowLargeShapeContract(InductorTestCase):
         self.assertFalse(plan.levels[0].is_reduction)
 
         with patch(
-            "torch_spyre._inductor.coarse_tile.op_out_coords",
+            "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
             _out_coords_for_bhld,
         ):
-            with patch("torch_spyre._inductor.coarse_tile.insert_tiling_propagation"):
+            with patch(
+                "torch_spyre._inductor.wsr.coarse_tile.insert_tiling_propagation"
+            ):
                 with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
                     # Layer 2: adapter emits the same group shape as user hints.
                     auto_graph = _graph([auto_op])
@@ -2161,7 +2185,7 @@ class TestSpanOverflowLargeShapeContract(InductorTestCase):
 class TestSpanOverflowPointwiseCodegen(InductorTestCase):
     """Small codegen test for scheduler/codegen LoopSpec emission."""
 
-    @patch("torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES", 8192)
+    @patch("torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES", 8192)
     @config.patch(
         {
             "sencores": 4,
@@ -2190,7 +2214,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         self.assertIn("LoopSpec(", src)
         self.assertIn("sympify('5')", src)
 
-    @patch("torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES", 8192)
+    @patch("torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES", 8192)
     @config.patch(
         {
             "sencores": 4,
@@ -2273,7 +2297,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
             patch(_PREPARE_KERNEL),
             patch("subprocess.run"),
             patch(
-                "torch_spyre._inductor.coarse_tile.plan_span_overflow_tile",
+                "torch_spyre._inductor.wsr.coarse_tile.plan_span_overflow_tile",
                 return_value=fake_plan,
             ),
         ):
@@ -2297,7 +2321,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
     # synchronized group by test_lm_head_matmul_joins_tiled_restickify_producer
     # -- so this test always asserted the same outcome as that one.
 
-    @patch("torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES", 8192)
+    @patch("torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES", 8192)
     @config.patch(
         {
             "sencores": 4,
@@ -2471,7 +2495,7 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
             self.assertTrue(has_sum)
 
         with patch(
-            "torch_spyre._inductor.coarse_tile.plan_span_overflow_tile", forced_plan
+            "torch_spyre._inductor.wsr.coarse_tile.plan_span_overflow_tile", forced_plan
         ):
             compare_with_cpu(
                 fn,
