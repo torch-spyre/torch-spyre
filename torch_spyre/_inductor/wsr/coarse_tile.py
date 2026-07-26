@@ -86,7 +86,9 @@ from torch.utils._ordered_set import OrderedSet
 
 from torch_spyre._C import SpyreTensorLayout
 
+from .. import config
 from ..constants import BATCH_MATMUL_OP
+from ..errors import Unsupported
 from ..logging_utils import get_inductor_logger
 from ..loop_info import CoarseTileInfo, copy_op_metadata
 from ..propagate_hints import DimHint
@@ -827,6 +829,57 @@ def _is_loop_invariant_at_reduction_levels_stamped(
     if not levels:
         return False
     return all(not loop_info.loop_tiled_dims[i] for i in levels)
+
+
+def _group_reduction_tiled_levels_in_group(
+    group_ops: list[Operation],
+    levels: list[tuple],
+) -> set[int]:
+    """Planning-time equivalent of _group_reduction_tiled_levels.
+
+    Level indices (positions into per-op loop_tiled_dims/
+    loop_tiled_reduction_dims) where some Reduction op in group_ops tiles a
+    reduction dim, computed directly from group_ops -- planning already has
+    the group's ops together (unlike the post-stamp version, which only has
+    the flat operations list and must filter by loop_group_id[0]).
+
+    A Reduction op's own reduction-tiled-dims list is only ever non-empty at
+    a level for that op (Pointwise ops never populate reduction dims -- see
+    plan_coarse_tile_groups's hint_id_to_reduction_ranges_pos, gated on
+    isinstance(op.data, Reduction)), so this scan only needs to inspect
+    Reduction ops; a Pointwise-only group always yields an empty set.
+    """
+    reduction_levels: set[int] = set()
+    for o in group_ops:
+        if not isinstance(o, ComputedBuffer) or not isinstance(o.data, Reduction):
+            continue
+        hint_id_to_reduction_ranges_pos: dict[int, int] = {
+            h.hint_id: pos
+            for h in getattr(o, "dim_hints", [])
+            if h.loop_var is not None and h.is_reduction
+            if (pos := _loop_var_to_reduction_ranges_pos(o, h.loop_var)) is not None
+        }
+        for level_idx, (hint_id, _count) in enumerate(levels):
+            if hint_id in hint_id_to_reduction_ranges_pos:
+                reduction_levels.add(level_idx)
+    return reduction_levels
+
+
+def _plan_is_loop_invariant_at_reduction_levels(
+    op: ComputedBuffer,
+    op_tiled_dims: list[list[int]],
+    group_reduction_tiled_levels: set[int],
+) -> bool:
+    """True if op is loop-invariant at every level where some Reduction op
+    in the same group tiles a reduction dim -- planning-time equivalent of
+    _is_loop_invariant_at_reduction_levels_stamped, using the group's
+    own ops (already available during planning) instead of a flat-list
+    post-stamp scan."""
+    if not isinstance(op.data, Pointwise):
+        return False
+    if not group_reduction_tiled_levels:
+        return False
+    return all(not op_tiled_dims[i] for i in group_reduction_tiled_levels)
 
 
 def _op_reads(op: ComputedBuffer) -> set[str]:
@@ -2797,6 +2850,9 @@ def plan_coarse_tile_groups(
         group_id: tuple[int, ...] = (group_idx,)
         nested_group_id: tuple[int, ...] = group_id + (0,) * (len(levels) - 1)
         counts = [count for _, count in levels]
+        group_reduction_tiled_levels = _group_reduction_tiled_levels_in_group(
+            group_ops, levels
+        )
 
         for op in group_ops:
             if not isinstance(op, ComputedBuffer):
@@ -2830,6 +2886,22 @@ def plan_coarse_tile_groups(
                 rpos = hint_id_to_reduction_ranges_pos.get(hint_id)
                 op_tiled_dims.append([opos] if opos is not None else [])
                 op_tiled_reduction_dims.append([rpos] if rpos is not None else [])
+
+            has_tiled_reduction = any(op_tiled_reduction_dims)
+            if has_tiled_reduction and not config.enable_reduction_tiling:
+                raise Unsupported(
+                    f"reduction-dim tiling for op {op.get_name()} "
+                    "(disabled via enable_reduction_tiling)"
+                )
+
+            if _plan_is_loop_invariant_at_reduction_levels(
+                op, op_tiled_dims, group_reduction_tiled_levels
+            ):
+                if _seed_buffer_for_carry(op, nested_group_id, operations) is not None:
+                    raise Unsupported(
+                        f"reduction-dim tiling requiring carry propagation for "
+                        f"op {op.get_name()}"
+                    )
 
             combined_extents = _planned_tile_extents(
                 op, op_tiled_dims, op_tiled_reduction_dims, levels

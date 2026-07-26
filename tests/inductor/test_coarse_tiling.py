@@ -68,6 +68,7 @@ from torch_spyre._inductor.constants import (
     SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.wsr.coarse_tile import (
     _LOOPS_FREE_SYMS_KEY,
@@ -1750,6 +1751,142 @@ class TestCoarseTileTileAdvanceExprs(unittest.TestCase):
         self.assertTrue(
             all(id(o) in plan for o in group_ops if isinstance(o, ComputedBuffer))
         )
+
+    def test_plan_raises_unsupported_when_reduction_tiling_disabled(self):
+        """Planning raises Unsupported for reduction-dim tiling when disabled.
+
+        Single-level group, hint_id 1 tiles reduction dim 0 (dim_index 1 ==
+        len(ranges) + 0), matching TestValidateReductionTiling's
+        pure-reduction-tile shape -- the same fixture
+        test_reduction_dim_advance_is_offset_by_output_dims uses for a
+        _stamp_group-level check, but exercised through
+        plan_coarse_tile_groups instead.
+        """
+        op = _make_real_reduction_op(
+            ranges=[Integer(128)],
+            reduction_ranges=[Integer(256)],
+            input_shape_stride=([128, 256], [256, 1]),
+            name="buf0",
+            hints=((1, 1),),
+        )
+        group_ops = [op]
+        levels = [(1, Integer(4))]
+
+        with config.patch({"enable_reduction_tiling": False}):
+            with self.assertRaisesRegex(
+                Unsupported, "disabled via enable_reduction_tiling"
+            ):
+                plan_coarse_tile_groups(group_ops, [(group_ops, levels)])
+
+    def test_plan_raises_unsupported_for_carry(self):
+        """Planning raises Unsupported for an op requiring carry propagation.
+
+        Models the flash-attention online-softmax shape
+        (tests/inductor/test_coarse_tile_e2e.py::test_hint_flash_attention's
+        running_max/QK^T pattern): a Reduction op ("red0", e.g. the QK^T
+        matmul) tiles its reduction dim at the group's only level, and a
+        sibling Pointwise op ("carry0", e.g. the running-max update) is
+        loop-invariant at that level (no output-dim tiling there) and reads
+        a pre-loop constant-fill seed buffer directly -- the exact shape
+        _seed_buffer_for_carry's docstring describes.
+
+        The seed itself must be a ComputedBuffer(Pointwise) wrapping a
+        SpyreConstantFallback scalar (matching lowering.py's real
+        full.default lowering and coarse_tile.py's own fill-insertion code
+        at ~line 2023) -- _seed_buffer_for_carry only accepts ComputedBuffer
+        reads as seed candidates (see coarse_tile.py's
+        `isinstance(buf, ComputedBuffer)` check), so carry0 must read this
+        wrapper buffer ("seed0"), not the raw SpyreConstantFallback scalar
+        directly.
+
+        _seed_closure (called by _seed_buffer_for_carry) restricts its scan
+        to ops already stamped with loop_info in the same outer group --
+        that stamping normally happens in _stamp_group, which planning
+        never calls (planning is zero-mutation). This fixture pre-stamps
+        carry0.loop_info directly to simulate "already decided this op is
+        in outer group 0", matching the closure-membership shape the real
+        pipeline produces by the time _seed_buffer_for_carry ever runs
+        post-stamp -- carry0 itself is never actually stamped by
+        plan_coarse_tile_groups (it stays zero-mutation for real ops), this
+        is fixture setup only.
+        """
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            Pointwise,
+            StorageBox,
+            TensorBox,
+        )
+        from torch_spyre._inductor.ir import SpyreConstantFallback
+
+        red_op = _make_real_reduction_op(
+            ranges=[Integer(8)],
+            reduction_ranges=[Integer(16)],
+            input_shape_stride=([8, 16], [16, 1]),
+            name="red0",
+            hints=((1, 1),),
+        )
+
+        # Seed buffer: a constant-fill wrapper -- ComputedBuffer(Pointwise)
+        # whose only read resolves to a SpyreConstantFallback scalar (see
+        # _is_constant_fill). Mirrors torch.full's real lowering shape.
+        scalar_op = SpyreConstantFallback(
+            torch.ops.spyre.constant.default, 0.0, torch.float32, torch.device("cpu")
+        )
+        scalar_loader = TensorBox(StorageBox(scalar_op)).make_loader()
+
+        def seed_inner_fn(index, _loader=scalar_loader):
+            return _loader([])
+
+        seed_pw = Pointwise(
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            inner_fn=seed_inner_fn,
+            ranges=[Integer(8)],
+        )
+        seed_buf = ComputedBuffer(
+            name="seed0",
+            layout=FixedLayout(torch.device("cpu"), torch.float32, [Integer(8)], None),
+            data=seed_pw,
+        )
+        seed_buf.operation_name = "seed0"
+        V.graph.name_to_buffer["seed0"] = seed_buf
+
+        # carry0 reads the seed buffer directly -- the running-max-style
+        # carry step, loop-invariant at the reduction-tiled level.
+        seed_loader = TensorBox(StorageBox(seed_buf)).make_loader()
+
+        def carry_inner_fn(index, _loader=seed_loader):
+            return _loader(index)
+
+        carry_pw = Pointwise(
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            inner_fn=carry_inner_fn,
+            ranges=[Integer(8)],
+        )
+        carry_op = ComputedBuffer(
+            name="carry0",
+            layout=FixedLayout(torch.device("cpu"), torch.float32, [Integer(8)], None),
+            data=carry_pw,
+        )
+        carry_op.operation_name = "carry0"
+        V.graph.name_to_buffer["carry0"] = carry_op
+        carry_op._test_out_coords = [sympy.Symbol("c0")]
+        carry_op.dim_hints = []  # loop-invariant: no dim_hints tile any level
+        # Simulate post-_stamp_group state for the closure-membership check
+        # in _seed_buffer_for_carry -> _seed_closure (see docstring above).
+        carry_op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[]],
+        )
+
+        group_ops = [red_op, carry_op]
+        levels = [(1, Integer(4))]
+
+        with self.assertRaisesRegex(Unsupported, "requiring carry propagation"):
+            plan_coarse_tile_groups(group_ops, [(group_ops, levels)])
 
 
 def _make_fixed_flag_op(
