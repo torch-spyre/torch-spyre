@@ -54,6 +54,7 @@ from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
 from torch_spyre._C import DataFormats
+from torch_spyre._inductor import config
 from torch_spyre._inductor.codegen.bundle import generate_bundle
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.codegen.compute_ops import generate_sdsc
@@ -680,6 +681,17 @@ class TestCoarseTileInfo(unittest.TestCase):
             info.output_tile_advance_expr,
             Integer(1024) * Integer(512) * d0 + Integer(1024) * d1,
         )
+
+
+class TestConfigFlags(unittest.TestCase):
+    """Test configuration flags."""
+
+    def test_enable_reduction_tiling_default_and_patch(self):
+        """enable_reduction_tiling defaults to True and is patchable."""
+        self.assertTrue(config.enable_reduction_tiling)
+        with config.patch({"enable_reduction_tiling": False}):
+            self.assertFalse(config.enable_reduction_tiling)
+        self.assertTrue(config.enable_reduction_tiling)
 
 
 class TestTileAdvanceExprFromDep(unittest.TestCase):

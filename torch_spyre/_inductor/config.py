@@ -89,6 +89,15 @@ core_id_k_fast_emission: bool = (
 # into the SDSC JSON and bundle.mlir emits sdsc_execute with no operands.
 bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 
+# Enable reduction-dim (Lk-style) coarse tiling. Defaults to enabled — this
+# capability is exercised by passing tests today. Disabling it (or a future
+# hardware limitation that can't support it) makes planning treat any op
+# whose group requests reduction-dim tiling as unsupported, raising
+# Unsupported rather than attempting to tile it.
+enable_reduction_tiling: bool = (
+    os.environ.get("SPYRE_INDUCTOR_ENABLE_REDUCTION_TILING", "1") == "1"
+)
+
 # Layout solver class used by default in scratchpad.allocator.ScratchpadAllocator.
 # Options:
 #  "greedy":       GreedyLayoutSolver (default),
