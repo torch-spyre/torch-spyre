@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import math
 import warnings
 from dataclasses import dataclass
@@ -1681,3 +1682,32 @@ def _per_core_view_on_buf(
     if cache is not None:
         cache[key] = result
     return result
+
+
+def format_operations(operations: list[Operation]) -> str:
+    """Format LLIR operations including torch-spyre custom metadata"""
+    buf = io.StringIO()
+    for op in operations:
+        buf.write(f"{op.get_operation_name()}: {type(op).__name__}")
+        if isinstance(op, ComputedBuffer):
+            buf.write(f"\n  layout={op.layout}")
+            if allocation := getattr(op.layout, "allocation", None):
+                buf.write(f"\n  allocation={allocation}")
+            if splits := getattr(op, "op_it_space_splits", None):
+                rw = op.get_read_writes()
+                write_index = next(iter(rw.writes)).index
+                read_index = next((d.index for d in rw.reads), write_index)
+                it_space = iteration_space_from_op(op)
+                readable_splits = apply_splits_from_index_coeff(
+                    splits, write_index, read_index, it_space
+                )
+                buf.write(f"\n  op_it_space_splits={readable_splits}")
+            if dim_hints := getattr(op, "dim_hints", None):
+                buf.write(f"\n  dim_hints={dim_hints}")
+            if loop_info := getattr(op, "loop_info", None):
+                buf.write(f"\n  loop_info={loop_info}")
+            if pending_per_tile_fixed := getattr(op, "_pending_per_tile_fixed", None):
+                buf.write(f"\n  _pending_per_tile_fixed={pending_per_tile_fixed}")
+            buf.write(f"\n  {op.data}")
+        buf.write("\n\n")
+    return buf.getvalue()

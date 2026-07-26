@@ -799,11 +799,11 @@ def tiling_expr_to_device_expr(
     vars = index.free_symbols
     for var in vars:
         step = index.xreplace({var: 1}).xreplace({v: 0 for v in vars})
-        j = n - 1  # device dimension for var
-        for i in range(n - 1):
+        j = -1  # device dimension for var
+        for i in range(n):
             if (
                 device_size[i] > 1
-                and stride_map[i] > stride_map[j]
+                and stride_map[i] > (stride_map[j] if j != -1 else 0)
                 and stride_map[i] <= step
             ):
                 j = i

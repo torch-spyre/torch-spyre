@@ -284,6 +284,13 @@ class TestTilingExprToDeviceExpr(TestCase):
         result = tiling_expr_to_device_expr([16, 4096, 64], [64, 1024, 1], index)
         self.assertEqual(result, 2097152 * p0 + 65536 * p1)
 
+    def test_tiling_expr_row_major_transposed_restickified(self):
+        # [1024, 4096] tensor tiled 2x4 times (generic stick format) transposed
+        # and restickified before use
+        index = 512 * p0 + 1024 * 1024 * p1
+        result = tiling_expr_to_device_expr([64, 1024, 64], [65536, 1, 1024], index)
+        self.assertEqual(result, 32768 * p0 + 1048576 * p1)
+
 
 if __name__ == "__main__":
     run_tests()
