@@ -979,8 +979,8 @@ Current coverage includes:
 
 | File | Role |
 |---|---|
-| `torch_spyre/_inductor/span_overflow_hint_analysis.py` | Candidate collection, combo search, post-tile validation, tile-plan dataclasses |
-| `torch_spyre/_inductor/coarse_tile.py` | Adapter from tile plans to synthetic `DimHint`s; coarse-tile IR stamping |
+| `torch_spyre/_inductor/wsr/span_overflow_hint_analysis.py` | Candidate collection, combo search, post-tile validation, tile-plan dataclasses |
+| `torch_spyre/_inductor/wsr/coarse_tile.py` | Adapter from tile plans to synthetic `DimHint`s; coarse-tile IR stamping |
 | `torch_spyre/_inductor/passes.py` | Combines user hint groups and automatic span-overflow groups |
 | `torch_spyre/_inductor/propagate_layouts.py` | Preserves pointwise producer layouts from copy-back elision when automatic span-overflow is explicitly enabled |
 | `torch_spyre/_inductor/ir.py` | Spyre layout resize/reconstruction helpers |
