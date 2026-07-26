@@ -43,10 +43,8 @@ from .temp_passes import (
     mark_direct_unit_bmm_pass,
     mm_to_bmm_pass,
 )
-from .wsr.coarse_tile import (
-    span_overflow_groups,
-    validate_coarse_tile_groups,
-)
+from .wsr.coarse_tile import validate_coarse_tile_groups
+from .wsr.coarse_tile_span_overflow import span_overflow_groups
 from .wsr.coarse_tile_hints import (
     hints_to_coarse_tile_groups,
     reorder_unhinted_interlopers,
