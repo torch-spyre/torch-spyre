@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import torch_spyre._inductor.propagate_named_dims as _pnd
+import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch._inductor.utils import run_and_get_code
 from torch_spyre._inductor import spyre_hint  # noqa: F401
 
