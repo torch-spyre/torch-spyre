@@ -81,6 +81,35 @@ CREATE TABLE spyre.run_properties
 )
 ```
 
+### `spyre.pr_check_events`
+
+Right now our Jenkins CI only sends test pass/fail data to ClickHouse, not the actual
+build and check-run activity (like when a check starts, finishes, or what
+artifact it produced), so the dashboard can't show that. The
+`pr_check_events` table stores this activity per PR, so we can eventually
+see it on the dashboard.
+
+```sql
+CREATE TABLE IF NOT EXISTS pr_check_events
+(
+    ts            DateTime DEFAULT now(),
+    host          LowCardinality(String),
+    owner         String,
+    repo          String,
+    pr            UInt32,
+    sha           String,
+    run_id        String,
+    build_url     String,
+    component     String,
+    arch          LowCardinality(String),
+    mode          LowCardinality(String),
+    state         LowCardinality(String),
+    conclusion    Nullable(String),
+    artifact_url  Nullable(String),
+    gha_url       Nullable(String)
+)
+```
+
 ### Performance data
 
 ### `spyre.benchmark_runs`

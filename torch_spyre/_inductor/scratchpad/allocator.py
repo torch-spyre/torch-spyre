@@ -78,6 +78,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
+from torch_spyre._inductor.ir import FixedTiledLayout
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -211,6 +212,10 @@ class ScratchpadAllocator:
         if not isinstance(op, ComputedBuffer):
             return False
         if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+            return False
+        # A CPU-resident ComputedBuffer has a plain FixedLayout
+        # with no device_layout and can never be LX-pinned.
+        if not isinstance(op.layout, FixedTiledLayout):
             return False
         return config.allow_all_ops_in_lx_planning or (
             self._get_op_name(op) in OP_OUTPUT_GOOD_FOR_LX_REUSE
@@ -1226,8 +1231,14 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
             "mem_usage": 0.0,
         }
 
+        # HBM footprint per buffer. A buffer with no Spyre device_layout
+        # occupies no on-device HBM, so it contributes 0.
         buf_total_bytes: dict[str, int] = {
-            name: math.prod(buf.layout.device_layout.device_size[:-1]) * 128
+            name: (
+                math.prod(buf.layout.device_layout.device_size[:-1]) * 128
+                if isinstance(buf.layout, FixedTiledLayout)
+                else 0
+            )
             for name, buf in graph.name_to_buffer.items()
         }
 
@@ -1296,6 +1307,8 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
         If `timings` is provided, _generate_buffers accumulates its
         `residency` / `mem_usage` sub-step seconds into it. `lifetimes`
         (split-invariant) is forwarded to avoid recomputing it per leaf.
+
+        Note: 0-byte entries are guaranteed never to appear in pinned_names.
         """
         buffers = self._generate_buffers(graph, cache, timings, lifetimes)
         assert self.layout_planning is not None
