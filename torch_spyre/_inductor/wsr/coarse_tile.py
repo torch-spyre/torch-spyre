@@ -87,18 +87,18 @@ from torch.utils._ordered_set import OrderedSet
 
 from torch_spyre._C import SpyreTensorLayout
 
-from .constants import BATCH_MATMUL_OP
-from .errors import Unsupported
-from .logging_utils import get_inductor_logger
-from .loop_info import CoarseTileInfo, copy_op_metadata
-from .propagate_hints import DimHint
-from .pass_utils import op_out_coords, host_coordinates, indirect_sizes_from_op
+from ..constants import BATCH_MATMUL_OP
+from ..errors import Unsupported
+from ..logging_utils import get_inductor_logger
+from ..loop_info import CoarseTileInfo, copy_op_metadata
+from ..propagate_hints import DimHint
+from ..pass_utils import op_out_coords, host_coordinates, indirect_sizes_from_op
 from .span_overflow_hint_analysis import (
     SpanOverflowTilePlan,
     can_conform_pointwise_tile,
     plan_span_overflow_tile,
 )
-from .ir import FixedTiledLayout, SpyreConstantFallback, _resize_device_layout
+from ..ir import FixedTiledLayout, SpyreConstantFallback, _resize_device_layout
 
 logger = get_inductor_logger("coarse_tile")
 hints_logger = get_inductor_logger("assign_dim_hints")

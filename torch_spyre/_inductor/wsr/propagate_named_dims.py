@@ -17,7 +17,7 @@ import dataclasses
 import logging
 import sympy
 import torch
-from .logging_utils import get_inductor_logger
+from ..logging_utils import get_inductor_logger
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
@@ -32,16 +32,16 @@ from torch._inductor.ir import (
 from torch._inductor.dependencies import MemoryDep, is_indirect
 from torch._inductor.graph import GraphLowering
 from torch._inductor.virtualized import V
-from .errors import Unsupported
-from .pass_utils import (
+from ..errors import Unsupported
+from ..pass_utils import (
     host_coordinates,
     device_coordinates,
     indirect_sizes_from_op,
     op_out_coords,
     find_reduction_var,
 )
-from .ir import SpyreConstantFallback
-from .propagate_hints import DimHint, get_op_hints
+from ..ir import SpyreConstantFallback
+from ..propagate_hints import DimHint, get_op_hints
 from torch_spyre._C import SpyreTensorLayout
 from torch.utils.weak import WeakTensorKeyDictionary
 
