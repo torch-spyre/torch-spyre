@@ -33,7 +33,13 @@ from .constants import (
 )
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
-from .ir import SpyreReduction, SpyreConstantFallback, SpyreEmptyFallback
+from .ir import (
+    SpyreReduction,
+    SpyreConstantFallback,
+    SpyreEmptyFallback,
+    BroadcastAsyncFallback,
+    WaitWorkFallback,
+)
 from torch_spyre._C import get_elem_in_stick
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
@@ -1371,3 +1377,59 @@ def lower_prod_dim(x, dim, keepdim=False):
         return result
 
     return with_int64_fallback(_prod_dim_impl, x)
+
+
+# ============================================================================
+# Direct c10d Lowerings
+# ============================================================================
+@register_spyre_lowering(torch.ops._c10d_functional.broadcast.default)
+def lower_c10d_broadcast_async(tensor, src_rank, group_name):
+    """
+    Direct lowering for _c10d_functional.broadcast using ASYNC pattern.
+
+    Creates an async broadcast operation that returns immediately without blocking.
+    This provides the infrastructure for potential communication-compute overlap,
+    though actual overlap depends on scheduler decisions.
+
+    Flow:
+      _c10d_functional.broadcast → This lowering → BroadcastAsyncFallback
+      → Generated code: torch.ops.spyre.broadcast_async() → C++ → spyre-comms (non-blocking)
+    """
+    logger.debug(
+        "Lowering _c10d_functional.broadcast to BroadcastAsyncFallback "
+        "(src_rank=%s, group_name='%s')",
+        src_rank,
+        group_name,
+    )
+
+    tensor.realize()
+    return ir.TensorBox.create(
+        BroadcastAsyncFallback(
+            torch.ops.spyre.broadcast_async.default,
+            tensor,
+            src_rank,
+            group_name,
+        )
+    )
+
+
+@register_spyre_lowering(torch.ops._c10d_functional.wait_tensor.default)
+def lower_c10d_wait_tensor_async(tensor):
+    """
+    Direct lowering for _c10d_functional.wait_tensor using ASYNC pattern.
+
+    Synchronizes on the async broadcast operation, blocking until communication completes.
+
+    Flow:
+      _c10d_functional.wait_tensor → This lowering → WaitWorkFallback
+      → Generated code: torch.ops.spyre.wait_work() → C++ → work->wait()
+    """
+    logger.debug("Lowering _c10d_functional.wait_tensor to WaitWorkFallback")
+
+    tensor.realize()
+    return ir.TensorBox.create(
+        WaitWorkFallback(
+            torch.ops.spyre.wait_work.default,
+            tensor,
+        )
+    )

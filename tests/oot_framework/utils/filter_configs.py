@@ -20,6 +20,12 @@ Selection rules
   (empty) / "full"   All configs (backward compatible by default).
   "smoke"            Configs whose test_suite_config.labels contains "smoke".
   "core"             Configs whose test_suite_config.labels contains "core".
+  "device_critical"  Configs whose test_suite_config.labels contains
+                     "device_critical" -- the device-layer surfaces flex and
+                     deeptools/dxp_standalone exercise most (streams, job
+                     launch plans, codegen, LX/scratchpad planning, tensor
+                     layout, allocator/GC, D2D copies). Used as the default
+                     test_type for the tests.yml CI workflow.
   "suite_<group>"    Configs residing inside a directory named "<group>", or
                      whose filename starts with "<group>_".  This lets the
                      existing <group>/<name>_config.yaml layout act as a
@@ -27,7 +33,11 @@ Selection rules
   <other>            Treated as an arbitrary label name; matches configs
                      whose labels array contains the value.
 
-Configs with no labels field default to ["full"] (backward compatible).
+Configs with no labels field default to ["full"] (backward compatible) --
+they run under "full" but are excluded from every narrower test_type
+(smoke, core, device_critical, suite_<group>, custom labels). Every config
+should carry an explicit labels list; an unlabeled config is a gap to close
+by adding one, not a signal to widen matching.
 
 Output formats
 --------------

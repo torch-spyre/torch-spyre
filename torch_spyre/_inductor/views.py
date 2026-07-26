@@ -775,3 +775,37 @@ def align_tensors(
     }
 
     return new_iteration_space, new_tensors
+
+
+def tiling_expr_to_device_expr(
+    device_size: Sequence[sympy.Expr],
+    stride_map: Sequence[sympy.Expr],
+    index: sympy.Expr,
+) -> sympy.Expr:
+    """
+    Convert a tile offset expression (index) to a device layout (device_size and
+    stride_map)
+    """
+
+    assert all(isinstance(s, (int, sympy.Integer)) for s in device_size), (
+        f"tiling_expr_to_device_expr requires a concrete device_size, got {device_size}"
+    )
+    assert all(isinstance(s, (int, sympy.Integer)) for s in stride_map), (
+        f"tiling_expr_to_device_expr requires a concrete stride_map, got {stride_map}"
+    )
+
+    out = sympy.S.Zero
+    n = len(stride_map)
+    vars = index.free_symbols
+    for var in vars:
+        step = index.xreplace({var: 1}).xreplace({v: 0 for v in vars})
+        j = -1  # device dimension for var
+        for i in range(n):
+            if (
+                device_size[i] > 1
+                and stride_map[i] > (stride_map[j] if j != -1 else 0)
+                and stride_map[i] <= step
+            ):
+                j = i
+        out += var * math.prod(device_size[j + 1 : n]) * step // stride_map[j]
+    return out

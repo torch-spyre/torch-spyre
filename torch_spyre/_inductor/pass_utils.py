@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import math
 import warnings
 from dataclasses import dataclass
@@ -38,12 +39,8 @@ from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import IndirectAccess
 
 from . import config
-from .codegen.superdsc import (
-    _get_core_to_slice_mapping,
-    _k_fast_core_to_slice_mapping,
-    _should_use_k_fast_mapping,
-)
-from .constants import BATCH_MATMUL_OP, ELIDED_COPY_BACK_ATTR
+from .core_mapping import core_to_slice_mapping
+from .constants import ELIDED_COPY_BACK_ATTR, MATMUL_REDUCTION_OPS
 from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
@@ -743,11 +740,10 @@ def try_device_coordinates(
     """Like ``device_coordinates`` but returns ``None`` instead of raising when
     the layout's stick expression is one the backend cannot represent.
 
-    Intended for callers that *enumerate* candidate layouts (e.g. matmul input
-    layout selection) and want to skip an unrepresentable candidate rather than
-    abort the whole compile. Callers that have already committed to a single
-    layout should keep using ``device_coordinates`` so an unrepresentable stick
-    remains a hard error.
+    Use this to probe whether a layout is representable under a given dep —
+    for example, when iterating candidate input STLs and wanting to skip any
+    whose stick concretizes to an unsupported expression (e.g. the literal 1
+    when the stick dimension is size-1 in the current op's loop ranges).
     """
     try:
         return device_coordinates(stl, dep, indirect_sizes)
@@ -1363,12 +1359,12 @@ def _is_matmul_op(op: Operation) -> bool:
     return (
         isinstance(op, ComputedBuffer)
         and isinstance(op.data, Reduction)
-        and op.data.reduction_type == BATCH_MATMUL_OP
+        and op.data.reduction_type in MATMUL_REDUCTION_OPS
     )
 
 
-# TODO: refactor core assignment so the LX planner consumes determined
-# assignments instead of re-deriving them here.
+# TODO: Select and store the core mapping before LX planning, then pass the
+# winning mapping to codegen.
 class _ViewPrep(NamedTuple):
     """Candidate-invariant precompute shared across every core-division
     candidate of one ``(op, dep, buf_name)``.
@@ -1579,16 +1575,23 @@ def _per_core_view_from_prep(
         work_slice_dims[dev_dim] = split
         sym_to_device_dim[sym] = dev_dim
 
-    # Step 3: build the core→slot mapping using the same gate codegen uses
-    # (_should_use_k_fast_mapping), so K-fast matmul ops compare under the
-    # K-cohort-adjacent ordering they will actually emit.
+    # Step 4: model the same physical ownership SDSC will emit. LX compatibility
+    # requires producer and consumer to assign each slice to the same physical
+    # core; matching split factors alone is insufficient.
     num_cores = int(math.prod(per_sym.values()))
-    is_matmul = prep.is_matmul
-    if _should_use_k_fast_mapping(is_matmul, iter_space, per_sym):
-        _mapping_func = _k_fast_core_to_slice_mapping
-    else:
-        _mapping_func = _get_core_to_slice_mapping
-    core_to_slot_by_name = _mapping_func(iter_space, per_sym, num_cores)
+    iter_symbols = tuple(iter_space)
+    dim_splits = tuple(int(per_sym[sym]) for sym in iter_symbols)
+    contiguous_dim = (
+        len(dim_splits) - 1
+        if prep.is_matmul and config.core_id_k_fast_emission
+        else None
+    )
+    core_to_slot_by_name = core_to_slice_mapping(
+        iter_symbols,
+        dim_splits,
+        num_cores,
+        contiguous_dim=contiguous_dim,
+    )
     # Re-key by the buffer's device-dim index (canonical) instead of the op's
     # iter symbol name. Two ops with the same per-core slicing on this buffer
     # compare equal even if they name their iter axes differently.
@@ -1630,8 +1633,9 @@ def _per_core_view_on_buf(
     write_index / read_index / iter_space / matmul-ness, not just (splits, dep,
     buf_name): two different ops can share the same (splits, dep, buf_name) — e.g.
     a producer's write-dep and a consumer's read-dep on the same buffer at the
-    same index — and must NOT alias the same entry (``_as_core_division_buffers``
-    shares one cache across a producer and consumer of the same buffer).
+    same index — and must NOT alias the same entry (both
+    ``ScratchpadAllocator._cd_parent_matches`` and ``get_ncores_for_buffers``
+    share one cache across a producer and consumer of the same buffer).
     """
     coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
     if cache is not None:
@@ -1663,3 +1667,30 @@ def _per_core_view_on_buf(
     if cache is not None:
         cache[key] = result
     return result
+
+
+def format_operations(operations: list[Operation]) -> str:
+    """Format LLIR operations including torch-spyre custom metadata"""
+    buf = io.StringIO()
+    for op in operations:
+        buf.write(f"{op.get_operation_name()}: {type(op).__name__}")
+        if isinstance(op, ComputedBuffer):
+            buf.write(f"\n  layout={op.layout}")
+            if allocation := getattr(op.layout, "allocation", None):
+                buf.write(f"\n  allocation={allocation}")
+            if splits := getattr(op, "op_it_space_splits", None):
+                rw = op.get_read_writes()
+                write_index = next(iter(rw.writes)).index
+                read_index = next((d.index for d in rw.reads), write_index)
+                it_space = iteration_space_from_op(op)
+                readable_splits = apply_splits_from_index_coeff(
+                    splits, write_index, read_index, it_space
+                )
+                buf.write(f"\n  op_it_space_splits={readable_splits}")
+            if dim_hints := getattr(op, "dim_hints", None):
+                buf.write(f"\n  dim_hints={dim_hints}")
+            if loop_info := getattr(op, "loop_info", None):
+                buf.write(f"\n  loop_info={loop_info}")
+            buf.write(f"\n  {op.data}")
+        buf.write("\n\n")
+    return buf.getvalue()
