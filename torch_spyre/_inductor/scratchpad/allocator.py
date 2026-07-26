@@ -1307,7 +1307,7 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
         If `timings` is provided, _generate_buffers accumulates its
         `residency` / `mem_usage` sub-step seconds into it. `lifetimes`
         (split-invariant) is forwarded to avoid recomputing it per leaf.
-        
+
         Note: 0-byte entries are guaranteed never to appear in pinned_names.
         """
         buffers = self._generate_buffers(graph, cache, timings, lifetimes)
