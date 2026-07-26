@@ -35,6 +35,13 @@ mixes Spyre and CPU-C++ kernels (TestReinterpretTensorCpuBuffer).
 Plus a traced spyre -> cpu -> spyre round-trip via plain `.to()`
 (TestTracedDeviceCopy).
 
+Plus a CPU tensor lifted as a graph input (TestLiftedCpuGraphInput) and CPU
+pointwise ComputedBuffers inside the graph (TestInGraphCpuComputedBuffers) --
+two ways a non-Spyre buffer enters a mixed CPU/Spyre graph. The lifted input
+tripped propagate_layouts' graph-input loop ("missing device_tensor_layout on
+graph input"); the CPU ComputedBuffers tripped the scratchpad planner
+("'FixedLayout' object has no attribute 'device_layout'").
+
 All tests run end-to-end through `torch.compile(..., backend="inductor")` on
 the Spyre device to guard against regressions.
 """
@@ -43,6 +50,8 @@ import unittest
 
 import torch
 import torch.nn.functional as F
+
+from torch_spyre._inductor import config
 
 
 DEVICE = "spyre"
@@ -281,6 +290,107 @@ class TestFallbackKernelPoolResidentArg(unittest.TestCase):
         out = compiled(x.clone().to(DEVICE))
         self.assertEqual(out.dtype, DTYPE)
         torch.testing.assert_close(out.cpu(), fn(x.clone()), atol=0.01, rtol=0.01)
+
+
+class TestLiftedCpuGraphInput(unittest.TestCase):
+    """A CPU tensor lifted as a graph input must not crash layout propagation.
+
+    When a compiled fn closes over (or Dynamo/AOTAutograd constant-folds) a CPU
+    tensor that has no data-dependency on any declared input, it is lifted as an
+    extra graph-input placeholder. That input is CPU-resident, so
+    `device_tensor_layout()` returns None. propagate_layouts' graph-input loop
+    used to treat that as fatal and raised
+    `missing device_tensor_layout on graph input <name>`; it now skips the input
+    (leaving its FixedLayout intact), mirroring the non-Spyre ComputedBuffer skip
+    further down the same pass. The lifted CPU input's only consumer here is the
+    convert fallback that moves it onto Spyre.
+
+    """
+
+    def test_lifted_cpu_constant_matmul_compiles(self):
+        spyre = torch.device(DEVICE)
+        inner, padded, num_tokens = 32, 64, 16
+
+        # Built outside the compiled region -> closed over -> lifted as a CPU
+        # graph input. A {0,1} expand matrix, like RoPE's _get_expand_matrix.
+        e_cpu = torch.zeros(2 * inner, 2 * padded, dtype=DTYPE)
+        idx = torch.arange(inner)
+        e_cpu[idx, idx] = 1
+        e_cpu[inner + idx, padded + idx] = 1
+
+        def fn(x):
+            e = torch.ops.test_fk_conv.convert(e_cpu, spyre)
+            return x @ e
+
+        x = torch.randn(num_tokens, 2 * inner, dtype=DTYPE)
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
+        out = compiled(x.to(spyre))
+        self.assertEqual(out.device.type, DEVICE)
+        self.assertEqual(tuple(out.shape), (num_tokens, 2 * padded))
+        torch.testing.assert_close(out.cpu(), x @ e_cpu, atol=0.01, rtol=0.01)
+
+
+class TestInGraphCpuComputedBuffers(unittest.TestCase):
+    """CPU pointwise ComputedBuffers in a mixed graph must not crash scratchpad planning.
+
+    A convert fallback returns a CPU tensor; a chain of pointwise ops
+    (add/sub/mul -- all in OP_OUTPUT_GOOD_FOR_LX_REUSE) then runs on it inside
+    the same graph, before converting back to Spyre. propagate_layouts SKIPS
+    those CPU ComputedBuffers (device != spyre), leaving them a plain
+    `FixedLayout` with no `device_layout`. The scratchpad planner's op gate
+    (`_op_output_good_for_lx_reuse`) whitelisted by op NAME only, so a CPU
+    add/sub/mul passed the gate, entered graph_view, and reached
+    `mem_usage_by_buf`, which read `layout.device_layout` and raised
+    `'FixedLayout' object has no attribute 'device_layout'`. The gate now also
+    requires a Spyre `FixedTiledLayout`, so CPU buffers stay out of the planner.
+
+    Same class of bug as spyre-inference's RoPE `_get_expand_matrix` (a CPU
+    constant built in-graph) and the TP>1 vocab-shard mask. Uses tensor-bound
+    ops (no dtype change / no scalar-int constants) so the ONLY thing under test
+    is "CPU pointwise ComputedBuffer in a Spyre graph".
+
+    Both scratchpad allocators are covered: the default greedy allocator (which
+    filters ops through `_op_output_good_for_lx_reuse` -> the gate fix) and the
+    co-optimizing allocator (`co_optimizing_lx_planning`), whose `_search`
+    footprint accounting reads `.device_layout` over every buffer -> the
+    `buf_total_bytes` guard.
+    """
+
+    @staticmethod
+    def _run_and_check(test: "unittest.TestCase") -> None:
+        cpu = torch.device("cpu")
+        spyre = torch.device(DEVICE)
+        num_tokens, hidden = 16, 256
+
+        def fn(x):
+            # Opaque spyre -> cpu: CPU FallbackKernel output.
+            x_cpu = torch.ops.test_fk_conv.convert(x, cpu)
+            # CPU pointwise chain -> CPU ComputedBuffers (add/sub/mul).
+            y = (x_cpu + 1.0) * (x_cpu - 1.0)
+            # Opaque cpu -> spyre and an on-device consumer.
+            y_s = torch.ops.test_fk_conv.convert(y, spyre)
+            return y_s * 2.0
+
+        x = torch.randn(num_tokens, hidden, dtype=DTYPE)
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
+        out = compiled(x.to(spyre))
+        test.assertEqual(out.device.type, DEVICE)
+        # ((x + 1)(x - 1)) * 2 = (x^2 - 1) * 2
+        torch.testing.assert_close(
+            out.cpu(), ((x + 1.0) * (x - 1.0)) * 2.0, atol=0.05, rtol=0.05
+        )
+
+    def test_cpu_pointwise_chain_compiles_greedy(self):
+        """Default greedy allocator: exercises the `_op_output_good_for_lx_reuse`
+        gate (mem_usage_by_buf over the filtered graph_view)."""
+        self._run_and_check(self)
+
+    @config.patch({"co_optimizing_lx_planning": True})
+    def test_cpu_pointwise_chain_compiles_co_optimizing(self):
+        """Co-optimizing allocator: `mem_usage_by_buf` runs on the RAW graph in
+        `_build_cd_bound_buffers` / `_determine_in_place_division_invariant`,
+        bypassing the gate -> exercises the defensive sentinel."""
+        self._run_and_check(self)
 
 
 if __name__ == "__main__":

@@ -1324,11 +1324,11 @@ def propagate_spyre_tensor_layouts(
             if isinstance(real_input, torch.Tensor):
                 stl = real_input.device_tensor_layout()
                 if stl is None:
-                    # All spyre tensors are created with device layouts.
-                    # Therefore we expect all graph inputs to have them.
-                    raise Unsupported(
-                        f"missing device_tensor_layout on graph input {name}"
-                    )
+                    # A CPU tensor lifted as a graph input, or a host tensor
+                    # feeding a FallbackKernel has no Spyre layout;
+                    # leave its FixedLayout and .layouts untouched,
+                    # mirroring the non-Spyre ComputedBuffer skip below.
+                    continue
                 tb = graph.graph_inputs[name]
                 if (
                     not isinstance(tb, TensorBox)
