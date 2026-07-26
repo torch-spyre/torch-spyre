@@ -810,7 +810,7 @@ The unhinted op is not an interloper in this case — it is a trailing consumer.
 
 Groups are derived automatically from `spyre_hint(num_tiles_per_dim=...)` annotations
 (`slices=` and `tiles=` are deprecated aliases that still work)
-via `hints_to_coarse_tile_groups` (in `torch_spyre/_inductor/coarse_tile.py`),
+via `hints_to_coarse_tile_groups` (in `torch_spyre/_inductor/wsr/coarse_tile.py`),
 which is a no-op when no hints are present.  `CustomPreSchedulingPasses`
 maintains a `self.passes` list of uniform `Callable[[GraphLowering], None]`
 entries, run in order by `__call__`.  Config-gated or multi-step groups are
