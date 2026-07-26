@@ -354,7 +354,7 @@ def _is_movable_interloper(op: Operation) -> bool:
     not safe to relocate on the strength of get_read_names()/
     get_mutation_names() alone.
     """
-    from .ir import SpyreEmptyFallback  # deferred: avoids circular import
+    from ..ir import SpyreEmptyFallback  # deferred: avoids circular import
 
     return isinstance(op, (ComputedBuffer, SpyreConstantFallback, SpyreEmptyFallback))
 
@@ -707,7 +707,7 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
     consumer" would silently reintroduce the exact span violation tiling was
     meant to prevent.
     """
-    from . import config
+    from .. import config
 
     if config.ignore_wsr_hints or config.ignore_span_overflow_hints:
         logger.debug(
@@ -1973,8 +1973,8 @@ def _propagate_carry_op(
       5. Outside consumers / graph outputs (of op, the terminal value)
          redirected to accum_full.
     """
-    from .insert_restickify import NameSwapHandler
-    from .pass_utils import replace_computed_buffer_body
+    from ..insert_restickify import NameSwapHandler
+    from ..pass_utils import replace_computed_buffer_body
 
     accum_full = seed_buf
     op_loop_info = op.loop_info
@@ -2263,7 +2263,7 @@ def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
     full buffer, while the op's own candidates are sized to its tile.  See
     _insert_read_view_ops.
     """
-    from .ir import SpyreEmptyFallback  # deferred: avoids circular import
+    from ..ir import SpyreEmptyFallback  # deferred: avoids circular import
 
     reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
     return [
@@ -2314,7 +2314,7 @@ def _allocate_full_buffer(
     FixedTiledLayout post-stickify), splices it into operations at
     insert_at_idx, and returns the new ComputedBuffer.
     """
-    from .ir import SpyreEmptyFallback  # deferred: avoids circular import
+    from ..ir import SpyreEmptyFallback  # deferred: avoids circular import
 
     graph_lowering = V.graph
     fx_graph = graph_lowering.graph
@@ -2616,7 +2616,7 @@ def _insert_read_view_ops(
     # site in this file (_patch_consumers, _patch_retiled_load_indexes,
     # _apply_fill_name_swap): a fresh ComputedBuffer has no stale per-object
     # caches, sidestepping the need to enumerate every cache key by hand.
-    from .pass_utils import replace_computed_buffer_body
+    from ..pass_utils import replace_computed_buffer_body
 
     orig_inner = tiled_op.data.inner_fn
 
@@ -2892,7 +2892,7 @@ def _propagate_tiled_reduction_op(
     # redundant but harmless.
     dtype = op.get_dtype()
     device = op.get_device()
-    from .ir import SpyreConstantFallback  # deferred: avoids circular import
+    from ..ir import SpyreConstantFallback  # deferred: avoids circular import
 
     scalar_op = SpyreConstantFallback(
         torch.ops.spyre.constant.default, float(identity), dtype, device
@@ -3010,8 +3010,8 @@ def _patch_consumers(
     if not consumers or old_name == new_name:
         return
 
-    from .insert_restickify import NameSwapHandler
-    from .pass_utils import replace_computed_buffer_body
+    from ..insert_restickify import NameSwapHandler
+    from ..pass_utils import replace_computed_buffer_body
 
     name_map = {old_name: new_name}
     rewrites = _stride_rewrite_map(retile_info) if retile_info is not None else {}
@@ -3211,7 +3211,7 @@ def _patch_retiled_load_indexes(
     if not rewrites_by_name:
         return
 
-    from .pass_utils import replace_computed_buffer_body
+    from ..pass_utils import replace_computed_buffer_body
 
     # Only ops that were already in the group when _stamp_group ran can hold a
     # stale (pre-divide) coefficient for a retiled buffer.  Ops inserted later
@@ -3531,8 +3531,8 @@ def _apply_fill_name_swap(
         return
 
     from torch._inductor.dependencies import MemoryDep
-    from .insert_restickify import NameSwapHandler
-    from .pass_utils import replace_computed_buffer_body
+    from ..insert_restickify import NameSwapHandler
+    from ..pass_utils import replace_computed_buffer_body
 
     for op in group_ops:
         if not isinstance(op, ComputedBuffer):
@@ -3765,12 +3765,12 @@ def _stick_host_dim(op: ComputedBuffer, device_layout) -> int | None:
     but does not change which axis is the stick), so this may be computed either
     before or after ``_divide_ranges`` mutates the ranges.
     """
-    from .pass_utils import (
+    from ..pass_utils import (
         host_coordinates,
         indirect_sizes_from_op,
         try_device_coordinates,
     )
-    from .views import matching_dim
+    from ..views import matching_dim
 
     try:
         writes = op.get_read_writes().writes
