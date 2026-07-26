@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from contextlib import contextmanager
+from functools import wraps
 
 import torch
 from torch._inductor.graph import GraphLowering
@@ -136,3 +137,47 @@ def enable_spyre_context(
             joint_graph.pass_patterns[:] = origin_pass
             Loops.has_large_inner_fn = old_loop
             GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]
+
+
+OBSERVER_HOOKS_KEY = "__spyre_hooks_meta"
+
+
+def patch_inductor_fusions():
+    import torch._inductor.fx_passes.post_grad
+
+    # disable addmm fusion. The fusion will be undone by the decomposition that is
+    # registered in torch-spyre, but the hints are lost in the process
+    addmm_fusion_found = False
+    for entries in torch._inductor.fx_passes.post_grad.pass_patterns[
+        2
+    ].patterns.values():
+        for entry in entries:
+            if (
+                entry.extra_check
+                == torch._inductor.fx_passes.post_grad.is_valid_addmm_fusion
+            ):
+                entry.extra_check = lambda x: False
+                addmm_fusion_found = True
+
+    assert addmm_fusion_found, (
+        "Couldn't find addmm fusion. This patch needs to be reviewed."
+    )
+
+    # Install observer patch
+    from torch.fx.passes.graph_transform_observer import GraphTransformObserver
+
+    _original = GraphTransformObserver.apply_graph_pass
+
+    @wraps(GraphTransformObserver.apply_graph_pass)
+    def apply_graph_pass(self, pass_fn):
+        meta = self.gm.meta.get(OBSERVER_HOOKS_KEY, {})
+        self.gm.meta[OBSERVER_HOOKS_KEY] = meta
+        meta["pass"] = self.passname
+        meta["subsystem"] = self.subsystem
+        try:
+            return _original(self, pass_fn)
+        finally:
+            meta.pop("pass", None)
+            meta.pop("subsystem", None)
+
+    GraphTransformObserver.apply_graph_pass = apply_graph_pass

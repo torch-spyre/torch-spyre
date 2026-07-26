@@ -19,6 +19,7 @@ IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
 DEPTHWISE_CONV2D_OP = "depthwiseconv2dnative"
 BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
+MATMUL_REDUCTION_OPS = frozenset({BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP})
 
 # Reduction ops that cannot reduce along the stick dimension.
 # Native prod reduction is not currently available in the backend.

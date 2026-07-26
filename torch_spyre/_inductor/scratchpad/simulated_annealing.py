@@ -59,10 +59,10 @@ from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     FirstFitLayoutSolver,
 )
 from torch_spyre._inductor.scratchpad.plan_solver import (
-    GreedyLayoutSolver,
     LifetimeBoundBuffer,
     MemoryPlanSolver,
 )
+from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.permutation_layout import (
     PermutationBasedLayoutSolver,
 )
@@ -122,7 +122,12 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
     def plan_layout(
         self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
     ) -> list[LifetimeBoundBuffer]:
-        _buffers = list(buffers)
+        # Barred buffers keep address=None and stay out of the permutation
+        # entirely, so no annealing move can ever place one.
+        placeable, _ = self.partition(buffers)
+        if not placeable:
+            return list(buffers)
+        _buffers = list(placeable)
         solver = SimulatedAnnealingSolverWithBuffers(
             _buffers,
             self.limit,
@@ -133,7 +138,9 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
         )
         solver.solve()
         solver.finalize()
-        return _buffers
+        # The annealer mutates the buffer objects in place, so the caller's full
+        # list (barred buffers included, still at address=None) is the result.
+        return list(buffers)
 
 
 class SimulatedAnnealingSolverWithBuffers:

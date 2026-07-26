@@ -409,6 +409,8 @@ jobs:
             config: distributed_tests/test_gather.yaml
           - name: Test Multi-Spyre Allgather
             config: distributed_tests/test_allgather.yaml
+          - name: Test Multi-Spyre Broadcast Compiled
+            config: distributed_tests/test_broadcast_compiled.yaml
 
     steps:
       # See the `test` job above: prebaked path symlinks the baked .github into
