@@ -29,6 +29,7 @@ CREATE TABLE spyre.test_runs
     workflow        LowCardinality(String),
     suite_name      String,
     filename        String,
+    platform        LowCardinality(String),
     branch          LowCardinality(String),
     commit_sha      FixedString(40),
     gha_run_id      UInt64,
