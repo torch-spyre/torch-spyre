@@ -15,20 +15,20 @@
 # Owner(s): ["module: cpp"]
 
 import os
-import regex as re
-import psutil
 import warnings
 from contextlib import contextmanager
-import pytest
 
+import psutil
+import pytest
+import regex as re
 import torch
 from torch.testing._internal.common_utils import (
+    TestCase,
     instantiate_parametrized_tests,
     parametrize,
     run_tests,
     set_warn_always_context,
     subtest,
-    TestCase,
 )
 
 # 0-dim scalar roundtrip: shared dtype × factory lambdas (used by parametrized fill test).
@@ -110,6 +110,22 @@ class TestSpyre(TestCase):
         with torch.device("spyre"):
             a = torch.empty(50, dtype=torch.float16)
         self.assertEqual(a.device.type, "spyre")
+
+    def test_empty_size_arguments(self):
+        # Positional size argument
+        a = torch.empty((2, 3), device="spyre", dtype=torch.float16)
+        self.assertEqual(tuple(a.shape), (2, 3))
+
+        # Keyword size argument
+        a = torch.empty(size=(2, 3), device="spyre", dtype=torch.float16)
+        self.assertEqual(tuple(a.shape), (2, 3))
+
+        # Both positonal and keyword size arguments
+        with pytest.raises(
+            TypeError,
+            match="received an invalid combination of arguments",
+        ):
+            torch.empty((2, 3), size=(2, 3), device="spyre", dtype=torch.float16)
 
     def test_ones_factory(self):
         a = torch.ones(50, device="spyre", dtype=torch.float16)

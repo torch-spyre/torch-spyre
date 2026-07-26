@@ -1049,8 +1049,8 @@ class TestIntermediatePartialReadNotPinned(BaseTestScratchpadUsage):
     """An *intermediate* buffer read partially (sliced) must not be LX-pinned.
 
     Companion to ``TestCloneAtGraphBoundaries``, which guards graph
-    input/output clones. ``_filter_ops`` applies the same
-    ``buffer_not_read_in_full`` guard to intermediate buffers: a buffer that is
+    input/output clones. ``ScratchpadAllocator._residency_reasons`` applies the
+    same ``buffer_not_read_in_full`` guard to intermediate buffers: a buffer that is
     produced in full and then read over a sub-extent (an inner-dim slice that
     feeds a chained op) would be LX-pinned and mis-addressed by the single-base
     LX path. Without the intermediate guard this regresses to a large
@@ -1089,7 +1089,7 @@ class TestIntermediatePartialReadNotPinned(BaseTestScratchpadUsage):
             cpu_result,
             atol=0.1,
             rtol=0.1,
-            msg="sliced intermediate miscompiled — is the _filter_ops guard present?",
+            msg="sliced intermediate miscompiled — is the partial-read guard present?",
         )
 
 
@@ -1210,7 +1210,7 @@ class TestCpSatTimeoutFallback(BaseTestScratchpadUsage):
         """Count ``GreedyLayoutSolver.plan_layout`` invocations while still running
         the real method.
         """
-        from torch_spyre._inductor.scratchpad.plan_solver import GreedyLayoutSolver
+        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 
         original_plan_layout = GreedyLayoutSolver.plan_layout
         calls = {"count": 0}
@@ -1288,7 +1288,7 @@ class TestSelectAllocator(unittest.TestCase):
             StrategyBCoOptimizingAllocator,
             select_allocator,
         )
-        from torch_spyre._inductor.scratchpad.plan_solver import GreedyLayoutSolver
+        from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
         from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
             BestFitLayoutSolver,
         )
@@ -1312,11 +1312,18 @@ class TestSelectAllocator(unittest.TestCase):
         ):
             self.assertIsInstance(select_allocator(), StrategyBCoOptimizingAllocator)
 
-        # cpsat + co-optimization routes to the joint allocator.
+        # cpsat + co-optimization routes to the joint allocator when ortools is
+        # present, else degrades to greedy placement (the fallback now lives in
+        # select_allocator, not inside CoOptimizingAllocator).
         with ts_inductor_config.patch(
             layout_solver="cpsat", co_optimizing_lx_planning=True
         ):
-            self.assertIsInstance(select_allocator(), CoOptimizingAllocator)
+            a = select_allocator()
+            if _HAS_ORTOOLS:
+                self.assertIsInstance(a, CoOptimizingAllocator)
+            else:
+                self.assertIs(type(a), ScratchpadAllocator)
+                self.assertIsInstance(a.layout_planning, GreedyLayoutSolver)
 
         # cpsat without co-optimization is placement-only: a ScratchpadAllocator
         # driven by the CP-SAT solver on the pre-determined core divisions.

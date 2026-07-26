@@ -12,16 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Sequence
 import logging
 import logging.handlers
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch as mock_patch
 
 import pytest
 from sympy import Integer, Symbol
 import torch
+import torch.fx.traceback
+from torch.fx.graph_module import GraphModule
+from torch._decomp import get_decompositions
+from torch._dynamo.test_case import (
+    TestCase as DynamoTestCase,
+)
+from torch._functorch.aot_autograd import aot_module_simplified
+from torch._functorch._aot_autograd.utils import make_boxed_func
 from torch._inductor.test_case import TestCase as InductorTestCase
-from torch._inductor.utils import run_and_get_code
+from torch._inductor.utils import run_and_get_code, InputType
+
 
 from torch_spyre._inductor import config, spyre_hint
 import torch_spyre._inductor.work_division as _wd
@@ -510,6 +521,70 @@ class TestNamedWorkDivisionHint(InductorTestCase):
             Exception, "reduction dimensions|expected exactly 1 reduction variable"
         ):
             torch.compile(fn, dynamic=False)(x)
+
+
+def aot_backend(gm: GraphModule, example_inputs: Sequence[InputType]):
+    decompositions = get_decompositions(
+        [
+            torch.ops.aten.gelu.default,
+            torch.ops.aten.gelu_backward.default,
+        ]
+    )
+
+    def fw(gm: GraphModule, example_inputs: Sequence[InputType]) -> Any:
+        for node in gm.graph.nodes:
+            if node.op not in ["placeholder", "output"]:
+                meta = node.meta.get("custom", {})
+                assert meta.get("custom_hint", 0) == 1
+
+        return make_boxed_func(gm.forward)
+
+    def bw(gm: GraphModule, example_inputs: Sequence[InputType]) -> Any:
+        return make_boxed_func(gm.forward)
+
+    return aot_module_simplified(
+        gm,
+        example_inputs,
+        fw_compiler=fw,
+        bw_compiler=bw,
+        decompositions=decompositions,
+    )  # type: ignore
+
+
+class TestAOTAnnotationAssumptions(DynamoTestCase):
+    def _compile_and_run(self, model: torch.nn.Module):
+        x = torch.randn((64, 64), dtype=torch.float16, device="cpu")
+        compiled = torch.compile(model, fullgraph=True, backend=aot_backend)
+        for i in range(2):
+            compiled(x)
+
+    def test_dead_code_elimination(self):
+        class TestModule(torch.nn.Module):
+            def forward(self, x):
+                with torch.fx.traceback.annotate({"custom_hint": 1}):
+                    y = torch.zeros_like(x)
+                    y = torch.cos(y)
+                    return x + 1
+
+        self._compile_and_run(TestModule())
+
+    def test_decomposition(self):
+        class TestModule(torch.nn.Module):
+            def forward(self, x):
+                with torch.fx.traceback.annotate({"custom_hint": 1}):
+                    return torch.nn.functional.gelu(x)
+
+        self._compile_and_run(TestModule())
+
+    def test_functionalization(self):
+        class TestModule(torch.nn.Module):
+            def forward(self, x):
+                with torch.fx.traceback.annotate({"custom_hint": 1}):
+                    y = torch.zeros_like(x)
+                    y.add_(x)
+                    return y
+
+        self._compile_and_run(TestModule())
 
 
 if __name__ == "__main__":

@@ -20,10 +20,13 @@ import regex as re
 import sympy
 
 import torch
+import torch.compiler
 import torch.fx.traceback
+from torch._dynamo.symbolic_convert import InstructionTranslator
 from torch._inductor.ir import Operation
 
 from .logging_utils import get_inductor_logger
+from .patches import OBSERVER_HOOKS_KEY
 
 logger = get_inductor_logger("propagate_hints")
 
@@ -54,22 +57,40 @@ class DimHint:
 
 
 _HINT_RE = re.compile(r"^_hint_(\d+)$")
-_hint_counter = 0
+
+
+@torch.compiler.allow_in_graph
+def get_id():
+    """Returns a new hint ID each time it is called
+
+    The IDs are generated per compilation session
+    and always start on 0 and are incremented by one.
+    The dependency to a global counter is hidden by
+    `allow_in_graph` and this call is removed by
+    dead code elimination because the counter is not
+    used for any computation. The counter is thread
+    local.
+    """
+
+    tx = InstructionTranslator.current_tx()
+    assert tx is not None
+
+    counter = getattr(tx, "__spyre_hint_counter", 0)
+    setattr(tx, "__spyre_hint_counter", counter + 1)
+
+    # returning a tensor is required for allow_in_graph
+    return counter, torch.empty(0, device="cpu")
 
 
 def spyre_hint(**kwargs: Any):
     """
     Attach a hint and a unique hint id to every FX node in scope.
     """
-    global _hint_counter
-
-    _hint_counter += 1
-    return torch.fx.traceback.annotate({f"_hint_{_hint_counter}": kwargs})
-
-
-def _reset_counter(*args, **kwargs):
-    global _hint_counter
-    _hint_counter = 0
+    if torch.compiler.is_compiling():
+        _id, _ = get_id()
+    else:
+        _id = 0
+    return torch.fx.traceback.annotate({f"_hint_{_id}": kwargs})
 
 
 def get_op_hints(op: Operation) -> dict[int, dict[str, Any]]:
@@ -93,6 +114,27 @@ def get_op_hints(op: Operation) -> dict[int, dict[str, Any]]:
     return hints
 
 
+def log_new_nodes(node: torch.fx.Node):
+    if (
+        node.graph.owning_module is not None
+        and (meta := node.graph.owning_module.meta.get(OBSERVER_HOOKS_KEY)) is not None
+    ):
+        _pass = meta["pass"]
+        subsystem = meta["subsystem"]
+    else:
+        _pass = "unknown"
+        subsystem = "unknown"
+
+    logger.warning(
+        "Post-grad insertion of node %s with target %s detected after"
+        " pass %s, subsystem %s. Spyre hints could be invalidated.",
+        node.name,
+        node.target,
+        _pass,
+        subsystem,
+    )
+
+
 def collect_spyre_hints(graph: torch.fx.Graph) -> None:
     """
     Snapshot call_function nodes' (target, custom-meta) by topological position.
@@ -106,11 +148,15 @@ def collect_spyre_hints(graph: torch.fx.Graph) -> None:
     """
     assert graph.owning_module is not None
 
-    graph.owning_module.meta["__spyre_dim_hints"] = [
-        (node.target, node.meta.get("custom"))
-        for node in graph.nodes
-        if node.op == "call_function"
-    ]
+    # post_grad_custom_pre_pass is called twice
+    if graph.owning_module.meta.get("__spyre_dim_hints") is None:
+        graph.owning_module._register_create_node_hook(log_new_nodes)
+
+        graph.owning_module.meta["__spyre_dim_hints"] = [
+            (node.target, node.meta.get("custom"))
+            for node in graph.nodes
+            if node.op == "call_function"
+        ]
 
 
 def recover_spyre_hints(graph: torch.fx.Graph) -> None:
@@ -127,7 +173,12 @@ def recover_spyre_hints(graph: torch.fx.Graph) -> None:
     the same hint. This keeps alignment intact across such insertions, where the
     old count check would bail and silently drop every hint.
     """
-    _dim_hints = graph.owning_module.meta["__spyre_dim_hints"]
+
+    assert graph.owning_module is not None
+
+    graph.owning_module._unregister_create_node_hook(log_new_nodes)
+
+    _dim_hints = graph.owning_module.meta.pop("__spyre_dim_hints")
     nodes = [n for n in graph.nodes if n.op == "call_function"]
 
     cursor = 0
