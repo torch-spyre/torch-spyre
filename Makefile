@@ -10,12 +10,17 @@ PYTEST_ARGS ?= -v
 TEST_CONFIGS ?= tests/configs/torch_spyre_tests
 
 # TEST_TYPE selects which suite subset to run:
-#   smoke          — fast sanity checks (~4 suites)
-#   core           — all functional tests, excludes special-purpose hardware
-#   full           — everything (core + LX-planning); default
-#   suite_<group>  — all configs inside the <group>/ sub-directory
-#                    (e.g. suite_inductor, suite_tensors)
-#   <label>        — any arbitrary label defined in test_suite_config.labels
+#   smoke            — fast sanity checks (~4 suites)
+#   core             — all functional tests, excludes special-purpose hardware
+#   device_critical  — device-layer surfaces flex and deeptools/dxp_standalone
+#                       exercise most: streams, job launch plans, codegen,
+#                       LX/scratchpad planning, tensor layout, allocator/GC,
+#                       D2D copies (used as the default in integration-tests.yaml,
+#                       triggered by those upstream repos)
+#   full             — everything (core + LX-planning); default for `make tests`
+#   suite_<group>    — all configs inside the <group>/ sub-directory
+#                      (e.g. suite_inductor, suite_tensors)
+#   <label>          — any arbitrary label defined in test_suite_config.labels
 # Empty / unset defaults to "full" (all configs under TEST_CONFIGS).
 TEST_TYPE ?= full
 

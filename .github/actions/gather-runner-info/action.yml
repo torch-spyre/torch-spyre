@@ -37,6 +37,9 @@ runs:
         echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
         echo "GHA_RUNNER_POD_NAME $GHA_RUNNER_POD_NAME"
         echo "GHA_RUNNER_POD_NAMESPACE $GHA_RUNNER_POD_NAMESPACE"
+        # The DTLOG-based dump the parser used to rely on only fires on the
+        # final attempt under DTLOG_LEVEL=Info.
+        echo "PCIDEVICE_IBM_COM_AIU_PF ${PCIDEVICE_IBM_COM_AIU_PF:-}"
         echo "GHA_RUNNER_POD_CPU_REQUEST $GHA_RUNNER_POD_CPU_REQUEST"
         echo "GHA_RUNNER_POD_CPU_LIMIT $GHA_RUNNER_POD_CPU_LIMIT"
         # Memory limits/requests are reported by the downward API in bytes.
