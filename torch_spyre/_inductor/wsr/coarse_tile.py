@@ -361,7 +361,7 @@ def insert_tiling_propagation(
             if not isinstance(op.data, (Pointwise, Reduction)):
                 continue
             _propagate_tiled_op(op, operations)
-            # _propagate_tiled_op (and the Case 1/2/carry rewrites it may
+            # _propagate_tiled_op (and the Case 1/2 rewrites it may
             # delegate to) can replace op with a new ComputedBuffer object
             # spliced into `operations` under the same name (see
             # replace_computed_buffer_body).  group_ops is a separate list
@@ -804,34 +804,11 @@ def _is_loop_invariant_at_reduction_levels(
     return True
 
 
-def _group_reduction_tiled_levels(
-    loop_group_id: tuple, operations: list[Operation]
-) -> set[int]:
-    """Post-stamp equivalent of _group_reduction_tiled_hint_ids: level indices
-    (positions into loop_tiled_dims/loop_tiled_reduction_dims) where some
-    Reduction op in the same outer loop group has a non-empty
-    loop_tiled_reduction_dims entry.  Used by _propagate_tiled_op, which runs
-    after _stamp_group and only has the flat operations list, not group_ops.
-    """
-    outer_key = loop_group_id[0]
-    levels: set[int] = set()
-    for o in operations:
-        if not isinstance(o, ComputedBuffer) or not isinstance(o.data, Reduction):
-            continue
-        li = getattr(o, "loop_info", None)
-        if li is None or li.loop_group_id[0] != outer_key:
-            continue
-        for i, rdims in enumerate(li.loop_tiled_reduction_dims):
-            if rdims:
-                levels.add(i)
-    return levels
-
-
 def _group_reduction_tiled_levels_in_group(
     group_ops: list[Operation],
     levels: list[tuple],
 ) -> set[int]:
-    """Planning-time equivalent of _group_reduction_tiled_levels.
+    """Planning-time helper for cross-op reduction-tiling checks.
 
     Level indices (positions into per-op loop_tiled_dims/
     loop_tiled_reduction_dims) where some Reduction op in group_ops tiles a
