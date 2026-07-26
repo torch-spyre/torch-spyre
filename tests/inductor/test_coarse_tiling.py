@@ -80,6 +80,7 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _stamp_group,
     _stride_rewrite_map,
     coarse_tile,
+    plan_coarse_tile_groups,
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 from torch_spyre._inductor.fusion import spyre_fuse_nodes
@@ -1705,6 +1706,50 @@ class TestCoarseTileTileAdvanceExprs(unittest.TestCase):
         # a, because b's own stride is transposed relative to a's.
         expected_b = Integer(1) * Integer(512) * d0 + Integer(1024) * Integer(1024) * d1
         self.assertEqual(simplify(op.loop_info.tile_advance_exprs[1] - expected_b), 0)
+
+    def test_plan_coarse_tile_groups_zero_mutation(self):
+        """Planning must not mutate op.data.ranges, layout, or set loop_info.
+
+        Reuses the same simple single-level (well, two-level, per the small
+        example) tiled-group fixture as
+        test_small_example_output_and_input_advance above -- there is no
+        shared "_make_simple_tiled_group" helper in this class; the
+        _stamp_group tests above all build their op inline via
+        _make_real_pointwise_op, so this test copies that same construction.
+        """
+        from torch._inductor.ir import ComputedBuffer
+
+        op = _make_real_pointwise_op(
+            ranges=[Integer(1024), Integer(4096)],
+            input_shapes_strides=[
+                ([1024, 4096], [4096, 1]),
+                ([1024, 4096], [4096, 1]),
+            ],
+            name="buf0",
+            hints=((1, 0), (2, 1)),
+        )
+        group_ops = [op]
+        levels = [(1, Integer(2)), (2, Integer(4))]
+
+        pre_ranges = [
+            tuple(o.data.ranges) for o in group_ops if isinstance(o, ComputedBuffer)
+        ]
+        pre_loop_info = [getattr(o, "loop_info", None) for o in group_ops]
+
+        plan = plan_coarse_tile_groups(group_ops, [(group_ops, levels)])
+
+        post_ranges = [
+            tuple(o.data.ranges) for o in group_ops if isinstance(o, ComputedBuffer)
+        ]
+        post_loop_info = [getattr(o, "loop_info", None) for o in group_ops]
+        self.assertEqual(pre_ranges, post_ranges)
+        self.assertEqual(pre_loop_info, post_loop_info)
+        # plan is keyed by id(op), not op itself: ir.Operation/ComputedBuffer
+        # are (eq=True, unsafe_hash=False) dataclasses, so Python sets their
+        # __hash__ to None and they cannot be used as dict keys directly.
+        self.assertTrue(
+            all(id(o) in plan for o in group_ops if isinstance(o, ComputedBuffer))
+        )
 
 
 def _make_fixed_flag_op(

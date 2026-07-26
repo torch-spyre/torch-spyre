@@ -2708,6 +2708,167 @@ def _is_constant_fill(op: ComputedBuffer) -> bool:
     )
 
 
+def _planned_tile_extents(
+    op: ComputedBuffer,
+    op_tiled_dims: list[list[int]],
+    op_tiled_reduction_dims: list[list[int]],
+    levels: list[tuple],
+) -> dict[int, Expr]:
+    """Analytically compute combined_extents without mutating op.data.
+
+    Mirrors the arithmetic _divide_ranges/_divide_reduction_ranges perform
+    in place, but reads pre-mutation op.data.ranges/reduction_ranges and
+    divides cumulatively across levels without ever calling
+    object.__setattr__ on op.data or touching op.layout. Raises RuntimeError
+    on non-even division, matching _divide_ranges's own check (line ~2952
+    in this file) so the error surfaces at the same point in the pipeline
+    it does today.
+    """
+    counts_by_dim: dict[int, Expr] = {}
+    counts_by_reduction_dim: dict[int, Expr] = {}
+    for level_idx, (_, count) in enumerate(levels):
+        for d in op_tiled_dims[level_idx]:
+            counts_by_dim[d] = counts_by_dim.get(d, sympy.Integer(1)) * count
+        for d in op_tiled_reduction_dims[level_idx]:
+            counts_by_reduction_dim[d] = (
+                counts_by_reduction_dim.get(d, sympy.Integer(1)) * count
+            )
+
+    def _divided(r: Expr, count: Expr, dim_desc: str) -> Expr:
+        if isinstance(r, (int, sympy.Integer)) and isinstance(
+            count, (int, sympy.Integer)
+        ):
+            if int(r) % int(count) != 0:
+                raise RuntimeError(
+                    f"coarse_tile: op {op.get_name()!r} {dim_desc} range {r} "
+                    f"is not divisible by loop_count {count}.  All tiled "
+                    f"dimensions must be evenly divisible by the loop trip count."
+                )
+            return sympy.Integer(int(r) // int(count))
+        return sympy.sympify(r) / sympy.sympify(count)
+
+    tiled_dim_extents = {
+        d: _divided(op.data.ranges[d], count, f"loop var d{d}")
+        for d, count in counts_by_dim.items()
+    }
+    reduction_dim_extents = {}
+    if isinstance(op.data, Reduction):
+        reduction_dim_extents = {
+            d: _divided(op.data.reduction_ranges[d], count, f"reduction dim {d}")
+            for d, count in counts_by_reduction_dim.items()
+        }
+
+    n_output_dims = len(op.data.ranges) if hasattr(op.data, "ranges") else 0
+    combined_extents = dict(tiled_dim_extents)
+    for d, extent in reduction_dim_extents.items():
+        combined_extents[n_output_dims + d] = extent
+    return combined_extents
+
+
+def plan_coarse_tile_groups(
+    operations: list[Operation],
+    groups: list[tuple],
+) -> dict[int, CoarseTileInfo]:
+    """Decide every op's coarse-tiling attributes without mutating the IR.
+
+    Mirrors _stamp_group's per-op decision logic (hint-to-position lookup,
+    per-level tiled-dims bookkeeping, tile_advance_exprs/
+    output_tile_advance_expr) but never calls _divide_ranges/
+    _divide_reduction_ranges -- those are real IR mutation and must only run
+    during transformation. Extents are instead computed analytically by
+    _planned_tile_extents, reading op.data.ranges/reduction_ranges as they
+    exist before any mutation.
+
+    Returns a dict mapping each tiled op's ``id(op)`` to its planned
+    CoarseTileInfo. Keyed by ``id(op)`` rather than ``op`` itself because
+    ir.Operation/ComputedBuffer are (unsafe_hash=False, eq=True) dataclasses
+    -- Python therefore sets their __hash__ to None, so they cannot be used
+    directly as dict keys (confirmed: ``{ComputedBuffer(...): 1}`` raises
+    ``TypeError: unhashable type``). ``id(op)`` still gives exact identity
+    semantics (the same object passed in via ``groups``, unmodified), and
+    matches the existing ``{id(op): ...}`` convention already used for
+    op-identity dicts elsewhere in this codebase (see
+    ``torch_spyre/_inductor/passes.py``'s ``op_order`` dicts).
+
+    Untiled/skipped ops (non-ComputedBuffer) have no entry.
+    """
+    plan: dict[int, CoarseTileInfo] = {}
+    for group_idx, (group_ops, levels) in enumerate(groups):
+        group_id: tuple[int, ...] = (group_idx,)
+        nested_group_id: tuple[int, ...] = group_id + (0,) * (len(levels) - 1)
+        counts = [count for _, count in levels]
+
+        for op in group_ops:
+            if not isinstance(op, ComputedBuffer):
+                continue
+
+            op_out = op_out_coords(op)
+            rw = op.get_read_writes()
+            read_deps = [d for d in rw.reads if isinstance(d, MemoryDep)]
+            write_deps = [d for d in rw.writes if isinstance(d, MemoryDep)]
+
+            hint_id_to_ranges_pos: dict[int, int] = {
+                h.hint_id: pos
+                for h in getattr(op, "dim_hints", [])
+                if h.loop_var is not None and not h.is_reduction
+                if (pos := _loop_var_to_ranges_pos(op_out, h.loop_var)) is not None
+            }
+            hint_id_to_reduction_ranges_pos: dict[int, int] = {}
+            if isinstance(op.data, Reduction):
+                hint_id_to_reduction_ranges_pos = {
+                    h.hint_id: pos
+                    for h in getattr(op, "dim_hints", [])
+                    if h.loop_var is not None and h.is_reduction
+                    if (pos := _loop_var_to_reduction_ranges_pos(op, h.loop_var))
+                    is not None
+                }
+
+            op_tiled_dims: list[list[int]] = []
+            op_tiled_reduction_dims: list[list[int]] = []
+            for hint_id, _count in levels:
+                opos = hint_id_to_ranges_pos.get(hint_id)
+                rpos = hint_id_to_reduction_ranges_pos.get(hint_id)
+                op_tiled_dims.append([opos] if opos is not None else [])
+                op_tiled_reduction_dims.append([rpos] if rpos is not None else [])
+
+            combined_extents = _planned_tile_extents(
+                op, op_tiled_dims, op_tiled_reduction_dims, levels
+            )
+
+            tile_advance_exprs = [
+                _tile_advance_expr_from_dep(dep, combined_extents) for dep in read_deps
+            ]
+            output_tile_advance_expr = (
+                _tile_advance_expr_from_dep(write_deps[0], combined_extents)
+                if write_deps
+                else sympy.Integer(0)
+            )
+
+            plan[id(op)] = CoarseTileInfo(
+                loop_group_id=nested_group_id,
+                loop_count=counts,
+                loop_tiled_dims=op_tiled_dims,
+                loop_tiled_reduction_dims=op_tiled_reduction_dims,
+                tile_advance_exprs=tile_advance_exprs,
+                output_tile_advance_expr=output_tile_advance_expr,
+            )
+
+            logger.debug(
+                "coarse_tile: planned %s loop_group_id=%s loop_count=%s "
+                "loop_tiled_dims=%s loop_tiled_reduction_dims=%s "
+                "tile_advance_exprs=%s output_tile_advance_expr=%s",
+                op.get_operation_name(),
+                nested_group_id,
+                counts,
+                op_tiled_dims,
+                op_tiled_reduction_dims,
+                tile_advance_exprs,
+                output_tile_advance_expr,
+            )
+
+    return plan
+
+
 def _stamp_group(
     ops: list[Operation],
     group_id: tuple[int, ...],
