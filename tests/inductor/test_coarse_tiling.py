@@ -564,7 +564,23 @@ def _make_sdsc_spec(
 def _make_tiled_op_spec() -> OpSpec:
     """Minimal OpSpec with tiled_symbols that compile_op_spec can process."""
     c0 = Symbol("c0")
+    # compile_op_spec (superdsc.parse_op_spec) renames the sole iteration-
+    # space symbol c0 to OUTPUT_DIM_LABELS[0] == "out" for this 1-dim
+    # non-matmul op (constants.py); device_tile_advance_expr must be
+    # expressed in terms of "out", not "c0" -- see
+    # TestCompileOpSpecTwoTiledSymbols._make_3d_op_spec and
+    # TestGenerateBundleMlirWithAffineStrides.
+    # test_tiled_snapshot_via_device_tile_advance_expr for the same renaming
+    # rule with worked examples.
+    out = Symbol("out")
     fp16 = _FP16
+    # device-element-offset advance per unit step of out, for a device_size=
+    # [2, 64] layout with c0/out in the last (stick) position. generate_sdsc's
+    # affine-stride filter (_tensor_tiled_by_symbol) requires a nonzero coeff
+    # on device_tile_advance_expr to treat a tensor as tiled/advancing at
+    # all, so this must be set for these tests' tensors to produce any
+    # affine stride.
+    tile_advance_expr = 64 * out
     tensor_in = TensorArg(
         is_input=True,
         arg_index=0,
@@ -572,6 +588,7 @@ def _make_tiled_op_spec() -> OpSpec:
         device_size=[2, 64],
         device_coordinates=[Integer(0), c0],
         allocation={"hbm": 0x1000},
+        device_tile_advance_expr=tile_advance_expr,
     )
     tensor_out = TensorArg(
         is_input=False,
@@ -580,6 +597,7 @@ def _make_tiled_op_spec() -> OpSpec:
         device_size=[2, 64],
         device_coordinates=[Integer(0), c0],
         allocation={"hbm": 0x2000},
+        device_tile_advance_expr=tile_advance_expr,
     )
     return OpSpec(
         op="add",
@@ -588,6 +606,7 @@ def _make_tiled_op_spec() -> OpSpec:
         args=[tensor_in, tensor_out],
         op_info={},
         tiled_symbols=[[c0]],
+        tiled_symbol_trip_counts={c0: 128},
     )
 
 
@@ -2413,6 +2432,11 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             start_address=0,
             backGap={},
             arg_index=0,
+            # device_tile_advance_expr drives generate_sdsc's affine-stride
+            # filter (_tensor_tiled_by_symbol); without it the tensor never
+            # advances regardless of tensor.strides. coeff(s) == 128 matches
+            # this tensor's declared stride=128 above.
+            device_tile_advance_expr=128 * s,
         )
         sdsc_spec = SDSCSpec(
             opfunc="add",
@@ -2443,6 +2467,70 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
         self.assertEqual(symbols[1], 128)  # core-1 derived = sentinel + per-core stride
         # affine_strides[0] = [{s: stride}] (one level, one tensor)
         self.assertIn(s, affine_strides[0][0])
+
+    def test_generate_sdsc_same_dim_tiled_two_levels_distinct_strides(self):
+        """Two levels tiling the same host dim must produce two distinct
+        per-level strides in generate_sdsc's output, not one collapsed
+        term -- this is the multi-level-collapse bug this plan fixes."""
+        # Mirrors test_nested_same_dim_different_counts's fixture shape:
+        # ranges=[Integer(256)], hints=((1, 0), (2, 0)) tiling dim 0 at
+        # level 0 (outer, count 4) and level 1 (inner, count 2).
+        # Per test_planned_tile_extents_per_level_same_dim_two_levels:
+        # level 0 (outer) extent = 64, level 1 (inner) extent = 32.
+        d0 = Symbol("d0")
+        lvl0 = Symbol("_tile_adv_add_lvl0")
+        lvl1 = Symbol("_tile_adv_add_lvl1")
+        # device_tile_advance_expr: this tensor's own device-element-offset
+        # advance per unit step of each minted level symbol -- one term per
+        # level, with the level's own extent as its coefficient (elements).
+        tile_advance_expr = 64 * lvl0 + 32 * lvl1
+        tensor = SDSCArgs(
+            layout="A",
+            dim_order=[d0],
+            data_format=_FP16,
+            scales={d0: 1},
+            strides={d0: 1},
+            offsets={d0: 0},
+            max_dim_sizes={d0: -1},
+            allocation={"hbm": 0x1000},
+            start_address=0,
+            backGap={},
+            arg_index=0,
+            device_tile_advance_expr=tile_advance_expr,
+        )
+        sdsc_spec = SDSCSpec(
+            opfunc="add",
+            execution_unit="sfp",
+            data_format=_FP16,
+            num_inputs=1,
+            iteration_space={d0: 256},
+            num_cores=1,
+            work_slices={d0: 1},
+            core_id_to_work_slice={d0: Integer(0)},
+            padding={},
+            layouts={"A": {"dim_order": [d0], "stick_dim_order": d0, "stick_size": 64}},
+            args=[tensor],
+            constants={},
+            coordinate_masking={},
+        )
+        symbols: list[int] = []
+        # tiled_symbols is outermost-first (see generate_sdsc's own comment,
+        # compute_ops.py:526) -- level 0 (outer) first, level 1 (inner) second.
+        _, _, affine_strides, _ = generate_sdsc(
+            0,
+            sdsc_spec,
+            symbols,
+            symbol_id_offset=0,
+            tiled_symbols=[[lvl0], [lvl1]],
+            use_symbols=True,
+        )
+        self.assertEqual(len(affine_strides), 1)
+        per_level = affine_strides[0]
+        self.assertEqual(len(per_level), 2)
+        nb = 2  # fp16 byte size
+        self.assertEqual(per_level[0].get(lvl0), 64 * nb)
+        self.assertEqual(per_level[1].get(lvl1), 32 * nb)
+        self.assertNotEqual(per_level[0].get(lvl0), per_level[1].get(lvl1))
 
 
 class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):

@@ -482,6 +482,26 @@ def _build_indirect_access_fields(sdsc_spec, tensor, tensor_idx: int) -> dict:
     return fields
 
 
+def _tensor_tiled_by_symbol(tensor, sym) -> bool:
+    """True iff `sym` contributes a nonzero term to this tensor's own
+    tile advance.
+
+    Real dimension symbols additionally require a positive scale (exclude
+    reduction dims, whose stride describes intra-tile layout, not the
+    inter-tile advance). Minted level symbols (Task 5) carry no
+    dimension/scale identity of their own, so that half of the check is
+    skipped for them; tensor.device_tile_advance_expr already only
+    contains a minted symbol's term when this tensor genuinely advances
+    at that level, so the coefficient check alone is both necessary and
+    sufficient for minted symbols.
+    """
+    if sym in tensor.strides and tensor.scales.get(sym, 1) <= 0:
+        return False
+    if tensor.device_tile_advance_expr is None:
+        return False
+    return bool(tensor.device_tile_advance_expr.coeff(sym))
+
+
 def generate_sdsc(
     idx,
     sdsc_spec,
@@ -686,7 +706,7 @@ def generate_sdsc(
                 # per_tile_fixed lx tensors are fine: they don't advance, same as
                 # non-tiled tensors, so [{}] * n_levels is correct either way.
                 is_tiled_lx = tensor.per_tile_fixed is False and any(
-                    s in tensor.strides and tensor.scales.get(s, 1) > 0
+                    _tensor_tiled_by_symbol(tensor, s)
                     for level_syms in tiled_symbols
                     for s in level_syms
                 )
@@ -821,7 +841,9 @@ def generate_sdsc(
                 # Pool tensor: no raw-base or slice symbol needed.
                 sliced_base_sym_idx = -1
             # Build per-level strides: for each level, collect the symbols at that
-            # level that tile this tensor (i.e. appear in tensor.strides).
+            # level that tile this tensor (see _tensor_tiled_by_symbol -- a nonzero
+            # coeff on tensor.device_tile_advance_expr, with real dimension symbols
+            # additionally required to have a positive scale).
             # Exclude symbols whose scale is negative: those are reduced dimensions
             # whose stride describes element layout within one tile, not the advance
             # between tiles.  Tiling by a reduction-dim symbol would incorrectly
@@ -833,9 +855,7 @@ def generate_sdsc(
             if not tensor.per_tile_fixed:
                 for level_idx, level_syms in enumerate(tiled_symbols):
                     tensor_tiled_at_level = [
-                        s
-                        for s in level_syms
-                        if s in tensor.strides and tensor.scales.get(s, 1) > 0
+                        s for s in level_syms if _tensor_tiled_by_symbol(tensor, s)
                     ]
                     strides_for_level: dict = {}
                     for s in tensor_tiled_at_level:
