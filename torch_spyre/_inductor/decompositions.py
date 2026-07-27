@@ -998,6 +998,34 @@ def spyre_prod_dim_int(
 
 
 ###############################################################################################
+##         Remove decompositions for fallback ops at module import time.                      ##
+###############################################################################################
+# Fallback ops need to have their PyTorch decompositions removed from the global
+# decomposition registry before torch-spyre's lowering module is imported. This prevents
+# PyTorch's make_fallback from detecting conflicts between fallbacks and decompositions.
+#
+# This must happen at module scope (not in enable_spyre_decompositions CM) so that:
+# 1. The removal happens before lowering.py is imported
+# 2. The removal is permanent and thread-safe (not just during compilation)
+# 3. PyTorch's Inductor sees no decomposition when it tries to register fallbacks
+def _remove_fallback_ops_decompositions():
+    from torch_spyre.ops.fallbacks import fallback_ops
+    from torch._ops import OpOverload, OpOverloadPacket
+
+    decomps = torch._inductor.decomposition.decompositions
+    for op in fallback_ops:
+        if isinstance(op, OpOverloadPacket):
+            for overload_name in op.overloads():
+                opo = getattr(op, overload_name)
+                decomps.pop(opo, None)
+        elif isinstance(op, OpOverload):
+            decomps.pop(op, None)
+
+
+_remove_fallback_ops_decompositions()
+
+
+###############################################################################################
 ##                           Register custom kernels for Spyre.                              ##
 ###############################################################################################
 # Kernels are registered permanently in the C++ dispatcher by
