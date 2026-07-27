@@ -1458,20 +1458,13 @@ def _insert_reduction_copy_op(
 
     By default inserts immediately after tiled_op (or its combine op, if
     any) — correct when nothing else in the inner loop group depends on
-    tiled_op.  Pass insert_after to place the copy after a different op
-    instead — needed when tiled_op has sibling closure members later in the
-    same inner loop group (the carry case): the copy must run once per
-    outer tile after the *last* inner-loop iteration, i.e. after every
-    closure member has executed, not immediately after tiled_op itself.
-
-    force_live: set for a carry copy-out whose seed has no outside
-    consumers or graph-output status (e.g. online-softmax running state
-    like M, never read after the recurrence's last iteration). Its write
-    is only ever "read" by the NEXT outer-tile iteration's copy-in — a
-    cross-iteration dependency invisible to the single-pass, pre-unroll IR
-    the scheduler's dead_node_elimination walks, so without this the op is
-    (wrongly) seen as dead and removed. Stamps _coarse_tile_force_live,
-    consulted by the has_side_effects patch in patches.py.
+    tiled_op.  insert_after/force_live exist for a case this function's sole
+    current caller (_propagate_tiled_reduction_op) never needs and always
+    leaves at their defaults: reduction-dim tiling requiring cross-tile carry
+    propagation is rejected with Unsupported at planning time
+    (plan_coarse_tile_groups, via _seed_buffer_for_carry), so no caller ever
+    needs to place the copy after anything but tiled_op/its combine op, or to
+    force it live.
     """
     copy_data = Pointwise(
         device=tiled_op.get_device(),
@@ -1957,7 +1950,7 @@ def _patch_retiled_load_indexes(
 
     from ..pass_utils import replace_computed_buffer_body
 
-    # Only ops that were already in the group when _stamp_group ran can hold a
+    # Only ops that were already in the group when _apply_plan ran can hold a
     # stale (pre-divide) coefficient for a retiled buffer.  Ops inserted later
     # by insert_tiling_propagation (e.g. _insert_copy_op's copy_buf) read the
     # retiled buffer's already-updated layout directly, so rewriting them here
@@ -2007,7 +2000,7 @@ def _seed_closure_pre_stamp(seed_name: str, group_ops: list[Operation]) -> set[s
     """Pre-stamp equivalent of _seed_closure, over a plain group_ops list.
 
     Not transitive — see _seed_closure's docstring for why. Used by
-    _replace_constant_fill_predecessors, which runs before _stamp_group (so
+    _replace_constant_fill_predecessors, which runs before _apply_plan (so
     ops in group_ops have no loop_info yet, and the outer-loop-group
     filtering _seed_closure does via stamped loop_info is unnecessary —
     group_ops is already scoped to the group).
@@ -2044,7 +2037,7 @@ def _replace_constant_fill_predecessors(
     is semantically equivalent to slicing a per-iteration fill.
 
     Returns a name_map {old_fill_name: new_tile_fill_name} for the caller to
-    apply via _apply_fill_name_swap after _stamp_group has run (so that
+    apply via _apply_fill_name_swap after _apply_plan has run (so that
     replace_computed_buffer_body preserves the loop_info already stamped on
     each group op).
     """
@@ -2112,7 +2105,7 @@ def _replace_constant_fill_predecessors(
             # Skip the tile-sized-copy rewrite for this (old_name, op) pair.
             # Checked via dim_hints directly (not stamped loop_info, which
             # does not exist yet at this point in the pass pipeline — this
-            # function runs before _stamp_group).  A closure of size > 1 is
+            # function runs before _apply_plan).  A closure of size > 1 is
             # not itself a disqualifying signal (see _seed_buffer_for_carry)
             # — only "is every closure member carry-shaped" matters here.
             closure = _seed_closure_pre_stamp(old_name, group_ops)
@@ -2226,9 +2219,10 @@ def _replace_constant_fill_predecessors(
             # Stamp loop_info so the fill is placed inside the loop group by
             # build_loop_scheduler_nodes, with empty loop_tiled_dims (loop-
             # invariant: executed once per loop body but no range is divided).
-            # Use the same nested_group_id that _stamp_group assigns to broadcast
-            # ops: group_id + (0,) * (len(levels) - 1).  loop_count length must
-            # equal loop_group_id length (enforced by _loop_count assertion).
+            # Use the same nested_group_id that plan_coarse_tile_groups assigns
+            # to broadcast ops: group_id + (0,) * (len(levels) - 1).  loop_count
+            # length must equal loop_group_id length (enforced by _loop_count
+            # assertion).
             counts = [count for _, count in levels]
             nested_group_id = group_id + (0,) * (len(levels) - 1)
             fill_buf.loop_info = CoarseTileInfo(  # type: ignore[attr-defined]
@@ -2268,7 +2262,7 @@ def _apply_fill_name_swap(
 ) -> None:
     """Patch group ops to read tile-sized fills instead of the original full-size ones.
 
-    Must be called AFTER _stamp_group so that replace_computed_buffer_body
+    Must be called AFTER _apply_plan so that replace_computed_buffer_body
     copies the already-stamped loop_info onto the reconstructed ComputedBuffer.
     """
     if not name_map:
