@@ -384,10 +384,11 @@ def finalize_layouts(graph: GraphLowering) -> None:
                 # FixedTiledLayout. Two producers of this shape:
                 #  - the copy-back elision optimization (propagate_layouts.py),
                 #    which stamps ELIDED_COPY_BACK_ATTR on the producer; or
-                #  - a sequential-carry op (_propagate_carry_op) that mutates
-                #    directly into a SpyreEmptyFallback accumulator (accum_tile) —
-                #    a legitimate in-group consumer (e.g. the next recurrence
-                #    step) reads the carry op's own output the same way an
+                #  - coarse_tile.py's nested output-dim + reduction-dim tiling
+                #    (_insert_reduction_copy_op), which mutates directly into a
+                #    SpyreEmptyFallback accumulator (accum_tile) — a legitimate
+                #    in-group consumer (e.g. the next outer-tile iteration's
+                #    copy-in) reads that copy op's own output the same way an
                 #    ordinary producer's output would be read.
                 mutation_target = in_layout.get_buffer()
                 is_elided = getattr(input_buf, ELIDED_COPY_BACK_ATTR, False)

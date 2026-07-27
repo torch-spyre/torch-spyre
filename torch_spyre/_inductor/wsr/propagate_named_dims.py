@@ -608,9 +608,9 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
                 {},
             )
             # TODO: support multiple dimensions per spyre_hint() call.
-            # hint_id_to_ranges_pos in _stamp_group would need to become
-            # dict[int, list[int]] and _hints_levels would need to deduplicate
-            # by hint_id.
+            # hint_id_to_ranges_pos in plan_coarse_tile_groups would need to
+            # become dict[int, list[int]] and _hints_levels would need to
+            # deduplicate by hint_id.
             if len(dims) > 1:
                 raise NotImplementedError(
                     f"spyre_hint() argument {list(hint_dict.items())} specifies "

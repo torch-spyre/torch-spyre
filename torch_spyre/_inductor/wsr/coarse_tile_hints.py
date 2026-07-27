@@ -46,8 +46,9 @@ def _hints_levels(ops: list[Operation]) -> list[tuple]:
     ascending (outermost-first).
 
     is_reduction is intentionally absent from the returned pairs: it is a
-    per-op, per-dimension property consulted directly in _stamp_group via each
-    op's own DimHint, not a group-level concept.
+    per-op, per-dimension property consulted directly from each op's own
+    DimHint by plan_coarse_tile_groups (via _op_hint_dim_positions), not a
+    group-level concept.
     """
     best: dict[int, DimHint] = {}
     for op in ops:
