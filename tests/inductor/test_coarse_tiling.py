@@ -75,6 +75,8 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _REDUCTION_FREE_SYMS_KEY,
     _RetiledBufferInfo,
     _divide_ranges,
+    _full_buffer_read_deps,
+    _insert_read_copy_ops,
     _replace_group_op,
     _retile_load_index_from_strides,
     _should_patch_retiled_load_indexes,
@@ -3837,6 +3839,159 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
             "_seed_buffer_for_carry must stay defined -- plan_coarse_tile_groups "
             "still calls it as its carry-detection predicate",
         )
+
+
+def _make_full_buffer_read_fixture():
+    """Build a real tiled Pointwise op that reads a full-size SpyreEmptyFallback.
+
+    Mirrors ``_make_real_pointwise_op`` (real IR, not mocks) but the input is
+    a genuine ``SpyreEmptyFallback`` buffer (constructed directly, bypassing
+    FX-node lowering) rather than a plain ``InputBuffer`` -- this is what
+    ``_full_buffer_read_deps`` specifically filters for.  The op's own
+    ranges are smaller than the full buffer's shape (8 rows out of 64),
+    modeling the tile-vs-full-buffer mismatch ``_insert_read_copy_ops``
+    exists to resolve.
+
+    Caller must have an active graph handler (``V.set_graph_handler(...)``)
+    around this call, matching every other real-IR helper in this file.
+    Returns ``(tiled_op, full_deps, operations)`` ready to pass straight into
+    ``_insert_read_copy_ops``.
+    """
+    from torch._inductor.ir import (
+        ComputedBuffer,
+        FixedLayout,
+        Pointwise,
+        StorageBox,
+        TensorBox,
+    )
+
+    from torch_spyre._inductor.ir import SpyreEmptyFallback
+
+    device = torch.device("cpu")
+    dtype = torch.float32
+
+    full_buf = SpyreEmptyFallback(
+        torch.ops.spyre.empty.default, [64, 128], device, dtype
+    )
+    full_buf.layout = FixedLayout(device, dtype, [64, 128], [128, 1])
+    full_box = TensorBox(StorageBox(full_buf))
+
+    def inner_fn(index):
+        return full_box.make_loader()(index)
+
+    pw = Pointwise.create(
+        device=device,
+        dtype=dtype,
+        inner_fn=inner_fn,
+        ranges=[Integer(8), Integer(128)],
+    )
+    pw_data = pw.data.data  # TensorBox -> StorageBox -> Pointwise
+    tiled_op = ComputedBuffer(
+        name="tiled_op0",
+        layout=FixedLayout(device, dtype, [Integer(8), Integer(128)], None),
+        data=pw_data,
+    )
+    tiled_op.operation_name = "tiled_op0"
+    tiled_op.origins = OrderedSet()
+    tiled_op.loop_info = CoarseTileInfo(
+        loop_group_id=(0,), loop_count=[Integer(8)], loop_tiled_dims=[[0]]
+    )
+    V.graph.name_to_buffer["tiled_op0"] = tiled_op
+
+    operations = [full_buf, tiled_op]
+    full_deps = _full_buffer_read_deps(tiled_op)
+    return tiled_op, full_deps, operations
+
+
+class TestInsertReadCopyOps(unittest.TestCase):
+    """_insert_read_copy_ops always materializes a real copy, never a view.
+
+    Regression coverage added alongside the rename from
+    _insert_read_view_ops -- there was no direct unit test of this function
+    before (confirmed by grep across tests/inductor/ at the time this test
+    was written), even though the function's actual behavior has always
+    been to build a genuine Pointwise computation into a fresh,
+    independently-laid-out ComputedBuffer (never an IR-level view/alias
+    node such as ReinterpretView) -- the "view" in the old name was a
+    misnomer, not a description of a second, non-materializing code path.
+    """
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    def test_boundary_read_always_copies_not_views(self):
+        """A full-buffer boundary read must always get a real copy, never a
+        view-only op."""
+        from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
+
+        from torch_spyre._inductor.ir import SpyreEmptyFallback
+
+        tiled_op, full_deps, operations = _make_full_buffer_read_fixture()
+        self.assertEqual(len(full_deps), 1)
+        full_buf = V.graph.get_buffer(full_deps[0].name)
+
+        new_op = _insert_read_copy_ops(tiled_op, full_deps, operations)
+
+        # Exactly one new op was inserted (the copy), immediately before
+        # tiled_op; the original full_buf is untouched.
+        self.assertEqual(len(operations), 3)
+        copy_buf = operations[1]
+        self.assertIs(operations[0], full_buf)
+        self.assertIs(operations[2], new_op)
+
+        # The inserted op is a real materializing copy, not a pass-through
+        # view/alias:
+        #  - it is a genuine Pointwise computation (not a ReinterpretView or
+        #    other aliasing IR node), so it has its own independent storage;
+        self.assertIsInstance(copy_buf, ComputedBuffer)
+        self.assertIsInstance(copy_buf.data, Pointwise)
+        #  - its layout is an independent FixedLayout sized to the *tile*
+        #    range, distinct from (not shared with, not a view over)
+        #    full_buf's own full-size layout;
+        self.assertIsInstance(copy_buf.layout, FixedLayout)
+        self.assertIsNot(copy_buf.layout, full_buf.layout)
+        self.assertEqual(list(copy_buf.layout.size), [8, 128])
+        self.assertEqual(list(full_buf.layout.size), [64, 128])
+        #  - its own inner_fn actually loads from the full buffer (i.e. it
+        #    reads through the dependency rather than aliasing it) --
+        #    observed by installing a recording ops handler, matching this
+        #    codebase's WrapperHandler-based inner_fn inspection convention
+        #    rather than re-deriving index expressions by hand;
+        loaded_names = []
+
+        class _RecordingHandler:
+            def load(self, name, index):
+                loaded_names.append(name)
+                return 0.0
+
+        with V.set_ops_handler(_RecordingHandler()):
+            copy_buf.data.inner_fn([sympy.Integer(0) for _ in copy_buf.data.ranges])
+        self.assertEqual(loaded_names, [full_buf.get_name()])
+
+        #  - tiled_op's own (reconstructed) inner_fn is patched to read the
+        #    copy instead of the full buffer -- confirming the name-swap
+        #    landed and no consumer still reads full_buf directly.
+        redirected_names = []
+
+        class _RecordingHandler2:
+            def load(self, name, index):
+                redirected_names.append(name)
+                return 0.0
+
+        with V.set_ops_handler(_RecordingHandler2()):
+            new_op.data.inner_fn([sympy.Integer(0) for _ in new_op.data.ranges])
+        self.assertEqual(redirected_names, [copy_buf.get_name()])
+        self.assertNotIn(full_buf.get_name(), redirected_names)
+
+        # SpyreEmptyFallback (the only buffer type _full_buffer_read_deps
+        # matches) is unmodified -- confirms the fixture is exercising the
+        # intended full-vs-tile mismatch, not some other buffer kind.
+        self.assertIsInstance(full_buf, SpyreEmptyFallback)
 
 
 def _make_tiled_reduction_op(
