@@ -60,6 +60,7 @@ from .op_spec import (
     OpSpec,
     TensorArg,
     UnimplementedOp as OpSpecUnimplementedOp,
+    format_op_spec_list,
 )
 from torch_spyre._inductor.provenance import build_debug_handle
 import logging
@@ -686,6 +687,23 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
             debug_handle = None
 
+        if not is_reduction and op != "ReStickifyOpHBM" and not indirect_var_names:
+            stick_vars = {
+                next(iter(arg.device_coordinates[-1].free_symbols))
+                for arg in args
+                if arg.device_coordinates and arg.device_coordinates[-1].free_symbols
+            }
+            assert len(stick_vars) <= 1, (
+                f"create_op_spec: stick mismatch for op={op!r} "
+                f"ir_chain={getattr(debug_handle, 'ir_chain', '?')}: "
+                f"args have different stick loop variables: "
+                + ", ".join(
+                    str(arg.device_coordinates[-1])
+                    for arg in args
+                    if arg.device_coordinates
+                )
+            )
+
         return OpSpec(
             op,
             is_reduction,
@@ -918,8 +936,21 @@ class SpyreKernel(Kernel[CSEVariable]):
             if self.indirect_vars
             else None
         )
+
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "OP SPECS AFTER CREATION/LOOP-WRAPPING\n%s",
+                format_op_spec_list(self.op_specs),
+            )
+
         for op_spec in _iter_op_specs(self.op_specs):
             simplify_op_spec(op_spec, self.indirect_sizes, indirect_access_subs)
+
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "OP SPECS AFTER SIMPLIFICATION\n%s",
+                format_op_spec_list(self.op_specs),
+            )
 
         def sympy_str(x: sympy.Expr) -> str:
             if isinstance(x, IndirectAccess):

@@ -254,7 +254,10 @@ class JobPlanStep {
   }
 
  protected:
-  bool pipeline_barrier_ = false;
+  // true by default: every step is a potential consumer that should wait for
+  // prior ops. Steps that are genuinely overlap-eligible (HostCompute) opt out
+  // explicitly.
+  bool pipeline_barrier_ = true;
 };
 
 /**
@@ -407,7 +410,9 @@ class JobPlanStepHostCompute final : public JobPlanStep {
       : hcm_(std::move(hcm)),
         output_buffer_(output_buffer),
         input_buffer_(input_buffer),
-        ishape_(ishape) {}
+        ishape_(ishape) {
+    pipeline_barrier_ = false;  // host callbacks are overlap-eligible
+  }
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 

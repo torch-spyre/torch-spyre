@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2025-2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,8 +16,8 @@
 Spyre profiling package.
 
 This package provides the Python-side scaffolding for Spyre profiling
-integration. It will expose profiling utilities and hooks once fully
-implemented.
+integration. Public FFDC API is exposed as ``torch.spyre.get_diagnostic_report``
+(see ``make_spyre_module``); import ``torch_spyre.profiler._ffdc`` for internals.
 """
 
 
@@ -26,5 +26,4 @@ def is_available() -> bool:
     return False
 
 
-# Public API (to be populated in future issues)
 __all__: list[str] = []

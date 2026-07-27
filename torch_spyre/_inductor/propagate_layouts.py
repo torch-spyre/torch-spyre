@@ -60,7 +60,12 @@ from .constants import (
     STAGGERED_EAS,
     TOPK_OPS,
 )
-from .ir import FixedTiledLayout, SpyreConstantFallback
+from .ir import (
+    FixedTiledLayout,
+    SpyreConstantFallback,
+    BroadcastAsyncFallback,
+    WaitWorkFallback,
+)
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
@@ -163,6 +168,8 @@ def _make_output_stl(
     Returns None if the resulting stick expression has an offset.
     """
     stick_size = get_elem_in_stick(output.dtype)
+    if stick_dim >= 0 and c_size[stick_dim] == 1:
+        return None
     out_coords = host_coordinates(output, output_dep, None)
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
     stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
@@ -365,7 +372,12 @@ def _single_arg_op_layout(
             # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),
             # which becomes 64 FP32 elements when converted. We need to reflect this
             # in the output host size so the constructor creates the correct device layout.
-            in_stick_expr = device_coordinates(stl, dep, None)[-1]
+            try:
+                in_stick_expr = device_coordinates(stl, dep, None)[-1]
+            except Unsupported:
+                # Staggered-EA candidate whose physical stick depth differs from
+                # elems_per_stick — not a valid input for this conversion path.
+                return []
             if not is_stick_expr_offset_free(in_stick_expr, stl.elems_per_stick()):
                 return []
 
@@ -462,7 +474,9 @@ def _single_arg_op_layout(
         )
         return [stl]
 
-    in_device_coords = device_coordinates(stl, dep, None)
+    in_device_coords = try_device_coordinates(stl, dep, None)
+    if in_device_coords is None:
+        return []
     stick_expr = in_device_coords[-1]
 
     # Try to preserve input layout, fall back to scanning all output dims
@@ -809,10 +823,12 @@ def _multi_arg_pointwise_layouts(
 
     ind_names, _, ind_sizes = indirect_info_from_op(op)
     stick_exprs = {
-        device_coordinates(stl, arg.dep, ind_sizes)[-1]
+        dc[-1]
         for arg in args
         for stl in arg.layouts
         if arg.dep.name not in ind_names
+        for dc in [try_device_coordinates(stl, arg.dep, ind_sizes)]
+        if dc is not None
     }
 
     # If the indexing and device element size are identical
@@ -848,8 +864,8 @@ def _multi_arg_pointwise_layouts(
             in_stl = SpyreTensorLayout(
                 c_in_size, c_in_stride, output.dtype, projected_dim_order, output_ea
             )
-            coord = device_coordinates(in_stl, arg.dep, ind_sizes)
-            if not is_stick_expr_offset_free(coord[-1], stick_size):
+            coord = try_device_coordinates(in_stl, arg.dep, ind_sizes)
+            if coord is None or not is_stick_expr_offset_free(coord[-1], stick_size):
                 return False
         return True
 
@@ -882,13 +898,26 @@ def _multi_arg_pointwise_layouts(
         for stick_expr in sorted(offset_free_stick_exprs, key=iter_var_id):
             _try_stick_dim(_pick_stick_dim(stick_expr, out_coords))
 
-    # Try alternative layouts if no valid layouts found
-    if not results:
-        for alt_stick_dim in range(len(output.size) - 1):
-            # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
-            if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
-                continue
-            _try_stick_dim(alt_stick_dim)
+    # Always scan all dims so that dims absent from any input stick expression
+    # (e.g. the outer broadcast dim) are also offered as candidates. Deduplicate
+    # against layouts already produced by the input-stick loop above.
+    # Skip for staggered-EA ops: their output layout is dictated by the staggered
+    # input EA and adding STANDARD candidates would corrupt downstream ops.
+    # EA omitted from key: the loop below is skipped for staggered ops, so all
+    # candidates added (and looked up) here use STANDARD EA — geometry suffices.
+    seen_keys = {(tuple(r.device_size), tuple(r.stride_map)) for r in results}
+    for alt_stick_dim in range(len(output.size)) if not staggered_inputs else []:
+        # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
+        if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
+            continue
+        pre_len = len(results)
+        _try_stick_dim(alt_stick_dim)
+        if len(results) > pre_len:
+            key = (tuple(results[-1].device_size), tuple(results[-1].stride_map))
+            if key in seen_keys:
+                results.pop()
+            else:
+                seen_keys.add(key)
 
     # LX in-place: promote a same-frame input's layout to FIRST so the beam
     # commits it on a cost tie, avoiding a free-but-in-place-defeating permutation
@@ -1095,6 +1124,7 @@ def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
     output: FixedLayout = op.get_layout()
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
+    stick_size = get_elem_in_stick(output.dtype)
     layouts = [
         SpyreTensorLayout(
             c_size,
@@ -1103,7 +1133,7 @@ def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
             [d for d in range(len(c_size)) if d != stick_dim] + [stick_dim],
         )
         for stick_dim in range(len(c_size))
-        if c_size[stick_dim] > 1  # no sticks of size 1
+        if c_size[stick_dim] % stick_size == 0 and c_size[stick_dim] >= stick_size
     ]
     if not layouts:
         layouts = [generic_layout(op)]
@@ -1259,6 +1289,11 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
         producer_layouts = getattr(producer, "layouts", None)
         if not producer_layouts or target_stl not in producer_layouts:
             continue
+        # Only elide when the producer has a single unambiguous layout. With
+        # multiple candidates the optimizer may not commit to target_stl, so
+        # eliding the copy would be incorrect.
+        if len(producer_layouts) != 1:
+            continue
 
         producer.layout = copy_op.layout
         producer.layouts = [target_stl]
@@ -1289,11 +1324,11 @@ def propagate_spyre_tensor_layouts(
             if isinstance(real_input, torch.Tensor):
                 stl = real_input.device_tensor_layout()
                 if stl is None:
-                    # All spyre tensors are created with device layouts.
-                    # Therefore we expect all graph inputs to have them.
-                    raise Unsupported(
-                        f"missing device_tensor_layout on graph input {name}"
-                    )
+                    # A CPU tensor lifted as a graph input, or a host tensor
+                    # feeding a FallbackKernel has no Spyre layout;
+                    # leave its FixedLayout and .layouts untouched,
+                    # mirroring the non-Spyre ComputedBuffer skip below.
+                    continue
                 tb = graph.graph_inputs[name]
                 if (
                     not isinstance(tb, TensorBox)
@@ -1414,6 +1449,11 @@ def propagate_spyre_tensor_layouts(
             if op.get_layout().device.type == DEVICE_NAME:
                 op.layouts = [generic_layout(op)]
                 op.restick_cost_fn = AnyInNode.from_args()
+        elif isinstance(op, (BroadcastAsyncFallback, WaitWorkFallback)):
+            input_name = op.inputs[0].get_name()
+            input_buf = V.graph.get_buffer(input_name)
+            op.layouts = list(input_buf.layouts)
+            op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ExternKernel):
             logger.warning(f"unhandled node type {type(op)}")
         else:

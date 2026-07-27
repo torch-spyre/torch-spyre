@@ -13,11 +13,11 @@
 # limitations under the License.
 
 
-from torch_spyre.constants import DEVICE_NAME
-
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from torch._dynamo.guards import GuardBuilder
+
+from torch_spyre.constants import DEVICE_NAME
 
 if TYPE_CHECKING:
     from torch_spyre._C import SpyreTensorLayout
@@ -152,10 +152,17 @@ def _patch_tensor_for_spyre():
                 ):
                     return self
                 else:
-                    return torch.ops.spyre.copy_from_d2d(self, dst)
+                    # Pass storage_offsets explicitly: a graph input's
+                    # storage_offset is dropped by Inductor, so the lowering
+                    # must re-introduce it in-graph (see copy_from_d2d in
+                    # customops.py and lower_spyre_from_d2d).
+                    return torch.ops.spyre.copy_from_d2d(
+                        self, dst, self.storage_offset(), dst.storage_offset()
+                    )
 
     def spyre_empty(
         *args,
+        size=None,
         device_layout=None,
         out=None,
         dtype=None,
@@ -165,6 +172,15 @@ def _patch_tensor_for_spyre():
         pin_memory=False,
         memory_format=torch.contiguous_format,
     ):
+        # torch.empty supports size as either a positional arg or keyword arg.
+        # Normalise so downstream always receives it as positional.
+        if size is not None:
+            if args:
+                raise TypeError(
+                    "empty() received an invalid combination of arguments - got (tuple, size=tuple)"
+                )
+            args = (size,)
+
         if (
             device_layout is None
         ):  # use original implementation if no layout is provided

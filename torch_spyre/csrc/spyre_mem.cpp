@@ -431,7 +431,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
   dci.input_shape_ = host2device ? cpu_shape : dev_shape;
   dci.output_shape_ = host2device ? dev_shape : cpu_shape;
-  if (g_debug_info_enabled) {
+  if (torch_spyre::logging::legacy::is_legacy_debug_enabled()) {
     std::stringstream s;
     dci.exportJson(s);
     DEBUGINFO("DataConversionInfo: ", s.str());

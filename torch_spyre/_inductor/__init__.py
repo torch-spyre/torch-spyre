@@ -1,4 +1,4 @@
-# Copyright 2025 The Torch-Spyre Authors.
+# Copyright 2025-2026 The Torch-Spyre Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,21 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import contextmanager
 from .constants import DEVICE_NAME
-from .patches import enable_spyre_context
+from .patches import enable_spyre_context, patch_inductor_fusions
 from . import config
 
 import threading
 from functools import wraps
 
-from .propagate_hints import spyre_hint, get_op_hints, _reset_counter  # noqa: F401
+from .propagate_hints import spyre_hint, get_op_hints  # noqa: F401
+from torch_spyre.profiler._ffdc import CATEGORY_COMPILE, try_collect
 
 _autoload_lock = threading.Lock()
 
 
 def enable_spyre_compile_fx_wrapper():
-    from torch._dynamo.repro.after_dynamo import WrapBackendDebug
     import torch._inductor.compile_fx as cfx
     import torch.fx as fx
     import torch
@@ -36,7 +35,13 @@ def enable_spyre_compile_fx_wrapper():
     with _autoload_lock:
         if getattr(cfx, "_spyre_wrapped", False):
             return
+
+        patch_inductor_fusions()
+
         _orig = cfx.compile_fx
+        from torch_spyre._inductor.logging_utils import get_inductor_logger
+
+        logger = get_inductor_logger("compile_fx_wrapper")
 
         # Iterate over producer nodes (supports nested containers of nodes)
         def iter_nodes(x):
@@ -99,39 +104,33 @@ def enable_spyre_compile_fx_wrapper():
             decomps = kwargs.setdefault(
                 "decompositions", torch._inductor.decomposition.decompositions
             )
+            uses_spyre = _uses_spyre(gm, example_inputs)
 
-            if _uses_spyre(gm, example_inputs):
-                torch.spyre._impl._lazy_init()
+            try:
+                if uses_spyre:
+                    torch.spyre._impl._lazy_init()
 
-                with enable_spyre_context(
-                    example_inputs, decomps=decomps
-                ) as spyre_context_decompositions:
-                    # The `decomps` is the updated in the context manager
-                    # with the appropriate spyre decompositions
-                    # and yielded as `spyre_context_decompositions` from the CM
+                    with enable_spyre_context(
+                        example_inputs, decomps=decomps
+                    ) as spyre_context_decompositions:
+                        # The `decomps` is the updated in the context manager
+                        # with the appropriate spyre decompositions
+                        # and yielded as `spyre_context_decompositions` from the CM
 
-                    kwargs["decompositions"] = spyre_context_decompositions
+                        kwargs["decompositions"] = spyre_context_decompositions
+                        return _orig(
+                            gm,
+                            example_inputs,
+                            *args,
+                            **kwargs,
+                        )
 
-                    return _orig(
-                        gm,
-                        example_inputs,
-                        *args,
-                        **kwargs,
-                    )
-
-            return _orig(gm, example_inputs, *args, **kwargs)
-
-        # Reset the global counter after each
-        # run to prevent recompilation
-        @contextmanager
-        def backend_context():
-            _reset_counter()
-            yield
-
-        def backend_ctx_ctor(self):
-            return backend_context
-
-        setattr(WrapBackendDebug, "backend_ctx_ctor", property(backend_ctx_ctor))
+                # Non-Spyre graphs: no FFDC — avoids capturing unrelated CPU compiles.
+                return _orig(gm, example_inputs, *args, **kwargs)
+            except Exception as exc:
+                if uses_spyre:
+                    try_collect(exc, logger=logger, failure_category=CATEGORY_COMPILE)
+                raise
 
         cfx.compile_fx = _wrapper
         cfx._spyre_wrapped = True
@@ -139,6 +138,7 @@ def enable_spyre_compile_fx_wrapper():
 
 def _light_autoload():
     from . import decompositions  # noqa: F401
+    from . import distributed as _distributed_init  # noqa: F401  registers spyre::broadcast_async/wait_work
 
     enable_spyre_compile_fx_wrapper()
 
