@@ -255,10 +255,11 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 | File | Responsibility |
 |---|---|
 | `passes.py` | `ScratchpadOptimizationPass` ABC, `CloneInputNodesPass` |
-| `plan_solver.py` | `MemoryPlanSolver` ABC, `LifetimeBoundBuffer`, `GreedyLayoutSolver` |
+| `plan_solver.py` | `MemoryPlanSolver` ABC (declarative exclusion via `partition`/`excluded`), `LifetimeBoundBuffer` |
+| `greedy_solver.py` | `GreedyLayoutSolver` |
 | `firstfit_bestfit_solver.py` | `FirstFitLayoutSolver`, `BestFitLayoutSolver` |
-| `allocator.py` | `ScratchpadAllocator`, `StrategyBCoOptimizingAllocator` |
-| `utils.py` | liveness, in-place candidates, op eligibility lists |
+| `allocator.py` | `ScratchpadAllocator`, `StrategyBCoOptimizingAllocator`, and the single LX-eligibility predicate (`_residency_reasons`, one reason per buffer) |
+| `utils.py` | liveness, mem usage, op-name/eligibility helpers |
 
 ### Entry point
 
@@ -271,16 +272,61 @@ scratchpad_planning(graph, allocator=ScratchpadAllocator())
 1. **Pre-passes.** `CloneInputNodesPass` walks graph inputs and inserts a
    `clone` for any HBM input that is read more than once *and* fits on
    LX. The clone output becomes a fresh LX-eligible buffer.
-2. **Buffer analysis.** `_generate_buffers` produces a list of
-   `LifetimeBoundBuffer(name, size, start_time, end_time, in_place_parents)`
-   for every op that survives the eligibility filter (graph i/o is
-   excluded; so are buffers whose users have incompatible core splits).
-3. **Layout planning.** The solver assigns an `address` to each buffer
-   it can fit; the rest get `address=None` and stay on HBM.
+2. **Buffer analysis.** `_generate_buffers` produces one
+   `LifetimeBoundBuffer` per buffer — *including* the ones that may not
+   reside. Nothing is filtered out; `ScratchpadAllocator._residency_reasons`
+   (in `allocator.py`) decides eligibility and the verdict rides along as
+   `residency_reason` (see
+   [Declarative exclusion](#declarative-exclusion) below).
+3. **Layout planning.** The solver partitions off every barred buffer
+   (`MemoryPlanSolver.partition`), then assigns an `address` to each of the
+   rest it can fit; whatever is left gets `address=None` and stays on HBM.
 4. **Push allocation.** Successful placements are written to
    `layout.allocation["lx"] = addr` on each buffer's `FixedTiledLayout`.
 5. **Post-passes.** Currently empty. Reserved for solver-driven graph
    mutations (output cloning, op re-ordering).
+
+### Declarative exclusion
+
+Eligibility is decided in exactly one place — `ScratchpadAllocator._residency_reasons`
+in `allocator.py` — and carried
+to the solver as a single field, `LifetimeBoundBuffer.residency_reason`:
+`None` means the buffer may be pinned, any string is the reason it may not.
+
+**No buffer is ever dropped.** A barred buffer is still handed to the
+solver so it keeps participating in slicing matching and in-place chains: a
+forced-out consumer keeps its producers' residency viable instead of
+orphaning them, and an in-place parent reference always resolves. Honouring
+the verdict is therefore each solver's responsibility, via
+`MemoryPlanSolver.excluded`, and every solver (greedy, first-fit, best-fit,
+simulated annealing, CP-SAT) routes its exclusions through it.
+
+**Where a check belongs.** Precomputable from the graph ⇒ it lives in
+`_residency_reasons` as a reason string. Depends on the solver's free variables ⇒
+it stays a constraint in the solver — today that is only CP-SAT's per-edge
+slicing match over the division variables and its in-place merge gate.
+Capacity is the exception that belongs to neither allocator: it is solver
+state, so it lives on `MemoryPlanSolver.excluded` alongside the tag.
+
+The checks, in evaluation order (the first failure is the reason reported):
+
+| Reason | Why |
+|---|---|
+| `op not allowed` | not a `ComputedBuffer`, a mutation layout, or an op name outside `OP_OUTPUT_GOOD_FOR_LX_REUSE` |
+| `unsized (no device layout)` | no computable footprint (e.g. a `MultiOutputLayout` tuple op) |
+| `mutation target` | filled by offset writes, so one LX base mis-addresses it |
+| `tiled (advancing), not per_tile_fixed` | LX addresses cannot be `affine.apply` symbols |
+| `read by restickify (cross-frame barrier)` | the read and write frames are transposes, so a per-core LX slice is not self-sufficient (the buffer a restickify reads; its own output is safe and is not barred) |
+| `extern kernel user` | extern ops read from HBM |
+| `graph output (no clone)` / `graph input (no clone)` | without boundary cloning there is nothing to redirect |
+| `graph output is a ReinterpretView` | output cloning cannot rewrap the view |
+| `partial/offset read` | a sliced or multi-offset read mis-addresses a single LX base |
+| `core div mismatch: …` | the buffer's users disagree on core slicing (**placement path only** — the joint solver *chooses* the division, so its slicing gate decides instead) |
+| `no consumer reads it from LX` | residency would save nothing |
+| `lx back gap` | `backGap` is supported for HBM but not LX |
+
+That last distinction is the only difference between the two allocators,
+and it is a parameter (`division_is_fixed`) rather than a second predicate.
 
 ### Per-core size and core-division mismatch
 

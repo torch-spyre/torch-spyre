@@ -17,8 +17,12 @@ import dataclasses
 import math
 import itertools
 from sympy import Expr, Integer, Symbol, divisors
-from .ir import SpyreConstantFallback, SpyreEmptyFallback
-
+from .ir import (
+    SpyreConstantFallback,
+    SpyreEmptyFallback,
+    BroadcastAsyncFallback,
+    WaitWorkFallback,
+)
 from torch._inductor.ir import (
     ComputedBuffer,
     DeviceCopy,
@@ -1423,6 +1427,9 @@ def _iter_computed_buffers(operations: list[Operation]):
             if isinstance(op, (SpyreConstantFallback, SpyreEmptyFallback, DeviceCopy)):
                 # Work division not supported on allocation/constant kernels, nor
                 # on DeviceCopy.
+                pass
+            elif isinstance(op, (BroadcastAsyncFallback, WaitWorkFallback)):
+                # Work division not supported on broadcast kernels
                 pass
             else:
                 logger.warning(f"unhandled node type {type(op)}")

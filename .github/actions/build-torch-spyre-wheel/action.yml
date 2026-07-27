@@ -35,15 +35,31 @@ runs:
       uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
 
     - name: Restore ccache
-      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      id: ccache_restore
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: ${{ github.workspace }}/.ccache
         # Keyed on the C++ sources + build config. image_label discriminates the
         # ABI/toolchain (it also fixes the Python version — each image ships one
         # interpreter). An exact key => full hit; the prefix restore-key warm-
         # starts a partial rebuild when only a few .cpp/.h files changed.
+        #
+        # The run_id suffix makes the key unique, so it never exact-matches and
+        # the save step below always gets the chance to publish a refreshed
+        # entry. That matters because the ccache also depends on inputs this key
+        # does NOT cover — above all the Spyre SDK headers (<flex/...>,
+        # <util/sendefs.h>) that come from the runner image, which 12 of the 19
+        # TUs include. When one of those drifts the objects go stale while the
+        # key stays identical, and since actions/cache never overwrites an entry
+        # whose primary key hit, the stale entry used to be served forever (one
+        # sat unrefreshed from 2026-07-20, costing ~8 min of recompiles on every
+        # run for days). Entries keep the default retention and are reaped by
+        # the 7-day-unused rule / 10 GB LRU.
         key: ts-ccache-${{ inputs.image_label }}-${{ hashFiles(format('{0}/torch_spyre/csrc/**', inputs.torch_spyre_dir), format('{0}/setup.py', inputs.torch_spyre_dir),
-          format('{0}/pyproject.toml', inputs.torch_spyre_dir), format('{0}/uv.lock', inputs.torch_spyre_dir)) }}
+          format('{0}/pyproject.toml', inputs.torch_spyre_dir), format('{0}/uv.lock', inputs.torch_spyre_dir)) }}-${{ github.run_id }}
+        # The prefix does the real warm start: it restores the most recent entry
+        # for this label, which the save step then republishes with whatever was
+        # missing folded in.  
         restore-keys: |
           ts-ccache-${{ inputs.image_label }}-
 
@@ -102,6 +118,21 @@ runs:
         uv build --wheel --no-build-isolation --out-dir dist
         ccache --show-stats || true
 
+        # Publish a refreshed cache only when this build actually compiled
+        # something. A clean 19/19 hit has nothing new to add, and re-uploading
+        # ~130 MB per run would churn the repo's shared 10 GB cache quota.
+        # Anything unparseable (older ccache without --print-stats) counts as
+        # dirty: a needless save costs bandwidth, a skipped one costs every
+        # later build.
+        misses="$({ ccache --print-stats 2>/dev/null || true; } \
+                  | awk '$1 == "cache_miss" { print $2; exit }')"
+        echo "ccache misses this build: ${misses:-unknown}"
+        if [[ "$misses" == "0" ]]; then
+          echo "ccache_dirty=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "ccache_dirty=true" >> "$GITHUB_OUTPUT"
+        fi
+
         WHEEL="$(ls -1 dist/*.whl | head -1)"
         if [[ -z "$WHEEL" ]]; then
           echo "::error::No wheel produced under ${TORCH_SPYRE_DIR}/dist" >&2
@@ -109,3 +140,16 @@ runs:
         fi
         echo "Built wheel: $WHEEL"
         echo "wheel_name=$(basename "$WHEEL")" >> "$GITHUB_OUTPUT"
+
+    # Restore/save are split because the all-in-one cache action saves only as a
+    # post-step and only when the primary key MISSED — the exact behaviour that
+    # kept a stale entry alive. Cache entries are immutable, so this publishes a
+    # new entry rather than overwriting anything. Skipped on build failure by
+    # the usual step semantics: a half-populated cache from a build that died
+    # partway is not worth publishing.
+    - name: Save ccache
+      if: steps.build.outputs.ccache_dirty == 'true'
+      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: ${{ github.workspace }}/.ccache
+        key: ${{ steps.ccache_restore.outputs.cache-primary-key }}
