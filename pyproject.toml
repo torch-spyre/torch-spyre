@@ -58,7 +58,7 @@ test = [
 #    "torch_sendnn",        # must be installed manually
 ]
 lint = [
-    "mypy~=1.13.0",
+    "mypy>=1.13,<2.2",
     "pre-commit~=4.5.0",
     "types-PyYAML~=6.0.12.20250915",
     "uv~=0.10.0",
