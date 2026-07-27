@@ -76,7 +76,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Generic, TypeVar, cast
 import torch
-import numpy as np
 
 
 if TYPE_CHECKING:
@@ -90,6 +89,7 @@ else:
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
+    ceil_div,
     CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
     SolveError,
@@ -200,31 +200,26 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
         return []
 
     # ------------------------------ residency ------------------------------
-    @property
-    def min_footprint(self) -> int:
-        """Smallest footprint the buffer can take, for the capacity trim."""
-        return self.buffer.size
-
-    @property
-    def residency_reason(self) -> "str | None":
-        """Allocator-supplied reason the buffer may not reside, if any. Carried
-        on the buffer itself, so both entry points honour the allocator's
-        hard bars (e.g. the restickify cross-frame barrier) identically."""
-        return self.buffer.residency_reason
-
-    def spill_cost(self, num_children: int) -> int:
-        """Differential HBM traffic a spill adds over residency. Without the
-        producer/consumer edges of the joint model, the accesses are read
-        straight off ``uses``: the producer's write (absent for a graph input,
-        whose first use is a read) plus one re-read per later use."""
+    def spill_cost(self) -> int:
+        """Differential HBM traffic a spill adds over residency: the reads
+        residency would have served from LX (``read_count``, computed by the
+        allocator) plus the producer's write, which residency turns into a free
+        LX write. A graph input has no producer write to save; a graph output's
+        write-out is unavoidable either way, so it too cancels. Both cases are
+        exactly ``boundary != Intermediate`` -- for a plain
+        :class:`LifetimeBoundBuffer`, whose boundary is not tracked,
+        ``first_use_is_read`` marks the same distinction for inputs."""
         b = self.buffer
-        writes = 0 if b.first_use_is_read else 1
-        reads = len(b.uses) - writes
-        return (reads + writes) * b.size
+        boundary = getattr(b, "boundary", None)
+        is_intermediate = (
+            boundary == BufferType.Intermediate
+            if boundary is not None
+            else not b.first_use_is_read
+        )
+        return (b.read_count + (1 if is_intermediate else 0)) * b.size
 
-    def constrain_residency(self, model, kids, bufs) -> "str | None":
+    def constrain_residency(self, model, kids, bufs) -> None:
         """Placement-only: any buffer may reside, so there is no slicing gate."""
-        return None
 
     def constrain_merge(self, model, parent: "_LifetimeBufferWithCpVars", edge) -> None:
         """Extra conditions on an active in-place merge. None when the division
@@ -257,9 +252,7 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         b = self.buffer
         m = self.model
 
-        per_core = [
-            int(np.ceil(b.size / cd.output_partition)) for cd in b.core_divisions
-        ]
+        per_core = [ceil_div(b.size, cd.output_partition) for cd in b.core_divisions]
         # Total cores the op runs on under each division -- includes any
         # reduction-axis split, so a reduction-parallel division counts its full
         # parallelism (``output_partition`` alone would score it as 1 core).
@@ -281,48 +274,21 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
     def match_pairs(self, parent: str) -> list[tuple[int, int]]:
         return self.buffer.cd_parent_matches.get(parent, [])
 
-    @property
-    def min_footprint(self) -> int:
-        t = self.buffer
-        return min(
-            int(np.ceil(t.size / cd.output_partition)) for cd in t.core_divisions
-        )
-
-    def spill_cost(self, num_children: int) -> int:
-        b = self.buffer
-        reads = num_children + b.unallocated_reads
-        if b.boundary == BufferType.Input and reads > 0:
-            reads -= 1
-        writes = 1 if b.boundary == BufferType.Intermediate else 0
-        return (reads + writes) * b.size
-
-    def constrain_residency(self, model, kids, bufs) -> "str | None":
+    def constrain_residency(self, model, kids, bufs) -> None:
         """Slicing-consistency gate: a resident buffer's division must match
-        *every* consumer's division under the ``cd_parent_matches`` pairs. A
-        buffer with no consumer edge, or with a consumer that has no compatible
-        pair, can never reside; the reason returned here is surfaced to the
-        allocator as the buffer's drop cause."""
-        t = self.buffer
-        if not kids:
-            if t.unallocated_reads:
-                # Read only by consumers the solver never sees (filtered-out
-                # ops / graph outputs). They still read it from LX when it
-                # resides, so residency is worthwhile; there is no resident
-                # consumer to constrain the division against, so no gate.
-                # TODO: Remove this when the other solvers are brought to parity
-                return None
-            # Nothing consumes this buffer from LX -> it can never reside.
-            model.add(self.in_buffer == 0)
-            return "no consumer reads it from LX"
+        *every* consumer's division under the ``cd_parent_matches`` pairs.
+
+        This is the part of residency that genuinely depends on the solver's
+        free variables, so it stays here as a constraint. The precomputable
+        parts -- having no LX reader at all, or a consumer with no compatible
+        pair -- are decided by the allocator and arrive as ``read_count`` /
+        ``residency_reason``. A consumer with no compatible pair still lands
+        correctly if it slips through: ``_gate_divisions`` forces ``in_buffer``
+        false when the pair list is empty."""
         for child, compatible in kids:
-            if not compatible:
-                # This child can never match -> the buffer cannot reside.
-                model.add(self.in_buffer == 0)
-                return f"consumer {child} has no slicing-compatible core division"
             _gate_divisions(
                 model, compatible, self.division, bufs[child].division, self.in_buffer
             )
-        return None
 
     def constrain_merge(self, model, parent, edge) -> None:
         """An active merge means the child reuses the parent's exact per-core
@@ -341,7 +307,7 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
     def footprint(self, solver: "cp_model.CpSolver") -> int:
         t = self.buffer
         cd = t.core_divisions[solver.Value(self.division)]
-        return int(np.ceil(t.size / cd.output_partition))
+        return ceil_div(t.size, cd.output_partition)
 
     def record_division(self, solver: "cp_model.CpSolver") -> None:
         self.buffer.chosen_division = solver.Value(self.division)
@@ -373,10 +339,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         self._capacity_units = self.limit // self.alignment
         self._time_limit_seconds = time_limit_seconds
         self._bottom_justify = bottom_justify
-        # Per-buffer drop cause for the most recent solve ({buffer name: reason},
-        # spilled buffers only). The allocator reads this to populate its own
-        # ``reject_reasons`` so cpsat spills show up in the LX-pinning debug log.
-        self.spill_reasons: dict[str, str] = {}
 
     def plan_layout(
         self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
@@ -420,7 +382,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         division); anything else -- a plain :class:`LifetimeBoundBuffer`, or a
         :class:`CoreDivisionBuffer` with nothing to choose from -- gets the
         placement-only wrapper, whose footprint is ``size`` as given."""
-        units = int(np.ceil(buffer.size / self.alignment))
+        units = ceil_div(buffer.size, self.alignment)
         if isinstance(buffer, CoreDivisionBuffer) and buffer.core_divisions:
             return _CoreDivisionBufferWithCpVars(
                 replace(buffer, size=units), model, self._capacity_units
@@ -434,7 +396,6 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         buffers: Sequence[LifetimeBoundBuffer | CoreDivisionBuffer],
         log_lx_usage: bool = False,
     ) -> list[LifetimeBoundBuffer | CoreDivisionBuffer]:
-        self.spill_reasons = {}
         if not buffers:
             return []
         assert all(b.address is None for b in buffers), (
@@ -443,16 +404,25 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
         _assert_in_place_relationships(buffers)
 
+        # Declarative exclusion, shared with every other solver: whatever the
+        # allocator barred (each buffer's ``residency_reason``), plus the
+        # no-LX-reader and capacity checks. Unlike the gap solvers -- which
+        # ``partition`` these out -- we still hand the barred buffers to the
+        # model (they must stay available for slicing matching and in-place
+        # chains) but pin them non-resident below, so we only need the reasons.
+        forced_reasons = dict(self.record_exclusions(buffers))
+
         model = cp_model.CpModel()
         # Solve on copies so we never mutate the caller's buffers.
         working = {b.name: self._wrap(model, b) for b in buffers}
 
-        solved, forced_reasons = self._run(model, working)
-        spilled = {name for name, sb in solved.items() if sb.address is None}
+        solved = self._run(model, working, forced_reasons)
         # Surface a drop cause for every spilled buffer: the pre-solve forced
         # reason when we have one, otherwise the solver chose to spill it.
         self.spill_reasons = {
-            name: forced_reasons.get(name, _SOLVER_CHOSE_SPILL) for name in spilled
+            name: forced_reasons.get(name, _SOLVER_CHOSE_SPILL)
+            for name, sb in solved.items()
+            if sb.address is None
         }
 
         # Copy the solved results back onto the caller's buffers. Offsets come
@@ -472,10 +442,11 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         self,
         model: "cp_model.CpModel",
         tensors: dict[str, _LifetimeBufferWithCpVars],
-    ) -> tuple[dict[str, LifetimeBoundBuffer], dict[str, str]]:
+        forced_reasons: dict[str, str],
+    ) -> dict[str, LifetimeBoundBuffer]:
         children_of = self._get_children(tensors)
         self._add_inplace_relaxation(model, tensors)
-        forced_reasons = self._add_core_division(model, tensors, children_of)
+        self._add_core_division(model, tensors, children_of, forced_reasons)
 
         solver = cp_model.CpSolver()
         if self._time_limit_seconds:
@@ -488,10 +459,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
         # TODO: Update objective to a maxmin optimization to optimize overall
         # throughput.
-        hbm_terms = [
-            sb.spill_cost(len(children_of.get(sb.name, []))) * (1 - sb.in_buffer)
-            for sb in tensors.values()
-        ]
+        hbm_terms = [sb.spill_cost() * (1 - sb.in_buffer) for sb in tensors.values()]
         status = cp_model.INFEASIBLE
         if hbm_terms:
             model.minimize(sum(hbm_terms))
@@ -542,7 +510,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     forced_reasons.get(name, _SOLVER_CHOSE_SPILL),
                 )
 
-        return final_tensors, forced_reasons
+        return final_tensors
 
     def _add_inplace_relaxation(
         self,
@@ -670,47 +638,22 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 )
         return children_of
 
-    def _trim_oversized_tensors(
-        self,
-        model: "cp_model.CpModel",
-        bufs: dict[str, _LifetimeBufferWithCpVars],
-    ) -> dict[str, str]:
-        """Pin out of LX the buffers whose non-residency is fixed up front: those
-        whose *smallest* candidate footprint still exceeds capacity, and those
-        the allocator marked non-resident (``residency_reason`` set). Returns
-        ``name -> reason`` for the buffers it forces out (drop-cause debug
-        logging), using the allocator's specific reason when it has one."""
-        forced: dict[str, str] = {}
-        for sb in bufs.values():
-            min_size = sb.min_footprint
-            if min_size > self._capacity_units:
-                forced[sb.name] = (
-                    f"min per-core footprint {min_size} > LX capacity "
-                    f"{self._capacity_units} (alignment units)"
-                )
-                model.add(sb.in_buffer == 0)
-            elif sb.residency_reason is not None:
-                forced[sb.name] = sb.residency_reason
-                model.add(sb.in_buffer == 0)
-        return forced
-
     def _add_core_division(
         self,
         model: "cp_model.CpModel",
         bufs: dict[str, _LifetimeBufferWithCpVars],
         children_of: dict[str, list[tuple[str, list[tuple[int, int]]]]],
-    ) -> dict[str, str]:
-        """Wire up forced spills and the per-buffer residency gate. Returns
-        ``name -> reason`` for every buffer pinned non-resident up front, so the
-        solve can log why each buffer was dropped to HBM. In the joint model the
-        gate is the slicing match, driven entirely by the precomputed
-        ``cd_parent_matches`` pairs; placement-only buffers have no gate."""
-        forced = self._trim_oversized_tensors(model, bufs)
+        forced: dict[str, str],
+    ) -> None:
+        """Pin out every buffer ``forced`` non-resident (decided declaratively by
+        :meth:`MemoryPlanSolver.partition`) and install the per-buffer residency
+        gate. In the joint model that gate is the slicing match, driven entirely
+        by the precomputed ``cd_parent_matches`` pairs; placement-only buffers
+        have no gate."""
+        for name in forced:
+            model.add(bufs[name].in_buffer == 0)
         for sb in bufs.values():
-            why = sb.constrain_residency(model, children_of.get(sb.name, []), bufs)
-            if why is not None:
-                forced.setdefault(sb.name, why)
-        return forced
+            sb.constrain_residency(model, children_of.get(sb.name, []), bufs)
 
     # ------------------------------------------------------------------
     # Extract

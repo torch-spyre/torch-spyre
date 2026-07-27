@@ -143,11 +143,19 @@ RE_NODE_NAME = re.compile(
 RE_POD_NAME = re.compile(
     r"GHA_RUNNER_POD_NAME(?!\w)[ \t]*(?:->|=)?[ \t]*(?P<v>[\w.*-]+)"
 )
+# gather-runner-info's own script preview -- `echo "PCIDEVICE_IBM_COM_AIU_PF
+# ${PCIDEVICE_IBM_COM_AIU_PF:-}"` -- references the var name TWICE on one
+# line. The first occurrence is followed by `$` (rejected, not in the value
+# class), but the SECOND occurrence, inside `${...:-}`, is followed by `:`,
+# which the old `[0-9a-fA-F:.,]+` class allowed -- capturing a bare ':' as
+# the "value" before ever reaching the real output line. Real PCI addresses
+# always start with a hex digit (e.g. "0000:..."), so requiring the first
+# captured character to be one rejects that bare-colon false match.
 RE_PCI_DEVICE = re.compile(
-    r"PCIDEVICE_IBM_COM_AIU_PF(?!\w)[ \t]*(?:->|=)?[ \t]*(?P<v>[0-9a-fA-F:.,]+)"
+    r"PCIDEVICE_IBM_COM_AIU_PF(?!\w)[ \t]*(?:->|=)?[ \t]*(?P<v>[0-9a-fA-F][0-9a-fA-F:.,]*)"
 )
 RE_AIU_RANK0 = re.compile(
-    r"AIU_WORLD_RANK_0(?!\w)[ \t]*(?:->|=)?[ \t]*(?P<v>[0-9a-fA-F:.,]+)"
+    r"AIU_WORLD_RANK_0(?!\w)[ \t]*(?:->|=)?[ \t]*(?P<v>[0-9a-fA-F][0-9a-fA-F:.,]*)"
 )
 RE_PCI_DEV_ID = re.compile(
     r"pcidevid\.cpp.*?Device id \(for card idx \d+\):\s*(?P<v>[0-9a-f:.]+)"

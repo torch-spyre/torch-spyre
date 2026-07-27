@@ -28,9 +28,9 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     MemoryPlanSolver,
     CoreDivision,
     CoreDivisionBuffer,
-    GreedyLayoutSolver,
     LifetimeBoundBuffer,
 )
+from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 
 try:
     from ortools.sat.python import cp_model  # noqa: F401
@@ -142,7 +142,8 @@ class BaseLayoutSolverTests:
         return LifetimeBoundBuffer(name, size, uses, **kwargs)
 
     def solve(self, buffers, size=LARGE_SIZE, alignment=1):
-        return self.solver_class(size, alignment).plan_layout(buffers)
+        self.last_solver = self.solver_class(size, alignment)
+        return self.last_solver.plan_layout(buffers)
 
     def check_result(self, result, expected_addresses, size, alignment):
         """Assert the solved layout matches the heuristic-solver expectation.
@@ -170,6 +171,42 @@ class BaseLayoutSolverTests:
     ):
         result = self.solve(buffers, size, alignment)
         self.check_result(result, expected_addresses, size, alignment)
+
+    # -- the declarative-exclusion contract, run against every solver --------
+    #
+    # The allocator hands over *every* buffer, barred ones included, so that
+    # in-place parents always resolve and the joint solver can still match
+    # slicing across a barred buffer. Honouring the verdict is therefore each
+    # solver's responsibility, not the allocator's, and placing a barred buffer
+    # is a correctness bug rather than a heuristic choice.
+
+    def test_barred_buffer_is_never_placed(self):
+        # The allocator's declared verdict (here the restickify cross-frame
+        # barrier) keeps the buffer out of LX, and the solver reports it back
+        # verbatim so the allocator can explain the spill. An unbarred buffer of
+        # the same shape still resides, proving the bar did the work.
+        reason = "read by restickify (cross-frame barrier)"
+        barred = self.make_buffer("barred", 40, [0, 1], residency_reason=reason)
+        free = self.make_buffer("free", 40, [0, 1])
+        result = {b.name: b for b in self.solve([barred, free])}
+
+        self.assertIsNone(result["barred"].address)
+        self.assertIsNotNone(result["free"].address)
+        self.assertEqual(self.last_solver.spill_reasons["barred"], reason)
+        self.assertNotIn("free", self.last_solver.spill_reasons)
+
+    def test_barred_in_place_parent_does_not_orphan_its_child(self):
+        # A barred parent leaves a dangling in_place_parents name once it is
+        # partitioned out. The child must still be placed (on its own slot,
+        # since there is none to inherit) rather than crashing the solver.
+        parent = self.make_buffer(
+            "parent", 40, [0, 1], residency_reason="mutation target"
+        )
+        child = self.make_buffer("child", 40, [1, 2], in_place_parents=["parent"])
+        result = {b.name: b for b in self.solve([parent, child])}
+
+        self.assertIsNone(result["parent"].address)
+        self.assertIsNotNone(result["child"].address)
 
     def test_simple_layout(self):
         # Three non-overlapping buffers fill memory sequentially.
@@ -623,9 +660,8 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
             parents=names,
             cd_parent_matches={n: [(0, 0)] for n in names},
         )
-        result = self.solver_class(size, alignment).plan_layout_and_core_divisions(
-            buffers + [sink]
-        )
+        self.last_solver = self.solver_class(size, alignment)
+        result = self.last_solver.plan_layout_and_core_divisions(buffers + [sink])
         return [b for b in result if b.name != "__sink__"]
 
     def check_result(self, result, expected_addresses, size, alignment):
@@ -665,7 +701,16 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
                 core_divisions=_whole(),
             ),
             CoreDivisionBuffer("Q", 75, [16, 17], core_divisions=_whole()),
-            CoreDivisionBuffer("TERMINAL", 75, [17, 18], core_divisions=_whole()),
+            # Consumer-less tail: the allocator declares its non-residency
+            # ("no consumer reads it from LX") up front, exactly as it would for
+            # any buffer nothing reads from LX, and the solver honours it.
+            CoreDivisionBuffer(
+                "TERMINAL",
+                75,
+                [17, 18],
+                core_divisions=_whole(),
+                residency_reason="no consumer reads it from LX",
+            ),
         ]
         for i in range(1, len(buffers)):
             buffers[i].cd_parent_matches = {buffers[i - 1].name: [(0, 0)]}
@@ -739,13 +784,21 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
         self.assertEqual(p_cd.output_partition, 4)
 
     def test_no_consumer_division_buffer_is_spilled(self):
-        # A buffer that carries divisions but has no local consumer edge can
-        # never match anything, so it is force-spilled even when it would fit.
-        leaf = CoreDivisionBuffer("leaf", 40, [0, 1], core_divisions=_divs())
-        result = self.solver_class(
-            size=256, alignment=1
-        ).plan_layout_and_core_divisions([leaf])
+        # "Nothing reads this from LX" is a graph fact, so the allocator decides
+        # it (read_count == 0 -> residency_reason) rather than the solver
+        # re-deriving it from the absence of consumer edges. The solver's job is
+        # to honour that verdict and report it back.
+        leaf = CoreDivisionBuffer(
+            "leaf",
+            40,
+            [0, 1],
+            core_divisions=_divs(),
+            residency_reason="no consumer reads it from LX",
+        )
+        solver = self.solver_class(size=256, alignment=1)
+        result = solver.plan_layout_and_core_divisions([leaf])
         self.assertIsNone(result[0].address)
+        self.assertEqual(solver.spill_reasons["leaf"], "no consumer reads it from LX")
 
     def test_oversized_min_footprint_is_spilled(self):
         # Even the smallest candidate footprint (total/4 = 250) exceeds the
@@ -849,10 +902,18 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
 
     def test_spill_reasons_recorded(self):
         # The solver records a per-buffer drop cause for every spilled buffer so
-        # the allocator can report why each landed in HBM. `leaf` has divisions
-        # but no consumer edge (forced out by the residency gate); `big`'s
-        # smallest footprint exceeds capacity (forced out up front).
-        leaf = CoreDivisionBuffer("leaf", 40, [0, 1], core_divisions=_whole())
+        # the allocator can report why each landed in HBM. The two sources are
+        # covered: `leaf` and `C` carry the allocator's declared verdict (nothing
+        # reads them from LX), while `big` is spilled by the solver's own
+        # capacity check -- its smallest per-core footprint (1000/4) exceeds the
+        # 200 B limit.
+        leaf = CoreDivisionBuffer(
+            "leaf",
+            40,
+            [0, 1],
+            core_divisions=_whole(),
+            residency_reason="no consumer reads it from LX",
+        )
         big = CoreDivisionBuffer(
             "big", 1000, [0, 1], core_divisions=[CoreDivision(output_splits={256: 4})]
         )
@@ -862,6 +923,7 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
             [1, 2],
             core_divisions=[CoreDivision(output_splits={256: 4})],
             parents=["big"],
+            residency_reason="no consumer reads it from LX",
         )
         solver = self.solver_class(size=200, alignment=1)
         result = {
@@ -903,7 +965,8 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
             # Below one alignment unit the unit-scaled capacity rounds to zero
             # and the solver cannot represent any placement.
             return buffers
-        return self.solver_class(size, alignment).plan_layout(buffers)
+        self.last_solver = self.solver_class(size, alignment)
+        return self.last_solver.plan_layout(buffers)
 
     def check_result(self, result, expected_addresses, size, alignment):
         _assert_legal_packing(self, result, expected_addresses, size, alignment)
@@ -986,7 +1049,7 @@ class TestCpSatUnallocatedReads(TestCase):
     *not* pin the producer. All without a Spyre device.
     """
 
-    def _mk(self, name, uses, parents=(), unallocated_reads=0, matches=None):
+    def _mk(self, name, uses, parents=(), matches=None, barred=False):
         """A single-fixed-division ``CoreDivisionBuffer``. ``matches`` overrides
         the per-parent match pairs; by default every parent edge is compatible
         (``[(0, 0)]``), matching a producer/consumer whose fixed divisions slice
@@ -1002,22 +1065,23 @@ class TestCpSatUnallocatedReads(TestCase):
             core_divisions=[CoreDivision()],
             parents=list(parents),
             cd_parent_matches=matches,
-            unallocated_reads=unallocated_reads,
+            residency_reason="no consumer reads it from LX" if barred else None,
         )
 
     def _pinned(self, bufs):
         out = CpSatLayoutSolver(1 << 20).plan_layout_and_core_divisions(bufs)
         return {b.name for b in out if b.address is not None}
 
-    def test_only_unallocated_reads_is_pinned(self):
+    def test_only_non_candidate_reads_is_pinned(self):
         """A buffer read solely by a non-candidate consumer (no children) is
-        pinned on the strength of its unallocated read."""
-        self.assertIn("b0", self._pinned([self._mk("b0", [0, 1], unallocated_reads=1)]))
+        pinned on the strength of that read: the allocator counted it in
+        ``read_count`` and so did not bar the buffer."""
+        self.assertIn("b0", self._pinned([self._mk("b0", [0, 1])]))
 
     def test_no_reads_is_not_pinned(self):
-        """A buffer with no children and no unallocated reads is forced to HBM
-        (nothing reads it from LX)."""
-        self.assertNotIn("b0", self._pinned([self._mk("b0", [0, 1])]))
+        """A buffer nothing reads from LX is barred by the allocator and the
+        solver honours that, leaving it in HBM."""
+        self.assertNotIn("b0", self._pinned([self._mk("b0", [0, 1], barred=True)]))
 
     def test_candidate_parent_edge_still_pins(self):
         """The ordinary producer->consumer edge still pins the producer."""
@@ -1080,9 +1144,9 @@ class TestTopologicalSort(TestCase):
         # A 3-level in-place chain gp -> p -> c. Each level has exactly one
         # ready node at a time, so topology alone fixes the order regardless of
         # the tie-break key or input order.
-        gp = LifetimeBoundBuffer("gp", 100, 0, 2)
-        p = LifetimeBoundBuffer("p", 100, 2, 4, in_place_parents=["gp"])
-        c = LifetimeBoundBuffer("c", 100, 4, 6, in_place_parents=["p"])
+        gp = LifetimeBoundBuffer("gp", 100, [0, 1])
+        p = LifetimeBoundBuffer("p", 100, [2, 3], in_place_parents=["gp"])
+        c = LifetimeBoundBuffer("c", 100, [4, 5], in_place_parents=["p"])
         # Pass the inputs out of order to prove the result is driven by the
         # in-place edges, not the input order.
         self.assertEqual(self._names([c, p, gp], lambda b: 0), ["gp", "p", "c"])
@@ -1099,13 +1163,13 @@ class TestTopologicalSort(TestCase):
         # f sorts ascending by size, so the smaller buffer `a` must come first.
         # `a` deliberately has the LONGER lifetime, so the old lifetime-keyed
         # tie-break would (incorrectly) emit `b` before `a`.
-        root = LifetimeBoundBuffer("root", 100, 0, 1)
-        mid = LifetimeBoundBuffer("mid", 100, 1, 2, in_place_parents=["root"])
+        root = LifetimeBoundBuffer("root", 100, [0])
+        mid = LifetimeBoundBuffer("mid", 100, [1], in_place_parents=["root"])
         a = LifetimeBoundBuffer(
-            "a", 1, 2, 102, in_place_parents=["mid"]
+            "a", 1, [2, 101], in_place_parents=["mid"]
         )  # size 1, lifetime 100
         b = LifetimeBoundBuffer(
-            "b", 100, 2, 3, in_place_parents=["mid"]
+            "b", 100, [2], in_place_parents=["mid"]
         )  # size 100, lifetime 1
 
         self.assertEqual(
