@@ -1740,9 +1740,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         # (host-range index 1 (H) incorrectly resolving to the Lq iteration-space
         # symbol instead of H's) must instead be checked via the *value* of
         # device_tile_advance_expr's coefficient on that minted symbol: with the
-        # correct host-range→dim mapping the coefficient reflects H's device
-        # stride (256 device elements/step); the old bug would have advanced by
-        # Lq's stride (1 device element/step) instead.
+        # correct host-range→dim mapping, each step of the minted level symbol
+        # advances by H's per-tile extent (8 // 2 == 4) times the flattened
+        # host-index multiplier for H's inner dims (Lq*D == 256*64 == 16384),
+        # i.e. 4 * 16384 == 65536; the old bug would instead have advanced by
+        # a multiple of Lq's stride (D == 64) rather than H's (Lq*D == 16384).
+
         tiled_syms_matches = re.findall(r"tiled_symbols=\[(\[.*?\])\]", src, re.DOTALL)
         self.assertTrue(
             tiled_syms_matches,
@@ -1769,10 +1772,11 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 f"symbol {minted_sym}, got: {advance_expr}",
             )
             self.assertIn(
-                "256",
+                "65536",
                 advance_expr,
-                f"device_tile_advance_expr should advance by H's device stride "
-                f"(256), NOT Lq's (1) -- got: {advance_expr}",
+                f"device_tile_advance_expr should advance by H's per-tile "
+                f"extent times H's flattened host stride (4 * 16384 == 65536), "
+                f"NOT a multiple of Lq's stride (64) -- got: {advance_expr}",
             )
 
     def test_hint_row_tiling_multi_stick_pointwise_correct(self):
