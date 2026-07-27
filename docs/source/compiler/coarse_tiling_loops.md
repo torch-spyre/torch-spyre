@@ -667,13 +667,14 @@ flattened `loop_tiled_reduction_dims`.  These symbols are appended to
 `tiled_syms` so the runtime correctly advances the input tensor pointer
 between tiles.
 
-Crucially, `loop_tiled_dims` is **per-op**: `_stamp_group` consults each
-op's own `DimHint.dim_index` for each nesting level rather than applying a
-fixed spec-op index to every op.  This handles broadcast ops and other ops
-whose iteration space lacks a particular dimension — those ops get an empty
-sub-list `[]` for the corresponding level and are not split along that axis
-(they become loop-invariant at that depth, as detected by
-`insert_tiling_propagation` and flagged `per_tile_fixed`).
+Crucially, `loop_tiled_dims` is **per-op**: `plan_coarse_tile_groups` consults
+each op's own `DimHint.loop_var` for each nesting level (via the helper
+`_op_hint_dim_positions`) rather than applying a fixed spec-op index to every
+op.  This handles broadcast ops and other ops whose iteration space lacks a
+particular dimension — those ops get an empty sub-list `[]` for the
+corresponding level and are not split along that axis (they become
+loop-invariant at that depth, as detected by `insert_tiling_propagation` and
+flagged `per_tile_fixed`).
 
 ### `Loops` is a frozen dataclass
 
@@ -692,6 +693,7 @@ object.__setattr__(data, "ranges", ranges)
 def coarse_tile(
     graph: GraphLowering,
     groups: list[tuple],
+    group_idx_offset: int = 0,
 ) -> None:
 ```
 
@@ -701,6 +703,23 @@ sub-sequence of `graph.operations`; a gap indicates a data-flow dependency
 crossing the group boundary and raises `RuntimeError`.  The full
 `GraphLowering` is required (not just the operations list) because
 `insert_tiling_propagation` calls `V.graph` APIs to allocate new buffers.
+`group_idx_offset` lets a caller make a second `coarse_tile()` call on the
+same graph (e.g. hint-driven groups stamped pre-stickification, followed by
+a later span-overflow-driven call) without the new call's group IDs
+colliding with IDs already stamped by the earlier one.
+
+`coarse_tile()` itself is a thin plan-then-transform driver: it calls
+`plan_coarse_tile_groups(operations, groups)` exactly once, up front, for
+every group in the list.  Planning does zero IR mutation — it only decides
+each op's tiling attributes and raises `Unsupported` if any op in any group
+can't be tiled (see "Sequential recurrences are rejected at planning time"
+below).  Only if that single planning call succeeds does `coarse_tile()`
+move on to transformation: it loops over `groups` again and calls
+`_apply_plan` once per group to perform the actual IR mutation, followed by
+`insert_tiling_propagation`, `_zero_fixed_tile_advance_exprs`, and
+`_patch_retiled_load_indexes`.  There is no per-group interleaving of
+planning and mutation — every group is planned before any group is
+transformed.
 
 Each group tuple has the form:
 
@@ -716,17 +735,19 @@ where `levels` is a list of `(hint_id, K)` pairs, outermost first:
 
 `hint_id` is the integer ID assigned by the enclosing `spyre_hint` scope
 (smaller IDs are outer scopes).  Whether a level tiles an output dimension
-or a reduction dimension is a **per-op** property: `_stamp_group` consults
-each op's own `DimHint.is_reduction` for each level rather than carrying
-`is_reduction` at the group level.  This means broadcast ops and
-`Pointwise` ops inside a reduction-level group get an empty sub-list for
-that level and are not split along that axis.  `tiled_dims` are likewise
-**not** in the pair — they are derived per-op inside `_stamp_group` by
-consulting each op's `DimHint.loop_var`.
+or a reduction dimension is a **per-op** property: `plan_coarse_tile_groups`
+consults each op's own `DimHint.is_reduction` for each level (via the helper
+`_op_hint_dim_positions`) rather than carrying `is_reduction` at the group
+level.  This means broadcast ops and `Pointwise` ops inside a
+reduction-level group get an empty sub-list for that level and are not
+split along that axis.  `tiled_dims` are likewise **not** in the pair —
+they are derived per-op inside `plan_coarse_tile_groups` by consulting each
+op's `DimHint.loop_var`.
 
-`_stamp_group` always receives this canonical list-of-pairs representation;
-it is built by `_hints_levels()` inside `hints_to_coarse_tile_groups` in
-`coarse_tile.py` before `coarse_tile()` stamps each op.
+`plan_coarse_tile_groups` always receives this canonical list-of-pairs
+representation; it is built by `_hints_levels()` inside
+`hints_to_coarse_tile_groups` in `coarse_tile.py` before `coarse_tile()`
+plans and then transforms each group.
 
 ### `reorder_unhinted_interlopers`: pre-grouping pass
 
@@ -1210,18 +1231,19 @@ inner level's for the same dim.
 The write-side perimeter above is not the whole story. `_propagate_tiled_op`
 checks, before any Case classification, whether `op` directly reads a
 full-size `SpyreEmptyFallback` buffer — typically an accumulator that an
-earlier Case-2/mutation rewrite (or a carry rewrite, below) already
-promoted to full size. A loop-internal op cannot read such a buffer
+earlier Case-2/mutation rewrite already promoted to full size (see
+"Reduction tiling," below, for the nested output-dim + inner-reduction-dim
+case that produces this). A loop-internal op cannot read such a buffer
 directly: its own candidate layouts are tile-sized, and a full-size
 `SpyreEmptyFallback` has only one, full-size candidate layout, so the two
 can never be made stick-compatible. `_full_buffer_read_deps` detects this
-and `_insert_read_view_ops` splices in a tile-sized "view" `ComputedBuffer`
-per such read, rewriting `op`'s `inner_fn` (via a `WrapperHandler`
-subclass, per the wrap-never-reconstruct convention) to read the view
-instead of the full buffer. This means the "no conversion, just addressing"
-claim above holds only when the full buffer being read is a genuine graph
-input or other host-side tensor — not when it is itself the product of an
-earlier tile→full promotion inside the same compilation.
+and `_insert_read_copy_ops` always materializes a tile-sized copy
+`ComputedBuffer` per such read, rewriting `op`'s `inner_fn` (via a
+`WrapperHandler` subclass, per the wrap-never-reconstruct convention) to
+read the copy instead of the full buffer. This means the "no conversion,
+just addressing" claim above holds only when the full buffer being read is
+a genuine graph input or other host-side tensor — not when it is itself the
+product of an earlier tile→full promotion inside the same compilation.
 
 #### Reduction tiling: stick and non-stick reduction dims
 
@@ -1321,90 +1343,68 @@ relationship `_multi_arg_pointwise_layouts` otherwise assumes, which is why
 the `Reduction`-specific paths exist as separate cases rather than folding
 into the pointwise one.
 
-(sequential-carry-online-softmax-style-recurrences)=
+(sequential-recurrences-are-rejected-at-planning-time)=
 
-#### Sequential carry: online-softmax-style recurrences
+#### Sequential recurrences are rejected at planning time
 
 The fill/combine pattern above is a **monoid combine**: each tile's partial
 result is independent and can be merged into the accumulator in any order.
 Online-softmax-style kernels (flash-attention's running max and
 rescale-accumulate denominator/output) need something structurally
 different — a **true recurrence**, where the value one loop iteration
-writes must be visible, unmodified, as the *next* iteration's input. Re-
-running the traced Python's fill on every tile would silently reset the
-running max/denominator each iteration instead of carrying it forward. This
-fourth regime, "carry ops," is handled by `_seed_buffer_for_carry`,
-`_carry_terminal_op`, and `_propagate_carry_op` — entirely separate from
-the Case 1/2/3 classification and from the reduction accum pattern, even
-though it reuses some of the same buffer shapes.
+writes must be visible, unmodified, as the *next* iteration's input.
+Re-running the traced Python's fill on every tile would silently reset the
+running max/denominator each iteration instead of carrying it forward.
+There is no execution mechanism for this fourth regime: an op that needs it
+is rejected outright, before any IR mutation happens.
 
-**Seed buffer.** The recurrence's pre-loop initializer (e.g.
-`M = torch.full((...), -inf)` for a running max) is not a fresh allocation —
-it is reused directly as `accum_full`. Detecting which pre-loop constant
-fill is a carry seed (as opposed to an ordinary hoisted constant) is
-closure-based, not op-local.
+**Detection, not propagation.** `plan_coarse_tile_groups` (the planning
+phase — see
+[Public API: `coarse_tile()`](#public-api-coarse_tile)) calls
+`_seed_buffer_for_carry` on every op that is loop-invariant at the group's
+reduction-tiled level(s) (`_plan_is_loop_invariant_at_reduction_levels`
+gates this call). If `_seed_buffer_for_carry` identifies `op` as the
+carry-producing step of such a recurrence, planning raises `Unsupported`
+immediately — `coarse_tile()` never reaches the transformation phase for
+that group, and no buffers are allocated or rewired for the recurrence.
+`_seed_buffer_for_carry` exists purely to answer "does this op need a
+pattern we don't support," not to drive any propagation; there is no
+`accum_tile`/`carry_prev` machinery, no copy-in/copy-out placement, and no
+entry-op/terminal-op walk — those all belonged to the deleted execution
+mechanism and have no replacement.
 
-**Closure.** `_seed_closure` returns every op in the same outer loop group
-that reads the seed *directly* — e.g. both `max_running = maximum(M,
-block_max)` and `correction = exp(M - max_running)` read `M` directly, so
-both are in `M`'s closure, even though only the first is the actual
-recurrence update. This is deliberately non-transitive: an op that reads a
-closure member but not the seed itself is an ordinary downstream consumer,
-not part of the closure.
+**How detection works.** The recurrence's pre-loop initializer (e.g.
+`M = torch.full((...), -inf)` for a running max) is a constant fill —
+`_is_constant_fill` recognizes it (a `Pointwise` wrapper around a
+`SpyreConstantFallback` scalar, the lowering of `torch.full`/`torch.zeros`/
+`torch.zeros_like`). Detecting which such fill is a carry seed (as opposed
+to an ordinary hoisted constant) is closure-based, not op-local:
 
-**Entry op vs. terminal op.** `_seed_buffer_for_carry` finds the unique
-closure member whose non-seed operands are all external to the closure —
-the entry op, which reads the seed directly (e.g. the multiply in
-`denominator = denominator * correction + tile_sum`). The traced Python's
-actual recurrence value is sometimes one or more ops further downstream:
-`_carry_terminal_op` walks forward from the entry op, through in-group
-Pointwise consumers that are loop-invariant at the same reduction level and
-do not themselves read the seed directly, to find the terminal op (the add,
-in the example above) whose *result* is what must persist as the next
-iteration's carry. Entry and terminal coincide whenever the update is a
-single op reading the seed directly (e.g. the running-max `maximum` itself).
+- **Closure.** `_seed_closure` returns every op in the same outer loop
+  group that reads the seed *directly* — e.g. both
+  `max_running = maximum(M, block_max)` and
+  `correction = exp(M - max_running)` read `M` directly, so both are in
+  `M`'s closure, even though only the first is the actual recurrence
+  update. This is deliberately non-transitive: an op that reads a closure
+  member but not the seed itself is an ordinary downstream consumer, not
+  part of the closure.
+- **The unique externally-fed member.** `_seed_buffer_for_carry` requires
+  `op` to be the *unique* closure member whose non-seed operands are all
+  external to the closure
+  (`_closure_member_has_external_operands_only`) — the step that combines
+  the previous carry value with fresh, per-iteration data, as opposed to a
+  downstream step that only combines the seed with an already-computed
+  sibling (e.g. `correction` reads `max_running`, a closure member, so it
+  is excluded even though it also reads `M` directly). If zero or more than
+  one closure member satisfies this, `_seed_buffer_for_carry` returns
+  `None` (not a carry step) rather than guessing — a known, accepted
+  limitation for closures with more than one externally-fed member, not
+  hit by any current test.
 
-**`accum_tile` and `carry_prev`.** When the group also tiles an outer
-output dim (e.g. H) above the reduction-tiled level, the terminal op's own
-buffer is only tile-sized at that outer level and cannot write into
-`accum_full` (full-size) directly — the same stick-compatibility
-constraint that motivates Case 1/2 for ordinary tiled ops. `accum_tile` is
-a per-outer-tile scratch buffer, `per_tile_fixed=True`, that the entry op
-reads from and the terminal op mutates via `MutationLayoutSHOULDREMOVE`,
-mirroring the reduction pattern's `accum_tile`. It differs in one respect
-that the reduction pattern never needs: other closure members (e.g.
-`correction`) need the carry's value from *before* this iteration's update
-— the same pre-update value the entry op itself reads — but
-`MutationLayoutSHOULDREMOVE` is a plain storage alias with no versioning,
-so a sibling reader positioned after the terminal op in `operations` would
-observe the post-update write instead. `carry_prev` is a distinct
-per-inner-iteration scratch buffer that snapshots `accum_tile` before the
-terminal op's write, and sibling closure members are redirected to read it
-instead of the seed.
-
-**Copy-in/copy-out placement.** Once per outer tile, before the inner loop's
-first iteration, a copy-in op loads `accum_full`'s current outer-tile slice
-into `accum_tile`. Once per outer tile, after the inner loop's *last*
-iteration, a copy-out op writes `accum_tile` back into `accum_full`'s slice
-— reusing `_insert_reduction_copy_op`. The copy-out's insertion point is
-not simply "immediately after the terminal op": it must run after the last
-op in the seed's closure (found via `max(..., key=operations.index)`),
-since sibling closure members like `correction` still need to run inside
-the same inner-loop iteration after the terminal op's write.
-
-**Joint layout choices for closure members.** A closure with multiple
-external members feeding a shared multi-input `AllSameNode` join (e.g.
-flash-attention's `M = torch.maximum(M, block_max)` join) needs its
-siblings' candidate layouts chosen together, not independently — a
-per-op-local, greedy choice for one sibling can foreclose a jointly-better
-choice for the other. `optimize_restickify_locations`'s beam search
-(`beam_global_min_cost`) now searches this joint space directly, carrying
-multiple candidate assignments forward across ops rather than committing
-each op's placement in isolation; a prior, narrower join-conflict pre-pass
-that special-cased this specific shape was removed once the beam search
-covered it. See
-[Groups derivation and placement in `CustomPreSchedulingPasses`](#groups-derivation-and-placement-in-custompreschedulingpasses)
-for where that pass runs relative to coarse tiling.
+If `_seed_buffer_for_carry` returns non-`None` for an op that is
+loop-invariant at a reduction-tiled level, that op is the carry-producing
+step of a recurrence this pass cannot execute, and planning raises
+`Unsupported` for the whole group.
 
 ## Layer 2 — `CountedLoopSchedulerNode`
 
@@ -1880,7 +1880,7 @@ landed.
 | `torch_spyre/_inductor/loop_info.py` | Layer 1: `CoarseTileInfo` dataclass; `copy_op_metadata` |
 | `torch_spyre/_inductor/wsr/coarse_tile_hints.py` | `reorder_unhinted_interlopers()` reorders interlopers before grouping |
 | `torch_spyre/_inductor/wsr/coarse_tile.py` | Layer 1: `coarse_tile()` stamps `loop_info` and rewrites ranges; `insert_tiling_propagation` handles the data perimeter |
-| `torch_spyre/_inductor/insert_restickify.py` | Commits deferred `_pending_per_tile_fixed` flags in `finalize_layouts`; derives a restickify buffer's own `per_tile_fixed` from the *consuming* op's `loop_info` rather than inheriting the source layout's flag, needed when the restickify buffer takes over an advancing accumulator's role (reduction copy-out, carry-into-accumulator) |
+| `torch_spyre/_inductor/insert_restickify.py` | Commits deferred `_pending_per_tile_fixed` flags in `finalize_layouts`; derives a restickify buffer's own `per_tile_fixed` from the *consuming* op's `loop_info` rather than inheriting the source layout's flag, needed when the restickify buffer takes over an advancing accumulator's role (the nested output-dim + reduction-dim tiling copy-out into `accum_tile`, `_insert_reduction_copy_op`) |
 | `torch_spyre/_inductor/scheduler.py` | Layer 2: `CountedLoopSchedulerNode`, `build_loop_scheduler_nodes`, `_codegen_counted_loop`, `_regroup_by_outer_loop_key` |
 | `torch_spyre/_inductor/op_spec.py` | Layer 3: `LoopSpec` and `OpSpec` dataclasses |
 | `torch_spyre/_inductor/spyre_kernel.py` | Layer 3: serializes `LoopSpec` tree in `codegen_kernel()`; `wrap_op_specs_in_loop()` |
@@ -1904,7 +1904,7 @@ is raised.  This ensures that all same-hint ops are contiguous in
 
 **Contiguity invariant**: all `SchedulerNode`s sharing a
 `loop_info.loop_group_id` must be contiguous after the scheduler's
-topological sort.  `_stamp_group` enforces this at stamp time via
+topological sort.  `_apply_plan` enforces this during transformation via
 `_validate_contiguous`, which raises `RuntimeError` if the ops are not
 a contiguous slice of the operation list.  The post-fusion pass
 (`build_loop_scheduler_nodes`) also asserts this by processing a contiguous
@@ -2041,7 +2041,7 @@ edits cannot violate Inductor's own scheduler and dependency-tracking
 invariants. It is written for developers who need to modify `coarse_tile.py`
 itself or diagnose a wrong-code bug that might originate there — not a
 restatement of the Case 1/2/3 classification, the reduction accum pattern, or
-the carry seed/closure/entry/terminal vocabulary, all covered above.
+the carry seed/closure detection vocabulary, all covered above.
 
 ### The wrap-never-reconstruct convention in practice
 
@@ -2053,7 +2053,7 @@ specific `ranges`/`reduction_ranges`; those expressions go stale the moment
 anything about the op's shape changes, so hand-rebuilding them from scratch
 is a silent wrong-code trap (issue #2797, cited directly in
 `replace_computed_buffer_body`'s implementation comment in
-`pass_utils.py:1116-1117`). Every rewrite site in `coarse_tile.py` and
+`pass_utils.py:1114`). Every rewrite site in `coarse_tile.py` and
 `insert_restickify.py` follows the same four-line idiom instead:
 
 ```python
@@ -2078,7 +2078,7 @@ assignments used elsewhere in this appendix are ordinary attribute sets, not
 escape-hatch writes — the two mechanisms look similar but rest on different
 class-level decisions.
 
-`replace_computed_buffer_body` (`pass_utils.py:1098-1135`) is the second half
+`replace_computed_buffer_body` (`pass_utils.py:1095-1132`) is the second half
 of the idiom: because `ComputedBuffer` itself is also frozen, the mutated
 `data` cannot simply be re-attached to the existing `op` object either — a
 fresh `ComputedBuffer` is constructed with the new `data`, all metadata
@@ -2091,26 +2091,23 @@ so that stale per-object caches on the old buffer can never leak forward.
 
 Call sites, all following this exact shape:
 
-- `_insert_read_view_ops` (`coarse_tile.py:2314-2414`, local
-  `_NameSwapHandler`) — see
+- `_insert_read_copy_ops` (`coarse_tile.py:1274-1378`, local
+  `_NameSwapHandler` defined just above it at `coarse_tile.py:1256-1273`) —
+  see
   [Read-side adaptation](#read-side-adaptation-full-buffer-inputs-to-a-loop-internal-op)
   above; detailed further below.
-- `_patch_consumers` (`coarse_tile.py:2772-2806`, `NameSwapHandler` imported
+- `_patch_consumers` (`coarse_tile.py:1728-1780`, `NameSwapHandler` imported
   from `insert_restickify.py`) — patches an outside consumer's `inner_fn` to
   read the newly-promoted full buffer instead of the original tile-sized one.
 - `_patch_retiled_load_indexes` / `_RetileLoadIndexHandler`
-  (`coarse_tile.py:2809-2972`) — a distinct mechanism from name-swapping,
-  detailed in the next subsection.
-- `_propagate_carry_op` (`coarse_tile.py:1763-2088`) — see
-  [Sequential carry](#sequential-carry-online-softmax-style-recurrences)
-  above; also rewires `entry_op`/closure-sibling `inner_fn`s to read
-  `carry_prev` instead of the seed.
-- `insert_restickify_on_node_inputs` (`insert_restickify.py:143-186`, using
-  the canonical `NameSwapHandler` defined at `insert_restickify.py:67-82`) —
+  (`coarse_tile.py:1936-1972` / `coarse_tile.py:1868-1881`) — a distinct
+  mechanism from name-swapping, detailed in the next subsection.
+- `insert_restickify_on_node_inputs` (`insert_restickify.py:144-186`, using
+  the canonical `NameSwapHandler` defined at `insert_restickify.py:68-83`) —
   the example CLAUDE.md itself points to.
 
 One site looks like an exception but is not: `_insert_copy_op`
-(`coarse_tile.py:2258-2293`) builds a **new** `Pointwise` via
+(`coarse_tile.py:1187-1252`) builds a **new** `Pointwise` via
 `tiled_op.make_loader()` rather than editing `tiled_op`'s own `inner_fn`.
 This is IR-safe by construction, not a violation of the convention — it
 reuses Inductor's own `make_loader()` (which itself returns a closure over
@@ -2119,7 +2116,7 @@ index expression, so the same "never reconstruct a stale index" property
 holds even though no `WrapperHandler` is involved.
 
 No site in either file reconstructs an index expression from scratch.
-`_divide_ranges` (`coarse_tile.py:3455-3559`) is the one place shape and
+`_divide_ranges` (`coarse_tile.py:2545-2648`) is the one place shape and
 layout are mutated (via `object.__setattr__`) with `inner_fn` left completely
 untouched — deliberately, and safely, for the reason given in the next
 subsection.
@@ -2129,27 +2126,31 @@ subsection.
 Two distinct mechanisms handle index-expression correctness after tiling,
 and they are staged deliberately rather than combined:
 
-1. **`_divide_ranges`** (`coarse_tile.py:3455-3559`) shrinks `data.ranges`
+1. **`_divide_ranges`** (`coarse_tile.py:2545-2648`) shrinks `data.ranges`
    (and the op's own `layout.size`/`layout.stride`) via `object.__setattr__`,
    leaving `inner_fn` completely untouched. This is correct because the op's
    own index arithmetic is expressed in terms of the loop variables that the
    surrounding (now smaller, per-tile) iteration space binds — the *op*
-   never needs to know it was tiled; only its bounds shrink.
+   never needs to know it was tiled; only its bounds shrink. `_divide_ranges`
+   only ever runs from `_apply_plan` (the transformation phase); planning
+   itself never mutates `data.ranges` — it computes what the post-mutation
+   extents *would be* analytically via `_planned_tile_extents`, reading the
+   still-untouched `data.ranges`/`data.reduction_ranges`.
 
 2. **`_patch_retiled_load_indexes`** fixes a different problem: *other* ops
    whose captured load index still carries the pre-tiling stride
    coefficient for a buffer that has since been re-tiled. This is driven
    exactly once, at the very end of `coarse_tile()`, after every group in
    the call has been processed — not per-group. `_stride_rewrite_map`
-   (`coarse_tile.py:2809`) builds the substitution from old to new stride
-   coefficients; `_retile_load_index_from_strides`
-   (`coarse_tile.py:2822-2892`) checks that the load index is affine and
+   (`coarse_tile.py:1784-1794`) builds the substitution from old to new
+   stride coefficients; `_retile_load_index_from_strides`
+   (`coarse_tile.py:1797-1865`) checks that the load index is affine and
    separable in the rewritten variables before substituting, and — this is
    a real, flagged soft spot rather than a proven bug — conservatively
    *refuses and warns* rather than raising a hard compile error if a future
    index shape is not affine-separable. A refusal here degrades to a
    runtime warning plus likely-wrong output, not a caught error at compile
-   time. `_RetileLoadIndexHandler` (`coarse_tile.py:2893-2934`,
+   time. `_RetileLoadIndexHandler` (`coarse_tile.py:1868-1881`,
    a `WrapperHandler` subclass) is the mechanism that actually applies the
    substitution to the consumer's `inner_fn`, following the same
    wrap-never-reconstruct idiom as every other site in this appendix.
@@ -2181,27 +2182,30 @@ information is *derived from* `inner_fn` by re-tracing it, not stored
 independently — so the only way to actually redirect what an op reads is to
 change what its `inner_fn` does when traced.
 
-`_insert_read_view_ops` (`coarse_tile.py:2314-2414`) is the concrete instance
+`_insert_read_copy_ops` (`coarse_tile.py:1274-1378`) is the concrete instance
 already introduced under
 [Read-side adaptation](#read-side-adaptation-full-buffer-inputs-to-a-loop-internal-op)
 above: when a loop-internal op reads a full-size `SpyreEmptyFallback` buffer
-directly (typically an accumulator that an earlier Case-2/mutation or carry
-rewrite already promoted to full size), the two-step mechanism is (1) insert,
-before the tiled op, a small tile-sized "view" `ComputedBuffer` whose
-`inner_fn` loads the full buffer's current tile slice using the *same* index
-expression the tiled op already computes and the *same* `loop_info` (so the
-per-iteration base address advances identically to the tiled op's own reads);
-then (2) wrap the tiled op's own `inner_fn` with the local `_NameSwapHandler`
-so that its load of the full buffer's name is retargeted to the new view
-buffer's name instead. The view's own layout is built from the full buffer's
-per-variable strides (extracted from the read dependency's index, which is
-affine in its var_names) rather than fresh contiguous strides, specifically
-so the tiled op's *unmodified* read index still resolves correctly once
-`_NameSwapHandler` retargets only the buffer name, not the index expression
-itself.
+directly (typically an accumulator that an earlier Case-2/mutation rewrite
+already promoted to full size), the two-step mechanism is (1) insert, before
+the tiled op, a small tile-sized copy `ComputedBuffer` whose `inner_fn` loads
+the full buffer's current tile slice using the *same* index expression the
+tiled op already computes and the *same* `loop_info` (so the per-iteration
+base address advances identically to the tiled op's own reads); then (2) wrap
+the tiled op's own `inner_fn` with the local `_NameSwapHandler` so that its
+load of the full buffer's name is retargeted to the new copy buffer's name
+instead. This always materializes an actual copy — there is no conditional
+path that instead installs a zero-copy "view" over the full buffer; every
+call constructs a real `Pointwise`/`ComputedBuffer` that Inductor's own
+scheduler treats as an ordinary tile-sized producer. The copy's own layout is
+built from the full buffer's per-variable strides (extracted from the read
+dependency's index, which is affine in its var_names) rather than fresh
+contiguous strides, specifically so the tiled op's *unmodified* read index
+still resolves correctly once `_NameSwapHandler` retargets only the buffer
+name, not the index expression itself.
 
-The reason a view buffer is needed at all, rather than simply changing which
-name the tiled op loads from, is the same `AllSameNode` stick-compatibility
+The reason a copy is needed at all, rather than simply changing which name
+the tiled op loads from, is the same `AllSameNode` stick-compatibility
 constraint that motivates the Case 1/2/3 split on the write side: a full-size
 buffer has exactly one candidate layout (sized to the full buffer), while the
 tiled op's own candidate layouts are all tile-sized — the two can never be
@@ -2209,8 +2213,8 @@ made stick-compatible without an intermediate buffer sized to match.
 
 ### `MutationLayoutSHOULDREMOVE`: the real contract
 
-The doc above uses `MutationLayoutSHOULDREMOVE` four times (Case 3, the
-reduction accum pattern, the carry mechanism) as an already-understood
+The doc above uses `MutationLayoutSHOULDREMOVE` several times (Case 3, and
+both the flat and nested reduction accum patterns) as an already-understood
 primitive, each time asserting it is "a metadata redirect, zero added data
 movement." This subsection explains why that claim is true, from the actual
 upstream implementation (`torch/_inductor/ir.py:4373-4459`):
@@ -2283,10 +2287,11 @@ onto a target that already carries one:
 
 | Site | File:line | Target |
 |---|---|---|
-| Case 3 direct mutation | `coarse_tile.py:1346` | full HBM buffer |
-| `_insert_copy_op` | `coarse_tile.py:2258-2293` | full buffer (copy-out) |
-| `_insert_reduction_copy_op` | `coarse_tile.py:2483-2546` | `accum_full` |
-| `_propagate_carry_op` | `coarse_tile.py:1763-2088` | seed / `accum_full` / `accum_tile` |
+| Case 3 direct mutation | `coarse_tile.py:631` | full HBM buffer |
+| `_insert_copy_op` | `coarse_tile.py:1187-1252` | full buffer (copy-out) |
+| `_insert_combine_op` | `coarse_tile.py:1383-1442` | `accum_full`/`accum_tile` (per-tile combine) |
+| `_insert_reduction_copy_op` | `coarse_tile.py:1444-1499` | `accum_full` (nested-tiling copy-out) |
+| fill op inside `_propagate_tiled_reduction_op` | `coarse_tile.py:1650-1666` | fill target (identity-value seed) |
 
 This was checked directly against the current codebase and no violation was
 found — but the invariant is currently upheld by convention (one assignment
@@ -2294,7 +2299,7 @@ per op, never revisited), not by an assertion or type-level guard. If this
 pattern is ever extended to a new call site, it is worth adding an explicit
 check rather than relying on the same discipline holding indefinitely.
 
-**A documented-but-unenforced gap.** `coarse_tile.py:1344-1345` carries a
+**A documented-but-unenforced gap.** `coarse_tile.py:618-619` carries a
 comment stating that `MutationLayoutSHOULDREMOVE` is incompatible with
 `lx_planning` (LX scratchpad placement) — the two must never be combined on
 the same buffer. There is no code-level guard preventing this combination;
@@ -2395,7 +2400,7 @@ site is the project's own prior articulation of this exact argument: *"Always
 wrap the original inner_fn via WrapperHandler; never rebuild index
 expressions from scratch (they go stale — see issue #2797)."*
 
-### DCE liveness: why carry copy-outs survive
+### DCE liveness: why reduction copy-outs survive
 
 `Scheduler.dead_node_elimination` (`scheduler.py:3528-3567`) is a single
 reverse-topological-order linear sweep — not a separate reachability
@@ -2445,27 +2450,32 @@ torch-spyre pass wants to apply must already be in place by the time this
 sweep runs, not applied afterward — `CustomPreFusionPasses` is too late to
 save a node DCE has already dropped.
 
-The real problem this creates: a carry copy-out that writes the updated
-value back into the pre-loop seed buffer (`_propagate_carry_op`, described
-above) has no downstream reader *in the flat scheduler IR that DCE walks,
-before loop codegen ever groups it under an `scf.for`*.  The buffer it writes
-is read again only by the *next outer-tile iteration's* copy-in — a
-cross-iteration read with no representation at this IR level.
-From DCE's perspective the copy-out's output looks like a dead buffer with
-zero live users, and it would be removed despite being required for
-correctness — a real bug the project found and fixed (task history: "Confirm
-DCE mechanism: buf3's copy-out has no protecting downstream reader" /
-"Design and apply fix for DCE-eliminated carry copy-out").
+The real problem this creates: `_propagate_tiled_reduction_op`'s nested
+output-dim + reduction-dim tiling (see "Reduction tiling," above) inserts a
+copy-out op (`_insert_reduction_copy_op`) that mutates a pre-loop
+accumulation buffer (`accum_full`) so its updated value is visible to the
+*next outer-tile iteration's* copy-in. That copy-out has no downstream
+reader *in the flat scheduler IR that DCE walks, before loop codegen ever
+groups it under an `scf.for`* — the buffer it writes is read again only by
+that next-iteration copy-in, a cross-iteration read with no representation
+at this IR level. The same problem applies to the fill op inside
+`_propagate_tiled_reduction_op` that seeds the accumulator with the
+reduction's identity value before the loop: its write is only ever "read" by
+the next iteration's use of the fill target as an accumulator seed, again
+invisible to this IR level. From DCE's perspective both ops' outputs look
+like dead buffers with zero live users, and they would be removed despite
+being required for correctness — a real bug the project found and fixed.
 
 The fix is a targeted monkeypatch in `torch_spyre/_inductor/patches.py:126-144`:
 
 ```python
-    # coarse_tile.py's sequential-carry mechanism (_propagate_carry_op) inserts
-    # a copy-out op that mutates a pre-loop seed buffer (accum_full) so its
-    # updated value is visible to the NEXT outer-tile iteration's copy-in.
-    # That cross-iteration read has no representation in the single-pass,
-    # pre-unroll IR the scheduler's own dead_node_elimination walks, so a
-    # carry copy-out with no other downstream reader looks dead and is
+    # coarse_tile.py's nested output-dim + reduction-dim tiling
+    # (_propagate_tiled_reduction_op) inserts a copy-out op
+    # (_insert_reduction_copy_op) that mutates a pre-loop accumulation buffer
+    # (accum_full) so its updated value is visible to the NEXT outer-tile
+    # iteration's copy-in. That cross-iteration read has no representation in
+    # the single-pass, pre-unroll IR the scheduler's own dead_node_elimination
+    # walks, so a copy-out with no other downstream reader looks dead and is
     # removed — even though it is required for correctness. Mark such ops
     # with _coarse_tile_force_live (see _insert_reduction_copy_op) and force
     # SchedulerNode.has_side_effects() to report True for them, mirroring how
@@ -2496,7 +2506,8 @@ has_side_effects` specifically — not `BaseSchedulerNode`, not
 decorated) implementation (`scheduler.py:1818-1823`) for every node except
 the ones explicitly stamped. The `_coarse_tile_force_live` attribute is
 stamped at exactly two sites: inside `_insert_reduction_copy_op`
-(`coarse_tile.py:2532`) and on a fill buffer (`coarse_tile.py:2712`).
+(`coarse_tile.py:1485`) and on the fill buffer inside
+`_propagate_tiled_reduction_op` (`coarse_tile.py:1665`).
 
 ### Summary: invariant-by-invariant soundness table
 
@@ -2510,5 +2521,5 @@ covers the IR-rewrite mechanism this appendix describes.
 | Dependencies must reflect `inner_fn` | `get_read_writes()` re-traces every call, no cache (`ir.py:4768`) | No caching exists to go stale; wrap-in-place is automatically observed |
 | ≤1 mutation target per op | `assert` at `scheduler.py:3337` | Every `MutationLayoutSHOULDREMOVE` call site assigns exactly one; `.layout` is a single attribute, never chained |
 | Mutated buffers must not be silently inlined | `mark_buffer_mutated` called unconditionally in the constructor (`ir.py:4383`) | Constructor call fires on every instantiation, before `make_loader()` can ever see a stale view |
-| Dead nodes are pruned before codegen | `dead_node_elimination`, `scheduler.py:3528`, runs once, before `CustomPreFusionPasses` | `_coarse_tile_force_live` + patched `has_side_effects()` (`patches.py:126-144`) protects the two carry/reduction copy-out sites that need it |
+| Dead nodes are pruned before codegen | `dead_node_elimination`, `scheduler.py:3528`, runs once, before `CustomPreFusionPasses` | `_coarse_tile_force_live` + patched `has_side_effects()` (`patches.py:126-144`) protects the two reduction copy-out/fill sites that need it |
 | Loop-group contiguity after scheduling | (existing invariant, cross-referenced only) | See [Contiguity invariant](#invariants-and-failure-modes) above |
