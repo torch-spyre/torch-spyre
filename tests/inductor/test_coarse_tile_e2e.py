@@ -878,7 +878,14 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "allow_all_ops_in_lx_planning": True,
         }
     )
-    @pytest.mark.xfail(strict=False, reason="flash attention v3/v4 not yet passing")
+    @pytest.mark.xfail(
+        strict=False,
+        reason=(
+            "flash attention v3/v4 not yet passing: Lk reduction-dim tiling is "
+            "disabled (see FIXME on kv_block_size), unrelated to carry "
+            "propagation"
+        ),
+    )
     def test_hint_flash_attention_v3(self):
         from torch_spyre._inductor import spyre_hint
 
@@ -979,7 +986,14 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
-    @pytest.mark.xfail(strict=False, reason="flash attention v3/v4 not yet passing")
+    @pytest.mark.xfail(
+        strict=False,
+        reason=(
+            "flash attention v3/v4 not yet passing: Lk reduction-dim tiling is "
+            "disabled (see FIXME on kv_block_size), unrelated to carry "
+            "propagation"
+        ),
+    )
     def test_hint_flash_attention_v3_b2(self):
         """Same as flash_v3 but with B=2 and b_block_size=2 so B is nto tiled"""
         from torch_spyre._inductor import spyre_hint
@@ -1080,7 +1094,14 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
-    @pytest.mark.xfail(strict=False, reason="flash attention v3/v4 not yet passing")
+    @pytest.mark.xfail(
+        strict=False,
+        reason=(
+            "flash attention v3/v4 not yet passing: Lk reduction-dim tiling is "
+            "disabled (see FIXME on kv_block_size), unrelated to carry "
+            "propagation"
+        ),
+    )
     def test_hint_flash_attention_v3_b2_minimal(self):
         """Minimal reproducer for v3_b2 correctness failure."""
         from torch_spyre._inductor import spyre_hint
@@ -1123,7 +1144,14 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
-    @pytest.mark.xfail(strict=False, reason="flash attention v3/v4 not yet passing")
+    @pytest.mark.xfail(
+        strict=False,
+        reason=(
+            "flash attention v3/v4 not yet passing: unrelated "
+            "propagate_named_dims bug (num_heads layout dim has no loop "
+            "vars), not carry propagation"
+        ),
+    )
     def test_hint_flash_attention_v4(self):
         """This test attempts to replicate the standalone test_granite_attn.py with views
         but the flash logic is inlined rather than relying on decompositions.py
