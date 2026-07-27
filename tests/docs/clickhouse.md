@@ -90,23 +90,25 @@ artifact it produced), so the dashboard can't show that. The
 see it on the dashboard.
 
 ```sql
-CREATE TABLE IF NOT EXISTS pr_check_events
+CREATE TABLE IF NOT EXISTS spyre.pr_check_events
 (
-    ts            DateTime DEFAULT now(),
-    host          LowCardinality(String),
-    owner         String,
-    repo          String,
-    pr            UInt32,
-    sha           String,
-    run_id        String,
-    build_url     String,
-    component     String,
-    arch          LowCardinality(String),
-    mode          LowCardinality(String),
-    state         LowCardinality(String),
-    conclusion    Nullable(String),
-    artifact_url  Nullable(String),
-    gha_url       Nullable(String)
+    ts             DateTime DEFAULT now(),
+    host           LowCardinality(String),
+    owner          String,
+    repo           String,
+    pr             UInt32,
+    sha            String,
+    run_id         String,
+    build_url      String,
+    component      String,
+    arch           LowCardinality(String),
+    mode           LowCardinality(String),
+    state          LowCardinality(String),
+    conclusion     Nullable(String),
+    artifact_url   Nullable(String),
+    gha_url        Nullable(String),
+    rpm_versions   Array(String) DEFAULT [],
+    wheel_versions Array(String) DEFAULT []
 )
 ```
 
