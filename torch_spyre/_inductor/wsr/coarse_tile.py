@@ -2383,13 +2383,13 @@ def plan_coarse_tile_groups(
 ) -> dict[int, CoarseTileInfo]:
     """Decide every op's coarse-tiling attributes without mutating the IR.
 
-    Mirrors _stamp_group's per-op decision logic (hint-to-position lookup,
-    per-level tiled-dims bookkeeping, tile_advance_exprs/
-    output_tile_advance_expr) but never calls _divide_ranges/
-    _divide_reduction_ranges -- those are real IR mutation and must only run
-    during transformation. Extents are instead computed analytically by
-    _planned_tile_extents, reading op.data.ranges/reduction_ranges as they
-    exist before any mutation.
+    Performs the per-op decision logic (hint-to-position lookup, per-level
+    tiled-dims bookkeeping, tile_advance_exprs/output_tile_advance_expr) but
+    never calls _divide_ranges/_divide_reduction_ranges -- those are real IR
+    mutation and must only run during transformation (see _apply_plan).
+    Extents are instead computed analytically by _planned_tile_extents,
+    reading op.data.ranges/reduction_ranges as they exist before any
+    mutation.
 
     Returns a dict mapping each tiled op's ``id(op)`` to its planned
     CoarseTileInfo. Keyed by ``id(op)`` rather than ``op`` itself because
