@@ -159,6 +159,8 @@ def _cache_key(cached_method: object) -> str:
     )
 
 
+# Resolve cache keys once at import time — any rename in upstream IR will raise
+# AttributeError here rather than silently no-oping at runtime.
 _LOOPS_FREE_SYMS_KEY = _cache_key(Loops.get_free_symbol_uses)
 _LOOPS_INNER_FN_STR_KEY = _cache_key(Loops.inner_fn_str)
 _LOOPS_INNER_FN_OPCOUNT_KEY = _cache_key(Loops.inner_fn_opcount)
