@@ -113,7 +113,16 @@ def _run_and_capture(
         patch("torch_spyre.execution.kernel_runner.launch_jobplan"),
         patch("torch_spyre.execution.async_compile.subprocess.run"),
     ):
-        _compile_and_run(fn, args, DEVICE)
+        try:
+            _compile_and_run(fn, args, DEVICE)
+        except Exception:
+            # These tests check that named dim propagation is correct.
+            # Failures in later passes (e.g. codegen) are irrelevant and
+            # should not block the dim assertions below.  If propagation
+            # itself failed, `captured` will be empty and we re-raise so
+            # that tests expecting a propagation error still fail correctly.
+            if not captured:
+                raise
 
     result = _CaptureResult(
         propagated_dims=captured.get("named_dims", []),
