@@ -470,6 +470,44 @@ class SpyreKernelOpsHandler(DefaultHandler):
         raise NotImplementedError
 
 
+def _tile_advance_expr_from_dep(
+    dep: MemoryDep,
+    tiled_dim_extents: dict[int, sympy.Expr],
+) -> sympy.Expr:
+    """Element-offset advance of ``dep`` for one step of each tiled dim.
+
+    ``tiled_dim_extents`` maps a host-range positional index (the same
+    indices used in ``loop_tiled_dims`` / ``loop_tiled_reduction_dims``) to
+    the tile extent one loop step advances that dim's ``d{i}`` symbol by.
+
+    Built by substituting, in ``dep.index``, each tiled dim's ``d{dim}``
+    with ``extent * d{dim}`` (staying symbolic in ``d{dim}`` -- the
+    expression is meant to stay unevaluated until a later compilation stage
+    substitutes a concrete tile-index value for each ``d{dim}``) and every
+    other free symbol in ``dep.index`` with ``0`` (dims that never advance:
+    untiled dims, and broadcast dims ``dep`` does not depend on).  Because
+    this is a direct substitution rather than coefficient extraction,
+    ``dep.index`` need not be affine in the tiled symbols -- a tiled dim
+    wrapped in ``Mod``/``FloorDiv``/``ModularIndexing`` (reshape-split or
+    gather/indirect-indexing dims) produces the exact non-linear term
+    rather than an approximation.
+    Returns ``sympy.Integer(0)`` when every tiled dim's substituted term
+    also evaluates to ``0`` (this dependency never advances).
+
+    Moved here (from coarse_tile.py) so index substitution happens once
+    the tensor's get_read_writes().index is guaranteed final -- see
+    docs/superpowers/specs/2026-07-27-deferred-tile-advance-capture-design.md.
+    """
+    subs = {
+        sympy_index_symbol(f"d{dim}"): extent * sympy_index_symbol(f"d{dim}")
+        for dim, extent in tiled_dim_extents.items()
+    }
+    subs.update(
+        {sym: sympy.Integer(0) for sym in dep.index.free_symbols if sym not in subs}
+    )
+    return dep.index.subs(subs)
+
+
 class SpyreKernel(Kernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
 
