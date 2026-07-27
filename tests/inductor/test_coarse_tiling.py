@@ -2679,6 +2679,73 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
                 use_symbols=True,
             )
 
+    def test_minted_symbol_tiled_on_different_dim_does_not_raise_unsupported(self):
+        """A tensor tiled (via a minted symbol) on one dim, and merely also
+        *active* (but untiled) on a different dim that happens to be the
+        symbolically-split one, must NOT raise Unsupported.
+
+        Regression test for fix-loop round 1: the original minted-symbol
+        check flagged tiled_on_split_dim=True whenever sym_dim_name was
+        *any* active dim of a tensor that advanced at all, regardless of
+        which dim actually drove that advance -- because a minted symbol's
+        combined coefficient (spyre_kernel._general_tile_advance sums every
+        host dim tiled at a level into one coefficient before this tensor's
+        device_tile_advance_expr is built) carries no per-dimension
+        provenance to check against. Here the tensor is split on `mb` but
+        tiled only on `kj` (a different, unrelated dim that also happens to
+        be active) -- mb itself never advances, so this combination is
+        supported and must not raise.
+        """
+        mb = Symbol("mb")
+        kj = Symbol("kj")
+        minted = Symbol("_tile_adv_add_lvl0")
+        tensor = SDSCArgs(
+            layout="A",
+            dim_order=[mb, kj],
+            data_format=_FP16,
+            scales={mb: 1, kj: 1},
+            strides={mb: 256, kj: 999},
+            offsets={mb: 0, kj: 0},
+            max_dim_sizes={mb: -1, kj: -1},
+            allocation={"hbm": 0x1000},
+            start_address=0,
+            backGap={},
+            arg_index=0,
+            # Tiled only via kj: the combined coefficient on the minted
+            # symbol is nonzero (the tensor genuinely advances at this
+            # level), but mb contributes nothing to it.
+            device_tile_advance_expr=512 * minted,
+        )
+        sdsc_spec = SDSCSpec(
+            opfunc="add",
+            execution_unit="sfp",
+            data_format=_FP16,
+            num_inputs=1,
+            iteration_space={mb: 1024, kj: 128},
+            num_cores=8,
+            work_slices={mb: 8, kj: 1},
+            core_id_to_work_slice={mb: Integer(0), kj: Integer(0)},
+            padding={},
+            layouts={
+                "A": {"dim_order": [mb, kj], "stick_dim_order": kj, "stick_size": 64}
+            },
+            args=[tensor],
+            constants={},
+            coordinate_masking={},
+            symbolic_dims={"mb": ("s0", 64, 1024)},
+        )
+        symbols: list[int] = []
+        # Must not raise: mb (the split dim) is active but not the dim this
+        # tensor is actually tiled on.
+        generate_sdsc(
+            0,
+            sdsc_spec,
+            symbols,
+            symbol_id_offset=0,
+            tiled_symbols=[[minted]],
+            use_symbols=True,
+        )
+
 
 class TestSharedWeightUnitBmmLayout(unittest.TestCase):
     def _static_bmm_custom_meta(self, x_shape, y_shape, out_shape):

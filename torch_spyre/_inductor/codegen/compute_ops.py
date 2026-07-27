@@ -724,16 +724,31 @@ def generate_sdsc(
                 #
                 # Minted-symbol path (spyre_kernel._get_or_mint_level_symbol):
                 # a minted symbol names a loop-nesting *level*, not a
-                # dimension, so its name can never equal sym_dim_name even
-                # when it genuinely drives sym_dim_name's advance. Detect
-                # that case instead via: is sym_dim_name an active
-                # (non-reduced) dim of this tensor, and does *some* symbol at
-                # *some* level contribute a nonzero term to this tensor's own
-                # device_tile_advance_expr. This is deliberately conservative
-                # (any tiling at all on sym_dim_name is flagged, regardless of
-                # which level) -- matching this function's own docstring
-                # scope ("A symbolic-split dim that is ALSO tiled for this
-                # tensor is out of scope").
+                # dimension -- _general_tile_advance (spyre_kernel.py) sums
+                # every host dim tiled at a level into ONE combined
+                # coefficient on that level's minted symbol before this
+                # tensor's device_tile_advance_expr is ever built, so by the
+                # time we get here there is no way to recover, from a
+                # nonzero coeff(minted_sym) alone, *which* of this tensor's
+                # active dims that coefficient came from (see fix-loop
+                # round-1 review: a tensor with two active dims, tiled only
+                # on one of them, previously false-positived on the other
+                # merely because it was also active and the tensor advanced
+                # via *some* dim).
+                #
+                # Absent that per-dimension provenance, the only sound test
+                # (no false positives) is: flag `sym_dim_name` only when it
+                # is this tensor's *sole* active (non-reduced) dim -- then a
+                # nonzero combined coefficient cannot be attributed to any
+                # other dim, because there is no other dim. This is a
+                # deliberate narrowing versus "any tiling at all, on any
+                # dim" -- it can under-detect (miss a real conflict on a
+                # tensor with 2+ active dims where sym_dim_name genuinely is
+                # the tiled one) but never over-detects, which is the
+                # correctness-critical direction for a False positive to
+                # avoid: it would otherwise reject support for supported
+                # ops using this check.
+                active_dims = [d for d in tensor.strides if tensor.scales.get(d, 1) > 0]
                 tensor_advances_at_some_level = (
                     tensor.device_tile_advance_expr is not None
                     and any(
@@ -750,6 +765,7 @@ def generate_sdsc(
                 ) or (
                     sym_dim in tensor.strides
                     and tensor.scales.get(sym_dim, 1) > 0
+                    and active_dims == [sym_dim]
                     and tensor_advances_at_some_level
                 )
                 if tiled_on_split_dim:
