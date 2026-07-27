@@ -1046,6 +1046,20 @@ class TestCodegenOpSpecListRoundtrip(unittest.TestCase):
         result = _roundtrip(original)
         self.assertEqual(result[0].body[0].args[0].arg_index, 3)
 
+    def test_tiled_symbol_trip_counts_preserved(self):
+        sym = Symbol("_tile_adv_op0_lvl0")
+        op = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={Symbol("x0"): (Integer(128), 1)},
+            args=[],
+            op_info={},
+            tiled_symbol_trip_counts={sym: 4},
+        )
+        original = [op]
+        result = _roundtrip(original)
+        self.assertEqual(result[0].tiled_symbol_trip_counts, {sym: 4})
+
 
 # ===========================================================================
 # 2. coarse_tile IR pass

@@ -1313,6 +1313,12 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                         )
                         + "],"
                     )
+                if op_spec.tiled_symbol_trip_counts:
+                    trip_counts_str = ", ".join(
+                        f"{sympy_str(sym)}: {count}"
+                        for sym, count in op_spec.tiled_symbol_trip_counts.items()
+                    )
+                    buf.writeline(f"tiled_symbol_trip_counts={{{trip_counts_str}}},")
                 buf.writeline(
                     f"symbolic_dim_bounds={_serialize_value(op_spec.symbolic_dim_bounds)},"
                 )
