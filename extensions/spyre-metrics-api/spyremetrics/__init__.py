@@ -33,7 +33,7 @@ from .section_types import (
 
 ## TODO: Should refer to the package version
 __version__ = "0.5.0"  ## Version for release
-#__version__ = "0.5.8"  ## Version for uploading to PyPI test server
+# __version__ = "0.5.8"  ## Version for uploading to PyPI test server
 __all__ = [
     "CONFIG_FILE_LIST",
     "FileHeader",
