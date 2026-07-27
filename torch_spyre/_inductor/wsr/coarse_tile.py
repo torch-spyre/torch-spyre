@@ -1459,18 +1459,19 @@ def coarse_tile(
 
 
 def _zero_fixed_tile_advance_exprs(operations: list[Operation]) -> None:
-    """Zero tile_advance_exprs / output_tile_advance_expr for fixed tiles.
+    """Drop tiled_dims_per_read / output_tiled_dims entries for fixed tiles.
 
     A per-tile-fixed buffer (flagged by insert_tiling_propagation, above, via
     either the pre-stickify _pending_per_tile_fixed or an already-committed
     post-stickify FixedTiledLayout.per_tile_fixed) is reused in place every
     tile iteration -- it never actually advances, regardless of what its
-    dependency's index arithmetic would otherwise compute. Replace that
-    mathematically-correct-but-semantically-useless real expression with a
-    real 0, both for the op's own output (if its own buffer is fixed) and
-    for any op reading a fixed buffer as an input.
+    dependency's index arithmetic would otherwise compute. Drop that
+    dependency's tiled-dim entries entirely (an empty per-level list has the
+    same effect as a zero advance expr did before this plan: no dims to
+    substitute means no advance), both for the op's own output (if its own
+    buffer is fixed) and for any op reading a fixed buffer as an input.
 
-    This is the only place tile_advance_exprs/output_tile_advance_expr reads
+    This is the only place tiled_dims_per_read/output_tiled_dims reads
     per_tile_fixed/_pending_per_tile_fixed -- a deliberate one-way bridge
     kept isolated here so it can be deleted once a later stage derives
     per_tile_fixed from a zero advance expr instead of the reverse.
@@ -1492,15 +1493,15 @@ def _zero_fixed_tile_advance_exprs(operations: list[Operation]) -> None:
         if loop_info is None:
             continue
         if op.get_name() in fixed_names:
-            loop_info.output_tile_advance_expr = sympy.Integer(0)
-        if not loop_info.tile_advance_exprs:
+            loop_info.output_tiled_dims = []
+        if not loop_info.tiled_dims_per_read:
             continue
         reads = [
             dep for dep in op.get_read_writes().reads if isinstance(dep, MemoryDep)
         ]
         for i, dep in enumerate(reads):
             if dep.name in fixed_names:
-                loop_info.tile_advance_exprs[i] = sympy.Integer(0)
+                loop_info.tiled_dims_per_read[i] = []
 
 
 # ---------------------------------------------------------------------------
@@ -2031,7 +2032,7 @@ def _insert_copy_op(
 
     The copy op carries the same loop metadata as tiled_op (so it executes
     inside the same loop body) but its own freshly-derived
-    tile_advance_exprs/output_tile_advance_expr, since its reads/write don't
+    tiled_dims_per_read/output_tiled_dims, since its reads/write don't
     correspond positionally to tiled_op's. Its layout is
     MutationLayoutSHOULDREMOVE pointing at full_buf so store_output writes
     into full_buf; loop_tiled_dims being set makes SpyreKernel stamp
@@ -2054,35 +2055,32 @@ def _insert_copy_op(
     copy_buf.origins = tiled_op.origins
     copy_buf.operation_name = copy_name
 
-    # Fresh tile_advance_exprs/output_tile_advance_expr from copy_buf's own
-    # reads/write (positionally different from tiled_op's). Use
-    # dataclasses.replace, not a shared/shallow-copied loop_info: a later
-    # pass (_zero_fixed_tile_advance_exprs) mutates these fields in place,
-    # and aliasing would leak those mutations onto copy_buf.
+    # Fresh per-level tiled-dim decisions from copy_buf's own reads/write
+    # (positionally different from tiled_op's). copy_buf's ranges are
+    # identical to tiled_op's post-division ranges, so each tiled dim's
+    # level-0..N extent is simply 1 -- the copy op is not itself re-divided,
+    # it just re-reads tiled_op's already-divided buffer once per tile.
     tiled_op_info = tiled_op.loop_info  # type: ignore[attr-defined]
-    tiled_dim_extents = {
-        d: copy_buf.data.ranges[d]
+    per_level_extents = [
+        {d: sympy.Integer(1) for d in level_dims}
         for level_dims in tiled_op_info.loop_tiled_dims
-        for d in level_dims
-    }
+    ]
     copy_reads = [
         dep for dep in copy_buf.get_read_writes().reads if isinstance(dep, MemoryDep)
     ]
     copy_writes = [
         dep for dep in copy_buf.get_read_writes().writes if isinstance(dep, MemoryDep)
     ]
-    tile_advance_exprs = [
-        _tile_advance_expr_from_dep(dep, tiled_dim_extents) for dep in copy_reads
+    tiled_dims_per_read = [
+        _tiled_dims_for_dep(dep, per_level_extents) for dep in copy_reads
     ]
-    output_tile_advance_expr = (
-        _tile_advance_expr_from_dep(copy_writes[0], tiled_dim_extents)
-        if copy_writes
-        else sympy.Integer(0)
+    output_tiled_dims = (
+        _tiled_dims_for_dep(copy_writes[0], per_level_extents) if copy_writes else []
     )
     copy_buf.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
         tiled_op_info,
-        tile_advance_exprs=tile_advance_exprs,
-        output_tile_advance_expr=output_tile_advance_expr,
+        tiled_dims_per_read=tiled_dims_per_read,
+        output_tiled_dims=output_tiled_dims,
     )
 
     V.graph.name_to_buffer[copy_name] = copy_buf
@@ -2371,6 +2369,8 @@ def _compute_fill_loop_info(op: ComputedBuffer) -> "CoarseTileInfo | None":
         loop_count=outer_counts,
         loop_tiled_dims=outer_tiled_dims,
         loop_tiled_reduction_dims=outer_tiled_rdims,
+        tiled_dims_per_read=[],
+        output_tiled_dims=[],
     )
 
 

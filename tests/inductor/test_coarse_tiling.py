@@ -667,26 +667,24 @@ class TestCoarseTileInfo(unittest.TestCase):
             loop_count=[Integer(4)],
             loop_tiled_dims=[[0]],
         )
-        self.assertEqual(info.tile_advance_exprs, [])
-        self.assertEqual(info.output_tile_advance_expr, Integer(0))
+        self.assertEqual(info.tiled_dims_per_read, [])
+        self.assertEqual(info.output_tiled_dims, [])
 
     def test_tile_advance_explicit(self):
-        d0, d1 = sympy.symbols("d0 d1")
         info = CoarseTileInfo(
             loop_group_id=(0, 0),
             loop_count=[Integer(2), Integer(4)],
             loop_tiled_dims=[[0], [1]],
-            tile_advance_exprs=[Integer(4096) * Integer(512) * d0 + Integer(1024) * d1],
-            output_tile_advance_expr=Integer(1024) * Integer(512) * d0
-            + Integer(1024) * d1,
+            tiled_dims_per_read=[[[(0, Integer(512))], [(1, Integer(1024))]]],
+            output_tiled_dims=[[(0, Integer(512))], [(1, Integer(1024))]],
         )
         self.assertEqual(
-            info.tile_advance_exprs,
-            [Integer(4096) * Integer(512) * d0 + Integer(1024) * d1],
+            info.tiled_dims_per_read,
+            [[[(0, Integer(512))], [(1, Integer(1024))]]],
         )
         self.assertEqual(
-            info.output_tile_advance_expr,
-            Integer(1024) * Integer(512) * d0 + Integer(1024) * d1,
+            info.output_tiled_dims,
+            [[(0, Integer(512))], [(1, Integer(1024))]],
         )
 
 
@@ -1552,9 +1550,9 @@ class TestCoarseTileNested(unittest.TestCase):
                     self.assertIsNotNone(getattr(op, "loop_info", None))
 
 
-class TestCoarseTileTileAdvanceExprs(unittest.TestCase):
-    """Real-IR tests for CoarseTileInfo.tile_advance_exprs /
-    output_tile_advance_expr, using the small example from
+class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
+    """Real-IR tests for CoarseTileInfo.tiled_dims_per_read /
+    output_tiled_dims, using the small example from
     docs/source/compiler/coarse_tiling_loops.md (1024x4096, outer K=2 over
     dim 0, inner M=4 over dim 1).
 
@@ -1577,11 +1575,10 @@ class TestCoarseTileTileAdvanceExprs(unittest.TestCase):
     FX-dispatch/lowering machinery this lightweight harness does not
     provide (confirmed live: raises LoweringException /
     "'NullHandler' object does not support the context manager protocol").
-    _apply_plan is the layer that actually populates tile_advance_exprs /
-    output_tile_advance_expr (see Task 3 Step 3), so calling
-    plan_coarse_tile_groups + _apply_plan directly exercises exactly what
-    Stage 1 needs without pulling in buffer propagation, which Stage 1 does
-    not touch.
+    _apply_plan is the layer that actually populates tiled_dims_per_read /
+    output_tiled_dims (see Task 2/3), so calling plan_coarse_tile_groups +
+    _apply_plan directly exercises exactly what Stage 1 needs without
+    pulling in buffer propagation, which Stage 1 does not touch.
     """
 
     def setUp(self):
@@ -1612,27 +1609,22 @@ class TestCoarseTileTileAdvanceExprs(unittest.TestCase):
         levels = [(1, Integer(2)), (2, Integer(4))]
         plan = plan_coarse_tile_groups([op], [([op], levels)])
         _apply_plan([op], (0, 0), levels, {op.get_operation_name(): 0}, plan)
-        d0 = sympy_index_symbol("d0")
-        d1 = sympy_index_symbol("d1")
-        # Output: buf0's own pre-division stride is [4096, 1]; one outer
-        # (K=2) step covers 512 rows, one inner (M=4) step covers 1024 cols.
-        # _tile_advance_expr_from_dep keeps each term symbolic in d{i} (see
-        # TestTileAdvanceExprFromDep) -- the expression is only resolved
-        # once a later compilation stage substitutes a concrete tile-index
-        # value for each d{i}.
-        expected_output = (
-            Integer(4096) * Integer(512) * d0 + Integer(1) * Integer(1024) * d1
-        )
+        # Output: dim 0 tiled at level 0 (K=2 outer, extent 512 = 1024/2);
+        # dim 1 tiled at level 1 (M=4 inner, extent 1024 = 4096/4). Neither
+        # dim is tiled at more than one level here, so each level's list has
+        # exactly the one dim it tiles.
         self.assertEqual(
-            simplify(op.loop_info.output_tile_advance_expr - expected_output), 0
+            op.loop_info.output_tiled_dims, [[(0, Integer(512))], [(1, Integer(1024))]]
         )
         # Inputs: a and b are never divided (buf0's own division doesn't
-        # touch them), so both reads have the same original [4096, 1]
-        # stride -> same advance expression as the output would have had
-        # pre-division (same coefficients, same formula).
-        self.assertEqual(len(op.loop_info.tile_advance_exprs), 2)
-        for expr in op.loop_info.tile_advance_exprs:
-            self.assertEqual(simplify(expr - expected_output), 0)
+        # touch them), so both reads have the same tiled-dims decision as
+        # the output would have had pre-division (same dims, same extents
+        # -- the decision is about which dims/levels, not about a
+        # particular tensor's stride, which is applied later at
+        # spyre_kernel.py substitution time).
+        self.assertEqual(len(op.loop_info.tiled_dims_per_read), 2)
+        for tiled_dims in op.loop_info.tiled_dims_per_read:
+            self.assertEqual(tiled_dims, [[(0, Integer(512))], [(1, Integer(1024))]])
 
     def test_broadcast_input_has_zero_advance(self):
         # a (tiled input) + b (broadcast scalar-row input, stride [0, 1]).
@@ -1648,11 +1640,11 @@ class TestCoarseTileTileAdvanceExprs(unittest.TestCase):
         levels = [(1, Integer(2)), (2, Integer(4))]
         plan = plan_coarse_tile_groups([op], [([op], levels)])
         _apply_plan([op], (0, 0), levels, {op.get_operation_name(): 0}, plan)
-        d1 = sympy_index_symbol("d1")
-        broadcast_expr = op.loop_info.tile_advance_exprs[1]
-        # Broadcast along dim 0 (stride 0): only the dim-1 (M=4, extent
-        # 1024) term survives, coefficient 1, staying symbolic in d1.
-        self.assertEqual(simplify(broadcast_expr - Integer(1024) * d1), 0)
+        broadcast_tiled_dims = op.loop_info.tiled_dims_per_read[1]
+        # Broadcast along dim 0 (stride 0): b's index never depends on d0,
+        # so dim 0 is filtered out of every level's list for this dep;
+        # only dim 1 (M=4, extent 1024, tiled at level 1) survives.
+        self.assertEqual(broadcast_tiled_dims, [[], [(1, Integer(1024))]])
 
     def test_reduction_dim_advance_is_offset_by_output_dims(self):
         # out[d0] = sum_{d1} in[d0, d1].  in is [8, 16], row-major
@@ -1672,23 +1664,21 @@ class TestCoarseTileTileAdvanceExprs(unittest.TestCase):
         levels = [(1, Integer(2)), (2, Integer(4))]
         plan = plan_coarse_tile_groups([op], [([op], levels)])
         _apply_plan([op], (0, 0), levels, {op.get_operation_name(): 0}, plan)
-        # Input's read index is 16*d0 + d1: d0 (output dim, extent 4 -- 8
-        # rows / K=2 outer steps) contributes 16*4*d0; d1 (reduction dim,
-        # extent 4 -- the R=4 tile step itself) contributes 1*4*d1.
-        d0 = sympy_index_symbol("d0")
-        d1 = sympy_index_symbol("d1")
-        expected_input = Integer(16) * Integer(4) * d0 + Integer(1) * Integer(4) * d1
-        self.assertEqual(len(op.loop_info.tile_advance_exprs), 1)
+        # Input's read index is 16*d0 + d1: d0 (output dim 0, extent 4 --
+        # 8 rows / K=2 outer steps) tiled at level 0; d1 (reduction dim,
+        # numbered n_output_dims(1) + 0 = 1, extent 4 -- the R=4 tile step
+        # itself) tiled at level 1.
+        self.assertEqual(len(op.loop_info.tiled_dims_per_read), 1)
         self.assertEqual(
-            simplify(op.loop_info.tile_advance_exprs[0] - expected_input), 0
+            op.loop_info.tiled_dims_per_read[0],
+            [[(0, Integer(4))], [(1, Integer(4))]],
         )
 
     def test_subset_of_dims_tiled_on_3d_tensor(self):
         # a is [8, 16, 32], row-major (stride [512, 32, 1]).  Only dims 0
         # and 2 are tiled (levels use hint_id 1 -> dim 0, hint_id 2 ->
         # dim 2); dim 1 is genuinely present in the index but never tiled
-        # at any level -- it must contribute 0, while dims 0 and 2 keep
-        # their own coefficients.
+        # at any level -- it must not appear in any level's list at all.
         op = _make_real_pointwise_op(
             ranges=[Integer(8), Integer(16), Integer(32)],
             input_shapes_strides=[
@@ -1700,27 +1690,27 @@ class TestCoarseTileTileAdvanceExprs(unittest.TestCase):
         levels = [(1, Integer(2)), (2, Integer(4))]
         plan = plan_coarse_tile_groups([op], [([op], levels)])
         _apply_plan([op], (0, 0), levels, {op.get_operation_name(): 0}, plan)
-        d0 = sympy_index_symbol("d0")
-        d2 = sympy_index_symbol("d2")
-        # Output stride [512, 32, 1]; outer (hint 1, count=2) tiles dim 0
-        # with extent 4 (8 rows / 2 steps); inner (hint 2, count=4) tiles
-        # dim 2 with extent 8 (32 cols / 4 steps).  Dim 1 (untiled) drops
-        # out entirely -- no d1 term at all, not even a zero-coefficient
-        # one, since it is substituted with 0.
-        expected = Integer(512) * Integer(4) * d0 + Integer(1) * Integer(8) * d2
-        self.assertEqual(len(op.loop_info.tile_advance_exprs), 1)
-        self.assertEqual(simplify(op.loop_info.tile_advance_exprs[0] - expected), 0)
-        self.assertEqual(simplify(op.loop_info.output_tile_advance_expr - expected), 0)
+        # Level 0 (hint 1, count=2) tiles dim 0, extent 4 (8 rows / 2 steps);
+        # level 1 (hint 2, count=4) tiles dim 2, extent 8 (32 cols / 4
+        # steps). Dim 1 (untiled) never appears -- not even as a
+        # zero-extent entry, since it is filtered out entirely.
+        expected = [[(0, Integer(4))], [(2, Integer(8))]]
+        self.assertEqual(len(op.loop_info.tiled_dims_per_read), 1)
+        self.assertEqual(op.loop_info.tiled_dims_per_read[0], expected)
+        self.assertEqual(op.loop_info.output_tiled_dims, expected)
 
     def test_transposed_input_advance_uses_its_own_stride_order(self):
         # a is row-major [1024, 4096] (stride [4096, 1]); b is the
         # *transposed* layout of the same logical shape -- stride
         # [1, 1024] instead of [4096, 1] -- while both share the same
         # op-level ranges=[1024, 4096] and the same tiled dims (K=2 over
-        # dim 0, M=4 over dim 1).  Each input's advance expression must use
-        # its OWN stride's coefficient-to-dim mapping, not the op's/other
-        # input's, so b's dim-0 term (coefficient 1) and dim-1 term
-        # (coefficient 1024) land opposite of a's.
+        # dim 0, M=4 over dim 1). The tiled-dims DECISION (which dims, at
+        # which level, what extent) is identical for both inputs -- it is
+        # purely about op.data.ranges, not either input's stride. Each
+        # input's stride only matters once spyre_kernel.py substitutes this
+        # decision into that input's own (possibly transposed) index
+        # expression -- that substitution is exercised in Task 5's tests,
+        # not here.
         op = _make_real_pointwise_op(
             ranges=[Integer(1024), Integer(4096)],
             input_shapes_strides=[
@@ -1733,18 +1723,10 @@ class TestCoarseTileTileAdvanceExprs(unittest.TestCase):
         levels = [(1, Integer(2)), (2, Integer(4))]
         plan = plan_coarse_tile_groups([op], [([op], levels)])
         _apply_plan([op], (0, 0), levels, {op.get_operation_name(): 0}, plan)
-        d0 = sympy_index_symbol("d0")
-        d1 = sympy_index_symbol("d1")
-        self.assertEqual(len(op.loop_info.tile_advance_exprs), 2)
-        # a: row-major -- dim 0 (extent 512) keeps coefficient 4096, dim 1
-        # (extent 1024) keeps coefficient 1.
-        expected_a = Integer(4096) * Integer(512) * d0 + Integer(1) * Integer(1024) * d1
-        self.assertEqual(simplify(op.loop_info.tile_advance_exprs[0] - expected_a), 0)
-        # b: transposed -- dim 0 (extent 512) keeps coefficient 1, dim 1
-        # (extent 1024) keeps coefficient 1024 -- the opposite pairing from
-        # a, because b's own stride is transposed relative to a's.
-        expected_b = Integer(1) * Integer(512) * d0 + Integer(1024) * Integer(1024) * d1
-        self.assertEqual(simplify(op.loop_info.tile_advance_exprs[1] - expected_b), 0)
+        expected = [[(0, Integer(512))], [(1, Integer(1024))]]
+        self.assertEqual(len(op.loop_info.tiled_dims_per_read), 2)
+        self.assertEqual(op.loop_info.tiled_dims_per_read[0], expected)
+        self.assertEqual(op.loop_info.tiled_dims_per_read[1], expected)
 
     def test_plan_coarse_tile_groups_zero_mutation(self):
         """Planning must not mutate op.data.ranges, layout, or set loop_info.
@@ -1930,8 +1912,8 @@ class TestCoarseTileTileAdvanceExprs(unittest.TestCase):
 
 def _make_fixed_flag_op(
     name,
-    tile_advance_exprs,
-    output_tile_advance_expr,
+    tiled_dims_per_read,
+    output_tiled_dims,
     pending_per_tile_fixed=False,
     layout_per_tile_fixed=False,
     read_names=(),
@@ -1955,8 +1937,8 @@ def _make_fixed_flag_op(
         loop_group_id=(0,),
         loop_count=[Integer(4)],
         loop_tiled_dims=[[0]],
-        tile_advance_exprs=list(tile_advance_exprs),
-        output_tile_advance_expr=output_tile_advance_expr,
+        tiled_dims_per_read=[list(entry) for entry in tiled_dims_per_read],
+        output_tiled_dims=list(output_tiled_dims),
     )
     op.get_read_writes.return_value = _make_rw_with_reads(*read_names)
     if layout_per_tile_fixed:
@@ -1980,85 +1962,74 @@ class TestZeroFixedTileAdvanceExprs(unittest.TestCase):
     def test_no_fixed_ops_is_noop(self):
         from torch_spyre._inductor.wsr.coarse_tile import _zero_fixed_tile_advance_exprs
 
-        d0 = sympy_index_symbol("d0")
         op = _make_fixed_flag_op(
             "op0",
-            tile_advance_exprs=[Integer(4) * d0],
-            output_tile_advance_expr=Integer(4) * d0,
+            tiled_dims_per_read=[[[(0, Integer(4))]]],
+            output_tiled_dims=[[(0, Integer(4))]],
         )
         _zero_fixed_tile_advance_exprs([op])
-        self.assertEqual(
-            simplify(op.loop_info.tile_advance_exprs[0] - Integer(4) * d0), 0
-        )
-        self.assertEqual(
-            simplify(op.loop_info.output_tile_advance_expr - Integer(4) * d0), 0
-        )
+        self.assertEqual(op.loop_info.tiled_dims_per_read[0], [[(0, Integer(4))]])
+        self.assertEqual(op.loop_info.output_tiled_dims, [[(0, Integer(4))]])
 
     def test_pending_per_tile_fixed_zeros_own_output(self):
         from torch_spyre._inductor.wsr.coarse_tile import _zero_fixed_tile_advance_exprs
 
-        d0 = sympy_index_symbol("d0")
         op = _make_fixed_flag_op(
             "op0",
-            tile_advance_exprs=[],
-            output_tile_advance_expr=Integer(4) * d0,
+            tiled_dims_per_read=[],
+            output_tiled_dims=[[(0, Integer(4))]],
             pending_per_tile_fixed=True,
         )
         _zero_fixed_tile_advance_exprs([op])
-        self.assertEqual(op.loop_info.output_tile_advance_expr, Integer(0))
+        self.assertEqual(op.loop_info.output_tiled_dims, [])
 
     def test_committed_layout_per_tile_fixed_zeros_own_output(self):
         from torch_spyre._inductor.wsr.coarse_tile import _zero_fixed_tile_advance_exprs
 
-        d0 = sympy_index_symbol("d0")
         op = _make_fixed_flag_op(
             "op0",
-            tile_advance_exprs=[],
-            output_tile_advance_expr=Integer(4) * d0,
+            tiled_dims_per_read=[],
+            output_tiled_dims=[[(0, Integer(4))]],
             layout_per_tile_fixed=True,
         )
         _zero_fixed_tile_advance_exprs([op])
-        self.assertEqual(op.loop_info.output_tile_advance_expr, Integer(0))
+        self.assertEqual(op.loop_info.output_tiled_dims, [])
 
     def test_reader_of_fixed_buffer_has_its_read_advance_zeroed(self):
         from torch_spyre._inductor.wsr.coarse_tile import _zero_fixed_tile_advance_exprs
 
-        d0 = sympy_index_symbol("d0")
         fixed_op = _make_fixed_flag_op(
             "fixed0",
-            tile_advance_exprs=[],
-            output_tile_advance_expr=Integer(4) * d0,
+            tiled_dims_per_read=[],
+            output_tiled_dims=[[(0, Integer(4))]],
             pending_per_tile_fixed=True,
         )
         reader = _make_fixed_flag_op(
             "reader0",
-            tile_advance_exprs=[Integer(4) * d0, Integer(8) * d0],
-            output_tile_advance_expr=Integer(8) * d0,
+            tiled_dims_per_read=[[[(0, Integer(4))]], [[(0, Integer(8))]]],
+            output_tiled_dims=[[(0, Integer(8))]],
             read_names=["fixed0", "other_buf"],
         )
         _zero_fixed_tile_advance_exprs([fixed_op, reader])
         # fixed0's own read entry (index 0, matching read_names[0]) is
-        # zeroed; other_buf's (index 1) is untouched.
-        self.assertEqual(reader.loop_info.tile_advance_exprs[0], Integer(0))
-        self.assertEqual(
-            simplify(reader.loop_info.tile_advance_exprs[1] - Integer(8) * d0), 0
-        )
+        # dropped to an empty per-level list; other_buf's (index 1) is
+        # untouched.
+        self.assertEqual(reader.loop_info.tiled_dims_per_read[0], [])
+        self.assertEqual(reader.loop_info.tiled_dims_per_read[1], [[(0, Integer(8))]])
         # reader's own output is unaffected -- reader0 itself isn't fixed.
-        self.assertEqual(
-            simplify(reader.loop_info.output_tile_advance_expr - Integer(8) * d0), 0
-        )
+        self.assertEqual(reader.loop_info.output_tiled_dims, [[(0, Integer(8))]])
 
     def test_op_without_loop_info_is_skipped(self):
         from torch_spyre._inductor.wsr.coarse_tile import _zero_fixed_tile_advance_exprs
 
         fixed_op = _make_fixed_flag_op(
             "fixed0",
-            tile_advance_exprs=[],
-            output_tile_advance_expr=Integer(0),
+            tiled_dims_per_read=[],
+            output_tiled_dims=[],
             pending_per_tile_fixed=True,
         )
         no_loop_info_op = _make_fixed_flag_op(
-            "other0", tile_advance_exprs=[], output_tile_advance_expr=Integer(0)
+            "other0", tiled_dims_per_read=[], output_tiled_dims=[]
         )
         del no_loop_info_op.loop_info
         # Must not raise despite the second op having no loop_info at all.
