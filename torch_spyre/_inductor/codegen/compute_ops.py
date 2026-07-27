@@ -717,11 +717,40 @@ def generate_sdsc(
             )
             if symbolic_split is not None:
                 sym_dim_name = symbolic_split[0]
+                sym_dim = Symbol(sym_dim_name)
+                # Real-symbol fast path: s IS the dim symbol (already renamed
+                # to its SDSC dim label by symbol_mapping), so name equality
+                # against sym_dim_name is a correct, direct test.
+                #
+                # Minted-symbol path (spyre_kernel._get_or_mint_level_symbol):
+                # a minted symbol names a loop-nesting *level*, not a
+                # dimension, so its name can never equal sym_dim_name even
+                # when it genuinely drives sym_dim_name's advance. Detect
+                # that case instead via: is sym_dim_name an active
+                # (non-reduced) dim of this tensor, and does *some* symbol at
+                # *some* level contribute a nonzero term to this tensor's own
+                # device_tile_advance_expr. This is deliberately conservative
+                # (any tiling at all on sym_dim_name is flagged, regardless of
+                # which level) -- matching this function's own docstring
+                # scope ("A symbolic-split dim that is ALSO tiled for this
+                # tensor is out of scope").
+                tensor_advances_at_some_level = (
+                    tensor.device_tile_advance_expr is not None
+                    and any(
+                        tensor.device_tile_advance_expr.coeff(s)
+                        for level_syms in tiled_symbols
+                        for s in level_syms
+                    )
+                )
                 tiled_on_split_dim = any(
                     str(s) == sym_dim_name
                     for level_syms in tiled_symbols
                     for s in level_syms
                     if s in tensor.strides
+                ) or (
+                    sym_dim in tensor.strides
+                    and tensor.scales.get(sym_dim, 1) > 0
+                    and tensor_advances_at_some_level
                 )
                 if tiled_on_split_dim:
                     raise Unsupported(

@@ -773,6 +773,17 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     symbol_mapping = {
         sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)
     }
+    # Minted per-(op, level) tile-advance symbols (see spyre_kernel.py's
+    # _get_or_mint_level_symbol) are not iteration-space dimensions -- they are
+    # loop-nesting-level markers -- so they have no dim label to rename to.
+    # Register each as an identity mapping instead, so compile_op_spec's
+    # `symbol_mapping[s]` lookup for op_spec.tiled_symbols does not silently
+    # drop them. setdefault never overwrites a real-symbol entry above, and
+    # collides with none: minted names (`_tile_adv_{op_name}_lvl{n}`) can
+    # never equal a dim label or a real Inductor `d{i}` symbol name.
+    for level in op_spec.tiled_symbols:
+        for sym in level:
+            symbol_mapping.setdefault(sym, sym)
     logger.debug(
         "symbol mapping: %s",
         ", ".join(f"{k} -> {v}" for k, v in symbol_mapping.items()),

@@ -2574,6 +2574,111 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
         self.assertIn("affine_map", mlir)
         self.assertIn("scf.for", mlir)
 
+    def test_symbol_mapping_preserves_minted_tile_advance_symbols(self):
+        """A minted _tile_adv_* symbol must survive parse_op_spec's
+        symbol_mapping translation, not be silently dropped -- this is
+        the root cause of every tiled op failing past tile 0 in the e2e
+        suite (see task-5-report.md's root-cause trace)."""
+        op_spec = _make_tiled_op_spec()
+        minted = Symbol("_tile_adv_add_lvl0")
+        # Minted symbols are, by construction, never members of
+        # iteration_space -- they name a loop-nesting level, not a
+        # dimension. Swap _make_tiled_op_spec's real-symbol tiled_symbols
+        # (c0, which IS in iteration_space) for a minted symbol to exercise
+        # exactly the case symbol_mapping used to drop.
+        op_spec.tiled_symbols = [[minted]]
+
+        _, symbol_mapping = parse_op_spec(op_spec)
+
+        for level in op_spec.tiled_symbols:
+            for sym in level:
+                self.assertIn(
+                    sym,
+                    symbol_mapping,
+                    f"Minted symbol {sym} missing from symbol_mapping; it "
+                    "will be silently dropped by compile_op_spec's "
+                    "tiled_symbols_per_level translation.",
+                )
+
+        # compile_op_spec's own translation of tiled_symbols must retain the
+        # minted symbol too (as an identity mapping -- Site 1's fix), not
+        # just parse_op_spec's returned symbol_mapping dict in isolation.
+        symbols: list[int] = []
+        compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        tiled_symbols_per_level = [
+            [symbol_mapping[s] for s in level if s in symbol_mapping]
+            for level in reversed(op_spec.tiled_symbols)
+        ]
+        self.assertEqual(
+            tiled_symbols_per_level,
+            [[minted]],
+            "compile_op_spec's tiled_symbols_per_level translation dropped "
+            f"the minted symbol; got {tiled_symbols_per_level}.",
+        )
+
+    def test_minted_symbol_tiled_on_symbolic_split_dim_raises_unsupported(self):
+        """A tensor tiled (via a minted symbol) on the same dim that's
+        symbolically split across cores must still raise Unsupported --
+        this combination was already rejected for real symbols; the
+        minted-symbol path must not silently bypass the same guard.
+
+        No existing test exercises this Unsupported raise for the
+        real-symbol path either (searched for tiled_on_split_dim /
+        _symbolic_split_info / "symbolic dim" + "tiled" across
+        test_coarse_tiling.py and test_codegen.py; only _symbolic_split_info
+        itself, not its caller's Unsupported branch, is covered) -- this
+        task's job is the minted-symbol path, not backfilling that gap.
+        """
+        mb = Symbol("mb")
+        minted = Symbol("_tile_adv_add_lvl0")
+        # mb is a symbolic dim, split across 8 cores, and this tensor uses it
+        # (scale > 0) -- this alone would make _symbolic_split_info fire.
+        tensor = SDSCArgs(
+            layout="A",
+            dim_order=[mb],
+            data_format=_FP16,
+            scales={mb: 1},
+            strides={mb: 256},
+            offsets={mb: 0},
+            max_dim_sizes={mb: -1},
+            allocation={"hbm": 0x1000},
+            start_address=0,
+            backGap={},
+            arg_index=0,
+            # The minted symbol contributes a nonzero term to this tensor's
+            # own device_tile_advance_expr -- Site 3's minted-symbol test
+            # must detect that this tensor is ALSO tiled on mb (the same dim
+            # that's symbolically split) purely from this coefficient, since
+            # str(minted) can never equal "mb".
+            device_tile_advance_expr=256 * minted,
+        )
+        sdsc_spec = SDSCSpec(
+            opfunc="add",
+            execution_unit="sfp",
+            data_format=_FP16,
+            num_inputs=1,
+            iteration_space={mb: 1024},
+            num_cores=8,
+            work_slices={mb: 8},
+            core_id_to_work_slice={mb: Integer(0)},
+            padding={},
+            layouts={"A": {"dim_order": [mb], "stick_dim_order": mb, "stick_size": 64}},
+            args=[tensor],
+            constants={},
+            coordinate_masking={},
+            symbolic_dims={"mb": ("s0", 64, 1024)},
+        )
+        symbols: list[int] = []
+        with self.assertRaises(Unsupported):
+            generate_sdsc(
+                0,
+                sdsc_spec,
+                symbols,
+                symbol_id_offset=0,
+                tiled_symbols=[[minted]],
+                use_symbols=True,
+            )
+
 
 class TestSharedWeightUnitBmmLayout(unittest.TestCase):
     def _static_bmm_custom_meta(self, x_shape, y_shape, out_shape):
