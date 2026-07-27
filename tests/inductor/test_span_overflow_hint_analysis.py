@@ -185,6 +185,22 @@ def _out_coords_for_symbolic_bhld(_op):
     ]
 
 
+def _apply_span_overflow(graph):
+    """Run span_overflow_groups and apply its dim_hints assignments.
+
+    span_overflow_groups is a pure planning step: it returns
+    (groups, dim_hint_assignments) without mutating any op.  Real callers
+    (_maybe_coarse_tile_span_overflow in passes.py) apply the assignments
+    themselves before coarse_tile()/validate_coarse_tile_groups run; tests
+    that inspect op.dim_hints after calling span_overflow_groups need to do
+    the same, so this helper mirrors that call site.
+    """
+    groups, dim_hint_assignments = span_overflow_groups(graph)
+    for op, dim_hints in dim_hint_assignments:
+        op.dim_hints = dim_hints
+    return groups
+
+
 def _run_span_overflow_groups(op):
     """Run span_overflow_groups with op_out_coords patched for one test op."""
     graph = _graph([op])
@@ -193,7 +209,7 @@ def _run_span_overflow_groups(op):
         "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
         _out_coords_for_bhld,
     ):
-        return span_overflow_groups(graph)
+        return _apply_span_overflow(graph)
 
 
 _E2E_SHAPE = (1, 8195, 256, 64)
@@ -270,7 +286,7 @@ class TestSpanOverflowGroups(InductorTestCase):
         op = _reduction_op((), reduction_ranges=(8195, 256, 64))
 
         with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
-            groups = span_overflow_groups(_graph([op]))
+            groups = _apply_span_overflow(_graph([op]))
 
         self.assertEqual(groups, [])
 
@@ -299,7 +315,7 @@ class TestSpanOverflowGroups(InductorTestCase):
             _out_coords_for_bhld,
         ):
             with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
-                groups = span_overflow_groups(_graph([op0, op1]))
+                groups = _apply_span_overflow(_graph([op0, op1]))
 
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0][0], [op0, op1])
@@ -333,7 +349,7 @@ class TestSpanOverflowGroups(InductorTestCase):
             _out_coords_for_bhld,
         ):
             with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
-                groups = span_overflow_groups(_graph([op0, op1]))
+                groups = _apply_span_overflow(_graph([op0, op1]))
 
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0][0], [op0, op1])
@@ -405,7 +421,7 @@ class TestSpanOverflowGroups(InductorTestCase):
             ),
             config.patch({"sencores": 4, "ignore_span_overflow_hints": False}),
         ):
-            groups = span_overflow_groups(_graph([op0, op1]))
+            groups = _apply_span_overflow(_graph([op0, op1]))
 
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0][0], [op0, op1])
@@ -468,7 +484,7 @@ class TestSpanOverflowGroups(InductorTestCase):
             ),
             config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
         ):
-            groups = span_overflow_groups(_graph([producer, matmul]))
+            groups = _apply_span_overflow(_graph([producer, matmul]))
 
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0][0], [producer, matmul])
@@ -536,7 +552,7 @@ class TestSpanOverflowGroups(InductorTestCase):
                 "already auto-tiled producer.*grouping currently only synchronizes "
                 "compatible contiguous pointwise ops",
             ):
-                span_overflow_groups(_graph([producer, matmul]))
+                _apply_span_overflow(_graph([producer, matmul]))
 
     def test_non_matmul_reduction_joins_tiled_producer_group(self):
         """The join is reduction-type-agnostic, not matmul-only (#3217): a plain
@@ -593,7 +609,7 @@ class TestSpanOverflowGroups(InductorTestCase):
             ),
             config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
         ):
-            groups = span_overflow_groups(_graph([producer, reduction]))
+            groups = _apply_span_overflow(_graph([producer, reduction]))
 
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0][0], [producer, reduction])
@@ -662,7 +678,7 @@ class TestSpanOverflowGroups(InductorTestCase):
                 "already auto-tiled producer.*grouping currently only synchronizes "
                 "compatible contiguous pointwise ops",
             ):
-                span_overflow_groups(_graph([producer, reduction]))
+                _apply_span_overflow(_graph([producer, reduction]))
 
     def test_reduction_range_tile_never_joins(self):
         """A reduction that tiles its *reduction* range (``is_reduction=True``)
@@ -754,7 +770,7 @@ class TestSpanOverflowGroups(InductorTestCase):
                 "already auto-tiled producer.*grouping currently only synchronizes "
                 "compatible contiguous pointwise ops",
             ):
-                span_overflow_groups(_graph([producer, reduction]))
+                _apply_span_overflow(_graph([producer, reduction]))
 
     def test_second_reduction_consumer_of_joined_producer_rejected(self):
         """One auto-tiled producer feeds at most one reduction consumer: the
@@ -815,7 +831,7 @@ class TestSpanOverflowGroups(InductorTestCase):
                 "multiple consumers sharing one auto-tiled producer is not yet "
                 "supported",
             ):
-                span_overflow_groups(_graph([producer, matmul1, matmul2]))
+                _apply_span_overflow(_graph([producer, matmul1, matmul2]))
 
     def test_chained_pointwise_ops_conform_failure_still_raises(self):
         """op1's own search disagrees with op0's, and op0's split (5) does not
@@ -844,7 +860,7 @@ class TestSpanOverflowGroups(InductorTestCase):
                 "already auto-tiled producer.*buf0.*grouping currently only "
                 "synchronizes compatible contiguous pointwise ops",
             ):
-                span_overflow_groups(_graph([op0, op1]))
+                _apply_span_overflow(_graph([op0, op1]))
 
     def test_lm_head_matmul_joins_tiled_restickify_producer(self):
         """LM-head restickify and BMM are tiled into one synchronized group (#3217).
@@ -926,7 +942,7 @@ class TestSpanOverflowGroups(InductorTestCase):
             ),
             config.patch({"sencores": 4, "ignore_span_overflow_hints": False}),
         ):
-            groups = span_overflow_groups(_graph([restickify_weight, lm_head_bmm]))
+            groups = _apply_span_overflow(_graph([restickify_weight, lm_head_bmm]))
 
         # One synchronized group containing the weight producer and the matmul.
         self.assertEqual(len(groups), 1)
@@ -980,7 +996,7 @@ class TestSpanOverflowGroups(InductorTestCase):
                 "already auto-tiled producer.*grouping currently only synchronizes "
                 "compatible contiguous pointwise ops",
             ):
-                span_overflow_groups(_graph([producer, consumer]))
+                _apply_span_overflow(_graph([producer, consumer]))
 
     def test_dim_hint_attached_to_op(self):
         from torch_spyre._inductor.propagate_hints import DimHint
@@ -1023,7 +1039,7 @@ class TestSpanOverflowGroups(InductorTestCase):
         op.get_operation_name.return_value = "non_fixed_tiled"
 
         with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
-            groups = span_overflow_groups(_graph([op]))
+            groups = _apply_span_overflow(_graph([op]))
 
         self.assertEqual(groups, [])
 
@@ -1032,7 +1048,7 @@ class TestSpanOverflowGroups(InductorTestCase):
         op.layout.size[1] = sympy.Symbol("s0")
 
         with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
-            groups = span_overflow_groups(_graph([op]))
+            groups = _apply_span_overflow(_graph([op]))
 
         self.assertEqual(groups, [])
 
@@ -1054,7 +1070,7 @@ class TestSpanOverflowGroups(InductorTestCase):
                 "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
                 _out_coords_for_bhld,
             ):
-                groups = span_overflow_groups(_graph([hinted_op, unhinted_op]))
+                groups = _apply_span_overflow(_graph([hinted_op, unhinted_op]))
 
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0][0], [unhinted_op])
@@ -1672,7 +1688,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         op = _pointwise_op(_E2E_SHAPE)
 
         with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
-            groups = span_overflow_groups(_graph([op]))
+            groups = _apply_span_overflow(_graph([op]))
 
         self.assertEqual(len(groups), 1)
         group_ops, levels = groups[0]
@@ -1690,7 +1706,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         op = _pointwise_op((4, 8195, 256, 64))
 
         with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
-            groups = span_overflow_groups(_graph([op]))
+            groups = _apply_span_overflow(_graph([op]))
 
         self.assertEqual(len(groups), 1)
         self.assertEqual(len(op.dim_hints), 1)
@@ -1712,7 +1728,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
             graph = _graph([op])
-            groups = span_overflow_groups(graph)
+            groups = _apply_span_overflow(graph)
             coarse_tile(graph, groups)
 
         self.assertEqual(list(op.data.ranges), _E2E_TILE_SHAPE)
@@ -2132,7 +2148,7 @@ class TestSpanOverflowLargeShapeContract(InductorTestCase):
                 with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
                     # Layer 2: adapter emits the same group shape as user hints.
                     auto_graph = _graph([auto_op])
-                    auto_groups = span_overflow_groups(auto_graph)
+                    auto_groups = _apply_span_overflow(auto_graph)
                     manual_graph = _graph([manual_op])
                     manual_groups = _manual_h_hint_group(manual_op)
 

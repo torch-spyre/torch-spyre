@@ -206,7 +206,9 @@ def _dims_to_hints(
     return hints
 
 
-def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
+def span_overflow_groups(
+    graph: GraphLowering,
+) -> tuple[list[tuple], list[tuple[Operation, list[DimHint]]]]:
     """Build coarse_tile() groups from automatic span-overflow plans.
 
     This adapter converts SpanOverflowTilePlans into the same group shape as
@@ -215,6 +217,15 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
     ``is_reduction`` is not carried in the group-level ``levels`` list; it
     lives on each op's own ``DimHint`` and is consulted directly by
     ``_stamp_group``.
+
+    Returns a ``(groups, dim_hint_assignments)`` pair.  ``dim_hint_assignments``
+    is a list of ``(op, dim_hints)`` pairs this function decided on but did
+    NOT apply — applying them (setting ``op.dim_hints``) is the caller's
+    responsibility, and must happen before ``coarse_tile()``/
+    ``validate_coarse_tile_groups`` run, since ``dim_hints`` is an input those
+    consume, not something they produce.  Keeping the assignment out of this
+    function's own decision logic keeps ``span_overflow_groups`` a pure
+    planning step: nothing here mutates ``op`` state.
 
     A contiguous run of Pointwise ops shares one group/loop when either:
       - each op's own independently-searched plan
@@ -257,7 +268,7 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
             config.ignore_wsr_hints,
             config.ignore_span_overflow_hints,
         )
-        return []
+        return [], []
 
     logger.debug(
         "[span-overflow groups] begin ops=%d sencores=%s",
@@ -265,6 +276,7 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
         config.sencores,
     )
     groups: list[tuple] = []
+    dim_hint_assignments: list[tuple[Operation, list[DimHint]]] = []
     next_hint_id = _SPAN_OVERFLOW_HINT_ID
     auto_tiled_producers: set[str] = set()
     # Producers whose group was closed by a Reduction consumer joining it (see
@@ -305,8 +317,8 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
 
         group_ops: list[Operation] = []
         for grouped_op, dims in current_group:
-            grouped_op.dim_hints = _dims_to_hints(  # type: ignore[attr-defined]
-                grouped_op, dims, hint_ids
+            dim_hint_assignments.append(
+                (grouped_op, _dims_to_hints(grouped_op, dims, hint_ids))
             )
             group_ops.append(grouped_op)
             auto_tiled_producers.add(grouped_op.get_name())
@@ -530,9 +542,7 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
         # gets an independent singleton group.
         hint_ids = list(range(next_hint_id, next_hint_id + len(signature)))
         next_hint_id += len(signature)
-        op.dim_hints = _dims_to_hints(  # type: ignore[attr-defined]
-            op, signature, hint_ids
-        )
+        dim_hint_assignments.append((op, _dims_to_hints(op, signature, hint_ids)))
         levels = [
             (hint_id, sympy.Integer(split_count))
             for hint_id, (_host_dim, split_count, _is_reduction) in zip(
@@ -562,4 +572,4 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
         )
 
     flush_current_group()
-    return groups
+    return groups, dim_hint_assignments

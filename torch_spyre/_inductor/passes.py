@@ -303,9 +303,16 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     """
     if config.ignore_span_overflow_hints:
         return
-    groups = span_overflow_groups(graph)
+    groups, dim_hint_assignments = span_overflow_groups(graph)
     if not groups:
         return
+    # span_overflow_groups is a pure planning step: it decides each op's
+    # dim_hints but does not set them.  Apply them now, before
+    # validate_coarse_tile_groups/coarse_tile run, since dim_hints is an
+    # input those consume (via plan_coarse_tile_groups's hint lookups), not
+    # something they produce.
+    for op, dim_hints in dim_hint_assignments:
+        op.dim_hints = dim_hints  # type: ignore[attr-defined]
     # Compute offset to avoid loop_group_id collision with any hint-driven
     # groups already stamped by _maybe_coarse_tile_hints.
     # E.g. if hints used groups 0 and 1, span-overflow groups start at 2.
