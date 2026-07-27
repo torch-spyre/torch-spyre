@@ -979,7 +979,8 @@ def _apply_plan(
     """Apply planning's decisions: divide ranges and stamp loop_info.
 
     This is transformation's mutation step. All decisions (which
-    dims/reduction levels are tiled, tile_advance_exprs) already exist in
+    dims/reduction levels are tiled, per CoarseTileInfo.tiled_dims_per_read /
+    output_tiled_dims) already exist in
     `plan` (keyed by id(op) -- Operation/ComputedBuffer are unhashable, see
     plan_coarse_tile_groups) -- this function only performs the IR mutation
     _divide_ranges/_divide_reduction_ranges and the loop_info attribute
@@ -1692,9 +1693,10 @@ def _propagate_tiled_op(
         # once per outer-loop iteration cannot be recovered later from the
         # op's device_coordinates (see coarse_tiling_loops.md's IR-rewiring
         # appendix and issue tracking the ct_test_1.py wrong-result bug).
-        # CoarseTileInfo.output_tile_advance_expr (computed elsewhere) is
-        # the mechanism that carries this into create_op_spec /
-        # TensorArg.device_tile_advance_expr.
+        # CoarseTileInfo.output_tiled_dims (this op's per-level (dim, extent)
+        # decision, computed elsewhere) is what SpyreKernel._general_tile_advance
+        # substitutes with a minted per-level symbol to carry this into
+        # create_op_spec / TensorArg.device_tile_advance_expr.
         op.layout = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(full_buf)))
 
     # Patch outside consumers and graph outputs to read full_buf.
