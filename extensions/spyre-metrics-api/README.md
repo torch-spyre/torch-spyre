@@ -65,16 +65,16 @@ pip install -e .
 # Build a wheel package
 $ python3 -m build
 $ ls -1 dist
-spyremetrics-0.5.6-py3-none-any.whl
-spyremetrics-0.5.6.tar.gz
+spyremetrics-0.5.0-py3-none-any.whl
+spyremetrics-0.5.0.tar.gz
 
 # Install the wheel package
-$ pip3 install dist/spyremetrics-0.5.6-py3-none-any.whl
+$ pip3 install dist/spyremetrics-0.5.0-py3-none-any.whl
 
 ...
-Successfully installed spyremetrics-0.5.6
+Successfully installed spyremetrics-0.5.0
 $ pip3 list | grep spyremetrics
-spyremetrics            0.5.6
+spyremetrics            0.5.0
 ```
 
 ## Usage
