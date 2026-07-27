@@ -668,9 +668,10 @@ flattened `loop_tiled_reduction_dims`.  These symbols are appended to
 between tiles.
 
 Crucially, `loop_tiled_dims` is **per-op**: `plan_coarse_tile_groups` consults
-each op's own `DimHint.loop_var` for each nesting level (via the helper
-`_op_hint_dim_positions`) rather than applying a fixed spec-op index to every
-op.  This handles broadcast ops and other ops whose iteration space lacks a
+each op's own `DimHint.loop_var` for each nesting level (via
+`_loop_var_to_ranges_pos`/`_loop_var_to_reduction_ranges_pos`) rather than
+applying a fixed spec-op index to every op.  This handles broadcast ops and
+other ops whose iteration space lacks a
 particular dimension — those ops get an empty sub-list `[]` for the
 corresponding level and are not split along that axis (they become
 loop-invariant at that depth, as detected by `insert_tiling_propagation` and
@@ -736,9 +737,11 @@ where `levels` is a list of `(hint_id, K)` pairs, outermost first:
 `hint_id` is the integer ID assigned by the enclosing `spyre_hint` scope
 (smaller IDs are outer scopes).  Whether a level tiles an output dimension
 or a reduction dimension is a **per-op** property: `plan_coarse_tile_groups`
-consults each op's own `DimHint.is_reduction` for each level (via the helper
-`_op_hint_dim_positions`) rather than carrying `is_reduction` at the group
-level.  This means broadcast ops and `Pointwise` ops inside a
+consults each op's own `DimHint.is_reduction` for each level (building
+`hint_id_to_ranges_pos`/`hint_id_to_reduction_ranges_pos` via
+`_loop_var_to_ranges_pos`/`_loop_var_to_reduction_ranges_pos`) rather than
+carrying `is_reduction` at the group level.  This means broadcast ops and
+`Pointwise` ops inside a
 reduction-level group get an empty sub-list for that level and are not
 split along that axis.  `tiled_dims` are likewise **not** in the pair —
 they are derived per-op inside `plan_coarse_tile_groups` by consulting each
