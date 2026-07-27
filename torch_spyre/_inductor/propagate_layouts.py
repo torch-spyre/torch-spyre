@@ -60,7 +60,12 @@ from .constants import (
     STAGGERED_EAS,
     TOPK_OPS,
 )
-from .ir import FixedTiledLayout, SpyreConstantFallback
+from .ir import (
+    FixedTiledLayout,
+    SpyreConstantFallback,
+    BroadcastAsyncFallback,
+    WaitWorkFallback,
+)
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
@@ -1119,6 +1124,7 @@ def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
     output: FixedLayout = op.get_layout()
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
+    stick_size = get_elem_in_stick(output.dtype)
     layouts = [
         SpyreTensorLayout(
             c_size,
@@ -1127,7 +1133,7 @@ def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
             [d for d in range(len(c_size)) if d != stick_dim] + [stick_dim],
         )
         for stick_dim in range(len(c_size))
-        if c_size[stick_dim] > 1  # no sticks of size 1
+        if c_size[stick_dim] % stick_size == 0 and c_size[stick_dim] >= stick_size
     ]
     if not layouts:
         layouts = [generic_layout(op)]
@@ -1407,11 +1413,11 @@ def propagate_spyre_tensor_layouts(
             if isinstance(real_input, torch.Tensor):
                 stl = real_input.device_tensor_layout()
                 if stl is None:
-                    # All spyre tensors are created with device layouts.
-                    # Therefore we expect all graph inputs to have them.
-                    raise Unsupported(
-                        f"missing device_tensor_layout on graph input {name}"
-                    )
+                    # A CPU tensor lifted as a graph input, or a host tensor
+                    # feeding a FallbackKernel has no Spyre layout;
+                    # leave its FixedLayout and .layouts untouched,
+                    # mirroring the non-Spyre ComputedBuffer skip below.
+                    continue
                 tb = graph.graph_inputs[name]
                 if (
                     not isinstance(tb, TensorBox)
@@ -1535,6 +1541,11 @@ def propagate_spyre_tensor_layouts(
             if op.get_layout().device.type == DEVICE_NAME:
                 op.layouts = [generic_layout(op)]
                 op.restick_cost_fn = AnyInNode.from_args()
+        elif isinstance(op, (BroadcastAsyncFallback, WaitWorkFallback)):
+            input_name = op.inputs[0].get_name()
+            input_buf = V.graph.get_buffer(input_name)
+            op.layouts = list(input_buf.layouts)
+            op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ExternKernel):
             logger.warning(f"unhandled node type {type(op)}")
         else:

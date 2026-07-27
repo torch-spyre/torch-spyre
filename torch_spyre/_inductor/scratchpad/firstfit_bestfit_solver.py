@@ -49,7 +49,12 @@ def _topological_sort(
 
     for i, child in enumerate(buffers):
         for parent_name in child.in_place_parents:
-            p = name_to_idx[parent_name]
+            # A parent barred from LX (or otherwise absent from the candidate
+            # set) imposes no ordering: there is no slot for the child to
+            # inherit, so it is placed on its own like any other buffer.
+            p = name_to_idx.get(parent_name)
+            if p is None:
+                continue
             children[p].append(i)
             in_degree[i] += 1
 
@@ -185,8 +190,11 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
         )
         _assert_in_place_relationships(buffers)
 
+        # Barred buffers keep address=None and are never candidates for a gap,
+        # nor obstacles in one (they occupy no LX).
+        placeable, _ = self.partition(buffers)
         buffers_filtered = [
-            buffer for buffer in buffers if buffer.end_time >= buffer.start_time + 1
+            buffer for buffer in placeable if buffer.end_time >= buffer.start_time + 1
         ]
         parent_names = {p for b in buffers_filtered for p in b.in_place_parents}
 

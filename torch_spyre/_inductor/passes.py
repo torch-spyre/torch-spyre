@@ -14,7 +14,6 @@
 
 
 import inspect
-import io
 import logging
 import time
 from typing import Optional, Any, Callable
@@ -33,7 +32,7 @@ except ImportError:
 
 
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import ComputedBuffer, Operation
+from torch._inductor.ir import Operation
 from torch._inductor.scheduler import BaseSchedulerNode
 
 from .logging_utils import get_inductor_logger
@@ -72,7 +71,7 @@ from .work_division import (
     work_distribution,
     cost_model_matmul_division,
 )
-from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
+from .pass_utils import format_operations
 from .scratchpad.allocator import (
     scratchpad_planning,
 )
@@ -86,32 +85,6 @@ from .split_multi_ops import split_multi_ops, validate_ops
 
 
 logger = get_inductor_logger("passes")
-
-
-def _format_operations(operations: list[Operation]) -> str:
-    buf = io.StringIO()
-    for op in operations:
-        buf.write(f"{op.get_operation_name()}: {type(op).__name__}")
-        if isinstance(op, ComputedBuffer):
-            buf.write(f"\n  layout={op.layout}")
-            if allocation := getattr(op.layout, "allocation", None):
-                buf.write(f"\n  allocation={allocation}")
-            if splits := getattr(op, "op_it_space_splits", None):
-                rw = op.get_read_writes()
-                write_index = next(iter(rw.writes)).index
-                read_index = next((d.index for d in rw.reads), write_index)
-                it_space = iteration_space_from_op(op)
-                readable_splits = apply_splits_from_index_coeff(
-                    splits, write_index, read_index, it_space
-                )
-                buf.write(f"\n  op_it_space_splits={readable_splits}")
-            if dim_hints := getattr(op, "dim_hints", None):
-                buf.write(f"\n  dim_hints={dim_hints}")
-            if loop_info := getattr(op, "loop_info", None):
-                buf.write(f"\n  loop_info={loop_info}")
-            buf.write(f"\n  {op.data}")
-        buf.write("\n\n")
-    return buf.getvalue()
 
 
 def _get_pass_name(pass_fn: Callable) -> str:
@@ -381,7 +354,7 @@ class CustomPreSchedulingPasses:
 
         if logger.isEnabledFor(logging.INFO):
             logger.info(
-                "BEFORE PRE-SCHEDULING\n%s", _format_operations(graph.operations)
+                "BEFORE PRE-SCHEDULING\n%s", format_operations(graph.operations)
             )
 
         for pass_fn in self.passes:
@@ -397,13 +370,11 @@ class CustomPreSchedulingPasses:
             pass_name = _get_pass_name(pass_fn)
             if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):
                 logger.debug(
-                    "AFTER %s\n%s", pass_name, _format_operations(graph.operations)
+                    "AFTER %s\n%s", pass_name, format_operations(graph.operations)
                 )
 
         if logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "AFTER PRE-SCHEDULING\n%s", _format_operations(graph.operations)
-            )
+            logger.info("AFTER PRE-SCHEDULING\n%s", format_operations(graph.operations))
 
     def uuid(self) -> Any | None:
         return _uuid(self.passes)

@@ -51,12 +51,20 @@ struct StreamPool {
       low_priority_streams;
   std::unordered_map<c10::DeviceIndex, std::vector<c10::StreamId>>
       high_priority_streams;
+  std::unordered_map<c10::DeviceIndex, std::vector<c10::StreamId>>
+      host_compute_streams;
 
   // Round-robin indices
   std::unordered_map<c10::DeviceIndex, size_t> next_low_priority_idx;
   std::unordered_map<c10::DeviceIndex, size_t> next_high_priority_idx;
+  std::unordered_map<c10::DeviceIndex, size_t> next_host_compute_idx;
 
-  // Mapping from c10::StreamId to flex::RuntimeStream*
+  // Mapping from c10::StreamId to flex::RuntimeStream*.
+  // NOTE: this assumes one Spyre device per process (PyTorch's model for
+  // multi-device use is one process per device), so the map is keyed by stream
+  // id only. Supporting multiple devices in a single process would require
+  // keying by (c10::DeviceIndex, c10::StreamId) so each device has its own
+  // handles.
   std::unordered_map<c10::StreamId, flex::RuntimeStream*> stream_handle_map;
 
   // Per-device initialization flags
@@ -78,8 +86,25 @@ thread_local std::unordered_map<c10::DeviceIndex, c10::StreamId>
 // - Stream 0: Default stream (always available, priority 0)
 // - Streams 1-32: Low priority streams (priority 0)
 // - Streams 33-64: High priority streams (priority -1)
+// - Stream 65+: Host compute streams (priority -1)
 constexpr int kStreamsPerDevice = 32;
 constexpr int kHighPriorityStreamsPerDevice = 32;
+constexpr int kHostComputeStreamStartPerDevice = 65;
+constexpr int kDefaultHostComputeStreams = 4;
+constexpr int kMaxHostComputeStreams = 8;
+
+// Read from environment variable, defaulting to kDefaultHostComputeStreams when
+// unset. An explicit value less than 1 (including malformed input, which parses
+// to 0) is an error; values above kMaxHostComputeStreams are capped.
+inline int getNumHostComputeStreams() {
+  const char* env = std::getenv("TORCH_SPYRE_NUM_HOST_COMPUTE_STREAMS");
+  int n = env ? std::atoi(env) : kDefaultHostComputeStreams;
+  TORCH_CHECK(n >= 1,
+              "TORCH_SPYRE_NUM_HOST_COMPUTE_STREAMS must be at least 1, got '",
+              env, "'");
+  if (n > kMaxHostComputeStreams) n = kMaxHostComputeStreams;
+  return n;
+}
 
 // Constructor
 SpyreStream::SpyreStream()
@@ -125,8 +150,7 @@ void SpyreStream::synchronize() const {
   DEBUGINFO("SpyreStream::synchronize() - stream ", id(), " on device ",
             static_cast<int>(device().index()));
 
-  flex::RuntimeStream* handle = resolveRuntimeHandle();
-  handle->synchronize();
+  resolveRuntimeHandle()->synchronize();
 }
 
 c10::Stream SpyreStream::unwrap() const {
@@ -261,6 +285,26 @@ void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
   // Register default stream (ID 0).
   pool.stream_handle_map[0] = runtime->getDefaultStream();
 
+  // Register host compute streams (IDs 65+)
+  int num_host_streams = getNumHostComputeStreams();
+  pool.host_compute_streams[device_index].reserve(num_host_streams);
+  for (int i = 0; i < num_host_streams; ++i) {
+    c10::StreamId sid = kHostComputeStreamStartPerDevice + i;
+    // Create the flex handle only if this stream id has not been registered
+    // yet. stream_handle_map is keyed by stream id, not device, so when the
+    // pool is initialized under more than one device index in the same process
+    // (all mapping to the same runtime) the handle is created once and reused.
+    TORCH_CHECK(
+        pool.stream_handle_map.find(sid) == pool.stream_handle_map.end(),
+        "Host compute stream id ", sid,
+        " is already registered; only one Spyre device per process is "
+        "supported");
+    pool.stream_handle_map[sid] =
+        runtime->createStream(flex::RuntimeStreamPriority::NORMAL);
+    pool.host_compute_streams[device_index].push_back(sid);
+  }
+  pool.next_host_compute_idx[device_index] = 0;
+
   // Initialize low priority streams (IDs 1 to kStreamsPerDevice)
   pool.low_priority_streams[device_index].reserve(kStreamsPerDevice);
   for (int i = 1; i <= kStreamsPerDevice; ++i) {
@@ -323,6 +367,50 @@ SpyreStream setCurrentStream(SpyreStream stream) {
   auto old_stream = getCurrentStream(device);
   current_streams[device.index()] = stream.id();
   return old_stream;
+}
+
+SpyreStream getHostComputeStream(c10::Device device) {
+  if (device.index() == -1) {
+    device = c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx);
+  }
+
+  // Ensure runtime is initialized before creating streams
+  // This is critical when this is called before any tensor operations
+  startRuntime();
+
+  initializeStreamPool(device.index());
+
+  auto& pool = getStreamPool();
+  std::unique_lock<std::shared_mutex> lock(pool.mutex);
+
+  auto& streams = pool.host_compute_streams[device.index()];
+  auto& idx = pool.next_host_compute_idx[device.index()];
+
+  c10::StreamId stream_id = streams[idx];
+  idx = (idx + 1) % streams.size();
+
+  return SpyreStream(c10::Stream(c10::Stream::UNSAFE, device, stream_id));
+}
+
+SpyreStream getHostComputeStreamById(c10::StreamId id, c10::Device device) {
+  if (device.index() == -1) {
+    device = c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx);
+  }
+
+  // Ensure runtime is initialized before creating streams
+  // This is critical when this is called before any tensor operations
+  startRuntime();
+
+  initializeStreamPool(device.index());
+
+  const c10::StreamId end =
+      kHostComputeStreamStartPerDevice + getNumHostComputeStreams();
+  TORCH_CHECK(id >= kHostComputeStreamStartPerDevice && id < end,
+              "getHostComputeStreamById: stream id ", id,
+              " is not a host compute stream id (valid range [",
+              kHostComputeStreamStartPerDevice, ", ", end, "))");
+
+  return SpyreStream(c10::Stream(c10::Stream::UNSAFE, device, id));
 }
 
 SpyreStream getStreamFromPool(c10::Device device, int priority) {
@@ -400,6 +488,7 @@ void synchronizeDevice(c10::optional<c10::Device> device) {
       };
       collect(pool.low_priority_streams);
       collect(pool.high_priority_streams);
+      collect(pool.host_compute_streams);
     }  // lock released
 
     auto runtime = GlobalRuntime::get();

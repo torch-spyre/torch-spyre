@@ -687,6 +687,23 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
             debug_handle = None
 
+        if not is_reduction and op != "ReStickifyOpHBM" and not indirect_var_names:
+            stick_vars = {
+                next(iter(arg.device_coordinates[-1].free_symbols))
+                for arg in args
+                if arg.device_coordinates and arg.device_coordinates[-1].free_symbols
+            }
+            assert len(stick_vars) <= 1, (
+                f"create_op_spec: stick mismatch for op={op!r} "
+                f"ir_chain={getattr(debug_handle, 'ir_chain', '?')}: "
+                f"args have different stick loop variables: "
+                + ", ".join(
+                    str(arg.device_coordinates[-1])
+                    for arg in args
+                    if arg.device_coordinates
+                )
+            )
+
         return OpSpec(
             op,
             is_reduction,
