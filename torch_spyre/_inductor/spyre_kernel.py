@@ -478,7 +478,8 @@ def _tile_advance_expr_from_dep(
 
     ``tiled_dim_extents`` maps a host-range positional index (the same
     indices used in ``loop_tiled_dims`` / ``loop_tiled_reduction_dims``) to
-    the tile extent one loop step advances that dim's ``d{i}`` symbol by.
+    the tile extent one loop step advances that dim's ``d{i}`` symbol by
+    (the product of ``loop_count`` for every level tiling that dim).
 
     Built by substituting, in ``dep.index``, each tiled dim's ``d{dim}``
     with ``extent * d{dim}`` (staying symbolic in ``d{dim}`` -- the
@@ -489,8 +490,9 @@ def _tile_advance_expr_from_dep(
     this is a direct substitution rather than coefficient extraction,
     ``dep.index`` need not be affine in the tiled symbols -- a tiled dim
     wrapped in ``Mod``/``FloorDiv``/``ModularIndexing`` (reshape-split or
-    gather/indirect-indexing dims) produces the exact non-linear term
-    rather than an approximation.
+    gather/indirect-indexing dims; ``_loop_var_to_ranges_pos`` only checks
+    for a single free symbol, so such a dim still reaches this function)
+    produces the exact non-linear term rather than an approximation.
     Returns ``sympy.Integer(0)`` when every tiled dim's substituted term
     also evaluates to ``0`` (this dependency never advances).
 
