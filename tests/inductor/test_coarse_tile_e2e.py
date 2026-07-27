@@ -1734,26 +1734,45 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         src = source_codes[0]
         self.assertIn("LoopSpec(", src, "Expected LoopSpec for H-tiled elementwise")
         self.assertIn("sympify('2')", src, "Expected loop count 2 for H/2 tiles")
-        # The tiled symbol must be the H iteration-space symbol (c0 — the first
-        # non-unit dim after skipping B=1), NOT the Lq symbol (c1).
-        # With an incorrect host-range→iteration-space mapping, host index 1 (H)
-        # would select c1 (Lq) instead of c0 (H), advancing per-tile strides by
-        # the wrong amount.
+        # tiled_symbols now holds one minted per-(op, level) symbol (see
+        # spyre_kernel._get_or_mint_level_symbol), not the real iteration-space
+        # symbol (c0 for H) — so the regression this test guards against
+        # (host-range index 1 (H) incorrectly resolving to the Lq iteration-space
+        # symbol instead of H's) must instead be checked via the *value* of
+        # device_tile_advance_expr's coefficient on that minted symbol: with the
+        # correct host-range→dim mapping the coefficient reflects H's device
+        # stride (256 device elements/step); the old bug would have advanced by
+        # Lq's stride (1 device element/step) instead.
         tiled_syms_matches = re.findall(r"tiled_symbols=\[(\[.*?\])\]", src, re.DOTALL)
         self.assertTrue(
             tiled_syms_matches,
             "Expected tiled_symbols=[[...]] in generated OpSpec source",
         )
-        for match in tiled_syms_matches:
+        minted_sym_matches = re.findall(r"_tile_adv_\w+_lvl\d+", tiled_syms_matches[0])
+        self.assertTrue(
+            minted_sym_matches,
+            f"Expected a minted _tile_adv_* symbol in tiled_symbols, "
+            f"got: {tiled_syms_matches[0]}",
+        )
+        minted_sym = minted_sym_matches[0]
+        advance_matches = re.findall(
+            r"device_tile_advance_expr=sympify\('([^']*)'\)", src
+        )
+        self.assertTrue(
+            advance_matches, "Expected device_tile_advance_expr in generated source"
+        )
+        for advance_expr in advance_matches:
             self.assertIn(
-                "c0",
-                match,
-                f"tiled_symbols should contain the H symbol (c0), got: {match}",
+                minted_sym,
+                advance_expr,
+                f"device_tile_advance_expr should reference the tiled level "
+                f"symbol {minted_sym}, got: {advance_expr}",
             )
-            self.assertNotIn(
-                "c1",
-                match,
-                f"tiled_symbols should NOT contain the Lq symbol (c1), got: {match}",
+            self.assertIn(
+                "256",
+                advance_expr,
+                f"device_tile_advance_expr should advance by H's device stride "
+                f"(256), NOT Lq's (1) -- got: {advance_expr}",
             )
 
     def test_hint_row_tiling_multi_stick_pointwise_correct(self):

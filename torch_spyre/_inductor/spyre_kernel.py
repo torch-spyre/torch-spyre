@@ -521,6 +521,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         self.indirect_sizes: dict[sympy.Symbol, int] = {}
         self._indirect_var_count: int = 0
         self._general_tile_advance_seen: dict[str, int] = {}
+        self._tile_advance_symbols: dict[int, sympy.Symbol] = {}
 
     def indirect_var_names(self) -> "frozenset[str] | None":
         if not self.indirect_vars:
@@ -534,14 +535,98 @@ class SpyreKernel(Kernel[CSEVariable]):
         )
         return self
 
+    def _get_or_mint_level_symbol(self, level_idx: int, op_name: str) -> sympy.Symbol:
+        """Fresh, distinct symbol for one nesting level of the current op.
+
+        Minted once per (op, level) and cached in self._tile_advance_symbols
+        (reset at the start of every op by store()/store_reduction()) so
+        every TensorArg built for this op, plus create_op_spec's own
+        tiled_symbols/tiled_symbol_trip_counts, resolve to the exact same
+        Symbol object for a given level -- required for
+        device_tile_advance_expr.coeff(sym) lookups in compute_ops.py /
+        superdsc.py to find the term each level contributed.
+
+        Distinct from the real Inductor d{i} symbols by construction (the
+        name embeds the op name and level index, which never collides with
+        Inductor's own "d0", "d1", ... convention) -- this is what fixes
+        the same-real-symbol-tiled-at-2+-levels collapse bug: two levels
+        tiling the same host dim get two different minted symbols here,
+        so their sympy.Add terms never combine into one coefficient.
+        """
+        if level_idx not in self._tile_advance_symbols:
+            self._tile_advance_symbols[level_idx] = sympy.Symbol(
+                f"_tile_adv_{op_name}_lvl{level_idx}"
+            )
+        return self._tile_advance_symbols[level_idx]
+
+    @staticmethod
+    def _host_dim_to_index_symbol(ir_node: Any, dim: int) -> sympy.Symbol:
+        """Map a host-range positional dim index to its dep.index d{i} symbol.
+
+        CoarseTileInfo.tiled_dims_per_read/output_tiled_dims store *host-range*
+        positional indices (indices into op.data.ranges, or
+        n_output_dims + reduction_pos for reduction dims -- see loop_info.py).
+        But dep.index's own free symbols are minted by Inductor's
+        extract_read_writes -> index_vars_squeeze, which -- via
+        SqueezeView.squeezer -- drops unit-size (==1) dims from op.data.ranges/
+        reduction_ranges before numbering d0, d1, ... densely over the
+        *remaining* dims. So d{dim} in dep.index is only the correct symbol
+        when no unit dims precede it; whenever a unit dim is skipped, the
+        host-range index and the d{i} symbol index diverge (e.g. BHLD with
+        B=1: host-range dim 1 (H) is squeezed d0, not d1).
+
+        This mirrors create_op_spec's own host_to_it construction (same
+        squeeze arithmetic, same n_output_it_syms reduction-dim offset).
+        """
+        n_output_dims = 0
+        it_idx = 0
+        mapped: "int | None" = None
+        if hasattr(ir_node, "data") and hasattr(ir_node.data, "ranges"):
+            for host_idx, r in enumerate(ir_node.data.ranges):
+                if int(r) != 1:
+                    if host_idx == dim:
+                        mapped = it_idx
+                    it_idx += 1
+            n_output_dims = it_idx
+        else:
+            mapped = dim
+        if mapped is None and hasattr(ir_node, "data"):
+            # Reduction dim: dim >= n_output_dims: offset is n_output_dims
+            # (post-squeeze) plus the squeezed position within
+            # reduction_ranges.
+            reduction_pos = dim - (
+                len(ir_node.data.ranges) if hasattr(ir_node.data, "ranges") else 0
+            )
+            reduction_ranges = getattr(ir_node.data, "reduction_ranges", None)
+            if reduction_ranges is not None and reduction_pos >= 0:
+                red_it_idx = 0
+                for host_idx, r in enumerate(reduction_ranges):
+                    if int(r) != 1:
+                        if host_idx == reduction_pos:
+                            mapped = n_output_dims + red_it_idx
+                            break
+                        red_it_idx += 1
+        if mapped is None:
+            # Fallback: identity mapping (no unit dims to skip, or ir_node
+            # lacks a `data` attribute -- e.g. in unit tests using bare
+            # fixtures).
+            mapped = dim
+        return sympy_index_symbol(f"d{mapped}")
+
     def _general_tile_advance(
         self, tensor: TensorAccess, is_input: bool, name: str
     ) -> "sympy.Expr | None":
-        """This arg's device-element tile-advance expr, derived from
-        CoarseTileInfo.tile_advance_exprs / output_tile_advance_expr (the
-        general, unconditional, host-element-offset mechanism -- see
-        loop_info.py) via views.tiling_expr_to_device_expr, using this
-        arg's own device_size/stride_map.
+        """This arg's device-element tile-advance expr.
+
+        Re-derives dep.index at this call (guaranteed final -- every pass
+        that could rewrite it via WrapperHandler has already run), builds
+        one substituted term per nesting level using that level's own
+        minted symbol (via _get_or_mint_level_symbol) and
+        CoarseTileInfo.tiled_dims_per_read/output_tiled_dims's per-level
+        (dim, extent) decision, reprojects each level's host-space term to
+        device-element space via views.tiling_expr_to_device_expr, and sums
+        every level into one combined Expr -- preserving the single-Expr-
+        per-arg contract compute_ops.py/superdsc.py/bundle.py depend on.
 
         This is the sole tile-advance mechanism. Returns None for ops
         without loop_info/coarse tiling.
@@ -550,6 +635,8 @@ class SpyreKernel(Kernel[CSEVariable]):
         loop_info = getattr(ir_node, "loop_info", None)
         if loop_info is None:
             return None
+
+        op_name = ir_node.get_operation_name()
 
         if is_input:
             read_deps = [
@@ -569,20 +656,53 @@ class SpyreKernel(Kernel[CSEVariable]):
                 return None
             self._general_tile_advance_seen[name] = consumed + 1
             dep_idx = matching_idx[consumed]
-            if dep_idx >= len(loop_info.tile_advance_exprs):
+            if dep_idx >= len(loop_info.tiled_dims_per_read):
                 return None
-            host_expr = loop_info.tile_advance_exprs[dep_idx]
+            dep = read_deps[dep_idx]
+            per_level_dims = loop_info.tiled_dims_per_read[dep_idx]
         else:
-            host_expr = loop_info.output_tile_advance_expr
+            write_deps = [
+                dep
+                for dep in ir_node.get_read_writes().writes
+                if isinstance(dep, MemoryDep)
+            ]
+            if not write_deps:
+                return None
+            dep = write_deps[0]
+            per_level_dims = loop_info.output_tiled_dims
 
-        if host_expr is None:
+        if not per_level_dims:
             return None
 
-        return tiling_expr_to_device_expr(
-            tensor.layout.device_layout.device_size,
-            tensor.layout.device_layout.stride_map,
-            host_expr,
-        )
+        device_size = tensor.layout.device_layout.device_size
+        stride_map = tensor.layout.device_layout.stride_map
+
+        total_device_expr: "sympy.Expr | None" = None
+        for level_idx, dim_extent_pairs in enumerate(per_level_dims):
+            if not dim_extent_pairs:
+                continue
+            level_symbol = self._get_or_mint_level_symbol(level_idx, op_name)
+            tiled_dim_extents = {
+                self._host_dim_to_index_symbol(ir_node, d): extent * level_symbol
+                for d, extent in dim_extent_pairs
+            }
+            subs = dict(tiled_dim_extents)
+            subs.update(
+                {
+                    sym: sympy.Integer(0)
+                    for sym in dep.index.free_symbols
+                    if sym not in subs
+                }
+            )
+            host_expr = dep.index.subs(subs)
+            device_expr = tiling_expr_to_device_expr(device_size, stride_map, host_expr)
+            total_device_expr = (
+                device_expr
+                if total_device_expr is None
+                else total_device_expr + device_expr
+            )
+
+        return total_device_expr
 
     def create_tensor_arg(
         self,
@@ -684,10 +804,12 @@ class SpyreKernel(Kernel[CSEVariable]):
         # dim-index lists, outermost first — so we build outermost-first then
         # reverse to get innermost-first for tiled_symbols storage.
         #
-        # IMPORTANT: loop_tiled_dims stores *host-range* indices (indices into
-        # op.data.ranges), but the iteration space skips unit-size dims.  We
-        # must map host-range index → iteration-space key index before looking
-        # up symbols.
+        # Each level that tiles at least one dim (output or reduction) gets a
+        # single minted symbol via _get_or_mint_level_symbol, shared with the
+        # same (op, level) symbol _general_tile_advance mints when building
+        # each TensorArg's device_tile_advance_expr -- so
+        # device_tile_advance_expr.coeff(sym) resolves to that level's own
+        # contribution regardless of how many host dims it tiles.
         li = getattr(ir_node, "loop_info", None)
         raw_tiled_dims: list[list[int]] = li.loop_tiled_dims if li is not None else []
         raw_tiled_red_dims: list[list[int]] = (
@@ -699,55 +821,21 @@ class SpyreKernel(Kernel[CSEVariable]):
         # lists have the same length and the per-level loop below never
         # silently drops an entry from the shorter one.
         n_levels = max(len(raw_tiled_dims), len(raw_tiled_red_dims))
-        it_space_keys = list(it_space.keys())
 
-        # host_to_it and n_output_it_syms call int() on data.ranges entries,
-        # which throws on symbolic dimensions.  They are only needed when this
-        # op is inside a tiling loop, so skip the computation for non-tiled ops.
         tiled_symbol_trip_counts: dict = {}
         tiled_syms: list[list] = []
         if n_levels > 0:
-            # Build host-range-index → iteration-space-key-index map by walking
-            # data.ranges and counting only non-unit entries.  loop_tiled_dims
-            # stores *host-range* indices which include unit-size dims that the
-            # iteration space skips; this mapping corrects for that.
-            host_to_it: dict[int, int] = {}
-            if hasattr(ir_node, "data") and hasattr(ir_node.data, "ranges"):
-                it_idx = 0
-                for host_idx, r in enumerate(ir_node.data.ranges):
-                    if int(r) != 1:
-                        host_to_it[host_idx] = it_idx
-                        it_idx += 1
-            else:
-                # Fallback: identity mapping (no unit-size dims to skip).
-                host_to_it = {i: i for i in range(len(it_space_keys))}
-
-            # For reduction dims: offset is the number of non-unit output-dim ranges.
-            n_output_it_syms = sum(
-                1
-                for r in (
-                    ir_node.data.ranges
-                    if hasattr(ir_node, "data") and hasattr(ir_node.data, "ranges")
-                    else []
-                )
-                if int(r) != 1
-            )
-
             loop_count = li.loop_count if li is not None else []
 
+            op_name = ir_node.get_operation_name()
             tiled_syms_per_level_outermost: list[list] = []
             for lvl in range(n_levels):
                 level_syms: list = []
-                if lvl < len(raw_tiled_dims):
-                    for d in raw_tiled_dims[lvl]:
-                        mapped = host_to_it.get(d)
-                        if mapped is not None and mapped < len(it_space_keys):
-                            level_syms.append(it_space_keys[mapped])
-                if lvl < len(raw_tiled_red_dims):
-                    for r in raw_tiled_red_dims[lvl]:
-                        sym_idx = n_output_it_syms + r
-                        if sym_idx < len(it_space_keys):
-                            level_syms.append(it_space_keys[sym_idx])
+                has_any_tiled_dim = (
+                    lvl < len(raw_tiled_dims) and raw_tiled_dims[lvl]
+                ) or (lvl < len(raw_tiled_red_dims) and raw_tiled_red_dims[lvl])
+                if has_any_tiled_dim:
+                    level_syms.append(self._get_or_mint_level_symbol(lvl, op_name))
                 tiled_syms_per_level_outermost.append(level_syms)
                 if lvl < len(loop_count):
                     trip_count = int(loop_count[lvl])
@@ -858,6 +946,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         mode: StoreMode = None,
     ) -> None:
         self._general_tile_advance_seen = {}
+        self._tile_advance_symbols = {}
         # mutation_real_name maps mutation aliases to their real destination buffer. Resolve that here,
         # and mark the buf name as removed so the wrapper does not allocate it separately.
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
@@ -970,6 +1059,7 @@ class SpyreKernel(Kernel[CSEVariable]):
     ) -> None:
         """Convert an RValue"""
         self._general_tile_advance_seen = {}
+        self._tile_advance_symbols = {}
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
