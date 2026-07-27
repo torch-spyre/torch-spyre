@@ -190,12 +190,12 @@ def plan_coarse_tile_groups(
     """Decide every op's coarse-tiling attributes without mutating the IR.
 
     Performs the per-op decision logic (hint-to-position lookup, per-level
-    tiled-dims bookkeeping, tile_advance_exprs/output_tile_advance_expr) but
-    never calls _divide_ranges/_divide_reduction_ranges -- those are real IR
+    tiled-dims bookkeeping, tiled_dims_per_read/output_tiled_dims) but never
+    calls _divide_ranges/_divide_reduction_ranges -- those are real IR
     mutation and must only run during transformation (see _apply_plan).
-    Extents are instead computed analytically by _planned_tile_extents,
-    reading op.data.ranges/reduction_ranges as they exist before any
-    mutation.
+    Extents are instead computed analytically by
+    _planned_tile_extents_per_level, reading op.data.ranges/reduction_ranges
+    as they exist before any mutation.
 
     Returns a dict mapping each tiled op's ``id(op)`` to its planned
     CoarseTileInfo. Keyed by ``id(op)`` rather than ``op`` itself because
@@ -268,17 +268,17 @@ def plan_coarse_tile_groups(
                         f"op {op.get_name()}"
                     )
 
-            combined_extents = _planned_tile_extents(
+            per_level_extents = _planned_tile_extents_per_level(
                 op, op_tiled_dims, op_tiled_reduction_dims, levels
             )
 
-            tile_advance_exprs = [
-                _tile_advance_expr_from_dep(dep, combined_extents) for dep in read_deps
+            tiled_dims_per_read = [
+                _tiled_dims_for_dep(dep, per_level_extents) for dep in read_deps
             ]
-            output_tile_advance_expr = (
-                _tile_advance_expr_from_dep(write_deps[0], combined_extents)
+            output_tiled_dims = (
+                _tiled_dims_for_dep(write_deps[0], per_level_extents)
                 if write_deps
-                else sympy.Integer(0)
+                else []
             )
 
             plan[id(op)] = CoarseTileInfo(
@@ -286,41 +286,46 @@ def plan_coarse_tile_groups(
                 loop_count=counts,
                 loop_tiled_dims=op_tiled_dims,
                 loop_tiled_reduction_dims=op_tiled_reduction_dims,
-                tile_advance_exprs=tile_advance_exprs,
-                output_tile_advance_expr=output_tile_advance_expr,
+                tiled_dims_per_read=tiled_dims_per_read,
+                output_tiled_dims=output_tiled_dims,
             )
 
             logger.debug(
                 "coarse_tile: planned %s loop_group_id=%s loop_count=%s "
                 "loop_tiled_dims=%s loop_tiled_reduction_dims=%s "
-                "tile_advance_exprs=%s output_tile_advance_expr=%s",
+                "tiled_dims_per_read=%s output_tiled_dims=%s",
                 op.get_operation_name(),
                 nested_group_id,
                 counts,
                 op_tiled_dims,
                 op_tiled_reduction_dims,
-                tile_advance_exprs,
-                output_tile_advance_expr,
+                tiled_dims_per_read,
+                output_tiled_dims,
             )
 
     return plan
 
 
-def _planned_tile_extents(
+def _planned_tile_extents_per_level(
     op: ComputedBuffer,
     op_tiled_dims: list[list[int]],
     op_tiled_reduction_dims: list[list[int]],
     levels: list[tuple],
-) -> dict[int, Expr]:
-    """Analytically compute combined_extents without mutating op.data.
+) -> list[dict[int, Expr]]:
+    """Per-level (not merged) tile extents, outermost-first.
 
     Mirrors the arithmetic _divide_ranges/_divide_reduction_ranges perform
     in place, but reads pre-mutation op.data.ranges/reduction_ranges and
-    divides cumulatively across levels without ever calling
-    object.__setattr__ on op.data or touching op.layout. Raises RuntimeError
-    on non-even division, matching _divide_ranges's own check (line ~2952
-    in this file) so the error surfaces at the same point in the pipeline
-    it does today.
+    never calls object.__setattr__ on op.data or touches op.layout. Raises
+    RuntimeError on non-even division, matching _divide_ranges's own check
+    so the error surfaces at the same point in the pipeline it does today.
+
+    Unlike the deleted _planned_tile_extents, a dim tiled at more than one
+    level gets a DISTINCT extent value per level here (see the per-level
+    extent formula in
+    docs/superpowers/plans/2026-07-27-deferred-tile-advance-capture.md):
+    level i's extent is final_extent * (product of counts at every level
+    strictly more-inner than i that also tiles this same dim).
     """
     counts_by_dim: dict[int, Expr] = {}
     counts_by_reduction_dim: dict[int, Expr] = {}
@@ -345,22 +350,74 @@ def _planned_tile_extents(
             return sympy.Integer(int(r) // int(count))
         return sympy.sympify(r) / sympy.sympify(count)
 
-    tiled_dim_extents = {
+    final_dim_extents = {
         d: _divided(op.data.ranges[d], count, f"loop var d{d}")
         for d, count in counts_by_dim.items()
     }
-    reduction_dim_extents = {}
+    final_reduction_extents = {}
     if isinstance(op.data, Reduction):
-        reduction_dim_extents = {
+        final_reduction_extents = {
             d: _divided(op.data.reduction_ranges[d], count, f"reduction dim {d}")
             for d, count in counts_by_reduction_dim.items()
         }
 
     n_output_dims = len(op.data.ranges) if hasattr(op.data, "ranges") else 0
-    combined_extents = dict(tiled_dim_extents)
-    for d, extent in reduction_dim_extents.items():
-        combined_extents[n_output_dims + d] = extent
-    return combined_extents
+
+    def _per_level_extent_for(
+        final_extent: Expr,
+        tiled_at_level: list[list[int]],
+        dim_id: int,
+    ) -> dict[int, Expr]:
+        # tiled_at_level[level_idx] is the list of dims tiled at that level
+        # (op_tiled_dims or op_tiled_reduction_dims); find every level index
+        # tiling dim_id, outermost first (levels is already outermost-first).
+        levels_tiling_dim = [
+            level_idx for level_idx, dims in enumerate(tiled_at_level) if dim_id in dims
+        ]
+        result: dict[int, Expr] = {}
+        # Walk innermost-to-outermost; each step outward multiplies by the
+        # next-inner level's own count, so an outer level's extent equals
+        # the final extent times every more-inner level's count.
+        running_extent = final_extent
+        for level_idx in reversed(levels_tiling_dim):
+            result[level_idx] = running_extent
+            running_extent = running_extent * levels[level_idx][1]
+        return result
+
+    per_level_output: list[dict[int, Expr]] = [dict() for _ in levels]
+    for d, final_extent in final_dim_extents.items():
+        level_extents = _per_level_extent_for(final_extent, op_tiled_dims, d)
+        for level_idx, extent in level_extents.items():
+            per_level_output[level_idx][d] = extent
+    for d, final_extent in final_reduction_extents.items():
+        dim_key = n_output_dims + d
+        level_extents = _per_level_extent_for(final_extent, op_tiled_reduction_dims, d)
+        for level_idx, extent in level_extents.items():
+            per_level_output[level_idx][dim_key] = extent
+
+    return per_level_output
+
+
+def _tiled_dims_for_dep(
+    dep: MemoryDep,
+    per_level_extents: list[dict[int, Expr]],
+) -> list[list[tuple[int, Expr]]]:
+    """Filter per-level tiled-dim extents down to dims dep.index actually reads.
+
+    A dim tiled at some level that this dependency's index does not depend
+    on (broadcast, or simply not one of its dims) must not appear in its
+    per-level list -- matching the implicit zeroing _tile_advance_expr_from_dep
+    performs today for any free symbol absent from tiled_dim_extents.
+    """
+    dep_dims = {
+        int(str(sym)[1:])
+        for sym in dep.index.free_symbols
+        if str(sym).startswith("d") and str(sym)[1:].isdigit()
+    }
+    return [
+        [(d, extent) for d, extent in level.items() if d in dep_dims]
+        for level in per_level_extents
+    ]
 
 
 def _stick_host_dim(op: ComputedBuffer, device_layout) -> int | None:

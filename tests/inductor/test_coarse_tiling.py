@@ -1504,6 +1504,25 @@ class TestCoarseTileNested(unittest.TestCase):
         self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [0]])
 
+    def test_planned_tile_extents_per_level_same_dim_two_levels(self):
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _planned_tile_extents_per_level,
+        )
+
+        data = _make_pointwise([Integer(256)])
+        op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 0)))
+        levels = [(1, Integer(4)), (2, Integer(2))]
+        op_tiled_dims = [[0], [0]]
+        op_tiled_reduction_dims = [[], []]
+        per_level = _planned_tile_extents_per_level(
+            op, op_tiled_dims, op_tiled_reduction_dims, levels
+        )
+        self.assertEqual(len(per_level), 2)
+        # Outer level (count 4): extent = final_extent(32) * inner_count(2) = 64.
+        self.assertEqual(per_level[0], {0: Integer(64)})
+        # Inner level (count 2): extent = final_extent(32).
+        self.assertEqual(per_level[1], {0: Integer(32)})
+
     def test_coarse_tile_plans_before_any_transformation(self):
         """coarse_tile() must fully plan every group before transforming any.
 
