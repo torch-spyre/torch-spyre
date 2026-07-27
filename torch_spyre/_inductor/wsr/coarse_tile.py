@@ -46,10 +46,9 @@ whose results are consumed outside the loop.
 Before touching any ``inner_fn``/``layout``/``MutationLayoutSHOULDREMOVE``
 rewiring in this file, read "Appendix: How IR rewiring works, and why it's
 sound" in ``docs/source/compiler/coarse_tiling_loops.md``. It documents the
-wrap-never-reconstruct convention, why ``MutationLayoutSHOULDREMOVE`` sites
-must satisfy the single-mutation-target invariant, and the DCE-liveness
-mechanism protecting carry copy-outs -- the same ground this file's rewrite
-sites depend on.
+wrap-never-reconstruct convention and why ``MutationLayoutSHOULDREMOVE``
+sites must satisfy the single-mutation-target invariant -- the same ground
+this file's rewrite sites depend on.
 """
 
 from __future__ import annotations
@@ -201,13 +200,12 @@ def _apply_plan(
 ) -> dict[str, _RetiledBufferInfo]:
     """Apply planning's decisions: divide ranges and stamp loop_info.
 
-    This is transformation's mutation step, replacing _stamp_group. All
-    decisions (which dims/reduction levels are tiled, tile_advance_exprs)
-    already exist in `plan` (keyed by id(op) -- Operation/ComputedBuffer are
-    unhashable, see plan_coarse_tile_groups) -- this function only performs
-    the IR mutation _divide_ranges/_divide_reduction_ranges and the
-    loop_info attribute assignment, using the plan's values instead of
-    recomputing them.
+    This is transformation's mutation step. All decisions (which
+    dims/reduction levels are tiled, tile_advance_exprs) already exist in
+    `plan` (keyed by id(op) -- Operation/ComputedBuffer are unhashable, see
+    plan_coarse_tile_groups) -- this function only performs the IR mutation
+    _divide_ranges/_divide_reduction_ranges and the loop_info attribute
+    assignment, using the plan's values instead of recomputing them.
 
     `stamped_group_id` is the caller's own group_id (with group_idx_offset
     and trailing per-level zeros already applied) -- it is NOT the same
@@ -742,7 +740,8 @@ def _op_hint_dim_positions(op: ComputedBuffer, hint_id: int) -> tuple[bool, bool
 
     has_output_pos: op's own output ranges contain a dim driven by this hint.
     has_reduction_pos: op is a Reduction whose reduction_ranges contain a dim
-    driven by this hint.  Mirrors the lookup _stamp_group performs per op.
+    driven by this hint.  This is the hint-to-position lookup used to decide
+    which of op's own dims a given hint_id tiles.
     """
     dim_hint = next(
         (h for h in getattr(op, "dim_hints", []) if h.hint_id == hint_id), None
@@ -787,10 +786,10 @@ def _is_loop_invariant_at_reduction_levels(
     (running max, rescale-accumulate) is tiled at outer output-dim levels
     (e.g. H, a real dim of its own output) exactly like any other op in the
     group, but is invariant in shape at the inner reduction-tiled level
-    (e.g. Lk) because that dim never appears in its own output — the same
-    surface _stamp_group already computes per op, consulted here from
-    dim_hints directly so this works both before and after _stamp_group has
-    run (needed because _replace_constant_fill_predecessors runs first).
+    (e.g. Lk) because that dim never appears in its own output. Consulted
+    here from dim_hints directly, rather than from stamped loop_info, because
+    the caller (_replace_constant_fill_predecessors) runs before _apply_plan
+    has stamped loop_info onto any op.
     """
     if not isinstance(op.data, Pointwise):
         return False
@@ -874,9 +873,9 @@ def _seed_closure(
     closure — including it would pull in the whole downstream dependency
     cone, which is a different (much larger, wrong) set.
 
-    Restricted to ops stamped with loop_info in the same outer group
-    (post-_stamp_group; see _seed_closure_pre_stamp for the pre-stamp
-    equivalent used by _replace_constant_fill_predecessors).
+    Restricted to ops stamped with loop_info in the same outer group (i.e.
+    after _apply_plan has stamped loop_info; see _seed_closure_pre_stamp for
+    the pre-stamp equivalent used by _replace_constant_fill_predecessors).
     """
     outer_key = loop_group_id[0]
     closure: set[str] = set()
