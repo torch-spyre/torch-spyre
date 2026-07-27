@@ -22,6 +22,9 @@ from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import (
     device_coordinates,
     try_device_coordinates,
+    _check_stick_expr_supported,
+    _is_multi_stick_row_expr,
+    is_stick_expr_offset_free,
 )
 from torch_spyre._inductor.propagate_layouts import (
     PropArg,
@@ -269,6 +272,73 @@ class TestUnrepresentableStickCandidates(TestCase):
         dep, bad, _ = self._traced_scenario()
         arg = PropArg(dep, None, [bad])
         _check_supported_input_sticks([arg], "batchmatmul")  # must not raise
+
+
+d1, d2 = sympy.symbols("d1 d2", integer=True, nonnegative=True)
+
+
+class TestMultiStickRowExpr(TestCase):
+    """Tests for the multi-stick-per-row stick expression pattern.
+
+    The expression ``d2 + 64*(Mod(d1, 4))`` arises when a tensor's last host
+    dimension spans more than one stick (here: D=256 = 4 sticks × 64 elements).
+    """
+
+    EPS = 64  # elems_per_stick for fp16
+
+    # --- is_stick_expr_offset_free: must stay False for multi-stick-row ---
+
+    def test_offset_free_rejects_multi_stick_row(self):
+        expr = d2 + self.EPS * sympy.Mod(d1, 4)
+        self.assertFalse(is_stick_expr_offset_free(expr, self.EPS))
+
+    # --- _is_multi_stick_row_expr ---
+
+    def test_recognises_canonical_case(self):
+        # d2 + 64*Mod(d1, 4) — the expression from the AntoniExample failure
+        expr = d2 + self.EPS * sympy.Mod(d1, 4)
+        self.assertTrue(_is_multi_stick_row_expr(expr, self.EPS))
+
+    def test_recognises_two_sticks_per_row(self):
+        expr = d2 + self.EPS * sympy.Mod(d1, 2)
+        self.assertTrue(_is_multi_stick_row_expr(expr, self.EPS))
+
+    def test_rejects_bare_var(self):
+        self.assertFalse(_is_multi_stick_row_expr(d1, self.EPS))
+
+    def test_rejects_simple_mod(self):
+        self.assertFalse(
+            _is_multi_stick_row_expr(sympy.Mod(d1, self.EPS), self.EPS)
+        )
+
+    def test_rejects_wrong_coefficient(self):
+        # coefficient is 32, not elems_per_stick=64
+        expr = d2 + 32 * sympy.Mod(d1, 4)
+        self.assertFalse(_is_multi_stick_row_expr(expr, self.EPS))
+
+    def test_rejects_two_bare_vars(self):
+        # d1 + d2 — two bare symbols, no Mod
+        self.assertFalse(_is_multi_stick_row_expr(d1 + d2, self.EPS))
+
+    def test_rejects_offset_variant(self):
+        # Mod(d1, 64) + 8 — single free-symbol offset, not multi-stick-row
+        expr = sympy.Mod(d1, self.EPS) + 8
+        self.assertFalse(_is_multi_stick_row_expr(expr, self.EPS))
+
+    # --- _check_stick_expr_supported ---
+
+    def test_check_accepts_multi_stick_row(self):
+        expr = d2 + self.EPS * sympy.Mod(d1, 4)
+        _check_stick_expr_supported(expr, self.EPS)  # must not raise
+
+    def test_check_rejects_two_bare_vars(self):
+        with self.assertRaises(Unsupported):
+            _check_stick_expr_supported(d1 + d2, self.EPS)
+
+    def test_check_rejects_wrong_coeff(self):
+        # coefficient 32 != elems_per_stick 64
+        with self.assertRaises(Unsupported):
+            _check_stick_expr_supported(d2 + 32 * sympy.Mod(d1, 4), self.EPS)
 
 
 if __name__ == "__main__":

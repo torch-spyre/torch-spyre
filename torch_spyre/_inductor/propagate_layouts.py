@@ -72,6 +72,7 @@ from .pass_utils import (
     try_device_coordinates,
     indirect_info_from_op,
     is_stick_expr_offset_free,
+    _is_multi_stick_row_expr,
     iter_var_id,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
@@ -856,7 +857,10 @@ def _multi_arg_pointwise_layouts(
                 c_in_size, c_in_stride, output.dtype, projected_dim_order, output_ea
             )
             coord = device_coordinates(in_stl, arg.dep, ind_sizes)
-            if not is_stick_expr_offset_free(coord[-1], stick_size):
+            if not (
+                is_stick_expr_offset_free(coord[-1], stick_size)
+                or _is_multi_stick_row_expr(coord[-1], stick_size)
+            ):
                 return False
         return True
 
@@ -882,12 +886,42 @@ def _multi_arg_pointwise_layouts(
     elif not stick_exprs:
         _try_stick_dim(-1)
     else:
+        # Include both offset-free and multi-stick-row stick expressions as
+        # candidates. Multi-stick-row exprs (inner + N*Mod(outer, k)) have two
+        # free symbols; _pick_stick_dim would return -1 for them (matching_dim
+        # requires exactly one free symbol), so we derive the stick dimension
+        # from the outer (cross-stick) variable instead.
         offset_free_stick_exprs = {
             e for e in stick_exprs if is_stick_expr_offset_free(e, stick_size)
         }
-        # Sort stick exprs for determinism
+        multi_stick_row_exprs = {
+            e for e in stick_exprs if _is_multi_stick_row_expr(e, stick_size)
+        }
+        # Sort stick exprs for determinism; iter_var_id picks the first free
+        # symbol — use min index across all free symbols for multi-symbol exprs.
+        def _sort_key(e):
+            if not e.free_symbols:
+                return -1
+            return min(iter_var_id(sympy.Symbol(str(s))) for s in e.free_symbols)
+
         for stick_expr in sorted(offset_free_stick_exprs, key=iter_var_id):
             _try_stick_dim(_pick_stick_dim(stick_expr, out_coords))
+        for stick_expr in sorted(multi_stick_row_exprs, key=_sort_key):
+            # For inner + N*Mod(outer, k): use the output dim that `outer`
+            # maps to (the cross-stick variable that indexes whole sticks).
+            outer_var = next(
+                next(iter(a.free_symbols))
+                for a in stick_expr.args
+                if a.free_symbols and not a.is_symbol
+            )
+            stick_dim = _pick_stick_dim(sympy.Mod(outer_var, stick_size), out_coords)
+            if stick_dim == -1:
+                # Fall back: try each output dimension.
+                for d in range(len(out_coords)):
+                    if outer_var in out_coords[d].free_symbols:
+                        stick_dim = d
+                        break
+            _try_stick_dim(stick_dim)
 
     # Always scan all dims so that dims absent from any input stick expression
     # (e.g. the outer broadcast dim) are also offered as candidates. Deduplicate

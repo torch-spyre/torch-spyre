@@ -684,3 +684,138 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
         self.assertTrue(
             any(sk.is_derived_symbolic for sk in symbol_kinds[first_address:])
         )
+
+
+class TestMultiStickRowSDSC(InductorTestCase):
+    """Unit tests for multi-stick-per-row (MSR) normalisation in parse_op_spec.
+
+    Pattern: stick_expr = inner + elems_per_stick * Mod(outer, n_sticks).
+    Two host loop variables (outer=0..3, inner=0..63) jointly cover a
+    256-element last dimension (4 sticks of 64 fp16 elements each).
+
+    The fix merges inner into outer at the SDSC level so SDSC sees a single
+    wide-stick variable (size 256) — identical to a normal single-variable
+    wide-stick tensor.  This avoids both an MLIR 'map operands' crash and an
+    LX-fit failure caused by the inflated chunk from the extra inner loop.
+    """
+
+    EPS = 64       # elems_per_stick for fp16
+    N_STICKS = 4   # n_sticks_per_row  (last_dim = 4 * 64 = 256 elements)
+    N_ROWS = 8     # outer device rows
+    WIDE_DIM = N_STICKS * EPS  # 256 — the merged outer dimension
+
+    def _make_msr_op_spec(self) -> "OpSpec":
+        """Build an OpSpec whose tensors have a multi-stick-row stick expr.
+
+        Device layout: [N_ROWS, N_STICKS, EPS] = [8, 4, 64].
+        Host coords:   [c_rows, c_outer // N_STICKS,
+                        c_inner + EPS * Mod(c_outer, N_STICKS)].
+        Iteration space has three variables: c_rows, c_outer (range 4),
+        c_inner (range 64).  After MSR normalisation, c_inner is merged into
+        c_outer (range 256) and removed from the SDSC iteration space.
+        """
+        from sympy import Integer, Mod, Symbol
+
+        c_rows = Symbol("c_rows")
+        c_outer = Symbol("c_outer")   # 0..3: selects stick within row
+        c_inner = Symbol("c_inner")   # 0..63: within-stick position
+
+        coords = [
+            c_rows,
+            c_outer // self.N_STICKS,  # row index = 0 for c_outer in 0..3
+            c_inner + self.EPS * Mod(c_outer, self.N_STICKS),  # stick expr
+        ]
+        device_size = [self.N_ROWS, self.N_STICKS, self.EPS]
+        fp16 = DataFormats.SEN169_FP16
+        HBM = 0x400000000
+
+        def _arg(is_input, idx, base):
+            return TensorArg(
+                is_input=is_input,
+                arg_index=idx,
+                device_dtype=fp16,
+                device_size=list(device_size),
+                device_coordinates=coords,
+                allocation={"hbm": base},
+            )
+
+        return OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={
+                c_rows: (Integer(self.N_ROWS), 1),
+                c_outer: (Integer(self.N_STICKS), 1),   # 4 sticks per row
+                c_inner: (Integer(self.EPS), 1),         # 64 elements per stick
+            },
+            args=[_arg(True, 0, HBM), _arg(True, 1, HBM + 0x1000), _arg(False, 2, HBM + 0x2000)],
+            op_info={},
+        )
+
+    def test_outer_is_wide_stick_dim_in_coordinfo(self):
+        """After MSR normalisation, c_outer (merged to 256 elements) must be
+        the stick coordInfo entry with elem_arr_1=N_STICKS and elem_arr_0=EPS.
+        c_inner must NOT appear as a separate coordInfo entry."""
+        from torch_spyre._inductor.codegen.superdsc import compile_op_spec
+
+        op_spec = self._make_msr_op_spec()
+        sdsc_json, *_ = compile_op_spec(0, op_spec, symbols=[])
+
+        top = next(iter(sdsc_json.values()))
+        dsc = next(iter(top["dscs_"][0].values()))
+
+        for node in dsc["scheduleTree_"]:
+            if node.get("nodeType_") != "allocate":
+                continue
+            coord_info = node["coordinates_"]["coordInfo"]
+            # Exactly one dim must have elemArr == 2 (the merged wide stick).
+            stick_dims = [k for k, v in coord_info.items() if v.get("elemArr") == 2]
+            self.assertEqual(
+                len(stick_dims),
+                1,
+                f"Expected exactly 1 stick coordInfo (elemArr=2), got {coord_info}",
+            )
+            sd = stick_dims[0]
+            factors = {
+                e["label_"]: e["factor_"]
+                for e in coord_info[sd]["folds"]["dim_prop_attr"]
+            }
+            # elem_arr_1 = N_STICKS (4 sticks per wide row)
+            self.assertEqual(
+                factors.get("elem_arr_1"),
+                self.N_STICKS,
+                f"elem_arr_1 should be {self.N_STICKS}, got {factors}",
+            )
+            # elem_arr_0 = EPS (64 elements per stick)
+            self.assertEqual(
+                factors.get("elem_arr_0"),
+                self.EPS,
+                f"elem_arr_0 should be {self.EPS}, got {factors}",
+            )
+
+    def test_inner_var_merged_into_outer_in_N(self):
+        """After MSR normalisation:
+        - c_inner must NOT appear in N_ (it was merged away).
+        - c_outer must appear in N_ with value == WIDE_DIM (256).
+        """
+        from torch_spyre._inductor.codegen.superdsc import compile_op_spec
+
+        op_spec = self._make_msr_op_spec()
+        sdsc_json, *_ = compile_op_spec(0, op_spec, symbols=[])
+        top = next(iter(sdsc_json.values()))
+        dsc = next(iter(top["dscs_"][0].values()))
+        n_block = dsc["N_"]
+        values = [v for k, v in n_block.items() if k != "name_"]
+        # The merged outer dim must be present as WIDE_DIM.
+        self.assertIn(
+            self.WIDE_DIM,
+            values,
+            f"WIDE_DIM={self.WIDE_DIM} not in N_ {n_block}; outer not merged",
+        )
+        # The raw inner dim (EPS=64) must NOT be present (it was merged).
+        # N_ROWS=8 != EPS=64, so EPS as a standalone value would be suspicious.
+        # (EPS might still appear as elem_arr_0 in coordInfo, but not in N_.)
+        self.assertNotIn(
+            self.EPS,
+            values,
+            f"EPS={self.EPS} still in N_ {n_block}; inner was not merged away",
+        )

@@ -691,15 +691,70 @@ def _is_stick_expr_with_offset(stick_expr: sympy.Expr, elems_per_stick: int) -> 
     )
 
 
+def _is_multi_stick_row_expr(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
+    """Return True if stick_expr is a multi-stick-per-row pattern.
+
+    Recognises ``inner + elems_per_stick * Mod(outer, n_sticks)`` where
+    ``inner`` is a bare symbol (the within-stick position, 0..elems_per_stick-1)
+    and ``elems_per_stick * Mod(outer, n_sticks)`` selects which stick within a
+    wide row (row_size = n_sticks * elems_per_stick > elems_per_stick).
+
+    This arises when a tensor's last host dimension spans more than one stick,
+    causing two iteration variables to both contribute to the device stick
+    coordinate — for example the ``d2 + 64*(Mod(d1, 4))`` expression produced
+    when the K/D dimension is 256 elements wide (4 sticks per row).
+    """
+    if not isinstance(stick_expr, sympy.Add):
+        return False
+    free_args = [a for a in stick_expr.args if a.free_symbols]
+    if len(free_args) != 2:
+        return False
+    # Exactly one term must be a bare symbol (within-stick position).
+    bare_candidates = [a for a in free_args if a.is_symbol]
+    if len(bare_candidates) != 1:
+        return False
+    other = next(a for a in free_args if not a.is_symbol)
+    # The other term must be elems_per_stick * Mod(single_var, n) for some n > 0.
+    if not isinstance(other, sympy.Mul):
+        return False
+    coeff, mod_part = other.as_coeff_Mul()
+    return (
+        coeff == elems_per_stick
+        and isinstance(mod_part, sympy.Mod)
+        and len(mod_part.args[0].free_symbols) == 1
+        and mod_part.args[1] > 0
+    )
+
+
+def _msr_outer_var(
+    stick_expr: sympy.Expr, elems_per_stick: int
+) -> "sympy.Symbol | None":
+    """Return the outer (stick-selecting) variable from an MSR stick expression.
+
+    For ``inner + elems_per_stick * Mod(outer, n_sticks)`` returns the single
+    free symbol of the Mod argument (``outer``).  Returns None if
+    ``stick_expr`` is not an MSR expression.
+    """
+    if not _is_multi_stick_row_expr(stick_expr, elems_per_stick):
+        return None
+    for term in stick_expr.args:
+        if term.free_symbols and not term.is_symbol:
+            # This is the elems_per_stick * Mod(outer, n) term.
+            _, mod_part = term.as_coeff_Mul()
+            return next(iter(mod_part.args[0].free_symbols))
+    return None  # pragma: no cover
+
+
 def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) -> None:
     """Raise Unsupported for stick expressions may be valid but are not yet supported."""
     offset_free = is_stick_expr_offset_free(stick_expr, elems_per_stick)
     has_offset = _is_stick_expr_with_offset(stick_expr, elems_per_stick)
-    if not (offset_free or has_offset):
+    is_multi_stick_row = _is_multi_stick_row_expr(stick_expr, elems_per_stick)
+    if not (offset_free or has_offset or is_multi_stick_row):
         raise Unsupported(
             f"Unexpected stick expression {stick_expr!r}: expected "
-            f"Mod(var, {elems_per_stick}), a bare variable, 0, or any of those "
-            f"with a constant offset"
+            f"Mod(var, {elems_per_stick}), a bare variable, 0, any of those "
+            f"with a constant offset, or inner + {elems_per_stick}*Mod(outer, n)"
         )
 
 
@@ -991,7 +1046,10 @@ def compute_restickify_target_layout(
     return SpyreTensorLayout(device_size, stride_map, stl.device_dtype)
 
 
-def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
+def stick_compatible(
+    coords: "list[list[sympy.Expr]]",
+    elems_per_stick: int = 64,
+) -> bool:
     """Return True if all tensors are stick-compatible.
 
     coords: list of device_coordinates() results, one per tensor.
@@ -1000,7 +1058,38 @@ def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
     device coordinate) across all tensors has at most one element, and is
     disjoint from the union of nonstick variables (free symbols in all other
     device coordinates, excluding each tensor's own stick variable).
+
+    Multi-stick-per-row (MSR) tensors are handled as a special case: if every
+    tensor in ``coords`` is MSR and they all share the same outer (stick-
+    selecting) variable, they are considered compatible even though each last
+    coordinate contains two free symbols.
     """
+    # --- MSR fast-path ---------------------------------------------------
+    # If every tensor uses an MSR stick expression and they all agree on the
+    # same outer variable, the layouts are already in the same stick universe
+    # and no restickify is required.
+    #
+    # The outer variable legitimately appears in the non-stick address coords
+    # (it also acts as the row counter).  The only incompatibility to guard
+    # against is the within-stick (inner) variable leaking into non-stick
+    # address coordinates of *other* tensors — which would indicate a
+    # different layout structure.
+    if all(_is_multi_stick_row_expr(dc[-1], elems_per_stick) for dc in coords):
+        outer_vars = {_msr_outer_var(dc[-1], elems_per_stick) for dc in coords}
+        if len(outer_vars) == 1:
+            outer_var = next(iter(outer_vars))
+            # Collect all inner (within-stick) variables across tensors.
+            all_inner_vars: set[sympy.Symbol] = set()
+            for dc in coords:
+                all_inner_vars |= dc[-1].free_symbols - {outer_var}
+            # Verify no inner variable appears in any non-stick coordinate.
+            for dc in coords:
+                for coord in dc[:-1]:
+                    if coord.free_symbols & all_inner_vars:
+                        return False
+            return True
+
+    # --- Standard single-stick path --------------------------------------
     stick_vars: set[sympy.Symbol] = set()
     nonstick_vars: set[sympy.Symbol] = set()
     for dc in coords:
@@ -1050,10 +1139,27 @@ def compute_restickify_needed(
         return True, None
     assert idc, "device_coordinates returned empty list for input"
     assert out_idc, "device_coordinates returned empty list for output"
+    elems_per_stick = in_stl.elems_per_stick()
     # Input stick with an offset always needs restickify to remove the offset.
-    in_stick_offset_free = is_stick_expr_offset_free(idc[-1], in_stl.elems_per_stick())
-    if in_stick_offset_free and stick_compatible([idc, out_idc]):
+    in_stick_offset_free = is_stick_expr_offset_free(idc[-1], elems_per_stick)
+    # MSR layouts are layout-compatible with each other (no restickify needed)
+    # when both input and output use the same outer stick-selecting variable.
+    in_is_msr = _is_multi_stick_row_expr(idc[-1], elems_per_stick)
+    compatible = stick_compatible([idc, out_idc], elems_per_stick)
+    if (in_stick_offset_free or in_is_msr) and compatible:
         return False, None
+    logger.debug(
+        "compute_restickify_needed: restickify may be needed "
+        "in=%s idc[-1]=%r out=%s out_idc[-1]=%r "
+        "offset_free=%s is_msr=%s compatible=%s",
+        in_dep.name,
+        idc[-1],
+        out_dep.name,
+        out_idc[-1],
+        in_stick_offset_free,
+        in_is_msr,
+        compatible,
+    )
     ic = host_coordinates(in_host, in_dep, ind_sizes)
     target_stick = out_idc[-1]
 
@@ -1065,9 +1171,17 @@ def compute_restickify_needed(
         if reduction_vars:
             red_var = next(iter(reduction_vars))
             target_stick = sympy.Mod(red_var, in_stl.elems_per_stick())
-    return True, compute_restickify_target_layout(
+    result = compute_restickify_target_layout(
         in_stl, in_host, target_stick, ic, idc
     )
+    logger.debug(
+        "compute_restickify_needed: result needed=True tgt=%s "
+        "(device_size=%s stride_map=%s)",
+        result,
+        list(result.device_size) if result else None,
+        list(result.stride_map) if result else None,
+    )
+    return True, result
 
 
 def copy_fx_custom_meta(src: "torch.fx.Node", dst: "torch.fx.Node") -> None:
