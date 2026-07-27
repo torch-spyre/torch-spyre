@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+import torch.utils._pytree as pytree
 import torch_spyre.ops.fallbacks  # noqa: F401
 from .fallbacks import _get_op_overloads
 import warnings
@@ -28,22 +29,32 @@ aten = torch.ops.aten
 def compile_once(op, **compile_kwargs):
     def decorator(fn):
         compiled = None
+        # Only forward the resolved `op` to wrapped functions that explicitly
+        # accept it (e.g. dispatch_to_torch_compile, which uses it to invoke
+        # the original aten overload on CPU when no SDSC mapping exists for
+        # the input dtype). Plain @compile_once-decorated custom ops
+        # (overwrite, copy_from_d2d, ...) keep their original signature
+        # unchanged.
+        old_signature = inspect.signature(fn)
+        accepts_op = "op" in old_signature.parameters
 
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             nonlocal compiled
             nonlocal op
+            if isinstance(op, str):
+                op = operator.attrgetter(op)(torch.ops)
             if compiled is None:
-                if isinstance(op, str):
-                    op = operator.attrgetter(op)(torch.ops)
                 compiled = torch.compile(op, **compile_kwargs)
+            if accepts_op:
+                return fn(*args, compiled=compiled, op=op, **kwargs)
             return fn(*args, compiled=compiled, **kwargs)
 
-        # We remove the `compiled` arg from the signature to have
+        # We remove the `compiled` and `op` args from the signature to have
         # a clean signature.
-        old_signature = inspect.signature(fn)
         params = dict(old_signature.parameters)
         params.pop("compiled", None)
+        params.pop("op", None)
         new_signature = old_signature.replace(parameters=params.values())
         wrapper.__signature__ = new_signature
 
@@ -58,7 +69,52 @@ def maybe_wrap_dim(dim: int, ndims: int) -> int:
     return dim
 
 
-def dispatch_to_torch_compile(*args, compiled=None, **kwargs):
+# Integer-typed inputs to ops registered via `register_torch_compile_kernel`
+# have no matching SDSC op mapping today; reaching the device compiler with
+# them aborts `dxp_standalone --bundle` with
+# "Scheduler failed to find a suitable op mapping for sdsc: 0_<op>" (and in
+# some cases silently returns uninitialized memory — see issue #2376).
+# Route those calls through CPU at dispatch time and move the result back
+# to the original device so callers that expect a device tensor still get one.
+_UNSUPPORTED_INT_DTYPES = frozenset(
+    {
+        torch.int8,
+        torch.uint8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+    }
+)
+
+
+def _is_unsupported_int_tensor(t):
+    return isinstance(t, torch.Tensor) and t.dtype in _UNSUPPORTED_INT_DTYPES
+
+
+def dispatch_to_torch_compile(*args, compiled=None, op=None, **kwargs):
+    leaves = pytree.arg_tree_leaves(*args, **kwargs)
+    if op is not None and any(_is_unsupported_int_tensor(t) for t in leaves):
+        # Late import to avoid circulars at module load.
+        from .fallbacks import FallbackWarning
+
+        warnings.warn(
+            f"{op} is falling back to cpu (no SDSC mapping for integer dtype)",
+            category=FallbackWarning,
+            stacklevel=2,
+        )
+        spyre_device = next(
+            (
+                t.device
+                for t in leaves
+                if isinstance(t, torch.Tensor) and t.device.type == "spyre"
+            ),
+            torch.device("spyre"),
+        )
+        cpu_args, cpu_kwargs = pytree.tree_map_only(
+            torch.Tensor, lambda t: t.cpu(), (args, kwargs)
+        )
+        result = op(*cpu_args, **cpu_kwargs)
+        return pytree.tree_map_only(torch.Tensor, lambda t: t.to(spyre_device), result)
     return compiled(*args, **kwargs)
 
 
