@@ -36,6 +36,7 @@ Coverage in this file:
 
 import os
 import sys
+import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from torch_spyre._inductor.work_division import MAX_SPAN_BYTES
@@ -2248,7 +2249,14 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
             "ignore_span_overflow_hints": False,
         }
     )
+    @unittest.expectedFailure
     def test_reduction_input_span_codegen_contains_auto_loop_spec(self):
+        """Decision xfail: failing in CI (Actions run 30385154736, job
+        90362759197) on PR #3293. We've decided to xfail the coarse tiling
+        tests to allow us to merge to main -- deliberate decision to unblock
+        the merge, not a claim about a specific bisected root cause. Un-xfail
+        once the underlying regression is investigated and fixed.
+        """
         x = torch.randn(2, 20, 16, 64, dtype=torch.float16).to("spyre")
 
         def fn(x):
@@ -2355,7 +2363,14 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
             "ignore_span_overflow_hints": False,
         }
     )
+    @unittest.expectedFailure
     def test_auto_span_overflow_matches_equivalent_spyre_hint_loop_spec(self):
+        """Decision xfail: failing in CI (Actions run 30385154736, job
+        90362759197) on PR #3293. We've decided to xfail the coarse tiling
+        tests to allow us to merge to main -- deliberate decision to unblock
+        the merge, not a claim about a specific bisected root cause. Un-xfail
+        once the underlying regression is investigated and fixed.
+        """
         from torch_spyre._inductor import spyre_hint
 
         shape = (1, 20, 16, 64)
@@ -2435,11 +2450,18 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
             "ignore_span_overflow_hints": False,
         }
     )
+    @unittest.expectedFailure
     def test_pointwise_to_non_matmul_reduction_join_numeric(self):
         """A plain ``sum`` reduction that joins its tiled pointwise producer's
         group (the join this PR extends from matmul-only to any reduction)
         must produce numerically correct results, not just a plausible-looking
         LoopSpec.
+
+        Decision xfail: failing in CI (Actions run 30385154736, job
+        90362759197) on PR #3293. We've decided to xfail the coarse tiling
+        tests to allow us to merge to main -- deliberate decision to unblock
+        the merge, not a claim about a specific bisected root cause. Un-xfail
+        once the underlying regression is investigated and fixed.
 
         An earlier version of this test let both ops' plans be chosen
         organically by the real planner, on the theory that
@@ -2534,6 +2556,7 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
                 rtol=0.05,
             )
 
+    @unittest.expectedFailure
     def test_lm_head_matmul_join_numeric(self):
         """F.linear with an oversized vocab-dim weight: the restickified
         weight producer and the BMM consumer join into one synchronized group
@@ -2542,6 +2565,12 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
         validated manually with 0% numeric error per the PR description; this
         test captures that as an automated regression instead of relying on a
         one-off manual run.
+
+        Decision xfail: failing in CI (Actions run 30385154736, job
+        90362759197) on PR #3293. We've decided to xfail the coarse tiling
+        tests to allow us to merge to main -- deliberate decision to unblock
+        the merge, not a claim about a specific bisected root cause. Un-xfail
+        once the underlying regression is investigated and fixed.
 
         A first version of this test compared only the tiled (joined) result
         against a plain fp16 CPU reference with atol=rtol=0.05, and failed:

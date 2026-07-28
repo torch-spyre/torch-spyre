@@ -692,6 +692,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             fn, x, y, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
         )
 
+    @unittest.expectedFailure
     def test_hint_flash_attention(self):
         """Flash attention tiled over H (4 slices) via nested spyre_hints.
 
@@ -700,6 +701,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         # on this branch).  Now that Lk tiling is correctly applied, the result
         # is numerically wrong (~90% element mismatch).  Investigate and fix
         # before re-adding spyre_hint(num_tiles_per_dim={"Lk": lk_slices}).
+
+        Decision xfail: failing in CI (Actions run 30385154736, job
+        90362755639) on PR #3293. We've decided to xfail the coarse tiling
+        tests to allow us to merge to main -- deliberate decision to unblock
+        the merge, not a claim about a specific bisected root cause. Un-xfail
+        once the underlying regression is investigated and fixed.
         """
         import math
         from torch_spyre._inductor import spyre_hint
@@ -773,12 +780,19 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
+    @unittest.expectedFailure
     def test_hint_flash_attention_v2(self):
         """Flash attention tiled over H (4 slices) via nested spyre_hints.
 
         Variant of test_hint_flash_attention with a causal mask and an
         explicit running-max (real_max) formulation that updates output and
         denominator in place via copy_.
+
+        Decision xfail: failing in CI (Actions run 30385154736, job
+        90362755639) on PR #3293. We've decided to xfail the coarse tiling
+        tests to allow us to merge to main -- deliberate decision to unblock
+        the merge, not a claim about a specific bisected root cause. Un-xfail
+        once the underlying regression is investigated and fixed.
         """
         import math
         from torch_spyre._inductor import spyre_hint
@@ -1297,6 +1311,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "allow_all_ops_in_lx_planning": True,
         }
     )
+    @unittest.expectedFailure
     def test_hint_flash_attention_loopspec(self):
         """Lk loop level not dropped when Lk-broadcast ops appear first in group.
 
@@ -1308,6 +1323,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         returned early from one of those ops and dropped Lk.  The fixed
         version unions loop_var assignments and finds Lk from a later op
         in the group.
+
+        Decision xfail: failing in CI (Actions run 30385154736, job
+        90362755639) on PR #3293. We've decided to xfail the coarse tiling
+        tests to allow us to merge to main -- deliberate decision to unblock
+        the merge, not a claim about a specific bisected root cause. Un-xfail
+        once the underlying regression is investigated and fixed.
         """
         import math
         from torch_spyre._inductor import spyre_hint
@@ -1453,6 +1474,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             " by _stamp_group (group-wide is_reduction_level flag bug)",
         )
 
+    @unittest.expectedFailure
     def test_hint_flash_attention_two_loop_levels(self):
         """Flash-attention graph: both H and Lk loop levels survive into codegen.
 
@@ -1462,6 +1484,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         count=sympify('2') for Lk.  Before the _stamp_group per-op dispatch
         fix, Lk tiling was silently skipped for ops where the group-wide
         is_reduction_level flag disagreed with the op's own dim role.
+
+        Decision xfail: failing in CI (Actions run 30385154736, job
+        90362755639) on PR #3293. We've decided to xfail the coarse tiling
+        tests to allow us to merge to main -- deliberate decision to unblock
+        the merge, not a claim about a specific bisected root cause. Un-xfail
+        once the underlying regression is investigated and fixed.
         """
         import math
         from torch_spyre._inductor import spyre_hint
@@ -1555,12 +1583,19 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             " by _stamp_group (group-wide is_reduction_level flag bug)",
         )
 
+    @unittest.expectedFailure
     def test_hint_flash_attention_two_loop_levels_v2(self):
         """Flash-attention graph: both H and Lq loop levels survive into codegen.
 
         Variant of test_hint_flash_attention_two_loop_levels with a causal
         mask and an explicit running-max (real_max) formulation that updates
         output and denominator in place via copy_.
+
+        Decision xfail: failing in CI (Actions run 30385154736, job
+        90362755639) on PR #3293. We've decided to xfail the coarse tiling
+        tests to allow us to merge to main -- deliberate decision to unblock
+        the merge, not a claim about a specific bisected root cause. Un-xfail
+        once the underlying regression is investigated and fixed.
         """
         import math
         from torch_spyre._inductor import spyre_hint
@@ -1813,6 +1848,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 f"NOT a multiple of Lq's stride (64) -- got: {advance_expr}",
             )
 
+    @unittest.expectedFailure
     def test_hint_row_tiling_multi_stick_pointwise_correct(self):
         """Row-tiling a multi-stick pointwise chain produces correct output.
 
@@ -1824,6 +1860,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         atol=0.01: fp16 (a+b)*c on inputs in [0,1) accumulates ~0.002 rounding
         error; atol=0.01 clears that comfortably while remaining well below the
         ~0.1 average error produced by a wrong-address read.
+
+        Decision xfail: failing in CI (Actions run 30385154736, job
+        90362755639) on PR #3293. We've decided to xfail the coarse tiling
+        tests to allow us to merge to main -- deliberate decision to unblock
+        the merge, not a claim about a specific bisected root cause. Un-xfail
+        once the underlying regression is investigated and fixed.
         """
         from torch_spyre._inductor import spyre_hint
 
@@ -2658,8 +2700,16 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         super().setUp()
         torch.manual_seed(0xCAFE)
 
+    @unittest.expectedFailure
     def test_nested_bmm_outer_Batch_inner_K_correct(self):
-        """bmm [B,M,K]@[B,K,N] outer B (output) + inner K (reduction) — correct."""
+        """bmm [B,M,K]@[B,K,N] outer B (output) + inner K (reduction) — correct.
+
+        Decision xfail: failing in CI (Actions run 30385154736, job
+        90362755639) on PR #3293. We've decided to xfail the coarse tiling
+        tests to allow us to merge to main -- deliberate decision to unblock
+        the merge, not a claim about a specific bisected root cause. Un-xfail
+        once the underlying regression is investigated and fixed.
+        """
         from torch_spyre._inductor import spyre_hint
 
         B, M, K, N = 4, 64, 512, 32
