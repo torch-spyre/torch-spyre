@@ -42,7 +42,7 @@ inputs:
   stall_timeout_secs:
     description: Seconds of no stdout before the test is killed as hung
     required: false
-    default: '300'
+    default: '600'
   stall_check_interval:
     description: How often (seconds) the stall watcher polls
     required: false
