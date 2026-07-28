@@ -1157,6 +1157,7 @@ def generate_sdsc(
                 "coreFoldProp_": {"factor_": sdsc_spec.num_cores, "label_": "core"},
                 "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
                 "numCoresUsed_": sdsc_spec.num_cores,
+                "numCoreletsUsed_": 1,
                 "coreIdToDsc_": {str(c): 0 for c in range(sdsc_spec.num_cores)},
                 "numWkSlicesPerDim_": {
                     str(dim): num_wk_slices
