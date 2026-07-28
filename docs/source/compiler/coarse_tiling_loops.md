@@ -448,23 +448,16 @@ Key observations:
   `y` is
   produced and fully consumed within the same tile iteration, no HBM
   allocation is needed.
-- The final output `z` (output of `mul`) has no inside consumers, but
-  `mul`'s own input `y` is itself a loop-internal, tile-sized producer
-  (`buf0`), so `_has_loop_internal_real_input` forces `insert_tiling_propagation`
-  down the **Case 2** (copy-op) path — the row-2 variant that fires with zero
-  inside consumers of `z` — rather than Case 3.  Concretely, `mul` writes its
-  per-tile result into its own small buffer, and a separate loop-tagged
-  `identity` op (the third `OpSpec` above, generated from
-  `coarse_tile_copy_buf1`) copies each tile into the correct slice of `z`'s
-  own, separately-allocated full HBM buffer (`allocation={'hbm': ...}`,
-  `arg_index=3`).  Because `mul`'s own small buffer is fully drained by that
-  copy op every iteration before the next iteration overwrites it, it is
-  loop-internal scratch by construction regardless of *why* it took the
-  copy-op path — `_propagate_tiled_op` stamps `per_tile_fixed=True` on it
-  directly inside that branch (`coarse_tile.py`'s own code-level comments
-  call this branch "Case 1", using a different two-way split on treatment
-  rather than the doc's topology-based rows — see the note above), and
-  `scratchpad_planning` places it in
+- The final output `z` (output of `mul`) has no inside consumers, so it
+  takes the **Case 2** (copy-op) path: `mul` writes its per-tile result into
+  its own small buffer, and a separate loop-tagged `identity` op (the third
+  `OpSpec` above, generated from `coarse_tile_copy_buf1`) copies each tile
+  into the correct slice of `z`'s own, separately-allocated full HBM buffer
+  (`allocation={'hbm': ...}`, `arg_index=3`).  Because `mul`'s own small
+  buffer is fully drained by that copy op every iteration before the next
+  iteration overwrites it, it is loop-internal scratch by construction.
+  `_propagate_tiled_op` stamps `per_tile_fixed=True` on it directly inside
+  the copy-op branch, and `scratchpad_planning` places it in
   `lx` (address 0, aliasing `y`'s slot since `y` and `mul`'s output are never
   live at the same time within scratchpad's allocator).  The identity copy is
   still the op whose `MutationLayoutSHOULDREMOVE` targets the full buffer; the
@@ -953,45 +946,68 @@ tile), the loop body reads from full HBM tensors using tile-sized windows
 via `affine.apply` — no conversion, just addressing.  Only producer-side
 crossings need adaptation.
 
-For each tiled `ComputedBuffer`, the pass classifies by consumer *and
-input* topology and applies the cheapest treatment that maintains
-correctness:
+For each tiled `ComputedBuffer`, the pass classifies by consumer topology
+and applies one of two treatments:
 
-| Case | Inside consumers | Outside consumers | Loop-internal real input | Treatment |
-|---|---|---|---|---|
-| 1 | ✓ | ✗ | — | Mark `per_tile_fixed` — flag only, no IR change |
-| 2 | ✓ | ✓ | — | Allocate full HBM buffer; insert a loop-tagged copy op that publishes each tile into the correct slice |
-| 2 | ✗ | ✓ | ✓ | Same as above — a loop-internal real *input* forces the copy-op path even with zero inside consumers of this op's own output |
-| 3 | ✗ | ✓ | ✗ | Rewire the tiled op to write directly into a full HBM buffer via `MutationLayoutSHOULDREMOVE` — a metadata redirect, zero added data movement |
+| Case | Inside consumers | Outside consumers | Treatment |
+|---|---|---|---|
+| 1 | ✓ | ✗ | Mark `per_tile_fixed` — flag only, no IR change |
+| 2 | any | ✓ | Allocate full HBM buffer; insert a loop-tagged copy op that publishes each tile into the correct slice |
 
-The third row is not a corner case worth ignoring: the trigger is
-`_has_loop_internal_real_input(op, ...)` — true when *any* real
-(non-`SpyreConstantFallback`) input of `op` is itself a `ComputedBuffer`
-stamped with `loop_info` in the same outer loop group. Such an input is a
-tile-sized, loop-internal producer with its own tile-sized candidate
-layouts, which can never be made stick-compatible with a full-size
-`MutationLayoutSHOULDREMOVE` target under `AllSameNode`'s
-stick-compatibility rule. Routing through the copy-op path instead keeps
-the tiled op self-consistent — its own layout and its own real inputs stay
-tile-sized — and reuses the copy op's single-real-input path, which fuses
-the tiled op's own upstream computation via `make_loader()`. Without this
-row, Case 3 (rows 3 and 4's condition as originally stated, "no inside
-consumers → mutate directly") is necessary but not sufficient: an op with
-no inside consumers of its own output but a loop-internal input must still
-route through the copy-op path.
+Every cross-loop-group write, regardless of inside-consumer topology or
+whether any of the op's real inputs are themselves loop-internal, takes
+the copy-op path (Case 2 in this table, "Case 1" in `coarse_tile.py`'s own
+comments and debug logging — see the code-level-naming note below). There
+is no longer a direct-mutation treatment: an earlier version of this pass
+(deleted as part of the unconditional-copy change; see
+`coarse_tile.py`'s git history around the deletion of
+`_has_loop_internal_real_input`) rewired the tiled op itself to write
+directly into the full buffer via `MutationLayoutSHOULDREMOVE` whenever it
+had no inside consumers and no loop-internal real input. That treatment
+had a genuine post-stickify safety gap: `_allocate_full_buffer`'s
+post-stickify branch derives the full buffer's device layout by scaling
+the tiled op's own already-committed output layout, without ever
+consulting the op's *input* layouts, and — unlike the pre-stickify path,
+which goes through `finalize_layouts`'s explicit
+`is_elided`/`is_carry_into_accum` compatibility assert — there was no
+check that an external input's own committed layout was actually
+stick-compatible with the newly-derived, scaled-up full-buffer layout. An
+incompatible case could silently miscompile rather than raise.
 
-This condition (from commit `8ac03da`) is deliberately narrower than an
-earlier version of the same idea, which forced the copy-op path for *any*
-tiled op with more than one real input (`_num_real_inputs(op) > 1`) — that
-rule over-triggered for ops whose several inputs were all external (e.g.
-two graph inputs), producing an unnecessary identity copy. The current rule
-only cares whether an input is loop-internal, not how many inputs there are.
+Splitting every cross-boundary write into two ops (the real op's own
+tile-sized output, then a single-input copy into the full buffer) avoids
+this by construction: the real op only ever has to satisfy its own
+input-derived layout (the same problem the pass already solves correctly
+for ordinary loop-internal ops with no outside consumers at all), and the
+new copy op only ever has to satisfy the full buffer's derived layout
+against its own single, freshly-fixed input — there is no second edge
+whose compatibility can be silently skipped.
 
-**Note on code-level naming**: `coarse_tile.py`'s own comments and debug
-logging call the copy-op path "Case 1" and the mutation path "Case 2" (a
-two-way split on treatment, ignoring the loop-internal/no-IR-change case
-covered separately above) — do not confuse this with the doc's three/four-row
-numbering above, which classifies by topology rather than by treatment.
+An earlier version of this same always-copy idea (predating the
+loop-internal-input narrowing entirely, i.e. before commit `8ac03da`)
+forced the copy-op path for *any* tiled op with more than one real input
+(`_num_real_inputs(op) > 1`); that rule was itself narrowed because it
+over-triggered for ops whose several inputs were all external (e.g. two
+graph inputs), producing what was judged at the time to be an unnecessary
+identity copy. That perf argument is superseded now that the inserted
+copy is understood to be scratchpad-resident (LX planning targets exactly
+this kind of small, tile-sized, loop-internal buffer) — and the prior
+direct-mutation treatment had a secondary cost of its own, forcing the
+real op's output out of scratchpad-reuse eligibility entirely (see
+`_op_output_good_for_lx_reuse`,
+`torch_spyre/_inductor/scratchpad/allocator.py:210-217`, which
+unconditionally excludes `MutationLayoutSHOULDREMOVE` outputs). Under the
+current always-copy rule, the real op's own output is never a mutation
+layout, so it never loses scratchpad eligibility on that account.
+
+**Note on code-level naming**: The operative comment in `coarse_tile.py`
+(`_propagate_tiled_op`, around line 1658) describes a single unconditional
+path: "Every cross-loop-group write always takes the copy-op path: the real
+compute op keeps its own natural, input-derived, tile-sized layout, and a
+separate copy op takes `MutationLayoutSHOULDREMOVE(full_buf)`." The code's
+docstring at lines 1491-1499 still refers to "Case 1" and "Case 2" but this
+is stale — it predates the unconditional-copy consolidation. The single
+operative treatment now corresponds to the doc's Case 2 row above.
 
 **Case 1** is where most of the working-set-reduction win comes from.  An
 intermediate like `y` in the small example flows from one tiled op to
@@ -1015,15 +1031,9 @@ wraps both in the same `CountedLoopSchedulerNode`.  The `tiled_symbols` / `affin
 machinery computes the per-iteration slice offset automatically.  All
 outside consumers are patched to read the full buffer.
 
-**Case 3**: `MutationLayoutSHOULDREMOVE` tells Inductor the op mutates an
-existing storage in-place.  The full buffer's address is encoded in the
-`TensorArg` via the `tiled_symbols` offset; no copy op is needed.  A
-unified treatment that always inserted a copy would handle all three cases
-correctly but waste a copy op here.
-
-**Case 3 also needs "which supertile" recoverable at codegen time, since
-Inductor's IR has no side channel for it.**  The direct rewire in this row
-leaves the op's own `inner_fn` completely untouched (per the wrap-never-
+**Which supertile?** Case 2's copy op needs "which supertile" recoverable at
+codegen time, since Inductor's IR has no side channel for it.  The original
+tiled op leaves its own `inner_fn` completely untouched (per the wrap-never-
 reconstruct convention — see the [IR-rewiring
 appendix](#appendix-how-ir-rewiring-works-and-why-its-sound)), so the op's
 write index is still computed against its own tile-local `ranges`.  Which
@@ -1094,9 +1104,9 @@ both already iterating per arg:
   This replaces a reverse-engineering step (deriving the same fact from
   `device_coordinates`) that silently reads the wrong slot when
   `_get_device_dim_order`'s coordinate walk happens to place the stick
-  dimension differently for a mutated (Case 3) arg than for its sibling
+  dimension differently for a copy-op output arg than for its sibling
   input args. `device_coordinates` cannot represent "which supertile" for
-  a Case 3 arg at all, so no downstream mechanism can correct a wrong
+  a copy-op arg at all, so no downstream mechanism can correct a wrong
   compile-time base offset — this is why the override survives here even
   though the harder problem (below) is already per-arg by construction.
   For each minted level symbol present in `op_spec.tiled_symbols`,
@@ -1136,16 +1146,15 @@ it** — for Case 2 (the copy-op path), `_insert_copy_op` builds its own,
 separate `ComputedBuffer` (`coarse_tile_copy_*`) with its own
 `MutationLayoutSHOULDREMOVE` layout; whether its `TensorArg`s end up with a
 nonzero `device_tile_advance_expr` depends on whether `loop_info` on that
-copy op itself records tiled dims for the relevant dependency, not on
-which Case inserted it.  The [Small Example](#small-example) above takes
-this Case 2 path for `coarse_tile_copy_buf1`, and its `bundle.mlir` affine
-map is already correct via the ordinary `tiled_symbols`/`affine.apply`
-machinery described under Case 2, independent of
-`device_tile_advance_expr`.  `test_hint_nested_tiling_copy_mutation_correct`
-(`tests/inductor/test_coarse_tile_e2e.py`) exercises a `c.copy_(a + b)`
-direct mutation on a 2-D `[Lq, D]` tensor with no copy op inserted, so
-`add` itself takes Case 3 and relies on `device_tile_advance_expr` for its
-base offset.
+copy op itself records tiled dims for the relevant dependency. The
+[Small Example](#small-example) above takes this Case 2 path for
+`coarse_tile_copy_buf1`, and its `bundle.mlir` affine map is already
+correct via the ordinary `tiled_symbols`/`affine.apply` machinery
+described under Case 2, independent of `device_tile_advance_expr`.
+Tests like `test_hint_nested_tiling_copy_mutation_correct`
+(`tests/inductor/test_coarse_tile_e2e.py`) now exercise the copy-op path
+with nested tiling where the copy op itself needs `device_tile_advance_expr`
+for its base offset calculation.
 
 **The same multi-level-shared-host-dim pattern also covers a flattened 1-D
 `[Lq * D]` tensor**, tracked by `test_hint_nested_tiling_copy_mutation_flat`
@@ -1544,9 +1553,7 @@ level.
 
 `TensorArg.device_tile_advance_expr` is a single `sympy.Expr | None`,
 computed independently for **each** `TensorArg` (not shared across the
-op's `args`) by `SpyreKernel._general_tile_advance` — see [Case 3 also
-needs "which supertile" recoverable at codegen
-time](#treatment-by-consumer-topology) above for how each arg's own
+op's `args`) by `SpyreKernel._general_tile_advance` — see [Which supertile?](#treatment-by-consumer-topology) above for how each arg's own
 expression is derived and consumed; it is `None` for any arg whose
 dependency has no tiled `(dim, extent)` pairs recorded on it. Its free
 symbols are the minted, per-`(op, level)` `_tile_adv_{op_name}_lvl{level}`
@@ -2147,11 +2154,11 @@ made stick-compatible without an intermediate buffer sized to match.
 
 ### `MutationLayoutSHOULDREMOVE`: the real contract
 
-The doc above uses `MutationLayoutSHOULDREMOVE` several times (Case 3, and
-both the flat and nested reduction accum patterns) as an already-understood
-primitive, each time asserting it is "a metadata redirect, zero added data
-movement." This subsection explains why that claim is true, from the actual
-upstream implementation (`torch/_inductor/ir.py:4373-4459`):
+The doc above uses `MutationLayoutSHOULDREMOVE` several times (the copy-op
+output in Case 2, and both the flat and nested reduction accum patterns) as
+an already-understood primitive, each time asserting it is "a metadata
+redirect, zero added data movement." This subsection explains why that claim
+is true, from the actual upstream implementation (`torch/_inductor/ir.py:4373-4459`):
 
 ```python
 class MutationLayoutSHOULDREMOVE(Layout):
@@ -2221,8 +2228,7 @@ onto a target that already carries one:
 
 | Site | File:line | Target |
 |---|---|---|
-| Case 3 direct mutation | `coarse_tile.py:631` | full HBM buffer |
-| `_insert_copy_op` | `coarse_tile.py:1187-1252` | full buffer (copy-out) |
+| `_insert_copy_op` | `coarse_tile.py:1963-2046` | full buffer (copy-out) |
 | `_insert_combine_op` | `coarse_tile.py:1383-1442` | `accum_full`/`accum_tile` (per-tile combine) |
 | `_insert_reduction_copy_op` | `coarse_tile.py:1444-1499` | `accum_full` (nested-tiling copy-out) |
 | fill op inside `_propagate_tiled_reduction_op` | `coarse_tile.py:1650-1666` | fill target (identity-value seed) |
