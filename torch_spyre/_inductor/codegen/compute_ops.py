@@ -17,6 +17,7 @@ import dataclasses
 
 from torch_spyre._C import encode_constant, DataFormats
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.pass_utils import coeff_through_floor
 from sympy import Symbol
 
 
@@ -499,7 +500,7 @@ def _tensor_tiled_by_symbol(tensor, sym) -> bool:
         return False
     if tensor.device_tile_advance_expr is None:
         return False
-    return bool(tensor.device_tile_advance_expr.coeff(sym))
+    return bool(coeff_through_floor(tensor.device_tile_advance_expr, sym))
 
 
 def generate_sdsc(
@@ -772,7 +773,7 @@ def generate_sdsc(
                 tensor_advances_at_some_level = (
                     tensor.device_tile_advance_expr is not None
                     and any(
-                        tensor.device_tile_advance_expr.coeff(s)
+                        coeff_through_floor(tensor.device_tile_advance_expr, s)
                         for level_syms in tiled_symbols
                         for s in level_syms
                     )
@@ -860,7 +861,7 @@ def generate_sdsc(
                     strides_for_level: dict = {}
                     for s in tensor_tiled_at_level:
                         coeff = (
-                            tensor.device_tile_advance_expr.coeff(s)
+                            coeff_through_floor(tensor.device_tile_advance_expr, s)
                             if tensor.device_tile_advance_expr is not None
                             else 0
                         )

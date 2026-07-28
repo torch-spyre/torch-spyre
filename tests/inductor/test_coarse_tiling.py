@@ -2546,6 +2546,64 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
         self.assertEqual(per_level[1].get(lvl1), 32 * nb)
         self.assertNotEqual(per_level[0].get(lvl0), per_level[1].get(lvl1))
 
+    def test_generate_sdsc_floor_wrapped_tile_advance_produces_stride(self):
+        """Real stick-layout tensors wrap their tile-advance term in
+        floor() (views.tiling_expr_to_device_expr) -- generate_sdsc must
+        still detect the tensor as tiled and extract the correct byte
+        stride, not silently treat it as non-advancing (the exact bug
+        Task 6 of the deferred-tile-advance-capture plan found and
+        deferred)."""
+        d0 = Symbol("d0")
+        lvl0 = Symbol("_tile_adv_add_lvl0")
+        # floor() wrapping is what views.tiling_expr_to_device_expr emits
+        # when a level's host-stride step isn't a multiple of the device
+        # dim's own stride_map entry; coeff(lvl0) on this expr is 0 via
+        # plain sympy .coeff(), which is exactly the bug this task fixes.
+        tile_advance_expr = sympy.floor(64 * lvl0)
+        tensor = SDSCArgs(
+            layout="A",
+            dim_order=[d0],
+            data_format=_FP16,
+            scales={d0: 1},
+            strides={d0: 1},
+            offsets={d0: 0},
+            max_dim_sizes={d0: -1},
+            allocation={"hbm": 0x1000},
+            start_address=0,
+            backGap={},
+            arg_index=0,
+            device_tile_advance_expr=tile_advance_expr,
+        )
+        sdsc_spec = SDSCSpec(
+            opfunc="add",
+            execution_unit="sfp",
+            data_format=_FP16,
+            num_inputs=1,
+            iteration_space={d0: 256},
+            num_cores=1,
+            work_slices={d0: 1},
+            core_id_to_work_slice={d0: Integer(0)},
+            padding={},
+            layouts={"A": {"dim_order": [d0], "stick_dim_order": d0, "stick_size": 64}},
+            args=[tensor],
+            constants={},
+            coordinate_masking={},
+        )
+        symbols: list[int] = []
+        _, _, affine_strides, _ = generate_sdsc(
+            0,
+            sdsc_spec,
+            symbols,
+            symbol_id_offset=0,
+            tiled_symbols=[[lvl0]],
+            use_symbols=True,
+        )
+        self.assertEqual(len(affine_strides), 1)
+        per_level = affine_strides[0]
+        self.assertEqual(len(per_level), 1)
+        nb = 2  # fp16 byte size
+        self.assertEqual(per_level[0].get(lvl0), 64 * nb)
+
 
 class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
     def _make_3d_op_spec(self) -> OpSpec:
@@ -2753,6 +2811,73 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
             # that's symbolically split) purely from this coefficient, since
             # str(minted) can never equal "mb".
             device_tile_advance_expr=256 * minted,
+        )
+        sdsc_spec = SDSCSpec(
+            opfunc="add",
+            execution_unit="sfp",
+            data_format=_FP16,
+            num_inputs=1,
+            iteration_space={mb: 1024},
+            num_cores=8,
+            work_slices={mb: 8},
+            core_id_to_work_slice={mb: Integer(0)},
+            padding={},
+            layouts={"A": {"dim_order": [mb], "stick_dim_order": mb, "stick_size": 64}},
+            args=[tensor],
+            constants={},
+            coordinate_masking={},
+            symbolic_dims={"mb": ("s0", 64, 1024)},
+        )
+        symbols: list[int] = []
+        with self.assertRaises(Unsupported):
+            generate_sdsc(
+                0,
+                sdsc_spec,
+                symbols,
+                symbol_id_offset=0,
+                tiled_symbols=[[minted]],
+                use_symbols=True,
+            )
+
+    def test_tiled_on_split_dim_detects_floor_wrapped_minted_symbol(self):
+        """tiled_on_split_dim's tensor_advances_at_some_level check must
+        detect a minted symbol's advance even when device_tile_advance_expr
+        wraps it in floor() -- plain .coeff() returns 0 for that shape,
+        which would let this Unsupported guard silently fail to fire.
+
+        Adapted from test_minted_symbol_tiled_on_symbolic_split_dim_raises_
+        Unsupported immediately above: same fixture shape (a tensor tiled
+        via a minted symbol on the same dim that's symbolically split
+        across cores), with the sole difference that
+        device_tile_advance_expr wraps the minted symbol's term in
+        floor(), exactly as views.tiling_expr_to_device_expr emits it for
+        a real stick-layout tensor. Goes through generate_sdsc directly
+        (not compile_op_spec/OpSpec) because tiled_on_split_dim's guard --
+        and the SDSCSpec.symbolic_dims/_symbolic_split_info machinery it
+        depends on -- lives in generate_sdsc; that is also the path the
+        sibling raises-Unsupported test above exercises.
+        """
+        mb = Symbol("mb")
+        minted = Symbol("_tile_adv_add_lvl0")
+        tensor = SDSCArgs(
+            layout="A",
+            dim_order=[mb],
+            data_format=_FP16,
+            scales={mb: 1},
+            strides={mb: 256},
+            offsets={mb: 0},
+            max_dim_sizes={mb: -1},
+            allocation={"hbm": 0x1000},
+            start_address=0,
+            backGap={},
+            arg_index=0,
+            # Same combined coefficient as the plain-Mul sibling fixture
+            # (256 on the minted symbol), but wrapped in floor() -- the
+            # shape views.tiling_expr_to_device_expr actually emits.
+            # Plain sympy .coeff() returns 0 for this shape, which would
+            # make tensor_advances_at_some_level (and therefore
+            # tiled_on_split_dim) silently False here.
+            device_tile_advance_expr=sympy.floor(256 * minted),
         )
         sdsc_spec = SDSCSpec(
             opfunc="add",
