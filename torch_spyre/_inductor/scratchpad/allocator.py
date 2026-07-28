@@ -468,7 +468,7 @@ class ScratchpadAllocator:
                 self._set_one_allocation(buf, b.address)
 
     def _set_one_allocation(self, buf: TensorBox | ComputedBuffer, address: int):
-        return
+
         layout = buf.get_layout()
         layout.allocation["lx"] = address
 
