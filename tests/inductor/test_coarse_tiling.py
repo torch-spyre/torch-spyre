@@ -2776,6 +2776,102 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
             f"the minted symbol; got {tiled_symbols_per_level}.",
         )
 
+    def test_sdsc_dim_advance_detects_floor_wrapped_minted_symbol(self):
+        """superdsc._create_sdsc_tensors's sdsc_dim_advance computation
+        must extract a tile_size from a floor-wrapped minted symbol's
+        device_tile_advance_expr, not silently skip it (the same bug
+        class as compute_ops.py's _tensor_tiled_by_symbol, in the
+        sibling backGap/base-offset computation)."""
+        minted = Symbol("_tile_adv_add_lvl0")
+        op_spec = _make_tiled_op_spec()
+        # _make_tiled_op_spec's own tensor(s) carry device_tile_advance_expr
+        # in terms of the real dim symbol (see Task 6's fixture repair in
+        # task-6-report.md) -- swap it for a floor-wrapped minted symbol to
+        # exercise this task's fix.
+        op_spec.tiled_symbols = [[minted]]
+        for arg in op_spec.args:
+            if arg.device_tile_advance_expr is not None:
+                arg.device_tile_advance_expr = sympy.floor(64 * minted)
+        symbols: list[int] = []
+        # Must not raise, and must not silently produce empty affine_strides.
+        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        has_strides = any(
+            any(len(level_d) > 0 for level_d in per_level)
+            for per_level in affine_strides
+        )
+        self.assertTrue(
+            has_strides,
+            f"Expected non-empty affine_strides; got {affine_strides}.",
+        )
+        # NOTE: affine_strides above is computed entirely by
+        # compute_ops.generate_sdsc (already fixed independently in the
+        # prior commit) and does not depend on this task's superdsc.py
+        # line -- _create_sdsc_tensors's sdsc_dim_advance dict is keyed by
+        # symbol_mapping[sym], and with a *minted* tiled symbol that key is
+        # the minted symbol itself, never a device dim in dim_order, so the
+        # `dim in sdsc_dim_advance` branch this task's fix feeds is
+        # structurally unreachable for this fixture shape (confirmed by
+        # running this exact assertion with the pre-fix `.coeff(sym)` --
+        # it still passes). See
+        # test_sdsc_dim_advance_backgap_uses_floor_wrapped_coefficient
+        # below for a fixture that actually distinguishes the two.
+
+    def test_sdsc_dim_advance_backgap_uses_floor_wrapped_coefficient(self):
+        """Direct regression test for the superdsc.py line this task fixes.
+
+        _create_sdsc_tensors's sdsc_dim_advance branch (~line 448) is only
+        consulted when `dim in sdsc_dim_advance`, which requires
+        symbol_mapping[sym] to equal an actual device dim in dim_order --
+        true for a *real* tiled dim symbol (e.g. "out"), never for a
+        minted level symbol (see the note in the test above). It is also
+        only observable in the emitted SDSC (via backGapCore_) when the
+        tile is a genuine sub-slice of a larger extent, i.e.
+        supertile_count = tiled_symbol_trip_counts[sym] > 1 and the
+        tensor's device_size exceeds one tile along that dim -- this
+        fixture sets both up explicitly (device_size doubled to 128,
+        trip count 2), unlike _make_tiled_op_spec's default (trip count 1,
+        no supertile). With a floor-wrapped device_tile_advance_expr on
+        "out" and the buggy plain `.coeff()`, the coefficient silently
+        comes back 0, sdsc_dim_advance stays empty, and backGapCore_ is
+        omitted entirely from the SDSC JSON -- a silently wrong (missing)
+        base-offset/backGap for every tile past the first.
+        """
+        out = Symbol("out")
+        op_spec = _make_tiled_op_spec()
+        op_spec.tiled_symbols = [[out]]
+        op_spec.tiled_symbol_trip_counts = {out: 2}
+        for arg in op_spec.args:
+            # Double the stick-dim device_size so the tile (64 elements,
+            # from device_tile_advance_expr below) is half the full
+            # extent -- i.e. dev_dim_size (128) > it_dim_size (64),
+            # the condition that makes backGap/offsets nonempty.
+            arg.device_size = [2, 128]
+            if arg.device_tile_advance_expr is not None:
+                arg.device_tile_advance_expr = sympy.floor(64 * out)
+        symbols: list[int] = []
+        sdsc_json, _, _, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        found_backgap = False
+        for entry in sdsc_json.values():
+            for dsc in entry.get("dscs_", []):
+                for op_dsc in dsc.values():
+                    for node in op_dsc.get("scheduleTree_", []):
+                        back_gap = node.get("backGapCore_", {})
+                        if "out" in back_gap:
+                            found_backgap = True
+                            self.assertEqual(
+                                back_gap["out"].get("-1"),
+                                "128",
+                                f"Expected backGapCore_['out']['-1'] == "
+                                f"'128' (dev_dim_size - it_dim_size = "
+                                f"128 - 0, byte units); got {back_gap}.",
+                            )
+        self.assertTrue(
+            found_backgap,
+            "Expected backGapCore_['out'] present in the emitted SDSC JSON "
+            "-- its absence means sdsc_dim_advance was silently left empty "
+            f"by a floor-wrapped coefficient extraction bug; got {sdsc_json}.",
+        )
+
     def test_minted_symbol_tiled_on_symbolic_split_dim_raises_unsupported(self):
         """A tensor tiled (via a minted symbol) on the same dim that's
         symbolically split across cores must still raise Unsupported --

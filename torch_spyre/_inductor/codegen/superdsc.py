@@ -50,6 +50,7 @@ from torch_spyre._inductor.op_spec import (
     TensorArg,
 )
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch_spyre._inductor.pass_utils import coeff_through_floor
 
 from .compute_ops import SymbolKind, generate_sdsc, num_bytes
 
@@ -445,7 +446,7 @@ def _create_sdsc_tensors(
                 for sym in level_syms:
                     if sym not in symbol_mapping:
                         continue
-                    coeff = arg.device_tile_advance_expr.coeff(sym)
+                    coeff = coeff_through_floor(arg.device_tile_advance_expr, sym)
                     if not coeff:
                         continue
                     tile_size = int(coeff) * arg_elem_bytes
