@@ -2228,7 +2228,7 @@ onto a target that already carries one:
 
 | Site | File:line | Target |
 |---|---|---|
-| `_insert_copy_op` | `coarse_tile.py:1963-2046` | full buffer (copy-out) |
+| `_insert_copy_op` | `coarse_tile.py:1963-2026` | full buffer (copy-out) |
 | `_insert_combine_op` | `coarse_tile.py:1383-1442` | `accum_full`/`accum_tile` (per-tile combine) |
 | `_insert_reduction_copy_op` | `coarse_tile.py:1444-1499` | `accum_full` (nested-tiling copy-out) |
 | fill op inside `_propagate_tiled_reduction_op` | `coarse_tile.py:1650-1666` | fill target (identity-value seed) |
