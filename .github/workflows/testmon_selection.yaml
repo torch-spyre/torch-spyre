@@ -141,11 +141,11 @@ on:
         type: string
         default: full
       ref:
-        description: 'Git ref (branch, tag, or SHA) to checkout. Defaults to the triggering commit.'
+        description: Git ref (branch, tag, or SHA) to checkout. Defaults to the triggering commit.
         required: false
         type: string
       repository:
-        description: 'Repository (owner/repo) to checkout, for testing a fork. Defaults to this repository.'
+        description: Repository (owner/repo) to checkout, for testing a fork. Defaults to this repository.
         required: false
         type: string
 
@@ -376,7 +376,7 @@ jobs:
       - name: Clean stale build cache and artifacts
         run: |
           cd torch-spyre
-          rm -rf build/ dist/ *.egg-info/ .pytest_cache/
+          rm -rf build/ dist/ ./*.egg-info/ .pytest_cache/
           find . -name "*.pyc" -delete
           find . -name "__pycache__" -delete
 
