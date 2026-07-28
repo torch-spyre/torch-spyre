@@ -6,8 +6,8 @@ on:
   #   tags: ['*']
   # pull_request:
   #   branches: [main]
-  merge_group:
-    types: [checks_requested]
+  # merge_group:
+  #   types: [checks_requested]
   workflow_dispatch:
     inputs:
       ref:
