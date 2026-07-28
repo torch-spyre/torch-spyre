@@ -69,7 +69,8 @@ from torch_spyre._inductor.constants import (
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.loop_info import CoarseTileInfo
+from torch_spyre._inductor.loop_info import CoarseTileInfo, copy_op_metadata
+from torch_spyre._inductor.pass_utils import coeff_through_floor
 from torch_spyre._inductor.wsr.coarse_tile import (
     _LOOPS_FREE_SYMS_KEY,
     _REDUCTION_FREE_SYMS_KEY,
@@ -6323,6 +6324,78 @@ class TestHintsToCoarseTileGroupsLogging(unittest.TestCase):
             f"(loop_var=None for hint_id=2 on group_ops[0]); "
             f"got: {scopes_line!r}",
         )
+
+
+class TestCopyOpMetadataAttrCoverage(unittest.TestCase):
+    """Unit test for loop_info.py's _SPYRE_METADATA_ATTRS coverage."""
+
+    def test_copy_op_metadata_no_longer_carries_old_attr_name(self):
+        src = SimpleNamespace()
+        src._coarse_tile_dim_advance = [{0: (64, 4)}]
+        dst = SimpleNamespace()
+        copy_op_metadata(src, dst)
+        self.assertFalse(hasattr(dst, "_coarse_tile_dim_advance"))
+
+
+class TestCoeffThroughFloor(unittest.TestCase):
+    """Unit tests for pass_utils.coeff_through_floor.
+
+    coeff_through_floor extends sympy.Expr.coeff(sym) to also find sym's
+    coefficient when sym only appears inside a floor(...) wrapper -- the
+    shape device_tile_advance_expr takes for stick-layout tensors (see
+    views.tiling_expr_to_device_expr). Plain sympy.Expr.coeff(sym) returns 0
+    for a symbol wrapped in floor(), even though it is a genuine free symbol.
+    """
+
+    def test_plain_mul_term_matches_coeff(self):
+        """Non-floor-wrapped case: behaves exactly like .coeff(sym)."""
+        s = Symbol("s")
+        expr = 64 * s
+        self.assertEqual(coeff_through_floor(expr, s), 64)
+        self.assertEqual(coeff_through_floor(expr, s), expr.coeff(s))
+
+    def test_floor_wrapped_term_extracts_coeff(self):
+        """The exact shape from Task 6's investigation:
+        floor(65536*sym) -- plain .coeff(sym) returns 0 here, this must
+        return 65536."""
+        s = Symbol("_tile_adv_op0_lvl0")
+        expr = floor(65536 * s)
+        self.assertEqual(expr.coeff(s), 0)  # the bug this helper fixes
+        self.assertEqual(coeff_through_floor(expr, s), 65536)
+
+    def test_multi_level_sum_with_one_floor_wrapped_term(self):
+        """device_tile_advance_expr is a sum of one term per level; only
+        the symbol actually queried should be extracted, regardless of
+        whether its own term or a sibling term is floor-wrapped."""
+        lvl0 = Symbol("_tile_adv_add_lvl0")
+        lvl1 = Symbol("_tile_adv_add_lvl1")
+        expr = floor(65536 * lvl0) + 32 * lvl1
+        self.assertEqual(coeff_through_floor(expr, lvl0), 65536)
+        self.assertEqual(coeff_through_floor(expr, lvl1), 32)
+
+    def test_symbol_absent_returns_zero(self):
+        s = Symbol("s")
+        other = Symbol("other")
+        expr = 64 * other
+        self.assertEqual(coeff_through_floor(expr, s), sympy.S.Zero)
+
+    def test_floor_wrapped_non_integer_coeff_raises_unsupported(self):
+        """Tiles are always a whole number of sticks, so floor()'s
+        division inside device_tile_advance_expr must always be exact.
+        A non-integer extracted coefficient means an earlier pass or
+        spyre_hint produced an invalid sub-stick tile boundary -- this
+        must fail loudly, not silently truncate via int()."""
+        s = Symbol("s")
+        expr = floor(4 * s / 3)  # 4/3 does not reduce to an integer
+        with self.assertRaises(Unsupported):
+            coeff_through_floor(expr, s)
+
+    def test_floor_wrapped_integer_reducing_division(self):
+        """floor(k*sym/d) where d evenly divides k must return the
+        reduced integer coefficient, not raise."""
+        s = Symbol("s")
+        expr = floor(128 * s / 2)
+        self.assertEqual(coeff_through_floor(expr, s), 64)
 
 
 if __name__ == "__main__":
