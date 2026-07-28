@@ -5,6 +5,8 @@ name: upstream-pytorch-tests-beta
 # others. No test_type input here, so no trunk wiring beyond this label.
 on:
   # Run automatically on every merge to main
+  pull_request:
+    branches: [main]
   push:
     branches: [main]
     paths-ignore:
