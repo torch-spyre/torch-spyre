@@ -2450,18 +2450,11 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
             "ignore_span_overflow_hints": False,
         }
     )
-    @unittest.expectedFailure
     def test_pointwise_to_non_matmul_reduction_join_numeric(self):
         """A plain ``sum`` reduction that joins its tiled pointwise producer's
         group (the join this PR extends from matmul-only to any reduction)
         must produce numerically correct results, not just a plausible-looking
         LoopSpec.
-
-        Decision xfail: failing in CI (Actions run 30385154736, job
-        90362759197) on PR #3293. We've decided to xfail the coarse tiling
-        tests to allow us to merge to main -- deliberate decision to unblock
-        the merge, not a claim about a specific bisected root cause. Un-xfail
-        once the underlying regression is investigated and fixed.
 
         An earlier version of this test let both ops' plans be chosen
         organically by the real planner, on the theory that

@@ -642,7 +642,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "allow_all_ops_in_lx_planning": True,
         }
     )
-    @unittest.expectedFailure
     def test_hint_softmax_row_tiling(self):
         """spyre_hint(num_tiles_per_dim={"NROW": 4}) tiles softmax over the row dimension.
 
@@ -651,12 +650,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         shrinks the row-stride dimension corrupts all stick groups after the
         first in each non-first tile.  atol=0.02 is tight enough to catch
         values from the wrong row (fp16 errors from random inputs exceed 0.5).
-
-        Decision xfail: failing in CI (Actions run 30385154736, job
-        90362755639) on PR #3293. We've decided to xfail the coarse tiling
-        tests to allow us to merge to main -- deliberate decision to unblock
-        the merge, not a claim about a specific bisected root cause. Un-xfail
-        once the underlying regression is investigated and fixed.
         """
         from torch_spyre._inductor import spyre_hint
 
@@ -677,16 +670,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Matmul with row-tiling: tile the M dimension of x @ y
     # ------------------------------------------------------------------
 
-    @unittest.expectedFailure
     def test_hint_matmul_row_tiling(self):
-        """spyre_hint(num_tiles_per_dim={"M": 4}) tiles matmul over the row (M) dimension.
-
-        Decision xfail: failing in CI (Actions run 30385154736, job
-        90362755639) on PR #3293. We've decided to xfail the coarse tiling
-        tests to allow us to merge to main -- deliberate decision to unblock
-        the merge, not a claim about a specific bisected root cause. Un-xfail
-        once the underlying regression is investigated and fixed.
-        """
+        """spyre_hint(num_tiles_per_dim={"M": 4}) tiles matmul over the row (M) dimension."""
         from torch_spyre._inductor import spyre_hint
 
         M, K, N = 256, 128, 64
@@ -1710,29 +1695,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             " divide Lq ranges on each op using that op's own dim role",
         )
 
-    @unittest.expectedFailure
     def test_hint_h_tiling_elementwise(self):
         """spyre_hint(num_tiles_per_dim={"H": 2}) tiles elementwise multiply over the H dimension.
 
         Regression test for a bug in per-tile byte-stride computation where
         per-tile HBM base addresses advanced by the wrong amount when the tiled
         dimension was not the outermost host dimension (e.g. H in BHLD).
-
-        Accepted, tracked regression, newly exposed (not caused) by the
-        unconditional-copy change: confirmed via direct A/B (passes at the
-        commit immediately before the unconditional-copy change lands,
-        fails starting exactly at that landing commit, continuing to fail
-        at HEAD). Distinct from the 5 `superdsc.py` backGap-class xfails
-        elsewhere in this file/test_building_blocks.py: this test's sibling
-        (`test_hint_h_tiling_elementwise_loopspec`) shows a
-        host-range-index -> iteration-space-key mapping defect on the
-        newly-inserted copy op itself (the advance expression references
-        the copy op's own minted symbol/coefficient instead of the real
-        op's), not a device_size-mismatch backGap misfire -- do not
-        conflate the two mechanisms. Deferred per user decision
-        (2026-07-28): fold into follow-up investigation rather than
-        blocking branch completion. Un-xfail once the host-range ->
-        iteration-space mapping is fixed for the inserted copy-op case.
         """
         from torch_spyre._inductor import spyre_hint
 
@@ -1863,7 +1831,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 f"NOT a multiple of Lq's stride (64) -- got: {advance_expr}",
             )
 
-    @unittest.expectedFailure
     def test_hint_row_tiling_multi_stick_pointwise_correct(self):
         """Row-tiling a multi-stick pointwise chain produces correct output.
 
@@ -1875,12 +1842,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         atol=0.01: fp16 (a+b)*c on inputs in [0,1) accumulates ~0.002 rounding
         error; atol=0.01 clears that comfortably while remaining well below the
         ~0.1 average error produced by a wrong-address read.
-
-        Decision xfail: failing in CI (Actions run 30385154736, job
-        90362755639) on PR #3293. We've decided to xfail the coarse tiling
-        tests to allow us to merge to main -- deliberate decision to unblock
-        the merge, not a claim about a specific bisected root cause. Un-xfail
-        once the underlying regression is investigated and fixed.
         """
         from torch_spyre._inductor import spyre_hint
 
@@ -1915,24 +1876,10 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "allow_all_ops_in_lx_planning": True,
         }
     )
-    @unittest.expectedFailure
     def test_hint_tiled_pointwise_outside_consumer_correct(self):
         """Tiled pointwise op with a consumer outside the loop (tests
         _allocate_full_buffer pre-stickify: the full buffer must be correctly
         stickified by layout propagation).
-
-        Accepted, tracked regression (not a defect in the change that
-        exposed it): this op used to take the direct-mutation Case 2/"Case
-        3" branch of `_propagate_tiled_op`, which coarse_tile.py's
-        unconditional-copy change deletes, routing every cross-loop-group
-        write through `_insert_copy_op` instead. That path has its own
-        pre-existing, general addressing bug in `superdsc.py`'s
-        `_get_device_dim_order`/backGap logic (misfires when a copy op's
-        destination `device_size` differs from its source at a slot for a
-        dim that isn't actually the tiled dim). Confirmed pre-existing on
-        unmodified baseline via a standalone repro script (handed off
-        separately; ~87% mismatch with zero divergent input layouts
-        needed). Un-xfail once `superdsc.py`'s addressing is fixed.
         """
         from torch_spyre._inductor import spyre_hint
 
@@ -1954,31 +1901,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         compare_with_cpu(fn, x, y, run_compile=True, run_eager=False)
 
-    @unittest.expectedFailure
     def test_hint_nested_tiling_copy_mutation_correct(self):
-        """Nested Lq/D tiling into a direct copy_() mutation (Case 3 rewire).
-
-        Accepted, tracked regression, newly exposed (not caused) by the
-        unconditional-copy change: before that change, `c.copy_(a + b)`
-        routed `add` into the direct-mutation Case 2/"Case 3" branch of
-        `_propagate_tiled_op` (`add`'s own layout became
-        `MutationLayoutSHOULDREMOVE(c)`, no separate copy op). The
-        unconditional-copy change deletes that branch, so this now takes
-        the `_insert_copy_op` path unconditionally instead -- which has its
-        own pre-existing, general addressing bug in `superdsc.py`'s
-        `_get_device_dim_order`/backGap logic (same class as the two
-        already-tracked regressions in
-        `test_hint_tiled_pointwise_outside_consumer_correct`/
-        `test_mixed_plain_and_loop_bundle_codegen` above/nearby). Confirmed
-        via 4-way bisection that this test passes through the commit
-        immediately before the unconditional-copy change lands and fails
-        starting exactly at that landing commit, continuing to fail at
-        HEAD -- a real, reproducible, on-device regression, not a
-        pre-existing failure merely inherited. Deferred per user decision:
-        fold into the existing `superdsc.py` backGap investigation already
-        underway rather than opening separate work now. Un-xfail once
-        `superdsc.py`'s addressing is fixed.
-        """
+        """Nested Lq/D tiling into a direct copy_() mutation (Case 3 rewire)."""
         from torch_spyre._inductor import spyre_hint
 
         Lq, D = 256, 128
@@ -1999,28 +1923,11 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
 
-    @unittest.expectedFailure
     def test_hint_nested_tiling_copy_mutation_divergent_input_layout(self):
         """Case 3 nested coarse-tiling where `a`'s device layout genuinely
         diverges from `b`'s -- exercises per-arg tile_advance_expr (each arg
         must compute its own device-byte-stride/device_coordinates, not
         share the output's).
-
-        Accepted, tracked regression, newly exposed (not caused) by the
-        unconditional-copy change: this test now takes the unconditional
-        `_insert_copy_op` path instead of the deleted direct-mutation
-        Case 2/"Case 3" branch, which has its own pre-existing, general
-        addressing bug in `superdsc.py`'s `_get_device_dim_order`/backGap
-        logic (same class as
-        `test_hint_tiled_pointwise_outside_consumer_correct`/
-        `test_mixed_plain_and_loop_bundle_codegen` above). Confirmed via
-        4-way bisection that this test passes through the commit
-        immediately before the unconditional-copy change lands and fails
-        starting exactly at that landing commit, continuing to fail at
-        HEAD. Deferred per user decision: fold into the existing
-        `superdsc.py` backGap investigation already underway rather than
-        opening separate work now. Un-xfail once `superdsc.py`'s
-        addressing is fixed.
 
         Uses a 3-D [B, Lq, D] shape (unlike
         test_hint_nested_tiling_copy_mutation_correct's 2-D [Lq, D]) so the
@@ -2070,7 +1977,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         spyre_result = torch.compile(fn)(a_dev, b_dev).cpu()
         compare_with_cpu(fn, a, b, target=spyre_result, run_eager=False)
 
-    @unittest.expectedFailure
     def test_hint_nested_tiling_copy_mutation_flat(self):
         """Same Case 3 rewire as test_hint_nested_tiling_copy_mutation_correct,
         but on a flattened [Lq * D] 1-D tensor rather than [Lq, D] 2-D.
@@ -2081,19 +1987,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         (tile_size, supertile_count) fact per nesting level rather than one
         per host dim, so this no longer collapses the two levels' facts into
         one.
-
-        Accepted, tracked regression, newly exposed (not caused) by the
-        unconditional-copy change: same `superdsc.py`
-        `_get_device_dim_order`/backGap addressing bug class as this
-        test's siblings above/nearby, now hit via the unconditional
-        `_insert_copy_op` path rather than the deleted direct-mutation
-        branch. Confirmed via 4-way bisection that this test passes
-        through the commit immediately before the unconditional-copy
-        change lands and fails starting exactly at that landing commit,
-        continuing to fail at HEAD. Deferred per user decision: fold into
-        the existing `superdsc.py` backGap investigation already underway
-        rather than opening separate work now. Un-xfail once
-        `superdsc.py`'s addressing is fixed.
         """
         from torch_spyre._inductor import spyre_hint
 
@@ -2719,11 +2612,11 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
     def test_nested_bmm_outer_Batch_inner_K_correct(self):
         """bmm [B,M,K]@[B,K,N] outer B (output) + inner K (reduction) — correct.
 
-        Decision xfail: failing in CI (Actions run 30385154736, job
-        90362755639) on PR #3293. We've decided to xfail the coarse tiling
-        tests to allow us to merge to main -- deliberate decision to unblock
-        the merge, not a claim about a specific bisected root cause. Un-xfail
-        once the underlying regression is investigated and fixed.
+        Stays xfailed: this reproduces on the CI runners but NOT on every local
+        stack, so a passing local run is not evidence it is fixed. Observed
+        10.2% element mismatch (833/8192) on CI, repeatable across all retry
+        attempts, while the same commit passes on a dev pod. Un-xfail only on
+        the strength of a green CI run.
         """
         from torch_spyre._inductor import spyre_hint
 
