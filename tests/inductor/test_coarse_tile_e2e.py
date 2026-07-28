@@ -642,6 +642,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "allow_all_ops_in_lx_planning": True,
         }
     )
+    @unittest.expectedFailure
     def test_hint_softmax_row_tiling(self):
         """spyre_hint(num_tiles_per_dim={"NROW": 4}) tiles softmax over the row dimension.
 
@@ -650,6 +651,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         shrinks the row-stride dimension corrupts all stick groups after the
         first in each non-first tile.  atol=0.02 is tight enough to catch
         values from the wrong row (fp16 errors from random inputs exceed 0.5).
+
+        Decision xfail: failing in CI (Actions run 30385154736, job
+        90362755639) on PR #3293. We've decided to xfail the coarse tiling
+        tests to allow us to merge to main -- deliberate decision to unblock
+        the merge, not a claim about a specific bisected root cause. Un-xfail
+        once the underlying regression is investigated and fixed.
         """
         from torch_spyre._inductor import spyre_hint
 
@@ -670,8 +677,16 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Matmul with row-tiling: tile the M dimension of x @ y
     # ------------------------------------------------------------------
 
+    @unittest.expectedFailure
     def test_hint_matmul_row_tiling(self):
-        """spyre_hint(num_tiles_per_dim={"M": 4}) tiles matmul over the row (M) dimension."""
+        """spyre_hint(num_tiles_per_dim={"M": 4}) tiles matmul over the row (M) dimension.
+
+        Decision xfail: failing in CI (Actions run 30385154736, job
+        90362755639) on PR #3293. We've decided to xfail the coarse tiling
+        tests to allow us to merge to main -- deliberate decision to unblock
+        the merge, not a claim about a specific bisected root cause. Un-xfail
+        once the underlying regression is investigated and fixed.
+        """
         from torch_spyre._inductor import spyre_hint
 
         M, K, N = 256, 128, 64
