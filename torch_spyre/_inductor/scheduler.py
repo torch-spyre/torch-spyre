@@ -176,7 +176,7 @@ def _regroup_by_outer_loop_key(
         unit_of_node[id(node)] = unit
 
     def unit_key(unit) -> int:
-        return id(unit) if isinstance(unit, list) else id(unit)
+        return id(unit)
 
     unit_deps: dict[int, OrderedSet] = {}
     unit_members: dict[int, list[BaseSchedulerNode]] = {}
