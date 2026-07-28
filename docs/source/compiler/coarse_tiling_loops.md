@@ -891,7 +891,7 @@ class CustomPreFusionPasses(CustomNodePassBase):
 
 class CustomPostFusionPasses(CustomNodePassBase):
     def get_passes(self):
-        return [memory_planning, spyre_fuse_nodes]
+        return [hbm_pool_planning, spyre_fuse_nodes]
 ```
 
 **`build_loop_scheduler_nodes` must run before Inductor's fusion pass and

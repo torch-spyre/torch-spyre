@@ -27,7 +27,7 @@ from .scheduler import CountedLoopSchedulerNode
 from .logging_utils import get_inductor_logger
 from . import config
 
-logger = get_inductor_logger("MEMORY_PLANNING")
+logger = get_inductor_logger("HBM_POOL_PLANNING")
 _STICK_BYTES = 128
 
 
@@ -99,7 +99,7 @@ def _compute_size_bytes(name: str) -> int:
     buf = V.graph.get_buffer(name)
     layout = buf.maybe_get_layout()
     assert isinstance(layout, FixedTiledLayout), (
-        f"memory_planning: expected FixedTiledLayout for {name}, got {type(layout)}"
+        f"hbm_pool_planning: expected FixedTiledLayout for {name}, got {type(layout)}"
     )
     dev_layout = layout.device_layout
     num_sticks = math.prod(dev_layout.device_size[:-1])
@@ -135,8 +135,22 @@ def _compute_live_ranges(
     return live_ranges
 
 
-def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     """Pool-allocate buffers so non-overlapping tensors share the HBM intermediates segment.
+
+    This is a *distinct* pass from LX scratchpad planning
+    (`scratchpad/allocator.py`, `scratchpad_planning()`). Both passes decide
+    where an intermediate tensor's data lives, but:
+    - This pass runs in `CustomPostFusionPasses`, **after** Inductor's
+      scheduler fusion has already run.
+    - LX planning runs in `CustomPreSchedulingPasses`, **before** the
+      Scheduler is even constructed.
+    - This pass bump/free-list-allocates a region of regular HBM (the
+      "intermediates segment", see `constants.INTERMEDIATES_SEGMENT`); LX
+      planning allocates a fixed on-chip SRAM scratchpad per core.
+    - A buffer is only an hbm_pool candidate if LX planning did *not* already
+      claim it (`"lx" not in layout.allocation`); the two passes are
+      mutually exclusive per buffer, applied in that order.
 
     Collects pool candidates from two sources:
     - Kernel intermediates: buffers both written and read within the graph,
@@ -144,12 +158,15 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     - SpyreEmptyFallback full buffers created by coarse_tile.py (non-outputs).
       These are ExternKernel nodes invisible to the written & read path above.
 
-    For each candidate, assigns layout.allocation["pool"] = INTERMEDIATES_SEGMENT + offset.
+    For each candidate, assigns layout.allocation["hbm_pool"] = INTERMEDIATES_SEGMENT + offset.
     Graph inputs/outputs and LX-allocated buffers are excluded.
+
+    See docs/source/compiler/hbm_pool_planning.md for the full design and a
+    side-by-side comparison table with LX scratchpad planning.
     """
 
-    if not config.hbm_planning:
-        V.graph.pool_size = 0
+    if not config.hbm_pool_planning:
+        V.graph.hbm_pool_size = 0
         return nodes
 
     graph_inputs: set[str] = set(V.graph.graph_inputs.keys())
@@ -239,7 +256,7 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         if _is_intermediate(name)
     }
     if not intermediates:
-        V.graph.pool_size = 0
+        V.graph.hbm_pool_size = 0
         return nodes
 
     live_ranges = _compute_live_ranges(nodes, intermediates)
@@ -276,14 +293,14 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         layout = buf.maybe_get_layout()
         assert isinstance(layout, FixedTiledLayout)
         if config.bundle_symbolic_args:
-            layout.allocation["pool"] = offset
+            layout.allocation["hbm_pool"] = offset
         else:
-            layout.allocation["pool"] = INTERMEDIATES_SEGMENT + offset
+            layout.allocation["hbm_pool"] = INTERMEDIATES_SEGMENT + offset
 
         pending_frees.append((end, offset, size))
 
         logger.debug(
-            "memory_planning: %s  live=[%d,%d]  size=%d  offset=%d",
+            "hbm_pool_planning: %s  live=[%d,%d]  size=%d  offset=%d",
             name,
             start,
             end,
@@ -294,12 +311,12 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     peak = allocator.get_peak_usage()
     pool_extent = allocator.get_pool_end()
     logger.info(
-        "memory_planning: assigned %d intermediates, peak concurrent usage %.2f GB, pool extent %.2f GB / %.2f GB",
+        "hbm_pool_planning: assigned %d intermediates, peak concurrent usage %.2f GB, pool extent %.2f GB / %.2f GB",
         len(sorted_bufs),
         peak / (1024**3),
         pool_extent / (1024**3),
         SEGMENT_SIZE / (1024**3),
     )
-    V.graph.pool_size = pool_extent
+    V.graph.hbm_pool_size = pool_extent
 
     return nodes

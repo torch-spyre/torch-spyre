@@ -32,7 +32,7 @@ from torch._inductor.ir import (
     Reduction,
 )
 from torch._inductor.scheduler import SchedulerNode
-from torch._inductor.dependencies import MemoryDep, ReadWrites, StarDep
+from torch._inductor.dependencies import MemoryDep, ReadWrites, StarDep, is_indirect
 from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 from torch_spyre._inductor.errors import Unsupported
@@ -124,7 +124,7 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
     if isinstance(expr, sympy.Integer):
         return int(expr)
     if hasattr(expr, "free_symbols") and expr.free_symbols:
-        return V.graph.sizevars.size_hint(expr)
+        return V.graph.sizevars.optimization_hint(expr)
     return int(expr)
 
 
@@ -190,13 +190,13 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
     min_default_g = config.min_default_granularity
 
     # When ShapeEnv has no finite upper bound, max_size came from
-    # size_hint (via compute_max_size below, merged in #2003), not from
+    # optimization_hint (via compute_max_size below, merged in #2003), not from
     # mark_dynamic(max=...). The granularity is then only as trustworthy
     # as that hint -- warn the user so they can pin it explicitly with
     # mark_dynamic(max=...).
     if finite_upper_or_none(expr) is None:
         warnings.warn(
-            f"max for symbolic dim {expr} came from size_hint, not from "
+            f"max for symbolic dim {expr} came from optimization_hint, not from "
             f"mark_dynamic(max=...). Proceeding with max={max_size} as a "
             f"best-effort estimate. Set max explicitly via mark_dynamic to "
             f"lock the bucket structure.",
@@ -257,14 +257,20 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     if not isinstance(index, sympy.Basic):
         return sympy.sympify(index)
 
-    size_syms = index.free_symbols - loop_vars
+    # Exclude indirect (gather/scatter) index symbols such as ``tmp0``. Under
+    # PT 2.12, ``optimization_hint`` concretizes an unbacked indirect symbol to
+    # ``config.unbacked_symint_fallback`` (8192) instead of raising, which would
+    # drop the symbol from the coordinate and break named-dim propagation for
+    # gathers. Only genuine dynamic-shape size symbols (s0, s1, ...) should be
+    # concretized here; indirect symbols must stay symbolic.
+    size_syms = {s for s in (index.free_symbols - loop_vars) if not is_indirect(s.name)}
     if not size_syms:
         return index
     # Try each symbol individually
     subs = {}
     for s in size_syms:
         try:
-            hint = V.graph.sizevars.size_hint(s)
+            hint = V.graph.sizevars.optimization_hint(s)
             subs[s] = hint  # Successfully concretized
         except (TypeError, ValueError):
             # Can't concretize this symbol, skip it
@@ -281,7 +287,7 @@ def compute_max_size(expr: Union[Expr, int]) -> int:
 
     Uses the ShapeEnv upper bound when one is recorded (i.e. the symbol was
     created with an explicit ``max=`` constraint using mark_dynamic API). Falls
-    back to ``size_hint`` when no finite upper bound exists.
+    back to ``optimization_hint`` when no finite upper bound exists.
 
     Needed for dynamic shape support.
     """
@@ -294,7 +300,11 @@ def compute_max_size(expr: Union[Expr, int]) -> int:
     bound = finite_upper_or_none(expr)
     if bound is not None:
         return bound
-    return V.graph.sizevars.size_hint(expr)
+    # No finite ShapeEnv bound: fall back to the permissive hint. size_hint was
+    # removed in PT 2.12; optimization_hint is its replacement and keeps the
+    # intended "best-effort max estimate" semantics (a heuristic/fallback for
+    # unbacked symbols) rather than raising.
+    return V.graph.sizevars.optimization_hint(expr)
 
 
 def compute_symbolic_bounds(expr: Union[Expr, int]) -> "tuple[int, int] | None":

@@ -115,7 +115,17 @@ class TensorArg:
         device_size: The device size (as per SpyreTensorLayout) of the Tensor
         device_coordinates: The sympy Exprs that describe how elements in the Tensor are accessed.
                 Free variables in device_coordinates refer to entries in the OpSpec's iteration_space.
-        allocation: If present, the offset in scratchpad memory assigned to the Tensor.
+        allocation: dict tagging where this Tensor's data lives. Mirrors
+                layout.allocation and carries exactly one of three
+                mutually-exclusive keys:
+                - "hbm": graph input/output or fallback-kernel input/output,
+                  addressed directly in HBM.
+                - "lx": placed in on-chip LX scratchpad by LX planning
+                  (scratchpad/allocator.py).
+                - "hbm_pool": intermediate that didn't fit in LX, bump-
+                  allocated into the off-chip HBM intermediates segment by
+                  hbm_pool_planning.py. See
+                  docs/source/compiler/hbm_pool_planning.md.
     """
 
     is_input: bool

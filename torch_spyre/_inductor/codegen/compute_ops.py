@@ -36,12 +36,18 @@ def _build_padding_sizes(conv_params, dim_sizes=None, dim_splits=None):
     if not conv_params:
         return {}
 
-    def compute_padding_for_dim(suffix, pad_dim_key, stride_key, window_dim_key, total_size_key):
+    def compute_padding_for_dim(
+        suffix, pad_dim_key, stride_key, window_dim_key, total_size_key
+    ):
         """Compute padding fields for a single dimension (i or j)."""
         pad_dim = conv_params[pad_dim_key]
         stride = conv_params[stride_key]
         pad_amount = conv_params.get(f"pad_{suffix}", 0)
-        kernel_size = int(dim_sizes[Symbol(f"k{suffix}")]) if dim_sizes and Symbol(f"k{suffix}") in dim_sizes else 3
+        kernel_size = (
+            int(dim_sizes[Symbol(f"k{suffix}")])
+            if dim_sizes and Symbol(f"k{suffix}") in dim_sizes
+            else 3
+        )
 
         # Determine total_size and per_core_output based on context
         if dim_sizes is None:
@@ -64,7 +70,7 @@ def _build_padding_sizes(conv_params, dim_sizes=None, dim_splits=None):
             else:
                 # Splitting: per-core minimum buffer needed
                 # total_size = (per_core_output - 1) * stride + kernel_size
-                total_size = (per_core_output) * stride + kernel_size-1
+                total_size = (per_core_output) * stride + kernel_size - 1
 
         # Calculate unneededPad_ using formula: totalSize - ((output_size - 1) * stride + kernel_size)
         min_required_input = (per_core_output - 1) * stride + kernel_size
@@ -87,7 +93,7 @@ def _build_padding_sizes(conv_params, dim_sizes=None, dim_splits=None):
             padBack -= reduce_amount
             unneeded_remaining -= reduce_amount
 
-        # 2. Then reduce valid region
+        # 2. Then reduce based on valid region
         if valid_size > 0 and unneeded_remaining > 0:
             reduce_amount = min(valid_size, unneeded_remaining)
             unneeded_remaining -= reduce_amount
@@ -180,8 +186,19 @@ class SymbolKind:
                                              ``kernel_derived``: the per-core entry is
                                              a negative symbol id under
                                              ``isStartAddrSymbolic_``.
-      - ``pool()``:                          pool-allocated tensor address;
-                                             emitted as ``arith.addi %pool, value``.
+      - ``pool()``:                          MLIR-symbol-table mirror of a
+                                             ``TensorArg.allocation["hbm_pool"]``-tagged
+                                             tensor (see ``hbm_pool_planning.py`` and
+                                             ``TensorArg.allocation``). This is the
+                                             *same* underlying concept re-expressed at
+                                             the symbol-table layer for MLIR emission,
+                                             not a separate allocation kind ``SymbolKind``
+                                             has no ``"hbm"``/``"lx"`` analog because
+                                             those don't need symbolic-address emission
+                                             the same way (kernel args are
+                                             ``input_arg`` params directly; LX addresses
+                                             are baked constants, never symbols).
+                                             Emitted as ``arith.addi %pool, value``.
       - ``dimension(gran, max, sym)``:       dynamic iteration-space dim size from
                                              mark_dynamic; carried in SDSC JSON as a
                                              ``dimToSymbolMapping_`` entry.  Registered
@@ -362,7 +379,7 @@ def gen_coord_info_value(
                 "dim_prop_func": [
                     {
                         "Affine": {
-                            "alpha_": size*conv_params["stride_len"],
+                            "alpha_": size * conv_params["stride_len"],
                             "beta_": 0,
                         }
                     },
@@ -491,8 +508,10 @@ def get_conv_params(tensor_num, dim, opfunc, conv_params, size, splits):
             and str(dim) == str(conv_params["pad_dim_i"])
             and "total_size_i" in conv_params
         ):
-            #total_size = conv_params["total_size_i"]
-            total_size = (size // splits)*conv_params["stride_i"] + conv_params["kernel_h"]-1 #2*conv_params["pad_i"] + 2
+            # total_size = conv_params["total_size_i"]
+            total_size = (
+                (size // splits) * conv_params["stride_i"] + conv_params["kernel_h"] - 1
+            )  # 2*conv_params["pad_i"] + 2
             padding_len = conv_params["pad_i"]
             stride_len = conv_params["stride_i"]
         elif (
@@ -500,12 +519,19 @@ def get_conv_params(tensor_num, dim, opfunc, conv_params, size, splits):
             and str(dim) == str(conv_params["pad_dim_j"])
             and "total_size_j" in conv_params
         ):
-            #total_size = conv_params["total_size_j"]
-            #total_size = size // splits + 2*conv_params["pad_j"] + 2
-            total_size = (size // splits)*conv_params["stride_j"] + conv_params["kernel_w"]-1 #2*conv_params["pad_j"] + 2
+            # total_size = conv_params["total_size_j"]
+            # total_size = size // splits + 2*conv_params["pad_j"] + 2
+            total_size = (
+                (size // splits) * conv_params["stride_j"] + conv_params["kernel_w"] - 1
+            )  # 2*conv_params["pad_j"] + 2
             padding_len = conv_params["pad_j"]
             stride_len = conv_params["stride_j"]
-    return {"conv_padding": conv_padding, "padding_len": padding_len, "stride_len": stride_len, "total_size": total_size}
+    return {
+        "conv_padding": conv_padding,
+        "padding_len": padding_len,
+        "stride_len": stride_len,
+        "total_size": total_size,
+    }
 
 
 def _symbolic_split_info(
@@ -1036,7 +1062,7 @@ def generate_sdsc(
                     for c in range(sdsc_spec.num_cores)
                 }
             nb = num_bytes(tensor.data_format)
-            is_pool_tensor = tensor.arg_index < 0 and "pool" in tensor.allocation
+            is_pool_tensor = tensor.arg_index < 0 and "hbm_pool" in tensor.allocation
             # Recompute the symbolic-split status so c>0 cores resolve to the
             # ("kernel_derived_symbolic", arg_index, core_idx) key the per-tensor
             # loop registered.  Pure function of the tensor + work_slices, so this
@@ -1155,7 +1181,7 @@ def generate_sdsc(
                                     _build_padding_sizes(
                                         sdsc_spec.conv_params,
                                         dim_sizes=None,
-                                        dim_splits=None
+                                        dim_splits=None,
                                     )
                                     if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
                                     else {}
@@ -1208,7 +1234,7 @@ def generate_sdsc(
                                             _build_padding_sizes(
                                                 sdsc_spec.conv_params,
                                                 dim_sizes=sdsc_spec.iteration_space,
-                                                dim_splits=sdsc_spec.work_slices
+                                                dim_splits=sdsc_spec.work_slices,
                                             ).get("paddingSizes_", {})
                                             if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
                                             else {}
@@ -1232,7 +1258,7 @@ def generate_sdsc(
                                             _build_padding_sizes(
                                                 sdsc_spec.conv_params,
                                                 dim_sizes=sdsc_spec.iteration_space,
-                                                dim_splits=sdsc_spec.work_slices
+                                                dim_splits=sdsc_spec.work_slices,
                                             ).get("paddingSizes_", {})
                                             if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
                                             else {}
@@ -1258,6 +1284,10 @@ def generate_sdsc(
                                     "name_": f"allocate-Tensor{i}_{'lx' if 'lx' in tensor.allocation else 'hbm'}",
                                     "prev_": "",
                                     "ldsIdx_": i,
+                                    # NOTE: "hbm"/"lx" here are sdsc fields and are
+                                    # not to be confused with the internal
+                                    # layout.allocation dict keys ("hbm"/"lx"/
+                                    # "hbm_pool").
                                     "component_": "lx"
                                     if "lx" in tensor.allocation
                                     else "hbm",
@@ -1346,7 +1376,7 @@ def generate_sdsc(
                                                             sdsc_spec.opfunc,
                                                             sdsc_spec.conv_params,
                                                             dim_size,
-                                                            dim_nsplits
+                                                            dim_nsplits,
                                                         ),
                                                     )
                                                 )

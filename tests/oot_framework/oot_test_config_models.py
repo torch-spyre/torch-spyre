@@ -356,16 +356,41 @@ class InputArgPy(BaseModel):
 
 
 class InputArgConfig(BaseModel):
-    """A HuggingFace-style config object positional argument.
+    """A HuggingFace-style config object positional/keyword argument.
 
-    Built at runtime by importing ``config_path`` and instantiating it with
-    ``config_kwargs`` (e.g. transformers module constructors that take a
-    ``PretrainedConfig``). The kwargs carry the captured model dimensions so the
-    module is built with the right shapes rather than library defaults.
+    Resolved at runtime to a ``PretrainedConfig`` (see :func:`_build_hf_config`).
+    Two mutually exclusive reconstruction strategies, chosen by which field is
+    set:
+
+    - ``model_id`` (preferred): load the full, faithful config with
+      ``AutoConfig.from_pretrained(model_id)`` — carries every config field the
+      model actually had. ``config_overrides`` then setattr's a few resolved
+      values on top (e.g. ``_attn_implementation``, which ``from_pretrained`` may
+      leave as ``None``).
+    - ``config_kwargs``: rebuild by importing ``config_path`` and calling
+      ``config_cls(**config_kwargs)`` — only the captured dimensions are set;
+      everything else falls back to library defaults (historical behaviour).
+
+    Exactly one of ``model_id`` / ``config_path`` must be set. ``model_id`` takes
+    precedence when both are present; the ``model_id`` path needs no
+    ``config_path`` at all (``AutoConfig`` resolves the class), so a ``model_id``
+    spec may omit ``config_path`` entirely.
     """
 
-    config_path: str  # e.g. "transformers.models.granite...GraniteConfig"
+    config_path: Optional[str] = None  # e.g. "transformers.models...GraniteConfig"
     config_kwargs: Dict[str, Any] = {}
+    model_id: Optional[str] = None  # HF path/dir for AutoConfig.from_pretrained
+    config_overrides: Dict[str, Any] = {}  # applied via setattr after from_pretrained
+
+    @model_validator(mode="after")
+    def _require_source(self) -> "InputArgConfig":
+        if not self.model_id and not self.config_path:
+            raise ValueError(
+                "config arg needs either 'model_id' (load full config via "
+                "AutoConfig.from_pretrained) or 'config_path' (rebuild from "
+                "config_kwargs); neither was set."
+            )
+        return self
 
 
 # Union type for a single element of edits.inputs.args
@@ -397,10 +422,15 @@ def _parse_input_arg(raw: Any) -> InputArg:
         return InputArgTensorList(
             tensor_list=[InputTensorSpec(**t) for t in raw["tensor_list"]]
         )
-    if "config_path" in keys:
+    # A config arg is identified by either key: "model_id" (load full config via
+    # AutoConfig.from_pretrained — no config_path required) or "config_path"
+    # (rebuild from config_kwargs).
+    if "config_path" in keys or "model_id" in keys:
         return InputArgConfig(
-            config_path=raw["config_path"],
+            config_path=raw.get("config_path"),
             config_kwargs=raw.get("config_kwargs", {}) or {},
+            model_id=raw.get("model_id"),
+            config_overrides=raw.get("config_overrides", {}) or {},
         )
     if "value" in keys:
         return InputArgValue(value=raw["value"])
@@ -408,8 +438,43 @@ def _parse_input_arg(raw: Any) -> InputArg:
         return InputArgPy(py=raw["py"])
     raise ValueError(
         f"Each args element must contain exactly one of: "
-        f"tensor, tensor_list, config_path, value, py. Got keys: {keys}"
+        f"tensor, tensor_list, config_path, model_id, value, py. Got keys: {keys}"
     )
+
+
+def _build_hf_config(arg: "InputArgConfig") -> Any:
+    """Resolve an :class:`InputArgConfig` to a ``PretrainedConfig`` instance.
+
+    Shared by both the positional (``build_cpu_args``) and keyword
+    (``resolved_kwargs``) resolution paths so the two strategies stay in one
+    place.
+
+    - ``model_id`` set: load the full config via
+      ``AutoConfig.from_pretrained(model_id)``, then ``setattr`` each
+      ``config_overrides`` entry on top (the resolved ``_attn_implementation``
+      etc.). This yields every field the real model had, not just the handful of
+      captured dimensions.
+    - otherwise: import ``config_path`` and call ``config_cls(**config_kwargs)``.
+    """
+    import importlib
+
+    if arg.model_id:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(arg.model_id)
+        for key, value in arg.config_overrides.items():
+            setattr(config, key, value)
+        return config
+
+    assert arg.config_path is not None
+    module_path, _, cls_name = arg.config_path.rpartition(".")
+    if not module_path:
+        raise ValueError(
+            f"Invalid config_path {arg.config_path!r}: expected "
+            f"'package.module.ClassName'"
+        )
+    config_cls = getattr(importlib.import_module(module_path), cls_name)
+    return config_cls(**arg.config_kwargs)
 
 
 def _dtypes_from_input_arg(arg: "InputArg") -> Set[torch.dtype]:
@@ -527,16 +592,7 @@ class InputsEdits(BaseModel):
                 cpu_args.append(_move_to_test_device(lst, test_device))
 
             elif isinstance(arg, InputArgConfig):
-                import importlib
-
-                module_path, _, cls_name = arg.config_path.rpartition(".")
-                if not module_path:
-                    raise ValueError(
-                        f"Invalid config_path {arg.config_path!r}: expected "
-                        f"'package.module.ClassName'"
-                    )
-                config_cls = getattr(importlib.import_module(module_path), cls_name)
-                cpu_args.append(config_cls(**arg.config_kwargs))
+                cpu_args.append(_build_hf_config(arg))
 
             elif isinstance(arg, InputArgValue):
                 val = arg.value
@@ -597,7 +653,7 @@ class InputsEdits(BaseModel):
         position_ids) are unaffected.
 
         A kwarg value may itself be a tensor spec — a dict carrying one of
-        ``tensor`` / ``tensor_list`` / ``config_path`` / ``value`` / ``py`` — just
+        ``tensor`` / ``tensor_list`` / ``config_path`` / ``model_id`` / ``py`` — just
         like a positional arg. Those are built into real tensors/objects here via
         the same ``_parse_input_arg`` path used for positional args. Modules such
         as attention/rotary layers receive ``hidden_states`` / ``position_ids`` /
@@ -616,7 +672,7 @@ class InputsEdits(BaseModel):
 
         # Tensor-spec dicts carry exactly one of these keys; anything else is a
         # plain scalar/dtype/device value handled by the string branch below.
-        _SPEC_KEYS = {"tensor", "tensor_list", "config_path", "py"}
+        _SPEC_KEYS = {"tensor", "tensor_list", "config_path", "model_id", "py"}
 
         out: Dict[str, Any] = {}
         for i, (k, v) in enumerate(self.kwargs.items()):
@@ -639,11 +695,7 @@ class InputsEdits(BaseModel):
                     ]
                     out[k] = _move_to_test_device(lst, test_device)
                 elif isinstance(arg, InputArgConfig):
-                    import importlib
-
-                    module_path, _, cls_name = arg.config_path.rpartition(".")
-                    config_cls = getattr(importlib.import_module(module_path), cls_name)
-                    out[k] = config_cls(**arg.config_kwargs)
+                    out[k] = _build_hf_config(arg)
                 elif isinstance(arg, InputArgPy):
                     out[k] = _eval_py_literal(arg.py)
                 continue

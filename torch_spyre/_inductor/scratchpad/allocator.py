@@ -78,6 +78,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
+from torch_spyre._inductor.ir import FixedTiledLayout
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
@@ -211,6 +212,10 @@ class ScratchpadAllocator:
         if not isinstance(op, ComputedBuffer):
             return False
         if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+            return False
+        # A CPU-resident ComputedBuffer has a plain FixedLayout
+        # with no device_layout and can never be LX-pinned.
+        if not isinstance(op.layout, FixedTiledLayout):
             return False
         return config.allow_all_ops_in_lx_planning or (
             self._get_op_name(op) in OP_OUTPUT_GOOD_FOR_LX_REUSE
@@ -477,11 +482,22 @@ class ScratchpadAllocator:
                     max(0, info["size_per_core"]),
                     uses,
                     first_use_is_read=False,
-                    in_place_parents=in_place.get(output_name, []),
+                    # Copy: the reverse-parent block in the input loop below appends
+                    # to a consumer's in_place_parents, which would otherwise mutate
+                    # this list inside the shared ``in_place`` dict (matches the copy
+                    # in ``_build_cd_bound_buffers``).
+                    in_place_parents=list(in_place.get(output_name, [])),
                     residency_reason=reasons.get(output_name),
                 )
             )
 
+        # Consumer buffers already built above (intermediates + graph outputs),
+        # indexed for the reverse-parent edge below. A graph-input clone can only
+        # ever be an in-place *parent* -- it is pinned to LX and dies at its last
+        # read, and its source stays in HBM (not an LX candidate), so it has no
+        # parent of its own. The value is letting the consumer that performs that
+        # last read reuse the clone's slot for its own output.
+        built_by_name = {b.name: b for b in buffers}
         for input_name in graph.graph_input_names:
             uses = lifetimes.get(input_name, [])
             if not uses:
@@ -494,10 +510,11 @@ class ScratchpadAllocator:
                 ncores_reasons=ncores_reasons,
                 division_is_fixed=True,
             )
+            clone_size = self._input_footprint(graph, input_name, ncores)
             buffers.append(
                 LifetimeBoundBuffer(
                     input_name,
-                    self._input_footprint(graph, input_name, ncores),
+                    clone_size,
                     uses,
                     first_use_is_read=True,
                     in_place_parents=[],
@@ -505,7 +522,98 @@ class ScratchpadAllocator:
                 )
             )
 
+            # Reverse-parent edge (issue #3212): let the input clone's last consumer
+            # reuse the clone's LX slot in place. The op at the clone's last-use tick
+            # both reads the clone and writes its own output, so the
+            # single-handoff-tick invariant holds for that consumer alone (enforced
+            # by ``_inplace_edge_ok``'s ``parent_end == child_start`` check). Only
+            # when the clone can actually reside (``reason is None``) and the
+            # consumer is a built candidate with matching per-core size, device
+            # layout, a pointwise producer, and no core-division mismatch is there
+            # anything safe to merge.
+            if reason is not None:
+                continue
+            last_use = uses[-1]
+            consumer_op = graph.operations[last_use]
+            consumer = built_by_name.get(consumer_op.name)
+            if consumer is None or input_name in consumer.in_place_parents:
+                continue
+            # A multi-output op (e.g. max/aminmax) carries a MultiOutputLayout with
+            # no single ``device_layout``, so it cannot alias one input clone in
+            # place; skip it (matches the guard in
+            # ``_determine_in_place_division_invariant``).
+            consumer_layout = graph.get_buffer(consumer_op.name).get_layout()
+            input_layout = graph.get_buffer(input_name).layout
+            if not hasattr(consumer_layout, "device_layout") or not hasattr(
+                input_layout, "device_layout"
+            ):
+                continue
+            if self._inplace_edge_ok(
+                child_pointwise_inputs=self._op_inputs_good_for_lx_inplace(consumer_op),
+                parent_name=input_name,
+                child_size_per_core=consumer.size,
+                parent_size_per_core=clone_size,
+                child_device_layout=consumer_layout.device_layout,
+                parent_device_layout=input_layout.device_layout,
+                child_start=lifetimes[consumer_op.name][0],
+                parent_end=last_use,
+                child_core_div_mismatch=mem_usage[consumer_op.name][
+                    "core_div_mismatch"
+                ],
+            ):
+                consumer.in_place_parents.append(input_name)
+
         return buffers
+
+    @staticmethod
+    def _inplace_edge_ok(
+        *,
+        child_pointwise_inputs: list[str],
+        parent_name: str,
+        child_device_layout: Any,
+        parent_device_layout: Any,
+        child_start: int,
+        parent_end: int,
+        child_size_per_core: Optional[int] = None,
+        parent_size_per_core: Optional[int] = None,
+        child_core_div_mismatch: bool = False,
+        division_invariant: bool = False,
+    ) -> bool:
+        """Whether ``parent_name`` may be reused in place by the child buffer.
+
+        The child (which writes at ``child_start``) reuses the parent's storage,
+        so the parent must die exactly as the child is born. The conditions:
+
+        - the parent is a pointwise-eligible read input of the child;
+        - matching device layout (so the storage can alias);
+        - single handoff tick (``parent_end == child_start``: the same op that reads
+          the parent as its last use writes the child), the invariant the solvers'
+          in-place relaxation relies on (see ``_assert_in_place_relationships``);
+        - matching per-core footprint and no core-division mismatch on the child.
+
+        With ``division_invariant`` the last condition (per-core size + core-div) is
+        skipped: those depend on a core division the joint solver has not chosen
+        yet, so it enforces them itself (``eff_size`` equality + the
+        ``cd_parent_matches`` gate). Only the first three (division-invariant)
+        preconditions are checked.
+
+        This is the sole definition of a legal in-place edge, shared by
+        ``_determine_in_place`` / ``_build_bound_buffers`` (placement path) and
+        ``_determine_in_place_division_invariant`` / ``_build_cd_bound_buffers``
+        (co-optimizing path), so they cannot drift.
+        """
+        base_ok = (
+            parent_name in child_pointwise_inputs
+            and child_device_layout == parent_device_layout
+            and parent_end == child_start
+        )
+        if division_invariant:
+            return base_ok
+        return (
+            base_ok
+            and child_size_per_core == parent_size_per_core
+            and not child_core_div_mismatch
+        )
 
     @staticmethod
     def _input_footprint(
@@ -553,19 +661,17 @@ class ScratchpadAllocator:
                     continue
                 if reasons.get(input_buf) is not None:
                     continue
-                in_end = lifetimes[input_buf][-1]  # inclusive last use
                 in_ten_layout = graph.get_buffer(input_buf).get_layout().device_layout
-                in_size = mem_usage[input_buf]["size_per_core"]
-                inp_i_size_match = out_size == in_size
-                inp_i_lay_match = out_ten_layout == in_ten_layout
-                inp_i_eol = in_end == out_start  # same op reads input and writes output
-                no_core_div_mismatch = not info["core_div_mismatch"]
-                if (
-                    input_buf in in_place_allowed[buf_name]
-                    and inp_i_size_match
-                    and inp_i_lay_match
-                    and inp_i_eol
-                    and no_core_div_mismatch
+                if self._inplace_edge_ok(
+                    child_pointwise_inputs=in_place_allowed[buf_name],
+                    parent_name=input_buf,
+                    child_size_per_core=out_size,
+                    parent_size_per_core=mem_usage[input_buf]["size_per_core"],
+                    child_device_layout=out_ten_layout,
+                    parent_device_layout=in_ten_layout,
+                    child_start=out_start,
+                    parent_end=lifetimes[input_buf][-1],  # inclusive last use
+                    child_core_div_mismatch=info["core_div_mismatch"],
                 ):
                     allow_inplace[buf_name].append(input_buf)
         return allow_inplace
@@ -1226,8 +1332,14 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
             "mem_usage": 0.0,
         }
 
+        # HBM footprint per buffer. A buffer with no Spyre device_layout
+        # occupies no on-device HBM, so it contributes 0.
         buf_total_bytes: dict[str, int] = {
-            name: math.prod(buf.layout.device_layout.device_size[:-1]) * 128
+            name: (
+                math.prod(buf.layout.device_layout.device_size[:-1]) * 128
+                if isinstance(buf.layout, FixedTiledLayout)
+                else 0
+            )
             for name, buf in graph.name_to_buffer.items()
         }
 
@@ -1296,6 +1408,8 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
         If `timings` is provided, _generate_buffers accumulates its
         `residency` / `mem_usage` sub-step seconds into it. `lifetimes`
         (split-invariant) is forwarded to avoid recomputing it per leaf.
+
+        Note: 0-byte entries are guaranteed never to appear in pinned_names.
         """
         buffers = self._generate_buffers(graph, cache, timings, lifetimes)
         assert self.layout_planning is not None
@@ -1507,11 +1621,23 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 in_layout = graph.get_buffer(input_buf).layout
                 if not hasattr(in_layout, "device_layout"):
                     continue
-                in_end = lifetimes[input_buf][-1]  # inclusive last use
                 in_ten_layout = in_layout.device_layout
-                inp_i_lay_match = out_ten_layout == in_ten_layout
-                inp_i_eol = in_end == out_start  # same op reads input, writes output
-                if inp_i_lay_match and inp_i_eol:
+                # The division-invariant edge gate (layout match + single handoff
+                # tick; per-core size and core-division deferred to the solver). The
+                # ``division_invariant`` mode also applies the per-input
+                # pointwise-eligibility test (``input_buf in in_place_allowed``): for
+                # pointwise-tagged ops that is every read (a no-op), but for a
+                # non-tagged Pointwise op it drops an input read at a different index
+                # than the output write -- which must not be aliased over the output.
+                if self._inplace_edge_ok(
+                    child_pointwise_inputs=in_place_allowed[buf_name],
+                    parent_name=input_buf,
+                    child_device_layout=out_ten_layout,
+                    parent_device_layout=in_ten_layout,
+                    child_start=out_start,
+                    parent_end=lifetimes[input_buf][-1],  # inclusive last use
+                    division_invariant=True,
+                ):
                     allow_inplace[buf_name].append(input_buf)
         return allow_inplace
 
@@ -1561,6 +1687,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         residency_by_buf = self._residency_by_buf(graph, mem_usage, lifetimes)
 
         input_clone_matches: dict[str, dict[str, list[tuple[int, int]]]] = {}
+        # Consumer op name -> input clones for which it is the last reader, and so
+        # may reuse the clone's LX slot in place (reverse-parent, #3212). Stays
+        # empty unless cloning is on, making the reverse-parent block in the output
+        # loop a no-op otherwise.
+        last_consumer_clones: dict[str, list[str]] = {}
         if clone_at_graph_boundaries():
             buffer_users = get_buffer_users(graph)
             for input_name in self._eligible_clone_inputs(graph, lifetimes):
@@ -1576,6 +1707,13 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     continue
                 input_clone_matches[input_name] = matches
                 residency_by_buf[input_name] = None
+                # Only the op at the clone's last-use tick both reads the clone and
+                # writes its own output, so only it satisfies the single handoff
+                # tick for reusing the clone's slot in place.
+                last_use = lifetimes[input_name][-1]
+                last_consumer_clones.setdefault(
+                    graph.operations[last_use].name, []
+                ).append(input_name)
                 dev_layout = graph.get_buffer(input_name).layout.device_layout
                 size = math.prod(dev_layout.device_size[:-1]) * 128
                 buffers.append(
@@ -1600,7 +1738,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             residency_reason = residency_by_buf[output_name]
 
             buf_divisions = divisions[output_name]
-            parents = in_place.get(output_name, [])
+            parents = list(in_place.get(output_name, []))
             size = info["size"]  # total footprint; solver divides per chosen cd
             parent_proj = info["op_inputs"].copy()
             cd_parent_matches = self._cd_parent_matches(
@@ -1618,6 +1756,36 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     cd_parent_matches[input_name] = input_clone_matches[input_name][
                         output_name
                     ]
+
+            # Reverse-parent edge (#3212): when this op is an input clone's last
+            # reader, let it reuse the clone's LX slot in place. Division-invariant
+            # gate (pointwise child reading the clone + matching device layout;
+            # single tick guaranteed by "last reader"); per-core size and core
+            # division are deferred to the solver, which also gates the merge on the
+            # cd_parent_matches entry set just above. Multi-output ops carry a
+            # MultiOutputLayout with no single device_layout and cannot alias one
+            # clone, so they are skipped.
+            out_layout = graph.get_buffer(output_name).get_layout()
+            for clone_name in last_consumer_clones.get(output_name, []):
+                if clone_name in parents:
+                    continue
+                clone_layout = graph.get_buffer(clone_name).get_layout()
+                if (
+                    op is None
+                    or not hasattr(out_layout, "device_layout")
+                    or not hasattr(clone_layout, "device_layout")
+                ):
+                    continue
+                if self._inplace_edge_ok(
+                    child_pointwise_inputs=self._op_inputs_good_for_lx_inplace(op),
+                    parent_name=clone_name,
+                    child_device_layout=out_layout.device_layout,
+                    parent_device_layout=clone_layout.device_layout,
+                    child_start=uses[0],
+                    parent_end=lifetimes[clone_name][-1],
+                    division_invariant=True,
+                ):
+                    parents.append(clone_name)
 
             buffers.append(
                 CoreDivisionBuffer(

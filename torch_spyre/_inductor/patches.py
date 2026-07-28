@@ -19,7 +19,6 @@ import torch
 from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
-from typing import Callable, Optional
 
 
 @contextmanager
@@ -37,40 +36,33 @@ def spyre_data_types():
 
 
 @contextmanager
-def enable_spyre_context(
-    example_inputs: list[InputType],
-    decomps: Optional[dict[torch._ops.OperatorBase, Callable]] = None,
-):
+def enable_spyre_context(example_inputs: list[InputType]):
     """
     Context manager that sets up the complete Spyre compilation environment.
 
     This CM configures PyTorch Inductor to compile graphs for the Spyre device by:
       - Enabling Spyre-specific data type handling
-      - Activating Spyre lowerings and decompositions
+      - Activating Spyre lowerings
       - Configuring Inductor settings optimized for Spyre
       - Setting up custom pre/post compilation passes
       - Disabling incompatible optimizations (e.g., reduction splitting, permute fusion)
+
+    Spyre-specific decompositions are *not* installed by this CM. They are
+    threaded into Inductor via ``get_decomp_fn`` (see ``_spyre_inner_compile``,
+    which re-binds it to ``get_spyre_decomp_table`` in
+    ``torch_spyre._inductor``), which keeps the FX graph cache key picklable
+    and avoids mutating PyTorch's global decomposition registry.
 
     Args:
         example_inputs: List of example inputs to the graph being compiled. Used to
             set real inputs in the virtualized context for shape inference and
             optimization decisions.
-        decomps: Decomposition table to be populated with Spyre-specific
-            decompositions. Maps operator overloads to their decomposition implementations.
-            This is typically a clone of PyTorch Inductor's global decomposition registry.
     """
-
-    if decomps is None:
-        decomps = torch._inductor.decomposition.decompositions
 
     from torch_spyre._inductor.lowering import enable_spyre_lowerings  # your CM
 
-    # Ensure decorators run (custom ops/decomp/lowerings modules)
+    # Ensure decorators run (custom ops/lowerings modules)
     import torch_spyre._inductor.customops  # noqa: F401
-    from torch_spyre._inductor.decompositions import (
-        enable_spyre_decompositions,
-    )
-
     import torch_spyre._inductor.lowering  # noqa: F401
     from torch_spyre._inductor.choices import SpyreHeuristics
     from torch_spyre._inductor.passes import (
@@ -126,13 +118,12 @@ def enable_spyre_context(
     with (
         spyre_data_types(),
         enable_spyre_lowerings(),
-        enable_spyre_decompositions(decomps=decomps) as spyre_context_decompositions,
         V.set_real_inputs(example_inputs),
         V.set_choices_handler(SpyreHeuristics()),
         torch._inductor.config.patch(new_config),
     ):
         try:
-            yield spyre_context_decompositions
+            yield
         finally:
             joint_graph.pass_patterns[:] = origin_pass
             Loops.has_large_inner_fn = old_loop
