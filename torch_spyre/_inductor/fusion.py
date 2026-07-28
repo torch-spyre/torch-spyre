@@ -43,6 +43,7 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     Fuse nodes together to form kernels without changing their order.
     Each kernel will be compiled into a single SuperDSC Bundle.
     """
+    return []
     if len(nodes) == 0:
         return nodes
     if not config.bundle_symbolic_args:
