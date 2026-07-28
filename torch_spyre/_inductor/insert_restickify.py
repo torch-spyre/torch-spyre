@@ -14,6 +14,7 @@
 
 import logging
 from collections import defaultdict
+from typing import cast
 
 import torch
 
@@ -270,7 +271,7 @@ def finalize_layouts(graph: GraphLowering) -> None:
         # until after the scheduler runs
         if op_layouts and not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
             stl = committed if cost_fn else op_layouts[0]
-            op.layout = _fixed_tiled(op.layout, stl)
+            op.layout = _fixed_tiled(op.layout, cast(SpyreTensorLayout, stl))
             # Mark loop-invariant tiled ops: per_tile_fixed so the unroller
             # reuses the same base address every tile iteration.  A tiled op is
             # loop-invariant when its CoarseTileInfo has no tiled dims at any
@@ -505,7 +506,7 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
         assert graph_input is not None
 
         # Create fresh layouts here, since reusing base_layout would overwrite
-        # arg0_1's address during memory_planning.
+        # arg0_1's address during hbm_pool_planning.
         target_input_buf = graph_input.data.data
         base_layout = target_input_buf.layout  # FixedTiledLayout(alt_stl)
         buf_tmp_layout = _fixed_tiled(base_layout, alt_stl)

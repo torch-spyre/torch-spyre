@@ -40,6 +40,7 @@ from .logging_utils import get_inductor_logger
 from .padding import insert_bmm_padding
 from .temp_passes import (
     bmm_unflatten_pass,
+    decompose_addmm,
     mark_direct_unit_bmm_pass,
     mm_to_bmm_pass,
 )
@@ -65,7 +66,7 @@ from .insert_restickify import (
     insert_post_mutation_restickify,
     insert_restickify,
 )
-from .memory_planning import memory_planning
+from .hbm_pool_planning import hbm_pool_planning
 from .work_division import (
     span_reduction,
     work_distribution,
@@ -209,6 +210,12 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
         super().__init__(
             [
                 recover_spyre_hints,
+                # Undo the post-grad re-fusion of add(input, mm(a, b)) back into
+                # aten.addmm, so the resulting mul.Scalar alpha/beta nodes (whose
+                # constants are materialized later by the LoopLevel IR multi-ops
+                # pass) and the mm flow through the Spyre lowerings instead of
+                # falling back to extern_kernels.addmm.
+                decompose_addmm,
                 mm_to_bmm_pass.apply,
                 mark_direct_unit_bmm_pass,
                 bmm_unflatten_pass.apply,
@@ -244,7 +251,8 @@ class CustomPostFusionPasses(_SpyreNodePassPipeline):
     """
 
     def __init__(self):
-        super().__init__([memory_planning, spyre_fuse_nodes])
+        # HBM-Pool Planning
+        super().__init__([hbm_pool_planning, spyre_fuse_nodes])
 
 
 # Several pre-scheduling steps are config-gated or need arguments beyond the

@@ -614,8 +614,9 @@ Environment Variables
        ``scratchpad_planning`` pass)
    * - ``CO_OPTIMIZING_LX_PLANNING``
      - Use the co-optimizing LX allocator strategy (default ``0``)
-   * - ``SPYRE_INDUCTOR_MEMORY_PLAN``
-     - Enable HBM / device-buffer memory planning (default ``1``)
+   * - ``HBM_POOL_PLANNING``
+     - Enable HBM-pool planning for intermediates not in LX
+       (default ``1``)
    * - ``GLOBAL_STICK_OPTIMIZER``
      - Enable the global stick-dimension optimizer (default ``1``)
    * - ``SPYRE_CORE_ID_K_FAST_EMISSION``

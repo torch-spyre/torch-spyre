@@ -496,6 +496,10 @@ def _make_snode(scheduler, ir_op, name="buf0"):
     snode.ancestors = OrderedSet()
     snode.min_order = 0
     snode.max_order = 0
+    # PT 2.12 added min/max_input_distance to BaseSchedulerNode (set in __init__,
+    # so absent from MagicMock(spec=...)); init_group_node reads them when fusing.
+    snode.min_input_distance = 0
+    snode.max_input_distance = 0
     snode.unmet_dependencies = OrderedSet()
     snode.is_reduction.return_value = False
     snode.group = (None, None)
@@ -2223,6 +2227,10 @@ def _make_counted_loop(scheduler, name="loop0", loop_count=sympy.Integer(4)):
     node.ancestors = OrderedSet()
     node.min_order = 0
     node.max_order = 0
+    # PT 2.12 added min/max_input_distance to BaseSchedulerNode (set in __init__,
+    # so absent from MagicMock(spec=...)); init_group_node reads them when fusing.
+    node.min_input_distance = 0
+    node.max_input_distance = 0
     node.unmet_dependencies = OrderedSet()
     node.is_reduction.return_value = False
     node.group = (None, None)
@@ -3169,7 +3177,7 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
                 Integer(0),
                 Mod(c2, 64),
             ],
-            allocation={"pool": 0},
+            allocation={"hbm_pool": 0},
         )
         kernel_arg = TensorArg(
             is_input=True,

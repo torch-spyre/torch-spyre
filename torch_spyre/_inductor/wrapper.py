@@ -77,8 +77,8 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         result_tuple = super().generate(is_inference)
         wrapper_value_with_linemap, kernel_decls = result_tuple
 
-        pool_size = getattr(V.graph, "pool_size", 0)
-        if pool_size > 0:
+        hbm_pool_size = getattr(V.graph, "hbm_pool_size", 0)
+        if hbm_pool_size > 0:
             wrapper_str = str(wrapper_value_with_linemap.value)
 
             # Inject pool allocation before kernel calls and cleanup before return.
@@ -93,7 +93,7 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
                     break
 
             # Add pool allocation before first kernel call (`.run(`).
-            pool_alloc_code = self.allocate_pool()
+            pool_alloc_code = self.allocate_hbm_pool()
             for i, line in enumerate(lines):
                 if ".run(" in line:
                     indent = len(line) - len(line.lstrip())
@@ -134,12 +134,12 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
             f'{node.get_name()} = spyre_constant_tensor({value}, torch.device("{device}"), {dtype})'
         )
 
-    def _is_pool_buffer(self, buffer: BufferLike) -> bool:
+    def _is_hbm_pool_buffer(self, buffer: BufferLike) -> bool:
         layout = buffer.get_layout()
-        return isinstance(layout, FixedTiledLayout) and "pool" in layout.allocation
+        return isinstance(layout, FixedTiledLayout) and "hbm_pool" in layout.allocation
 
     def codegen_free_buffer(self, buffer: BufferLike) -> None:
-        if not self._is_pool_buffer(buffer):
+        if not self._is_hbm_pool_buffer(buffer):
             super().codegen_free_buffer(buffer)
 
     def make_buffer_reuse(self, old: BufferLike, new: BufferLike, delete_old: bool):
@@ -157,16 +157,17 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         reinterpret_view = f"reinterpret_tensor_with_layout({old_name}, {new.get_size()}, {new.get_stride()}, 0, {new_stl!r})"
         return f"{self.declare}{new_name} = {reinterpret_view}{del_line}  {self.comment} reuse"
 
-    def allocate_pool(self):
+    def allocate_hbm_pool(self):
         """Allocate the intermediate pool."""
         # _pool is an opaque, flat byte-addressed region: individual buffers
-        # are placed into it at byte offsets (see memory_planning.py's
-        # layout.allocation["pool"] = offset) and it is passed to kernels
+        # are placed into it at byte offsets (see hbm_pool_planning.py's
+        # layout.allocation["hbm_pool"] = offset) and it is passed to kernels
         # as-is, never sliced/reshaped in Python.  A 1D uint8 tensor of
         # pool_size_bytes elements is the natural, unambiguous
         # representation -- no need to route it through a multi-dim device
-        # layout.
-        pool_size_bytes = getattr(V.graph, "pool_size", SEGMENT_SIZE)
+        # layout, and no need to divide by 128 (each uint8 element is
+        # already one byte, not one stick).
+        pool_size_bytes = getattr(V.graph, "hbm_pool_size", SEGMENT_SIZE)
         return (
             f"_pool = spyre_empty_with_layout("
             f"({pool_size_bytes},), (1,), "

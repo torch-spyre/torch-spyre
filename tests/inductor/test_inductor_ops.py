@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+import math
 import pytest
 import unittest
 import torch
@@ -2062,6 +2062,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d": (cached_randn((256, 128), dtype=torch.float16),),
                 "3d": (cached_randn((8, 16, 256), dtype=torch.float16),),
             },
+            # PT 2.12: the 3D fp16 (8, 16, 256) shape drifts a single element
+            # (~0.34 abs, 1/32768 elems) past tolerance under exp → sin (CPU
+            # fallback) → exp. 1D/2D pass. This is a PT 2.12 CPU-reference
+            # numerics change (the baseline the test compares against), not a
+            # Spyre kernel regression — one of the pre-existing edge cases
+            # documented and xfailed in commit 3a2d482.
+            "expect_fail": ["3d"],
         },
         (
             "test_arange",
@@ -3131,6 +3138,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
+            # PT 2.12: the fp16 sum-reduction over the sliced (128, 192, 256)
+            # input drifts a single element (1/16384) by ~0.11 (>0.1 tol). The
+            # reduction path is byte-identical to main; PT 2.12 shifted the CPU
+            # reference numerics enough to push an already-marginal fp16
+            # accumulation over the line. Same class as the cases xfailed in
+            # commit 3a2d482. amax on the same shape passes, so target sum only.
+            "expect_fail": ["sum_3d128_01"],
         },
         ("test_slice_stick_reduce_dim2", "test_slice_cpu"): {
             "ops_dict": {
@@ -4732,6 +4746,56 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             b[tiny_value_mask] = FP16_EPS
 
         self.compare_with_cpu(op, a, b)
+
+    def test_binary_op_stick_crossing_last_dim(self):
+        """A pointwise binary op whose stick (last) dim spans multiple sticks
+        with an extent coprime with the committed core split must stay
+        bit-exact.
+
+        When the stick dim occupies S>1 sticks and the outer dims are too small
+        to absorb the core split, work division splits the stick dim across S
+        cores. If the element count N is coprime with S (e.g. N=67 over S=2
+        sticks, or N=130 over S=3), the iteration-space realignment used to
+        re-intersect that split against N instead of S and collapse it to a
+        single core -- the layout the backend then miscompiled, corrupting
+        every element past the first stick.
+        """
+
+        # neg keeps both add operands LX-resident: the collapsed single-core
+        # layout only misaddresses the second stick when its operands come from
+        # LX (single per-core base). Feeding the add plain graph inputs would
+        # keep them in HBM, whose per-core addressing masks the bug even when
+        # the split still collapses.
+        def fn(x, y):
+            return torch.neg(x) + torch.neg(y)
+
+        # Last dim > 64 and coprime with the core split; outer dims kept small
+        # so work division divides the stick dim, not the outer.
+        shapes = [
+            (67,),  # 1D, 2 sticks, odd -> gcd(2,67)=1
+            (127,),  # 1D, 2 sticks, odd
+            (130,),  # 1D, 3 sticks, gcd(3,130)=1
+            (193,),  # 1D, 4 sticks, gcd(4,193)=1
+            (3, 67),  # 2D, stick dim split across cores
+            (4, 193),  # 2D, 4-stick coprime last dim
+            (2, 3, 67),  # 3D
+            (3, 5, 127),  # 3D
+            (2, 3, 2, 127),  # 4D
+        ]
+
+        for shape in shapes:
+            with self.subTest(shape=shape):
+                n = math.prod(shape)
+                # Distinct exact-fp16 integer patterns so a per-element
+                # permutation or a dropped trailing stick shows up as a value
+                # mismatch rather than washing out.
+                x = (torch.arange(n) % 251).to(torch.float16).reshape(shape)
+                y = ((torch.arange(n) + 100) % 251).to(torch.float16).reshape(shape)
+
+                result = torch.compile(fn, dynamic=False)(
+                    x.to("spyre"), y.to("spyre")
+                ).cpu()
+                torch.testing.assert_close(result, fn(x, y))
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_binary_op_cpu(self, op, x, y):

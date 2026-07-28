@@ -66,8 +66,19 @@ class SymbolKind:
                                              ``kernel_derived``: the per-core entry is
                                              a negative symbol id under
                                              ``isStartAddrSymbolic_``.
-      - ``pool()``:                          pool-allocated tensor address;
-                                             emitted as ``arith.addi %pool, value``.
+      - ``pool()``:                          MLIR-symbol-table mirror of a
+                                             ``TensorArg.allocation["hbm_pool"]``-tagged
+                                             tensor (see ``hbm_pool_planning.py`` and
+                                             ``TensorArg.allocation``). This is the
+                                             *same* underlying concept re-expressed at
+                                             the symbol-table layer for MLIR emission,
+                                             not a separate allocation kind ``SymbolKind``
+                                             has no ``"hbm"``/``"lx"`` analog because
+                                             those don't need symbolic-address emission
+                                             the same way (kernel args are
+                                             ``input_arg`` params directly; LX addresses
+                                             are baked constants, never symbols).
+                                             Emitted as ``arith.addi %pool, value``.
       - ``dimension(gran, max, sym)``:       dynamic iteration-space dim size from
                                              mark_dynamic; carried in SDSC JSON as a
                                              ``dimToSymbolMapping_`` entry.  Registered
@@ -943,7 +954,7 @@ def generate_sdsc(
                     for c in range(sdsc_spec.num_cores)
                 }
             nb = num_bytes(tensor.data_format)
-            is_pool_tensor = tensor.arg_index < 0 and "pool" in tensor.allocation
+            is_pool_tensor = tensor.arg_index < 0 and "hbm_pool" in tensor.allocation
             # Recompute the symbolic-split status so c>0 cores resolve to the
             # ("kernel_derived_symbolic", arg_index, core_idx) key the per-tensor
             # loop registered.  Pure function of the tensor + work_slices, so this
@@ -1141,6 +1152,10 @@ def generate_sdsc(
                                     "name_": f"allocate-Tensor{i}_{'lx' if 'lx' in tensor.allocation else 'hbm'}",
                                     "prev_": "",
                                     "ldsIdx_": i,
+                                    # NOTE: "hbm"/"lx" here are sdsc fields and are
+                                    # not to be confused with the internal
+                                    # layout.allocation dict keys ("hbm"/"lx"/
+                                    # "hbm_pool").
                                     "component_": "lx"
                                     if "lx" in tensor.allocation
                                     else "hbm",
@@ -1243,6 +1258,10 @@ def generate_sdsc(
                                     # Index tensors must reside in HBM; the Spyre
                                     # engine does not support indirect addressing
                                     # through LX scratchpad.
+                                    # NOTE: "hbm"/"lx" here are sdsc fields and are
+                                    # not to be confused with the internal
+                                    # layout.allocation dict keys ("hbm"/"lx"/
+                                    # "hbm_pool").
                                     "memOrg_": {"hbm": {"isPresent": 1}}
                                     if tensor.is_index_tensor
                                     else {

@@ -594,9 +594,12 @@ def _create_sdsc_tensors(
             else _get_data_format(op_spec.op, arg.device_dtype)
         )
 
+        # allocation keys are mutually exclusive (see TensorArg.allocation
+        # docstring in op_spec.py); this chain just reads whichever one is
+        # present. Priority order here is cosmetic, not semantic.
         start_addr = (
-            arg.allocation.get("pool")
-            if "pool" in arg.allocation
+            arg.allocation.get("hbm_pool")
+            if "hbm_pool" in arg.allocation
             else arg.allocation.get("lx")
             if "lx" in arg.allocation
             else arg.allocation.get("hbm")
@@ -659,7 +662,11 @@ def _concretize_for_sdsc(expr: Expr) -> int:
     if isinstance(expr, Integer):
         return int(expr)
     if hasattr(expr, "free_symbols") and expr.free_symbols:
-        return V.graph.sizevars.size_hint(expr)
+        # This is a correctness-critical boundary: the SDSC JSON / DeepTools
+        # backend needs the *true* concrete size, not an optimization heuristic.
+        # guarding_hint_or_throw resolves backed symbols and raises on unbacked
+        # ones, rather than silently emitting a fallback (e.g. sys.maxsize) size.
+        return V.graph.sizevars.guarding_hint_or_throw(expr)
     return int(expr)
 
 

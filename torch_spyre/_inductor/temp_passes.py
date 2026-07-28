@@ -363,3 +363,72 @@ def _unflatten_bmm_batch_dims(
                 and not expand_node.users
             ):
                 graph.erase_node(expand_node)
+
+
+def decompose_addmm(graph: torch.fx.Graph) -> None:
+    """Decompose ``aten.addmm.default`` into ``add(scaled_input, alpha*mm)``.
+
+    Inductor's post-grad pattern matcher re-fuses ``add(input, mm(a, b))`` back
+    into ``aten.addmm.default`` after AOTAutograd, defeating the upstream
+    decomposition. With no Spyre lowering for ``addmm``, the op then falls
+    back to ``extern_kernels.addmm`` which produces an ``ExternKernelOut``
+    without a ``FixedTiledLayout`` and breaks subsequent Spyre passes.
+
+    This pass undoes the re-fusion at FX time so the resulting ``mm``,
+    ``mul`` and ``add`` nodes flow through the existing Spyre lowerings.
+    Any ``alpha`` / ``beta`` scalars become ``aten.mul.Scalar`` nodes whose
+    scalar constants are later materialized into ``spyre.constant`` tensors by
+    the LoopLevel IR multi-ops pass (``split_multi_ops``).
+    """
+    for node in list(graph.nodes):
+        if node.op != "call_function" or node.target is not aten.addmm.default:
+            continue
+        input_node, mat1, mat2 = node.args[0], node.args[1], node.args[2]
+        beta = node.kwargs.get("beta", 1)
+        alpha = node.kwargs.get("alpha", 1)
+
+        out_meta = node.meta.get("val", None)
+
+        with graph.inserting_before(node):
+            mm_node = graph.call_function(aten.mm.default, args=(mat1, mat2))
+            if out_meta is not None:
+                mm_node.meta["val"] = torch.empty_like(out_meta, device="meta")
+            copy_fx_custom_meta(node, mm_node)
+
+            scaled_mm = mm_node
+            if alpha != 1:
+                scaled_mm = graph.call_function(aten.mul.Scalar, args=(mm_node, alpha))
+                if out_meta is not None:
+                    scaled_mm.meta["val"] = torch.empty_like(out_meta, device="meta")
+                copy_fx_custom_meta(node, scaled_mm)
+
+            if beta == 0:
+                replacement = scaled_mm
+            else:
+                scaled_input = input_node
+                if beta != 1:
+                    scaled_input = graph.call_function(
+                        aten.mul.Scalar, args=(input_node, beta)
+                    )
+                    in_meta = (
+                        input_node.meta.get("val", None)
+                        if isinstance(input_node, torch.fx.Node)
+                        else None
+                    )
+                    if in_meta is not None:
+                        scaled_input.meta["val"] = torch.empty_like(
+                            in_meta, device="meta"
+                        )
+                    copy_fx_custom_meta(node, scaled_input)
+
+                replacement = graph.call_function(
+                    aten.add.Tensor, args=(scaled_input, scaled_mm)
+                )
+                if out_meta is not None:
+                    replacement.meta["val"] = torch.empty_like(out_meta, device="meta")
+                copy_fx_custom_meta(node, replacement)
+
+        node.replace_all_uses_with(replacement)
+        graph.erase_node(node)
+
+    graph.lint()
