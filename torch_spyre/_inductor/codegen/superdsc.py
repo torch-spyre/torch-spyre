@@ -121,7 +121,6 @@ class SDSCSpec:
     # Generic pool/window fields.  Neutral defaults mean generate_sdsc treats a
     # non-pool op exactly as before; parse_op_spec fills these for pool ops via
     # _avgpool_sdsc_fields, so compute_ops.py stays free of op-specific logic.
-    num_corelets: int = 1
     padding_sizes: dict = dataclasses.field(default_factory=dict)
     pds_reuse: bool = False
     stick_replication: bool = False
@@ -406,14 +405,6 @@ def _is_pool(op: str) -> bool:
     return op in POOL_OPS
 
 
-# The pool datapath runs across 2 corelets, and dxp_standalone's scheduler
-# still requires the SDSC to declare this: emitting 1 corelet makes it abort
-# with "Expect valid lower and upper bound parameters".  Corelet subdivision is
-# otherwise dxp_standalone's concern, so this value is only asserted here, not
-# derived by the inductor codegen.
-_POOL_NUM_CORELETS = 2
-
-
 # Canonical avgpool iteration-space order -> SDSC labels.  Codegen owns these
 # label strings; the lowering supplies only per-role sizes
 # (op_info["pool_dim_sizes"]), so SDSC naming never leaks above the codegen
@@ -507,7 +498,6 @@ def _avgpool_sdsc_fields(iteration_space: dict, pool_params: dict) -> dict:
         input_coord_sizes[spatial] = in_size
 
     return {
-        "num_corelets": _POOL_NUM_CORELETS,
         "padding_sizes": padding_sizes,
         "pds_reuse": True,
         "stick_replication": True,

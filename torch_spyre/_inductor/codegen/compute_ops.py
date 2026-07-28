@@ -181,7 +181,7 @@ def num_bytes(df: DataFormats) -> int:
     return 128 // num_elems
 
 
-def generate_constant_info(data_format, constants, num_cores, num_corelets=1):
+def generate_constant_info(data_format, constants, num_cores):
     if len(constants.keys()) == 0:
         return "{}"
     constant_info = {}
@@ -193,7 +193,7 @@ def generate_constant_info(data_format, constants, num_cores, num_corelets=1):
                 "dim_prop_func": [{"Const": {}}, {"Const": {}}, {"Map": {}}],
                 "dim_prop_attr": [
                     {"factor_": num_cores, "label_": "core"},
-                    {"factor_": num_corelets, "label_": "corelet"},
+                    {"factor_": 1, "label_": "corelet"},
                     {"factor_": 1, "label_": "time"},
                 ],
                 "data_": {"[0, 0, 0]": [encode_constant(value, data_format)]},
@@ -1016,10 +1016,7 @@ def generate_sdsc(
                     "data_": {"[0]": "0"},
                 },
                 "coreFoldProp_": {"factor_": sdsc_spec.num_cores, "label_": "core"},
-                "coreletFoldProp_": {
-                    "factor_": sdsc_spec.num_corelets,
-                    "label_": "corelet",
-                },
+                "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
                 "numCoresUsed_": sdsc_spec.num_cores,
                 "coreIdToDsc_": {str(c): 0 for c in range(sdsc_spec.num_cores)},
                 "numWkSlicesPerDim_": {
@@ -1034,7 +1031,7 @@ def generate_sdsc(
                     {
                         sdsc_spec.opfunc: {
                             "numCoresUsed_": sdsc_spec.num_cores,
-                            "numCoreletsUsed_": sdsc_spec.num_corelets,
+                            "numCoreletsUsed_": 1,
                             "coreIdsUsed_": [c for c in range(sdsc_spec.num_cores)],
                             "N_": {
                                 "name_": "n",
@@ -1171,10 +1168,7 @@ def generate_sdsc(
                                                 "factor_": sdsc_spec.num_cores,
                                                 "label_": "core",
                                             },
-                                            {
-                                                "factor_": sdsc_spec.num_corelets,
-                                                "label_": "corelet",
-                                            },
+                                            {"factor_": 1, "label_": "corelet"},
                                             {"factor_": 1, "label_": "time"},
                                         ],
                                         "data_": _start_addr_data(tensor),
@@ -1297,7 +1291,6 @@ def generate_sdsc(
                                 sdsc_spec.data_format,
                                 sdsc_spec.constants,
                                 sdsc_spec.num_cores,
-                                sdsc_spec.num_corelets,
                             ),
                             "computeOp_": [
                                 {
