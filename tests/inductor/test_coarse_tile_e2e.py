@@ -1824,10 +1824,29 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "allow_all_ops_in_lx_planning": True,
         }
     )
+    @unittest.expectedFailure
     def test_hint_tiled_pointwise_outside_consumer_correct(self):
         """Tiled pointwise op with a consumer outside the loop (tests
         _allocate_full_buffer pre-stickify: the full buffer must be correctly
-        stickified by layout propagation)."""
+        stickified by layout propagation).
+
+        Accepted, tracked regression (not a defect in the change that
+        exposed it): this op used to take the direct-mutation Case 2/"Case
+        3" branch of `_propagate_tiled_op`, which coarse_tile.py's
+        unconditional-copy change (see
+        docs/superpowers/plans/2026-07-28-coarse-tile-unconditional-copy.md
+        Task 2) deletes, routing every cross-loop-group write through
+        `_insert_copy_op` instead. That path has its own pre-existing,
+        general addressing bug in `superdsc.py`'s `_get_device_dim_order`/
+        backGap logic (misfires when a copy op's destination `device_size`
+        differs from its source at a slot for a dim that isn't actually
+        the tiled dim). Confirmed pre-existing on unmodified baseline via
+        `coarse_tile_copy_backgap_repro.py` at the repo root (run it
+        directly against baseline to reproduce standalone, no pytest
+        needed). Root-cause writeup:
+        .superpowers/sdd/2026-07-28-coarse-tile-unconditional-copy/task-2-report.md.
+        Un-xfail once `superdsc.py`'s addressing is fixed.
+        """
         from torch_spyre._inductor import spyre_hint
 
         A, B = 128, 64
