@@ -1970,6 +1970,80 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
 
+    @config.patch(
+        {
+            "sencores": 4,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    @unittest.expectedFailure
+    def test_span_overflow_mutation_case_external_input_layout_mismatch(self):
+        """Regression repro for the Case 2/"Case 3" layout-reconciliation gap.
+
+        A span-overflow-tiled elementwise op with two real inputs -- both
+        fresh graph inputs -- and zero inside consumers, so
+        _has_loop_internal_real_input returns False and _propagate_tiled_op
+        takes the direct-mutation Case 2/"Case 3" branch
+        (coarse_tile.py:1682-1700) with no compatibility check against the
+        external inputs' own committed device layouts. See
+        docs/superpowers/specs/2026-07-28-coarse-tile-unconditional-copy-design.md
+        section 1.
+
+        `x` is physically stored as [Lq, B, D] and read via `.transpose(0, 1)`
+        (a real, non-contiguous stride permutation -- not just a relabeled
+        `dim_order` on an already-contiguous tensor, which is not sufficient
+        to reproduce this: several such variants were tried and all stayed
+        numerically correct). `y` keeps the default row-major [B, Lq, D]
+        layout, which is also what the op's own natural output layout
+        follows. `_allocate_full_buffer`'s post-stickify branch
+        (coarse_tile.py:1906-1949) derives `full_buf`'s device layout purely
+        by scaling the op's own committed output layout -- never consulting
+        `x`'s transposed layout -- and Case 2 then rewires the op to write
+        directly into `full_buf` with no compatibility check against `x`.
+        `superdsc.py`'s per-element stride/offset computation
+        (`_get_device_dim_order`'s `dim_order` walk, `arg.device_size[
+        -stride_idx - 2]` lookup around superdsc.py:498-533) trusts `x`'s own
+        (transposed) `device_size`/`stride_map` for addressing, but the
+        deliberate stick-dim-only correction at superdsc.py:502-526 does not
+        cover this case because the divergence here is on a *non-stick* dim
+        pair (B, Lq) -- so `x` is read with wrong per-element addressing.
+
+        Confirmed failure mode (see task-1-report.md for the full
+        investigation): 12221/16384 elements (74.6%) mismatch at
+        atol=0.01/rtol=0.01, max abs diff ~5.89 -- far outside fp16 rounding
+        noise (~0.0078 max abs diff on the passing baseline with the same
+        shapes and no span-overflow tiling). Confirmed via a `logger.debug`
+        spy on coarse_tile.py:1713 that this hits case "2 (mutation)", and
+        confirmed via a baseline run of the identical transpose+add with
+        span-overflow tiling NOT triggered that the transpose itself is
+        handled correctly outside this pass (0 mismatches). Will be
+        un-xfailed once the Case 2/"Case 3" branch is replaced by the
+        always-safe copy-op path (Task 2 of this plan).
+
+        MAX_SPAN_BYTES is patched down so a small tensor triggers automatic
+        span-overflow tiling without needing a multi-hundred-MB real
+        allocation (technique matches
+        test_span_overflow_hint_analysis.py's TestSpanOverflowNumericValidation
+        class).
+        """
+        from unittest.mock import patch as mock_patch2
+
+        B, Lq, D = 32, 8, 64
+        x_raw = torch.randn(Lq, B, D, dtype=torch.float16)
+        x = x_raw.transpose(0, 1)  # logical [B, Lq, D], non-contiguous strides
+        y = torch.randn(B, Lq, D, dtype=torch.float16)
+
+        def fn(x, y):
+            return x + y
+
+        with mock_patch2(
+            "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+            8192,
+        ):
+            compare_with_cpu(
+                fn, x, y, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
+            )
+
 
 class TestNamedDimsHint(InductorTestCase):
     """Tests for propagate_named_dims handling of ops with a named_dims hint.
