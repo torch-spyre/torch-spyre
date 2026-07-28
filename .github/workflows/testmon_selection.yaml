@@ -125,12 +125,14 @@ on:
       - torch_spyre/**/*.py
       - tests/**/*.py
       - tests/configs/**/*.yaml
+      - .github/**/*
   pull_request:
     branches: [main]
     paths:
       - torch_spyre/**/*.py
       - tests/**/*.py
       - tests/configs/**/*.yaml
+      - .github/**/*
   workflow_dispatch:
     inputs:
       test_type:
@@ -209,7 +211,7 @@ jobs:
           if [[ -n "$RUN_ID" ]]; then
             echo "Found previous run: $RUN_ID (sha $TARGET_SHA)"
             echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-            echo "is_first_run=true" >> "$GITHUB_OUTPUT"
+            echo "is_first_run=false" >> "$GITHUB_OUTPUT"
           else
             echo "No previous completed run found for sha '$TARGET_SHA' -- treating as first run"
             echo "run_id=" >> "$GITHUB_OUTPUT"
