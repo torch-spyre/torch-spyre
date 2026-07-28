@@ -4454,6 +4454,162 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         self.assertTrue(getattr(tiled_op, "_pending_per_tile_fixed", False))
 
 
+def _make_cross_group_producer_read_fixture():
+    """Like _make_full_buffer_read_fixture, but the producer is a plain
+    ComputedBuffer in a different loop group, not a SpyreEmptyFallback.
+
+    Models Open Question 5's chained-coarse-tile-group case: a buffer
+    produced by an earlier loop group (already stamped with its own
+    loop_info) rather than a fresh SpyreEmptyFallback accumulator. Before
+    this task, _full_buffer_read_deps's isinstance(SpyreEmptyFallback)
+    filter misses this case entirely; after, it must be caught by the
+    loop_group_id[0] comparison.
+
+    Caller must have an active graph handler around this call.
+    Returns (tiled_op, full_deps, operations).
+    """
+    from torch._inductor.ir import (
+        ComputedBuffer,
+        FixedLayout,
+        Pointwise,
+        StorageBox,
+        TensorBox,
+    )
+
+    device = torch.device("cpu")
+    dtype = torch.float32
+
+    # Producer: a ComputedBuffer in loop group (1,), full-size output.
+    producer_data = Pointwise.create(
+        device=device,
+        dtype=dtype,
+        inner_fn=lambda index: sympy.Integer(0),
+        ranges=[Integer(64), Integer(128)],
+    ).data.data
+    producer = ComputedBuffer(
+        name="producer0",
+        layout=FixedLayout(device, dtype, [64, 128], [128, 1]),
+        data=producer_data,
+    )
+    producer.operation_name = "producer0"
+    producer.origins = OrderedSet()
+    producer.loop_info = CoarseTileInfo(
+        loop_group_id=(1,), loop_count=[Integer(1)], loop_tiled_dims=[[]]
+    )
+    V.graph.name_to_buffer["producer0"] = producer
+
+    producer_box = TensorBox(StorageBox(producer))
+
+    def inner_fn(index):
+        # ComputedBuffer.make_loader() inlines the producer's own inner_fn
+        # (rather than emitting ops.load) whenever num_reads() == 0 -- i.e.
+        # before any other op has read it, which is exactly our case here.
+        # force_realize() forces a genuine ops.load, matching how a real
+        # cross-loop-group producer (already scheduled, with consumers
+        # elsewhere in the graph) would behave.
+        with ComputedBuffer.force_realize():
+            return producer_box.make_loader()(index)
+
+    pw = Pointwise.create(
+        device=device,
+        dtype=dtype,
+        inner_fn=inner_fn,
+        ranges=[Integer(8), Integer(128)],
+    )
+    pw_data = pw.data.data
+    tiled_op = ComputedBuffer(
+        name="tiled_op0",
+        layout=FixedLayout(device, dtype, [Integer(8), Integer(128)], None),
+        data=pw_data,
+    )
+    tiled_op.operation_name = "tiled_op0"
+    tiled_op.origins = OrderedSet()
+    tiled_op.loop_info = CoarseTileInfo(
+        loop_group_id=(0,), loop_count=[Integer(8)], loop_tiled_dims=[[0]]
+    )
+    V.graph.name_to_buffer["tiled_op0"] = tiled_op
+
+    operations = [producer, tiled_op]
+    full_deps = _full_buffer_read_deps(tiled_op)
+    return tiled_op, full_deps, operations
+
+
+class TestFullBufferReadDepsCrossGroup(unittest.TestCase):
+    """_full_buffer_read_deps must catch any cross-loop-group producer, not
+    just SpyreEmptyFallback targets (Open Question 5)."""
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    def test_cross_group_plain_producer_detected(self):
+        tiled_op, full_deps, operations = _make_cross_group_producer_read_fixture()
+        self.assertEqual(len(full_deps), 1)
+        self.assertEqual(full_deps[0].name, "producer0")
+
+    def test_same_group_producer_not_flagged(self):
+        """A producer in the SAME outer loop group must NOT be treated as
+        a full-buffer read (it's an ordinary loop-internal dependency)."""
+        from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
+
+        device = torch.device("cpu")
+        dtype = torch.float32
+        producer_data = Pointwise.create(
+            device=device,
+            dtype=dtype,
+            inner_fn=lambda index: sympy.Integer(0),
+            ranges=[Integer(8), Integer(128)],
+        ).data.data
+        producer = ComputedBuffer(
+            name="producer0",
+            layout=FixedLayout(device, dtype, [8, 128], [128, 1]),
+            data=producer_data,
+        )
+        producer.operation_name = "producer0"
+        producer.origins = OrderedSet()
+        producer.loop_info = CoarseTileInfo(
+            loop_group_id=(0,), loop_count=[Integer(8)], loop_tiled_dims=[[0]]
+        )
+        V.graph.name_to_buffer["producer0"] = producer
+
+        from torch._inductor.ir import StorageBox, TensorBox
+
+        producer_box = TensorBox(StorageBox(producer))
+
+        def inner_fn(index):
+            # See _make_cross_group_producer_read_fixture: force a real
+            # ops.load so this test genuinely exercises the loop_group_id
+            # comparison, rather than passing vacuously because the
+            # producer's own inner_fn got inlined (num_reads() == 0).
+            with ComputedBuffer.force_realize():
+                return producer_box.make_loader()(index)
+
+        pw = Pointwise.create(
+            device=device,
+            dtype=dtype,
+            inner_fn=inner_fn,
+            ranges=[Integer(8), Integer(128)],
+        )
+        tiled_op = ComputedBuffer(
+            name="tiled_op0",
+            layout=FixedLayout(device, dtype, [Integer(8), Integer(128)], None),
+            data=pw.data.data,
+        )
+        tiled_op.operation_name = "tiled_op0"
+        tiled_op.origins = OrderedSet()
+        tiled_op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,), loop_count=[Integer(8)], loop_tiled_dims=[[0]]
+        )
+        V.graph.name_to_buffer["tiled_op0"] = tiled_op
+
+        full_deps = _full_buffer_read_deps(tiled_op)
+        self.assertEqual(full_deps, [])
+
+
 def _make_full_buffer_read_fixture():
     """Build a real tiled Pointwise op that reads a full-size SpyreEmptyFallback.
 
@@ -4605,6 +4761,170 @@ class TestInsertReadCopyOps(unittest.TestCase):
         # matches) is unmodified -- confirms the fixture is exercising the
         # intended full-vs-tile mismatch, not some other buffer kind.
         self.assertIsInstance(full_buf, SpyreEmptyFallback)
+
+    def test_cross_group_plain_producer_copy_derivation(self):
+        """_insert_read_copy_ops must work for a cross-group read whose
+        producer is a plain ComputedBuffer, not just SpyreEmptyFallback
+        (Open Question 5).
+
+        Runs _make_cross_group_producer_read_fixture's tiled_op/full_deps
+        through _insert_read_copy_ops directly and asserts the same shape of
+        outcome test_boundary_read_always_copies_not_views already asserts
+        for the SpyreEmptyFallback case: a real materializing Pointwise copy,
+        correctly retargeted via _NameSwapHandler.
+        """
+        from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
+
+        tiled_op, full_deps, operations = _make_cross_group_producer_read_fixture()
+        self.assertEqual(len(full_deps), 1)
+        producer = V.graph.get_buffer(full_deps[0].name)
+
+        new_op = _insert_read_copy_ops(tiled_op, full_deps, operations)
+
+        # Exactly one new op was inserted (the copy), immediately before
+        # tiled_op; the original producer is untouched.
+        self.assertEqual(len(operations), 3)
+        copy_buf = operations[1]
+        self.assertIs(operations[0], producer)
+        self.assertIs(operations[2], new_op)
+
+        # The inserted op is a real materializing copy, not a pass-through
+        # view/alias, exactly as in the SpyreEmptyFallback case:
+        self.assertIsInstance(copy_buf, ComputedBuffer)
+        self.assertIsInstance(copy_buf.data, Pointwise)
+        self.assertIsInstance(copy_buf.layout, FixedLayout)
+        self.assertIsNot(copy_buf.layout, producer.layout)
+        self.assertEqual(list(copy_buf.layout.size), [8, 128])
+        self.assertEqual(list(producer.layout.size), [64, 128])
+
+        loaded_names = []
+
+        class _RecordingHandler:
+            def load(self, name, index):
+                loaded_names.append(name)
+                return 0.0
+
+        with V.set_ops_handler(_RecordingHandler()):
+            copy_buf.data.inner_fn([sympy.Integer(0) for _ in copy_buf.data.ranges])
+        self.assertEqual(loaded_names, [producer.get_name()])
+
+        redirected_names = []
+
+        class _RecordingHandler2:
+            def load(self, name, index):
+                redirected_names.append(name)
+                return 0.0
+
+        with V.set_ops_handler(_RecordingHandler2()):
+            new_op.data.inner_fn([sympy.Integer(0) for _ in new_op.data.ranges])
+        self.assertEqual(redirected_names, [copy_buf.get_name()])
+        self.assertNotIn(producer.get_name(), redirected_names)
+
+    def test_post_stickify_copy_drops_device_layout(self):
+        """Open Question 6 finding: on the post-stickify (span-overflow)
+        call site, _insert_read_copy_ops's copy buffer loses device_layout.
+
+        _allocate_full_buffer (coarse_tile.py:1825-1955ish) explicitly
+        branches on isinstance(orig_layout, FixedTiledLayout) so a
+        post-stickify full buffer gets a FixedTiledLayout copy (preserving
+        device_layout/SpyreTensorLayout stick-addressing metadata), while a
+        pre-stickify one gets a plain FixedLayout (stickification runs
+        later and fills device_layout in). _insert_read_copy_ops has no
+        such branch: it unconditionally builds
+        ``FixedLayout(device, dtype, tile_ranges, tile_strides)`` for the
+        copy op, regardless of whether the read target (and tiled_op
+        itself) already carries a FixedTiledLayout.
+
+        On the post-stickify call site (_maybe_coarse_tile_span_overflow,
+        passes.py), this pass runs *after* finalize_layouts/insert_restickify
+        have already completed, and every downstream pass in the pipeline
+        (span_reduction, work_distribution, LX scratchpad planning) expects
+        FixedTiledLayout.device_layout for physical span arithmetic (see
+        CustomPreSchedulingPasses's pipeline docstring). A copy op stamped
+        with a plain FixedLayout at this point has no device_layout at all,
+        and `isinstance(copy_buf.layout, FixedTiledLayout)` is False for it
+        even though every sibling op's layout at this pipeline stage is a
+        FixedTiledLayout.
+
+        This test demonstrates the gap directly rather than silently
+        patching around it (per task instructions): it does NOT currently
+        fail, because nothing in this narrow unit test inspects
+        device_layout downstream -- it documents the asymmetry so it is not
+        lost. Fixing it (mirroring _allocate_full_buffer's own
+        isinstance(orig_layout, FixedTiledLayout) branch inside
+        _insert_read_copy_ops) is out of this task's scope; flagged here for
+        follow-up.
+        """
+        from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise
+
+        from torch_spyre._C import ElementArrangement, SpyreTensorLayout
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        device = torch.device("cpu")
+        dtype = torch.float16
+
+        def _make_ftl_op(name, host_size, loop_group_id, loop_count, loop_tiled_dims):
+            strides = [int(s) for s in FlexibleLayout.contiguous_strides(host_size)]
+            device_layout = SpyreTensorLayout(
+                host_size,
+                strides,
+                dtype,
+                list(range(len(host_size))),
+                ElementArrangement.STANDARD,
+            )
+            layout = FixedTiledLayout(
+                device,
+                dtype,
+                [Integer(s) for s in host_size],
+                [Integer(s) for s in strides],
+                device_layout,
+            )
+            pw = Pointwise(
+                device=device,
+                dtype=dtype,
+                inner_fn=lambda index: sympy.Integer(0),
+                ranges=[Integer(s) for s in host_size],
+            )
+            op = ComputedBuffer(name=name, layout=layout, data=pw)
+            op.operation_name = name
+            op.origins = OrderedSet()
+            op.loop_info = CoarseTileInfo(
+                loop_group_id=loop_group_id,
+                loop_count=loop_count,
+                loop_tiled_dims=loop_tiled_dims,
+            )
+            V.graph.name_to_buffer[name] = op
+            return op
+
+        # Producer: a post-stickify FixedTiledLayout buffer in a different
+        # outer loop group, modeling an already-stickified cross-group read
+        # target on the span-overflow call site.
+        producer = _make_ftl_op("producer0", [64, 128], (1,), [Integer(1)], [[]])
+
+        from torch._inductor.ir import StorageBox, TensorBox
+
+        producer_box = TensorBox(StorageBox(producer))
+
+        def inner_fn(index):
+            with ComputedBuffer.force_realize():
+                return producer_box.make_loader()(index)
+
+        tiled_op = _make_ftl_op("tiled_op0", [8, 128], (0,), [Integer(8)], [[0]])
+        object.__setattr__(tiled_op.data, "inner_fn", inner_fn)
+
+        operations = [producer, tiled_op]
+        full_deps = _full_buffer_read_deps(tiled_op)
+        self.assertEqual(len(full_deps), 1)
+
+        _insert_read_copy_ops(tiled_op, full_deps, operations)
+        copy_buf = operations[1]
+
+        # tiled_op and producer both carry FixedTiledLayout (post-stickify),
+        # but the inserted copy does not -- confirming the asymmetry.
+        self.assertIsInstance(producer.layout, FixedTiledLayout)
+        self.assertIsInstance(tiled_op.layout, FixedTiledLayout)
+        self.assertNotIsInstance(copy_buf.layout, FixedTiledLayout)
+        self.assertFalse(hasattr(copy_buf.layout, "device_layout"))
 
 
 def _make_tiled_reduction_op(

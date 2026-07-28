@@ -1586,14 +1586,16 @@ def _propagate_tiled_op(
     loop_info = getattr(op, "loop_info", None)
 
     # A tiled op — Pointwise or Reduction, loop-internal or not — may read a
-    # full-size SpyreEmptyFallback buffer directly (e.g. an accumulator
-    # produced by an earlier Case 1/2 rewrite).  That buffer has exactly one
-    # candidate layout, sized to the full buffer, while this op's own
-    # candidates are sized to its tile — the two can never be stick-compatible.
-    # Insert a tile-sized read copy for each such input before doing anything
-    # else (mirrors the write-side _insert_copy_op fix, but on the read side).
-    # This must run before the Reduction/has_tiled_reduction branch below,
-    # since _propagate_tiled_reduction_op never touches op's own reads.
+    # buffer produced outside its own outer loop group directly (e.g. a
+    # SpyreEmptyFallback accumulator, or the output of an earlier, different
+    # coarse-tile group's own copy op).  That buffer's layout was fixed by a
+    # different loop group's (or no loop group's) constraints, sized to its
+    # own full extent, while this op's own candidates are sized to its tile
+    # — the two can never be stick-compatible.  Insert a tile-sized read copy
+    # for each such input before doing anything else (mirrors the write-side
+    # _insert_copy_op fix, but on the read side).  This must run before the
+    # Reduction/has_tiled_reduction branch below, since
+    # _propagate_tiled_reduction_op never touches op's own reads.
     full_deps = _full_buffer_read_deps(op)
     if full_deps:
         op = _insert_read_copy_ops(op, full_deps, operations)
@@ -1745,20 +1747,49 @@ def _has_inside_consumers(
 
 
 def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
-    """Return op's MemoryDep reads that target a full-size SpyreEmptyFallback buffer.
+    """Return op's MemoryDep reads whose producer is outside op's own loop group.
 
-    A loop-internal op (own tile-sized layout) that reads one of these
-    directly can never be made stick-compatible with it: the
-    SpyreEmptyFallback target has exactly one candidate layout, sized to the
-    full buffer, while the op's own candidates are sized to its tile.  See
-    _insert_read_copy_ops.
+    A loop-internal op (own tile-sized layout) that reads a buffer produced
+    outside its own outer loop group can never be made stick-compatible
+    with it under AllSameNode: that producer's layout was fixed by a
+    different loop group's (or no loop group's) constraints, sized to its
+    own full extent, while op's own candidates are sized to its tile.
+
+    This only applies to producers that go through coarse_tile's own
+    candidate-layout machinery: a SpyreEmptyFallback buffer (coarse_tile's
+    own full-extent accumulator, given a single generic_layout candidate and
+    AnyInNode -- see _allocate_full_buffer -- that the optimizer can never
+    relayout) or a ComputedBuffer with no loop_info (untiled, full-extent) or
+    a different loop_group_id[0] (divided by a different group's loop_count
+    -- e.g. the output of an earlier, different coarse-tile group's own copy
+    op). Ordinary graph-input InputBuffers (and other non-ComputedBuffer,
+    non-SpyreEmptyFallback producers such as constants/extern nodes) are
+    deliberately excluded: those get exactly one candidate layout too, but
+    _get_prop_args/AllSameNode's normal restickify path already reconciles a
+    full-extent input against a tile-sized read (see insert_restickify.py),
+    so flagging them here would insert a spurious copy for the common case
+    of a plain graph input read directly by a tiled op. See
+    _insert_read_copy_ops and _find_outside_consumers (same outer-key
+    comparison, mirrored here on the read side).
     """
     from ..ir import SpyreEmptyFallback  # deferred: avoids circular import
 
+    loop_info = getattr(op, "loop_info", None)
+    if loop_info is None:
+        return []
+    outer_key = loop_info.loop_group_id[0]
+
     reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
-    return [
-        d for d in reads if isinstance(V.graph.get_buffer(d.name), SpyreEmptyFallback)
-    ]
+    result = []
+    for d in reads:
+        buf = V.graph.get_buffer(d.name)
+        if isinstance(buf, SpyreEmptyFallback):
+            result.append(d)
+        elif isinstance(buf, ComputedBuffer):
+            producer_li = getattr(buf, "loop_info", None)
+            if producer_li is None or producer_li.loop_group_id[0] != outer_key:
+                result.append(d)
+    return result
 
 
 def _graph_output_names() -> set[str]:
