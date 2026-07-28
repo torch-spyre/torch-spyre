@@ -2586,7 +2586,7 @@ def _patch_consumers(
                 return _orig(*args)
 
         object.__setattr__(consumer.data, "inner_fn", new_inner_fn)
-        replace_computed_buffer_body(consumer, consumer.data, operations)
+        consumer = replace_computed_buffer_body(consumer, consumer.data, operations)
         V.graph.name_to_buffer[consumer.get_name()] = operations[
             next(
                 i

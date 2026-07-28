@@ -150,6 +150,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
             joint_graph.pass_patterns[:] = origin_pass
             Loops.has_large_inner_fn = old_loop
             GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]
+            SchedulerNode.has_side_effects = old_scheduler_node_has_side_effects  # type: ignore[method-assign]
 
 
 OBSERVER_HOOKS_KEY = "__spyre_hooks_meta"

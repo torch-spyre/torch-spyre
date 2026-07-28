@@ -2860,7 +2860,8 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
                                 "128",
                                 f"Expected backGapCore_['out']['-1'] == "
                                 f"'128' (dev_dim_size - it_dim_size = "
-                                f"128 - 0, byte units); got {back_gap}.",
+                                f"128 - 64 = 64 elements = 128 bytes at "
+                                f"2 bytes/elem); got {back_gap}.",
                             )
         self.assertTrue(
             found_backgap,
