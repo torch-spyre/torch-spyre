@@ -302,10 +302,9 @@ class TestBuildingBlocks(unittest.TestCase):
         general addressing bug in `superdsc.py`'s `_get_device_dim_order`/
         backGap logic (misfires when a copy op's destination `device_size`
         differs from its source at a slot for a dim that isn't actually
-        the tiled dim). Confirmed pre-existing on unmodified baseline via
-        `coarse_tile_copy_backgap_repro.py` at the repo root (run it
-        directly against baseline to reproduce standalone, no pytest
-        needed). Root-cause writeup:
+        the tiled dim). Confirmed pre-existing on unmodified baseline via a
+        standalone repro script (handed off separately; ~87% mismatch with
+        zero divergent input layouts needed). Root-cause writeup:
         .superpowers/sdd/2026-07-28-coarse-tile-unconditional-copy/task-2-report.md.
         Un-xfail once `superdsc.py`'s addressing is fixed.
         """
