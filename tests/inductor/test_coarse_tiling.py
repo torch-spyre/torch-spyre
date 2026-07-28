@@ -4435,19 +4435,35 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         ):
             _propagate_tiled_op(tiled_op, operations)
 
-        copy_ops = [
+        # tiled_op's own two inputs are real, full-size, untiled InputBuffers
+        # read at a tile-scoped index -- _full_buffer_read_deps now flags
+        # both, so _insert_read_copy_ops replaces tiled_op with a new
+        # ComputedBuffer (same name, "op0") before the write-side copy-op
+        # logic below even runs. Look the final op up by name rather than
+        # using the now-stale tiled_op reference.
+        final_op = V.graph.name_to_buffer["op0"]
+
+        write_copy_ops = [
             op
             for op in operations
             if isinstance(op, ComputedBuffer)
             and op.get_name().startswith("coarse_tile_copy_")
         ]
-        self.assertEqual(len(copy_ops), 1)
-        self.assertIsInstance(copy_ops[0].layout, MutationLayoutSHOULDREMOVE)
-        # The original tiled op itself never becomes a
-        # MutationLayoutSHOULDREMOVE -- it keeps its own tile-sized layout
-        # and is marked per_tile_fixed instead, mirroring the Case 1 path.
-        self.assertNotIsInstance(tiled_op.layout, MutationLayoutSHOULDREMOVE)
-        self.assertTrue(getattr(tiled_op, "_pending_per_tile_fixed", False))
+        read_copy_ops = [
+            op
+            for op in operations
+            if isinstance(op, ComputedBuffer)
+            and op.get_name().startswith("coarse_tile_read_copy_")
+        ]
+        self.assertEqual(len(write_copy_ops), 1)
+        self.assertIsInstance(write_copy_ops[0].layout, MutationLayoutSHOULDREMOVE)
+        # Both real inputs get their own read copy.
+        self.assertEqual(len(read_copy_ops), 2)
+        # The tiled op itself never becomes a MutationLayoutSHOULDREMOVE --
+        # it keeps its own tile-sized layout and is marked per_tile_fixed
+        # instead, mirroring the Case 1 path.
+        self.assertNotIsInstance(final_op.layout, MutationLayoutSHOULDREMOVE)
+        self.assertTrue(getattr(final_op, "_pending_per_tile_fixed", False))
 
 
 def _make_cross_group_producer_read_fixture():

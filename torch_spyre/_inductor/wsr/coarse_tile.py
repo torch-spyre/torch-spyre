@@ -70,6 +70,7 @@ from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
     FlexibleLayout,
+    InputBuffer,
     IRNode,
     Layout,
     Loops,
@@ -1741,13 +1742,24 @@ def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
     relayout) or a ComputedBuffer with no loop_info (untiled, full-extent) or
     a different loop_group_id[0] (divided by a different group's loop_count
     -- e.g. the output of an earlier, different coarse-tile group's own copy
-    op). Ordinary graph-input InputBuffers (and other non-ComputedBuffer,
-    non-SpyreEmptyFallback producers such as constants/extern nodes) are
-    deliberately excluded: those get exactly one candidate layout too, but
-    _get_prop_args/AllSameNode's normal restickify path already reconciles a
-    full-extent input against a tile-sized read (see insert_restickify.py),
-    so flagging them here would insert a spurious copy for the common case
-    of a plain graph input read directly by a tiled op. See
+    op).
+
+    Graph inputs (InputBuffer, including ConstantBuffer) are always
+    full-extent and undivided, exactly like a SpyreEmptyFallback accumulator
+    -- there is no loop_info question to ask, so they are always included.
+    An older version of this docstring argued these could be skipped because
+    insert_restickify's AllSameNode path "already reconciles a full-extent
+    input against a tile-sized read." That reasoning predates the decision
+    (see _insert_copy_op) to unconditionally insert a copy across any
+    loop-group boundary that changes size (full <-> tile), and does not hold
+    up under it: restickify only reconciles device layout/strides via a
+    fresh spyre.restickify op; it never rewrites a consumer's *index
+    expression*. A tiled op's own load index for a given read is sized to
+    its tile regardless of what the producer is, so a direct read of a
+    graph input inside the loop body is evaluated with a tile-scoped index
+    against a full-size buffer -- the same indexing bug _insert_copy_op's
+    write side had before that fix, just on the read side and against an
+    external buffer instead of a freshly allocated one. See
     _insert_read_copy_ops and _find_outside_consumers (same outer-key
     comparison, mirrored here on the read side).
     """
@@ -1762,7 +1774,14 @@ def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
     result = []
     for d in reads:
         buf = V.graph.get_buffer(d.name)
-        if isinstance(buf, SpyreEmptyFallback):
+        # Graph inputs are TensorBox(StorageBox(InputBuffer))-wrapped in
+        # V.graph.get_buffer's result (see graph_inputs); unwrap to check.
+        unwrapped = buf
+        if isinstance(unwrapped, TensorBox):
+            unwrapped = unwrapped.data
+        if isinstance(unwrapped, StorageBox):
+            unwrapped = unwrapped.data
+        if isinstance(unwrapped, (SpyreEmptyFallback, InputBuffer)):
             result.append(d)
         elif isinstance(buf, ComputedBuffer):
             producer_li = getattr(buf, "loop_info", None)
@@ -2102,6 +2121,16 @@ def _insert_read_copy_ops(
 
     for dep in full_deps:
         full_buf = V.graph.get_buffer(dep.name)
+        # Graph inputs come back TensorBox(StorageBox(InputBuffer))-wrapped
+        # (see graph_inputs); get_dtype() resolves to self.dtype via IRNode
+        # and is not delegated by TensorBox/StorageBox, so it raises
+        # AttributeError on the wrapper -- unwrap to the real Buffer first.
+        # get_name()/.layout are delegating and would work either way, but
+        # unwrap once so every full_buf.* access below is on the real node.
+        if isinstance(full_buf, TensorBox):
+            full_buf = full_buf.data
+        if isinstance(full_buf, StorageBox):
+            full_buf = full_buf.data
 
         tile_ranges = list(dep.size)
         tile_strides = [dep.index.coeff(v) for v in dep.var_names]
