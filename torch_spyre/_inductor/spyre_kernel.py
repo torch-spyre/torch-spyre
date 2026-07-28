@@ -505,8 +505,9 @@ def _tile_advance_expr_from_dep(
     also evaluates to ``0`` (this dependency never advances).
 
     Moved here (from coarse_tile.py) so index substitution happens once
-    the tensor's get_read_writes().index is guaranteed final -- see
-    docs/superpowers/specs/2026-07-27-deferred-tile-advance-capture-design.md.
+    the tensor's get_read_writes().index is guaranteed final -- capturing
+    the advance expression any earlier risks reading a stale, not-yet-final
+    index.
     """
     subs = {
         sympy_index_symbol(f"d{dim}"): extent * sympy_index_symbol(f"d{dim}")

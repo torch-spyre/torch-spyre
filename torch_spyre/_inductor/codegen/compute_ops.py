@@ -550,8 +550,8 @@ def generate_sdsc(
     ``tensor.device_tile_advance_expr``: each tensor's own device-element-
     offset ``sympy.Expr | None``, symbolic in the real Inductor iteration
     symbols. For a symbol tiled at exactly one nesting level (the only case
-    this function handles correctly -- see
-    docs/superpowers/specs/2026-07-25-device-tile-advance-codegen-design.md),
+    this function handles correctly -- a symbol tiled at more than one
+    level has no single coefficient ``expr.coeff(sym)`` could return),
     ``expr.coeff(sym)`` is that level's byte stride once multiplied by
     ``num_bytes(tensor.data_format)``.
     """

@@ -60,8 +60,10 @@ class CoarseTileInfo:
         the host-range positional dims (or ``n_output_dims + reduction_pos``
         for reduction dims, matching ``loop_tiled_dims``'s own numbering)
         tiled *for this dependency* at that level, paired with that level's
-        own tile extent (see the per-level extent formula in
-        docs/superpowers/plans/2026-07-27-deferred-tile-advance-capture.md).
+        own tile extent: for a dim tiled at more than one level, an outer
+        level's extent equals the final (innermost) extent times the
+        product of every more-inner level's own count that also tiles that
+        dim.
         An empty per-level list means the dep is loop-invariant at that
         level. This is a tiling *decision*, not a substituted index
         expression -- deferred substitution into the dependency's actual

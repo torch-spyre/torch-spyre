@@ -1669,12 +1669,10 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         dimension was not the outermost host dimension (e.g. H in BHLD).
 
         Accepted, tracked regression, newly exposed (not caused) by the
-        unconditional-copy change (see
-        docs/superpowers/plans/2026-07-28-coarse-tile-unconditional-copy.md
-        Task 2): confirmed via direct A/B (passes at the commit immediately
-        before Task 2, fails starting exactly at Task 2's landing commit,
-        continuing to fail at HEAD) during the plan's final whole-branch
-        review. Distinct from the 5 `superdsc.py` backGap-class xfails
+        unconditional-copy change: confirmed via direct A/B (passes at the
+        commit immediately before the unconditional-copy change lands,
+        fails starting exactly at that landing commit, continuing to fail
+        at HEAD). Distinct from the 5 `superdsc.py` backGap-class xfails
         elsewhere in this file/test_building_blocks.py: this test's sibling
         (`test_hint_h_tiling_elementwise_loopspec`) shows a
         host-range-index -> iteration-space-key mapping defect on the
@@ -1724,12 +1722,10 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         rather than the 1st (H), producing wrong per-tile stride advances.
 
         Accepted, tracked regression, newly exposed (not caused) by the
-        unconditional-copy change (see
-        docs/superpowers/plans/2026-07-28-coarse-tile-unconditional-copy.md
-        Task 2): confirmed via direct A/B (passes at the commit immediately
-        before Task 2, fails starting exactly at Task 2's landing commit,
-        continuing to fail at HEAD) during the plan's final whole-branch
-        review. The assertion below now fails because
+        unconditional-copy change: confirmed via direct A/B (passes at the
+        commit immediately before the unconditional-copy change lands,
+        fails starting exactly at that landing commit, continuing to fail
+        at HEAD). The assertion below now fails because
         `device_tile_advance_expr` references
         `_tile_adv_coarse_tile_copy_buf0_lvl0` with coefficient 64 instead
         of `_tile_adv_op0_lvl0` with coefficient 65536 -- the newly-inserted
@@ -1871,18 +1867,15 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         Accepted, tracked regression (not a defect in the change that
         exposed it): this op used to take the direct-mutation Case 2/"Case
         3" branch of `_propagate_tiled_op`, which coarse_tile.py's
-        unconditional-copy change (see
-        docs/superpowers/plans/2026-07-28-coarse-tile-unconditional-copy.md
-        Task 2) deletes, routing every cross-loop-group write through
-        `_insert_copy_op` instead. That path has its own pre-existing,
-        general addressing bug in `superdsc.py`'s `_get_device_dim_order`/
-        backGap logic (misfires when a copy op's destination `device_size`
-        differs from its source at a slot for a dim that isn't actually
-        the tiled dim). Confirmed pre-existing on unmodified baseline via a
-        standalone repro script (handed off separately; ~87% mismatch with
-        zero divergent input layouts needed). Root-cause writeup:
-        .superpowers/sdd/2026-07-28-coarse-tile-unconditional-copy/task-2-report.md.
-        Un-xfail once `superdsc.py`'s addressing is fixed.
+        unconditional-copy change deletes, routing every cross-loop-group
+        write through `_insert_copy_op` instead. That path has its own
+        pre-existing, general addressing bug in `superdsc.py`'s
+        `_get_device_dim_order`/backGap logic (misfires when a copy op's
+        destination `device_size` differs from its source at a slot for a
+        dim that isn't actually the tiled dim). Confirmed pre-existing on
+        unmodified baseline via a standalone repro script (handed off
+        separately; ~87% mismatch with zero divergent input layouts
+        needed). Un-xfail once `superdsc.py`'s addressing is fixed.
         """
         from torch_spyre._inductor import spyre_hint
 
@@ -1909,27 +1902,25 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         """Nested Lq/D tiling into a direct copy_() mutation (Case 3 rewire).
 
         Accepted, tracked regression, newly exposed (not caused) by the
-        unconditional-copy change (see
-        docs/superpowers/plans/2026-07-28-coarse-tile-unconditional-copy.md
-        Task 2): before Task 2, `c.copy_(a + b)` routed `add` into the
-        direct-mutation Case 2/"Case 3" branch of `_propagate_tiled_op`
-        (`add`'s own layout became `MutationLayoutSHOULDREMOVE(c)`, no
-        separate copy op). Task 2 deletes that branch, so this now takes
+        unconditional-copy change: before that change, `c.copy_(a + b)`
+        routed `add` into the direct-mutation Case 2/"Case 3" branch of
+        `_propagate_tiled_op` (`add`'s own layout became
+        `MutationLayoutSHOULDREMOVE(c)`, no separate copy op). The
+        unconditional-copy change deletes that branch, so this now takes
         the `_insert_copy_op` path unconditionally instead -- which has its
         own pre-existing, general addressing bug in `superdsc.py`'s
         `_get_device_dim_order`/backGap logic (same class as the two
         already-tracked regressions in
         `test_hint_tiled_pointwise_outside_consumer_correct`/
         `test_mixed_plain_and_loop_bundle_codegen` above/nearby). Confirmed
-        via 4-way bisection (Task 5) that this test passes through the
-        commit immediately before Task 2 and fails starting exactly at
-        Task 2's landing commit, continuing to fail at HEAD -- a real,
-        reproducible, on-device regression, not a pre-existing failure Task
-        2 merely inherited. Deferred per user decision (2026-07-28): fold
-        into the existing `superdsc.py` backGap investigation already
-        underway rather than opening separate work now. Root-cause writeup:
-        .superpowers/sdd/2026-07-28-coarse-tile-unconditional-copy/task-5-report.md.
-        Un-xfail once `superdsc.py`'s addressing is fixed.
+        via 4-way bisection that this test passes through the commit
+        immediately before the unconditional-copy change lands and fails
+        starting exactly at that landing commit, continuing to fail at
+        HEAD -- a real, reproducible, on-device regression, not a
+        pre-existing failure merely inherited. Deferred per user decision:
+        fold into the existing `superdsc.py` backGap investigation already
+        underway rather than opening separate work now. Un-xfail once
+        `superdsc.py`'s addressing is fixed.
         """
         from torch_spyre._inductor import spyre_hint
 
@@ -1959,22 +1950,20 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         share the output's).
 
         Accepted, tracked regression, newly exposed (not caused) by the
-        unconditional-copy change (see
-        docs/superpowers/plans/2026-07-28-coarse-tile-unconditional-copy.md
-        Task 2): this test now takes the unconditional `_insert_copy_op`
-        path instead of the deleted direct-mutation Case 2/"Case 3" branch,
-        which has its own pre-existing, general addressing bug in
-        `superdsc.py`'s `_get_device_dim_order`/backGap logic (same class
-        as `test_hint_tiled_pointwise_outside_consumer_correct`/
+        unconditional-copy change: this test now takes the unconditional
+        `_insert_copy_op` path instead of the deleted direct-mutation
+        Case 2/"Case 3" branch, which has its own pre-existing, general
+        addressing bug in `superdsc.py`'s `_get_device_dim_order`/backGap
+        logic (same class as
+        `test_hint_tiled_pointwise_outside_consumer_correct`/
         `test_mixed_plain_and_loop_bundle_codegen` above). Confirmed via
-        4-way bisection (Task 5) that this test passes through the commit
-        immediately before Task 2 and fails starting exactly at Task 2's
-        landing commit, continuing to fail at HEAD. Deferred per user
-        decision (2026-07-28): fold into the existing `superdsc.py` backGap
-        investigation already underway rather than opening separate work
-        now. Root-cause writeup:
-        .superpowers/sdd/2026-07-28-coarse-tile-unconditional-copy/task-5-report.md.
-        Un-xfail once `superdsc.py`'s addressing is fixed.
+        4-way bisection that this test passes through the commit
+        immediately before the unconditional-copy change lands and fails
+        starting exactly at that landing commit, continuing to fail at
+        HEAD. Deferred per user decision: fold into the existing
+        `superdsc.py` backGap investigation already underway rather than
+        opening separate work now. Un-xfail once `superdsc.py`'s
+        addressing is fixed.
 
         Uses a 3-D [B, Lq, D] shape (unlike
         test_hint_nested_tiling_copy_mutation_correct's 2-D [Lq, D]) so the
@@ -2037,20 +2026,17 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         one.
 
         Accepted, tracked regression, newly exposed (not caused) by the
-        unconditional-copy change (see
-        docs/superpowers/plans/2026-07-28-coarse-tile-unconditional-copy.md
-        Task 2): same `superdsc.py` `_get_device_dim_order`/backGap
-        addressing bug class as this test's siblings above/nearby, now
-        hit via the unconditional `_insert_copy_op` path rather than the
-        deleted direct-mutation branch. Confirmed via 4-way bisection
-        (Task 5) that this test passes through the commit immediately
-        before Task 2 and fails starting exactly at Task 2's landing
-        commit, continuing to fail at HEAD. Deferred per user decision
-        (2026-07-28): fold into the existing `superdsc.py` backGap
-        investigation already underway rather than opening separate work
-        now. Root-cause writeup:
-        .superpowers/sdd/2026-07-28-coarse-tile-unconditional-copy/task-5-report.md.
-        Un-xfail once `superdsc.py`'s addressing is fixed.
+        unconditional-copy change: same `superdsc.py`
+        `_get_device_dim_order`/backGap addressing bug class as this
+        test's siblings above/nearby, now hit via the unconditional
+        `_insert_copy_op` path rather than the deleted direct-mutation
+        branch. Confirmed via 4-way bisection that this test passes
+        through the commit immediately before the unconditional-copy
+        change lands and fails starting exactly at that landing commit,
+        continuing to fail at HEAD. Deferred per user decision: fold into
+        the existing `superdsc.py` backGap investigation already underway
+        rather than opening separate work now. Un-xfail once
+        `superdsc.py`'s addressing is fixed.
         """
         from torch_spyre._inductor import spyre_hint
 

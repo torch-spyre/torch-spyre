@@ -179,8 +179,9 @@ class OpSpec:
             (per-unit-step device element advance) * trip_count, without
             needing a separately tracked full-extent field on TensorArg.
             Only correct when a symbol belongs to exactly one nesting level
-            (see docs/superpowers/specs/2026-07-25-device-tile-advance-codegen-design.md
-            for the scope decision) -- empty for non-tiled ops.
+            -- a symbol tiled at more than one level has no single trip
+            count this field could hold, so this is scoped to the common
+            one-level-per-symbol case -- empty for non-tiled ops.
     """
 
     op: str
