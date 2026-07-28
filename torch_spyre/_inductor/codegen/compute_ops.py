@@ -486,22 +486,22 @@ def gen_coord_info_value(
 
 
 def get_conv_params(tensor_num, dim, opfunc, conv_params, size, splits):
-    required_keys = [
-        "pad_dim_i",
-        "pad_dim_j",
-        "stride_i",
-        "stride_j",
-        "kernel_h",
-        "kernel_w",
-    ]
-    missing = [k for k in required_keys if k not in conv_params]
-    if missing:
-        raise ValueError(f"Missing conv_params keys: {missing}")
     conv_padding = "nopad"
     total_size = size // splits
     padding_len = 0
     stride_len = 1
     if tensor_num == 0 and opfunc == DEPTHWISE_CONV2D_OP:
+        required_keys = [
+            "pad_dim_i",
+            "pad_dim_j",
+            "stride_i",
+            "stride_j",
+            "kernel_h",
+            "kernel_w",
+        ]
+        missing = [k for k in required_keys if k not in conv_params]
+        if missing:
+            raise ValueError(f"Missing conv_params keys: {missing}")
         if "pad_type" in conv_params and (
             str(dim) == str(conv_params["pad_dim_i"])
             or str(dim) == str(conv_params["pad_dim_j"])
