@@ -738,7 +738,7 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         )
 
     def test_extracts_coefficient_for_tiled_dim(self):
-        from torch_spyre._inductor.wsr.coarse_tile import _tile_advance_expr_from_dep
+        from torch_spyre._inductor.spyre_kernel import _tile_advance_expr_from_dep
 
         d0 = sympy_index_symbol("d0")
         d1 = sympy_index_symbol("d1")
@@ -747,7 +747,7 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         self.assertEqual(simplify(expr - Integer(4096) * Integer(512) * d0), 0)
 
     def test_untiled_dim_contributes_zero(self):
-        from torch_spyre._inductor.wsr.coarse_tile import _tile_advance_expr_from_dep
+        from torch_spyre._inductor.spyre_kernel import _tile_advance_expr_from_dep
 
         d0 = sympy_index_symbol("d0")
         d1 = sympy_index_symbol("d1")
@@ -756,7 +756,7 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         self.assertEqual(expr, Integer(0))
 
     def test_broadcast_dim_not_in_index_contributes_zero(self):
-        from torch_spyre._inductor.wsr.coarse_tile import _tile_advance_expr_from_dep
+        from torch_spyre._inductor.spyre_kernel import _tile_advance_expr_from_dep
 
         d0 = sympy_index_symbol("d0")
         d1 = sympy_index_symbol("d1")
@@ -766,7 +766,7 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         self.assertEqual(simplify(expr - Integer(4096) * Integer(512) * d0), 0)
 
     def test_sums_multiple_tiled_dims(self):
-        from torch_spyre._inductor.wsr.coarse_tile import _tile_advance_expr_from_dep
+        from torch_spyre._inductor.spyre_kernel import _tile_advance_expr_from_dep
 
         d0 = sympy_index_symbol("d0")
         d1 = sympy_index_symbol("d1")
@@ -790,7 +790,7 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         casing for non-affine forms: it produces the exact substituted
         expression.
         """
-        from torch_spyre._inductor.wsr.coarse_tile import _tile_advance_expr_from_dep
+        from torch_spyre._inductor.spyre_kernel import _tile_advance_expr_from_dep
 
         d0 = sympy_index_symbol("d0")
         d1 = sympy_index_symbol("d1")
@@ -817,7 +817,7 @@ class TestTileAdvanceExprFromDep(unittest.TestCase):
         d0's, 1) must produce that exact pairing rather than assuming d0
         always carries the larger stride.
         """
-        from torch_spyre._inductor.wsr.coarse_tile import _tile_advance_expr_from_dep
+        from torch_spyre._inductor.spyre_kernel import _tile_advance_expr_from_dep
 
         d0 = sympy_index_symbol("d0")
         d1 = sympy_index_symbol("d1")
