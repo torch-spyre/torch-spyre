@@ -29,6 +29,12 @@ global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == 
 
 allow_all_ops_in_lx_planning: bool = False
 
+# Op names that must never be placed in LX scratchpad, even when
+# ``allow_all_ops_in_lx_planning`` is True.  Add an op's short name (as
+# returned by ``_op_short_name``) to force its output buffer to remain in HBM.
+# Example: ``config.patch({"lx_force_hbm_ops": {"clone"}})``.
+lx_force_hbm_ops: set = set()
+
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
 
 sencores: int = int(os.getenv("SENCORES", "32"))

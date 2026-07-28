@@ -76,6 +76,7 @@ from torch_spyre._inductor.scratchpad.utils import (
     get_op_pointwise_inputs,
     _would_produce_lx_back_gap,
     _is_tiled_advancing,
+    _has_indirect_read,
 )
 from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 
@@ -198,6 +199,13 @@ class ScratchpadAllocator:
                 drop_list.add(op.name)
                 self.reject_reasons[op.name] = "op not allowed"
 
+        # filter out ops explicitly forced to HBM via config.lx_force_hbm_ops
+        if config.lx_force_hbm_ops:
+            for op in graph.operations:
+                if op.name not in drop_list and self._get_op_name(op) in config.lx_force_hbm_ops:
+                    drop_list.add(op.name)
+                    self.reject_reasons[op.name] = "forced HBM (lx_force_hbm_ops)"
+
         # filter out core division mismatches
         for key, mismatch in core_div_mismatch.items():
             if mismatch == -1:
@@ -228,6 +236,27 @@ class ScratchpadAllocator:
             if op.name not in drop_list and _is_tiled_advancing(op):
                 drop_list.add(op.name)
                 self.reject_reasons[op.name] = "tiled (advancing), not per_tile_fixed"
+
+        # filter out indirect-access (gather/index_select) output buffers: the
+        # LX address is a compile-time constant and cannot be data-dependently
+        # indexed at runtime. Index tensors are already forced to HBM by
+        # compute_ops.py (memOrg_); this guard covers the value-output buffer.
+        for op in graph.operations:
+            if op.name not in drop_list and _has_indirect_read(op):
+                drop_list.add(op.name)
+                self.reject_reasons[op.name] = "indirect access (gather/index_select), HBM required"
+
+        # filter out restickify op outputs unconditionally: a restickify moves
+        # the stick dimension, so its per-core read and write frames are
+        # transposes of each other.  Placing the output in LX (a per-core
+        # constant base address) cannot represent that frame difference and
+        # would mis-address the tensor.  The input-side barrier ("read by
+        # restickify") already exists in _build_bound_buffers; this guard
+        # covers the output side for the allow_all_ops_in_lx_planning path.
+        for op in graph.operations:
+            if op.name not in drop_list and self._get_op_name(op) == "restickify":
+                drop_list.add(op.name)
+                self.reject_reasons[op.name] = "restickify output, HBM required"
 
         if not clone_at_graph_boundaries():
             # Without clone support, graph outputs cannot be LX-pinned: the caller

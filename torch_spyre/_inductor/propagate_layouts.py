@@ -73,6 +73,7 @@ from .pass_utils import (
     indirect_info_from_op,
     is_stick_expr_offset_free,
     _is_multi_stick_row_expr,
+    _msr_outer_var,
     iter_var_id,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
@@ -144,24 +145,45 @@ def _pick_stick_dim(stick_expr, out_coords) -> int:
 def _output_stl_from_stick_expr(
     stick_expr, output, output_dep, c_size, c_stride
 ) -> SpyreTensorLayout | None:
-    """If stick_expr is offset-free, build an output STL with it mapped to the right dim.
+    """Build an output STL that preserves the input stick expression.
 
-    Returns None if stick_expr has an offset (caller should fall back to scanning).
+    Handles both offset-free expressions (Mod(var, N), bare var, 0) and
+    multi-stick-row (MSR) expressions (inner + N*Mod(outer, k)).
+
+    Returns None if stick_expr has a constant offset or is otherwise
+    unsupported (caller should fall back to scanning).
     """
     stick_size = get_elem_in_stick(output.dtype)
-    if not is_stick_expr_offset_free(stick_expr, stick_size):
-        return None
     out_coords = host_coordinates(output, output_dep, None)
-    out_stick_dim = _pick_stick_dim(stick_expr, out_coords)
-    return _make_output_stl(output, output_dep, c_size, c_stride, out_stick_dim)
+    if is_stick_expr_offset_free(stick_expr, stick_size):
+        out_stick_dim = _pick_stick_dim(stick_expr, out_coords)
+        return _make_output_stl(output, output_dep, c_size, c_stride, out_stick_dim)
+    if _is_multi_stick_row_expr(stick_expr, stick_size):
+        # For MSR, find the output dim that carries the outer (cross-stick) variable.
+        outer_var = _msr_outer_var(stick_expr, stick_size)
+        if outer_var is not None:
+            out_stick_dim = _pick_stick_dim(
+                sympy.Mod(outer_var, stick_size), out_coords
+            )
+            if out_stick_dim == -1:
+                # Fall back: find the dim whose coord contains outer_var.
+                for d, c in enumerate(out_coords):
+                    if outer_var in c.free_symbols:
+                        out_stick_dim = d
+                        break
+            return _make_output_stl(
+                output, output_dep, c_size, c_stride, out_stick_dim, allow_msr=True
+            )
+    return None
 
 
 def _make_output_stl(
-    output, output_dep, c_size, c_stride, stick_dim
+    output, output_dep, c_size, c_stride, stick_dim, allow_msr: bool = False
 ) -> SpyreTensorLayout | None:
-    """Build a candidate output STL with stick_dim last and verify the resulting stick is offset-free.
+    """Build a candidate output STL with stick_dim last and verify the resulting stick.
 
-    Returns None if the resulting stick expression has an offset.
+    Returns None if the resulting stick expression is neither offset-free nor
+    (when ``allow_msr=True``) a recognised multi-stick-row expression.
     """
     stick_size = get_elem_in_stick(output.dtype)
     if stick_dim >= 0 and c_size[stick_dim] == 1:
@@ -170,7 +192,10 @@ def _make_output_stl(
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
     stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
     coords = device_coordinates(stl, output_dep, None)
-    if is_stick_expr_offset_free(coords[-1], stick_size):
+    stick_expr = coords[-1]
+    if is_stick_expr_offset_free(stick_expr, stick_size):
+        return stl
+    if allow_msr and _is_multi_stick_row_expr(stick_expr, stick_size):
         return stl
     return None
 
@@ -521,9 +546,14 @@ def _clone_layout(
         c_size, c_stride, output.dtype, list(range(len(output.size)))
     )
 
-    if is_stick_expr_offset_free(stick_expr, stick_size):
+    if is_stick_expr_offset_free(stick_expr, stick_size) or _is_multi_stick_row_expr(
+        stick_expr, stick_size
+    ):
         # Case 1: No restickify insertion needed.
-        # Use AnyInNode to produce the fixed output layout.
+        # Covers both offset-free sticks and multi-stick-row (MSR) patterns.
+        # The clone materialises the data in the default row-major output layout;
+        # if the input is MSR and the output is single-stick (or vice versa) the
+        # clone itself acts as the layout conversion — no pre-clone restickify.
         op.restick_cost_fn = AnyInNode.from_args()
         return [out_stl]
 
