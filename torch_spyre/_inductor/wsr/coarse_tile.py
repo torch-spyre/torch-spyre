@@ -2073,6 +2073,14 @@ def _insert_read_copy_ops(
     against those same strides) still resolves correctly once _NameSwapHandler
     retargets the load at the copy buffer instead of full_buf.
 
+    Mirrors _allocate_full_buffer's isinstance(orig_layout, FixedTiledLayout)
+    branch: when full_buf already carries a FixedTiledLayout (post-stickify
+    call site), the copy gets a FixedTiledLayout too, with device_layout
+    resized down from full_buf's own device_layout via _resize_device_layout
+    (shrink direction, mirroring _divide_ranges's use of the same helper).
+    Otherwise (pre-stickify call site) the copy gets a plain FixedLayout, and
+    stickification (which runs later) fills device_layout in normally.
+
     Returns the reconstructed ComputedBuffer that replaces tiled_op in
     operations (see replace_computed_buffer_body below) — callers must
     rebind their own reference since the original tiled_op object is stale
@@ -2110,12 +2118,66 @@ def _insert_read_copy_ops(
         copy_name = V.graph.qualify_name(
             f"coarse_tile_read_copy_{tiled_op.get_name()}_{dep.name}"
         )
-        copy_layout = FixedLayout(
-            tiled_op.get_device(),
-            full_buf.get_dtype(),
-            tile_ranges,
-            tile_strides,
-        )
+
+        # Mirror _allocate_full_buffer's isinstance(orig_layout, FixedTiledLayout)
+        # branch: on the post-stickify call site (_maybe_coarse_tile_span_overflow),
+        # full_buf already carries a FixedTiledLayout, and every sibling op at
+        # this pipeline stage (span_reduction, work_distribution, LX scratchpad
+        # planning) expects a copy op to carry one too. On the pre-stickify call
+        # site (_maybe_coarse_tile_hints), full_buf is a plain FixedLayout and
+        # stickification (which runs later) fills device_layout in normally, so
+        # a plain FixedLayout on the copy is correct there.
+        full_layout = full_buf.layout
+        copy_layout: FixedLayout | FixedTiledLayout
+        if isinstance(full_layout, FixedTiledLayout):
+            full_size_ints = [int(s) for s in full_layout.size]
+            tile_size_ints = [int(s) for s in tile_ranges]
+            # Authoritative stick host dim from coordinate identity (issue
+            # #3116); None falls back to size-based inference inside
+            # _resize_device_layout.
+            stick_hd = _stick_host_dim(full_buf, full_layout.device_layout)
+            try:
+                device_layout = _resize_device_layout(
+                    full_layout.device_layout,
+                    full_size_ints,
+                    tile_size_ints,
+                    stick_host_dim=stick_hd,
+                )
+            except RuntimeError:
+                # Non-standard device layout (e.g. post-restickify HBM strides
+                # that don't correspond to contiguous host strides).  Fall
+                # back to a default row-major allocation, preserving
+                # element_arrangement -- same fallback _allocate_full_buffer
+                # uses for its own grow-direction resize failures.
+                logger.debug(
+                    "_insert_read_copy_ops: _resize_device_layout could not "
+                    "classify %r (full_size=%s tile_size=%s); using "
+                    "row-major fallback",
+                    full_layout.device_layout,
+                    full_size_ints,
+                    tile_size_ints,
+                )
+                device_layout = SpyreTensorLayout(
+                    tile_size_ints,
+                    [int(s) for s in tile_strides],
+                    full_buf.get_dtype(),
+                    list(range(len(tile_size_ints))),
+                    full_layout.device_layout.element_arrangement,
+                )
+            copy_layout = FixedTiledLayout(
+                tiled_op.get_device(),
+                full_buf.get_dtype(),
+                tile_ranges,
+                tile_strides,
+                device_layout,
+            )
+        else:
+            copy_layout = FixedLayout(
+                tiled_op.get_device(),
+                full_buf.get_dtype(),
+                tile_ranges,
+                tile_strides,
+            )
         copy_buf = ComputedBuffer(name=copy_name, layout=copy_layout, data=copy_data)
         copy_buf.origins = tiled_op.origins
         copy_buf.operation_name = copy_name

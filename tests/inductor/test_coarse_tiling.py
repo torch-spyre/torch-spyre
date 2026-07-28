@@ -4821,39 +4821,29 @@ class TestInsertReadCopyOps(unittest.TestCase):
         self.assertNotIn(producer.get_name(), redirected_names)
 
     def test_post_stickify_copy_drops_device_layout(self):
-        """Open Question 6 finding: on the post-stickify (span-overflow)
-        call site, _insert_read_copy_ops's copy buffer loses device_layout.
+        """Regression for Task 3's Open Question 6 finding: on the
+        post-stickify (span-overflow) call site, _insert_read_copy_ops's
+        copy buffer must preserve device_layout, not drop it.
 
-        _allocate_full_buffer (coarse_tile.py:1825-1955ish) explicitly
-        branches on isinstance(orig_layout, FixedTiledLayout) so a
-        post-stickify full buffer gets a FixedTiledLayout copy (preserving
+        _allocate_full_buffer (coarse_tile.py) explicitly branches on
+        isinstance(orig_layout, FixedTiledLayout) so a post-stickify full
+        buffer gets a FixedTiledLayout copy (preserving
         device_layout/SpyreTensorLayout stick-addressing metadata), while a
         pre-stickify one gets a plain FixedLayout (stickification runs
-        later and fills device_layout in). _insert_read_copy_ops has no
-        such branch: it unconditionally builds
-        ``FixedLayout(device, dtype, tile_ranges, tile_strides)`` for the
-        copy op, regardless of whether the read target (and tiled_op
-        itself) already carries a FixedTiledLayout.
+        later and fills device_layout in). _insert_read_copy_ops mirrors
+        that same branch: when the read target already carries a
+        FixedTiledLayout, the copy op must too, with a device_layout
+        resized down to the tile via _resize_device_layout.
 
         On the post-stickify call site (_maybe_coarse_tile_span_overflow,
         passes.py), this pass runs *after* finalize_layouts/insert_restickify
         have already completed, and every downstream pass in the pipeline
         (span_reduction, work_distribution, LX scratchpad planning) expects
         FixedTiledLayout.device_layout for physical span arithmetic (see
-        CustomPreSchedulingPasses's pipeline docstring). A copy op stamped
-        with a plain FixedLayout at this point has no device_layout at all,
-        and `isinstance(copy_buf.layout, FixedTiledLayout)` is False for it
-        even though every sibling op's layout at this pipeline stage is a
-        FixedTiledLayout.
-
-        This test demonstrates the gap directly rather than silently
-        patching around it (per task instructions): it does NOT currently
-        fail, because nothing in this narrow unit test inspects
-        device_layout downstream -- it documents the asymmetry so it is not
-        lost. Fixing it (mirroring _allocate_full_buffer's own
-        isinstance(orig_layout, FixedTiledLayout) branch inside
-        _insert_read_copy_ops) is out of this task's scope; flagged here for
-        follow-up.
+        CustomPreSchedulingPasses's pipeline docstring). Before the fix, a
+        copy op stamped with a plain FixedLayout at this point had no
+        device_layout at all, even though every sibling op's layout at this
+        pipeline stage is a FixedTiledLayout.
         """
         from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise
 
@@ -4920,11 +4910,22 @@ class TestInsertReadCopyOps(unittest.TestCase):
         copy_buf = operations[1]
 
         # tiled_op and producer both carry FixedTiledLayout (post-stickify),
-        # but the inserted copy does not -- confirming the asymmetry.
+        # and the inserted copy must too -- with a device_layout correctly
+        # resized down to the tile size.
         self.assertIsInstance(producer.layout, FixedTiledLayout)
         self.assertIsInstance(tiled_op.layout, FixedTiledLayout)
-        self.assertNotIsInstance(copy_buf.layout, FixedTiledLayout)
-        self.assertFalse(hasattr(copy_buf.layout, "device_layout"))
+        self.assertIsInstance(copy_buf.layout, FixedTiledLayout)
+        self.assertTrue(hasattr(copy_buf.layout, "device_layout"))
+
+        expected_strides = [int(s) for s in FlexibleLayout.contiguous_strides([8, 128])]
+        expected_device_layout = SpyreTensorLayout(
+            [8, 128],
+            expected_strides,
+            dtype,
+            [0, 1],
+            ElementArrangement.STANDARD,
+        )
+        self.assertEqual(copy_buf.layout.device_layout, expected_device_layout)
 
 
 def _make_tiled_reduction_op(
