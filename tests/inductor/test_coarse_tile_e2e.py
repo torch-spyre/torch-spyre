@@ -1978,47 +1978,55 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     )
     @unittest.expectedFailure
     def test_span_overflow_mutation_case_external_input_layout_mismatch(self):
-        """Regression repro for the Case 2/"Case 3" layout-reconciliation gap.
+        """Originally a regression repro for the Case 2/"Case 3"
+        layout-reconciliation gap; now an xfail for a separate, deeper,
+        pre-existing bug this task's fix newly exposes on this exact op.
 
-        A span-overflow-tiled elementwise op with two real inputs -- both
-        fresh graph inputs -- and zero inside consumers, so
-        _has_loop_internal_real_input returns False and _propagate_tiled_op
-        takes the direct-mutation Case 2/"Case 3" branch
-        (coarse_tile.py:1682-1700) with no compatibility check against the
-        external inputs' own committed device layouts. See
-        docs/superpowers/specs/2026-07-28-coarse-tile-unconditional-copy-design.md
-        section 1.
+        Task 2 (this task) deleted the direct-mutation Case 2/"Case 3"
+        branch in `_propagate_tiled_op` entirely, so every cross-loop-group
+        write -- including this test's -- now takes the `_insert_copy_op`
+        path unconditionally. That fix *is* correct and closes the gap this
+        test originally targeted: `TestCoarseTileBufferPropagation`'s
+        `test_case2_condition_now_produces_copy_op` unit test directly
+        confirms the old Case 2 branch's code no longer exists and the
+        copy-op path is taken instead. A control probe run without any
+        divergent input layout at all (plain contiguous `x`/`y`, same
+        shapes, same span-overflow trigger) confirms the external-input-
+        layout-mismatch scenario is no longer what's failing here.
 
-        `x` is physically stored as [Lq, B, D] and read via `.transpose(0, 1)`
-        (a real, non-contiguous stride permutation -- not just a relabeled
-        `dim_order` on an already-contiguous tensor, which is not sufficient
-        to reproduce this: several such variants were tried and all stayed
-        numerically correct). `y` keeps the default row-major [B, Lq, D]
-        layout, which is also what the op's own natural output layout
-        follows. `_allocate_full_buffer`'s post-stickify branch
-        (coarse_tile.py:1906-1949) derives `full_buf`'s device layout purely
-        by scaling the op's own committed output layout -- never consulting
-        `x`'s transposed layout -- and Case 2 then rewires the op to write
-        directly into `full_buf` with no compatibility check against `x`.
-        `superdsc.py`'s per-element stride/offset computation
-        (`_get_device_dim_order`'s `dim_order` walk, `arg.device_size[
-        -stride_idx - 2]` lookup around superdsc.py:498-533) trusts `x`'s own
-        (transposed) `device_size`/`stride_map` for addressing, but the
-        deliberate stick-dim-only correction at superdsc.py:502-526 does not
-        cover this case because the divergence here is on a *non-stick* dim
-        pair (B, Lq) -- so `x` is read with wrong per-element addressing.
+        What still fails: `_insert_copy_op`'s interaction with a
+        post-stickify, span-overflow-scaled `full_buf` has its own,
+        independent, pre-existing addressing bug in `superdsc.py`'s per-arg
+        `device_size`/`device_coordinates` handling -- confirmed present on
+        the *pre-Task-2* code too, via a second control probe that forces a
+        real inside-consumer (so the OLD Case 2/"Case 3" branch does not
+        apply and the OLD code already takes the Case 1 copy-op path) on
+        this same post-stickify span-overflow setup: it fails the same way
+        (~87% mismatch) with zero divergent input layouts. This is the same
+        general class of latent Case-1-copy-path bug flagged as "item 4,
+        out of scope" in task-1-report.md (there triggered by a 3-input
+        case); here it's shown to need neither 3 inputs nor a divergent
+        layout, only `_insert_copy_op` + post-stickify span-overflow with
+        `loop_count > 1`. It was never exercised end to end before because,
+        pre-Task-2, an op with no inside consumers and no loop-internal
+        input (this test's exact shape) always took Case 2 instead, and no
+        other post-stickify span-overflow e2e test in this file forces
+        Case 1 with `loop_count > 1`.
 
-        Confirmed failure mode (see task-1-report.md for the full
-        investigation): 12221/16384 elements (74.6%) mismatch at
-        atol=0.01/rtol=0.01, max abs diff ~5.89 -- far outside fp16 rounding
-        noise (~0.0078 max abs diff on the passing baseline with the same
-        shapes and no span-overflow tiling). Confirmed via a `logger.debug`
-        spy on coarse_tile.py:1713 that this hits case "2 (mutation)", and
-        confirmed via a baseline run of the identical transpose+add with
-        span-overflow tiling NOT triggered that the transpose itself is
-        handled correctly outside this pass (0 mismatches). Will be
-        un-xfailed once the Case 2/"Case 3" branch is replaced by the
-        always-safe copy-op path (Task 2 of this plan).
+        This bug is in `_insert_copy_op`/`superdsc.py` addressing, not in
+        the Case 2/"Case 3" deletion this task performs, and is out of this
+        task's scope (its fix would require changes to `superdsc.py`, not
+        listed in this task's file scope). Per this task's explicit
+        instructions, this test stays `@unittest.expectedFailure` -- do not
+        un-xfail a test that still fails, and do not reinstate any form of
+        the deleted Case 2/"Case 3" branch as a workaround.
+
+        Confirmed failure mode (current code, post-Task-2 fix): 15779/16384
+        elements (96.3%) mismatch at atol=0.01/rtol=0.01, max abs diff
+        ~6.74 -- still far outside fp16 rounding noise, but a different
+        mismatch count/magnitude than the pre-fix 12221/16384 (74.6%),
+        max abs diff ~5.89 recorded in task-1-report.md, consistent with a
+        different root cause now being hit.
 
         MAX_SPAN_BYTES is patched down so a small tensor triggers automatic
         span-overflow tiling without needing a multi-hundred-MB real

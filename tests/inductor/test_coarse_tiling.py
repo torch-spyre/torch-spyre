@@ -4178,6 +4178,19 @@ def _make_inside_consumer_op(name, reads_buf, loop_group_id):
 class TestCoarseTileBufferPropagation(unittest.TestCase):
     """Tests for insert_tiling_propagation — consumer analysis helpers."""
 
+    def setUp(self):
+        # Only test_case2_condition_now_produces_copy_op below needs a real
+        # graph handler (it drives _propagate_tiled_op end to end with real
+        # IR, which calls V.graph.qualify_name/run_node); the helper-level
+        # tests above it use mocks and never touch V.graph, so this setup is
+        # a no-op for them.
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
     # ------------------------------------------------------------------
     # Tests for _find_outside_consumers and _has_inside_consumers
     # (these helpers don't call V.graph, so no mocking needed)
@@ -4314,6 +4327,131 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
             "_seed_buffer_for_carry must stay defined -- plan_coarse_tile_groups "
             "still calls it as its carry-detection predicate",
         )
+
+    def test_has_loop_internal_real_input_removed(self):
+        """_has_loop_internal_real_input is deleted along with the direct-
+        mutation Case 2/"Case 3" branch it used to gate -- every cross-loop-
+        group write now takes the unconditional _insert_copy_op path, so the
+        loop-internal-input special case no longer needs its own predicate.
+        """
+        import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_module
+
+        self.assertFalse(
+            hasattr(coarse_tile_module, "_has_loop_internal_real_input"),
+            "_has_loop_internal_real_input should have been deleted",
+        )
+
+    def test_case2_condition_now_produces_copy_op(self):
+        """An op that used to hit the direct-mutation branch (outside
+        consumers, no inside consumers, no loop-internal real input) must
+        now always go through _insert_copy_op instead.
+
+        Built with real IR (matching TestInsertReadCopyOps's pattern) rather
+        than mocks: _propagate_tiled_op's transformation-time helpers
+        (_allocate_full_buffer, _insert_copy_op, _patch_consumers) all touch
+        real ComputedBuffer/V.graph machinery (qualify_name, run_node,
+        replace_computed_buffer_body), which MagicMock-based ops used
+        elsewhere in this file cannot satisfy. insert_tiling_propagation
+        itself takes a pre-grouped ``groups`` list that plan_coarse_tile_groups
+        would normally produce; calling _propagate_tiled_op directly is the
+        cheaper, equivalent way to reach exactly the code this task changed.
+        """
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            MutationLayoutSHOULDREMOVE,
+            Pointwise,
+            StorageBox,
+            TensorBox,
+        )
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        from torch_spyre._inductor.lowering import enable_spyre_lowerings
+        from torch_spyre._inductor.wsr.coarse_tile import _propagate_tiled_op
+
+        # _allocate_full_buffer lowers a real spyre.empty FX node via
+        # V.graph.run_node(), which needs V.fake_mode (GraphLowering.fake_mode
+        # is a passthrough property to it) -- V.set_graph_handler alone
+        # doesn't establish this.
+        fake_mode_ctx = V.set_fake_mode(FakeTensorMode())
+        fake_mode_ctx.__enter__()
+        self.addCleanup(fake_mode_ctx.__exit__, None, None, None)
+
+        # torch.ops.spyre.empty.default only lowers to SpyreEmptyFallback
+        # (rather than falling through to a generic FallbackKernel) while
+        # spyre_lowerings is installed into the live lowering table -- real
+        # compiles always run inside this CM; unit tests must enter it too.
+        lowerings_ctx = enable_spyre_lowerings()
+        lowerings_ctx.__enter__()
+        self.addCleanup(lowerings_ctx.__exit__, None, None, None)
+
+        device = torch.device("cpu")
+        dtype = torch.float32
+
+        # Two fresh graph inputs -- both external to any loop, so neither
+        # forces the (now-deleted) loop-internal-input branch.
+        tiled_op = _make_real_pointwise_op(
+            ranges=[Integer(8)],
+            input_shapes_strides=[([64], [1]), ([64], [1])],
+            name="op0",
+        )
+        tiled_op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,), loop_count=[Integer(8)], loop_tiled_dims=[[0]]
+        )
+
+        # A real outside consumer (no loop_info at all) that reads op0's
+        # output -- this is what used to make _find_outside_consumers report
+        # a consumer with no inside consumers, selecting the old Case 2
+        # branch.
+        op0_box = TensorBox(StorageBox(tiled_op))
+
+        def consumer_inner_fn(index):
+            return op0_box.make_loader()(index)
+
+        consumer_pw = Pointwise.create(
+            device=device,
+            dtype=dtype,
+            inner_fn=consumer_inner_fn,
+            ranges=[Integer(8)],
+        )
+        consumer_data = consumer_pw.data.data  # TensorBox -> StorageBox -> Pointwise
+        consumer = ComputedBuffer(
+            name="out0",
+            layout=FixedLayout(device, dtype, [Integer(8)], None),
+            data=consumer_data,
+        )
+        consumer.operation_name = "out0"
+        consumer.origins = OrderedSet()
+        V.graph.name_to_buffer["out0"] = consumer
+
+        # _allocate_full_buffer's V.graph.run_node() call appends the new
+        # full_buf to V.graph.buffers as a side effect (real GraphLowering.
+        # register_buffer behavior) and then _allocate_full_buffer does
+        # operations.remove(full_buf)/insert(...) expecting it to already be
+        # present -- so `operations` must be the same list object as
+        # V.graph.buffers, not an independent list, for that removal to find it.
+        operations = V.graph.buffers
+        operations.extend([tiled_op, consumer])
+
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
+            return_value=set(),
+        ):
+            _propagate_tiled_op(tiled_op, operations)
+
+        copy_ops = [
+            op
+            for op in operations
+            if isinstance(op, ComputedBuffer)
+            and op.get_name().startswith("coarse_tile_copy_")
+        ]
+        self.assertEqual(len(copy_ops), 1)
+        self.assertIsInstance(copy_ops[0].layout, MutationLayoutSHOULDREMOVE)
+        # The original tiled op itself never becomes a
+        # MutationLayoutSHOULDREMOVE -- it keeps its own tile-sized layout
+        # and is marked per_tile_fixed instead, mirroring the Case 1 path.
+        self.assertNotIsInstance(tiled_op.layout, MutationLayoutSHOULDREMOVE)
+        self.assertTrue(getattr(tiled_op, "_pending_per_tile_fixed", False))
 
 
 def _make_full_buffer_read_fixture():

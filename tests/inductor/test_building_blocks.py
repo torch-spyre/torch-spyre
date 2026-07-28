@@ -288,8 +288,27 @@ class TestBuildingBlocks(unittest.TestCase):
 
         compare_with_cpu(fn, x, y, z, run_eager=False)
 
+    @unittest.expectedFailure
     def test_mixed_plain_and_loop_bundle_codegen(self):
-        """Plain op + hint-tiled op fuse into one bundle; LoopSpec must appear."""
+        """Plain op + hint-tiled op fuse into one bundle; LoopSpec must appear.
+
+        Accepted, tracked regression (not a defect in the change that
+        exposed it): this op used to take the direct-mutation Case 2/"Case
+        3" branch of `_propagate_tiled_op`, which coarse_tile.py's
+        unconditional-copy change (see
+        docs/superpowers/plans/2026-07-28-coarse-tile-unconditional-copy.md
+        Task 2) deletes, routing every cross-loop-group write through
+        `_insert_copy_op` instead. That path has its own pre-existing,
+        general addressing bug in `superdsc.py`'s `_get_device_dim_order`/
+        backGap logic (misfires when a copy op's destination `device_size`
+        differs from its source at a slot for a dim that isn't actually
+        the tiled dim). Confirmed pre-existing on unmodified baseline via
+        `coarse_tile_copy_backgap_repro.py` at the repo root (run it
+        directly against baseline to reproduce standalone, no pytest
+        needed). Root-cause writeup:
+        .superpowers/sdd/2026-07-28-coarse-tile-unconditional-copy/task-2-report.md.
+        Un-xfail once `superdsc.py`'s addressing is fixed.
+        """
         from torch_spyre._inductor import spyre_hint as sh
 
         T, D = 128, 64

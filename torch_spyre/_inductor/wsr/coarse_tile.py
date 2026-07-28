@@ -1650,54 +1650,27 @@ def _propagate_tiled_op(
     )
     full_buf = _allocate_full_buffer(op, full_ranges, operations, group_start_idx)
 
-    has_inside = _has_inside_consumers(buf_name, loop_group_id, operations)
-    has_loop_internal_input = _has_loop_internal_real_input(
-        op, loop_group_id, operations
-    )
-
-    # Capture before either branch below overwrites op.layout.
+    # Capture before _insert_copy_op overwrites op.layout.
     old_stride = tuple(op.layout.stride)
 
-    if has_inside or has_loop_internal_input:
-        # Case 1: keep tiled op writing to small buffer; insert copy op.
-        # Ops with a loop-internal real input must take this path even with
-        # no inside consumers: that input is itself a tile-sized loop-internal
-        # op whose own stick layout can never be made compatible with a
-        # full-size output under AllSameNode's stick-compatibility rule (see
-        # _has_loop_internal_real_input). Routing through _insert_copy_op
-        # keeps the tiled op self-consistent (own tile-sized layout, own
-        # tile-sized real inputs) and reuses the copy op's proven
-        # single-real-input path (the copy fuses the tiled op's own
-        # upstream computation via make_loader()).
-        _insert_copy_op(op, full_buf, operations)
-        # The tiled op's own buffer is always loop-internal scratch here: it is
-        # fully drained by the copy op inserted above before the next iteration
-        # overwrites it, regardless of whether outside_consumers/is_graph_output
-        # routed it into this branch. Mark it so the unroller does not advance
-        # its base address.
-        if isinstance(op.layout, FixedTiledLayout):
-            op.layout.per_tile_fixed = True
-        else:
-            op._pending_per_tile_fixed = True  # type: ignore[attr-defined]
+    # Every cross-loop-group write always takes the copy-op path: the real
+    # compute op keeps its own natural, input-derived, tile-sized layout,
+    # and a separate copy op takes MutationLayoutSHOULDREMOVE(full_buf).
+    # See docs/source/compiler/coarse_tiling_loops.md's "Treatment by
+    # consumer topology" section for why the direct-mutation alternative
+    # (formerly "Case 2"/"Case 3") is unsafe post-stickify: it derives
+    # full_buf's layout from this op's own committed output layout without
+    # reconciling the op's *input* layouts, and there is no compatibility
+    # check analogous to finalize_layouts's is_elided/is_carry_into_accum
+    # guard on that path.
+    _insert_copy_op(op, full_buf, operations)
+    # The tiled op's own buffer is always loop-internal scratch here: it is
+    # fully drained by the copy op inserted above before the next iteration
+    # overwrites it.
+    if isinstance(op.layout, FixedTiledLayout):
+        op.layout.per_tile_fixed = True
     else:
-        # Case 2: no inside consumers and every real input is external to the
-        # loop (a graph input or other buffer with its own independent,
-        # unconstrained candidate layouts) — rewire the op to write directly
-        # into the full-size buffer.  Note: MutationLayoutSHOULDREMOVE is
-        # incompatible with lx_planning (scratchpad); do not combine the two.
-        #
-        # Inductor's own write index for this op stays tile-local (it maps
-        # op.data.ranges-sized loop vars through full_buf's layout — there is
-        # no side channel for "which tile"), so the fact that this op's
-        # coarse-tiled dims must actually advance the write's base address
-        # once per outer-loop iteration cannot be recovered later from the
-        # op's device_coordinates (see coarse_tiling_loops.md's IR-rewiring
-        # appendix and issue tracking the ct_test_1.py wrong-result bug).
-        # CoarseTileInfo.output_tiled_dims (this op's per-level (dim, extent)
-        # decision, computed elsewhere) is what SpyreKernel._general_tile_advance
-        # substitutes with a minted per-level symbol to carry this into
-        # create_op_spec / TensorArg.device_tile_advance_expr.
-        op.layout = MutationLayoutSHOULDREMOVE(TensorBox(StorageBox(full_buf)))
+        op._pending_per_tile_fixed = True  # type: ignore[attr-defined]
 
     # Patch outside consumers and graph outputs to read full_buf.
     full_name = full_buf.get_name()
@@ -1706,12 +1679,7 @@ def _propagate_tiled_op(
     if is_graph_output:
         _patch_graph_outputs(buf_name, full_buf)
 
-    logger.debug(
-        "coarse_tile: propagated %s → %s (case %s)",
-        buf_name,
-        full_name,
-        "1 (copy)" if (has_inside or has_loop_internal_input) else "2 (mutation)",
-    )
+    logger.debug("coarse_tile: propagated %s → %s (copy)", buf_name, full_name)
 
 
 # ---------------------------------------------------------------------------
@@ -1772,34 +1740,6 @@ def _has_inside_consumers(
         if li is None or li.loop_group_id[0] != outer_key:
             continue
         if _reads_buffer(op, buf_name):
-            return True
-    return False
-
-
-def _has_loop_internal_real_input(
-    op: ComputedBuffer,
-    loop_group_id: tuple,
-    operations: list[Operation],
-) -> bool:
-    """Return True if any real input of op is itself produced inside the loop.
-
-    A real (non-constant) input that is a ComputedBuffer stamped with
-    loop_info in the same outer loop group is a tile-sized, loop-internal
-    producer with its own tile-sized candidate layouts — those can never be
-    made stick-compatible with a full-size output under AllSameNode's
-    stick-compatibility rule (see Case 1 vs Case 2 above). A real input with
-    no loop_info (a graph input, or any other buffer resolved outside the
-    loop) has its own independent, unconstrained candidate layouts and does
-    not hit this problem, so it does not force Case 1.
-    """
-    outer_key = loop_group_id[0]
-    reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
-    for dep in reads:
-        buf = V.graph.get_buffer(dep.name)
-        if isinstance(buf, SpyreConstantFallback):
-            continue
-        li = getattr(buf, "loop_info", None)
-        if li is not None and li.loop_group_id[0] == outer_key:
             return True
     return False
 
