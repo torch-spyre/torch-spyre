@@ -4192,8 +4192,8 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         self._graph_ctx.__exit__(None, None, None)
 
     # ------------------------------------------------------------------
-    # Tests for _find_outside_consumers and _has_inside_consumers
-    # (these helpers don't call V.graph, so no mocking needed)
+    # Tests for _find_outside_consumers
+    # (this helper doesn't call V.graph, so no mocking needed)
     # ------------------------------------------------------------------
 
     def test_no_consumers_returns_empty(self):
@@ -4246,21 +4246,19 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         self.assertEqual(consumers, [])
         self.assertFalse(is_out)
 
-    def test_has_inside_consumer_true(self):
-        from torch_spyre._inductor.wsr.coarse_tile import _has_inside_consumers
+    def test_has_inside_consumers_removed(self):
+        """_has_inside_consumers is deleted along with the direct-mutation
+        Case 2/"Case 3" branch it used to help gate -- every cross-loop-
+        group write now takes the unconditional _insert_copy_op path
+        regardless of whether the tiled op also has inside consumers, so
+        this predicate no longer has a caller.
+        """
+        import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_module
 
-        tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
-        inside = _make_inside_consumer_op("op1", "op0", (0,))
-        result = _has_inside_consumers("op0", (0,), [tiled, inside])
-        self.assertTrue(result)
-
-    def test_has_inside_consumer_false_when_only_outside(self):
-        from torch_spyre._inductor.wsr.coarse_tile import _has_inside_consumers
-
-        tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
-        outside = _make_consumer_op("out0", "op0")
-        result = _has_inside_consumers("op0", (0,), [tiled, outside])
-        self.assertFalse(result)
+        self.assertFalse(
+            hasattr(coarse_tile_module, "_has_inside_consumers"),
+            "_has_inside_consumers should have been deleted",
+        )
 
     def test_compute_full_ranges_flat(self):
         from torch_spyre._inductor.wsr.coarse_tile import _compute_full_ranges

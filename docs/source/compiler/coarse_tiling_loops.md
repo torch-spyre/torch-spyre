@@ -1005,9 +1005,9 @@ layout, so it never loses scratchpad eligibility on that account.
 path: "Every cross-loop-group write always takes the copy-op path: the real
 compute op keeps its own natural, input-derived, tile-sized layout, and a
 separate copy op takes `MutationLayoutSHOULDREMOVE(full_buf)`." The code's
-docstring at lines 1491-1499 still refers to "Case 1" and "Case 2" but this
-is stale — it predates the unconditional-copy consolidation. The single
-operative treatment now corresponds to the doc's Case 2 row above.
+`insert_tiling_propagation` docstring describes the same single, unconditional
+treatment. The single operative treatment corresponds to the doc's Case 2 row
+above.
 
 **Case 1** is where most of the working-set-reduction win comes from.  An
 intermediate like `y` in the small example flows from one tiled op to
@@ -1172,15 +1172,17 @@ inner level's for the same dim.
 #### Read-side adaptation: full-buffer inputs to a loop-internal op
 
 The write-side perimeter above is not the whole story. `_propagate_tiled_op`
-checks, before any Case classification, whether `op` directly reads a
-full-size `SpyreEmptyFallback` buffer — typically an accumulator that an
-earlier Case-2/mutation rewrite already promoted to full size (see
-"Reduction tiling," below, for the nested output-dim + inner-reduction-dim
-case that produces this). A loop-internal op cannot read such a buffer
-directly: its own candidate layouts are tile-sized, and a full-size
-`SpyreEmptyFallback` has only one, full-size candidate layout, so the two
-can never be made stick-compatible. `_full_buffer_read_deps` detects this
-and `_insert_read_copy_ops` always materializes a tile-sized copy
+checks whether `op` directly reads a full-size buffer produced by a
+cross-loop-group producer — either a full-size `SpyreEmptyFallback` buffer
+(typically an accumulator that the copy-op path above already promoted to
+full size; see "Reduction tiling," below, for the nested output-dim +
+inner-reduction-dim case that produces this), or any other `ComputedBuffer`
+whose own `loop_group_id` outer key differs from `op`'s (see
+`_full_buffer_read_deps`). A loop-internal op cannot read such a buffer
+directly: its own candidate layouts are tile-sized, and the full-size buffer
+has only one, full-size candidate layout, so the two can never be made
+stick-compatible. `_full_buffer_read_deps` detects this and
+`_insert_read_copy_ops` always materializes a tile-sized copy
 `ComputedBuffer` per such read, rewriting `op`'s `inner_fn` (via a
 `WrapperHandler` subclass, per the wrap-never-reconstruct convention) to
 read the copy instead of the full buffer. This means the "no conversion,
@@ -1280,8 +1282,8 @@ ways depending on what kind of op is writing into it — `BATCH_MATMUL_OP`
 reductions use `_matmul_layouts`, other `Reduction` ops use
 `_single_arg_op_layout`, and plain `Pointwise` ops (including the fill and
 combine ops this section describes) use `_multi_arg_pointwise_layouts`, the
-same `AllSameNode` stick-compatibility path used for ordinary Case 2/3
-routing above. A reduction accumulator write does not fit the broadcast
+same `AllSameNode` stick-compatibility path used for ordinary Case 2
+copy-op routing above. A reduction accumulator write does not fit the broadcast
 relationship `_multi_arg_pointwise_layouts` otherwise assumes, which is why
 the `Reduction`-specific paths exist as separate cases rather than folding
 into the pointwise one.
@@ -2147,7 +2149,7 @@ name, not the index expression itself.
 
 The reason a copy is needed at all, rather than simply changing which name
 the tiled op loads from, is the same `AllSameNode` stick-compatibility
-constraint that motivates the Case 1/2/3 split on the write side: a full-size
+constraint that motivates the Case 1/2 split on the write side: a full-size
 buffer has exactly one candidate layout (sized to the full buffer), while the
 tiled op's own candidate layouts are all tile-sized — the two can never be
 made stick-compatible without an intermediate buffer sized to match.

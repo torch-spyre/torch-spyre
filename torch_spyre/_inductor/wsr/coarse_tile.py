@@ -1486,20 +1486,15 @@ def insert_tiling_propagation(
     For each eligible ComputedBuffer in a tiling group, if its result is
     consumed by any operation outside the loop (different loop_group_id or
     absent) or is a graph output, this pass ensures the outside consumer sees
-    the complete result by one of two strategies:
+    the complete result: allocate a full-sized buffer, then insert a copy op
+    (same loop_group_id, same loop_tiled_dims) that writes each tile into the
+    correct slice of the full buffer.  Patch outside consumers to read the
+    full buffer.  This applies uniformly regardless of whether the tiled
+    op's output is also consumed inside the loop.
 
-    Case 1 — output used both inside and outside the loop:
-        Allocate a full-sized buffer.  Insert a copy op (same loop_group_id,
-        same loop_tiled_dims) that writes each tile into the correct slice of
-        the full buffer.  Patch outside consumers to read the full buffer.
-
-    Case 2 — output used only outside the loop:
-        Allocate a full-sized buffer.  Rewire the tiled op to write directly
-        into the full buffer via MutationLayoutSHOULDREMOVE.  Patch outside
-        consumers to read the full buffer.
-
-    In both cases the existing tiled_symbols / affine.apply machinery in
-    SpyreKernel and bundle.py handles the per-iteration address offset.
+    The existing tiled_symbols / affine.apply machinery in SpyreKernel and
+    bundle.py handles the per-iteration address offset for both the tiled
+    op and the inserted copy op.
     """
     for group_ops, _ in groups:
         for idx, op in enumerate(group_ops):
@@ -1508,7 +1503,7 @@ def insert_tiling_propagation(
             if not isinstance(op.data, (Pointwise, Reduction)):
                 continue
             _propagate_tiled_op(op, operations)
-            # _propagate_tiled_op (and the Case 1/2 rewrites it may
+            # _propagate_tiled_op (and the copy-op insertion it may
             # delegate to) can replace op with a new ComputedBuffer object
             # spliced into `operations` under the same name (see
             # replace_computed_buffer_body).  group_ops is a separate list
@@ -1726,24 +1721,6 @@ def _find_outside_consumers(
 
     is_graph_output = buf_name in _graph_output_names()
     return consumers, is_graph_output
-
-
-def _has_inside_consumers(
-    buf_name: str,
-    group_loop_id: tuple,
-    operations: list[Operation],
-) -> bool:
-    """Return True if any op inside the same outermost loop group reads buf_name."""
-    outer_key = group_loop_id[0]
-    for op in operations:
-        if not isinstance(op, ComputedBuffer):
-            continue
-        li = getattr(op, "loop_info", None)
-        if li is None or li.loop_group_id[0] != outer_key:
-            continue
-        if _reads_buffer(op, buf_name):
-            return True
-    return False
 
 
 def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
@@ -2051,11 +2028,11 @@ def _insert_read_copy_ops(
 ) -> ComputedBuffer:
     """Insert, before tiled_op, one tile-sized copy op per full-size real input.
 
-    tiled_op is loop-internal (no outside consumers) but reads one or more
-    full-size SpyreEmptyFallback buffers directly. Those buffers get exactly
-    one candidate layout (sized to the full buffer), while tiled_op's own
-    candidates are sized to its tile — the two can never be stick-compatible
-    under AllSameNode.  Mirroring _insert_copy_op's write-side fix: for each
+    tiled_op reads one or more full-size cross-loop-group buffers directly
+    (see _full_buffer_read_deps).  Those buffers get exactly one candidate
+    layout (sized to the full buffer), while tiled_op's own candidates are
+    sized to its tile — the two can never be stick-compatible under
+    AllSameNode.  Mirroring _insert_copy_op's write-side fix: for each
     such input, insert a copy op that reads the full buffer's current tile
     slice (same index expression tiled_op already uses, same loop_info so
     the per-iteration base address advances identically) and writes it into

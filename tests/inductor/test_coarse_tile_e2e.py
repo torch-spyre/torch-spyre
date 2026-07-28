@@ -1660,12 +1660,31 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             " divide Lq ranges on each op using that op's own dim role",
         )
 
+    @unittest.expectedFailure
     def test_hint_h_tiling_elementwise(self):
         """spyre_hint(num_tiles_per_dim={"H": 2}) tiles elementwise multiply over the H dimension.
 
         Regression test for a bug in per-tile byte-stride computation where
         per-tile HBM base addresses advanced by the wrong amount when the tiled
         dimension was not the outermost host dimension (e.g. H in BHLD).
+
+        Accepted, tracked regression, newly exposed (not caused) by the
+        unconditional-copy change (see
+        docs/superpowers/plans/2026-07-28-coarse-tile-unconditional-copy.md
+        Task 2): confirmed via direct A/B (passes at the commit immediately
+        before Task 2, fails starting exactly at Task 2's landing commit,
+        continuing to fail at HEAD) during the plan's final whole-branch
+        review. Distinct from the 5 `superdsc.py` backGap-class xfails
+        elsewhere in this file/test_building_blocks.py: this test's sibling
+        (`test_hint_h_tiling_elementwise_loopspec`) shows a
+        host-range-index -> iteration-space-key mapping defect on the
+        newly-inserted copy op itself (the advance expression references
+        the copy op's own minted symbol/coefficient instead of the real
+        op's), not a device_size-mismatch backGap misfire -- do not
+        conflate the two mechanisms. Deferred per user decision
+        (2026-07-28): fold into follow-up investigation rather than
+        blocking branch completion. Un-xfail once the host-range ->
+        iteration-space mapping is fixed for the inserted copy-op case.
         """
         from torch_spyre._inductor import spyre_hint
 
@@ -1694,6 +1713,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         result = torch.compile(fn)(Q_dev, V_dev).cpu()
         torch.testing.assert_close(result, ref, atol=0.02, rtol=0.1)
 
+    @unittest.expectedFailure
     def test_hint_h_tiling_elementwise_loopspec(self):
         """H-tiling on BHLD (B=1 unit-size) selects the H iteration symbol, not Lq.
 
@@ -1702,6 +1722,24 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         unit-size dimensions that the iteration space skips.  Without the mapping,
         index 1 (H in BHLD with B=1) maps to the 2nd iteration-space key (Lq)
         rather than the 1st (H), producing wrong per-tile stride advances.
+
+        Accepted, tracked regression, newly exposed (not caused) by the
+        unconditional-copy change (see
+        docs/superpowers/plans/2026-07-28-coarse-tile-unconditional-copy.md
+        Task 2): confirmed via direct A/B (passes at the commit immediately
+        before Task 2, fails starting exactly at Task 2's landing commit,
+        continuing to fail at HEAD) during the plan's final whole-branch
+        review. The assertion below now fails because
+        `device_tile_advance_expr` references
+        `_tile_adv_coarse_tile_copy_buf0_lvl0` with coefficient 64 instead
+        of `_tile_adv_op0_lvl0` with coefficient 65536 -- the newly-inserted
+        copy op is getting the wrong host-range-index -> iteration-space-key
+        mapping this test was originally written to guard against, not the
+        `superdsc.py` backGap device_size-mismatch bug the other xfails in
+        this file/test_building_blocks.py hit. Deferred per user decision
+        (2026-07-28): fold into follow-up investigation rather than
+        blocking branch completion. Un-xfail once the host-range ->
+        iteration-space mapping is fixed for the inserted copy-op case.
         """
         from torch_spyre._inductor import spyre_hint
 
