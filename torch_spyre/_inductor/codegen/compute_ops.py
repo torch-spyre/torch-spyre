@@ -37,24 +37,19 @@ def _build_padding_sizes(conv_params, dim_sizes=None, dim_splits=None):
         return {}
 
     def compute_padding_for_dim(
-        suffix, pad_dim_key, stride_key, window_dim_key, total_size_key
+        suffix, pad_dim_key, kernel_key, stride_key, window_dim_key, total_size_key
     ):
         """Compute padding fields for a single dimension (i or j)."""
         pad_dim = conv_params[pad_dim_key]
         stride = conv_params[stride_key]
+        kernel_size = conv_params[kernel_key]
         pad_amount = conv_params.get(f"pad_{suffix}", 0)
-        kernel_size = (
-            int(dim_sizes[Symbol(f"k{suffix}")])
-            if dim_sizes and Symbol(f"k{suffix}") in dim_sizes
-            else 3
-        )
 
         # Determine total_size and per_core_output based on context
         if dim_sizes is None:
             # Top-level case: use full padded input size directly from conv_params
             total_size = conv_params[total_size_key]
             # Derive full output size from the given input sizes
-            # total_size = H_in + 2*padding, so output = (total_size - kernel) / stride + 1
             full_output = (total_size - kernel_size) // stride + 1
             per_core_output = full_output
         else:
@@ -120,10 +115,10 @@ def _build_padding_sizes(conv_params, dim_sizes=None, dim_splits=None):
     return {
         "paddingSizes_": {
             str(conv_params["pad_dim_i"]): compute_padding_for_dim(
-                "i", "pad_dim_i", "stride_i", "window_dim_i", "total_size_i"
+                "i", "pad_dim_i", "kernel_h", "stride_i", "window_dim_i", "total_size_i"
             ),
             str(conv_params["pad_dim_j"]): compute_padding_for_dim(
-                "j", "pad_dim_j", "stride_j", "window_dim_j", "total_size_j"
+                "j", "pad_dim_j", "kernel_w", "stride_j", "window_dim_j", "total_size_j"
             ),
         }
     }
@@ -491,6 +486,17 @@ def gen_coord_info_value(
 
 
 def get_conv_params(tensor_num, dim, opfunc, conv_params, size, splits):
+    required_keys = [
+        "pad_dim_i",
+        "pad_dim_j",
+        "stride_i",
+        "stride_j",
+        "kernel_h",
+        "kernel_w",
+    ]
+    missing = [k for k in required_keys if k not in conv_params]
+    if missing:
+        raise ValueError(f"Missing conv_params keys: {missing}")
     conv_padding = "nopad"
     total_size = size // splits
     padding_len = 0
@@ -503,27 +509,16 @@ def get_conv_params(tensor_num, dim, opfunc, conv_params, size, splits):
             conv_padding = conv_params["pad_type"]
             padding_len = conv_params["pad_i"]
             stride_len = conv_params["stride_i"]
-        if (
-            "pad_dim_i" in conv_params
-            and str(dim) == str(conv_params["pad_dim_i"])
-            and "total_size_i" in conv_params
-        ):
-            # total_size = conv_params["total_size_i"]
+        if "pad_dim_i" in conv_params and str(dim) == str(conv_params["pad_dim_i"]):
             total_size = (
                 (size // splits) * conv_params["stride_i"] + conv_params["kernel_h"] - 1
-            )  # 2*conv_params["pad_i"] + 2
+            )
             padding_len = conv_params["pad_i"]
             stride_len = conv_params["stride_i"]
-        elif (
-            "pad_dim_j" in conv_params
-            and str(dim) == str(conv_params["pad_dim_j"])
-            and "total_size_j" in conv_params
-        ):
-            # total_size = conv_params["total_size_j"]
-            # total_size = size // splits + 2*conv_params["pad_j"] + 2
+        elif "pad_dim_j" in conv_params and str(dim) == str(conv_params["pad_dim_j"]):
             total_size = (
                 (size // splits) * conv_params["stride_j"] + conv_params["kernel_w"] - 1
-            )  # 2*conv_params["pad_j"] + 2
+            )
             padding_len = conv_params["pad_j"]
             stride_len = conv_params["stride_j"]
     return {
@@ -1157,7 +1152,6 @@ def generate_sdsc(
                 "coreFoldProp_": {"factor_": sdsc_spec.num_cores, "label_": "core"},
                 "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
                 "numCoresUsed_": sdsc_spec.num_cores,
-                "numCoreletsUsed_": 1,
                 "coreIdToDsc_": {str(c): 0 for c in range(sdsc_spec.num_cores)},
                 "numWkSlicesPerDim_": {
                     str(dim): num_wk_slices
@@ -1171,6 +1165,7 @@ def generate_sdsc(
                     {
                         sdsc_spec.opfunc: {
                             "numCoresUsed_": sdsc_spec.num_cores,
+                            "numCoreletsUsed_": 1,
                             "coreIdsUsed_": [c for c in range(sdsc_spec.num_cores)],
                             "N_": {
                                 "name_": "n",
