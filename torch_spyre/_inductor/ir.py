@@ -732,6 +732,7 @@ class WaitWorkFallback(ir.ExternKernel):
         input_tensor = self.inputs[0]
         input_name = input_tensor.codegen_reference()
 
+        # Generate the wait call
         output_name = self.get_name()
         generated_code = f"{output_name} = torch.ops.spyre.wait_work({input_name})"
 

@@ -241,7 +241,13 @@ def generate_constant_info(
                     f"to int: {e}"
                 ) from e
         else:
-            encoded_value = encode_constant(value, data_format)
+            try:
+                encoded_value = encode_constant(value, data_format)
+            except (ValueError, TypeError) as e:
+                raise ValueError(
+                    f"Cannot encode constant '{name}' with value {value} "
+                    f"(type: {type(value).__name__}) to {data_format.name}: {e}"
+                ) from e
 
         ci = {
             "dataFormat_": data_format.name,
