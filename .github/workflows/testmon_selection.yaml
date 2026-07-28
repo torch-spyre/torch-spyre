@@ -482,7 +482,7 @@ jobs:
           pre_run: |
             unset _IBM_AIU_SETUP
             rm -rf /tmp/etc/ibm/spyre/topo.json
-            source /etc/profile.d/ibm-aiu-setup.sh
+            source /etc/profile.d/ibm-aiu-setup.sh || exit 1
 
       - name: Upload JUnit XML report
         if: always()
