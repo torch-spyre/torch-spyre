@@ -1972,15 +1972,47 @@ def _insert_copy_op(
     copy_buf.operation_name = copy_name
 
     # Fresh per-level tiled-dim decisions from copy_buf's own reads/write
-    # (positionally different from tiled_op's). copy_buf's ranges are
-    # identical to tiled_op's post-division ranges, so each tiled dim's
-    # level-0..N extent is simply 1 -- the copy op is not itself re-divided,
-    # it just re-reads tiled_op's already-divided buffer once per tile.
+    # (positionally different from tiled_op's).  The read and write sides need
+    # DIFFERENT extents, because they address differently sized buffers:
+    #
+    # READS re-read tiled_op's already-divided per-tile buffer, which is
+    # per_tile_fixed scratch reused in place every iteration -- it does not
+    # move, so each tiled dim's level-0..N extent is simply 1 (the copy op is
+    # not itself re-divided).
     tiled_op_info = tiled_op.loop_info  # type: ignore[attr-defined]
-    per_level_extents = [
+    read_level_extents = [
         {d: sympy.Integer(1) for d in level_dims}
         for level_dims in tiled_op_info.loop_tiled_dims
     ]
+    # The WRITE targets full_buf, which is NOT divided, so its store base must
+    # advance a whole tile per iteration -- the same real per-level extents
+    # plan_coarse_tile_groups derives for an op's own reads/write via
+    # _planned_tile_extents_per_level, and what the deleted direct-mutation
+    # branch used to get for free from the tiled op's own output_tiled_dims.
+    # Reusing the extent-1 read decision here instead emitted an advance of a
+    # single row rather than a full tile (e.g. 64 elements instead of 32768 for
+    # a [1024, 4096] fp16 buffer tiled 2-ways), so every tile after the first
+    # landed almost on top of tile 0 -- the multi-stick row-tiling and
+    # softmax-row-tiling wrong-address failures.  Now that every
+    # cross-loop-group write routes through this function unconditionally, this
+    # is the only place that decision gets made.
+    #
+    # copy_buf.data.ranges are already divided, so a dim's innermost-level
+    # extent is the range itself; each step outward multiplies by the
+    # next-inner level's trip count (same per-level formula as
+    # _planned_tile_extents_per_level's _per_level_extent_for).
+    copy_ranges = list(copy_data.ranges)
+    write_level_extents: list[dict[int, Expr]] = [
+        {} for _ in tiled_op_info.loop_tiled_dims
+    ]
+    for d in {d for level in tiled_op_info.loop_tiled_dims for d in level}:
+        levels_tiling_d = [
+            i for i, dims in enumerate(tiled_op_info.loop_tiled_dims) if d in dims
+        ]
+        running = sympy.sympify(copy_ranges[d])
+        for level_idx in reversed(levels_tiling_d):
+            write_level_extents[level_idx][d] = running
+            running = running * tiled_op_info.loop_count[level_idx]
     copy_reads = [
         dep for dep in copy_buf.get_read_writes().reads if isinstance(dep, MemoryDep)
     ]
@@ -1988,10 +2020,10 @@ def _insert_copy_op(
         dep for dep in copy_buf.get_read_writes().writes if isinstance(dep, MemoryDep)
     ]
     tiled_dims_per_read = [
-        _tiled_dims_for_dep(dep, per_level_extents) for dep in copy_reads
+        _tiled_dims_for_dep(dep, read_level_extents) for dep in copy_reads
     ]
     output_tiled_dims = (
-        _tiled_dims_for_dep(copy_writes[0], per_level_extents) if copy_writes else []
+        _tiled_dims_for_dep(copy_writes[0], write_level_extents) if copy_writes else []
     )
     copy_buf.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
         tiled_op_info,
