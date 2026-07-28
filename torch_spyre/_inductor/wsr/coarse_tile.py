@@ -262,7 +262,7 @@ def plan_coarse_tile_groups(
             if _plan_is_loop_invariant_at_reduction_levels(
                 op, op_tiled_dims, group_reduction_tiled_levels
             ):
-                if _seed_buffer_for_carry(op, nested_group_id, operations) is not None:
+                if _seed_buffer_for_carry(op, group_ops) is not None:
                     raise Unsupported(
                         f"reduction-dim tiling requiring carry propagation for "
                         f"op {op.get_name()}"
@@ -317,15 +317,13 @@ def _planned_tile_extents_per_level(
     Mirrors the arithmetic _divide_ranges/_divide_reduction_ranges perform
     in place, but reads pre-mutation op.data.ranges/reduction_ranges and
     never calls object.__setattr__ on op.data or touches op.layout. Raises
-    RuntimeError on non-even division, matching _divide_ranges's own check
+    Unsupported on non-even division, matching _divide_ranges's own check
     so the error surfaces at the same point in the pipeline it does today.
 
     Unlike the deleted _planned_tile_extents, a dim tiled at more than one
-    level gets a DISTINCT extent value per level here (see the per-level
-    extent formula in
-    docs/superpowers/plans/2026-07-27-deferred-tile-advance-capture.md):
-    level i's extent is final_extent * (product of counts at every level
-    strictly more-inner than i that also tiles this same dim).
+    level gets a DISTINCT extent value per level here: level i's extent is
+    final_extent * (product of counts at every level strictly more-inner
+    than i that also tiles this same dim).
     """
     counts_by_dim: dict[int, Expr] = {}
     counts_by_reduction_dim: dict[int, Expr] = {}
@@ -342,7 +340,7 @@ def _planned_tile_extents_per_level(
             count, (int, sympy.Integer)
         ):
             if int(r) % int(count) != 0:
-                raise RuntimeError(
+                raise Unsupported(
                     f"coarse_tile: op {op.get_name()!r} {dim_desc} range {r} "
                     f"is not divisible by loop_count {count}.  All tiled "
                     f"dimensions must be evenly divisible by the loop trip count."
@@ -582,8 +580,7 @@ def _plan_is_loop_invariant_at_reduction_levels(
 
 def _seed_buffer_for_carry(
     op: ComputedBuffer,
-    loop_group_id: tuple,
-    operations: list[Operation],
+    group_ops: list[Operation],
 ) -> ComputedBuffer | None:
     """Return the pre-loop seed buffer op carries state through, or None.
 
@@ -617,6 +614,10 @@ def _seed_buffer_for_carry(
     Caller (plan_coarse_tile_groups) is responsible for the shape gate
     (_plan_is_loop_invariant_at_reduction_levels); this function only
     checks the seed-buffer data-flow shape.
+
+    Uses the pre-stamp closure helper (_seed_closure_pre_stamp) because
+    planning is zero-mutation and runs before _apply_plan stamps
+    loop_info -- the post-stamp _seed_closure would find no matches here.
     """
     if not isinstance(op.data, Pointwise):
         return None
@@ -639,7 +640,7 @@ def _seed_buffer_for_carry(
     seed_buf = seed_candidates[0]
     seed_name = seed_buf.get_name()
 
-    closure = _seed_closure(seed_name, loop_group_id, operations)
+    closure = _seed_closure_pre_stamp(seed_name, group_ops)
     if op.get_name() not in closure:
         return None
 
@@ -647,7 +648,7 @@ def _seed_buffer_for_carry(
         name
         for name in closure
         if _closure_member_has_external_operands_only(
-            name, seed_name, closure, operations
+            name, seed_name, closure, group_ops
         )
     ]
     if len(external_candidates) != 1:
@@ -857,7 +858,7 @@ def _divide_ranges(
             loop_count, (int, sympy.Integer)
         ):
             if int(r) % int(loop_count) != 0:
-                raise RuntimeError(
+                raise Unsupported(
                     f"coarse_tile: op {op.get_name()!r} loop var d{i} range {r} "
                     f"is not divisible by loop_count {loop_count}.  All tiled "
                     f"dimensions must be evenly divisible by the loop trip count."
@@ -952,7 +953,7 @@ def _divide_reduction_ranges(
             loop_count, (int, sympy.Integer)
         ):
             if int(r) % int(loop_count) != 0:
-                raise RuntimeError(
+                raise Unsupported(
                     f"coarse_tile: op {op.get_name()!r} reduction dim {i} range {r} "
                     f"is not divisible by loop_count {loop_count}.  All tiled "
                     f"reduction dimensions must be evenly divisible by the loop trip count."
@@ -1528,7 +1529,7 @@ def insert_tiling_propagation(
 
 
 def _validate_reduction_tiling(op: ComputedBuffer) -> None:
-    """Raise RuntimeError for unsupported Reduction tiling configurations.
+    """Raise Unsupported for unsupported Reduction tiling configurations.
 
     Supported:
       - A single level that tiles only a non-stick reduction dim.
@@ -1537,7 +1538,8 @@ def _validate_reduction_tiling(op: ComputedBuffer) -> None:
       - Multiple nesting levels where outer level(s) tile output dims and the
         innermost level tiles a reduction dim (e.g. outer M + inner K for mm).
 
-    Deferred (raises RuntimeError):
+    Deferred (raises Unsupported — reachable via a user-supplied spyre_hint,
+    not an internal invariant violation):
       - Mixed output+reduction tiling at the same nesting level.
       - Multiple reduction range indices tiled at one level.
     """
@@ -1559,14 +1561,14 @@ def _validate_reduction_tiling(op: ComputedBuffer) -> None:
         zip(tiled_dims_padded, tiled_rdims_padded)
     ):
         if out_dims and red_dims:
-            raise RuntimeError(
+            raise Unsupported(
                 f"coarse_tile: op {op.get_name()!r} level {i} tiles both "
                 f"output dim(s) {out_dims} and reduction dim(s) {red_dims} "
                 "simultaneously (mixed output+reduction tiling at one level "
                 "is not yet implemented — Stage 2)."
             )
         if len(red_dims) > 1:
-            raise RuntimeError(
+            raise Unsupported(
                 f"coarse_tile: op {op.get_name()!r} level {i} tiles multiple "
                 f"reduction dims {red_dims} (tiling more than one reduction "
                 "dim per level is not yet implemented — Stage 2)."

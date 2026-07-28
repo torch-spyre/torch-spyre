@@ -1857,16 +1857,11 @@ class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
         wrapper buffer ("seed0"), not the raw SpyreConstantFallback scalar
         directly.
 
-        _seed_closure (called by _seed_buffer_for_carry) restricts its scan
-        to ops already stamped with loop_info in the same outer group --
-        that stamping normally happens in _apply_plan, which planning
-        never calls (planning is zero-mutation). This fixture pre-stamps
-        carry0.loop_info directly to simulate "already decided this op is
-        in outer group 0", matching the closure-membership shape the real
-        pipeline produces by the time _seed_buffer_for_carry ever runs
-        post-stamp -- carry0 itself is never actually stamped by
-        plan_coarse_tile_groups (it stays zero-mutation for real ops), this
-        is fixture setup only.
+        _seed_buffer_for_carry uses _seed_closure_pre_stamp, which scans
+        group_ops directly rather than requiring a stamped loop_info --
+        planning is zero-mutation and runs before _apply_plan, so no op
+        has loop_info yet. No fixture pre-stamping is needed or performed
+        here; this exercises the real, never-stamped-during-planning path.
         """
         from torch._inductor.ir import (
             ComputedBuffer,
@@ -1932,13 +1927,6 @@ class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
         V.graph.name_to_buffer["carry0"] = carry_op
         carry_op._test_out_coords = [sympy.Symbol("c0")]
         carry_op.dim_hints = []  # loop-invariant: no dim_hints tile any level
-        # Simulate post-_apply_plan state for the closure-membership check
-        # in _seed_buffer_for_carry -> _seed_closure (see docstring above).
-        carry_op.loop_info = CoarseTileInfo(
-            loop_group_id=(0,),
-            loop_count=[Integer(4)],
-            loop_tiled_dims=[[]],
-        )
 
         group_ops = [red_op, carry_op]
         levels = [(1, Integer(4))]
@@ -5134,7 +5122,7 @@ class TestValidateReductionTiling(unittest.TestCase):
         from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
 
         op = self._make_op(loop_tiled_dims=[[0]], loop_tiled_reduction_dims=[[0]])
-        with self.assertRaises(RuntimeError, msg="mixed same-level should raise"):
+        with self.assertRaises(Unsupported, msg="mixed same-level should raise"):
             _validate_reduction_tiling(op)
 
     def test_mixed_different_levels_allowed(self):
@@ -5175,9 +5163,7 @@ class TestValidateReductionTiling(unittest.TestCase):
             loop_tiled_dims=[[]],
             loop_tiled_reduction_dims=[[0, 1]],
         )
-        with self.assertRaises(
-            RuntimeError, msg="multiple reduction dims should raise"
-        ):
+        with self.assertRaises(Unsupported, msg="multiple reduction dims should raise"):
             _validate_reduction_tiling(op)
 
     def test_stick_dim_reduction_tiling_allowed(self):
@@ -5775,7 +5761,7 @@ class TestDivideReductionRanges(unittest.TestCase):
         op = self._make_reduction_op(
             ranges=[Integer(128)], reduction_ranges=[Integer(100)]
         )
-        with self.assertRaises(RuntimeError, msg="not divisible should raise"):
+        with self.assertRaises(Unsupported, msg="not divisible should raise"):
             _divide_reduction_ranges(op, Integer(3), [0])
 
     def test_divides_second_reduction_dim(self):
