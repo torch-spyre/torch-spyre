@@ -828,6 +828,43 @@ _V = TypeVar("_V")
 ItSpaceSplits = tuple[dict[sympy.Expr, int], dict[sympy.Expr, int]]
 
 
+def coeff_through_floor(expr: sympy.Expr, sym: sympy.Symbol) -> sympy.Expr:
+    """``expr.coeff(sym)``, but also finds ``sym``'s coefficient when it
+    only appears inside a ``floor(...)`` wrapper.
+
+    ``device_tile_advance_expr`` (the only caller of this helper today) is
+    always a sympy ``Add`` where each tiled symbol contributes exactly one
+    additive term -- one minted symbol per coarse-tiling level, produced by
+    ``views.tiling_expr_to_device_expr``. That term is either a plain
+    ``Mul`` (``k*sym``) or ``sympy.floor(k*sym/d)``. ``sympy.Expr.coeff()``
+    looks through ``Mul``/``Add`` fine but refuses to look inside
+    ``floor()``, silently returning 0 for a genuine free symbol. This
+    isolates ``sym``'s own term first, then unwraps one ``floor()`` layer
+    before delegating to ``.coeff()``.
+
+    Tiles are always a whole number of sticks, so ``floor()``'s division
+    here must always be exact; a non-integer result means an earlier pass
+    or ``spyre_hint`` produced an invalid sub-stick tile boundary, and is
+    reported as ``Unsupported`` rather than silently truncated.
+    """
+    terms = expr.args if isinstance(expr, sympy.Add) else (expr,)
+    own_term = next((t for t in terms if sym in t.free_symbols), None)
+    if own_term is None:
+        return sympy.S.Zero
+    if isinstance(own_term, sympy.floor):
+        coeff = own_term.args[0].coeff(sym)
+    else:
+        coeff = own_term.coeff(sym)
+    if coeff != 0 and not coeff.is_Integer:
+        raise Unsupported(
+            f"Tile-advance coefficient {coeff} for symbol {sym} in "
+            f"{expr!r} is not an integer number of sticks -- tiling below "
+            "stick granularity is not supported (check the originating "
+            "spyre_hint or coarse-tiling pass)"
+        )
+    return coeff
+
+
 def _coeff_splits_from_index(
     splits: dict[sympy.Symbol, _V],
     index: sympy.Expr,
