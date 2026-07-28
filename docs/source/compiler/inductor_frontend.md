@@ -45,7 +45,7 @@ points, all registered in
 | `CustomPrePasses` | Post-grad FX graph (early) | `collect_spyre_hints` snapshots `spyre_hint` annotations so they survive AOT re-tracing. |
 | `CustomPostPasses` | Post-grad FX graph (late) | Late post-grad rewrites: `recover_spyre_hints`, `mm_to_bmm_pass`, `mark_direct_unit_bmm_pass`, `bmm_unflatten_pass`. |
 | `CustomPreFusionPasses` | LoopLevelIR (pre-fusion) | Pre-fusion scheduler passes: `propagate_mutation_layouts`, `build_loop_scheduler_nodes`. |
-| `CustomPostFusionPasses` | LoopLevelIR (post-fusion) | Post-fusion scheduler passes: `memory_planning`, `spyre_fuse_nodes`. |
+| `CustomPostFusionPasses` | LoopLevelIR (post-fusion) | Post-fusion scheduler passes: `hbm_pool_planning`, `spyre_fuse_nodes`. |
 | `CustomPreSchedulingPasses` | LoopLevelIR (pre-scheduler) | The pre-scheduling pipeline that runs immediately before the Scheduler is constructed (wired in via a `GraphLowering._update_scheduler` monkey-patch in [`patches.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/patches.py)). The full step list is in [LoopLevelIR Passes](#looplevelir-passes) below. |
 
 ### FX Graph Passes
@@ -258,7 +258,7 @@ The headline modules above are the ones a contributor reaches for first. The fro
 | [`split_multi_ops.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/split_multi_ops.py) | `split_multi_ops` and `validate_ops`. Splits multi-op loop bodies into single-op buffers (materializing constant args as `SpyreConstantFallback`) and validates that op inputs share the same `ElementArrangement`. |
 | [`optimize_restickify.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/optimize_restickify.py) | Optimizes restickify operations inserted by layout propagation. |
 | [`insert_restickify.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/insert_restickify.py) | `finalize_layouts`, `insert_restickify`, `insert_post_mutation_restickify`. Settles tile-structure decisions, adds explicit re-tile ops where adjacent ops disagree on layout, and handles restickification for slice-mutation buffers. |
-| [`memory_planning.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/memory_planning.py) | Memory planning for Spyre device buffers. |
+| [`hbm_pool_planning.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/hbm_pool_planning.py) | HBM-pool allocation for intermediates not in LX. |
 | [`deadcode_elimination.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/deadcode_elimination.py) | `deadcode_elimination` for the pre-scheduling LoopLevelIR. |
 | [`work_division.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/work_division.py) | `span_reduction`, `cost_model_matmul_division`, `work_distribution`, `divide_pointwise_op`, `divide_reduction_op`, `apply_splits`. Three-pass work division: span reduction (mandatory), cost-model matmul division (claims a subset of matmuls), and work distribution (covers the rest). |
 | [`scratchpad/`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/scratchpad/) | `scratchpad_planning` and the layout-solver framework (`GreedyLayoutSolver`, `FirstFitLayoutSolver`, `BestFitLayoutSolver`). LX scratchpad allocation. |

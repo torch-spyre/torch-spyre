@@ -20,7 +20,7 @@ Usage (called by the GHA workflow):
 
 import argparse
 import os
-import re
+import regex as re
 import sys
 import uuid
 from collections import Counter, defaultdict

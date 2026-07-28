@@ -13,11 +13,11 @@
 # limitations under the License.
 
 
-from torch_spyre.constants import DEVICE_NAME
-
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from torch._dynamo.guards import GuardBuilder
+
+from torch_spyre.constants import DEVICE_NAME
 
 if TYPE_CHECKING:
     from torch_spyre._C import SpyreTensorLayout
@@ -162,6 +162,7 @@ def _patch_tensor_for_spyre():
 
     def spyre_empty(
         *args,
+        size=None,
         device_layout=None,
         out=None,
         dtype=None,
@@ -171,6 +172,15 @@ def _patch_tensor_for_spyre():
         pin_memory=False,
         memory_format=torch.contiguous_format,
     ):
+        # torch.empty supports size as either a positional arg or keyword arg.
+        # Normalise so downstream always receives it as positional.
+        if size is not None:
+            if args:
+                raise TypeError(
+                    "empty() received an invalid combination of arguments - got (tuple, size=tuple)"
+                )
+            args = (size,)
+
         if (
             device_layout is None
         ):  # use original implementation if no layout is provided
@@ -199,6 +209,22 @@ def _patch_tensor_for_spyre():
     torch.Tensor.device_tensor_layout = device_tensor_layout
     torch.Tensor._spyre_tensor_patched = True
     torch.Tensor.to = spyre_to
+    # Dynamo cannot trace INTO the Python ``spyre_to``: it inlines the wrapper,
+    # hits the C++ ``orig_to`` call, and graph-breaks — forcing the whole region
+    # to run eager, where D2D dtype casts (e.g. fp16<->bf16) are wrong. Mark
+    # ``.to`` allow_in_graph so Dynamo treats it as a leaf and traces its tensor
+    # semantics (-> prims.convert_element_type) directly, keeping the region
+    # compiled. (An ``is_compiling()`` guard inside spyre_to does NOT help — the
+    # break fires on ``orig_to`` regardless of the branch taken.)
+    #
+    # Scope note: this is a process-global registration affecting every user of
+    # ``torch.Tensor.to``, not just Spyre. That is acceptable here because
+    # torch-spyre already monkey-patches ``torch.Tensor.to`` globally (line
+    # above), so this backend already owns ``.to``'s behavior in-process;
+    # marking it allow_in_graph only changes how Dynamo traces it (as a leaf),
+    # which is harmless for cpu/other-backend tensors (spyre_to falls through to
+    # ``orig_to`` semantics for them).
+    torch._dynamo.allow_in_graph(torch.Tensor.to)
     torch.empty = spyre_empty
 
     # ── Optimal weight loading (issue #1339) ──────────────

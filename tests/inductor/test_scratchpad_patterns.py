@@ -36,9 +36,9 @@ from torch_spyre._inductor.scratchpad.simulated_annealing import (
 )
 from torch_spyre._inductor.scratchpad.plan_solver import (
     MemoryPlanSolver,
-    GreedyLayoutSolver,
     LifetimeBoundBuffer as Buffer,
 )
+from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 
 AVAILABLE_LX_SIZE = _lx_planning_size()
 

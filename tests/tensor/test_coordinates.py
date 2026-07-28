@@ -27,7 +27,7 @@ from torch_spyre._inductor.propagate_layouts import (
     PropArg,
     _check_supported_input_sticks,
 )
-from torch_spyre._inductor.views import compute_coordinates
+from torch_spyre._inductor.views import compute_coordinates, tiling_expr_to_device_expr
 from torch.utils._sympy.functions import ModularIndexing
 
 p0, p1, p2, p3, p4, p5 = sympy.symbols("p0 p1 p2 p3 p4 p5", integer=True)
@@ -269,6 +269,27 @@ class TestUnrepresentableStickCandidates(TestCase):
         dep, bad, _ = self._traced_scenario()
         arg = PropArg(dep, None, [bad])
         _check_supported_input_sticks([arg], "batchmatmul")  # must not raise
+
+
+class TestTilingExprToDeviceExpr(TestCase):
+    def test_tiling_expr_row_major(self):
+        # [1024, 4096] tensor tiled 2x4 times (generic stick format)
+        index = 4096 * 512 * p0 + 1024 * p1
+        result = tiling_expr_to_device_expr([64, 1024, 64], [64, 4096, 1], index)
+        self.assertEqual(result, 32768 * p0 + 1048576 * p1)
+
+    def test_tiling_expr_column_major(self):
+        # [4096, 1024] tensor tiled 4x2 times (generic stick format) transposed before use
+        index = 512 * p0 + 1024 * 1024 * p1
+        result = tiling_expr_to_device_expr([16, 4096, 64], [64, 1024, 1], index)
+        self.assertEqual(result, 2097152 * p0 + 65536 * p1)
+
+    def test_tiling_expr_row_major_transposed_restickified(self):
+        # [1024, 4096] tensor tiled 2x4 times (generic stick format) transposed
+        # and restickified before use
+        index = 512 * p0 + 1024 * 1024 * p1
+        result = tiling_expr_to_device_expr([64, 1024, 64], [65536, 1, 1024], index)
+        self.assertEqual(result, 32768 * p0 + 1048576 * p1)
 
 
 if __name__ == "__main__":

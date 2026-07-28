@@ -18,7 +18,11 @@ test_suite_config:
         - names:
             # normalization
             - TestOps::test_layernorm.*
+            - TestOps::test_layernorm_functional.*
             - TestOps::test_rmsnorm.*
+            - TestOps::test_rmsnorm_manual.*
+            - TestOps::test_batch_norm_functional.*
+            - TestOps::test_group_norm_functional.*
             - TestOps::test_softmax.*
             - TestOps::test_softplus.*
             # embedding

@@ -14,11 +14,13 @@
 
 import logging
 from collections import defaultdict
+from typing import cast
 
 import torch
 
 from .constants import ELIDED_COPY_BACK_ATTR
 from .ir import FixedTiledLayout
+from .optimize_restickify import EdgeCostMap
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
 from .pass_utils import copy_fx_custom_meta
@@ -269,7 +271,7 @@ def finalize_layouts(graph: GraphLowering) -> None:
         # until after the scheduler runs
         if op_layouts and not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
             stl = committed if cost_fn else op_layouts[0]
-            op.layout = _fixed_tiled(op.layout, stl)
+            op.layout = _fixed_tiled(op.layout, cast(SpyreTensorLayout, stl))
 
         # For each input edge, schedule a restickify if the input's committed STL
         # is incompatible with what this op requires on that edge.
@@ -287,6 +289,13 @@ def finalize_layouts(graph: GraphLowering) -> None:
             restick_stl = edge.layout(in_stl, target_stl)
             if restick_stl is None:
                 continue
+            if restick_stl is EdgeCostMap.INFEASIBLE:
+                raise AssertionError(
+                    f"finalize_layouts: restickify needed but infeasible for "
+                    f"op={op.get_name()!r} input={edge.dep.name!r}: "
+                    f"in_stl.stride_map={list(in_stl.stride_map)} "
+                    f"target_stl.stride_map={list(target_stl.stride_map)}"
+                )
             restick_target = _fixed_tiled(in_layout, restick_stl)
             logger.info(
                 f"Injecting restickify on {op.get_name()} input {edge.dep.name}: "
@@ -375,7 +384,7 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
         assert graph_input is not None
 
         # Create fresh layouts here, since reusing base_layout would overwrite
-        # arg0_1's address during memory_planning.
+        # arg0_1's address during hbm_pool_planning.
         target_input_buf = graph_input.data.data
         base_layout = target_input_buf.layout  # FixedTiledLayout(alt_stl)
         buf_tmp_layout = _fixed_tiled(base_layout, alt_stl)

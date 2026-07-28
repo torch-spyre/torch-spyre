@@ -45,7 +45,9 @@ def freeze(x: Any) -> Any:
     return x
 
 
-def case_key(case: Dict[str, Any], defaults: Dict[str, Any]) -> tuple:
+def case_key(
+    case: Dict[str, Any], defaults: Dict[str, Any]
+) -> tuple[Any, Any, Any, Any, Any, Any]:
     # Used for dedupe; intentionally does NOT include model name.
     op = case["op"]
     dtype = case.get("dtype", defaults.get("dtype", "float16"))

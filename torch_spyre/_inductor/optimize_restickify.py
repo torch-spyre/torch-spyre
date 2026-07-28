@@ -75,24 +75,35 @@ class EdgeCostMap:
             defaultdict(dict)
         )
 
+    # Sentinel stored in _layout when a restickify is needed but infeasible.
+    # Distinct from None ("compatible, no restickify needed") so finalize_layouts
+    # can raise instead of silently skipping.
+    INFEASIBLE: "SpyreTensorLayout" = object()  # type: ignore[assignment]
+
     def _compute_and_cache_cost(
         self, in_stl: "SpyreTensorLayout", target_stl: "SpyreTensorLayout"
     ) -> None:
         """Populate _cost and _layout for (in_stl, target_stl).
 
         Cost is 0 if stick-compatible, the input element count if restickifiable, or INF if infeasible.
+        _layout stores:
+          None               — compatible, no restickify needed
+          INFEASIBLE         — restickify needed but compute_restickify_target_layout returned None
+          SpyreTensorLayout  — feasible restickify target layout
         """
         needed, tgt = compute_restickify_needed(
             in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
         )
         if not needed:
             cost = 0.0
+            self._layout[in_stl][target_stl] = None
         elif tgt is None:
             cost = INF  # infeasible restickify
+            self._layout[in_stl][target_stl] = EdgeCostMap.INFEASIBLE
         else:
             cost = float(math.prod(in_stl.device_size))
+            self._layout[in_stl][target_stl] = tgt
         self._cost[in_stl][target_stl] = cost
-        self._layout[in_stl][target_stl] = tgt
 
     def cost(
         self, in_stl: "SpyreTensorLayout", target_stl: "SpyreTensorLayout"
@@ -105,7 +116,13 @@ class EdgeCostMap:
     def layout(
         self, in_stl: "SpyreTensorLayout", target_stl: "SpyreTensorLayout"
     ) -> "SpyreTensorLayout | None":
-        """Return target STL for restickifying in_stl to be compatible with target_stl, or None if no restickify needed."""
+        """Return target STL for restickifying in_stl to be compatible with target_stl.
+
+        Returns:
+          None               — compatible, no restickify needed
+          INFEASIBLE         — restickify needed but infeasible (caller must handle)
+          SpyreTensorLayout  — the target layout for the restickify op
+        """
         if target_stl not in self._cost[in_stl]:
             self._compute_and_cache_cost(in_stl, target_stl)
         return self._layout[in_stl][target_stl]
