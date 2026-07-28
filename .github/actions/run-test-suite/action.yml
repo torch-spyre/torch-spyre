@@ -3,22 +3,28 @@ description: >
   Runs a single run_test.sh config with up to MAX_ATTEMPTS retries,
   a stall watchdog, and DTLOG_LEVEL=Info on the final attempt.
 
+# ---------------------------------------------------------------------------
+# CHANGES vs the original action -- testmon support only, additive:
+#   - New inputs: `testmon` and `testmon_datafile`.
+#   - When testmon=true, pytest-testmon is lazy-installed and TESTMON_DATAFILE
+#     / --testmon are exported in EXACTLY the same shell block that already
+#     activates .venv and cd's into TORCH_SPYRE_DIR for pytest-cov -- i.e.
+#     the same place tests/run_test.sh itself actually runs from. This is
+#     deliberate: a separate workflow-level "install pytest-testmon" step
+#     has to independently re-derive TORCH_SPYRE_DIR and can silently land
+#     in a different resolved directory than this action does (that's what
+#     broke the first attempt -- pytest-testmon ended up in the wrong venv).
+#     Doing it here removes that whole class of mismatch by construction.
+#   - tests/run_test.sh itself is NOT modified anywhere below -- testmon is
+#     activated purely via env vars pytest reads on its own.
+# ---------------------------------------------------------------------------
+
 inputs:
   torch_spyre_dir:
     description: Path to the pre-cloned torch-spyre directory
     required: false
     type: string
     default: torch-spyre
-  venv_path:
-    description: >
-      Path to the Python virtualenv to activate, used verbatim. The venv
-      location is an image detail that varies, so the caller passes the full
-      path for its image — e.g. the shared /home/senuser/.venv for the prebaked
-      dev image. Absolute paths are used as-is; a relative path resolves
-      against the process working directory. Default '.venv'.
-    required: false
-    type: string
-    default: .venv
   suite_name:
     description: Human-readable label (used in echo/log output)
     required: true
@@ -57,15 +63,44 @@ inputs:
     description: Whether to pass --parallel to run_test.sh (disable for distributed torchrun tests)
     required: false
     default: 'true'
+  coverage_dir:
+    description: >
+      If set, installs pytest-cov (if missing) and writes
+      coverage/<suite>_config/coverage.json under this directory.
+      Leave empty to skip coverage entirely.
+    required: false
+    default: ''
+  testmon:
+    description: >
+      If true, lazy-installs pytest-testmon (if missing) into the same venv
+      this action activates below, and exports TESTMON_DATAFILE + appends
+      --testmon to PYTEST_ADDOPTS before running. Mutually exclusive with
+      coverage_dir in practice -- pytest-cov and pytest-testmon both drive
+      their own coverage.py instance, so don't set both on the same call.
+    required: false
+    default: 'false'
+  testmon_datafile:
+    description: >
+      Absolute path for TESTMON_DATAFILE when testmon=true. Must be an
+      absolute path supplied by the caller (e.g. under $GITHUB_WORKSPACE,
+      outside torch_spyre_dir) so it's immune to however torch_spyre_dir
+      itself resolves on a given runner.
+    required: false
+    default: ''
+
+outputs:
+  suite_dir:
+    description: Sanitized suite directory name derived from the config path (e.g. test_padding_config)
+    value: ${{ steps.run_suite.outputs.suite_dir }}
 
 runs:
   using: composite
   steps:
     - name: Run ${{ inputs.suite_name }}
+      id: run_suite
       shell: bash
       env:
         TORCH_SPYRE_DIR: ${{ inputs.torch_spyre_dir }}
-        VENV_PATH: ${{ inputs.venv_path }}
         MAX_ATTEMPTS: ${{ inputs.max_attempts }}
         STALL_TIMEOUT_SECS: ${{ inputs.stall_timeout_secs }}
         STALL_CHECK_INTERVAL: ${{ inputs.stall_check_interval }}
@@ -80,29 +115,74 @@ runs:
         echo "TORCH_SPYRE_DIR $TORCH_SPYRE_DIR"
         cd "$TORCH_SPYRE_DIR" || exit 1
 
-        # Activate the venv at VENV_PATH, used verbatim (no implicit base dir) so
-        # the caller has full control over where the venv lives — the venv
-        # location is an image detail that varies (e.g. <checkout>/.venv today,
-        # /home/senuser/.venv in the prebaked dev image) and may change again.
-        # The caller passes the full path for its image; a bare relative path
-        # (the default) resolves against the cwd set just above.
-        VENV_ACTIVATE="${VENV_PATH}/bin/activate"
-        echo "VENV_PATH $VENV_PATH (cwd $(pwd))"
-        if [[ ! -f "$VENV_ACTIVATE" ]]; then
-          echo "::error::venv activate script not found at '${VENV_ACTIVATE}'" \
-               "(VENV_PATH='${VENV_PATH}', resolved from cwd '$(pwd)')." \
-               "Set the run-test-suite 'venv_path' input to this image's venv:" \
-               "'.venv' for a normal checkout (<dir>/.venv), or an absolute path" \
-               "such as /home/senuser/.venv for the prebaked dev image."
-          echo "  contents of '${VENV_PATH}' (if any):"
-          ls -la "$VENV_PATH" 2>&1 | sed 's/^/    /' || true
-          exit 1
-        fi
-        # The action runs with `set +e`, so make activation fatal — otherwise a
-        # failed source is ignored and tests run against the global Python.
-        source "$VENV_ACTIVATE" || exit 1
+        source .venv/bin/activate
 
         CONFIG="${{ inputs.config }}"
+
+        SUITE_DIR=$(python3 -c "
+        import pathlib
+        print(pathlib.Path('${CONFIG}').stem)
+        ")
+        echo "suite_dir=$SUITE_DIR" >> "$GITHUB_OUTPUT"
+
+        _COV_FLAGS=""
+        COV_FILE=""
+        if [[ -n "${{ inputs.coverage_dir }}" ]]; then
+          if ! uv pip show pytest-cov > /dev/null 2>&1; then
+            echo "pytest-cov is missing! Installing now..."
+            uv pip install pytest-cov
+          fi
+
+          mkdir -p "${{ inputs.coverage_dir }}/$SUITE_DIR"
+          COV_FILE="${{ inputs.coverage_dir }}/$SUITE_DIR/coverage.json"
+          _COV_FLAGS="--cov=torch_spyre --cov-report=json:${COV_FILE}"
+          echo "  Coverage      : enabled -> ${COV_FILE}"
+        fi
+
+        # -------------------------------------------------------------------
+        # testmon: installed + activated HERE, in the same cd'd/activated
+        # venv used by the actual pytest invocation below -- see the header
+        # note on why this can't safely live in a separate workflow step.
+        #
+        # Activation is done via a CLI flag appended to the actual
+        # `python3 -m pytest` invocation (through run_test.sh's own "extra
+        # pytest args" forwarding), NOT via PYTEST_ADDOPTS. testmon only
+        # activates at all if --testmon/--testmon-forceselect is literally
+        # present in pytest's argv at startup (testmon/configure.py:
+        # _get_notestmon_reasons returns "not mentioned" and testmon does
+        # nothing -- no collection, no db -- if neither flag is seen).
+        # PYTEST_ADDOPTS has to survive: this export -> a backgrounded `&`
+        # job -> `env ... bash run_test.sh` -> run_test.sh's own internal
+        # subshells -> _run_pytest_isolated -> _run_cmd, before pytest ever
+        # starts. Any one of those hops dropping it means silent no-op,
+        # which is what was actually happening. _COV_FLAGS/_JUNIT_FLAG
+        # below don't have this problem because run_test.sh forwards them
+        # as literal CLI args, appended directly to every
+        # `python3 -m pytest "$_base" "${_args[@]}"` call it makes -- so
+        # _TESTMON_FLAGS rides along the same, already-proven path.
+        #
+        # --testmon-forceselect (not plain --testmon): in --parallel mode
+        # run_test.sh passes explicit "file.py::TestClass::test_x" node
+        # IDs per card, which testmon's own manual-selection check treats
+        # as "you selected tests manually" and silently stops selecting
+        # against -- forceselect prevents that. It's a strict superset of
+        # plain --testmon otherwise, so always using it is safe.
+        # -------------------------------------------------------------------
+        _TESTMON_FLAGS=""
+        if [[ "${{ inputs.testmon }}" == "true" ]]; then
+          if [[ -z "${{ inputs.testmon_datafile }}" ]]; then
+            echo "ERROR: testmon=true requires testmon_datafile (absolute path) to be set." >&2
+            exit 1
+          fi
+          if ! uv pip show pytest-testmon > /dev/null 2>&1; then
+            echo "pytest-testmon is missing! Installing now..."
+            uv pip install pytest-testmon
+          fi
+          export TESTMON_DATAFILE="${{ inputs.testmon_datafile }}"
+          _TESTMON_FLAGS="--testmon-forceselect"
+          echo "  Testmon       : enabled -> ${TESTMON_DATAFILE}"
+          echo "  Testmon flags : ${_TESTMON_FLAGS}"
+        fi
 
         _ARCH="$(uname -m)"
         _SLOW_FLAG=""
@@ -129,14 +209,15 @@ runs:
                 elapsed_stall=$(( elapsed_stall + STALL_CHECK_INTERVAL ))
                 echo "[stall-watcher] No new output for ${elapsed_stall}s (lines=${current_lines})"
                 if [[ $elapsed_stall -ge $STALL_TIMEOUT_SECS ]]; then
-                  echo "[stall-watcher] STALL DETECTED — killing test child processes"
-                  # Kill the parent and ALL child processes in order
-                  # 1. Freeze the parent process so it cannot spawn anything
-                  kill -STOP "$TEST_PID" || true
-                  # 2. Kill all existing child processes
-                  pkill -P "$TEST_PID" || true
-                  # 3. Kill the frozen parent process
-                  kill -KILL "$TEST_PID" || true
+                  echo "[stall-watcher] STALL DETECTED — attempting graceful shutdown first"
+                  kill -TERM "$TEST_PID" 2>/dev/null || true
+                  sleep 10
+                  if kill -0 "$TEST_PID" 2>/dev/null; then
+                    echo "[stall-watcher] Still alive after SIGTERM — force killing"
+                    kill -STOP "$TEST_PID" || true
+                    pkill -P "$TEST_PID" || true
+                    kill -KILL "$TEST_PID" || true
+                  fi
                   return
                 fi
               else
@@ -184,7 +265,7 @@ runs:
             _PARALLEL_FLAG="--parallel"
           fi
 
-          env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" ${_PARALLEL_FLAG} ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} \
+          env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" ${_PARALLEL_FLAG} ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} ${_COV_FLAGS} ${_TESTMON_FLAGS} \
             >&"$FIFO_FD" 2>&1 &
           TEST_PID=$!
 
@@ -207,6 +288,13 @@ runs:
           if [[ $TEST_EXIT -eq 0 ]]; then
             echo "=== Attempt ${attempt} PASSED ==="
             echo "${{ inputs.suite_name }} tests done"
+            if [[ "${{ inputs.testmon }}" == "true" ]]; then
+              if [[ -f "${{ inputs.testmon_datafile }}" ]]; then
+                echo "  Testmon db    : present -> $(ls -la "${{ inputs.testmon_datafile }}")"
+              else
+                echo "  Testmon db    : MISSING at ${{ inputs.testmon_datafile }} -- activation likely failed" >&2
+              fi
+            fi
             rm -f "$LOG_FILE" "$STALL_FLAG" "${STALL_FLAG}.done"
             exit 0
           fi
@@ -221,6 +309,7 @@ runs:
           rm -f "$LOG_FILE" "$STALL_FLAG" "${STALL_FLAG}.done"
           [[ $attempt -lt $MAX_ATTEMPTS ]] && sleep 10
         done
+
 
         echo "=== All ${MAX_ATTEMPTS} attempts failed for ${{ inputs.suite_name }} ==="
         exit 1
