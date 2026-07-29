@@ -397,6 +397,28 @@ def _planned_tile_extents_per_level(
     return per_level_output
 
 
+def _fixed_level_extents(loop_tiled_dims: list[list[int]]) -> list[dict[int, Expr]]:
+    """Per-level extents for a dep that is loop-invariant (does not advance).
+
+    The one and only "does not advance" convention in this pipeline is
+    *omitting* the dim from its level's dict entirely -- see
+    CoarseTileInfo.tiled_dims_per_read's docstring ("An empty per-level list
+    means the dep is loop-invariant at that level") and
+    SpyreKernel._general_tile_advance, which substitutes 0 for any dep.index
+    free symbol with no entry in the level's dict. An extent of
+    ``sympy.Integer(1)`` is NOT equivalent: _tiled_dims_for_dep keeps an
+    entry whenever the dependency's own index references that dim
+    (irrespective of the extent value attached), and
+    tiling_expr_to_device_expr has no zero-coefficient special case, so a
+    present-with-extent-1 entry still contributes a nonzero
+    ``1 * level_symbol`` advance term whenever the dep's index happens to
+    reference the dim -- exactly the per-tile-fixed scratch buffers this is
+    meant for (issue: read-copy op's own output advancing when it must not).
+    Only the empty dict is safe for every dependency, tiled or not.
+    """
+    return [{} for _ in loop_tiled_dims]
+
+
 def _tiled_dims_for_dep(
     dep: MemoryDep,
     per_level_extents: list[dict[int, Expr]],
@@ -1996,13 +2018,11 @@ def _insert_copy_op(
     #
     # READS re-read tiled_op's already-divided per-tile buffer, which is
     # per_tile_fixed scratch reused in place every iteration -- it does not
-    # move, so each tiled dim's level-0..N extent is simply 1 (the copy op is
-    # not itself re-divided).
+    # move, so it must not advance at any level (the copy op is not itself
+    # re-divided). See _fixed_level_extents for why "not advance" means
+    # omitting the dim, not giving it extent 1.
     tiled_op_info = tiled_op.loop_info  # type: ignore[attr-defined]
-    read_level_extents = [
-        {d: sympy.Integer(1) for d in level_dims}
-        for level_dims in tiled_op_info.loop_tiled_dims
-    ]
+    read_level_extents = _fixed_level_extents(tiled_op_info.loop_tiled_dims)
     # The WRITE targets full_buf, which is NOT divided, so its store base must
     # advance a whole tile per iteration -- the same real per-level extents
     # plan_coarse_tile_groups derives for an op's own reads/write via
@@ -2307,11 +2327,13 @@ def _insert_read_copy_ops(
         # Fresh per-level tiled-dim decisions for copy_buf's own read/write —
         # mirroring _insert_copy_op's read/write split (see its comment), but
         # with the roles swapped: there, the copy's READ (of tiled_op's
-        # per-tile scratch) is extent-1 and its WRITE (to full_buf) advances a
-        # whole tile; here, the copy's READ (of full_buf) advances a whole
-        # tile per iteration and its WRITE (to this copy's own freshly
-        # allocated, tile-sized buffer) is extent-1 -- the copy buffer is
-        # per_tile_fixed scratch reused in place, it does not move.
+        # per-tile scratch) must not advance and its WRITE (to full_buf)
+        # advances a whole tile; here, the copy's READ (of full_buf) advances
+        # a whole tile per iteration and its WRITE (to this copy's own
+        # freshly allocated, tile-sized buffer) must not advance -- the copy
+        # buffer is per_tile_fixed scratch reused in place, it does not move.
+        # See _fixed_level_extents for why "must not advance" means omitting
+        # the dim, not giving it extent 1.
         #
         # Reusing tiled_op.loop_info verbatim here (as an earlier version of
         # this function did) is wrong for a different reason than
@@ -2333,10 +2355,7 @@ def _insert_read_copy_ops(
         n_output_dims = (
             len(tiled_op.data.ranges) if hasattr(tiled_op.data, "ranges") else 0
         )
-        write_level_extents: list[dict[int, Expr]] = [
-            {d: sympy.Integer(1) for d in level_dims}
-            for level_dims in tiled_op_info.loop_tiled_dims
-        ]
+        write_level_extents = _fixed_level_extents(tiled_op_info.loop_tiled_dims)
         read_level_extents: list[dict[int, Expr]] = [
             {} for _ in tiled_op_info.loop_tiled_dims
         ]
@@ -2418,20 +2437,18 @@ def _insert_read_copy_ops(
     # advance, correct at plan time. But new_op's actual reads (per
     # get_read_writes(), re-derived from the now-patched inner_fn) are the
     # copy buffers for every swapped name: per_tile_fixed scratch reused in
-    # place every iteration, which must not advance (extent 1), exactly like
+    # place every iteration, which must not advance, exactly like
     # _insert_copy_op's own read side. SpyreKernel._general_tile_advance
     # matches tiled_dims_per_read to get_read_writes().reads purely
     # positionally (see loop_info.py's docstring), so every entry
-    # corresponding to a swapped-in copy-buffer read must be zeroed to
-    # extent 1 for the dims that dependency actually reads.
+    # corresponding to a swapped-in copy-buffer read must be zeroed (dim
+    # omitted, see _fixed_level_extents) for the dims that dependency
+    # actually reads.
     new_loop_info = new_op.loop_info  # type: ignore[attr-defined]
     new_reads = [r for r in new_op.get_read_writes().reads if isinstance(r, MemoryDep)]
     swapped_in_names = {copy_name for copy_name, _, _ in name_map.values()}
     if new_loop_info.tiled_dims_per_read:
-        fixed_level_extents = [
-            {d: sympy.Integer(1) for d in level_dims}
-            for level_dims in new_loop_info.loop_tiled_dims
-        ]
+        fixed_level_extents = _fixed_level_extents(new_loop_info.loop_tiled_dims)
         new_tiled_dims_per_read = [
             (
                 _tiled_dims_for_dep(dep, fixed_level_extents)
