@@ -1108,12 +1108,14 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
-    @pytest.mark.xfail(
-        strict=False,
+    @pytest.mark.skip(
         reason=(
             "flash attention v3/v4 not yet passing: Lk reduction-dim tiling is "
             "disabled (see FIXME on kv_block_size), unrelated to carry "
-            "propagation"
+            "propagation. Suspected of leaving the device in an error state "
+            "and cascading skips to every later test in the same process "
+            "(see conftest.py's has_stream_error() check) -- skipped outright "
+            "rather than xfailed until that's confirmed/fixed."
         ),
     )
     def test_hint_flash_attention_v3_b2_minimal(self):
