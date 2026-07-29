@@ -384,6 +384,12 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   dci.isHostToSen_ = host2device;
   dci.dataformat_src_ = host2device ? cpu_format_host : dev_format_dev;
   dci.dataformat_dst_ = host2device ? dev_format_dev : cpu_format_host;
+  TORCH_CHECK(
+      isDCIConversionSupported(dci.dataformat_src_, dci.dataformat_dst_),
+      "Unsupported DCI data format conversion: src=",
+      static_cast<int>(dci.dataformat_src_),
+      " dst=", static_cast<int>(dci.dataformat_dst_),
+      " (cpu_type=", cpu_str_type, ", dev_type=", dev_str_type, ")");
 
   std::vector<int64_t> cpu_shape;
   std::vector<int64_t> dev_shape = stl.device_size;

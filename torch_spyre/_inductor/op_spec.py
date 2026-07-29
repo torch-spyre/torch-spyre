@@ -115,7 +115,25 @@ class TensorArg:
         device_size: The device size (as per SpyreTensorLayout) of the Tensor
         device_coordinates: The sympy Exprs that describe how elements in the Tensor are accessed.
                 Free variables in device_coordinates refer to entries in the OpSpec's iteration_space.
-        allocation: If present, the offset in scratchpad memory assigned to the Tensor.
+        allocation: dict tagging where this Tensor's data lives. Mirrors
+                layout.allocation and carries exactly one of three
+                mutually-exclusive keys:
+                - "hbm": graph input/output or fallback-kernel input/output,
+                  addressed directly in HBM.
+                - "lx": placed in on-chip LX scratchpad by LX planning
+                  (scratchpad/allocator.py).
+                - "hbm_pool": intermediate that didn't fit in LX, bump-
+                  allocated into the off-chip HBM intermediates segment by
+                  hbm_pool_planning.py. See
+                  docs/source/compiler/hbm_pool_planning.md.
+        device_tile_advance_expr: This arg's own device-*element*-offset sympy.Expr for one
+            unit step of each tiled Inductor iteration symbol (d0, d1, ...), built by
+            SpyreKernel._general_tile_advance from CoarseTileInfo.tiled_dims_per_read /
+            output_tiled_dims's per-level (dim, extent) decisions: one term per nesting
+            level, substituted with that level's own minted symbol, reprojected to
+            device-element space via views.tiling_expr_to_device_expr, and summed into a
+            single combined Expr. This is the sole tile-advance mechanism. ``None`` for
+            ops without loop_info/coarse tiling.
     """
 
     is_input: bool
@@ -126,6 +144,7 @@ class TensorArg:
     allocation: Any
     per_tile_fixed: bool = False
     name: str | None = None
+    device_tile_advance_expr: Expr | None = None
 
 
 @dataclasses.dataclass
@@ -153,6 +172,16 @@ class OpSpec:
             The bundle path (compile_op_spec / generate_sdsc) reverses this list to
             outermost-first and builds per-level affine.apply stride maps, mapping
             each level's strides to the correct loop variable by explicit index.
+        tiled_symbol_trip_counts: Maps each symbol appearing in tiled_symbols
+            to its own nesting level's trip count (CoarseTileInfo.loop_count
+            for that level). Used by SDSC codegen to compute each tiled
+            tensor's full pre-tiling extent as
+            (per-unit-step device element advance) * trip_count, without
+            needing a separately tracked full-extent field on TensorArg.
+            Only correct when a symbol belongs to exactly one nesting level
+            -- a symbol tiled at more than one level has no single trip
+            count this field could hold, so this is scoped to the common
+            one-level-per-symbol case -- empty for non-tiled ops.
     """
 
     op: str
@@ -161,6 +190,9 @@ class OpSpec:
     args: Sequence[TensorArg]
     op_info: dict[str, Any]
     tiled_symbols: list[list[Symbol]] = dataclasses.field(default_factory=list)
+    tiled_symbol_trip_counts: dict[Symbol, int] = dataclasses.field(
+        default_factory=dict
+    )
     # Maps PyTorch symbol name (e.g. 's97') -> (max, granularity) bounds.
     # Populated by compute_symbolic_bounds during
     # create_op_spec; empty for concrete dims.
@@ -211,3 +243,69 @@ def find_unimplemented(specs: list) -> UnimplementedOp | None:
             if found is not None:
                 return found
     return None
+
+
+def format_op_spec_list(specs: list, indent: int = 0) -> str:
+    """Format an op spec list for structured logging output.
+
+    Uses an explicit stack to avoid recursion-depth issues with deeply
+    nested LoopSpecs.
+    """
+    lines: list[str] = []
+    stack: list[tuple[list, int, int]] = [(specs, indent, 0)]
+    while stack:
+        current_specs, cur_indent, idx = stack.pop()
+        if idx >= len(current_specs):
+            continue
+        # Push remainder back for later processing.
+        stack.append((current_specs, cur_indent, idx + 1))
+        item = current_specs[idx]
+        prefix = "  " * cur_indent
+        if isinstance(item, LoopSpec):
+            lines.append(f"{prefix}LoopSpec(count={item.count})")
+            lines.append(f"{prefix}  body=[")
+            # Push a sentinel to close the body bracket after children.
+            stack.append(([_LoopClose(prefix)], cur_indent, 0))
+            # Push the body for processing at deeper indent.
+            stack.append((item.body, cur_indent + 2, 0))
+        elif isinstance(item, OpSpec):
+            it_space_str = ", ".join(
+                f"{k}: ({v[0]}, {v[1]})" for k, v in item.iteration_space.items()
+            )
+            lines.append(
+                f"{prefix}OpSpec(op={item.op!r}, "
+                f"is_reduction={item.is_reduction}, "
+                f"iteration_space={{{it_space_str}}})"
+            )
+            for arg in item.args:
+                lines.append(
+                    f"{prefix}  TensorArg("
+                    f"{'input' if arg.is_input else 'output'}, "
+                    f"arg_index={arg.arg_index}, "
+                    f"device_size={arg.device_size}, "
+                    f"device_coordinates={arg.device_coordinates}, "
+                    f"device_tile_advance_expr={arg.device_tile_advance_expr}, "
+                    f"allocation={arg.allocation})"
+                )
+            if item.tiled_symbols:
+                lines.append(f"{prefix}  tiled_symbols={item.tiled_symbols}")
+            if item.symbolic_dim_bounds:
+                lines.append(
+                    f"{prefix}  symbolic_dim_bounds={item.symbolic_dim_bounds}"
+                )
+        elif isinstance(item, UnimplementedOp):
+            lines.append(f"{prefix}UnimplementedOp(op={item.op!r})")
+        elif isinstance(item, _LoopClose):
+            lines.append(f"{item.prefix}  ]")
+        else:
+            lines.append(f"{prefix}{item!r}")
+    return "\n".join(lines)
+
+
+class _LoopClose:
+    """Sentinel used by format_op_spec_list to emit closing brackets."""
+
+    __slots__ = ("prefix",)
+
+    def __init__(self, prefix: str):
+        self.prefix = prefix

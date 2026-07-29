@@ -23,7 +23,7 @@ lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
 co_optimizing_lx_planning: bool = (
     os.environ.get("CO_OPTIMIZING_LX_PLANNING", "0") == "1"
 )
-hbm_planning: bool = _get_env_bool("SPYRE_INDUCTOR_MEMORY_PLAN", True)
+hbm_pool_planning: bool = _get_env_bool("HBM_POOL_PLANNING", True)
 
 global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == "1"
 
@@ -72,6 +72,15 @@ log_passes: str = os.environ.get("SPYRE_LOG_PASSES", "")
 ignore_span_overflow_hints: bool = (
     ignore_wsr_hints
     or os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "1") == "1"
+)
+
+# Enable reduction-dim (Lk-style) coarse tiling. Defaults to enabled — this
+# capability is exercised by passing tests today. Disabling it (or a future
+# hardware limitation that can't support it) makes planning treat any op
+# whose group requests reduction-dim tiling as unsupported, raising
+# Unsupported rather than attempting to tile it.
+enable_reduction_tiling: bool = (
+    os.environ.get("SPYRE_INDUCTOR_ENABLE_REDUCTION_TILING", "1") == "1"
 )
 
 # For K-split matmuls, permute physical core IDs so the cores collaborating on a

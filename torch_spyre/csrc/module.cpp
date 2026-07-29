@@ -94,6 +94,9 @@ void _startRuntime() {
     logical_device_id = tls_idx;
   } else if (const char* lr = std::getenv("LOCAL_RANK")) {
     logical_device_id = std::atoi(lr);
+    // Match the current (c10) device to the rank so unqualified stream/pool
+    // lookups don't fall back to spyre:0.
+    SpyreGuardImpl::tls_idx = static_cast<c10::DeviceIndex>(logical_device_id);
   }
 
   const int num_devices = getVisibleDeviceCount();
@@ -363,6 +366,13 @@ PYBIND11_MODULE(_C, m) {
   m.def("default_stream", &spyre::getDefaultStream, py::arg("device"),
         "Get the default stream for a device");
 
+  m.def("host_compute_stream", &spyre::getHostComputeStream, py::arg("device"),
+        "Get a host compute stream for a device (round-robin)");
+
+  m.def("host_compute_stream_by_id", &spyre::getHostComputeStreamById,
+        py::arg("id"), py::arg("device"),
+        "Get a specific host compute stream by stream ID");
+
   m.def("synchronize", &spyre::synchronizeDevice,
         py::arg("device") = py::none(), "Synchronize a device or all devices");
 
@@ -507,4 +517,13 @@ PYBIND11_MODULE(_C, m) {
         allocator.resetPeakStats(device);
       },
       py::arg("device"), "Reset peak allocator statistics");
+
+  // Returns true if any stream in the runtime has been shut down
+  // (unrecoverable). When true, no further work can be submitted on the
+  // affected streams.
+  m.def("has_stream_error", []() -> bool {
+    auto runtime = spyre::GlobalRuntime::get();
+    if (!runtime) return false;
+    return runtime->hasStreamError();
+  });
 }

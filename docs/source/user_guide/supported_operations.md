@@ -67,14 +67,11 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.mean` | Y | Y | Spyre | |
 | `torch.amax` | Y | Y | Spyre | |
 | `torch.amin` | | Y | Spyre | Custom decomposition |
-| `torch.aminmax` | | Y | Spyre | Decomposes to `amax` + `amin` |
 | `torch.prod` | | Y | Spyre | Requires `dim` argument; custom decomposition + lowering |
 | `torch.max` | Y | Y | Spyre | `max.dim` via custom decomposition |
 | `torch.min` | Y | Y | Spyre | `min.dim` via custom decomposition (fp16) |
 | `torch.topk` | | Y | Spyre | Custom decomposition + custom ops (`spyre::topkvalue`, `spyre::topkindex`) |
-| `torch.linalg.vector_norm` | | Y | Spyre | Compiled only (eager misroutes `ord`) |
-| `torch.linalg.norm` | | Y | Spyre | Compiled only |
-| `torch.linalg.matrix_norm` | | Y | Spyre | Compiled only |
+| `torch.linalg.vector_norm` | Y | | Spyre | Eager only |
 | **View Ops** [^views] | | | | |
 | `torch.reshape` / `torch.view` | | Y | Spyre | Includes `_reshape_alias` (a C++ device view, not an Inductor lowering) |
 | `torch.transpose` | Y | Y | Spyre | |

@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import sys
 from pathlib import Path
+from typing import cast
 
 
 def parse_test_file(test_file: Path) -> tuple[list[str], set[str]]:
@@ -98,8 +99,8 @@ def _collect_params_roles(tree: ast.AST) -> tuple[set[str], set[str]]:
                 for key in item.value.keys:
                     if isinstance(key, ast.Tuple) and len(key.elts) >= 2:
                         if isinstance(key.elts[0], ast.Constant):
-                            primaries.add(key.elts[0].value)
+                            primaries.add(cast(str, key.elts[0].value))
                         if isinstance(key.elts[1], ast.Constant):
-                            helpers.add(key.elts[1].value)
+                            helpers.add(cast(str, key.elts[1].value))
 
     return primaries, helpers

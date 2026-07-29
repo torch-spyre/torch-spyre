@@ -33,7 +33,13 @@ from .constants import (
 )
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
-from .ir import SpyreReduction, SpyreConstantFallback, SpyreEmptyFallback
+from .ir import (
+    SpyreReduction,
+    SpyreConstantFallback,
+    SpyreEmptyFallback,
+    BroadcastAsyncFallback,
+    WaitWorkFallback,
+)
 from torch_spyre._C import get_elem_in_stick
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
@@ -125,6 +131,34 @@ def restore_lowerings(saved_overloads, lowering_dict):
             lowering_dict[overload] = func
 
 
+def register_fallback_over_decomp(fallback_ops):
+    """Register explicit fallback lowerings for fallback ops that also carry an
+    in-tree Inductor decomposition, returning the overloads newly added.
+
+    PT 2.12 added core-aten decompositions for several ops Spyre falls back to
+    (arange, tril, triu, isin, index_copy.out, ...). When such an op has no
+    registered lowering, Inductor's graph lowering auto-invokes
+    ``make_fallback(op)`` *without* ``override_decomp``, which asserts
+    ``both a fallback and a decomp for same op``. Pre-registering the fallback
+    with ``override_decomp=True`` installs a lowering so that auto-path — and
+    its assertion — is never reached.
+
+    Only overloads that are in ``lowering.decompositions`` and currently lack a
+    lowering are touched, so this composes with ``unregister_lowerings`` (which
+    runs first) and does not clobber Spyre's own lowerings.
+    """
+    added = []
+    for op in fallback_ops:
+        for overload in lowering.get_overloads(op):
+            if (
+                overload in lowering.decompositions
+                and overload not in lowering.lowerings
+            ):
+                lowering.make_fallback(overload, override_decomp=True)
+                added.append(overload)
+    return added
+
+
 # Overload names for aten.clamp
 _CLAMP_FUNC_OVS = ["default", "Tensor", "Tensor_minmax"]
 
@@ -148,6 +182,12 @@ def enable_spyre_lowerings():
             enable_spyre_lowerings._removed_fallbacks = {}
             enable_spyre_lowerings._removed_fallbacks = unregister_lowerings(
                 fallback_ops, lowering.lowerings, allow_missing=True
+            )
+            # Install explicit fallbacks for ops that also have an in-tree
+            # decomposition (PT 2.12), so Inductor never hits the asserting
+            # auto-``make_fallback`` path for them.
+            enable_spyre_lowerings._added_fallbacks = register_fallback_over_decomp(
+                fallback_ops
             )
             saved_intree_lowerings = {}
             for spyre_lowering_op, spyre_lowering_impl in spyre_lowerings.items():
@@ -218,6 +258,12 @@ def enable_spyre_lowerings():
                         ]
                     else:
                         lowering.lowerings.pop(spyre_lowering_op, None)
+                # Remove the fallback lowerings we added for decomp-carrying
+                # ops before restoring the originally-removed ones.
+                for overload in getattr(enable_spyre_lowerings, "_added_fallbacks", []):
+                    lowering.lowerings.pop(overload, None)
+                    lowering.fallbacks.discard(overload)
+                enable_spyre_lowerings._added_fallbacks = []
                 restore_lowerings(
                     enable_spyre_lowerings._removed_fallbacks, lowering.lowerings
                 )
@@ -1216,7 +1262,9 @@ def lower_constant_pad_nd(input, pad, value=0, align_to_stick=False):
     torch.ops.prims.convert_element_type.default,
     type_promotion_kind=None,
 )
-def to_dtype(x, dst_dtype):
+def to_dtype(x, dst_dtype, use_compute_types=True):
+    # PT 2.12 passes a ``use_compute_types`` kwarg to registered dtype-conversion
+    # lowerings; accept and forward it to the in-tree lowering.
     from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
     src_dtype = x.get_dtype()
@@ -1230,7 +1278,9 @@ def to_dtype(x, dst_dtype):
         op = torch.ops.spyre.to_dtype_cpu.default
         return eager_fallback(op, x, dst_dtype)
 
-    return lowering.to_dtype(x, dst_dtype, copy=True)
+    return lowering.to_dtype(
+        x, dst_dtype, copy=True, use_compute_types=use_compute_types
+    )
 
 
 def with_int64_fallback(fn, *args, convert_output=True):
@@ -1371,3 +1421,59 @@ def lower_prod_dim(x, dim, keepdim=False):
         return result
 
     return with_int64_fallback(_prod_dim_impl, x)
+
+
+# ============================================================================
+# Direct c10d Lowerings
+# ============================================================================
+@register_spyre_lowering(torch.ops._c10d_functional.broadcast.default)
+def lower_c10d_broadcast_async(tensor, src_rank, group_name):
+    """
+    Direct lowering for _c10d_functional.broadcast using ASYNC pattern.
+
+    Creates an async broadcast operation that returns immediately without blocking.
+    This provides the infrastructure for potential communication-compute overlap,
+    though actual overlap depends on scheduler decisions.
+
+    Flow:
+      _c10d_functional.broadcast → This lowering → BroadcastAsyncFallback
+      → Generated code: torch.ops.spyre.broadcast_async() → C++ → spyre-comms (non-blocking)
+    """
+    logger.debug(
+        "Lowering _c10d_functional.broadcast to BroadcastAsyncFallback "
+        "(src_rank=%s, group_name='%s')",
+        src_rank,
+        group_name,
+    )
+
+    tensor.realize()
+    return ir.TensorBox.create(
+        BroadcastAsyncFallback(
+            torch.ops.spyre.broadcast_async.default,
+            tensor,
+            src_rank,
+            group_name,
+        )
+    )
+
+
+@register_spyre_lowering(torch.ops._c10d_functional.wait_tensor.default)
+def lower_c10d_wait_tensor_async(tensor):
+    """
+    Direct lowering for _c10d_functional.wait_tensor using ASYNC pattern.
+
+    Synchronizes on the async broadcast operation, blocking until communication completes.
+
+    Flow:
+      _c10d_functional.wait_tensor → This lowering → WaitWorkFallback
+      → Generated code: torch.ops.spyre.wait_work() → C++ → work->wait()
+    """
+    logger.debug("Lowering _c10d_functional.wait_tensor to WaitWorkFallback")
+
+    tensor.realize()
+    return ir.TensorBox.create(
+        WaitWorkFallback(
+            torch.ops.spyre.wait_work.default,
+            tensor,
+        )
+    )

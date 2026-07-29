@@ -29,6 +29,7 @@ CREATE TABLE spyre.test_runs
     workflow        LowCardinality(String),
     suite_name      String,
     filename        String,
+    platform        LowCardinality(String),
     branch          LowCardinality(String),
     commit_sha      FixedString(40),
     gha_run_id      UInt64,
@@ -80,15 +81,47 @@ CREATE TABLE spyre.run_properties
 )
 ```
 
+### `spyre.pr_check_events`
+
+Right now our Jenkins CI only sends test pass/fail data to ClickHouse, not the actual
+build and check-run activity (like when a check starts, finishes, or what
+artifact it produced), so the dashboard can't show that. The
+`pr_check_events` table stores this activity per PR, so we can eventually
+see it on the dashboard.
+
+```sql
+CREATE TABLE IF NOT EXISTS spyre.pr_check_events
+(
+    ts             DateTime DEFAULT now(),
+    host           LowCardinality(String),
+    owner          String,
+    repo           String,
+    pr             UInt32,
+    sha            String,
+    run_id         String,
+    build_url      String,
+    component      String,
+    arch           LowCardinality(String),
+    mode           LowCardinality(String),
+    state          LowCardinality(String),
+    conclusion     Nullable(String),
+    artifact_url   Nullable(String),
+    gha_url        Nullable(String),
+    rpm_versions   Array(String) DEFAULT [],
+    wheel_versions Array(String) DEFAULT []
+)
+```
+
 ### Performance data
 
 ### `spyre.benchmark_runs`
 
 ```sql
 CREATE TABLE IF NOT EXISTS benchmark_runs (
-    run_id      UInt64 DEFAULT rand64(),
-    source_file String NOT NULL,
-    created_at  DateTime DEFAULT now()
+    run_id       UInt64 DEFAULT rand64(),
+    source_file  String NOT NULL,
+    version_info Nullable(String),
+    created_at   DateTime DEFAULT now()
 )
 ```
 
@@ -96,60 +129,25 @@ CREATE TABLE IF NOT EXISTS benchmark_runs (
 
 ```sql
 CREATE TABLE IF NOT EXISTS perf_benchmarks (
-    benchmark_id  UInt64 DEFAULT rand64(),
-    run_id        UInt64 NOT NULL,
-    record_type   String NOT NULL,
-    operation_name Nullable(String),
-    config_name    Nullable(String),
-    stack          String NOT NULL,
-    input_shapes   Nullable(String),
-    batch_size    Nullable(Int32),
-    prompt_length Nullable(Int32),
-    run_mode      Nullable(String),
-    kernel_name   Nullable(String),
+    benchmark_id            UInt64 DEFAULT rand64(),
+    run_id                  UInt64 NOT NULL,
+    record_type             String NOT NULL,
+    operation_name          Nullable(String),
+    config_name             Nullable(String),
+    input_shapes            Nullable(String),
+    batch_size              Nullable(Int32),
+    prompt_length           Nullable(Int32),
+    run_mode                Nullable(String),
     total_duration_ms       Nullable(Float64),
-    kernel_mean_ms          Nullable(Float64),
-    memcpy_htod_ms          Nullable(Float64),
-    memcpy_dtoh_ms          Nullable(Float64),
-    memset_device_ms        Nullable(Float64),
-    memory_transfer_mean_ms Nullable(Float64),
-    pt_util_percent         Nullable(Float64),
-    num_runs       Nullable(Int32),
-    custom_op_file Nullable(String),
-    version_info   Nullable(String),
-    created_at DateTime DEFAULT now()
-)
-```
-
-### `spyre.sendnn_runs`
-
-```sql
-CREATE TABLE IF NOT EXISTS sendnn_runs (
-    run_id      UInt64 DEFAULT rand64(),
-    source_file String NOT NULL,
-    created_at  DateTime DEFAULT now()
-)
-```
-
-### `spyre.sendnn_benchmarks`
-
-```sql
-CREATE TABLE IF NOT EXISTS sendnn_benchmarks (
-    benchmark_id  UInt64 DEFAULT rand64(),
-    run_id        UInt64 NOT NULL,
-    record_type   String NOT NULL,
-    operation_name Nullable(String),
-    stack          String NOT NULL,
-    input_shapes   Nullable(String),
-    batch_size    Nullable(Int32),
-    prompt_length Nullable(Int32),
-    run_mode      Nullable(String),
-    total_duration_ms       Nullable(Float64),
+    cpu_ms                  Nullable(Float64),
+    spyre_ms                Nullable(Float64),
     kernel_mean_ms          Nullable(Float64),
     memory_transfer_mean_ms Nullable(Float64),
     pt_util_percent         Nullable(Float64),
-    custom_op_file Nullable(String),
-    created_at DateTime DEFAULT now()
+    num_runs                Nullable(Int32),
+    custom_op_file          Nullable(String),
+    regression_status       Nullable(String),
+    created_at              DateTime DEFAULT now()
 )
 ```
 

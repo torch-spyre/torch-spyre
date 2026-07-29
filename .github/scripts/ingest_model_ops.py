@@ -11,15 +11,16 @@ rows into two ClickHouse tables:
                         matching exactly the JSON schema shown in the dashboard)
 
 Table lifecycle (every run):
-  1. DROP TABLE IF EXISTS   model_ops_variants
-  2. DROP TABLE IF EXISTS   model_ops_suites
-  3. CREATE TABLE           model_ops_suites
-  4. CREATE TABLE           model_ops_variants
-  5. INSERT all suite rows
-  6. INSERT all variant rows
+  1. CREATE TABLE IF NOT EXISTS  model_ops_suites   (idempotent, keeps history)
+  2. CREATE TABLE IF NOT EXISTS  model_ops_variants (idempotent, keeps history)
+  3. INSERT all suite rows  (ReplacingMergeTree deduplicates on suite_id)
+  4. INSERT all variant rows (ReplacingMergeTree deduplicates on variant_id)
 
-This guarantees the dashboard always shows only the latest run's data —
-no stale rows from previous runs are ever visible.
+All historical nightly runs are retained so the dashboard can show
+regression trends across builds.  Re-ingesting the same GHA run is safe
+because suite_id / variant_id are deterministic SHA-256 digests of the
+run + identifier fields — ClickHouse's ReplacingMergeTree will collapse
+duplicates during background merges.
 
 Usage (called by the GHA workflow):
     python3 ingest_model_ops.py \\
@@ -44,11 +45,8 @@ import clickhouse_connect
 # ClickHouse DDL
 # ---------------------------------------------------------------------------
 
-_DROP_VARIANTS_SQL = "DROP TABLE IF EXISTS model_ops_variants"
-_DROP_SUITES_SQL = "DROP TABLE IF EXISTS model_ops_suites"
-
 _CREATE_SUITES_SQL = """
-CREATE TABLE model_ops_suites
+CREATE TABLE IF NOT EXISTS model_ops_suites
 (
     -- ── Primary key ──────────────────────────────────────────────────────────
     -- SHA-256( gha_run_id || suite_name ) — one unique row per suite per run
@@ -96,7 +94,7 @@ SETTINGS index_granularity = 8192
 """
 
 _CREATE_VARIANTS_SQL = """
-CREATE TABLE model_ops_variants
+CREATE TABLE IF NOT EXISTS model_ops_variants
 (
     -- ── Primary key ──────────────────────────────────────────────────────────
     -- SHA-256( gha_run_id || suite_name || operation || classification || test_name )
@@ -215,23 +213,17 @@ def _make_id(*parts: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def recreate_tables(client) -> None:
+def ensure_tables(client) -> None:
     """
-    Drop both tables (if they exist) then recreate them from scratch.
-    This guarantees the dashboard always reflects only the latest run.
+    Create both tables if they do not yet exist (idempotent).
+    Existing tables — and their historical data — are left untouched so
+    the dashboard can show regression trends across nightly builds.
     """
-    print("[info] Dropping existing tables (if any) ...")
-    # Drop variants first — it has no dependants; suites may have dependants in views
-    client.command(_DROP_VARIANTS_SQL)
-    print("[info]   model_ops_variants  — dropped")
-    client.command(_DROP_SUITES_SQL)
-    print("[info]   model_ops_suites    — dropped")
-
-    print("[info] Creating tables ...")
+    print("[info] Ensuring tables exist (CREATE TABLE IF NOT EXISTS) ...")
     client.command(_CREATE_SUITES_SQL)
-    print("[info]   model_ops_suites    — created")
+    print("[info]   model_ops_suites    — ok")
     client.command(_CREATE_VARIANTS_SQL)
-    print("[info]   model_ops_variants  — created")
+    print("[info]   model_ops_variants  — ok")
     print()
 
 
@@ -498,8 +490,8 @@ def main() -> None:
     client.command("SELECT 1")
     print("[info] Connected.\n")
 
-    # ── Drop existing tables and recreate from scratch ────────────────────────
-    recreate_tables(client)
+    # ── Ensure tables exist (keeps historical data for regression views) ──────
+    ensure_tables(client)
 
     gha_run_id = _int(args.run_id)
     now = datetime.now(timezone.utc).replace(tzinfo=None)

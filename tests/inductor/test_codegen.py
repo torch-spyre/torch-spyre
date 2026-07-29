@@ -133,7 +133,7 @@ class TestSpyreConfig(InductorTestCase):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _mock_v(lower=None, upper=None, size_hint=None):
+    def _mock_v(lower=None, upper=None, optimization_hint=None):
         """
         Mock V whose ShapeEnv reports the given lower / upper bounds.
         """
@@ -141,8 +141,8 @@ class TestSpyreConfig(InductorTestCase):
             bound_sympy=lambda _e: SimpleNamespace(lower=lower, upper=upper)
         )
         sizevars = SimpleNamespace(shape_env=shape_env)
-        if size_hint is not None:
-            sizevars.size_hint = lambda _e: size_hint
+        if optimization_hint is not None:
+            sizevars.optimization_hint = lambda _e: optimization_hint
         return SimpleNamespace(graph=SimpleNamespace(sizevars=sizevars))
 
     def test_collect_symbol_metadata_opt_in(self):
@@ -169,7 +169,9 @@ class TestSpyreConfig(InductorTestCase):
         s0 = sympy.Symbol("s0", integer=True, positive=True)
         with patch(
             "torch_spyre._inductor.pass_utils.V",
-            self._mock_v(lower=sympy.Integer(2), upper=sympy.oo, size_hint=1024),
+            self._mock_v(
+                lower=sympy.Integer(2), upper=sympy.oo, optimization_hint=1024
+            ),
         ):
             self.assertEqual(_collect_symbol_metadata({s0: s0}), {})
 
@@ -253,13 +255,31 @@ class TestResolveSdscSize(InductorTestCase):
         s0 = sympy.Symbol("s0", integer=True, positive=True)
         self.assertEqual(_resolve_sdsc_size(s0, {"s0": (1024, 64)}), 1024)
 
-    def test_symbolic_not_in_bounds_falls_back_to_size_hint(self):
-        # Symbol absent from bounds → _concretize_for_sdsc → size_hint.
+    def test_symbolic_not_in_bounds_uses_guarding_hint(self):
+        # Symbol absent from bounds → _concretize_for_sdsc → guarding_hint_or_throw.
+        # The SDSC/DeepTools boundary is correctness-critical, so it must resolve
+        # the *true* concrete size (guarding_hint_or_throw), not an optimization
+        # heuristic that could silently emit a fallback (e.g. sys.maxsize).
         s0 = sympy.Symbol("s0", integer=True, positive=True)
-        sizevars = SimpleNamespace(size_hint=lambda _: 128)
+        sizevars = SimpleNamespace(guarding_hint_or_throw=lambda _: 128)
         mock_v = SimpleNamespace(graph=SimpleNamespace(sizevars=sizevars))
         with patch("torch_spyre._inductor.codegen.superdsc.V", mock_v):
             self.assertEqual(_resolve_sdsc_size(s0, {}), 128)
+
+    def test_symbolic_not_in_bounds_raises_on_unbacked(self):
+        # An unbacked symbol at the SDSC boundary must fail loudly rather than
+        # produce a bogus concrete size, so guarding_hint_or_throw's raise
+        # propagates out of _concretize_for_sdsc.
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+
+        def _raise(_e):
+            raise RuntimeError("unbacked symbol at SDSC boundary")
+
+        sizevars = SimpleNamespace(guarding_hint_or_throw=_raise)
+        mock_v = SimpleNamespace(graph=SimpleNamespace(sizevars=sizevars))
+        with patch("torch_spyre._inductor.codegen.superdsc.V", mock_v):
+            with self.assertRaises(RuntimeError):
+                _resolve_sdsc_size(s0, {})
 
 
 class TestSymbolKindDimension(InductorTestCase):
