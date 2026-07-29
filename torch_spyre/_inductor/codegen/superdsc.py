@@ -50,8 +50,9 @@ from torch_spyre._inductor.op_spec import (
     TensorArg,
 )
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch_spyre._inductor.pass_utils import coeff_through_floor
 
-from .compute_ops import SymbolKind, generate_sdsc
+from .compute_ops import SymbolKind, generate_sdsc, num_bytes
 
 logger = get_inductor_logger("codegen.superdsc")
 
@@ -72,6 +73,7 @@ class SDSCArgs:
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
     per_tile_fixed: bool = False
+    device_tile_advance_expr: Expr | None = None
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -421,6 +423,37 @@ def _create_sdsc_tensors(
         else:
             dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping, op_spec)
 
+        # Case 2 (MutationLayoutSHOULDREMOVE) ops carry an authoritative
+        # device-stride sympy.Expr for each coarse-tiled dim's per-iteration
+        # advance, stamped by coarse_tile._propagate_tiled_op (host-stride
+        # terms) and substituted to device-stride terms, per-arg, by
+        # spyre_kernel.create_tensor_arg. The per-iteration *advance* across
+        # levels is handled later, in compute_ops.generate_sdsc's
+        # affine_strides construction (which is structured per level). Here
+        # we only need the **iteration-0 base** fact -- the actual
+        # (innermost) tile extent this arg is written/read at per
+        # iteration, and the full extent it sits within -- to compute a
+        # correct base offset/backGap, since device_coordinates cannot
+        # represent "which supertile" for these ops (see
+        # coarse_tiling_loops.md's IR-rewiring appendix). The innermost
+        # level that tiles a given dim owns its true per-iteration
+        # tile_size; the full extent is that tile_size times every level's
+        # supertile_count for that dim.
+        sdsc_dim_advance: dict[Symbol, tuple[int, int]] = {}
+        if arg.device_tile_advance_expr is not None:
+            arg_elem_bytes = num_bytes(arg.device_dtype)
+            for level_syms in op_spec.tiled_symbols:
+                for sym in level_syms:
+                    if sym not in symbol_mapping:
+                        continue
+                    coeff = coeff_through_floor(arg.device_tile_advance_expr, sym)
+                    if not coeff:
+                        continue
+                    tile_size = int(coeff) * arg_elem_bytes
+                    trip_count = op_spec.tiled_symbol_trip_counts.get(sym, 1)
+                    sdsc_sym = symbol_mapping[sym]
+                    sdsc_dim_advance[sdsc_sym] = (tile_size, trip_count)
+
         scales: dict = {}
         strides: dict = {}
         offsets: dict = {}
@@ -466,12 +499,38 @@ def _create_sdsc_tensors(
             offsets[dim] = 0
             dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
 
-            dev_dim_size = arg.device_size[-stride_idx - 2]
-            it_dim_size = iteration_space[dim]
-            if dim == stick_dim:
-                stick_size = arg.device_dtype.elems_per_stick()
-                dev_dim_size *= stick_size
-                it_dim_size = ((it_dim_size - 1) // stick_size + 1) * stick_size
+            if dim is stick_dim and dim in sdsc_dim_advance:
+                # Authoritative fact from coarse_tile.py: the stick dim's
+                # iteration-0 tile is tile_size elements out of
+                # supertile_count tiles total (supertile_count already folds
+                # in every nesting level that tiles this dim, when there is
+                # more than one -- see the accumulation above).
+                # _get_device_dim_order's dim_order walk can place the stick
+                # dim at a different position for this (Case 2 / mutated) arg
+                # than for its sibling args, which makes the stride_idx-based
+                # arg.device_size[-stride_idx-2] lookup below read the wrong
+                # slot for this arg specifically (see
+                # coarse_tiling_loops.md's IR-rewiring appendix). Use the
+                # authoritative supertile count for dev_dim_size instead of
+                # trusting that slot. Scoped to the stick dim only: other
+                # coarse-tiled dims (e.g. mb) already read the correct slot
+                # via the existing device_size lookup for every arg in this
+                # op, and overriding them too double-applies the tile split
+                # baked into arg.device_size, corrupting an already-correct
+                # stride (see the input mb regression this scoping fixes).
+                # This establishes only the iteration-0 base offset/backGap;
+                # the per-iteration advance across nesting levels is applied
+                # separately in compute_ops.generate_sdsc's affine_strides.
+                tile_size, supertile_count = sdsc_dim_advance[dim]
+                dev_dim_size = tile_size * supertile_count
+                it_dim_size = tile_size
+            else:
+                dev_dim_size = arg.device_size[-stride_idx - 2]
+                it_dim_size = iteration_space[dim]
+                if dim == stick_dim:
+                    stick_size = arg.device_dtype.elems_per_stick()
+                    dev_dim_size *= stick_size
+                    it_dim_size = ((it_dim_size - 1) // stick_size + 1) * stick_size
 
             if has_indirect_access:
                 max_dim_sizes[dim] = compute_indirect_max_dim_sizes(
@@ -535,9 +594,12 @@ def _create_sdsc_tensors(
             else _get_data_format(op_spec.op, arg.device_dtype)
         )
 
+        # allocation keys are mutually exclusive (see TensorArg.allocation
+        # docstring in op_spec.py); this chain just reads whichever one is
+        # present. Priority order here is cosmetic, not semantic.
         start_addr = (
-            arg.allocation.get("pool")
-            if "pool" in arg.allocation
+            arg.allocation.get("hbm_pool")
+            if "hbm_pool" in arg.allocation
             else arg.allocation.get("lx")
             if "lx" in arg.allocation
             else arg.allocation.get("hbm")
@@ -564,6 +626,7 @@ def _create_sdsc_tensors(
                 is_index_tensor=is_idx_tensor,
                 related_value_tensor_idx=related_val_idx,
                 per_tile_fixed=arg.per_tile_fixed,
+                device_tile_advance_expr=arg.device_tile_advance_expr,
             )
         )
 
@@ -599,7 +662,11 @@ def _concretize_for_sdsc(expr: Expr) -> int:
     if isinstance(expr, Integer):
         return int(expr)
     if hasattr(expr, "free_symbols") and expr.free_symbols:
-        return V.graph.sizevars.size_hint(expr)
+        # This is a correctness-critical boundary: the SDSC JSON / DeepTools
+        # backend needs the *true* concrete size, not an optimization heuristic.
+        # guarding_hint_or_throw resolves backed symbols and raises on unbacked
+        # ones, rather than silently emitting a fallback (e.g. sys.maxsize) size.
+        return V.graph.sizevars.guarding_hint_or_throw(expr)
     return int(expr)
 
 
@@ -714,6 +781,17 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     symbol_mapping = {
         sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)
     }
+    # Minted per-(op, level) tile-advance symbols (see spyre_kernel.py's
+    # _get_or_mint_level_symbol) are not iteration-space dimensions -- they are
+    # loop-nesting-level markers -- so they have no dim label to rename to.
+    # Register each as an identity mapping instead, so compile_op_spec's
+    # `symbol_mapping[s]` lookup for op_spec.tiled_symbols does not silently
+    # drop them. setdefault never overwrites a real-symbol entry above, and
+    # collides with none: minted names (`_tile_adv_{op_name}_lvl{n}`) can
+    # never equal a dim label or a real Inductor `d{i}` symbol name.
+    for level in op_spec.tiled_symbols:
+        for sym in level:
+            symbol_mapping.setdefault(sym, sym)
     logger.debug(
         "symbol mapping: %s",
         ", ".join(f"{k} -> {v}" for k, v in symbol_mapping.items()),
@@ -926,7 +1004,7 @@ def compile_op_spec(
         [symbol_mapping[s] for s in level if s in symbol_mapping]
         for level in reversed(op_spec.tiled_symbols)
     ]
-    return generate_sdsc(
+    result = generate_sdsc(
         idx,
         sdsc_spec,
         symbols,
@@ -934,3 +1012,4 @@ def compile_op_spec(
         tiled_symbols=tiled_symbols_per_level,
         use_symbols=use_symbols,
     )
+    return result
