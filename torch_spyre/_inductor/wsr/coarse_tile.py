@@ -2324,6 +2324,15 @@ def _insert_read_copy_ops(
         # a semantic mismatch, not merely a magnitude one.
         tiled_op_info = tiled_op.loop_info  # type: ignore[attr-defined]
         copy_ranges = list(copy_data.ranges)
+        # tiled_op's reduction dims are numbered n_output_dims + reduction_pos
+        # in tiled_dims_per_read/output_tiled_dims (see CoarseTileInfo's
+        # docstring) -- the same combined d0, d1, ... positional space
+        # dep.index/dep.var_names already use (output dims first, then
+        # reduction dims), so copy_ranges (== list(dep.size)) is indexable
+        # by that same combined key directly, with no extra offset.
+        n_output_dims = (
+            len(tiled_op.data.ranges) if hasattr(tiled_op.data, "ranges") else 0
+        )
         write_level_extents: list[dict[int, Expr]] = [
             {d: sympy.Integer(1) for d in level_dims}
             for level_dims in tiled_op_info.loop_tiled_dims
@@ -2338,6 +2347,19 @@ def _insert_read_copy_ops(
             running = sympy.sympify(copy_ranges[d])
             for level_idx in reversed(levels_tiling_d):
                 read_level_extents[level_idx][d] = running
+                running = running * tiled_op_info.loop_count[level_idx]
+        for d in {
+            d for level in tiled_op_info.loop_tiled_reduction_dims for d in level
+        }:
+            dim_key = n_output_dims + d
+            levels_tiling_d = [
+                i
+                for i, dims in enumerate(tiled_op_info.loop_tiled_reduction_dims)
+                if d in dims
+            ]
+            running = sympy.sympify(copy_ranges[dim_key])
+            for level_idx in reversed(levels_tiling_d):
+                read_level_extents[level_idx][dim_key] = running
                 running = running * tiled_op_info.loop_count[level_idx]
         copy_reads = [
             r for r in copy_buf.get_read_writes().reads if isinstance(r, MemoryDep)
