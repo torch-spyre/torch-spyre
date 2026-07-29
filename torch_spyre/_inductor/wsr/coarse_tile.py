@@ -2447,15 +2447,22 @@ def _insert_read_copy_ops(
         # a semantic mismatch, not merely a magnitude one.
         tiled_op_info = tiled_op.loop_info  # type: ignore[attr-defined]
         copy_ranges = list(copy_data.ranges)
-        # tiled_op's reduction dims are numbered n_output_dims + reduction_pos
-        # in tiled_dims_per_read/output_tiled_dims (see CoarseTileInfo's
-        # docstring) -- the same combined d0, d1, ... positional space
-        # dep.index/dep.var_names already use (output dims first, then
-        # reduction dims), so copy_ranges (== list(dep.size)) is indexable
-        # by that same combined key directly, with no extra offset.
-        n_output_dims = (
-            len(tiled_op.data.ranges) if hasattr(tiled_op.data, "ranges") else 0
-        )
+        # tiled_op_info.loop_tiled_dims's dim keys are raw positional indices
+        # into tiled_op.data.ranges (see CoarseTileInfo's docstring), which
+        # may include unit-size (==1) dims (e.g. a unit B in BHLD). But
+        # copy_ranges (== list(dep.size), dep being tiled_op's own *squeezed*
+        # MemoryDep -- see extract_read_writes -> index_vars_squeeze) has
+        # already dropped those unit dims, so copy_ranges is one shorter per
+        # squeezed-out dim and its positions no longer line up with
+        # loop_tiled_dims's raw numbering. Map each raw dim to its squeezed
+        # position (mirroring SpyreKernel._host_dim_to_index_symbol's own
+        # squeeze arithmetic) before indexing copy_ranges.
+        squeeze_pos: dict[int, int] = {}
+        it_idx = 0
+        for host_idx, r in enumerate(tiled_op.data.ranges):
+            if int(r) != 1:
+                squeeze_pos[host_idx] = it_idx
+                it_idx += 1
         write_level_extents = _fixed_level_extents(tiled_op_info.loop_tiled_dims)
         read_level_extents: list[dict[int, Expr]] = [
             {} for _ in tiled_op_info.loop_tiled_dims
@@ -2464,22 +2471,34 @@ def _insert_read_copy_ops(
             levels_tiling_d = [
                 i for i, dims in enumerate(tiled_op_info.loop_tiled_dims) if d in dims
             ]
-            running = sympy.sympify(copy_ranges[d])
+            # The dict key must be a raw positional index into copy_buf's own
+            # data.ranges (what SpyreKernel._host_dim_to_index_symbol will
+            # later squeeze again when it runs against copy_buf) -- i.e. the
+            # squeezed position computed above, not tiled_op's raw d.
+            copy_dim = squeeze_pos[d]
+            running = sympy.sympify(copy_ranges[copy_dim])
             for level_idx in reversed(levels_tiling_d):
-                read_level_extents[level_idx][d] = running
+                read_level_extents[level_idx][copy_dim] = running
                 running = running * tiled_op_info.loop_count[level_idx]
+        reduction_squeeze_pos: dict[int, int] = {}
+        red_it_idx = 0
+        reduction_ranges = getattr(tiled_op.data, "reduction_ranges", None) or []
+        for host_idx, r in enumerate(reduction_ranges):
+            if int(r) != 1:
+                reduction_squeeze_pos[host_idx] = red_it_idx
+                red_it_idx += 1
         for d in {
             d for level in tiled_op_info.loop_tiled_reduction_dims for d in level
         }:
-            dim_key = n_output_dims + d
             levels_tiling_d = [
                 i
                 for i, dims in enumerate(tiled_op_info.loop_tiled_reduction_dims)
                 if d in dims
             ]
-            running = sympy.sympify(copy_ranges[dim_key])
+            copy_dim_key = it_idx + reduction_squeeze_pos[d]
+            running = sympy.sympify(copy_ranges[copy_dim_key])
             for level_idx in reversed(levels_tiling_d):
-                read_level_extents[level_idx][dim_key] = running
+                read_level_extents[level_idx][copy_dim_key] = running
                 running = running * tiled_op_info.loop_count[level_idx]
         copy_reads = [
             r for r in copy_buf.get_read_writes().reads if isinstance(r, MemoryDep)
