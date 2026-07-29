@@ -288,23 +288,8 @@ class TestBuildingBlocks(unittest.TestCase):
 
         compare_with_cpu(fn, x, y, z, run_eager=False)
 
-    @unittest.expectedFailure
     def test_mixed_plain_and_loop_bundle_codegen(self):
-        """Plain op + hint-tiled op fuse into one bundle; LoopSpec must appear.
-
-        Accepted, tracked regression (not a defect in the change that
-        exposed it): this op used to take the direct-mutation Case 2/"Case
-        3" branch of `_propagate_tiled_op`, which coarse_tile.py's
-        unconditional-copy change deletes, routing every cross-loop-group
-        write through `_insert_copy_op` instead. That path has its own
-        pre-existing, general addressing bug in `superdsc.py`'s
-        `_get_device_dim_order`/backGap logic (misfires when a copy op's
-        destination `device_size` differs from its source at a slot for a
-        dim that isn't actually the tiled dim). Confirmed pre-existing on
-        unmodified baseline via a standalone repro script (handed off
-        separately; ~87% mismatch with zero divergent input layouts
-        needed). Un-xfail once `superdsc.py`'s addressing is fixed.
-        """
+        """Plain op + hint-tiled op fuse into one bundle; LoopSpec must appear."""
         from torch_spyre._inductor import spyre_hint as sh
 
         T, D = 128, 64

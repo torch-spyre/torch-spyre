@@ -2064,14 +2064,75 @@ class _NameSwapHandler(WrapperHandler):
     reconstruct it from index expressions). Duplicated locally rather than
     imported to avoid a coarse_tile <-> insert_restickify import-order
     dependency; the two run at different, non-adjacent pipeline stages.
+
+    Unlike insert_restickify's version, entries here also carry the
+    full-buffer and tile-local strides for the swapped name (see
+    _insert_read_copy_ops): the copy buffer being swapped in is physically
+    smaller than the full buffer it replaces, so tiled_op's original index
+    (affine in its own loop vars, using full_buf's stride coefficients) no
+    longer resolves to a valid offset into it.
+
+    The incoming `index` at call time is tiled_op's own inner_fn tracing
+    through this exact load, so it is affine in whatever loop variables that
+    particular trace happens to use -- inner_fn may be retraced multiple
+    times (e.g. by scheduler fusion checks) with a *different* dummy
+    variable each time (d0, i0, q0, ... have all been observed for the same
+    load site), so a single precomputed replacement expression captured at
+    _insert_read_copy_ops time would be wrong on every trace that doesn't
+    happen to reuse those exact symbols. Instead, `index` is rescaled at
+    call time: each additive term's coefficient is matched (by value) against
+    full_strides to find its dimension, then replaced by that dimension's
+    tile_strides coefficient -- this works for whatever free symbols this
+    particular trace used, without needing to know them in advance.
     """
 
-    def __init__(self, inner, name_map: dict[str, str]):
+    def __init__(
+        self,
+        inner,
+        name_map: dict[str, tuple[str, list[Expr], list[Expr]]],
+    ):
         super().__init__(inner)
         self._name_map = name_map
 
     def load(self, name, index):
-        return super().load(self._name_map.get(name, name), index)
+        if name in self._name_map:
+            new_name, full_strides, tile_strides = self._name_map[name]
+            new_index = _rescale_index(index, full_strides, tile_strides)
+            return super().load(new_name, new_index)
+        return super().load(name, index)
+
+
+def _rescale_index(
+    index: Expr, full_strides: list[Expr], tile_strides: list[Expr]
+) -> Expr:
+    """Rescale an affine index's per-dimension coefficients.
+
+    `index` is affine in some set of loop variables, with one term per
+    dimension whose coefficient equals the matching entry in
+    `full_strides` (plus, possibly, a constant offset term). Returns the
+    same linear combination of the same variables with each dimension's
+    coefficient replaced by the matching entry in `tile_strides`. Matching
+    is by coefficient value rather than by variable identity because the
+    variables `index` is expressed in are not known in advance -- see
+    _NameSwapHandler.
+    """
+    remaining = list(zip(full_strides, tile_strides))
+    new_index: Expr = sympy.Integer(0)
+    for term, coeff in index.as_coefficients_dict().items():
+        if term == 1:
+            new_index += coeff
+            continue
+        for i, (full_stride, tile_stride) in enumerate(remaining):
+            if coeff == full_stride:
+                new_index += tile_stride * term
+                del remaining[i]
+                break
+        else:
+            raise RuntimeError(
+                f"_rescale_index: no matching full_stride for term {term} "
+                f"(coeff={coeff}) in index {index}; full_strides={full_strides}"
+            )
+    return new_index
 
 
 def _insert_read_copy_ops(
@@ -2096,12 +2157,16 @@ def _insert_read_copy_ops(
     The copy's own ranges/index must match dep (dep.var_names/dep.size), not
     tiled_op.data.ranges: for a Reduction, the read spans output dims plus
     the reduction dim, so dep's iteration space has more vars than the op's
-    own output-shaped ranges.  The copy's layout reuses full_buf's own
-    per-var strides (extracted from dep.index, which is affine in
-    dep.var_names) rather than fresh contiguous strides, sized down to
-    dep.size — so tiled_op's unmodified read index (dep.index, computed
-    against those same strides) still resolves correctly once _NameSwapHandler
-    retargets the load at the copy buffer instead of full_buf.
+    own output-shaped ranges.  The copy buffer's own layout gets fresh
+    contiguous tile-local strides (it is a physically smaller allocation
+    than full_buf, not an aliased view of it — see tile_strides below).
+    tiled_op's own read index, however, was computed against full_buf's
+    full-sized layout (dep.index, affine in dep.var_names) and no longer
+    resolves to a valid offset into the smaller copy buffer.  _NameSwapHandler
+    is therefore handed both full_strides (dep.index's own per-dimension
+    coefficients) and tile_strides alongside the copy's name, and rescales
+    the index's coefficients when it retargets the load — see
+    _NameSwapHandler and _rescale_index.
 
     Mirrors _allocate_full_buffer's isinstance(orig_layout, FixedTiledLayout)
     branch: when full_buf already carries a FixedTiledLayout (post-stickify
@@ -2116,7 +2181,7 @@ def _insert_read_copy_ops(
     rebind their own reference since the original tiled_op object is stale
     after this call.
     """
-    name_map: dict[str, str] = {}
+    name_map: dict[str, tuple[str, list[Expr], list[Expr]]] = {}
     tiled_idx = operations.index(tiled_op)
 
     for dep in full_deps:
@@ -2133,7 +2198,23 @@ def _insert_read_copy_ops(
             full_buf = full_buf.data
 
         tile_ranges = list(dep.size)
-        tile_strides = [dep.index.coeff(v) for v in dep.var_names]
+        # Fresh contiguous row-major strides for the copy buffer's own
+        # tile-sized shape (mirrors _allocate_full_buffer's strides loop) --
+        # NOT dep.index's own coefficients, which are strides into full_buf's
+        # full-sized layout (e.g. a row stride of the full row width) and
+        # would describe the freshly allocated, tile-sized copy buffer as if
+        # it shared the full buffer's physical layout.
+        tile_strides: list[Expr] = []
+        stride: Expr = sympy.Integer(1)
+        for s in reversed(tile_ranges):
+            tile_strides.insert(0, stride)
+            stride = stride * s
+
+        # dep.index's own per-dimension coefficients (full_buf's strides),
+        # in the same dep.var_names order as tile_strides -- used by
+        # _NameSwapHandler/_rescale_index to retarget tiled_op's read index
+        # at call time, whatever free variables that particular trace uses.
+        full_strides = [dep.index.coeff(v) for v in dep.var_names]
 
         def _copy_inner_fn(idx, _dep=dep, _full_name=full_buf.get_name()):
             subs = dict(zip(_dep.var_names, idx))
@@ -2222,13 +2303,74 @@ def _insert_read_copy_ops(
         copy_buf.origins = tiled_op.origins
         copy_buf.operation_name = copy_name
         copy_op_metadata(tiled_op, copy_buf)
-        copy_buf.loop_info = tiled_op.loop_info  # type: ignore[attr-defined]
+
+        # Fresh per-level tiled-dim decisions for copy_buf's own read/write —
+        # mirroring _insert_copy_op's read/write split (see its comment), but
+        # with the roles swapped: there, the copy's READ (of tiled_op's
+        # per-tile scratch) is extent-1 and its WRITE (to full_buf) advances a
+        # whole tile; here, the copy's READ (of full_buf) advances a whole
+        # tile per iteration and its WRITE (to this copy's own freshly
+        # allocated, tile-sized buffer) is extent-1 -- the copy buffer is
+        # per_tile_fixed scratch reused in place, it does not move.
+        #
+        # Reusing tiled_op.loop_info verbatim here (as an earlier version of
+        # this function did) is wrong for a different reason than
+        # _insert_copy_op's original bug: it is not just the wrong extent, it
+        # is tiled_dims_per_read/output_tiled_dims computed for tiled_op's own
+        # reads/write (by then patched to read the copy buffers, not
+        # full_buf) applied positionally to copy_buf's own reads/write (of
+        # full_buf and of copy_buf's own output) via
+        # SpyreKernel._general_tile_advance's positional dep-index lookup —
+        # a semantic mismatch, not merely a magnitude one.
+        tiled_op_info = tiled_op.loop_info  # type: ignore[attr-defined]
+        copy_ranges = list(copy_data.ranges)
+        write_level_extents: list[dict[int, Expr]] = [
+            {d: sympy.Integer(1) for d in level_dims}
+            for level_dims in tiled_op_info.loop_tiled_dims
+        ]
+        read_level_extents: list[dict[int, Expr]] = [
+            {} for _ in tiled_op_info.loop_tiled_dims
+        ]
+        for d in {d for level in tiled_op_info.loop_tiled_dims for d in level}:
+            levels_tiling_d = [
+                i for i, dims in enumerate(tiled_op_info.loop_tiled_dims) if d in dims
+            ]
+            running = sympy.sympify(copy_ranges[d])
+            for level_idx in reversed(levels_tiling_d):
+                read_level_extents[level_idx][d] = running
+                running = running * tiled_op_info.loop_count[level_idx]
+        copy_reads = [
+            r for r in copy_buf.get_read_writes().reads if isinstance(r, MemoryDep)
+        ]
+        copy_writes = [
+            w for w in copy_buf.get_read_writes().writes if isinstance(w, MemoryDep)
+        ]
+        tiled_dims_per_read = [
+            _tiled_dims_for_dep(r, read_level_extents) for r in copy_reads
+        ]
+        output_tiled_dims = (
+            _tiled_dims_for_dep(copy_writes[0], write_level_extents)
+            if copy_writes
+            else []
+        )
+        copy_buf.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
+            tiled_op_info,
+            tiled_dims_per_read=tiled_dims_per_read,
+            output_tiled_dims=output_tiled_dims,
+        )
 
         V.graph.name_to_buffer[copy_name] = copy_buf
         operations.insert(tiled_idx, copy_buf)
         tiled_idx += 1
 
-        name_map[dep.name] = copy_name
+        # tiled_op's own load index for this buffer is affine against
+        # full_buf's full-sized strides (dep.index, structurally, though the
+        # free variables at any given trace of tiled_op's inner_fn may not be
+        # dep.var_names themselves -- see _NameSwapHandler). The copy is a
+        # smaller, freshly allocated buffer with its own contiguous
+        # tile_strides, so _NameSwapHandler rescales the index's coefficients
+        # from full_strides to tile_strides at call time (_rescale_index).
+        name_map[dep.name] = (copy_name, full_strides, tile_strides)
 
     # Patch tiled_op's inner_fn once with the full name_map (wrap, not
     # reconstruct — see _NameSwapHandler docstring).  Rebuild via
@@ -2247,6 +2389,38 @@ def _insert_read_copy_ops(
     object.__setattr__(tiled_op.data, "inner_fn", new_inner_fn)
     new_op = replace_computed_buffer_body(tiled_op, tiled_op.data, operations)
     V.graph.name_to_buffer[new_op.get_name()] = new_op
+
+    # new_op.loop_info (copied from tiled_op by copy_op_metadata inside
+    # replace_computed_buffer_body) still carries tiled_dims_per_read as
+    # planned when this op's own reads were full_buf directly -- whole-tile
+    # advance, correct at plan time. But new_op's actual reads (per
+    # get_read_writes(), re-derived from the now-patched inner_fn) are the
+    # copy buffers for every swapped name: per_tile_fixed scratch reused in
+    # place every iteration, which must not advance (extent 1), exactly like
+    # _insert_copy_op's own read side. SpyreKernel._general_tile_advance
+    # matches tiled_dims_per_read to get_read_writes().reads purely
+    # positionally (see loop_info.py's docstring), so every entry
+    # corresponding to a swapped-in copy-buffer read must be zeroed to
+    # extent 1 for the dims that dependency actually reads.
+    new_loop_info = new_op.loop_info  # type: ignore[attr-defined]
+    new_reads = [r for r in new_op.get_read_writes().reads if isinstance(r, MemoryDep)]
+    swapped_in_names = {copy_name for copy_name, _, _ in name_map.values()}
+    if new_loop_info.tiled_dims_per_read:
+        fixed_level_extents = [
+            {d: sympy.Integer(1) for d in level_dims}
+            for level_dims in new_loop_info.loop_tiled_dims
+        ]
+        new_tiled_dims_per_read = [
+            (
+                _tiled_dims_for_dep(dep, fixed_level_extents)
+                if dep.name in swapped_in_names
+                else per_level
+            )
+            for dep, per_level in zip(new_reads, new_loop_info.tiled_dims_per_read)
+        ]
+        new_op.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
+            new_loop_info, tiled_dims_per_read=new_tiled_dims_per_read
+        )
     return new_op
 
 
