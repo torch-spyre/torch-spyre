@@ -1805,8 +1805,8 @@ def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
             unwrapped = unwrapped.data
         if isinstance(unwrapped, (SpyreEmptyFallback, InputBuffer)):
             result.append(d)
-        elif isinstance(buf, ComputedBuffer):
-            producer_li = getattr(buf, "loop_info", None)
+        elif isinstance(unwrapped, ComputedBuffer):
+            producer_li = getattr(unwrapped, "loop_info", None)
             if producer_li is None or producer_li.loop_group_id[0] != outer_key:
                 result.append(d)
     return result
@@ -2127,30 +2127,105 @@ def _rescale_index(
 ) -> Expr:
     """Rescale an affine index's per-dimension coefficients.
 
-    `index` is affine in some set of loop variables, with one term per
-    dimension whose coefficient equals the matching entry in
+    `index` is affine in some set of loop variables, with one additive term
+    per dimension whose coefficient equals the matching entry in
     `full_strides` (plus, possibly, a constant offset term). Returns the
     same linear combination of the same variables with each dimension's
     coefficient replaced by the matching entry in `tile_strides`. Matching
     is by coefficient value rather than by variable identity because the
     variables `index` is expressed in are not known in advance -- see
     _NameSwapHandler.
+
+    Each additive term is matched against a candidate `full_stride` by
+    dividing the term by it and checking the quotient is free of the
+    stride's own symbols (see `_divides_evenly` below) -- NOT via
+    `index.as_coefficients_dict()`, which only isolates a term's
+    "coefficient" correctly when that coefficient is a plain number. When
+    `full_strides` contains a genuinely symbolic stride (e.g. a level/tile
+    symbol) and the matching term is `loop_var * symbolic_stride`, sympy
+    normalizes that whole product into a single atom with numeric
+    coefficient 1 -- `as_coefficients_dict()` would report the *entire
+    product* as the "term" and never find a `full_strides` entry equal to
+    1, silently failing to match a case this function is specifically
+    meant to support.
+
+    Two further subtleties in the matching, both because dimensions are
+    identified by their stride *value* rather than their position:
+
+    - An extent-1 dimension's stride can coincide with a larger dimension's
+      stride (e.g. a size-[1, N] shape's dim-0 stride equals dim-1's full
+      extent, same as a size-[M, N] shape's dim-0 stride). Matching
+      smallest-remaining-first would let a degenerate extent-1 stride steal
+      a match that belongs to a real, larger dimension. Matching
+      largest-first instead defers ambiguity among small/degenerate strides
+      as long as possible, since a larger stride can only coincide with
+      another dimension of at least that size.
+    - Two full_strides can be symbolically equal but differently-formed
+      expressions (e.g. ``2*(s0 + 1)`` vs ``2*s0 + 2``) -- `_divides_evenly`
+      falls back to a simplified quotient/difference check rather than
+      relying on structural equality alone.
     """
-    remaining = list(zip(full_strides, tile_strides))
+
+    def _divides_evenly(term: Expr, full_stride: Expr) -> tuple[bool, Expr]:
+        """Return (matched, loop_var_part) if `full_stride` divides `term`.
+
+        `full_stride` divides `term` cleanly when dividing it out of `term`
+        leaves *exactly* the loop-variable part behind: no leftover free
+        symbol from `full_stride` (it must fully cancel, not partially --
+        e.g. dividing `c0*s0` by `s0` alone, not by some unrelated factor of
+        it), and no leftover numeric scale factor (e.g. dividing `c0*128` by
+        `4` leaves `32*c0`, i.e. still scaled by 32 -- not a clean divide,
+        even though the quotient happens to be symbol-free). Checked both
+        structurally and, if that's inconclusive, after simplifying the
+        quotient (mirrors the structural-vs-simplified fallback this
+        function has always used for coefficient matching).
+        """
+        stride_syms = full_stride.free_symbols
+
+        def _is_clean(quotient: Expr) -> bool:
+            coeff, _ = quotient.as_coeff_Mul()
+            return coeff == 1 and not (quotient.free_symbols & stride_syms)
+
+        quotient = term / full_stride
+        if _is_clean(quotient):
+            return True, quotient
+        simplified = sympy.simplify(quotient)
+        if _is_clean(simplified):
+            return True, simplified
+        return False, sympy.Integer(0)
+
+    def _sort_key(pair: tuple[Expr, Expr]) -> tuple[int, Expr]:
+        # Sort largest-first without calling `<` directly on sympy Exprs --
+        # that raises TypeError for expressions with free symbols, which
+        # full_strides commonly contains (level/tile symbols). Concrete
+        # integers compare among themselves by value; every symbolic stride
+        # sorts ahead of every concrete one (a symbolic stride is a
+        # multiple of some concrete extent, so it is at least as large),
+        # and symbolic-vs-symbolic keeps original relative order (stable
+        # sort) rather than guessing a magnitude.
+        full_stride = pair[0]
+        is_concrete = full_stride.is_number
+        return (
+            0 if is_concrete else 1,
+            full_stride if is_concrete else sympy.Integer(0),
+        )
+
+    remaining = sorted(zip(full_strides, tile_strides), key=_sort_key, reverse=True)
     new_index: Expr = sympy.Integer(0)
-    for term, coeff in index.as_coefficients_dict().items():
-        if term == 1:
-            new_index += coeff
+    for term in sympy.Add.make_args(index):
+        if term.is_number:
+            new_index += term
             continue
         for i, (full_stride, tile_stride) in enumerate(remaining):
-            if coeff == full_stride:
-                new_index += tile_stride * term
+            matched, loop_var_part = _divides_evenly(term, full_stride)
+            if matched:
+                new_index += tile_stride * loop_var_part
                 del remaining[i]
                 break
         else:
             raise RuntimeError(
                 f"_rescale_index: no matching full_stride for term {term} "
-                f"(coeff={coeff}) in index {index}; full_strides={full_strides}"
+                f"in index {index}; full_strides={full_strides}"
             )
     return new_index
 
@@ -2204,7 +2279,33 @@ def _insert_read_copy_ops(
     name_map: dict[str, tuple[str, list[Expr], list[Expr]]] = {}
     tiled_idx = operations.index(tiled_op)
 
+    # A single tiled_op can read the same full buffer through two distinct
+    # MemoryDeps (e.g. two different index expressions into the same
+    # buffer). _NameSwapHandler retargets loads by buffer *name* only, so
+    # only one copy op per unique name can ever be addressed -- keep the
+    # first dep per name and drop the rest, rather than silently
+    # overwriting name_map's entry for that name later (which would
+    # rescale every load of that name using only the last dep's
+    # full_strides/tile_strides, and leave the earlier, now-unreachable
+    # copy ops dead in `operations`). Safe only because every dep for a
+    # given name reads the same underlying buffer with the same full-size
+    # layout, so full_strides/tile_strides do not depend on which such dep
+    # was kept -- assert that invariant so a future violation fails loudly.
+    deduped_deps: dict[str, MemoryDep] = {}
     for dep in full_deps:
+        if dep.name in deduped_deps:
+            prior = deduped_deps[dep.name]
+            assert prior.var_names == dep.var_names and prior.index == dep.index, (
+                f"_insert_read_copy_ops: {dep.name!r} is read via two "
+                "MemoryDeps with different index expressions "
+                f"({prior.index} vs {dep.index}); a single copy op keyed by "
+                "buffer name cannot serve both -- _NameSwapHandler needs to "
+                "become index-aware to support this."
+            )
+            continue
+        deduped_deps[dep.name] = dep
+
+    for dep in deduped_deps.values():
         full_buf = V.graph.get_buffer(dep.name)
         # Graph inputs come back TensorBox(StorageBox(InputBuffer))-wrapped
         # (see graph_inputs); get_dtype() resolves to self.dtype via IRNode
@@ -2448,6 +2549,14 @@ def _insert_read_copy_ops(
     new_reads = [r for r in new_op.get_read_writes().reads if isinstance(r, MemoryDep)]
     swapped_in_names = {copy_name for copy_name, _, _ in name_map.values()}
     if new_loop_info.tiled_dims_per_read:
+        assert len(new_reads) == len(new_loop_info.tiled_dims_per_read), (
+            f"_insert_read_copy_ops: positional mismatch between "
+            f"new_op.get_read_writes().reads ({len(new_reads)} entries) and "
+            f"new_loop_info.tiled_dims_per_read ({len(new_loop_info.tiled_dims_per_read)} "
+            "entries) -- SpyreKernel._general_tile_advance matches these purely "
+            "positionally, so a length mismatch means silently wrong tile-advance "
+            "metadata rather than a loud failure."
+        )
         fixed_level_extents = _fixed_level_extents(new_loop_info.loop_tiled_dims)
         new_tiled_dims_per_read = [
             (

@@ -1111,11 +1111,14 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     @pytest.mark.skip(
         reason=(
             "flash attention v3/v4 not yet passing: Lk reduction-dim tiling is "
-            "disabled (see FIXME on kv_block_size), unrelated to carry "
-            "propagation. Suspected of leaving the device in an error state "
-            "and cascading skips to every later test in the same process "
-            "(see conftest.py's has_stream_error() check) -- skipped outright "
-            "rather than xfailed until that's confirmed/fixed."
+            "disabled (see FIXME on kv_block_size in this file), unrelated to "
+            "carry propagation. Confirmed (4/4 local full-suite runs) to leave "
+            "the device in an error state that cascades skips to every later "
+            "test in the same process (see conftest.py's has_stream_error() "
+            "check) when run as xfail -- skipped outright instead. Revisit "
+            "once the Lk coarse-tiling limitation above is fixed; a real fix "
+            "there should make this test pass rather than merely change its "
+            "failure mode, at which point this skip should be removed."
         ),
     )
     def test_hint_flash_attention_v3_b2_minimal(self):
