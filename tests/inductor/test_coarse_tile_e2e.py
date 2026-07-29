@@ -2613,16 +2613,19 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         super().setUp()
         torch.manual_seed(0xCAFE)
 
-    @unittest.expectedFailure
+    @pytest.mark.skip(
+        reason=(
+            "This reproduces on the CI runners but NOT on every local stack, "
+            "so a passing local run is not evidence it is fixed. Observed "
+            "10.2% element mismatch (833/8192) on CI, repeatable across all "
+            "retry attempts, while the same commit passes on a dev pod. "
+            "Skipped rather than xfailed because some CI runs use strict "
+            "xfail mode, where a passing xfail (e.g. on a dev pod) is itself "
+            "a failure. Un-skip only on the strength of a green CI run."
+        )
+    )
     def test_nested_bmm_outer_Batch_inner_K_correct(self):
-        """bmm [B,M,K]@[B,K,N] outer B (output) + inner K (reduction) — correct.
-
-        Stays xfailed: this reproduces on the CI runners but NOT on every local
-        stack, so a passing local run is not evidence it is fixed. Observed
-        10.2% element mismatch (833/8192) on CI, repeatable across all retry
-        attempts, while the same commit passes on a dev pod. Un-xfail only on
-        the strength of a green CI run.
-        """
+        """bmm [B,M,K]@[B,K,N] outer B (output) + inner K (reduction) — correct."""
         from torch_spyre._inductor import spyre_hint
 
         B, M, K, N = 4, 64, 512, 32
