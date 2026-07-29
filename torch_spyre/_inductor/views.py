@@ -809,7 +809,16 @@ def tiling_expr_to_device_expr(
     n = len(stride_map)
     vars = index.free_symbols
     for var in vars:
-        step = index.xreplace({var: 1}).xreplace({v: 0 for v in vars})
+        # index.xreplace({var: 1}) can degenerate to the bare Python int 1
+        # (not sympy.Integer(1)) when `index` is itself exactly the single
+        # symbol being replaced (e.g. index == var, coefficient 1, no other
+        # additive term) -- sympy auto-simplifies Mul(1, var) to var, and
+        # substituting var -> 1 into var alone returns the literal object
+        # passed in. sympy.sympify coerces that raw int back to a proper
+        # sympy numeric type so the second .xreplace call below (which
+        # every other, non-degenerate case already returns) does not crash
+        # with "'int' object has no attribute 'xreplace'".
+        step = sympy.sympify(index.xreplace({var: 1})).xreplace({v: 0 for v in vars})
         j = -1  # device dimension for var
         for i in range(n):
             if (

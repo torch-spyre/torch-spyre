@@ -525,7 +525,7 @@ to the requested number of core slices for that dimension:
 
 ```python
 from torch_spyre._inductor import spyre_hint
-from torch_spyre._inductor.propagate_named_dims import (
+from torch_spyre._inductor.wsr.propagate_named_dims import (
     declare_tensor_dim,
     name_tensor_dims,
 )

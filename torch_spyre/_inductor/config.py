@@ -74,6 +74,15 @@ ignore_span_overflow_hints: bool = (
     or os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "1") == "1"
 )
 
+# Enable reduction-dim (Lk-style) coarse tiling. Defaults to enabled — this
+# capability is exercised by passing tests today. Disabling it (or a future
+# hardware limitation that can't support it) makes planning treat any op
+# whose group requests reduction-dim tiling as unsupported, raising
+# Unsupported rather than attempting to tile it.
+enable_reduction_tiling: bool = (
+    os.environ.get("SPYRE_INDUCTOR_ENABLE_REDUCTION_TILING", "1") == "1"
+)
+
 # For K-split matmuls, permute physical core IDs so the cores collaborating on a
 # K reduction land on adjacent ring positions, cutting PSUM chain hops from m*n
 # to 1. The split itself is chosen by the cost-model planner; this only reorders

@@ -5670,7 +5670,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(dst, src):
             dst = dst.clone()
             result = op(dst, src)
-            assert id(result) == id(dst)
+            assert result.data_ptr() == dst.data_ptr()
             return result
 
         # Eager mode hangs/crashes when executing inplace operations on Spyre tensors

@@ -417,8 +417,10 @@ SpanOverflowTilePlan(
 or `None` if no automatic span-overflow tiling is needed or supported for that
 op.
 
-`span_overflow_groups(graph)` consumes the plan, attaches synthetic `DimHint`s,
-and returns groups shaped like user hint groups:
+`span_overflow_groups(graph)` consumes the plan, decides synthetic `DimHint`s
+for each op (without assigning them — that is left to the caller, see
+"Adapter and Coarse Tiling" below), and returns groups shaped like user hint
+groups:
 
 ```python
 [([op], [(hint_id, split_count, is_reduction_level), ...])]
@@ -756,7 +758,12 @@ synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
    distinct "multi-consumer not yet supported" message;
 7. creates synthetic `DimHint`s with ids starting at
    `_SPAN_OVERFLOW_HINT_ID = 10000`, shared across every op in a fused group;
-8. returns coarse-tile groups in the same format as user hints.
+8. returns `(groups, dim_hint_assignments)` — coarse-tile groups in the same
+   format as user hints, plus the `(op, dim_hints)` pairs decided in step 7.
+   `span_overflow_groups` itself never assigns `op.dim_hints`: it is a pure
+   planning step, and the caller (`_maybe_coarse_tile_span_overflow` in
+   `passes.py`) applies the assignments immediately before
+   `validate_coarse_tile_groups`/`coarse_tile` run.
 
 From `coarse_tile` onward, automatic and manual hints share the same path:
 
@@ -979,8 +986,8 @@ Current coverage includes:
 
 | File | Role |
 |---|---|
-| `torch_spyre/_inductor/span_overflow_hint_analysis.py` | Candidate collection, combo search, post-tile validation, tile-plan dataclasses |
-| `torch_spyre/_inductor/coarse_tile.py` | Adapter from tile plans to synthetic `DimHint`s; coarse-tile IR stamping |
+| `torch_spyre/_inductor/wsr/span_overflow_hint_analysis.py` | Candidate collection, combo search, post-tile validation, tile-plan dataclasses |
+| `torch_spyre/_inductor/wsr/coarse_tile.py` | Adapter from tile plans to synthetic `DimHint`s; coarse-tile IR stamping |
 | `torch_spyre/_inductor/passes.py` | Combines user hint groups and automatic span-overflow groups |
 | `torch_spyre/_inductor/propagate_layouts.py` | Preserves pointwise producer layouts from copy-back elision when automatic span-overflow is explicitly enabled |
 | `torch_spyre/_inductor/ir.py` | Spyre layout resize/reconstruction helpers |

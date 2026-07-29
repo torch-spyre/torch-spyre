@@ -19,11 +19,10 @@ from typing import cast
 import torch
 
 from .constants import ELIDED_COPY_BACK_ATTR
-from .ir import FixedTiledLayout
+from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .optimize_restickify import EdgeCostMap
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
-from .pass_utils import copy_fx_custom_meta
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -127,12 +126,6 @@ def _create_restickify_node(
         restick_fx_node = fx_graph.create_node(
             "call_function", torch.ops.spyre.restickify.default, (fx_arg_node,)
         )
-    # Propagate hint metadata from the consumer op so assign_dim_hints can assign
-    # dim_hints to the restickify buffer after insertion.
-    for consumer_fx_node in op.origins:
-        if "custom" in consumer_fx_node.meta:
-            copy_fx_custom_meta(consumer_fx_node, restick_fx_node)
-            break
     # Lower the FX node; run_node registers the output in graph.buffers and graph.operations.
     restick_tb = graph_lowering.run_node(restick_fx_node)
     restick_buff = restick_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
@@ -175,6 +168,13 @@ def insert_restickify_on_node_inputs(
         operations.remove(restick_buff)
         operations.insert(op_index, restick_buff)
         op_index += 1  # consumer shifted right by 1
+
+        # When coarse-tiling runs pre-stickification, the consumer op already
+        # carries loop_info (loop_group_id + loop_count).  The restickify node
+        # is inserted inside the same loop group, so it must inherit loop_info
+        # to remain contiguous in build_loop_scheduler_nodes.
+        if hasattr(op, "loop_info"):
+            restick_buff.loop_info = op.loop_info
 
     # Patch inner_fn once with the full name_map covering all restickified args.
     orig_inner = op.data.inner_fn
@@ -272,16 +272,131 @@ def finalize_layouts(graph: GraphLowering) -> None:
         if op_layouts and not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
             stl = committed if cost_fn else op_layouts[0]
             op.layout = _fixed_tiled(op.layout, cast(SpyreTensorLayout, stl))
+            # Mark loop-invariant tiled ops: per_tile_fixed so the unroller
+            # reuses the same base address every tile iteration.  A tiled op is
+            # loop-invariant when its CoarseTileInfo has no tiled dims at any
+            # level (all loop_tiled_dims and loop_tiled_reduction_dims entries
+            # are empty).  The loop-internal and tiled-reduction-scratch cases
+            # are handled later in _propagate_tiled_op /
+            # _propagate_tiled_reduction_op once consumer analysis is available.
+            loop_info = getattr(op, "loop_info", None)
+            if loop_info is not None and isinstance(op.layout, FixedTiledLayout):
+                all_tiled_dims_empty = all(
+                    not dims for dims in loop_info.loop_tiled_dims
+                )
+                all_tiled_rdims_empty = all(
+                    not dims
+                    for dims in getattr(loop_info, "loop_tiled_reduction_dims", [])
+                )
+                if all_tiled_dims_empty and all_tiled_rdims_empty:
+                    op.layout.per_tile_fixed = True
+                # Tiled-reduction scratch: inner level tiles a reduction dim.
+                # The op's output is a per-tile accumulation buffer reused
+                # every inner-loop iteration.
+                elif not all_tiled_rdims_empty:
+                    op.layout.per_tile_fixed = True
+                    # Propagate the reduction op's device layout to accum_full.
+                    # Pre-stickify, _allocate_full_buffer assigned accum_full a
+                    # generic layout; we now overwrite it with the same STL as
+                    # the reduction op (they share the same output shape and
+                    # stick orientation must agree for the combine to work).
+                    accum_name = getattr(op, "_tiled_reduction_accum_name", None)
+                    if accum_name is not None:
+                        accum_buf = graph.get_buffer(accum_name)
+                        accum_layout = accum_buf.layout
+                        if isinstance(accum_layout, FixedTiledLayout):
+                            # finalize_layouts already committed a generic STL
+                            # (from propagate_spyre_tensor_layouts) to accum_full.
+                            # Replace with the reduction op's actual STL so that
+                            # fill, combine, and copy all agree on the device
+                            # coordinate system.  Skip if already has the right
+                            # STL (span-overflow path where _allocate_full_buffer
+                            # already derived it from _resize_device_layout).
+                            if accum_layout.device_layout != op.layout.device_layout:
+                                accum_buf.layout = FixedTiledLayout(
+                                    accum_layout.device,
+                                    accum_layout.dtype,
+                                    accum_layout.size,
+                                    accum_layout.stride,
+                                    op.layout.device_layout,
+                                )
+                        else:
+                            # FixedLayout: wrap with the reduction op's STL.
+                            accum_buf.layout = _fixed_tiled(
+                                accum_layout, op.layout.device_layout
+                            )
+
+            # Loop-internal buffers: _propagate_tiled_op sets _pending_per_tile_fixed
+            # when the layout is still FixedLayout (pre-stickify).  Transfer that
+            # deferred flag now that we have the committed FixedTiledLayout.
+            if getattr(op, "_pending_per_tile_fixed", False):
+                assert isinstance(op.layout, FixedTiledLayout), (
+                    f"{op.get_name()} has _pending_per_tile_fixed but layout is "
+                    f"{type(op.layout).__name__} — expected FixedTiledLayout "
+                    "after finalize_layouts committed"
+                )
+                op.layout.per_tile_fixed = True
+                del op._pending_per_tile_fixed  # type: ignore[attr-defined]
 
         # For each input edge, schedule a restickify if the input's committed STL
         # is incompatible with what this op requires on that edge.
         if not cost_fn:
             continue
+        # Mutation ops targeting a SpyreEmptyFallback: the optimizer commits the
+        # mutation op's output STL via AllSameNode (matching the new-value inputs).
+        # The SpyreEmptyFallback was separately committed by AnyInNode (candidates[0]),
+        # which may differ.  Overwrite the accumulator's FixedTiledLayout to match the
+        # mutation op's committed STL so the backend sees consistent layouts.
+        if isinstance(getattr(op, "layout", None), MutationLayoutSHOULDREMOVE):
+            mut_target = op.layout.target
+            while isinstance(mut_target, ReinterpretView):
+                mut_target = mut_target.data
+            mut_target_name = (
+                mut_target.get_name() if hasattr(mut_target, "get_name") else ""
+            )
+            mut_target_buf = (
+                graph.get_buffer(mut_target_name) if mut_target_name else None
+            )
+            if isinstance(mut_target_buf, SpyreEmptyFallback) and committed is not None:
+                accum_layout = mut_target_buf.get_layout()
+                if isinstance(accum_layout, (FixedTiledLayout, FixedLayout)):
+                    new_layout = FixedTiledLayout(
+                        accum_layout.device,
+                        accum_layout.dtype,
+                        accum_layout.size,
+                        accum_layout.stride,
+                        committed,
+                    )
+                    new_layout.per_tile_fixed = getattr(
+                        accum_layout, "per_tile_fixed", False
+                    )
+                    mut_target_buf.layout = new_layout
+            elif isinstance(mut_target_buf, SpyreEmptyFallback) and committed is None:
+                # committed_stl was cleaned up; fall back to the accumulator's layout.
+                accum_layout = mut_target_buf.get_layout()
+                if isinstance(accum_layout, FixedTiledLayout):
+                    committed = accum_layout.device_layout
         for edge, target_stl in cost_fn.required_input_stls(committed):
             input_buf = graph.get_buffer(edge.dep.name)
             in_layout = input_buf.get_layout()
             if isinstance(in_layout, MutationLayoutSHOULDREMOVE):
-                assert getattr(input_buf, ELIDED_COPY_BACK_ATTR, False), (
+                # Reading real_layout() through a mutation layout is only valid
+                # once the target buffer's own layout is a committed
+                # FixedTiledLayout. Two producers of this shape:
+                #  - the copy-back elision optimization (propagate_layouts.py),
+                #    which stamps ELIDED_COPY_BACK_ATTR on the producer; or
+                #  - coarse_tile.py's nested output-dim + reduction-dim tiling
+                #    (_insert_reduction_copy_op), which mutates directly into a
+                #    SpyreEmptyFallback accumulator (accum_tile) — a legitimate
+                #    in-group consumer (e.g. the next outer-tile iteration's
+                #    copy-in) reads that copy op's own output the same way an
+                #    ordinary producer's output would be read.
+                mutation_target = in_layout.get_buffer()
+                is_elided = getattr(input_buf, ELIDED_COPY_BACK_ATTR, False)
+                is_carry_into_accum = isinstance(
+                    mutation_target, SpyreEmptyFallback
+                ) and isinstance(mutation_target.get_layout(), FixedTiledLayout)
+                assert is_elided or is_carry_into_accum, (
                     f"unexpected mutation layout on {edge.dep.name}"
                 )
                 in_layout = in_layout.real_layout()
@@ -297,6 +412,13 @@ def finalize_layouts(graph: GraphLowering) -> None:
                     f"target_stl.stride_map={list(target_stl.stride_map)}"
                 )
             restick_target = _fixed_tiled(in_layout, restick_stl)
+            # restick_target's buffer is created fresh by _create_restickify_node
+            # and consumed only by op's own inner_fn (see
+            # insert_restickify_on_node_inputs) — it can never have outside-loop
+            # consumers, so it is always safe to inherit in_layout's per_tile_fixed:
+            # if the source address doesn't advance across iterations, this private
+            # single-consumer copy of it doesn't need to either.
+            restick_target.per_tile_fixed = getattr(in_layout, "per_tile_fixed", False)
             logger.info(
                 f"Injecting restickify on {op.get_name()} input {edge.dep.name}: "
                 f"{list(in_stl.stride_map)} -> {list(target_stl.stride_map)}"

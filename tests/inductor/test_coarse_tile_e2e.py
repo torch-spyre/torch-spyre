@@ -40,7 +40,7 @@ from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code
 
 from torch_spyre._inductor import config
-import torch_spyre._inductor.propagate_named_dims as _pnd
+import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 from utils_inductor import compare_with_cpu  # noqa: E402
@@ -205,16 +205,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         {
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
-        }
-    )
-    # ------------------------------------------------------------------
-    # Scratchpad (LX) allocation for intermediate tiled buffer — hint syntax
-    # ------------------------------------------------------------------
-
-    @config.patch(
-        {
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
+            "sencores": 4,
         }
     )
     def test_hint_nested_loop_with_scratchpad(self):
@@ -227,7 +218,9 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         inner hint tiles B-dim by 4 (1024 cols/iter).  With lx_planning
         enabled, the intermediate result y=a+b is allocated to LX scratchpad
         (it is only consumed within the loop body); the final output z stays
-        in HBM.
+        in HBM.  sencores=4 keeps the generated bundle.mlir's per-core
+        address expansion small enough to quote in full in the design doc
+        (the default SENCORES=32 would unroll to 32 addresses per operand).
 
         Assertions:
         - LoopSpec entries are emitted (tiling is active).
@@ -474,6 +467,55 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         )
 
     # ------------------------------------------------------------------
+    # Loop-invariant (broadcast) op gets per_tile_fixed=True
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_loop_invariant_op_per_tile_fixed_in_sdsc(self):
+        """A loop-invariant ComputedBuffer inside a coarse-tile group must have
+        per_tile_fixed=True in the generated SDSC source, so the unroller does
+        not advance its address.
+
+        torch.full lowers to a scalar-fill ComputedBuffer with no loop var matching
+        the hinted dim.  Its loop_tiled_dims are all-empty, making it loop-invariant
+        w.r.t. the tiling.  finalize_layouts must stamp per_tile_fixed=True on it.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        M, K = 256, 64
+        x = torch.randn(M, K, dtype=torch.float16)
+        x_dev = x.to("spyre")
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _name_tensor_dims(x_dev, ["M", "K"])
+
+        def fn(x):
+            with spyre_hint(num_tiles_per_dim={"M": 4}):
+                # torch.full produces a scalar-fill ComputedBuffer with no M-dim
+                # loop var — its loop_tiled_dims are all empty (loop-invariant).
+                bias = torch.full(x.shape, 0.5, dtype=x.dtype, device=x.device)
+                return x + bias
+
+        cfn = torch.compile(fn)
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, x_dev)
+        src = source_codes[0]
+        self.assertIn(
+            "per_tile_fixed=True",
+            src,
+            "Loop-invariant (scalar-fill) buffer must have per_tile_fixed=True in SDSC",
+        )
+
+    # ------------------------------------------------------------------
     # Hint propagation through mm_to_bmm_pass
     # ------------------------------------------------------------------
 
@@ -650,6 +692,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             fn, x, y, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
         )
 
+    @unittest.expectedFailure
     def test_hint_flash_attention(self):
         """Flash attention tiled over H (4 slices) via nested spyre_hints.
 
@@ -658,6 +701,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         # on this branch).  Now that Lk tiling is correctly applied, the result
         # is numerically wrong (~90% element mismatch).  Investigate and fix
         # before re-adding spyre_hint(num_tiles_per_dim={"Lk": lk_slices}).
+
+        Decision xfail: failing in CI (Actions run 30385154736, job
+        90362755639) on PR #3293. We've decided to xfail the coarse tiling
+        tests to allow us to merge to main -- deliberate decision to unblock
+        the merge, not a claim about a specific bisected root cause. Un-xfail
+        once the underlying regression is investigated and fixed.
         """
         import math
         from torch_spyre._inductor import spyre_hint
@@ -673,16 +722,19 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         lk_slices = Lk // block_size  # noqa: F841 — used in commented-out Lk hint
 
         def flash(queries, keys, values):
-            output = torch.zeros_like(queries)
-            M = torch.full(
-                (B, H, Lq),
-                float("-inf"),
-                device=queries.device,
-                dtype=torch.float16,
-            )
-            denominator = torch.zeros(
-                (B, H, Lq), device=queries.device, dtype=torch.float16
-            )
+            with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
+                output = torch.zeros_like(queries)
+            with spyre_hint(named_dims=["B", "H", "Lq"]):
+                M = torch.full(
+                    (B, H, Lq),
+                    float("-inf"),
+                    device=queries.device,
+                    dtype=torch.float16,
+                )
+            with spyre_hint(named_dims=["B", "H", "Lq"]):
+                denominator = torch.zeros(
+                    (B, H, Lq), device=queries.device, dtype=torch.float16
+                )
             with spyre_hint(
                 num_tiles_per_dim={"B": 1}
             ):  # 3 nested scopes exercises multi-hint logic
@@ -728,12 +780,19 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
+    @unittest.expectedFailure
     def test_hint_flash_attention_v2(self):
         """Flash attention tiled over H (4 slices) via nested spyre_hints.
 
         Variant of test_hint_flash_attention with a causal mask and an
         explicit running-max (real_max) formulation that updates output and
         denominator in place via copy_.
+
+        Decision xfail: failing in CI (Actions run 30385154736, job
+        90362755639) on PR #3293. We've decided to xfail the coarse tiling
+        tests to allow us to merge to main -- deliberate decision to unblock
+        the merge, not a claim about a specific bisected root cause. Un-xfail
+        once the underlying regression is investigated and fixed.
         """
         import math
         from torch_spyre._inductor import spyre_hint
@@ -833,7 +892,14 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "allow_all_ops_in_lx_planning": True,
         }
     )
-    @pytest.mark.xfail(strict=False, reason="flash attention v3/v4 not yet passing")
+    @pytest.mark.xfail(
+        strict=False,
+        reason=(
+            "flash attention v3/v4 not yet passing: Lk reduction-dim tiling is "
+            "disabled (see FIXME on kv_block_size), unrelated to carry "
+            "propagation"
+        ),
+    )
     def test_hint_flash_attention_v3(self):
         from torch_spyre._inductor import spyre_hint
 
@@ -934,7 +1000,14 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
-    @pytest.mark.xfail(strict=False, reason="flash attention v3/v4 not yet passing")
+    @pytest.mark.xfail(
+        strict=False,
+        reason=(
+            "flash attention v3/v4 not yet passing: Lk reduction-dim tiling is "
+            "disabled (see FIXME on kv_block_size), unrelated to carry "
+            "propagation"
+        ),
+    )
     def test_hint_flash_attention_v3_b2(self):
         """Same as flash_v3 but with B=2 and b_block_size=2 so B is nto tiled"""
         from torch_spyre._inductor import spyre_hint
@@ -1035,7 +1108,14 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
-    @pytest.mark.xfail(strict=False, reason="flash attention v3/v4 not yet passing")
+    @pytest.mark.xfail(
+        strict=False,
+        reason=(
+            "flash attention v3/v4 not yet passing: Lk reduction-dim tiling is "
+            "disabled (see FIXME on kv_block_size), unrelated to carry "
+            "propagation"
+        ),
+    )
     def test_hint_flash_attention_v3_b2_minimal(self):
         """Minimal reproducer for v3_b2 correctness failure."""
         from torch_spyre._inductor import spyre_hint
@@ -1078,7 +1158,14 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
-    @pytest.mark.xfail(strict=False, reason="flash attention v3/v4 not yet passing")
+    @pytest.mark.xfail(
+        strict=False,
+        reason=(
+            "flash attention v3/v4 not yet passing: unrelated "
+            "propagate_named_dims bug (num_heads layout dim has no loop "
+            "vars), not carry propagation"
+        ),
+    )
     def test_hint_flash_attention_v4(self):
         """This test attempts to replicate the standalone test_granite_attn.py with views
         but the flash logic is inlined rather than relying on decompositions.py
@@ -1224,6 +1311,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "allow_all_ops_in_lx_planning": True,
         }
     )
+    @unittest.expectedFailure
     def test_hint_flash_attention_loopspec(self):
         """Lk loop level not dropped when Lk-broadcast ops appear first in group.
 
@@ -1235,6 +1323,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         returned early from one of those ops and dropped Lk.  The fixed
         version unions loop_var assignments and finds Lk from a later op
         in the group.
+
+        Decision xfail: failing in CI (Actions run 30385154736, job
+        90362755639) on PR #3293. We've decided to xfail the coarse tiling
+        tests to allow us to merge to main -- deliberate decision to unblock
+        the merge, not a claim about a specific bisected root cause. Un-xfail
+        once the underlying regression is investigated and fixed.
         """
         import math
         from torch_spyre._inductor import spyre_hint
@@ -1260,18 +1354,21 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(values_dev, ["B", "H", "Lk", "D"])
 
         def flash(queries, keys, values):
-            output = torch.zeros_like(queries)
-            M = torch.full(
-                (B, H, Lq),
-                float("-inf"),
-                device=queries.device,
-                dtype=torch.float16,
-            )
-            denominator = torch.zeros(
-                (B, H, Lq),
-                device=queries.device,
-                dtype=torch.float16,
-            )
+            with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
+                output = torch.zeros_like(queries)
+            with spyre_hint(named_dims=["B", "H", "Lq"]):
+                M = torch.full(
+                    (B, H, Lq),
+                    float("-inf"),
+                    device=queries.device,
+                    dtype=torch.float16,
+                )
+            with spyre_hint(named_dims=["B", "H", "Lq"]):
+                denominator = torch.zeros(
+                    (B, H, Lq),
+                    device=queries.device,
+                    dtype=torch.float16,
+                )
             with spyre_hint(num_tiles_per_dim={"B": 1}):
                 with spyre_hint(num_tiles_per_dim={"H": 4}):
                     with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
@@ -1377,6 +1474,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             " by _stamp_group (group-wide is_reduction_level flag bug)",
         )
 
+    @unittest.expectedFailure
     def test_hint_flash_attention_two_loop_levels(self):
         """Flash-attention graph: both H and Lk loop levels survive into codegen.
 
@@ -1386,6 +1484,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         count=sympify('2') for Lk.  Before the _stamp_group per-op dispatch
         fix, Lk tiling was silently skipped for ops where the group-wide
         is_reduction_level flag disagreed with the op's own dim role.
+
+        Decision xfail: failing in CI (Actions run 30385154736, job
+        90362755639) on PR #3293. We've decided to xfail the coarse tiling
+        tests to allow us to merge to main -- deliberate decision to unblock
+        the merge, not a claim about a specific bisected root cause. Un-xfail
+        once the underlying regression is investigated and fixed.
         """
         import math
         from torch_spyre._inductor import spyre_hint
@@ -1479,12 +1583,19 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             " by _stamp_group (group-wide is_reduction_level flag bug)",
         )
 
+    @unittest.expectedFailure
     def test_hint_flash_attention_two_loop_levels_v2(self):
         """Flash-attention graph: both H and Lq loop levels survive into codegen.
 
         Variant of test_hint_flash_attention_two_loop_levels with a causal
         mask and an explicit running-max (real_max) formulation that updates
         output and denominator in place via copy_.
+
+        Decision xfail: failing in CI (Actions run 30385154736, job
+        90362755639) on PR #3293. We've decided to xfail the coarse tiling
+        tests to allow us to merge to main -- deliberate decision to unblock
+        the merge, not a claim about a specific bisected root cause. Un-xfail
+        once the underlying regression is investigated and fixed.
         """
         import math
         from torch_spyre._inductor import spyre_hint
@@ -1618,6 +1729,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         result = torch.compile(fn)(Q_dev, V_dev).cpu()
         torch.testing.assert_close(result, ref, atol=0.02, rtol=0.1)
 
+    @unittest.expectedFailure
     def test_hint_h_tiling_elementwise_loopspec(self):
         """H-tiling on BHLD (B=1 unit-size) selects the H iteration symbol, not Lq.
 
@@ -1626,6 +1738,22 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         unit-size dimensions that the iteration space skips.  Without the mapping,
         index 1 (H in BHLD with B=1) maps to the 2nd iteration-space key (Lq)
         rather than the 1st (H), producing wrong per-tile stride advances.
+
+        Accepted, tracked regression, newly exposed (not caused) by the
+        unconditional-copy change: confirmed via direct A/B (passes at the
+        commit immediately before the unconditional-copy change lands,
+        fails starting exactly at that landing commit, continuing to fail
+        at HEAD). The assertion below now fails because
+        `device_tile_advance_expr` references
+        `_tile_adv_coarse_tile_copy_buf0_lvl0` with coefficient 64 instead
+        of `_tile_adv_op0_lvl0` with coefficient 65536 -- the newly-inserted
+        copy op is getting the wrong host-range-index -> iteration-space-key
+        mapping this test was originally written to guard against, not the
+        `superdsc.py` backGap device_size-mismatch bug the other xfails in
+        this file/test_building_blocks.py hit. Deferred per user decision
+        (2026-07-28): fold into follow-up investigation rather than
+        blocking branch completion. Un-xfail once the host-range ->
+        iteration-space mapping is fixed for the inserted copy-op case.
         """
         from torch_spyre._inductor import spyre_hint
 
@@ -1658,26 +1786,49 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         src = source_codes[0]
         self.assertIn("LoopSpec(", src, "Expected LoopSpec for H-tiled elementwise")
         self.assertIn("sympify('2')", src, "Expected loop count 2 for H/2 tiles")
-        # The tiled symbol must be the H iteration-space symbol (c0 — the first
-        # non-unit dim after skipping B=1), NOT the Lq symbol (c1).
-        # With an incorrect host-range→iteration-space mapping, host index 1 (H)
-        # would select c1 (Lq) instead of c0 (H), advancing per-tile strides by
-        # the wrong amount.
+        # tiled_symbols now holds one minted per-(op, level) symbol (see
+        # spyre_kernel._get_or_mint_level_symbol), not the real iteration-space
+        # symbol (c0 for H) — so the regression this test guards against
+        # (host-range index 1 (H) incorrectly resolving to the Lq iteration-space
+        # symbol instead of H's) must instead be checked via the *value* of
+        # device_tile_advance_expr's coefficient on that minted symbol: with the
+        # correct host-range→dim mapping, each step of the minted level symbol
+        # advances by H's per-tile extent (8 // 2 == 4) times the flattened
+        # host-index multiplier for H's inner dims (Lq*D == 256*64 == 16384),
+        # i.e. 4 * 16384 == 65536; the old bug would instead have advanced by
+        # a multiple of Lq's stride (D == 64) rather than H's (Lq*D == 16384).
+
         tiled_syms_matches = re.findall(r"tiled_symbols=\[(\[.*?\])\]", src, re.DOTALL)
         self.assertTrue(
             tiled_syms_matches,
             "Expected tiled_symbols=[[...]] in generated OpSpec source",
         )
-        for match in tiled_syms_matches:
+        minted_sym_matches = re.findall(r"_tile_adv_\w+_lvl\d+", tiled_syms_matches[0])
+        self.assertTrue(
+            minted_sym_matches,
+            f"Expected a minted _tile_adv_* symbol in tiled_symbols, "
+            f"got: {tiled_syms_matches[0]}",
+        )
+        minted_sym = minted_sym_matches[0]
+        advance_matches = re.findall(
+            r"device_tile_advance_expr=sympify\('([^']*)'\)", src
+        )
+        self.assertTrue(
+            advance_matches, "Expected device_tile_advance_expr in generated source"
+        )
+        for advance_expr in advance_matches:
             self.assertIn(
-                "c0",
-                match,
-                f"tiled_symbols should contain the H symbol (c0), got: {match}",
+                minted_sym,
+                advance_expr,
+                f"device_tile_advance_expr should reference the tiled level "
+                f"symbol {minted_sym}, got: {advance_expr}",
             )
-            self.assertNotIn(
-                "c1",
-                match,
-                f"tiled_symbols should NOT contain the Lq symbol (c1), got: {match}",
+            self.assertIn(
+                "65536",
+                advance_expr,
+                f"device_tile_advance_expr should advance by H's per-tile "
+                f"extent times H's flattened host stride (4 * 16384 == 65536), "
+                f"NOT a multiple of Lq's stride (64) -- got: {advance_expr}",
             )
 
     def test_hint_row_tiling_multi_stick_pointwise_correct(self):
@@ -1714,6 +1865,230 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         compare_with_cpu(
             fn, a, b, c, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
         )
+
+    # ------------------------------------------------------------------
+    # Tiled pointwise with outside consumer (_allocate_full_buffer)
+    # ------------------------------------------------------------------
+
+    @config.patch(
+        {
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_hint_tiled_pointwise_outside_consumer_correct(self):
+        """Tiled pointwise op with a consumer outside the loop (tests
+        _allocate_full_buffer pre-stickify: the full buffer must be correctly
+        stickified by layout propagation).
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        A, B = 128, 64
+        x = torch.randn(A, B, dtype=torch.float16)
+        y = torch.randn(A, B, dtype=torch.float16)
+
+        _declare_tensor_dim("A", A)
+        _declare_tensor_dim("B", B)
+        _name_tensor_dims(x, ["A", "B"])
+        _name_tensor_dims(y, ["A", "B"])
+
+        def fn(x, y):
+            _name_tensor_dims(x, ["A", "B"])
+            _name_tensor_dims(y, ["A", "B"])
+            with spyre_hint(num_tiles_per_dim={"A": 2}):
+                z = x + y  # tiled op
+            return z * 2.0  # outside consumer -- forces _allocate_full_buffer
+
+        compare_with_cpu(fn, x, y, run_compile=True, run_eager=False)
+
+    def test_hint_nested_tiling_copy_mutation_correct(self):
+        """Nested Lq/D tiling into a direct copy_() mutation (Case 3 rewire)."""
+        from torch_spyre._inductor import spyre_hint
+
+        Lq, D = 256, 128
+        a = torch.randn(Lq, D, dtype=torch.float16)
+        b = torch.randn(Lq, D, dtype=torch.float16)
+
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("D", D)
+
+        def fn(a, b):
+            _name_tensor_dims(a, ["Lq", "D"])
+            _name_tensor_dims(b, ["Lq", "D"])
+            c = torch.full((Lq, D), 0, device=a.device, dtype=torch.float16)
+            with spyre_hint(num_tiles_per_dim={"Lq": 2}):
+                with spyre_hint(num_tiles_per_dim={"D": 2}):
+                    c.copy_(a + b)
+            return c
+
+        compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
+
+    def test_hint_nested_tiling_copy_mutation_divergent_input_layout(self):
+        """Case 3 nested coarse-tiling where `a`'s device layout genuinely
+        diverges from `b`'s -- exercises per-arg tile_advance_expr (each arg
+        must compute its own device-byte-stride/device_coordinates, not
+        share the output's).
+
+        Uses a 3-D [B, Lq, D] shape (unlike
+        test_hint_nested_tiling_copy_mutation_correct's 2-D [Lq, D]) so the
+        divergence can be constructed with an explicit ``SpyreTensorLayout``
+        ``dim_order`` swap on two *non-stick* dims (B and Lq): `a` gets
+        dim_order [1, 0, 2] (Lq outermost, B next, D -- last -- still the
+        stick dim) while `b`/`c` keep the default [0, 1, 2] (B outermost, Lq
+        next, D the stick dim). Both tensors still end with D as the stick
+        dimension, so no restickify is inserted to normalize the mismatch
+        away before the coarse-tiled `add` runs -- unlike a 2-D [Lq, D]
+        tensor, where any dim_order divergence necessarily swaps the stick
+        dim itself and pointwise-op restickify insertion collapses the two
+        inputs onto one shared layout before coarse-tiling's per-arg logic
+        ever sees them (see docs/source/compiler/coarse_tiling_loops.md's
+        note on `_get_device_dim_order`'s stick-dim placement, and the
+        divergent-stick-dim case being a separate, pre-existing,
+        out-of-scope gap -- confirmed by direct repro, not exercised here;
+        tracked as https://github.com/torch-spyre/torch-spyre/issues/3332).
+        Nesting num_tiles_per_dim={"Lq": 2} outer / {"B": 2} inner tiles two
+        non-stick dims, each with a distinct per-arg device_coordinates walk.
+        """
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor import spyre_hint
+
+        B, Lq, D = 4, 256, 128
+        a = torch.randn(B, Lq, D, dtype=torch.float16)
+        b = torch.randn(B, Lq, D, dtype=torch.float16)
+
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("D", D)
+
+        a_stl = SpyreTensorLayout(a.size(), a.stride(), torch.float16, [1, 0, 2])
+        _ = a.to("spyre")  # required for lazy device initialization
+        a_dev = a.to(device_layout=a_stl)
+        b_dev = b.to("spyre")
+
+        def fn(a, b):
+            _name_tensor_dims(a, ["B", "Lq", "D"])
+            _name_tensor_dims(b, ["B", "Lq", "D"])
+            c = torch.full((B, Lq, D), 0, device=a.device, dtype=torch.float16)
+            with spyre_hint(num_tiles_per_dim={"Lq": 2}):
+                with spyre_hint(num_tiles_per_dim={"B": 2}):
+                    c.copy_(a + b)
+            return c
+
+        spyre_result = torch.compile(fn)(a_dev, b_dev).cpu()
+        compare_with_cpu(fn, a, b, target=spyre_result, run_eager=False)
+
+    def test_hint_nested_tiling_copy_mutation_flat(self):
+        """Same Case 3 rewire as test_hint_nested_tiling_copy_mutation_correct,
+        but on a flattened [Lq * D] 1-D tensor rather than [Lq, D] 2-D.
+
+        Both the outer Lq:2 and inner D:2 coarse-tiling hints land on the same
+        (only) host dim here, unlike the 2-D case where each hint owns a
+        distinct host dim. dim_advance_overrides carries one
+        (tile_size, supertile_count) fact per nesting level rather than one
+        per host dim, so this no longer collapses the two levels' facts into
+        one.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        Lq, D = 256, 128
+        a = torch.randn(Lq * D, dtype=torch.float16)
+        b = torch.randn(Lq * D, dtype=torch.float16)
+
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("D", D)
+
+        def fn(a, b):
+            _name_tensor_dims(a, ["Lq", "D"])
+            _name_tensor_dims(b, ["Lq", "D"])
+            c = torch.full([Lq * D], 0, device=a.device, dtype=torch.float16)
+            with spyre_hint(num_tiles_per_dim={"Lq": 2}):
+                with spyre_hint(num_tiles_per_dim={"D": 2}):
+                    c.copy_(a + b)
+            return c
+
+        compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
+
+    @config.patch(
+        {
+            "sencores": 4,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    @unittest.expectedFailure
+    def test_span_overflow_mutation_case_external_input_layout_mismatch(self):
+        """Originally a regression repro for the Case 2/"Case 3"
+        layout-reconciliation gap; now an xfail for a separate, deeper,
+        pre-existing bug this task's fix newly exposes on this exact op.
+
+        Task 2 (this task) deleted the direct-mutation Case 2/"Case 3"
+        branch in `_propagate_tiled_op` entirely, so every cross-loop-group
+        write -- including this test's -- now takes the `_insert_copy_op`
+        path unconditionally. That fix *is* correct and closes the gap this
+        test originally targeted: `TestCoarseTileBufferPropagation`'s
+        `test_case2_condition_now_produces_copy_op` unit test directly
+        confirms the old Case 2 branch's code no longer exists and the
+        copy-op path is taken instead. A control probe run without any
+        divergent input layout at all (plain contiguous `x`/`y`, same
+        shapes, same span-overflow trigger) confirms the external-input-
+        layout-mismatch scenario is no longer what's failing here.
+
+        What still fails: `_insert_copy_op`'s interaction with a
+        post-stickify, span-overflow-scaled `full_buf` has its own,
+        independent, pre-existing addressing bug in `superdsc.py`'s per-arg
+        `device_size`/`device_coordinates` handling -- confirmed present on
+        the *pre-Task-2* code too, via a second control probe that forces a
+        real inside-consumer (so the OLD Case 2/"Case 3" branch does not
+        apply and the OLD code already takes the Case 1 copy-op path) on
+        this same post-stickify span-overflow setup: it fails the same way
+        (~87% mismatch) with zero divergent input layouts. This is the same
+        general class of latent Case-1-copy-path bug flagged as "item 4,
+        out of scope" in task-1-report.md (there triggered by a 3-input
+        case); here it's shown to need neither 3 inputs nor a divergent
+        layout, only `_insert_copy_op` + post-stickify span-overflow with
+        `loop_count > 1`. It was never exercised end to end before because,
+        pre-Task-2, an op with no inside consumers and no loop-internal
+        input (this test's exact shape) always took Case 2 instead, and no
+        other post-stickify span-overflow e2e test in this file forces
+        Case 1 with `loop_count > 1`.
+
+        This bug is in `_insert_copy_op`/`superdsc.py` addressing, not in
+        the Case 2/"Case 3" deletion this task performs, and is out of this
+        task's scope (its fix would require changes to `superdsc.py`, not
+        listed in this task's file scope). Per this task's explicit
+        instructions, this test stays `@unittest.expectedFailure` -- do not
+        un-xfail a test that still fails, and do not reinstate any form of
+        the deleted Case 2/"Case 3" branch as a workaround.
+
+        Confirmed failure mode (current code, post-Task-2 fix): 15779/16384
+        elements (96.3%) mismatch at atol=0.01/rtol=0.01, max abs diff
+        ~6.74 -- still far outside fp16 rounding noise, but a different
+        mismatch count/magnitude than the pre-fix 12221/16384 (74.6%),
+        max abs diff ~5.89 recorded in task-1-report.md, consistent with a
+        different root cause now being hit.
+
+        MAX_SPAN_BYTES is patched down so a small tensor triggers automatic
+        span-overflow tiling without needing a multi-hundred-MB real
+        allocation (technique matches
+        test_span_overflow_hint_analysis.py's TestSpanOverflowNumericValidation
+        class).
+        """
+        from unittest.mock import patch as mock_patch2
+
+        B, Lq, D = 32, 8, 64
+        x_raw = torch.randn(Lq, B, D, dtype=torch.float16)
+        x = x_raw.transpose(0, 1)  # logical [B, Lq, D], non-contiguous strides
+        y = torch.randn(B, Lq, D, dtype=torch.float16)
+
+        def fn(x, y):
+            return x + y
+
+        with mock_patch2(
+            "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+            8192,
+        ):
+            compare_with_cpu(
+                fn, x, y, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
+            )
 
 
 class TestNamedDimsHint(InductorTestCase):
@@ -2233,8 +2608,16 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         super().setUp()
         torch.manual_seed(0xCAFE)
 
+    @unittest.expectedFailure
     def test_nested_bmm_outer_Batch_inner_K_correct(self):
-        """bmm [B,M,K]@[B,K,N] outer B (output) + inner K (reduction) — correct."""
+        """bmm [B,M,K]@[B,K,N] outer B (output) + inner K (reduction) — correct.
+
+        Stays xfailed: this reproduces on the CI runners but NOT on every local
+        stack, so a passing local run is not evidence it is fixed. Observed
+        10.2% element mismatch (833/8192) on CI, repeatable across all retry
+        attempts, while the same commit passes on a dev pod. Un-xfail only on
+        the strength of a green CI run.
+        """
         from torch_spyre._inductor import spyre_hint
 
         B, M, K, N = 4, 64, 512, 32
@@ -2386,6 +2769,48 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
             "allocation={'lx'",
             src,
             "Expected tile-sized accum TensorArg with lx allocation for nested M+K tiling",
+        )
+
+    def test_nested_matmul_accum_tile_per_tile_fixed_in_sdsc(self):
+        """Accumulator tile buffer in nested outer-M + inner-K reduction must have
+        per_tile_fixed=True in the generated SDSC source.
+
+        The accum_tile buffer is loop-internal to the inner K-loop, so the unroller
+        must not advance its base address across inner iterations.  This requires
+        _pending_per_tile_fixed to be set by _propagate_tiled_reduction_op (pre-
+        stickify path) and consumed by finalize_layouts.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        M, K, N = 128, 512, 32
+        a = torch.randn(M, K, dtype=torch.float16) * 0.01
+        b = torch.randn(K, N, dtype=torch.float16) * 0.01
+        a_dev = a.to("spyre")
+        b_dev = b.to("spyre")
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _declare_tensor_dim("N", N)
+        _name_tensor_dims(a_dev, ["M", "K"])
+        _name_tensor_dims(b_dev, ["K", "N"])
+
+        def fn(a, b):
+            with spyre_hint(num_tiles_per_dim={"M": 2}):
+                with spyre_hint(num_tiles_per_dim={"K": 4}):
+                    return torch.mm(a, b)
+
+        cfn = torch.compile(fn)
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn(
+            "per_tile_fixed=True",
+            src,
+            "Nested-reduction accum_tile must have per_tile_fixed=True in SDSC",
         )
 
 

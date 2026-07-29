@@ -27,7 +27,7 @@ from torch._inductor.ir import ComputedBuffer
 from unittest.mock import patch
 
 import torch_spyre._inductor.passes as _passes
-import torch_spyre._inductor.propagate_named_dims as _pnd
+import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._inductor import spyre_hint as _spyre_hint
 from utils_inductor import _compile_and_run
 

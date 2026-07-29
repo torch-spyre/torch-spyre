@@ -159,13 +159,20 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
 
     def allocate_hbm_pool(self):
         """Allocate the intermediate pool."""
+        # _pool is an opaque, flat byte-addressed region: individual buffers
+        # are placed into it at byte offsets (see hbm_pool_planning.py's
+        # layout.allocation["hbm_pool"] = offset) and it is passed to kernels
+        # as-is, never sliced/reshaped in Python.  A 1D uint8 tensor of
+        # pool_size_bytes elements is the natural, unambiguous
+        # representation -- no need to route it through a multi-dim device
+        # layout, and no need to divide by 128 (each uint8 element is
+        # already one byte, not one stick).
         pool_size_bytes = getattr(V.graph, "hbm_pool_size", SEGMENT_SIZE)
-        pool_size_sticks = (pool_size_bytes + 127) // 128
         return (
             f"_pool = spyre_empty_with_layout("
-            f"({pool_size_sticks},), (1,), "
-            f"torch.uint8, SpyreTensorLayout(device_size=[{pool_size_sticks}, 1, 1], "
-            f"stride_map=[1, 1, 1], device_dtype=DataFormats.SENINT8))"
+            f"({pool_size_bytes},), (1,), "
+            f"torch.uint8, SpyreTensorLayout(device_size=[{pool_size_bytes}], "
+            f"stride_map=[1], device_dtype=DataFormats.SENINT8))"
         )
 
 

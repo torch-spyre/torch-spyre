@@ -61,22 +61,12 @@ def _opt_float(d: dict, key: str):
 #  BENCHMARK XML detection & parsing
 # ---------------------------------------------------------------------------
 
-# Metric suffix  ->  column name in perf_benchmarks
-_METRIC_MAP = {
-    "wall_clock": "total_duration_ms",
-    "cpu": "total_duration_ms",  # same column; wall_clock takes priority
-    "spyre": "memory_transfer_mean_ms",  # net kernel+transfer on device
-    "kernel": "kernel_mean_ms",
-    "memory_transfer": "memory_transfer_mean_ms",
-}
-
-# Canonical metric order for "wall_clock wins over cpu" tie-breaking
-_METRIC_PRIORITY = ["wall_clock", "cpu", "spyre", "kernel", "memory_transfer"]
-
 # Pattern:  perf_{op_name}_{metric}_ms_{input_shapes}
 _PERF_NAME_RE = re.compile(
-    r"^perf_(?P<op>.+?)_(?P<metric>wall_clock|cpu|spyre|kernel|memory_transfer)_ms_(?P<shapes>.+)$"
+    r"^perf_(?P<op>.+?)_(?P<metric>wall_clock|cpu|spyre|kernel|memory_transfer)_ms(?:_(?P<shapes>.+))?$"
 )
+
+_GRANITE_CONFIG_RE = re.compile(r"bs(?P<batch_size>\d+)(?:_pl(?P<prompt_length>\d+))?")
 
 
 def is_benchmark_xml(root) -> bool:
@@ -112,6 +102,15 @@ def parse_benchmark_xml(xml_path: Path):
     except ValueError:
         created_at = datetime.now(timezone.utc)
 
+    # ── extract testsuite-level version_info ───────────────────────────────
+    version_info = None
+    suite_props = suite.find("properties")
+    if suite_props is not None:
+        for p in suite_props.findall("property"):
+            if p.get("name") == "version_info":
+                version_info = p.get("value", "").strip() or None
+                break
+
     # ── group cases by (op_name, input_shapes) ─────────────────────────────
     groups: dict[tuple, dict] = defaultdict(dict)  # (op, shapes) -> {metric: tc_el}
 
@@ -125,7 +124,7 @@ def parse_benchmark_xml(xml_path: Path):
             continue
         op = m.group("op")
         metric = m.group("metric")
-        shapes = m.group("shapes")
+        shapes = m.group("shapes") or ""
         groups[(op, shapes)][metric] = tc
 
     # ── build one row per group ─────────────────────────────────────────────
@@ -142,6 +141,14 @@ def parse_benchmark_xml(xml_path: Path):
                 total_ms = float(metric_cases[preferred].get("time", 0) or 0)
                 break
 
+        cpu_ms = None
+        if "cpu" in metric_cases:
+            cpu_ms = float(metric_cases["cpu"].get("time", 0) or 0)
+
+        spyre_ms = None
+        if "spyre" in metric_cases:
+            spyre_ms = float(metric_cases["spyre"].get("time", 0) or 0)
+
         kernel_ms = None
         if "kernel" in metric_cases:
             kernel_ms = float(metric_cases["kernel"].get("time", 0) or 0)
@@ -150,41 +157,59 @@ def parse_benchmark_xml(xml_path: Path):
         if "memory_transfer" in metric_cases:
             mem_ms = float(metric_cases["memory_transfer"].get("time", 0) or 0)
 
-        # torch_spyre_ms / sendnn_ms live in tags of individual cases
-        # For ratio: pull from any available case (consistent across metrics)
-        torch_spyre_ms = _opt_float(tags, "torch_spyre")
-        sendnn_ms = _opt_float(tags, "sendnn")
+        # torch_spyre_ms lives in tags of individual cases
+        torch_spyre_ms = _opt_float(tags, "torch_spyre_ms")
         ratio = _opt_float(tags, "ratio")
 
-        # stack detection: currently always torch-spyre from classname heuristic
-        stack = "torch-spyre"
+        # regression_status: read from kernel_ms testcase's tag properties
+        regression_status = None
+        if "kernel" in metric_cases:
+            kernel_tags = _tag_props(metric_cases["kernel"])
+            regression_status = kernel_tags.get("regression_status")
+            if regression_status == "N/A":
+                regression_status = None
+
+        is_granite = op_name.startswith("granite_")
+        if is_granite:
+            config_m = _GRANITE_CONFIG_RE.search(op_name)
+            batch_size = int(config_m.group("batch_size")) if config_m else None
+            pl_raw = config_m.group("prompt_length") if config_m else None
+            prompt_length = int(pl_raw) if pl_raw and pl_raw.isdigit() else None
+            config_name = tags.get("config")
+            run_mode = tags.get("mode")
+            pt_util = _opt_float(tags, "pt_util")
+            num_runs_val = _opt_float(tags, "num_runs")
+            num_runs_int = int(num_runs_val) if num_runs_val is not None else None
+        else:
+            batch_size = None
+            prompt_length = None
+            config_name = None
+            run_mode = "op_benchmark"
+            pt_util = _opt_float(tags, "pt_util")
+            num_runs_val = _opt_float(tags, "num_runs")
+            num_runs_int = int(num_runs_val) if num_runs_val is not None else None
 
         benchmarks.append(
             {
                 "benchmark_id": uuid.uuid4().int >> 64,
-                "record_type": "op",
-                "operation_name": op_name,
-                "config_name": None,
-                "stack": stack,
-                "input_shapes": shapes_str,
-                "batch_size": None,
-                "prompt_length": None,
-                "run_mode": "op_benchmark",
-                "kernel_name": None,
+                "record_type": "model" if is_granite else "op",
+                "operation_name": "granite" if is_granite else op_name,
+                "config_name": config_name,
+                "input_shapes": None if is_granite else (shapes_str or None),
+                "batch_size": batch_size,
+                "prompt_length": prompt_length,
+                "run_mode": run_mode,
                 "total_duration_ms": total_ms,
+                "cpu_ms": cpu_ms,
+                "spyre_ms": spyre_ms,
                 "kernel_mean_ms": kernel_ms,
-                "memcpy_htod_ms": None,
-                "memcpy_dtoh_ms": None,
-                "memset_device_ms": None,
                 "memory_transfer_mean_ms": mem_ms,
-                "pt_util_percent": None,
-                "num_runs": None,
+                "pt_util_percent": pt_util,
+                "num_runs": num_runs_int,
                 "custom_op_file": None,
-                "version_info": None,
+                "regression_status": regression_status,
                 "created_at": created_at,
-                # extra for dedup / display
                 "torch_spyre_ms": torch_spyre_ms,
-                "sendnn_ms": sendnn_ms,
                 "ratio": ratio,
             }
         )
@@ -192,6 +217,7 @@ def parse_benchmark_xml(xml_path: Path):
     run_meta = {
         "source_file": xml_path.name,
         "created_at": created_at,
+        "version_info": version_info,
     }
     return run_meta, benchmarks
 
@@ -208,10 +234,11 @@ def insert_benchmark_run(client, run_id: int, run_meta: dict) -> None:
             [
                 run_id,
                 run_meta["source_file"],
+                run_meta.get("version_info"),
                 run_meta["created_at"].replace(tzinfo=None),
             ]
         ],
-        column_names=["run_id", "source_file", "created_at"],
+        column_names=["run_id", "source_file", "version_info", "created_at"],
     )
 
 
@@ -227,22 +254,19 @@ def insert_perf_benchmarks(client, run_id: int, benchmarks: list[dict]) -> None:
                 b["record_type"],
                 b["operation_name"],
                 b["config_name"],
-                b["stack"],
                 b["input_shapes"],
                 b["batch_size"],
                 b["prompt_length"],
                 b["run_mode"],
-                b["kernel_name"],
                 b["total_duration_ms"],
+                b["cpu_ms"],
+                b["spyre_ms"],
                 b["kernel_mean_ms"],
-                b["memcpy_htod_ms"],
-                b["memcpy_dtoh_ms"],
-                b["memset_device_ms"],
                 b["memory_transfer_mean_ms"],
                 b["pt_util_percent"],
                 b["num_runs"],
                 b["custom_op_file"],
-                b["version_info"],
+                b["regression_status"],
                 b["created_at"].replace(tzinfo=None),
             ]
             for b in benchmarks
@@ -253,22 +277,19 @@ def insert_perf_benchmarks(client, run_id: int, benchmarks: list[dict]) -> None:
             "record_type",
             "operation_name",
             "config_name",
-            "stack",
             "input_shapes",
             "batch_size",
             "prompt_length",
             "run_mode",
-            "kernel_name",
             "total_duration_ms",
+            "cpu_ms",
+            "spyre_ms",
             "kernel_mean_ms",
-            "memcpy_htod_ms",
-            "memcpy_dtoh_ms",
-            "memset_device_ms",
             "memory_transfer_mean_ms",
             "pt_util_percent",
             "num_runs",
             "custom_op_file",
-            "version_info",
+            "regression_status",
             "created_at",
         ],
     )

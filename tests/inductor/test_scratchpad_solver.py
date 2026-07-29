@@ -41,6 +41,9 @@ try:
 
     _HAS_ORTOOLS = True
 except ImportError:
+    # Bound so class bodies below can reference it; Python evaluates a class body
+    # before skipUnless can suppress the class.
+    CpSatLayoutSolver = None  # type: ignore[assignment,misc]
     _HAS_ORTOOLS = False
 
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (

@@ -291,6 +291,21 @@ class TestTilingExprToDeviceExpr(TestCase):
         result = tiling_expr_to_device_expr([64, 1024, 64], [65536, 1, 1024], index)
         self.assertEqual(result, 32768 * p0 + 1048576 * p1)
 
+    def test_tiling_expr_bare_symbol_degenerate_substitution(self):
+        # index == p0 with coefficient 1 and no other additive term: sympy
+        # auto-simplifies Mul(1, p0) to the bare Symbol p0, so
+        # index.xreplace({p0: 1}) returns a raw Python int 1 (not
+        # sympy.Integer(1)) rather than the usual sympy numeric type -- the
+        # degenerate case that used to make the function's second .xreplace
+        # call crash with AttributeError: 'int' object has no attribute
+        # 'xreplace'. This mirrors the real _general_tile_advance call shape
+        # when a tiled dim's extent is 1 and no other term survives
+        # substitution (see tests/inductor/test_coarse_tile_e2e.py's
+        # test_hint_nested_loop_with_scratchpad).
+        index = p0
+        result = tiling_expr_to_device_expr([64, 1024, 64], [64, 4096, 1], index)
+        self.assertEqual(result, p0)
+
 
 if __name__ == "__main__":
     run_tests()
