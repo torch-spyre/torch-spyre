@@ -62,7 +62,7 @@ import torch
 from torch._dynamo.exc import BackendCompilerFailed
 from torch._inductor.test_case import TestCase as InductorTestCase
 
-import torch_spyre._inductor.propagate_named_dims as _pnd
+import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._C import SpyreTensorLayout, get_device_dtype
 from torch_spyre._inductor.op_spec import (
     IndirectAccess,

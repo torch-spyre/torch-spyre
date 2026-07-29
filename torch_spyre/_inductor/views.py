@@ -95,7 +95,7 @@ def convert_modular_indexing(expr: sympy.Expr) -> sympy.Expr:
 # NOTE: this is intentionally a local copy of pass_utils.concretize_expr.
 # views.py cannot import from pass_utils because pass_utils imports
 # compute_coordinates from views (circular dependency).  The duplication
-# is acceptable because both are thin wrappers around V.graph.sizevars.size_hint.
+# is acceptable because both are thin wrappers around V.graph.sizevars.optimization_hint.
 def _concretize_for_cmp(expr):
     """Return a concrete numeric value for use in comparison operators only.
 
@@ -124,7 +124,7 @@ def _concretize_for_cmp(expr):
     if isinstance(expr, float):
         return expr  # passthrough (incl. math.inf); avoids int(math.inf) error
     if hasattr(expr, "free_symbols") and expr.free_symbols:
-        return V.graph.sizevars.size_hint(expr)
+        return V.graph.sizevars.optimization_hint(expr)
     return int(expr)
 
 
@@ -509,7 +509,7 @@ def align_tensors(
     # Save original (possibly symbolic) range expressions before concretizing.
     # The algorithm below requires concrete ints for sorting and integer division,
     # but we must propagate symbolic expressions forward so downstream passes
-    # (work_division, SDSC codegen) see the symbols to extract fields, not size_hints.
+    # (work_division, SDSC codegen) see the symbols to extract fields, not hints.
     orig_ranges = {var: val[0] for var, val in iteration_space.items()}
     # local import: pass_utils imports compute_coordinates/matching_dim from
     # this module, so importing at module scope would create a cycle.
@@ -631,7 +631,18 @@ def align_tensors(
 
             # distribute work division for old var to new vars
             for v in reversed(remap[var]):
-                new_op_it_space_splits[v] = math.gcd(div, new_var_ranges[v])
+                # Re-intersect the committed split against the basis work
+                # division used for this var.
+                if v == var and v in stick_dim:
+                    # Stick var: stick count. The element range would drop a
+                    # legal split when the size is not a multiple of it
+                    # (e.g. gcd(2, 67) == 1).
+                    eps = int(stick_size[stick_dim.index(v)])
+                    basis = (int(new_var_ranges[v]) + eps - 1) // eps  # stick count
+                else:
+                    # Non-stick var (or synthetic sub-dim): element range.
+                    basis = new_var_ranges[v]
+                new_op_it_space_splits[v] = math.gcd(div, basis)
                 div //= new_op_it_space_splits[v]
         else:
             # no splits keep existing var, range, and work division
@@ -798,7 +809,16 @@ def tiling_expr_to_device_expr(
     n = len(stride_map)
     vars = index.free_symbols
     for var in vars:
-        step = index.xreplace({var: 1}).xreplace({v: 0 for v in vars})
+        # index.xreplace({var: 1}) can degenerate to the bare Python int 1
+        # (not sympy.Integer(1)) when `index` is itself exactly the single
+        # symbol being replaced (e.g. index == var, coefficient 1, no other
+        # additive term) -- sympy auto-simplifies Mul(1, var) to var, and
+        # substituting var -> 1 into var alone returns the literal object
+        # passed in. sympy.sympify coerces that raw int back to a proper
+        # sympy numeric type so the second .xreplace call below (which
+        # every other, non-degenerate case already returns) does not crash
+        # with "'int' object has no attribute 'xreplace'".
+        step = sympy.sympify(index.xreplace({var: 1})).xreplace({v: 0 for v in vars})
         j = -1  # device dimension for var
         for i in range(n):
             if (

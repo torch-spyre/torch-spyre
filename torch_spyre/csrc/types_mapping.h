@@ -352,6 +352,61 @@ stringToSenDatatypePair(const std::string& type_name) {
   return {sendnn::sen_datatype_enum::dt_undef,
           sendnn::sen_datatype_enum::dt_undef};
 }
+// Returns true if deeptools ConvertData_general_shuffle supports the given
+// (src, dst) DataFormats pair.  The set of supported pairs is derived from
+// the exhaustive if/else-if chain in
+// deeptools/util/sen_data_convert.cpp :: ConvertData_general_shuffle.
+inline bool isDCIConversionSupported(DataFormats src, DataFormats dst) {
+  // clang-format off
+  using DF = DataFormats;
+  // Pairs listed as (src, dst) matching the order in
+  // ConvertData_general_shuffle.
+  static const std::pair<DataFormats, DataFormats> kSupported[] = {
+      {DF::IEEE_FP32,   DF::IEEE_FP32},
+      {DF::SEN169_FP16, DF::IEEE_FP32},
+      {DF::IEEE_FP16,   DF::IEEE_FP32},
+      {DF::IEEE_FP32,   DF::SEN169_FP16},
+      {DF::SEN169_FP16, DF::SEN169_FP16},
+      {DF::SEN169_FP16, DF::SENINT16},
+      {DF::SENINT16,    DF::SEN169_FP16},
+      {DF::IEEE_FP32,   DF::BFLOAT16},
+      {DF::IEEE_FP16,   DF::BFLOAT16},
+      {DF::BFLOAT16,    DF::IEEE_FP32},
+      {DF::SEN143_FP8,  DF::IEEE_FP32},
+      {DF::IEEE_FP32,   DF::SEN143_FP8},
+      {DF::SEN143_FP8,  DF::SEN143_FP8},
+      {DF::SENINT4,     DF::IEEE_FP32},
+      {DF::IEEE_FP32,   DF::SENINT4},
+      {DF::SENINT8,     DF::IEEE_FP32},
+      {DF::IEEE_FP32,   DF::SENINT8},
+      {DF::SENUINT2,    DF::IEEE_FP32},
+      {DF::IEEE_FP32,   DF::SENUINT2},
+      {DF::BOOL,        DF::SEN169_FP16},
+      {DF::SEN169_FP16, DF::BOOL},
+      {DF::IEEE_INT64,  DF::SEN169_FP16},
+      {DF::IEEE_FP16,   DF::SEN169_FP16},
+      {DF::SEN169_FP16, DF::IEEE_FP16},
+      {DF::SENINT4,     DF::SENINT4},
+      {DF::SENINT8,     DF::SENINT8},
+      {DF::IEEE_INT64,  DF::IEEE_INT32},
+      {DF::IEEE_INT32,  DF::IEEE_INT64},
+      {DF::IEEE_INT32,  DF::IEEE_INT32},
+      {DF::SENUINT32,   DF::IEEE_INT64},
+      {DF::IEEE_INT64,  DF::SENUINT32},
+      {DF::SENUINT32,   DF::SENUINT32},
+      {DF::SEN169_FP16, DF::IEEE_INT64},
+      {DF::BFLOAT16,    DF::SEN169_FP16},
+      {DF::SEN169_FP16, DF::BFLOAT16},
+  };
+  // clang-format on
+  for (const auto& p : kSupported) {
+    if (p.first == src && p.second == dst) {
+      return true;
+    }
+  }
+  return false;
+}
+
 inline std::pair<size_t, size_t> elementSize(const c10::ScalarType& dtype) {
   /* return size (bytes) on CPU and on Spyre*/
   static const std::unordered_map<c10::ScalarType, std::pair<size_t, size_t>>
