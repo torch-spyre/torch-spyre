@@ -6406,9 +6406,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return op(t.permute(0, 3, 1, 2))
 
         x_nhwc = x.permute(0, 2, 3, 1).contiguous()
-        self.compare_with_cpu(
-            fn, x_nhwc, atol=0.1, rtol=0.1, run_eager=False, dynamic=False
-        )
+        self.compare_with_cpu(fn, x_nhwc, atol=0.1, rtol=0.1, run_eager=False)
 
     def test_conv2d_cpu(self, x, weight, bias, padding, stride, groups):
         def fn(x, weight, bias, padding, stride, groups):

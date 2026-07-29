@@ -1086,7 +1086,7 @@ def generate_sdsc(
                                         "name_": "core",
                                         **{
                                             str(dim) + "_": size
-                                            // sdsc_spec.work_slices.get(dim, 1)
+                                            // sdsc_spec.work_slices[dim]
                                             for dim, size in sdsc_spec.iteration_space.items()
                                         },
                                         # Per-dim symbolic bounds (per-core slice).
@@ -1105,7 +1105,7 @@ def generate_sdsc(
                                         "name_": "core",
                                         **{
                                             str(dim) + "_": size
-                                            // sdsc_spec.work_slices.get(dim, 1)
+                                            // sdsc_spec.work_slices[dim]
                                             for dim, size in sdsc_spec.iteration_space.items()
                                         },
                                         "symbolicDimInfo_": _per_core_symbolic_dim_info(
@@ -1233,13 +1233,11 @@ def generate_sdsc(
                                                         sdsc_spec.iteration_space[dim],
                                                         i < sdsc_spec.num_inputs,
                                                     )
-                                                    // sdsc_spec.work_slices.get(dim, 1)
+                                                    // sdsc_spec.work_slices[dim]
                                                 )
                                                 if (tensor.scales[dim] == 1)
                                                 else 1,
-                                                nsplits=sdsc_spec.work_slices.get(
-                                                    dim, 1
-                                                )
+                                                nsplits=sdsc_spec.work_slices[dim]
                                                 if (tensor.scales[dim] == 1)
                                                 else 1,
                                                 elems_per_stick=tensor.data_format.elems_per_stick(),

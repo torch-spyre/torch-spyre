@@ -836,6 +836,10 @@ def lower_avg_pool2d(
         reduction_ranges=[kH, kW],
         op_info=op_info,
     )
+    # Realize so the pool becomes its own ComputedBuffer: codegen's
+    # kernel_store_reduction reads op_info (pool constants + pool_dim_sizes) off
+    # node.data.op_info, which only exists when the SpyreReduction is realized
+    # rather than fused into a consumer.
     result.realize()
     return result
 
