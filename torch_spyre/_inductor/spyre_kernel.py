@@ -36,6 +36,7 @@ from .constants import (
     BATCH_MATMUL_OP,
     BATCH_MATMUL_FP8_OP,
     IDENTITY_OP,
+    POOL_OPS,
     RESTICKIFY_OP,
     SEGMENT_OFFSETS,
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
@@ -624,6 +625,13 @@ class SpyreKernel(Kernel[CSEVariable]):
             # data.ranges and counting only non-unit entries.  loop_tiled_dims
             # stores *host-range* indices which include unit-size dims that the
             # iteration space skips; this mapping corrects for that.
+            #
+            # NOTE (latent): this assumes data.ranges and the iteration space
+            # share a dim ordering.  For pools that is false — data.ranges is
+            # NCHW while iteration_space is NHWC — so the non-unit counting only
+            # happens to line up.  It is never exercised today because pools take
+            # the n_levels == 0 path; a tiled pool would need this reconciled
+            # against node_output_ranges.  Out of scope here (see PR #2846).
             host_to_it: dict[int, int] = {}
             if hasattr(ir_node, "data") and hasattr(ir_node.data, "ranges"):
                 it_idx = 0
@@ -712,6 +720,20 @@ class SpyreKernel(Kernel[CSEVariable]):
                 )
             )
 
+        # Carry the pool node's full logical output ranges (NCHW, incl. unit
+        # dims) so codegen can derive surviving dim roles and the channel count
+        # from live IR instead of a lowering-time size snapshot.  Store raw
+        # ranges (no int(): ranges may be symbolic); consumers convert only
+        # static dims.  Populated only for pools — the only consumer — so
+        # non-pool kernels' generated source is unchanged.
+        node_output_ranges = (
+            tuple(ir_node.data.ranges)
+            if op in POOL_OPS
+            and hasattr(ir_node, "data")
+            and hasattr(ir_node.data, "ranges")
+            else None
+        )
+
         return OpSpec(
             op,
             is_reduction,
@@ -720,6 +742,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             op_info,
             tiled_symbols=tiled_syms,
             symbolic_dim_bounds=symbolic_dim_bounds,
+            node_output_ranges=node_output_ranges,
             debug_handle=debug_handle,
         )
 
@@ -1130,6 +1153,18 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                 buf.writeline(
                     f"symbolic_dim_bounds={_serialize_value(op_spec.symbolic_dim_bounds)},"
                 )
+                if op_spec.node_output_ranges is not None:
+                    # Must survive the OpSpec -> generated-source -> exec
+                    # round-trip: pool codegen reads it to align dim labels and
+                    # the channel-count fallback.  Ranges are sympy Exprs;
+                    # sympy_str emits eval-able sympify(...) calls.
+                    buf.writeline(
+                        "node_output_ranges=("
+                        + "".join(
+                            sympy_str(r) + ", " for r in op_spec.node_output_ranges
+                        )
+                        + "),"
+                    )
                 if op_spec.debug_handle is not None:
                     # Source-to-kernel provenance must survive the OpSpec ->
                     # generated-source -> exec round-trip. DebugHandle/SourceLoc

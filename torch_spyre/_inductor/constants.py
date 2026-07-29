@@ -183,7 +183,8 @@ INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j", "ki", "kj"]
 OUTPUT_DIM_LABELS = ["out"]
 MATMUL_DIM_LABELS = ["ki", "kj", "y", "x", "mb", "out", "in"]
 # Canonical avgpool iteration-space order: batch, out-H, out-W, channel,
-# kernel-H, kernel-W. These SDSC labels are owned by the codegen layer; the
-# lowering supplies only per-role dim sizes (op_info["pool_dim_sizes"]), never
-# these strings, so SDSC naming does not leak above codegen.
+# kernel-H, kernel-W. These SDSC labels are owned by the codegen layer; dim-role
+# survival is derived from the node's live output ranges
+# (OpSpec.node_output_ranges), never from these strings, so SDSC naming does not
+# leak above codegen.
 POOL_DIM_LABELS = ["mb", "i", "j", "out", "ki", "kj"]

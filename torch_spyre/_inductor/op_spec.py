@@ -177,6 +177,12 @@ class OpSpec:
     symbolic_dim_bounds: dict[str, tuple[int, int]] = dataclasses.field(
         default_factory=dict
     )
+    # Full logical output ranges of the write/reduction node (NCHW for pools),
+    # including unit dims.  Distinct from the squeezed, permuted iteration_space:
+    # pool codegen derives which dim roles survived (and the channel count) from
+    # these live ranges rather than a lowering-time size snapshot.  None when the
+    # node exposes no data.ranges.
+    node_output_ranges: tuple[Expr, ...] | None = None
     debug_handle: DebugHandle | None = None
 
 

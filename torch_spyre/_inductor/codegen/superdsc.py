@@ -344,10 +344,10 @@ def _is_pool(op: str) -> bool:
     return op in POOL_OPS
 
 
-# Canonical avgpool iteration-space order -> SDSC labels.  Codegen owns these
-# label strings; the lowering supplies only per-role sizes
-# (op_info["pool_dim_sizes"]), so SDSC naming never leaks above the codegen
-# layer.  Order matches POOL_DIM_LABELS and the emitted iteration space.
+# Canonical avgpool iteration-space order (NHWC) -> SDSC labels.  Codegen owns
+# these label strings; survival of each role is read from the node's live output
+# ranges (see _align_pool_dim_labels), so no size info leaks above codegen.
+# Order matches POOL_DIM_LABELS and the emitted (NHWC) iteration space.
 _POOL_ROLE_LABELS = list(
     zip(["batch", "out_h", "out_w", "channel", "win_h", "win_w"], POOL_DIM_LABELS)
 )
@@ -360,28 +360,41 @@ def _is_static_one(sz) -> bool:
         return False  # symbolic/dynamic dim: never dropped
 
 
-def _align_pool_dim_labels(op_info: dict, ndim: int) -> list[str]:
+def _align_pool_dim_labels(node_output_ranges, ndim: int) -> list[str]:
     """Return the pool dim labels aligned to the (possibly squeezed) iteration space.
 
-    The lowering supplies ``pool_dim_sizes`` — each pooling-domain dim role
-    (batch, out_h, out_w, channel, win_h, win_w) mapped to its canonical size.
-    Codegen owns the SDSC label for each role (``_POOL_ROLE_LABELS``).  The
-    compilation pipeline drops statically size-1 dims (e.g. batch N=1) before
-    parse_op_spec runs, so a role whose canonical size is 1 has no surviving dim
-    and its label is filtered out here.  This keeps the labels aligned to the
-    real iteration space without inferring dim roles from sizes.
+    ``node_output_ranges`` is the reduction node's full logical output ranges in
+    **NCHW** order ``[N, C, H_out, W_out]`` (live IR, incl. unit dims) — see
+    ``OpSpec.node_output_ranges``.  Codegen owns the SDSC label for each role
+    (``_POOL_ROLE_LABELS``, in **NHWC** order).  The compilation pipeline drops
+    statically size-1 output dims (e.g. batch N=1) before parse_op_spec runs, so
+    a role whose live range is 1 has no surviving iteration-space dim and its
+    label is filtered out.  Survival is keyed by role name and emitted in NHWC
+    order; the window dims (win_h/win_w) always survive because the lowering
+    delegates to the in-tree path when kH==1 or kW==1, so a SpyreReduction always
+    has kH>1 and kW>1.  This keeps labels aligned to the real iteration space
+    using live node ranges rather than a lowering-time size snapshot.
     """
-    sizes = op_info.get("pool_dim_sizes", {})
-    labels = [
-        label
-        for role, label in _POOL_ROLE_LABELS
-        if not _is_static_one(sizes.get(role))
-    ]
+    if node_output_ranges is None or len(node_output_ranges) != 4:
+        raise ValueError(
+            "pool node_output_ranges must be NCHW [N, C, H_out, W_out]; got "
+            f"{node_output_ranges!r}"
+        )
+    # NCHW positions: 0=batch, 1=channel, 2=out_h, 3=out_w.
+    survives = {
+        "batch": not _is_static_one(node_output_ranges[0]),
+        "channel": not _is_static_one(node_output_ranges[1]),
+        "out_h": not _is_static_one(node_output_ranges[2]),
+        "out_w": not _is_static_one(node_output_ranges[3]),
+        "win_h": True,  # kH>1 guaranteed by the lowering delegation guard
+        "win_w": True,  # kW>1 guaranteed by the lowering delegation guard
+    }
+    labels = [label for role, label in _POOL_ROLE_LABELS if survives[role]]
     if len(labels) != ndim:
         raise ValueError(
             f"pool dim label count {len(labels)} ({labels}) does not match "
-            f"iteration-space rank {ndim}; pool_dim_sizes in the lowering are "
-            "out of sync with the emitted iteration space"
+            f"iteration-space rank {ndim}; node_output_ranges {node_output_ranges!r} "
+            "are out of sync with the emitted iteration space"
         )
     return labels
 
@@ -839,8 +852,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     }
     has_indirect_access = bool(index_tensor_indices)
 
-    if is_pool and op_spec.op_info:
-        dim_labels = _align_pool_dim_labels(op_spec.op_info, ndim)
+    if is_pool:
+        dim_labels = _align_pool_dim_labels(op_spec.node_output_ranges, ndim)
     else:
         dim_labels = _get_op_dim_labels(ndim, is_matmul)
     symbol_mapping = {
@@ -903,14 +916,16 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         if is_pool:
             # Pool op where C fits in one stick (e.g. C=1): the "out" (channel)
             # dimension was dropped from the iteration space because its size is 1,
-            # but the SDSC still needs it.  Take the channel count from the
-            # op-domain pool_dim_sizes rather than reaching into the physical
-            # device layout.  (Using INPUT_DIM_LABELS[ndim] would collide with the
-            # pool dim labels "i", "j", "ki", "kj".)
+            # but the SDSC still needs it.  Take the channel count from the node's
+            # live NCHW output ranges (position 1) rather than the physical device
+            # layout, which rounds channel up to a full stick and so cannot recover
+            # C when C < elems_per_stick.  (Using INPUT_DIM_LABELS[ndim] would
+            # collide with the pool dim labels "i", "j", "ki", "kj".)
             stick_sym = Symbol("out")
-            sdsc_iteration_space[stick_sym] = int(
-                op_spec.op_info["pool_dim_sizes"]["channel"]
-            )
+            # _align_pool_dim_labels already rejected a None here for pools;
+            # restate the invariant so the index is well-typed.
+            assert op_spec.node_output_ranges is not None
+            sdsc_iteration_space[stick_sym] = int(op_spec.node_output_ranges[1])
         else:
             stick_sym = Symbol(INPUT_DIM_LABELS[ndim])
             sdsc_iteration_space[stick_sym] = op_spec.args[

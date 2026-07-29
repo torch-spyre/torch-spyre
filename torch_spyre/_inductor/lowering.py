@@ -799,23 +799,6 @@ def lower_avg_pool2d(
             "pad_w": pW,
             "scaling_factor": 1.0 / (kH * kW),
         },
-        # Canonical size of each avgpool iteration-space dim, keyed by its
-        # pooling-domain role.  The codegen layer owns the SDSC label names and
-        # maps these roles onto them (see POOL_DIM_LABELS / _align_pool_dim_labels
-        # in codegen/superdsc.py), so SDSC naming never leaks above codegen.
-        #
-        # The pipeline drops statically size-1 dims from the iteration space
-        # before parse_op_spec runs (e.g. batch N=1), so codegen uses these sizes
-        # to drop the corresponding labels and stay aligned with the surviving
-        # dims — never inferring roles from sizes.
-        "pool_dim_sizes": {
-            "batch": N,
-            "out_h": H_out,
-            "out_w": W_out,
-            "channel": C,
-            "win_h": kH,
-            "win_w": kW,
-        },
     }
 
     def inner_fn(index, reduction_index):
@@ -837,9 +820,9 @@ def lower_avg_pool2d(
         op_info=op_info,
     )
     # Realize so the pool becomes its own ComputedBuffer: codegen's
-    # kernel_store_reduction reads op_info (pool constants + pool_dim_sizes) off
-    # node.data.op_info, which only exists when the SpyreReduction is realized
-    # rather than fused into a consumer.
+    # kernel_store_reduction reads op_info (pool constants) off node.data.op_info,
+    # which only exists when the SpyreReduction is realized rather than fused into
+    # a consumer.
     result.realize()
     return result
 
