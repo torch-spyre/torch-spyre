@@ -203,13 +203,16 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
     }
 
     # SpyreEmptyFallback nodes allocate a buffer but emit no dep-tracked write
-    # so they never appear in `written` via the dep walk above.  Collect them here explicitly
+    # so they never appear in `written` via the dep walk above.  Collect them here
+    # explicitly, using the underlying buffer's name (node.node.get_name()) rather
+    # than the scheduler node's own operation name (node.get_name()) — for an
+    # ExternKernelSchedulerNode these differ (e.g. "op30" vs "buf27").
     written |= {
-        node.get_name()
+        node.node.get_name()
         for node in flat_nodes
         if isinstance(node, ExternKernelSchedulerNode)
         and isinstance(node.node, SpyreEmptyFallback)
-        and node.get_name() not in graph_outputs
+        and node.node.get_name() not in graph_outputs
     }
 
     read = {
@@ -296,6 +299,19 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
             layout.allocation["hbm_pool"] = offset
         else:
             layout.allocation["hbm_pool"] = INTERMEDIATES_SEGMENT + offset
+
+        if isinstance(buf, SpyreEmptyFallback):
+            # SpyreEmptyFallback.should_allocate() returns False once pool-
+            # allocated, so the wrapper never emits an AllocateLine for it.
+            # Base Inductor's free machinery (Scheduler.free_buffers ->
+            # codegen_free -> can_reuse) does not consult should_allocate();
+            # it frees any buffer whose last use has passed regardless of
+            # whether it was ever allocated. Without this, the generated
+            # wrapper emits `del buf27` with no prior `buf27 = ...`, raising
+            # UnboundLocalError. free_buffers() itself subtracts
+            # V.graph.removed_buffers before iterating, so adding the name
+            # here keeps it out of codegen entirely.
+            V.graph.removed_buffers.add(name)
 
         pending_frees.append((end, offset, size))
 

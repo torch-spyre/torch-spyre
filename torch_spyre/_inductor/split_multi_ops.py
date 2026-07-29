@@ -17,7 +17,12 @@ import dataclasses
 import sympy
 import torch
 import torch.fx as fx
-from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
+from torch._inductor.ir import (
+    ComputedBuffer,
+    FixedLayout,
+    MutationLayoutSHOULDREMOVE,
+    Pointwise,
+)
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ops_handler import WrapperHandler
@@ -724,7 +729,7 @@ def split_multi_ops(graph: GraphLowering):
         if not (
             isinstance(op, ComputedBuffer)
             and isinstance(op.data, Pointwise)
-            and isinstance(op.layout, FixedLayout)
+            and isinstance(op.layout, (FixedLayout, MutationLayoutSHOULDREMOVE))
         ):
             continue
 
@@ -737,7 +742,13 @@ def split_multi_ops(graph: GraphLowering):
         if len(compute_ops) <= 1:
             continue
 
-        layout = op.layout
+        # Use real_layout() for MutationLayoutSHOULDREMOVE so _make_intermediate_bufs
+        # gets a valid device and dtype from the underlying FixedLayout.
+        layout = (
+            op.layout.real_layout()
+            if isinstance(op.layout, MutationLayoutSHOULDREMOVE)
+            else op.layout
+        )
         dtype_map = _propagate_dtypes(trace, layout.dtype)
         bufname_map = _init_vid_to_bufname(trace)
 

@@ -19,6 +19,7 @@ from torch_spyre._C import encode_constant, DataFormats
 from torch_spyre._inductor.constants import DEPTHWISE_CONV2D_OP
 
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.pass_utils import coeff_through_floor
 from sympy import Symbol
 
 
@@ -590,19 +591,6 @@ def _per_core_symbolic_dim_info(symbolic_dims: dict, work_slices: dict) -> dict:
     return info
 
 
-def _tiled_byte_stride(tensor, tiled_sym) -> int:
-    """Byte stride per loop iteration for a single tiled dimension.
-
-    ``tensor.strides[tiled_sym]`` is already the per-tile element stride
-    (``_create_sdsc_tensors`` receives the per-tile iteration space, since
-    ``coarse_tile.py`` has already divided the op ranges by ``loop_count``
-    before ``create_op_spec`` runs).  Multiplying by bytes-per-element
-    gives the correct per-iteration byte advance for the ``affine.apply``
-    in the ``scf.for`` loop body.
-    """
-    return int(tensor.strides[tiled_sym] * num_bytes(tensor.data_format))
-
-
 def _find_index_tensor_for_value(sdsc_spec, value_tensor_idx: int) -> int:
     """Find the index of the index tensor that references the given value tensor.
 
@@ -675,6 +663,26 @@ def _build_indirect_access_fields(sdsc_spec, tensor, tensor_idx: int) -> dict:
     return fields
 
 
+def _tensor_tiled_by_symbol(tensor, sym) -> bool:
+    """True iff `sym` contributes a nonzero term to this tensor's own
+    tile advance.
+
+    Real dimension symbols additionally require a positive scale (exclude
+    reduction dims, whose stride describes intra-tile layout, not the
+    inter-tile advance). Minted level symbols (Task 5) carry no
+    dimension/scale identity of their own, so that half of the check is
+    skipped for them; tensor.device_tile_advance_expr already only
+    contains a minted symbol's term when this tensor genuinely advances
+    at that level, so the coefficient check alone is both necessary and
+    sufficient for minted symbols.
+    """
+    if sym in tensor.strides and tensor.scales.get(sym, 1) <= 0:
+        return False
+    if tensor.device_tile_advance_expr is None:
+        return False
+    return bool(coeff_through_floor(tensor.device_tile_advance_expr, sym))
+
+
 def generate_sdsc(
     idx,
     sdsc_spec,
@@ -707,6 +715,14 @@ def generate_sdsc(
     When ``use_symbols=True``, HBM addresses are registered as negative symbol
     IDs in the JSON and their values appended to ``symbols``, enabling
     ``affine.apply`` address computation in ``bundle.mlir`` for tiled loops.
+
+    ``tensor.device_tile_advance_expr``: each tensor's own device-element-
+    offset ``sympy.Expr | None``, symbolic in the real Inductor iteration
+    symbols. For a symbol tiled at exactly one nesting level (the only case
+    this function handles correctly -- a symbol tiled at more than one
+    level has no single coefficient ``expr.coeff(sym)`` could return),
+    ``expr.coeff(sym)`` is that level's byte stride once multiplied by
+    ``num_bytes(tensor.data_format)``.
     """
     # tiled_symbols is list[list[Symbol]], outermost-first per nesting level.
     if tiled_symbols is None:
@@ -871,7 +887,7 @@ def generate_sdsc(
                 # per_tile_fixed lx tensors are fine: they don't advance, same as
                 # non-tiled tensors, so [{}] * n_levels is correct either way.
                 is_tiled_lx = tensor.per_tile_fixed is False and any(
-                    s in tensor.strides and tensor.scales.get(s, 1) > 0
+                    _tensor_tiled_by_symbol(tensor, s)
                     for level_syms in tiled_symbols
                     for s in level_syms
                 )
@@ -902,11 +918,56 @@ def generate_sdsc(
             )
             if symbolic_split is not None:
                 sym_dim_name = symbolic_split[0]
+                sym_dim = Symbol(sym_dim_name)
+                # Real-symbol fast path: s IS the dim symbol (already renamed
+                # to its SDSC dim label by symbol_mapping), so name equality
+                # against sym_dim_name is a correct, direct test.
+                #
+                # Minted-symbol path (spyre_kernel._get_or_mint_level_symbol):
+                # a minted symbol names a loop-nesting *level*, not a
+                # dimension -- _general_tile_advance (spyre_kernel.py) sums
+                # every host dim tiled at a level into ONE combined
+                # coefficient on that level's minted symbol before this
+                # tensor's device_tile_advance_expr is ever built, so by the
+                # time we get here there is no way to recover, from a
+                # nonzero coeff(minted_sym) alone, *which* of this tensor's
+                # active dims that coefficient came from (see fix-loop
+                # round-1 review: a tensor with two active dims, tiled only
+                # on one of them, previously false-positived on the other
+                # merely because it was also active and the tensor advanced
+                # via *some* dim).
+                #
+                # Absent that per-dimension provenance, the only sound test
+                # (no false positives) is: flag `sym_dim_name` only when it
+                # is this tensor's *sole* active (non-reduced) dim -- then a
+                # nonzero combined coefficient cannot be attributed to any
+                # other dim, because there is no other dim. This is a
+                # deliberate narrowing versus "any tiling at all, on any
+                # dim" -- it can under-detect (miss a real conflict on a
+                # tensor with 2+ active dims where sym_dim_name genuinely is
+                # the tiled one) but never over-detects, which is the
+                # correctness-critical direction for a False positive to
+                # avoid: it would otherwise reject support for supported
+                # ops using this check.
+                active_dims = [d for d in tensor.strides if tensor.scales.get(d, 1) > 0]
+                tensor_advances_at_some_level = (
+                    tensor.device_tile_advance_expr is not None
+                    and any(
+                        coeff_through_floor(tensor.device_tile_advance_expr, s)
+                        for level_syms in tiled_symbols
+                        for s in level_syms
+                    )
+                )
                 tiled_on_split_dim = any(
                     str(s) == sym_dim_name
                     for level_syms in tiled_symbols
                     for s in level_syms
                     if s in tensor.strides
+                ) or (
+                    sym_dim in tensor.strides
+                    and tensor.scales.get(sym_dim, 1) > 0
+                    and active_dims == [sym_dim]
+                    and tensor_advances_at_some_level
                 )
                 if tiled_on_split_dim:
                     raise Unsupported(
@@ -961,7 +1022,9 @@ def generate_sdsc(
                 # Pool tensor: no raw-base or slice symbol needed.
                 sliced_base_sym_idx = -1
             # Build per-level strides: for each level, collect the symbols at that
-            # level that tile this tensor (i.e. appear in tensor.strides).
+            # level that tile this tensor (see _tensor_tiled_by_symbol -- a nonzero
+            # coeff on tensor.device_tile_advance_expr, with real dimension symbols
+            # additionally required to have a positive scale).
             # Exclude symbols whose scale is negative: those are reduced dimensions
             # whose stride describes element layout within one tile, not the advance
             # between tiles.  Tiling by a reduction-dim symbol would incorrectly
@@ -971,15 +1034,18 @@ def generate_sdsc(
             per_level_strides: list[dict] = []
             any_tiled = False
             if not tensor.per_tile_fixed:
-                for level_syms in tiled_symbols:
+                for level_idx, level_syms in enumerate(tiled_symbols):
                     tensor_tiled_at_level = [
-                        s
-                        for s in level_syms
-                        if s in tensor.strides and tensor.scales.get(s, 1) > 0
+                        s for s in level_syms if _tensor_tiled_by_symbol(tensor, s)
                     ]
                     strides_for_level: dict = {}
                     for s in tensor_tiled_at_level:
-                        strides_for_level[s] = _tiled_byte_stride(tensor, s)
+                        coeff = (
+                            coeff_through_floor(tensor.device_tile_advance_expr, s)
+                            if tensor.device_tile_advance_expr is not None
+                            else 0
+                        )
+                        strides_for_level[s] = int(coeff) * nb
                         any_tiled = True
                     per_level_strides.append(strides_for_level)
             else:

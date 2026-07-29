@@ -44,18 +44,18 @@ from .temp_passes import (
     mark_direct_unit_bmm_pass,
     mm_to_bmm_pass,
 )
-from .coarse_tile import (
+from .wsr.coarse_tile import validate_coarse_tile_groups
+from .wsr.coarse_tile_span_overflow import span_overflow_groups
+from .wsr.coarse_tile_hints import (
     hints_to_coarse_tile_groups,
     reorder_unhinted_interlopers,
-    span_overflow_groups,
-    validate_coarse_tile_groups,
 )
 from . import config
 from .propagate_hints import (
     collect_spyre_hints,
     recover_spyre_hints,
 )
-from .propagate_named_dims import propagate_named_dims, assign_dim_hints
+from .wsr.propagate_named_dims import propagate_named_dims, assign_dim_hints
 from .propagate_layouts import (
     propagate_mutation_layouts,
     propagate_spyre_tensor_layouts,
@@ -81,7 +81,7 @@ from .scheduler import build_loop_scheduler_nodes
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
-from .coarse_tile import coarse_tile
+from .wsr.coarse_tile import coarse_tile
 from .split_multi_ops import split_multi_ops, validate_ops
 
 
@@ -276,22 +276,64 @@ def _runs(*passes: Callable) -> Callable[[Callable], Callable]:
 @_runs(
     reorder_unhinted_interlopers,
     hints_to_coarse_tile_groups,
+    validate_coarse_tile_groups,
+    coarse_tile,
+)
+def _maybe_coarse_tile_hints(graph: GraphLowering) -> None:
+    """Hint-driven coarse tiling only.  Runs PRE-stickification.
+
+    span_overflow_groups is intentionally absent: it requires FixedTiledLayout
+    (device_layout) and must run post-stickification.
+    """
+    if config.ignore_wsr_hints:
+        return
+    reorder_unhinted_interlopers(graph)
+    groups = hints_to_coarse_tile_groups(graph)
+    if not groups:
+        return
+    op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
+    groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
+    validate_coarse_tile_groups(groups)
+    coarse_tile(graph, groups=groups)
+
+
+@_runs(
     span_overflow_groups,
     validate_coarse_tile_groups,
     coarse_tile,
 )
-def _maybe_coarse_tile(graph: GraphLowering) -> None:
-    groups = []
-    if not config.ignore_wsr_hints:
-        reorder_unhinted_interlopers(graph)
-        groups += hints_to_coarse_tile_groups(graph)
-    if not config.ignore_span_overflow_hints:
-        groups += span_overflow_groups(graph)
-    if groups:
-        op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
-        groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
-        validate_coarse_tile_groups(groups)
-        coarse_tile(graph, groups=groups)
+def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
+    """Span-overflow coarse tiling only.  Runs POST-stickification.
+
+    Requires FixedTiledLayout (device_layout) on all ops.
+    hint-driven groups (hints_to_coarse_tile_groups) are intentionally
+    absent: they have already run pre-stickification.
+    """
+    if config.ignore_span_overflow_hints:
+        return
+    groups, dim_hint_assignments = span_overflow_groups(graph)
+    if not groups:
+        return
+    # span_overflow_groups is a pure planning step: it decides each op's
+    # dim_hints but does not set them.  Apply them now, before
+    # validate_coarse_tile_groups/coarse_tile run, since dim_hints is an
+    # input those consume (via plan_coarse_tile_groups's hint lookups), not
+    # something they produce.
+    for op, dim_hints in dim_hint_assignments:
+        op.dim_hints = dim_hints  # type: ignore[attr-defined]
+    # Compute offset to avoid loop_group_id collision with any hint-driven
+    # groups already stamped by _maybe_coarse_tile_hints.
+    # E.g. if hints used groups 0 and 1, span-overflow groups start at 2.
+    used_ids = [
+        op.loop_info.loop_group_id[0]
+        for op in graph.operations
+        if hasattr(op, "loop_info") and op.loop_info is not None
+    ]
+    group_idx_offset = max(used_ids, default=-1) + 1
+    op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
+    groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
+    validate_coarse_tile_groups(groups)
+    coarse_tile(graph, groups=groups, group_idx_offset=group_idx_offset)
 
 
 @_runs(cost_model_matmul_division, work_distribution)
@@ -331,6 +373,17 @@ class CustomPreSchedulingPasses:
         self.passes = [
             deadcode_elimination,
             #
+            # Working Set Reduction (hint-driven, pre-stickification)
+            # These passes only need host-side FixedLayout (size/stride) and
+            # loop variable ranges.  Running before stickification means
+            # _divide_ranges does not call _resize_device_layout: stickification
+            # computes the correct SpyreTensorLayout from the already-divided
+            # ranges.  This also dissolves the insert_restickify→hint cross-phase
+            # contract (issue #3135).
+            propagate_named_dims,
+            assign_dim_hints,
+            _maybe_coarse_tile_hints,
+            #
             # Tensor Layout (Stickification)
             split_multi_ops,
             propagate_spyre_tensor_layouts,
@@ -343,10 +396,10 @@ class CustomPreSchedulingPasses:
             #
             dedup_and_promote_constants,
             #
-            # Working Set Reduction
-            propagate_named_dims,
-            assign_dim_hints,
-            _maybe_coarse_tile,
+            # Working Set Reduction (device-layout-aware, post-stickification)
+            # These passes require FixedTiledLayout.device_layout (device_size,
+            # stride_map, elems_per_stick) for physical span arithmetic.
+            _maybe_coarse_tile_span_overflow,
             #
             # Core Division
             span_reduction,
