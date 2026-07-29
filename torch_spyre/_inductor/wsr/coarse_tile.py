@@ -2373,7 +2373,29 @@ def _insert_read_copy_ops(
         copy_layout: FixedLayout | FixedTiledLayout
         if isinstance(full_layout, FixedTiledLayout):
             full_size_ints = [int(s) for s in full_layout.size]
-            tile_size_ints = [int(s) for s in tile_ranges]
+            # tile_ranges (== list(dep.size)) is dep's *squeezed* size --
+            # extract_read_writes drops unit-size dims, so tile_ranges is
+            # one shorter per unit dim in full_buf's own raw size and no
+            # longer lines up positionally with full_size_ints.
+            # _resize_device_layout indexes new_host_size exclusively by
+            # positions derived from old_host_size (matched_host/pstar), so
+            # it requires equal rank -- reinsert a 1 at each raw position
+            # full_layout.size squeezed out, undoing the same squeeze
+            # applied to tiled_op's own ranges elsewhere in this function
+            # (see squeeze_pos above).
+            tile_size_ints = []
+            it_idx = 0
+            for s in full_size_ints:
+                if s == 1:
+                    tile_size_ints.append(1)
+                else:
+                    tile_size_ints.append(int(tile_ranges[it_idx]))
+                    it_idx += 1
+            assert it_idx == len(tile_ranges), (
+                f"_insert_read_copy_ops: could not align squeezed tile_ranges="
+                f"{tile_ranges} to full_size_ints={full_size_ints} for "
+                f"{dep.name!r}"
+            )
             # Authoritative stick host dim from coordinate identity (issue
             # #3116); None falls back to size-based inference inside
             # _resize_device_layout.
@@ -2399,11 +2421,17 @@ def _insert_read_copy_ops(
                     full_size_ints,
                     tile_size_ints,
                 )
+                # Row-major fallback describes the freshly allocated,
+                # squeezed-rank copy buffer directly (unlike the
+                # reconstruction above, it has no need for full_buf's raw
+                # rank) -- use tile_ranges/tile_strides, not the
+                # full-buf-rank-padded tile_size_ints.
+                squeezed_size_ints = [int(s) for s in tile_ranges]
                 device_layout = SpyreTensorLayout(
-                    tile_size_ints,
+                    squeezed_size_ints,
                     [int(s) for s in tile_strides],
                     full_buf.get_dtype(),
-                    list(range(len(tile_size_ints))),
+                    list(range(len(squeezed_size_ints))),
                     full_layout.device_layout.element_arrangement,
                 )
             copy_layout = FixedTiledLayout(
