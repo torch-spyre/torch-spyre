@@ -151,7 +151,13 @@ def _rebuild_matmul(
     object.__setattr__(reduction, "inner_fn", new_inner_fn)
     # reduction_ranges stays at K; no extension here.
 
-    return replace_computed_buffer_body(op, reduction, operations)
+    return replace_computed_buffer_body(
+        op,
+        reduction,
+        operations,
+        pass_name="insert_bmm_padding",
+        reason="redirect matmul to padded input",
+    )
 
 
 def insert_bmm_padding(graph: GraphLowering) -> None:

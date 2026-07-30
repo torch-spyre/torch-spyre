@@ -34,7 +34,11 @@ from torch_spyre._inductor.codegen.compute_ops import (
     _symbolic_split_info,
     _tensor_has_symbolic_split,
 )
-from torch_spyre._inductor.codegen.superdsc import _resolve_sdsc_size, compile_op_spec
+from torch_spyre._inductor.codegen.superdsc import (
+    _align_pool_dim_labels,
+    _resolve_sdsc_size,
+    compile_op_spec,
+)
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 from torch_spyre._inductor.work_division import (
     _collect_symbol_metadata,
@@ -280,6 +284,57 @@ class TestResolveSdscSize(InductorTestCase):
         with patch("torch_spyre._inductor.codegen.superdsc.V", mock_v):
             with self.assertRaises(RuntimeError):
                 _resolve_sdsc_size(s0, {})
+
+
+class TestAlignPoolDimLabels(InductorTestCase):
+    """Unit tests for superdsc._align_pool_dim_labels.
+
+    Survival of each pool dim role is derived from the node's live NCHW output
+    ranges [N, C, H_out, W_out]; statically size-1 output dims are dropped from
+    the emitted (NHWC) label list.  Window dims always survive (kH>1, kW>1 is
+    guaranteed by the lowering delegation guard).  These cases mirror the shapes
+    exercised by the hardware-only test_avg_pool2d_base.
+    """
+
+    def test_all_dims_present(self):
+        # N=2, C=3, H_out=W_out=8 -> every role survives.
+        labels = _align_pool_dim_labels((2, 3, 8, 8), 6)
+        self.assertEqual(labels, ["mb", "i", "j", "out", "ki", "kj"])
+
+    def test_batch_dropped(self):
+        # N=1 -> "mb" filtered out; iteration space rank 5.
+        labels = _align_pool_dim_labels((1, 3, 8, 8), 5)
+        self.assertEqual(labels, ["i", "j", "out", "ki", "kj"])
+
+    def test_channel_dropped(self):
+        # C=1 -> "out" filtered out; iteration space rank 5.
+        labels = _align_pool_dim_labels((2, 1, 8, 8), 5)
+        self.assertEqual(labels, ["mb", "i", "j", "ki", "kj"])
+
+    def test_batch_and_channel_dropped(self):
+        # N=1 and C=1 -> both "mb" and "out" filtered out; rank 4.
+        labels = _align_pool_dim_labels((1, 1, 8, 8), 4)
+        self.assertEqual(labels, ["i", "j", "ki", "kj"])
+
+    def test_symbolic_dims_never_dropped(self):
+        # A symbolic (dynamic) output dim must not be treated as size-1.
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+        labels = _align_pool_dim_labels((s0, 3, 8, 8), 6)
+        self.assertEqual(labels, ["mb", "i", "j", "out", "ki", "kj"])
+
+    def test_rank_mismatch_raises(self):
+        # Label count disagreeing with the reported iteration-space rank is a
+        # loud error rather than silent wrong-code.
+        with self.assertRaises(ValueError):
+            _align_pool_dim_labels((2, 3, 8, 8), 5)
+
+    def test_missing_ranges_raises(self):
+        with self.assertRaises(ValueError):
+            _align_pool_dim_labels(None, 6)
+
+    def test_wrong_rank_ranges_raises(self):
+        with self.assertRaises(ValueError):
+            _align_pool_dim_labels((2, 3, 8), 5)
 
 
 class TestSymbolKindDimension(InductorTestCase):

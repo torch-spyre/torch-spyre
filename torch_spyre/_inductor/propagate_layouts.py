@@ -870,6 +870,15 @@ def _multi_arg_pointwise_layouts(
             coord = try_device_coordinates(in_stl, arg.dep, ind_sizes)
             if coord is None or not is_stick_expr_offset_free(coord[-1], stick_size):
                 return False
+            # For indirect-access value tensors, the stick dimension cannot
+            # depend on the index symbol. If it does, a restickify will be needed
+            # to move the indirect coordinate away from the stick.
+            if arg.dep.name not in ind_names and ind_sizes:
+                stick_coord = coord[-1]
+                # Check if stick coordinate depends on any index symbol
+                for index_sym in ind_sizes:
+                    if index_sym in stick_coord.free_symbols:
+                        return False
         return True
 
     def _try_stick_dim(stick_dim):

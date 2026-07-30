@@ -107,11 +107,12 @@ _SPYRE_METADATA_ATTRS = (
 
 
 def copy_op_metadata(src: "ComputedBuffer", dst: "ComputedBuffer") -> None:
-    """Copy all Spyre pass metadata from src to dst.
+    """Copy non-provenance Spyre pass metadata from src to dst.
 
     Call this whenever a pass reconstructs a ComputedBuffer to ensure
     dim_hints, work-division hint metadata, and coarse-tiling attrs are not
-    silently dropped.
+    silently dropped. Source provenance is owned by the helpers in
+    ``provenance.py`` and is deliberately excluded from this bulk copy.
     """
     for attr in _SPYRE_METADATA_ATTRS:
         if hasattr(src, attr):

@@ -14,6 +14,7 @@
 
 """Tests for launching simple compiled ops through JobPlan execution."""
 
+import json
 import os
 import tempfile
 from typing import Tuple
@@ -142,6 +143,104 @@ class TestLaunchJobPlan(TestCase):
             with stream:
                 with pytest.raises(RuntimeError, match="Expect one DCI"):
                     torch_spyre._C.launch_jobplan(job_plan, [])
+
+
+def _build_d2h_jobplan(tmpdir: str, dev_ptr: int, size_bytes: int):
+    """Build a JobPlan with a single D2H DataTransfer step from dev_ptr.
+
+    prepare_kernel resolves a D2H whose dev_ptr is in a tensor segment into
+    JobPlanStepD2H whose device address is looked up from the launch args at
+    launch time.  This lets us drive that deferred path with mock SpyreCode
+    instead of relying on a particular backend-compiler output.
+    """
+    spyrecode_dir = os.path.join(tmpdir, "spyreCodeDir")
+    os.makedirs(spyrecode_dir, exist_ok=True)
+
+    spyrecode_json = {
+        "JobPreparationPlan": [
+            {"command": "Allocate", "properties": {"size": "1024"}},
+            {
+                "command": "InitTransfer",
+                "properties": {
+                    "init_bin_file": "init_binary.bin",
+                    "dev_ptr": "120259084288",
+                    "size": "1024",
+                },
+            },
+        ],
+        "JobExecPlan": [
+            {
+                "command": "DataTransfer",
+                "properties": {
+                    "dirn": "true",  # D2H
+                    "host_handle": "d2h_output",
+                    "dev_ptr": str(dev_ptr),
+                    "size": str(size_bytes),
+                },
+            },
+        ],
+    }
+    with open(os.path.join(spyrecode_dir, "spyrecode.json"), "w") as f:
+        json.dump(spyrecode_json, f)
+    with open(os.path.join(spyrecode_dir, "init_binary.bin"), "wb") as f:
+        f.write(b"\x00" * 1024)
+
+    return torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+
+class TestD2HFromTensorSegment(TestCase):
+    """Drive the D2H path via prepare_kernel +
+    launch_jobplan with mock SpyreCode.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _prepare_with_symbolic_args(self):
+        torch.zeros(1, device="spyre")
+        old_val = os.environ.get("BUNDLE_SYMBOLIC_ARGS")
+        os.environ["BUNDLE_SYMBOLIC_ARGS"] = "0"
+        try:
+            yield
+        finally:
+            if old_val is None:
+                os.environ.pop("BUNDLE_SYMBOLIC_ARGS", None)
+            else:
+                os.environ["BUNDLE_SYMBOLIC_ARGS"] = old_val
+
+    def test_tensor_segment_d2h_out_of_range(self):
+        """D2H from a tensor segment at offset 0 resolves and launches."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job_plan = _build_d2h_jobplan(tmpdir, 34359738368, 128)
+            assert job_plan.get_step_type(0) == "D2H"
+
+            inp = torch.zeros(128, dtype=torch.float16, device="spyre")
+            out = torch.zeros(128, dtype=torch.float16, device="spyre")
+            with pytest.raises(
+                RuntimeError, match="D2H tensor-segment lookup out of range"
+            ):
+                torch_spyre._C.launch_jobplan(job_plan, [inp, out])
+
+    def test_tensor_segment_d2h(self):
+        """D2H from a tensor segment at a non-zero offset
+        exercises the offset arithmetic in JobPlanStepD2H::construct."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job_plan = _build_d2h_jobplan(tmpdir, 0, 128)
+            assert job_plan.get_step_type(0) == "D2H"
+
+            inp = torch.zeros(128, dtype=torch.float16, device="spyre")
+            out = torch.zeros(128, dtype=torch.float16, device="spyre")
+            torch_spyre._C.launch_jobplan(job_plan, [inp, out])
+
+    def test_tensor_segment_d2h_out_of_bounds(self):
+        """D2H from a tensor segment at a non-zero offset
+        exercises the offset arithmetic in JobPlanStepD2H::construct."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job_plan = _build_d2h_jobplan(tmpdir, 256, 128)
+            assert job_plan.get_step_type(0) == "D2H"
+
+            inp = torch.zeros(128, dtype=torch.float16, device="spyre")
+            out = torch.zeros(128, dtype=torch.float16, device="spyre")
+            with pytest.raises(RuntimeError, match="D2H transfer out of bounds"):
+                torch_spyre._C.launch_jobplan(job_plan, [inp, out])
 
 
 if __name__ == "__main__":

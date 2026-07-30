@@ -36,6 +36,7 @@ from torch._inductor.ir import Operation
 from torch._inductor.scheduler import BaseSchedulerNode
 
 from .logging_utils import get_inductor_logger
+from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
 from .padding import insert_bmm_padding
 from .temp_passes import (
@@ -66,6 +67,7 @@ from .insert_restickify import (
     insert_post_mutation_restickify,
     insert_restickify,
 )
+from .enforce_indirect_access_layout import enforce_indirect_access_layout
 from .hbm_pool_planning import hbm_pool_planning
 from .work_division import (
     span_reduction,
@@ -77,7 +79,11 @@ from .scratchpad.allocator import (
     scratchpad_planning,
 )
 from .fusion import spyre_fuse_nodes
-from .scheduler import build_loop_scheduler_nodes
+from .scheduler import (
+    align_lx_producer_loop_order,
+    build_loop_scheduler_nodes,
+    demote_incoherent_lx_buffers,
+)
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
@@ -153,6 +159,9 @@ class _SpyreGraphPassPipeline(CustomGraphPass):
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
         if not self._has_spyre_device(graph):
             return
+        # FX-graph passes are already observed by upstream Inductor's
+        # GraphTransformObserver (populates node.meta["from_node"]); no Spyre
+        # observer is wrapped here.
         for p in self.passes:
             p(graph)
 
@@ -172,8 +181,17 @@ class _SpyreNodePassPipeline(CustomSchedulerPass):
     def __call__(self, target: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         if not self._has_spyre_device(target):
             return target
+        # This pipeline is a per-compile entry point for the observed passes,
+        # so clear the dedup here so each compile warns afresh.
+        reset_provenance_warnings()
         for pass_fn in self.passes:
-            target = pass_fn(target)
+            name = _get_pass_name(pass_fn)
+            observer = SpyreGraphTransformObserver(target, name, kind="node")
+            with observer:
+                target = pass_fn(target)
+                # Reconcile the returned list while recursively inspecting the
+                # underlying buffers through scheduler get_nodes().
+                observer.target = target
         return target
 
     def uuid(self) -> Any | None:
@@ -238,7 +256,16 @@ class CustomPreFusionPasses(_SpyreNodePassPipeline):
     # are visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return
     # False), so loop groups survive Inductor fusion intact.
     def __init__(self):
-        super().__init__([propagate_mutation_layouts, build_loop_scheduler_nodes])
+        # align_lx_producer_loop_order runs before build_loop_scheduler_nodes so
+        # it still sees plain SchedulerNodes (the only kind that can reorder
+        # their loops) rather than CountedLoopSchedulerNode wrappers.
+        super().__init__(
+            [
+                propagate_mutation_layouts,
+                align_lx_producer_loop_order,
+                build_loop_scheduler_nodes,
+            ]
+        )
 
 
 class CustomPostFusionPasses(_SpyreNodePassPipeline):
@@ -251,8 +278,12 @@ class CustomPostFusionPasses(_SpyreNodePassPipeline):
     """
 
     def __init__(self):
-        # HBM-Pool Planning
-        super().__init__([hbm_pool_planning, spyre_fuse_nodes])
+        # demote_incoherent_lx_buffers runs first: it re-checks LX core->slice
+        # coherence now that loop orders are final, and anything it demotes must
+        # still be visible to hbm_pool_planning as an unclaimed intermediate.
+        super().__init__(
+            [demote_incoherent_lx_buffers, hbm_pool_planning, spyre_fuse_nodes]
+        )
 
 
 # Several pre-scheduling steps are config-gated or need arguments beyond the
@@ -391,6 +422,7 @@ class CustomPreSchedulingPasses:
             optimize_restickify_locations,
             finalize_layouts,
             insert_restickify,
+            enforce_indirect_access_layout,
             insert_post_mutation_restickify,
             insert_bmm_padding,
             #
@@ -413,22 +445,31 @@ class CustomPreSchedulingPasses:
         if not _operations_have_spyre_device(graph.operations):
             return
 
+        # This pipeline is a per-compile entry point for the observed passes,
+        # so clear the dedup here so each compile warns afresh.
+        reset_provenance_warnings()
+
         if logger.isEnabledFor(logging.INFO):
             logger.info(
                 "BEFORE PRE-SCHEDULING\n%s", format_operations(graph.operations)
             )
 
         for pass_fn in self.passes:
-            t0 = time.perf_counter()
-            pass_fn(graph)
+            pass_name = _get_pass_name(pass_fn)
+            # `graph` is the same object throughout -- passes mutate
+            # `graph.operations` in place -- so before/after reconciliation
+            # is exact here.
+            with SpyreGraphTransformObserver(graph, pass_name, kind="graphlowering"):
+                t0 = time.perf_counter()
+                pass_fn(graph)
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+
             if logger.isEnabledFor(logging.INFO):
                 logger.info(
                     "elapsed %5dms  %s",
-                    (time.perf_counter() - t0) * 1000,
-                    _get_pass_name(pass_fn),
+                    elapsed_ms,
+                    pass_name,
                 )
-
-            pass_name = _get_pass_name(pass_fn)
             if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):
                 logger.debug(
                     "AFTER %s\n%s", pass_name, format_operations(graph.operations)
