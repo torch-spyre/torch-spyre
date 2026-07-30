@@ -1038,10 +1038,6 @@ def generate_sdsc(
         """
         return [d for d in dims if str(d) not in sdsc_spec.window_dims]
 
-    def _tensor_layout_dims(layout_key: str) -> list:
-        """Return the layout dim_order for a layout label, minus window dims."""
-        return _filter_window_dims(sdsc_spec.layouts[layout_key]["dim_order"])
-
     def _tensor_sched_layout_dims(dim_order: list) -> list:
         """Return a tensor's own dim_order for scheduleTree_, minus window dims.
 
@@ -1188,7 +1184,10 @@ def generate_sdsc(
                             "primaryDsInfo_": {
                                 label: {
                                     "layoutDimOrder_": [
-                                        str(dim) for dim in _tensor_layout_dims(label)
+                                        str(dim)
+                                        for dim in _filter_window_dims(
+                                            layout_info["dim_order"]
+                                        )
                                     ],
                                     "stickDimOrder_": [
                                         str(layout_info["stick_dim_order"])
@@ -1233,7 +1232,9 @@ def generate_sdsc(
                                     ],
                                     "maxDimSizes_": [
                                         tensor.max_dim_sizes[dim]
-                                        for dim in _tensor_layout_dims(tensor.layout)
+                                        for dim in _tensor_sched_layout_dims(
+                                            tensor.dim_order
+                                        )
                                     ],
                                     **_build_indirect_access_fields(
                                         sdsc_spec, tensor, i
@@ -1281,8 +1282,8 @@ def generate_sdsc(
                                                 if str(dim)
                                                 in {
                                                     str(d)
-                                                    for d in _tensor_layout_dims(
-                                                        tensor.layout
+                                                    for d in _tensor_sched_layout_dims(
+                                                        tensor.dim_order
                                                     )
                                                 }
                                             }
@@ -1320,8 +1321,10 @@ def generate_sdsc(
                                                     i < sdsc_spec.num_inputs,
                                                 ),
                                             )
-                                            for dim in _tensor_layout_dims(
-                                                tensor.layout
+                                            for dim in _filter_window_dims(
+                                                sdsc_spec.layouts[tensor.layout][
+                                                    "dim_order"
+                                                ]
                                             )
                                         },
                                         "coreIdToWkSlice_": {},
@@ -1336,7 +1339,11 @@ def generate_sdsc(
                                     "dsType_": tensor.layout,
                                     "scale_": [
                                         tensor.scales[dim]
-                                        for dim in _tensor_layout_dims(tensor.layout)
+                                        for dim in _filter_window_dims(
+                                            sdsc_spec.layouts[tensor.layout][
+                                                "dim_order"
+                                            ]
+                                        )
                                     ],
                                     "wordLength": num_bytes(tensor.data_format),
                                     "dataFormat_": tensor.data_format.name,

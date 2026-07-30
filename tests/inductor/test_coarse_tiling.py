@@ -80,6 +80,7 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _full_buffer_read_deps,
     _insert_read_copy_ops,
     _replace_group_op,
+    _rescale_index,
     _retile_load_index_from_strides,
     _should_patch_retiled_load_indexes,
     _stride_rewrite_map,
@@ -4435,19 +4436,47 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         ):
             _propagate_tiled_op(tiled_op, operations)
 
-        copy_ops = [
+        # tiled_op's own two inputs are real, full-size, untiled InputBuffers
+        # read at a tile-scoped index -- _full_buffer_read_deps now flags
+        # both, so _insert_read_copy_ops replaces tiled_op with a new
+        # ComputedBuffer (same name, "op0") before the write-side copy-op
+        # logic below even runs. Look the final op up by name rather than
+        # using the now-stale tiled_op reference.
+        final_op = V.graph.name_to_buffer["op0"]
+        # name_to_buffer is only half the story: replace_computed_buffer_body
+        # must also have swapped the stale tiled_op out of operations (==
+        # V.graph.buffers, see the comment above where it's assigned) for
+        # later scheduling to see the new op instead of the old one. Checked
+        # by identity (`is`), not `in`/`==`: ComputedBuffer is a frozen
+        # dataclass, so `==` compares field values rather than object
+        # identity, and tiled_op/final_op share the same (in-place-mutated)
+        # `.data` and layout -- they compare equal to each other even though
+        # only final_op is the live object, which makes assertIn/assertNotIn
+        # pass regardless of whether the swap actually happened.
+        self.assertTrue(any(op is final_op for op in operations))
+        self.assertFalse(any(op is tiled_op for op in operations))
+
+        write_copy_ops = [
             op
             for op in operations
             if isinstance(op, ComputedBuffer)
             and op.get_name().startswith("coarse_tile_copy_")
         ]
-        self.assertEqual(len(copy_ops), 1)
-        self.assertIsInstance(copy_ops[0].layout, MutationLayoutSHOULDREMOVE)
-        # The original tiled op itself never becomes a
-        # MutationLayoutSHOULDREMOVE -- it keeps its own tile-sized layout
-        # and is marked per_tile_fixed instead, mirroring the Case 1 path.
-        self.assertNotIsInstance(tiled_op.layout, MutationLayoutSHOULDREMOVE)
-        self.assertTrue(getattr(tiled_op, "_pending_per_tile_fixed", False))
+        read_copy_ops = [
+            op
+            for op in operations
+            if isinstance(op, ComputedBuffer)
+            and op.get_name().startswith("coarse_tile_read_copy_")
+        ]
+        self.assertEqual(len(write_copy_ops), 1)
+        self.assertIsInstance(write_copy_ops[0].layout, MutationLayoutSHOULDREMOVE)
+        # Both real inputs get their own read copy.
+        self.assertEqual(len(read_copy_ops), 2)
+        # The tiled op itself never becomes a MutationLayoutSHOULDREMOVE --
+        # it keeps its own tile-sized layout and is marked per_tile_fixed
+        # instead, mirroring the Case 1 path.
+        self.assertNotIsInstance(final_op.layout, MutationLayoutSHOULDREMOVE)
+        self.assertTrue(getattr(final_op, "_pending_per_tile_fixed", False))
 
 
 def _make_cross_group_producer_read_fixture():
@@ -4922,6 +4951,94 @@ class TestInsertReadCopyOps(unittest.TestCase):
             ElementArrangement.STANDARD,
         )
         self.assertEqual(copy_buf.layout.device_layout, expected_device_layout)
+
+
+class TestRescaleIndex(unittest.TestCase):
+    """Direct unit coverage for _rescale_index's coefficient matching.
+
+    _insert_read_copy_ops's own tests exercise _rescale_index only
+    indirectly, through whatever index shapes its fixtures happen to
+    produce. These tests call it directly with hand-built indexes so the
+    matching rules documented on _rescale_index itself -- largest-stride-
+    first, and the sympy.simplify fallback for non-structurally-equal but
+    symbolically-equal coefficients -- are locked in cheaply.
+    """
+
+    def test_plain_concrete_strides(self):
+        # full_strides/tile_strides are always sympy Expr in the real
+        # calling convention (dep.index.coeff(...) and a
+        # sympy.Integer(1)-seeded running product in
+        # _insert_read_copy_ops) -- never raw Python ints. Use
+        # sympy.Integer throughout so these tests match that convention.
+        c0, c1 = sympy.symbols("c0 c1")
+        index = c0 * 128 + c1 * 4
+        result = _rescale_index(
+            index,
+            [sympy.Integer(128), sympy.Integer(4)],
+            [sympy.Integer(32), sympy.Integer(4)],
+        )
+        self.assertEqual(sympy.expand(result), sympy.expand(c0 * 32 + c1 * 4))
+
+    def test_constant_offset_term_is_preserved(self):
+        c0 = sympy.symbols("c0")
+        index = c0 * 128 + 5
+        result = _rescale_index(index, [sympy.Integer(128)], [sympy.Integer(32)])
+        self.assertEqual(sympy.expand(result), sympy.expand(c0 * 32 + 5))
+
+    def test_symbolic_stride_structurally_equal(self):
+        c0, c1 = sympy.symbols("c0 c1")
+        s0 = sympy.Symbol("s0", positive=True)
+        index = c0 * s0 + c1
+        result = _rescale_index(
+            index, [s0, sympy.Integer(1)], [sympy.Integer(4), sympy.Integer(1)]
+        )
+        self.assertEqual(sympy.expand(result), sympy.expand(c0 * 4 + c1))
+
+    def test_symbolic_stride_simplify_fallback(self):
+        # coeff and full_stride describe the same dimension but are not
+        # structurally identical sympy expressions (2*(s0 + 1) vs
+        # 2*s0 + 2) -- only equal after simplification. Exercises the
+        # sympy.simplify(coeff - full_stride) == 0 fallback.
+        c0 = sympy.symbols("c0")
+        s0 = sympy.Symbol("s0", positive=True)
+        full_stride = 2 * (s0 + 1)
+        coeff_form = 2 * s0 + 2
+        index = coeff_form * c0
+        result = _rescale_index(index, [full_stride], [sympy.Integer(4)])
+        self.assertEqual(sympy.expand(result), sympy.expand(4 * c0))
+
+    def test_duplicate_stride_matches_largest_dimension_first(self):
+        # A size-[1, 16] shape's dim-0 stride (16) coincides with a
+        # size-[M, 16] shape's dim-1 full extent (also 16) -- both 16 here,
+        # but the two entries must still be told apart. Largest-first
+        # matching consumes the larger/earlier dimension's entry before the
+        # degenerate extent-1 one, so each loop variable's term lands on the
+        # tile_stride for its own dimension rather than swapping with the
+        # other.
+        c0, c1 = sympy.symbols("c0 c1")
+        index = c0 * 16 + c1 * 16
+        result = _rescale_index(
+            index,
+            [sympy.Integer(16), sympy.Integer(16)],
+            [sympy.Integer(8), sympy.Integer(2)],
+        )
+        # Both full_strides are equal (16), so which tile_stride pairs with
+        # which term is only distinguished by iteration/removal order, not
+        # by any property of c0 vs c1 -- assert the invariant _rescale_index
+        # actually guarantees: every term is rescaled by *some* consumed
+        # tile_stride, each tile_stride used exactly once, and no term is
+        # dropped or duplicated.
+        expected_options = {
+            sympy.expand(c0 * 8 + c1 * 2),
+            sympy.expand(c0 * 2 + c1 * 8),
+        }
+        self.assertIn(sympy.expand(result), expected_options)
+
+    def test_no_matching_stride_raises(self):
+        c0 = sympy.symbols("c0")
+        index = c0 * 128
+        with self.assertRaises(RuntimeError):
+            _rescale_index(index, [sympy.Integer(4)], [sympy.Integer(4)])
 
 
 def _make_tiled_reduction_op(
