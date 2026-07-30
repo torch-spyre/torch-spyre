@@ -197,9 +197,10 @@ POOL_DIM_LABELS = ["mb", "i", "j", "out", "ki", "kj"]
 # Canonical conv2d iteration-space order, mirroring POOL_DIM_LABELS: batch,
 # out-H, out-W, out-channel, in-channel (the contraction dim), kernel-H,
 # kernel-W. Like the pool labels, these SDSC strings are owned by the codegen
-# layer; the lowering supplies only per-role dim sizes (op_info["conv_dim_sizes"]),
-# never these strings, so SDSC naming does not leak above codegen. Codegen maps
-# each role to a label (see _CONV_ROLE_LABELS in codegen/superdsc.py) and drops
-# statically size-1 roles (e.g. batch N==1) to stay aligned with the surviving
-# iteration-space dims.
+# layer; per-role dim sizes are derived from the node's live IR ranges
+# (OpSpec.node_output_ranges + node_reduction_ranges), never from these strings,
+# so SDSC naming does not leak above codegen. Codegen maps each role to a label
+# (see _CONV_ROLE_LABELS in codegen/superdsc.py) and drops statically size-1
+# roles (e.g. batch N==1) to stay aligned with the surviving iteration-space
+# dims.
 CONV_DIM_LABELS = ["mb", "i", "j", "out", "in", "ki", "kj"]

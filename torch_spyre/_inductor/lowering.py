@@ -911,25 +911,12 @@ def lower_convolution(
             "dil_h": dilH,
             "dil_w": dilW,
         },
-        # Canonical size of each conv iteration-space dim, keyed by its
-        # conv-domain role.  The codegen layer owns the SDSC label names and maps
-        # these roles onto them (see CONV_DIM_LABELS / _CONV_ROLE_LABELS /
-        # _align_conv_dim_labels in codegen/superdsc.py), so SDSC naming never
-        # leaks above codegen -- mirroring the avgpool pool_dim_sizes contract.
-        #
-        # The pipeline drops statically size-1 dims from the iteration space
-        # before parse_op_spec runs (e.g. batch N==1, or ki/kj for a 1x1 kernel),
-        # so codegen uses these sizes to drop the corresponding labels and stay
-        # aligned with the surviving dims -- never inferring roles from sizes.
-        "conv_dim_sizes": {
-            "batch": N,
-            "out_h": H_out,
-            "out_w": W_out,
-            "channel": C_out,
-            "in_channel": C_in,
-            "win_h": kH,
-            "win_w": kW,
-        },
+        # NOTE: conv iteration-space dim sizes are NOT snapshotted here.  Codegen
+        # derives each dim role's size from the node's live IR ranges instead
+        # (output NCHW ranges + reduction ranges; see _conv_role_sizes /
+        # _align_conv_dim_labels in codegen/superdsc.py), so views and
+        # device-layout assignment stay authoritative -- mirroring the avgpool
+        # move off op_info["pool_dim_sizes"] to OpSpec.node_output_ranges.
     }
 
     def inner_fn(index, reduction_index):

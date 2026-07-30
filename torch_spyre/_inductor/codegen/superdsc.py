@@ -362,9 +362,9 @@ _POOL_ROLE_LABELS = list(
 
 # Canonical conv2d iteration-space order -> SDSC labels, mirroring
 # _POOL_ROLE_LABELS.  Conv adds the ``in_channel`` contraction role between the
-# output channel and the kernel taps.  Codegen owns these strings; the lowering
-# supplies only per-role sizes (op_info["conv_dim_sizes"]).  Order matches
-# CONV_DIM_LABELS.
+# output channel and the kernel taps.  Codegen owns these strings; per-role
+# sizes are sourced from the node's live IR ranges (see _conv_role_sizes).
+# Order matches CONV_DIM_LABELS.
 _CONV_ROLE_LABELS = list(
     zip(
         ["batch", "out_h", "out_w", "channel", "in_channel", "win_h", "win_w"],
@@ -419,29 +419,49 @@ def _align_pool_dim_labels(node_output_ranges, ndim: int) -> list[str]:
     return labels
 
 
-def _align_conv_dim_labels(op_info: dict, ndim: int) -> list[str]:
+def _conv_role_sizes(node_output_ranges, node_reduction_ranges) -> dict:
+    """Map each conv dim role to its live size from the node's IR ranges.
+
+    Replaces the lowering-time ``conv_dim_sizes`` snapshot: the output roles come
+    from the node's NCHW output ranges ``[N, C_out, H_out, W_out]`` and the
+    reduction roles from its reduction ranges ``[C_in, kH, kW]`` — both tracked
+    by the compiler (views, device-layout assignment) rather than frozen at
+    lowering.  Sourcing sizes from live IR keeps label alignment robust when the
+    compiler rewrites shapes before codegen.
+    """
+    return {
+        "batch": node_output_ranges[0],
+        "channel": node_output_ranges[1],
+        "out_h": node_output_ranges[2],
+        "out_w": node_output_ranges[3],
+        "in_channel": node_reduction_ranges[0],
+        "win_h": node_reduction_ranges[1],
+        "win_w": node_reduction_ranges[2],
+    }
+
+
+def _align_conv_dim_labels(role_sizes: dict, ndim: int) -> list[str]:
     """Return the conv dim labels aligned to the (possibly squeezed) iteration space.
 
-    Conv mirrors the pool contract: the lowering supplies ``conv_dim_sizes`` —
-    each conv-domain dim role (batch, out_h, out_w, channel, in_channel, win_h,
-    win_w) mapped to its canonical size — and codegen owns the SDSC label for
-    each role (``_CONV_ROLE_LABELS``).  The pipeline drops statically size-1 dims
-    (e.g. batch N=1, or ki/kj for a 1x1 kernel) before parse_op_spec runs, so a
-    role whose canonical size is 1 has no surviving dim and its label is filtered
-    out here.  Keeps labels aligned to the real iteration space without inferring
-    dim roles from sizes.
+    ``role_sizes`` maps each conv-domain dim role (batch, out_h, out_w, channel,
+    in_channel, win_h, win_w) to its live size, sourced from the node's IR ranges
+    (see ``_conv_role_sizes``).  Codegen owns the SDSC label for each role
+    (``_CONV_ROLE_LABELS``).  The pipeline drops statically size-1 dims (e.g.
+    batch N=1, or ki/kj for a 1x1 kernel) before parse_op_spec runs, so a role
+    whose size is 1 has no surviving dim and its label is filtered out here.
+    Keeps labels aligned to the real iteration space without inferring dim roles
+    from sizes.
     """
-    sizes = op_info.get("conv_dim_sizes", {})
     labels = [
         label
         for role, label in _CONV_ROLE_LABELS
-        if not _is_static_one(sizes.get(role))
+        if not _is_static_one(role_sizes.get(role))
     ]
     if len(labels) != ndim:
         raise ValueError(
             f"conv dim label count {len(labels)} ({labels}) does not match "
-            f"iteration-space rank {ndim}; conv_dim_sizes in the lowering are "
-            "out of sync with the emitted iteration space"
+            f"iteration-space rank {ndim}; conv IR ranges are out of sync with "
+            "the emitted iteration space"
         )
     return labels
 
@@ -1024,23 +1044,31 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     has_indirect_access = bool(index_tensor_indices)
 
     symbol_mapping = None
-    if is_conv and op_spec.op_info:
-        # Conv supplies role-keyed conv_dim_sizes; codegen owns the labels
-        # (_CONV_ROLE_LABELS) and drops squeezed size-1 roles.  Unlike pool, conv
-        # is a Reduction whose iteration space appends its reduction axes
-        # (in/ki/kj) in data-dependent read-dep access order, so the contraction
-        # dim (in) can land after the kernel taps (ki/kj) and a positional label
-        # assignment mislabels dims.  Assign conv labels by matching each dim's
-        # raw (pre-padding) size, which the iteration space carries exactly;
-        # falls back to positional when sizes are non-static or unmatched.
-        dim_labels = _align_conv_dim_labels(op_spec.op_info, ndim)
-        conv_sizes = op_spec.op_info.get("conv_dim_sizes")
-        if conv_sizes is not None:
-            symbol_mapping = _match_labels_by_size(
-                op_spec.iteration_space,
-                [label for _role, label in _CONV_ROLE_LABELS],
-                [conv_sizes.get(role) for role, _label in _CONV_ROLE_LABELS],
-            )
+    if (
+        is_conv
+        and op_spec.node_output_ranges is not None
+        and op_spec.node_reduction_ranges is not None
+    ):
+        # Conv sources its dim-role sizes from the node's live IR ranges (NCHW
+        # output ranges + reduction ranges) rather than a lowering-time size
+        # snapshot, so views / device-layout assignment stay authoritative.
+        # Codegen owns the labels (_CONV_ROLE_LABELS) and drops squeezed size-1
+        # roles.  Unlike pool, conv is a Reduction whose iteration space appends
+        # its reduction axes (in/ki/kj) in data-dependent read-dep access order,
+        # so the contraction dim (in) can land after the kernel taps (ki/kj) and
+        # a positional label assignment mislabels dims.  Assign conv labels by
+        # matching each dim's raw (pre-padding) size, which the iteration space
+        # carries exactly; falls back to positional when sizes are non-static or
+        # unmatched.
+        role_sizes = _conv_role_sizes(
+            op_spec.node_output_ranges, op_spec.node_reduction_ranges
+        )
+        dim_labels = _align_conv_dim_labels(role_sizes, ndim)
+        symbol_mapping = _match_labels_by_size(
+            op_spec.iteration_space,
+            [label for _role, label in _CONV_ROLE_LABELS],
+            [role_sizes.get(role) for role, _label in _CONV_ROLE_LABELS],
+        )
     elif is_pool:
         # Pool survival is read from the node's live output ranges (NCHW); the
         # lowering supplies no size snapshot.  Positional mapping (below) is
