@@ -45,11 +45,13 @@ from torch._inductor.virtualized import V
 
 from . import config
 from torch_spyre._C import (
+    DataFormats,
     ElementArrangement,
     SpyreTensorLayout,
     get_device_dtype,
     get_elem_in_stick,
 )
+from .dtype_ops import bool_equivalent_dtype
 from .errors import Unsupported
 from .constants import (
     BATCH_MATMUL_OP,
@@ -132,6 +134,67 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
     return get_elem_in_stick(t1) == get_elem_in_stick(t2)
 
 
+def infer_bool_device_dtype(args: list[PropArg]) -> DataFormats:
+    """Infer the on-device format for a torch.bool pointwise output.
+
+    Spyre has no native bool: a bool tensor reuses the physical format of its
+    producing operands. fp16 operands produce SEN169_FP16 bool (64 elems/stick);
+    fp32 operands produce IEEE_FP32 bool (32 elems/stick). This must match the
+    operand format because multi-arg pointwise ops require all args to share the
+    same stick element size.
+
+    Type promotion guarantees that all pointwise operands share one format, so
+    any operand's device layout reveals the output format.
+    """
+    formats = {stl.device_dtype for arg in args for stl in arg.layouts}
+    if len(formats) != 1 or bool_equivalent_dtype(next(iter(formats))) is None:
+        raise Unsupported(
+            f"torch.bool result from operands with device format(s) {formats}"
+        )
+    (device_dtype,) = formats
+    return device_dtype
+
+
+def _bool_layout_dtype(
+    device_dtype: DataFormats, context: str = "result"
+) -> torch.dtype:
+    """Return the logical dtype for a bool tensor stored as `device_dtype`.
+
+    Raises Unsupported if `device_dtype` has no bool-equivalent dtype.
+    """
+    dtype_for_layout = bool_equivalent_dtype(device_dtype)
+    if dtype_for_layout is None:
+        raise Unsupported(
+            f"torch.bool {context} of operand with device format {device_dtype}"
+        )
+    return dtype_for_layout
+
+
+def resolve_bool_layout_dtype(
+    stl: SpyreTensorLayout, context: str = "result"
+) -> torch.dtype:
+    """Return the logical dtype for a bool tensor physically stored as `stl`."""
+    return _bool_layout_dtype(stl.device_dtype, context)
+
+
+def resolve_output_formats(
+    output_dtype: torch.dtype,
+    bool_device_dtype: DataFormats | None,
+    context: str = "result",
+) -> tuple[DataFormats, torch.dtype]:
+    """Resolve an op output's ``(device_dtype, layout_dtype)`` pair.
+
+    Non-bool outputs derive both from ``output_dtype``. For bool outputs,
+    ``get_device_dtype(torch.bool)`` hardcodes SEN169_FP16 -- wrong for e.g. a
+    float32 comparison result -- so the caller supplies the real on-device
+    format in ``bool_device_dtype`` (read off the producing operand(s)).
+    """
+    if output_dtype == torch.bool:
+        assert bool_device_dtype is not None, "bool output needs bool_device_dtype"
+        return bool_device_dtype, _bool_layout_dtype(bool_device_dtype, context)
+    return get_device_dtype(output_dtype), output_dtype
+
+
 def _compute_dim_order(stick_dim, size, coords):
     """Order dimensions with stick_dim last, placing size-one dimensions to the right to avoid tiling."""
     dim_order = [d for d in range(len(size)) if d != stick_dim and coords[d] != 0]
@@ -147,33 +210,35 @@ def _pick_stick_dim(stick_expr, out_coords) -> int:
 
 
 def _output_stl_from_stick_expr(
-    stick_expr, output, output_dep, c_size, c_stride
+    stick_expr, output, output_dep, c_size, c_stride, dtype=None
 ) -> SpyreTensorLayout | None:
     """If stick_expr is offset-free, build an output STL with it mapped to the right dim.
 
     Returns None if stick_expr has an offset (caller should fall back to scanning).
     """
-    stick_size = get_elem_in_stick(output.dtype)
+    dtype = output.dtype if dtype is None else dtype
+    stick_size = get_elem_in_stick(dtype)
     if not is_stick_expr_offset_free(stick_expr, stick_size):
         return None
     out_coords = host_coordinates(output, output_dep, None)
     out_stick_dim = _pick_stick_dim(stick_expr, out_coords)
-    return _make_output_stl(output, output_dep, c_size, c_stride, out_stick_dim)
+    return _make_output_stl(output, output_dep, c_size, c_stride, out_stick_dim, dtype)
 
 
 def _make_output_stl(
-    output, output_dep, c_size, c_stride, stick_dim
+    output, output_dep, c_size, c_stride, stick_dim, dtype=None
 ) -> SpyreTensorLayout | None:
     """Build a candidate output STL with stick_dim last and verify the resulting stick is offset-free.
 
     Returns None if the resulting stick expression has an offset.
     """
-    stick_size = get_elem_in_stick(output.dtype)
+    dtype = output.dtype if dtype is None else dtype
+    stick_size = get_elem_in_stick(dtype)
     if stick_dim >= 0 and c_size[stick_dim] == 1:
         return None
     out_coords = host_coordinates(output, output_dep, None)
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
-    stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
+    stl = SpyreTensorLayout(c_size, c_stride, dtype, dim_order)
     coords = device_coordinates(stl, output_dep, None)
     if is_stick_expr_offset_free(coords[-1], stick_size):
         return stl
@@ -185,8 +250,8 @@ def _candidate_output_stls(
     output_dep: MemoryDep,
     c_size: list,
     c_stride: list,
-    stick_size: int,
     skip_stick_expr: sympy.Expr,
+    dtype=None,
 ) -> list[SpyreTensorLayout]:
     """Enumerate candidate output STLs by trying each dim as the stick.
 
@@ -195,6 +260,8 @@ def _candidate_output_stls(
     out_coords = host_coordinates(output, output_dep, None)
     skip_dim = _pick_stick_dim(skip_stick_expr, out_coords)
 
+    dtype = output.dtype if dtype is None else dtype
+    stick_size = get_elem_in_stick(dtype)
     result = []
     for alt_stick_dim in range(len(output.size)):
         if alt_stick_dim == skip_dim:
@@ -202,7 +269,9 @@ def _candidate_output_stls(
         if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
             # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
             continue
-        stl = _make_output_stl(output, output_dep, c_size, c_stride, alt_stick_dim)
+        stl = _make_output_stl(
+            output, output_dep, c_size, c_stride, alt_stick_dim, dtype
+        )
         if stl is not None:
             result.append(stl)
     return result
@@ -310,9 +379,13 @@ def _single_arg_op_layout(
     data = op.data
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
-    stick_size = get_elem_in_stick(output.dtype)
 
     if isinstance(data, Reduction):
+        # A bool result's physical format matches its operand's, not
+        # get_elem_in_stick(torch.bool)'s hardcoded SEN169_FP16.
+        out_dtype_for_layout = resolve_output_formats(output.dtype, stl.device_dtype)[1]
+        stick_size = get_elem_in_stick(out_dtype_for_layout)
+
         x_dev_coords = device_coordinates(stl, dep, None)
         x_stick_expr = x_dev_coords[-1]
         reduction_var = next(
@@ -329,7 +402,7 @@ def _single_arg_op_layout(
         ):
             # Try to preserve input layout
             out_stl = _output_stl_from_stick_expr(
-                x_stick_expr, output, output_dep, c_size, c_stride
+                x_stick_expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
             )
             if out_stl is not None:
                 return [out_stl]
@@ -354,7 +427,12 @@ def _single_arg_op_layout(
                 if out_stick_dim < 0:
                     continue
             out_stl = _make_output_stl(
-                output, output_dep, c_size, c_stride, out_stick_dim
+                output,
+                output_dep,
+                c_size,
+                c_stride,
+                out_stick_dim,
+                out_dtype_for_layout,
             )
             if out_stl is not None:
                 layouts.append(out_stl)
@@ -366,8 +444,9 @@ def _single_arg_op_layout(
     origin_node = next(iter(data.origins))
     aten_op = origin_node.target
     match aten_op:
-        case prims.convert_element_type.default if not same_device_size(
-            in_layout.dtype, output.dtype
+        case prims.convert_element_type.default if (
+            output.dtype != torch.bool
+            and stl.elems_per_stick() != get_elem_in_stick(output.dtype)
         ):
             # Type conversion may require padding when input has padding due to stick
             # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),
@@ -457,20 +536,29 @@ def _single_arg_op_layout(
                 _rescale_stl_for_dtype(stl, output.dtype, ElementArrangement.QFP8CH)
             ]
 
+    # For a bool output this op is dtype-preserving data movement or a
+    # same-width reinterpret (reshape/transpose/etc); reuse the input STL's
+    # physical format directly.
+    out_device_dtype, out_dtype_for_layout = resolve_output_formats(
+        output.dtype, stl.device_dtype
+    )
+
     in_coords = host_coordinates(in_layout, dep, None)
     out_coords = host_coordinates(output, output_dep, None)
     if (
         in_coords == out_coords
         and in_layout.size == output.size
         and dep.index == output_dep.index
-        and same_device_size(in_layout.dtype, output.dtype)
+        and same_device_size(in_layout.dtype, out_dtype_for_layout)
     ):
         # Input and output tensors are being accessed identically and elem size is the same.
         # We can simply propagate the device_layout including ElementArrangement.
+        # out_device_dtype resolves the correct physical format for bool outputs
+        # (get_device_dtype(bool) would hardcode SEN169_FP16).
         stl = SpyreTensorLayout(
             stl.device_size,
             stl.stride_map,
-            get_device_dtype(output.dtype),
+            out_device_dtype,
             stl.element_arrangement,
         )
         return [stl]
@@ -482,12 +570,17 @@ def _single_arg_op_layout(
 
     # Try to preserve input layout, fall back to scanning all output dims
     out_stl = _output_stl_from_stick_expr(
-        stick_expr, output, output_dep, c_size, c_stride
+        stick_expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
     )
     if out_stl is not None:
         return [out_stl]
     return _candidate_output_stls(
-        output, output_dep, c_size, c_stride, stick_size, stick_expr
+        output,
+        output_dep,
+        c_size,
+        c_stride,
+        stick_expr,
+        out_dtype_for_layout,
     )
 
 
@@ -520,12 +613,20 @@ def _clone_layout(
     in_stl = next(iter(args[0].layouts))
     in_device_coords = device_coordinates(in_stl, in_dep, None)
     stick_expr = in_device_coords[-1]
-    stick_size = get_elem_in_stick(output.dtype)
+
+    # Clone preserves physical format, so a bool output must match its
+    # input's -- substitute the equivalent logical dtype since
+    # get_device_dtype(torch.bool) can't express that.
+    if output.dtype == torch.bool:
+        dtype_for_layout = resolve_bool_layout_dtype(in_stl, "clone")
+    else:
+        dtype_for_layout = output.dtype
+    stick_size = get_elem_in_stick(dtype_for_layout)
 
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
     out_stl = SpyreTensorLayout(
-        c_size, c_stride, output.dtype, list(range(len(output.size)))
+        c_size, c_stride, dtype_for_layout, list(range(len(output.size)))
     )
 
     if is_stick_expr_offset_free(stick_expr, stick_size):
@@ -543,7 +644,7 @@ def _clone_layout(
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     required_in_stl = None
     for candidate in _candidate_output_stls(
-        output, output_dep, c_size, c_stride, stick_size, stick_expr
+        output, output_dep, c_size, c_stride, stick_expr, dtype_for_layout
     ):
         target_stick = device_coordinates(candidate, output_dep, None)[-1]
         target_stl = compute_restickify_target_layout(
@@ -834,6 +935,15 @@ def _multi_arg_pointwise_layouts(
         if dc is not None
     }
 
+    # A bool output reuses its operands' physical format (resolved from args);
+    # get_device_dtype(torch.bool) would hardcode SEN169_FP16.
+    bool_device_dtype = (
+        infer_bool_device_dtype(args) if output.dtype == torch.bool else None
+    )
+    out_device_dtype, out_dtype_for_layout = resolve_output_formats(
+        output.dtype, bool_device_dtype
+    )
+
     # If the indexing and device element size are identical
     # across all inputs and the output we can just propagate the device layout.
     in_coords = [host_coordinates(arg.layout, arg.dep, ind_sizes) for arg in args]
@@ -848,12 +958,12 @@ def _multi_arg_pointwise_layouts(
                 arg_coors != out_coords
                 or arg.layout.size != output.size
                 or arg.dep.index != output_dep.index
-                or not same_device_size(arg.layout.dtype, output.dtype)
+                or not same_device_size(arg.layout.dtype, out_dtype_for_layout)
             ):
                 can_use_same_layout = False
                 break
 
-    stick_size = get_elem_in_stick(output.dtype)
+    stick_size = get_elem_in_stick(out_dtype_for_layout)
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
 
@@ -865,7 +975,11 @@ def _multi_arg_pointwise_layouts(
             c_in_size = [concretize_expr(s) for s in arg.layout.size]
             c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
             in_stl = SpyreTensorLayout(
-                c_in_size, c_in_stride, output.dtype, projected_dim_order, output_ea
+                c_in_size,
+                c_in_stride,
+                out_dtype_for_layout,
+                projected_dim_order,
+                output_ea,
             )
             coord = try_device_coordinates(in_stl, arg.dep, ind_sizes)
             if coord is None or not is_stick_expr_offset_free(coord[-1], stick_size):
@@ -885,7 +999,9 @@ def _multi_arg_pointwise_layouts(
         dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
         if _is_supported_layout(dim_order):
             results.append(
-                SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order, output_ea)
+                SpyreTensorLayout(
+                    c_size, c_stride, out_dtype_for_layout, dim_order, output_ea
+                )
             )
 
     results: list[SpyreTensorLayout] = []
@@ -896,7 +1012,7 @@ def _multi_arg_pointwise_layouts(
             SpyreTensorLayout(
                 template_stl.device_size,
                 template_stl.stride_map,
-                get_device_dtype(output.dtype),
+                out_device_dtype,
                 output_ea,
             )
         )
@@ -1210,7 +1326,7 @@ def _find_alt_target_stl(
     c_size = [concretize_expr(s) for s in target_layout.size]
     c_stride = [concretize_expr(s) for s in target_layout.stride]
     candidates = _candidate_output_stls(
-        target_layout, output_dep, c_size, c_stride, stick_size, write_stick
+        target_layout, output_dep, c_size, c_stride, write_stick
     )
     if not candidates:
         raise Unsupported(
