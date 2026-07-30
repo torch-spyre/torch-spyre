@@ -22,7 +22,6 @@ test_suite_config:
             - TestSelectAlgorithm::test_cpp_coordinate_descent_tuning
             - TestSelectAlgorithm::test_cpp_weight_prune
             - TestSelectAlgorithm::test_grouped_linear
-            - TestSelectAlgorithm::test_grouped_linear_epilogue
             - TestSelectAlgorithm::test_grouped_linear_invalid
             - TestSelectAlgorithm::test_int4_concat_woq_mm
             - TestSelectAlgorithm::test_int4_woq_mm_amx
@@ -68,7 +67,8 @@ test_suite_config:
             - TestSelectAlgorithm::test_linear_with_permute
             - TestSelectAlgorithm::test_local_and_global_accumulator
             - TestSelectAlgorithm::test_qlinear_pointwise_int8_layout
-          mode: xfail  # xfail: UNKNOWN
+            - TestSelectAlgorithm::test_grouped_linear_epilogue
+          mode: xfail  
         # These tests exercise the `bmm` operation with flexible tensor layouts.
         # They are classified as `xfail` due to a missing module in the Spyre backend.
         # The relevant Spyre limitation is the unavailability of the `_oot_pre_test_cpu_select_algorithm` module.
