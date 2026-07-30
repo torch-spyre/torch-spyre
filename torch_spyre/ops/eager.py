@@ -90,6 +90,7 @@ register_torch_compile_kernel(
         aten.div,
         aten.exp,
         aten.floor,
+        aten.index_select,
         aten.log,
         aten.mean,
         aten.mul,
@@ -122,6 +123,7 @@ register_torch_compile_kernel(
         aten.where.self_out,
         aten.clamp,
         aten.constant_pad_nd,
+        aten.embedding.default,
     ]
 )
 

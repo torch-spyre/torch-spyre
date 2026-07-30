@@ -1356,7 +1356,13 @@ def _apply_fill_name_swap(
                 return _orig(*args)
 
         object.__setattr__(op.data, "inner_fn", new_inner_fn)
-        new_op = replace_computed_buffer_body(op, op.data, operations)
+        new_op = replace_computed_buffer_body(
+            op,
+            op.data,
+            operations,
+            pass_name="coarse_tile",
+            reason="redirect tiled group to tile-sized fill",
+        )
         V.graph.name_to_buffer[new_op.get_name()] = new_op
 
 
@@ -2216,7 +2222,13 @@ def _insert_read_copy_ops(
             return _orig_inner(*args)
 
     object.__setattr__(tiled_op.data, "inner_fn", new_inner_fn)
-    new_op = replace_computed_buffer_body(tiled_op, tiled_op.data, operations)
+    new_op = replace_computed_buffer_body(
+        tiled_op,
+        tiled_op.data,
+        operations,
+        pass_name="coarse_tile",
+        reason="redirect tiled op to copied inputs",
+    )
     V.graph.name_to_buffer[new_op.get_name()] = new_op
     return new_op
 
@@ -2618,7 +2630,13 @@ def _patch_consumers(
                 return _orig(*args)
 
         object.__setattr__(consumer.data, "inner_fn", new_inner_fn)
-        consumer = replace_computed_buffer_body(consumer, consumer.data, operations)
+        consumer = replace_computed_buffer_body(
+            consumer,
+            consumer.data,
+            operations,
+            pass_name="coarse_tile",
+            reason="redirect outside consumer to full-sized buffer",
+        )
         V.graph.name_to_buffer[consumer.get_name()] = operations[
             next(
                 i
@@ -2816,7 +2834,13 @@ def _patch_retiled_load_indexes(
                 return _orig(*args)
 
         object.__setattr__(op.data, "inner_fn", new_inner_fn)
-        new_op = replace_computed_buffer_body(op, op.data, operations)
+        new_op = replace_computed_buffer_body(
+            op,
+            op.data,
+            operations,
+            pass_name="coarse_tile",
+            reason="rewrite retiled load indexes",
+        )
         _replace_group_op(group_ops, op, new_op)
         V.graph.name_to_buffer[new_op.get_name()] = new_op
 

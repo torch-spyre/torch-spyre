@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 from sympy import Symbol, Expr, Function
 from torch_spyre._C import DataFormats
@@ -67,12 +67,43 @@ class SourceLoc:
         return dataclasses.asdict(self)
 
 
+ProvenanceTransformKind = Literal[
+    "rewrite", "fusion", "decomposition", "clone", "remap"
+]
+
+
+@dataclasses.dataclass(frozen=True)
+class ProvenanceTransform:
+    """One structured lower-IR transformation in a provenance history.
+
+    ``kind`` identifies the rewrite shape (for example ``fusion`` or
+    ``decomposition``); ``pass_name`` and optional ``reason`` are deliberately
+    separate so the record maps cleanly to MLIR location metadata.
+
+    Histories are immutable tuples so reconstructed buffers cannot accidentally
+    share and mutate provenance state.
+    """
+
+    kind: ProvenanceTransformKind
+    pass_name: str
+    reason: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "pass_name": self.pass_name,
+            "reason": self.reason,
+        }
+
+
 @dataclasses.dataclass(frozen=True)
 class DebugHandle:
     """Source-to-kernel provenance handle.
 
     Nestable to map onto MLIR locations: ``NameLoc(aten_op) -> SourceLoc``,
-    ``fused_from -> FusedLoc``, ``ir_chain -> CallSiteLoc`` lineage.
+    ``fused_from -> FusedLoc``, and ``ir_chain -> CallSiteLoc`` lineage.
+    ``transform_history`` retains structured lower-IR rewrite metadata rather
+    than overloading one scalar fusion label.
 
     A ``None`` ``source`` or ``aten_op`` is a *normal, expected* value, not a
     missing-data error: when an op fuses origins from several distinct source
@@ -86,7 +117,7 @@ class DebugHandle:
     aten_op: str | None
     ir_chain: tuple[str, ...]
     fused_from: tuple["DebugHandle", ...] = ()
-    fusion_context: str | None = None
+    transform_history: tuple[ProvenanceTransform, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -99,7 +130,7 @@ class DebugHandle:
             "aten_op": self.aten_op,
             "ir_chain": list(self.ir_chain),
             "fused_from": [h.to_dict() for h in self.fused_from],
-            "fusion_context": self.fusion_context,
+            "transform_history": [t.to_dict() for t in self.transform_history],
         }
 
 
@@ -199,6 +230,12 @@ class OpSpec:
     symbolic_dim_bounds: dict[str, tuple[int, int]] = dataclasses.field(
         default_factory=dict
     )
+    # Full logical output ranges of the write/reduction node (NCHW for pools),
+    # including unit dims.  Distinct from the squeezed, permuted iteration_space:
+    # pool codegen derives which dim roles survived (and the channel count) from
+    # these live ranges rather than a lowering-time size snapshot.  None when the
+    # node exposes no data.ranges.
+    node_output_ranges: tuple[Expr, ...] | None = None
     debug_handle: DebugHandle | None = None
 
 

@@ -23,6 +23,7 @@ from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .optimize_restickify import EdgeCostMap
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
+from .provenance import preserve_provenance
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -197,7 +198,12 @@ def insert_restickify_on_node_inputs(
         _original_reduction_ranges=op._original_reduction_ranges,
     )
     new_consumer_buffer.operation_name = op.operation_name
-    new_consumer_buffer.origins = op.origins
+    preserve_provenance(
+        op,
+        new_consumer_buffer,
+        pass_name="insert_restickify",
+        reason="redirect consumer to restickified input",
+    )
     copy_op_metadata(op, new_consumer_buffer)
     # Replace op in the operations list with the reconstructed buffer.
     operations[op_index] = new_consumer_buffer

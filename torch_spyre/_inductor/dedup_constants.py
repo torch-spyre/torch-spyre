@@ -20,6 +20,7 @@ from torch._inductor.virtualized import V
 from .ir import SpyreConstantFallback
 from .insert_restickify import NameSwapHandler
 from .logging_utils import get_inductor_logger
+from .provenance import merge_provenance
 
 logger = get_inductor_logger("dedup_constants")
 
@@ -87,6 +88,12 @@ def _drop_constant(
     D = dup.get_name()
     C = canonical.get_name()
     op_name = dup.get_operation_name()
+    merge_provenance(
+        [canonical, dup],
+        canonical,
+        pass_name="dedup_and_promote_constants",
+        reason="duplicate constant",
+    )
     operations.remove(dup)
     V.graph.removed_buffers.add(D)
     V.graph.name_to_buffer.pop(D, None)

@@ -19,12 +19,9 @@ test_suite_config:
         # in both wraps collapse to (pointwise|reduction).
         - names:
             - LxPlanning.*::test_scalar_cpu_combined_3d_lx_planning_reduction
-            - LxPlanning.*::test_add_alpha_add_alpha_0.5_6x7x12x256_6x7x12x256_lx_planning_reduction
             - LxPlanning.*::test_add_alpha_add_alpha_2_67x256_67x256_lx_planning_reduction
             - LxPlanning.*::test_add_alpha_add_alpha_2_67x71x256_67x71x256_lx_planning_reduction
-            - LxPlanning.*::test_add_alpha_add_alpha_2_6x7x12x256_6x7x12x256_lx_planning_reduction
             - LxPlanning.*::test_add_alpha_add_alpha_neg_67x71x256_67x71x256_lx_planning_reduction
-            - LxPlanning.*::test_add_alpha_add_alpha_neg_6x7x12x256_6x7x12x256_lx_planning_reduction
           mode: xfail
         - names:
             - LxPlanning.*::test_activation_cls.*_lx_planning_(pointwise|reduction)

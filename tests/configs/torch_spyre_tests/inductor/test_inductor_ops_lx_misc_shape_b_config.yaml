@@ -41,8 +41,6 @@ test_suite_config:
             - LxPlanning.*::test_unbind_4d_dim3_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_flatten_3d_leading_lx_planning_reduction
             - LxPlanning.*::test_flatten_4d_leading_lx_planning_reduction
-            - LxPlanning.*::test_round_trip_to_dtype_add_float16_to_float32_4x8x128_lx_planning_reduction
-            - LxPlanning.*::test_round_trip_to_dtype_implicit_add_float16_to_float32_4x8x128_lx_planning_reduction
             - LxPlanning.*::test_round_trip_to_dtype_mixed_ea_broadcast_add_fp16_2x4x64_bcast_fp32_2x4x1_lx_planning_(pointwise|reduction)
           mode: xfail
         - names:

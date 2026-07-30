@@ -4503,6 +4503,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_avg_pool2d", "test_avg_pool2d_base"): {
+            "ops_dict": {
+                "k2s2": lambda x: F.avg_pool2d(x, kernel_size=2, stride=2),
+                "k4s4": lambda x: F.avg_pool2d(x, kernel_size=4, stride=4),
+            },
+            "param_sets": {
+                "1x3x8x8": (cached_randn((1, 3, 8, 8)),),
+                "1x3x24x24": (cached_randn((1, 3, 24, 24)),),
+                "2x3x8x8": (cached_randn((2, 3, 8, 8)),),
+            },
+        },
         ("test_repeat", "test_repeat_cpu"): {
             "param_sets": {
                 "1d_1": (cached_randn((64), dtype=torch.float16), 1),
@@ -5662,7 +5673,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(dst, src):
             dst = dst.clone()
             result = op(dst, src)
-            assert id(result) == id(dst)
+            assert result.data_ptr() == dst.data_ptr()
             return result
 
         # Eager mode hangs/crashes when executing inplace operations on Spyre tensors
@@ -6450,6 +6461,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         x = torch.randint(0, 2, (64,), dtype=torch.bool)
         self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
+
+    def test_avg_pool2d_base(self, op, x):
+        # Spyre stores C as the stick (innermost) dim, so the op must see a
+        # physically-NHWC tensor viewed as NCHW.  Pass an NHWC-contiguous input
+        # (its layout is preserved by .to("spyre")) and do the NHWC→NCHW permute
+        # inside fn so the compiled graph carries it — this lets us use the
+        # standard compare_with_cpu harness (cpu fn(x_nhwc) == op(x)).
+        #
+        # run_eager=False: Spyre has no eager avg_pool2d kernel
+        # (aten::avg_pool2d.out is unregistered for the 'spyre' backend), so only
+        # the compiled path is valid for this op.
+        def fn(t):
+            return op(t.permute(0, 3, 1, 2))
+
+        x_nhwc = x.permute(0, 2, 3, 1).contiguous()
+        self.compare_with_cpu(fn, x_nhwc, atol=0.1, rtol=0.1, run_eager=False)
 
     def test_conv2d_cpu(self, x, weight, bias, padding, stride, groups):
         def fn(x, weight, bias, padding, stride, groups):

@@ -99,17 +99,15 @@ def canonical_device_layout(shape, dtype) -> SpyreTensorLayout:
     )
 
 
-def pinned_to_spyre(tensor: torch.Tensor) -> torch.Tensor:
-    """Move a contiguous tensor to "spyre" with its canonical layout pinned
-    explicitly (via `device_layout=`), instead of the implicit `.to("spyre")`.
+def plain_to_spyre(tensor: torch.Tensor) -> torch.Tensor:
+    """Move a tensor to "spyre" with the implicit default layout (plain `.to()`).
 
-    Used for the value (data) tensor of a gather, matching the manual `stl`
-    pattern in the example scripts; index tensors stay on a plain `.to("spyre")`.
+    With no explicit `device_layout=`, the compiler picks the generic layout.
+    For gather sources, this means a multi-stick row arrives with its indexed
+    dimension behind the stick-count dimension. The gather-source relayout pass
+    must rotate it outermost. Testing with this layout proves the pass works.
     """
-    return tensor.to(
-        "spyre",
-        device_layout=canonical_device_layout(tensor.shape, tensor.dtype),
-    )
+    return tensor.to("spyre")
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +203,20 @@ def coord_atoms(arg: TensorArg, kind):
 
 def arg_has_indirect_access(arg: TensorArg) -> bool:
     return bool(coord_atoms(arg, IndirectAccess))
+
+
+def indirect_access_coord_index(arg: TensorArg):
+    """Device-coordinate index whose expression carries an IndirectAccess (the
+    indexed dim), or None when the arg has no indirect access.
+
+    This is the position the gather-source relayout pass controls: the indexed
+    dim must be the outermost device dim, else the gather strides over the wrong
+    memory for rows wider than one stick.
+    """
+    for i, coord in enumerate(arg.device_coordinates):
+        if hasattr(coord, "atoms") and coord.atoms(IndirectAccess):
+            return i
+    return None
 
 
 def op_spec_has_indirect_access(op_spec: OpSpec) -> bool:
@@ -610,6 +622,35 @@ class IndirectAccessTestCase(InductorTestCase):
         )
         return op_specs
 
+    def assert_indirect_source_indexed_dim_outermost(self, op_specs):
+        """Assert the gather-source relayout landed the indexed dim outermost.
+
+        After the pass, on every indirect input arg the device coordinate that
+        carries an IndirectAccess (the indexed dim) must be the outermost
+        non-degenerate dim -- i.e. only size-1 dims may precede it. If it sits
+        behind a non-unit dim the gather reads only the first stick of each row
+        and strides wrong for the rest, silently. Checks the captured OpSpec
+        coordinates so a regression surfaces here until e2e tests can run.
+        """
+        checked = 0
+        for s in op_specs:
+            for a in s.args:
+                if not a.is_input:
+                    continue
+                pos = indirect_access_coord_index(a)
+                if pos is None:
+                    continue
+                leading = list(a.device_size)[:pos]
+                self.assertTrue(
+                    all(d == 1 for d in leading),
+                    f"indirect source {a.name!r}: IndirectAccess at device coord "
+                    f"{pos} behind non-degenerate dims {leading} "
+                    f"(device_size={list(a.device_size)}); indexed dim must be "
+                    f"outermost after the gather-source relayout",
+                )
+                checked += 1
+        self.assertTrue(checked, "no indirect-access input arg found to check")
+
     # -- One-compile, all-stage scenario check (used by per-op test files) --
     def check(
         self,
@@ -655,6 +696,12 @@ class IndirectAccessTestCase(InductorTestCase):
         if sdsc and r.label in (GATHER_OP_SPEC, SCATTER_OP_SPEC):
             kind = "gather" if r.label == GATHER_OP_SPEC else "scatter"
             self.assert_indirect_sdsc_fields(r.sdsc_jsons, kind)
+        # Every gather scenario asserts, by default, that the gather-source
+        # relayout landed the indexed dim outermost -- so a regression surfaces
+        # on any gather test, not just the few that opt in. Gated to gather:
+        # scatter writes indirectly to its *output* and has no source to rotate.
+        if r.label == GATHER_OP_SPEC:
+            self.assert_indirect_source_indexed_dim_outermost(r.op_specs)
         return r
 
     # -- one driver: validate every stage, then run on the real backend ---
