@@ -761,6 +761,37 @@ class _GatherScenarios(IndirectAccessTestCase):
             result = torch.compile(lambda x, i: x[i].exp())(x, i)
         self.assertIsNotNone(result, "gather compile returned nothing")
 
+    def test_gather_multiple_indices_same_kernel(self):
+        """Test x[i] + y[i] - multiple gathers with same index in one kernel.
+
+        Verifies that when multiple gather operations use the same index tensor
+        in the same kernel, each operation correctly gets only the index tensors
+        it needs, not all indirect tensors in the kernel (regression test for
+        kernel-level indirect_vars carryover bug).
+        """
+        x, i = self._xi(P=3, two_d=True, dtype=torch.int64)
+        y = torch.randn_like(x)
+
+        def kernel(x, y, i):
+            return x[i] + y[i]
+
+        self._stage_and_e2e(kernel, x, y, i, expect=GATHER_OP_SPEC)
+
+    def test_gather_different_indices_same_kernel(self):
+        """Test x[i] + y[j] - multiple gathers with different indices in one kernel.
+
+        Verifies that when multiple gather operations use different index tensors
+        in the same kernel, each operation gets the correct index tensor without
+        cross-contamination from other gathers.
+        """
+        x, i = self._xi(P=3, two_d=True, dtype=torch.int64, M=128, N=256)
+        y, j = self._xi(P=3, two_d=True, dtype=torch.int64, M=100, N=256)
+
+        def kernel(x, y, i, j):
+            return x[i] + y[j]
+
+        self._stage_and_e2e(kernel, x, y, i, j, expect=GATHER_OP_SPEC)
+
 
 @config.patch({"sencores": 1})
 class TestGather(_GatherScenarios):

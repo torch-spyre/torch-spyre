@@ -1182,6 +1182,18 @@ def _peel(node):
     return node
 
 
+def _peel_through_views(node):
+    """Like _peel, but also unwraps views (reshape/expand/slice/etc.).
+
+    A view (e.g. ir.ReinterpretView) is not a MutableBox/StorageBox, so plain
+    _peel stops at the view instead of reaching the Buffer underneath it.
+    """
+    node = _peel(node)
+    while isinstance(node, ir.BaseView):
+        node = _peel(node.data)
+    return node
+
+
 def _copy_back_candidate(dst, src) -> bool:
     """Whether ``copy_(dst, src)`` is worth checking after layout propagation.
 
@@ -1362,10 +1374,24 @@ def to_dtype(x, dst_dtype, use_compute_types=True):
         return lowering.clone(x)
 
     # Check if conversion is supported by backend
-    if DtypeOpTable.get_operator(src_dtype, dst_dtype) is None:
+    if not DtypeOpTable.is_supported(src_dtype, dst_dtype):
         # Unsupported conversion - fall back to CPU
         op = torch.ops.spyre.to_dtype_cpu.default
         return eager_fallback(op, x, dst_dtype)
+
+    # DMA-copied bool InputBuffers have a different HBM element ordering than
+    # computation-kernel outputs, so a stick-reordering typecast (e.g.
+    # DL16TOFP32 for bool → float32) reads them back shuffled (28/64 elements).
+    # Fall back to CPU for host bools whose conversion reorders sticks; an
+    # IDENTITY byte-copy (e.g. bool → float16) is safe. On-device computed bools
+    # use the native path. Peel through views (reshape/expand) too, since a
+    # viewed host bool is still backed by the same DMA-copied InputBuffer.
+    if src_dtype == torch.bool and DtypeOpTable.bool_host_conversion_reorders_sticks(
+        dst_dtype
+    ):
+        if isinstance(_peel_through_views(x), ir.InputBuffer):
+            op = torch.ops.spyre.to_dtype_cpu.default
+            return eager_fallback(op, x, dst_dtype)
 
     return lowering.to_dtype(
         x, dst_dtype, copy=True, use_compute_types=use_compute_types
