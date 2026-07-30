@@ -68,7 +68,7 @@ test_suite_config:
             - TestSelectAlgorithm::test_local_and_global_accumulator
             - TestSelectAlgorithm::test_qlinear_pointwise_int8_layout
             - TestSelectAlgorithm::test_grouped_linear_epilogue
-          mode: xfail  
+          mode: xfail
         # These tests exercise the `bmm` operation with flexible tensor layouts.
         # They are classified as `xfail` due to a missing module in the Spyre backend.
         # The relevant Spyre limitation is the unavailability of the `_oot_pre_test_cpu_select_algorithm` module.
