@@ -311,13 +311,17 @@ TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
         cached_randn(shape, dtype=src),
         dst,
     )
-    for src, dst in [(torch.float16, torch.float32)]
+    for src in [torch.float16, torch.float32]
+    for dst in [torch.float16, torch.float32]
+    if src != dst
     for shape in TO_DTYPE_OP_SHAPES
 }
 
 TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
-    for src, dst in [(torch.float16, torch.float32)]
+    for src in [torch.float16, torch.float32]
+    for dst in [torch.float16, torch.float32]
+    if src != dst
     for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
 ]
 
