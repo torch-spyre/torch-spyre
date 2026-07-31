@@ -251,7 +251,7 @@ def _is_invalid_compute_op(op) -> bool:
         return True
     if not isinstance(op.data, (Pointwise, Reduction)):
         return True
-    if not isinstance(op.layout, (FixedLayout, MutationLayoutSHOULDREMOVE))
+    if not isinstance(op.layout, (FixedLayout, MutationLayoutSHOULDREMOVE)):
         return True
 
     return False
