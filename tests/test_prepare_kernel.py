@@ -573,11 +573,11 @@ class TestPrepareKernel:
             )
 
     def test_pipeline_barrier_correction_sequence(self):
-        """Correction sequence: HostCompute=False, H2D=True, Compute=True.
+        """Correction sequence: HostCompute=True, H2D=True, Compute=True.
 
-        HostCompute opts out (overlap-eligible: runs while prior device compute
-        is in flight). H2D and Compute inherit the safe default True. Compute
-        must wait for H2D to close the RAW hazard on the seg-7 correction region.
+        HostCompute carries the barrier to close the WAR hazard on the reused
+        pinned correction buffer (see flex #1306). H2D and Compute inherit the
+        safe default True; Compute must also wait for H2D (RAW on the seg-7 region).
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = self.create_mock_spyrecode(
@@ -591,10 +591,11 @@ class TestPrepareKernel:
             assert job_plan.get_step_type(1) == "H2D"
             assert job_plan.get_step_type(2) == "Compute"
 
-            assert job_plan.get_step_pipeline_barrier(0) is False, (
-                "HostCompute step must carry pipeline_barrier=False to preserve "
-                "host/device overlap (correction callback runs while prior device "
-                "compute is still in flight)"
+            assert job_plan.get_step_pipeline_barrier(0) is True, (
+                "HostCompute step must carry pipeline_barrier=True to close the "
+                "WAR hazard on the reused pinned correction buffer: under flex's "
+                "inline caller-thread dispatch, the barrier makes the callback "
+                "wait for the prior iteration's H2D to drain before overwriting it"
             )
             assert job_plan.get_step_pipeline_barrier(1) is True, (
                 "H2D step must carry pipeline_barrier=True (safe default: "
