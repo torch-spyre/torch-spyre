@@ -22,7 +22,7 @@ on:
 concurrency:
   group: >-
     crcr-l2-${{ github.event.client_payload.payload.repository.full_name }}-${{
-    github.event.client_payload.payload.pull_request.number || github.run_id }}
+    github.event.client_payload.payload.pull_request.number || github.run_id }}-${{ github.event.client_payload.payload.action || 'push'}}
   cancel-in-progress: true
 
 permissions:
@@ -31,7 +31,11 @@ permissions:
 jobs:
   ingest:
     name: Classify dispatch -> ClickHouse
-    runs-on: ubuntu-latest
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - linux
+      - image_spyre_backend
     timeout-minutes: 10
 
     env:
