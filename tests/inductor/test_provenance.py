@@ -31,7 +31,13 @@ from torch._inductor.utils import IndentedBuffer
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.codegen.compute_ops import generate_sdsc
 from torch_spyre._inductor.codegen.superdsc import SDSCSpec, parse_op_spec
-from torch_spyre._inductor.op_spec import DebugHandle, OpSpec, SourceLoc, TensorArg
+from torch_spyre._inductor.op_spec import (
+    DebugHandle,
+    OpSpec,
+    ProvenanceTransform,
+    SourceLoc,
+    TensorArg,
+)
 from torch_spyre._inductor.provenance import _stable_id, build_debug_handle
 from torch_spyre._inductor.spyre_kernel import _codegen_op_spec_list
 
@@ -118,6 +124,20 @@ class TestStableId:
         assert _stable_id(*a) != _stable_id(*b)
 
 
+class TestProvenanceTransform:
+    def test_is_structured_frozen_value(self):
+        transform = ProvenanceTransform("fusion", "fuse_ops", "same tile")
+        assert transform.to_dict() == {
+            "kind": "fusion",
+            "pass_name": "fuse_ops",
+            "reason": "same tile",
+        }
+        assert (
+            len({transform, ProvenanceTransform("fusion", "fuse_ops", "same tile")})
+            == 1
+        )
+
+
 class TestDebugHandle:
     def test_to_dict_is_structured_and_nested(self):
         child = DebugHandle(
@@ -132,8 +152,17 @@ class TestDebugHandle:
             aten_op="aten.mm.default",
             ir_chain=("mm_default_1", "op0"),
             fused_from=(child,),
+            transform_history=(ProvenanceTransform("fusion", "fuse_ops", "same tile"),),
         )
         d = h.to_dict()
+        assert set(d) == {
+            "id",
+            "source",
+            "aten_op",
+            "ir_chain",
+            "fused_from",
+            "transform_history",
+        }
         assert d["source"] == {
             "file": "m.py",
             "start_line": 5,
@@ -144,7 +173,13 @@ class TestDebugHandle:
         assert d["aten_op"] == "aten.mm.default"
         assert d["ir_chain"] == ["mm_default_1", "op0"]
         assert d["fused_from"][0]["aten_op"] == "aten.permute.default"
-        assert d["fusion_context"] is None
+        assert d["transform_history"] == [
+            {
+                "kind": "fusion",
+                "pass_name": "fuse_ops",
+                "reason": "same tile",
+            }
+        ]
 
     def test_to_dict_serializes_id_as_string_for_js_safety(self):
         # A 63-bit id exceeds JS Number.MAX_SAFE_INTEGER (2**53-1); a JSON number
@@ -191,6 +226,20 @@ def _buffer(origins, origin_node=None, name="op0"):
 class TestBuildDebugHandle:
     def test_empty_origins_returns_none(self):
         assert build_debug_handle(_buffer([])) is None
+
+    def test_level_zero_does_not_gate_handle_construction(self):
+        from torch._inductor import config as inductor_config
+
+        relu = _node(
+            "relu",
+            "/home/u/model.py",
+            42,
+            "aten.relu.default",
+        )
+        with inductor_config.patch("trace.provenance_tracking_level", 0):
+            handle = build_debug_handle(_buffer([relu], origin_node=relu, name="op2"))
+        assert handle is not None
+        assert handle.aten_op == "aten.relu.default"
 
     def test_single_op_with_origin_node(self):
         # Inductor's clean 1:1 case (e.g. pointwise relu): use origin_node.
@@ -256,6 +305,35 @@ class TestBuildDebugHandle:
         h2 = build_debug_handle(_buffer([n_mul, n_add], name="op0"))
         assert h1.ir_chain == h2.ir_chain
         assert h1.id == h2.id
+
+    def test_reads_structured_transform_history(self):
+        # Explicit provenance helpers stamp immutable records on a buffer;
+        # build_debug_handle carries the complete history.
+        from torch_spyre._inductor.provenance import _SPYRE_PROV_HISTORY_ATTR
+
+        n = _node("mm", "/m.py", 5, "aten.mm.default")
+        buf = _buffer([n])
+        history = (
+            ProvenanceTransform("decomposition", "split_multi_ops"),
+            ProvenanceTransform("fusion", "spyre_fuse_nodes", "same tile"),
+        )
+        setattr(buf, _SPYRE_PROV_HISTORY_ATTR, history)
+        handle = build_debug_handle(buf)
+        assert handle is not None
+        assert handle.transform_history == history
+
+    def test_single_origin_no_trace_is_honest_empty(self):
+        # A single compiler-generated origin with no stack_trace and no
+        # origin_node (e.g. a synthesized node with no user source line): the
+        # source is honestly None rather than guessed, but original_aten still
+        # yields aten_op, and ir_chain remains valid. Not a fusion (one origin),
+        # so fused_from stays empty.
+        n = _node("synthetic", aten="aten.clone.default")
+        h = build_debug_handle(_buffer([n], name="op3"))
+        assert h.source is None
+        assert h.aten_op == "aten.clone.default"
+        assert h.ir_chain == ("synthetic", "op3")
+        assert h.fused_from == ()
 
 
 class TestOpSpecDebugHandle:
@@ -397,6 +475,7 @@ class TestCodegenRoundTrip:
         "TensorArg": TensorArg,
         "DebugHandle": DebugHandle,
         "SourceLoc": SourceLoc,
+        "ProvenanceTransform": ProvenanceTransform,
         "DataFormats": DataFormats,
         "sympify": sympify,
     }
@@ -423,6 +502,24 @@ class TestCodegenRoundTrip:
         )
         result = self._roundtrip(_threadable_op_spec(debug_handle=h))
         assert result.debug_handle == h
+
+    def test_transform_history_survives_codegen_roundtrip(self):
+        h = DebugHandle(
+            id=7,
+            source=SourceLoc("model.py", 5),
+            aten_op="aten.add.Tensor",
+            ir_chain=("add", "op0"),
+            transform_history=(
+                ProvenanceTransform(
+                    kind="decomposition",
+                    pass_name="split_multi_ops",
+                    reason="materialize add",
+                ),
+            ),
+        )
+        result = self._roundtrip(_threadable_op_spec(debug_handle=h))
+        assert result.debug_handle == h
+        assert result.debug_handle.transform_history == h.transform_history
 
     def test_fused_handle_with_children_survives_roundtrip(self):
         # The n->1 fusion case: nested fused_from must survive too.

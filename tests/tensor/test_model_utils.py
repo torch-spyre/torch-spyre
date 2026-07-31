@@ -78,6 +78,42 @@ class TestLoadModelToSpyre(TestCase):
         self.assertEqual(model.weight.device.type, "spyre")
         self.assertEqual(model.bias.device.type, "spyre")
 
+    # ── _apply is honored (matches nn.Module.to semantics) ─────────
+
+    def test_submodule_apply_override_keeps_params_on_cpu(self):
+        """A child that overrides _apply governs its own subtree: its params
+        stay on CPU while a sibling Linear still gets the dim_order layout."""
+        from torch_spyre._C import get_spyre_tensor_layout
+
+        class KeepOnCpu(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(8, 4, dtype=torch.float16))
+
+            def _apply(self, fn, recurse=True):
+                return self
+
+        class Root(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lin = nn.Linear(64, 128, dtype=torch.float16)
+                self.keep = KeepOnCpu()
+
+        model = Root()
+        load_model_to_spyre(model)
+
+        self.assertEqual(model.keep.weight.device.type, "cpu")
+        self.assertEqual(model.lin.weight.device.type, "spyre")
+        self.assertEqual(get_spyre_tensor_layout(model.lin.weight).device_size[0], 2)
+
+    def test_instance_apply_override_keeps_params_on_cpu(self):
+        """An instance-level _apply monkeypatch (the runner's Attention pattern)
+        is honored just like a class-level override."""
+        model = nn.Linear(8, 8, dtype=torch.float16)
+        model._apply = lambda fn, recurse=True, _m=model: _m
+        load_model_to_spyre(model)
+        self.assertEqual(model.weight.device.type, "cpu")
+
     # ── dtype contract (PR #2258) ──────────────────────────────────
 
     @parametrize(

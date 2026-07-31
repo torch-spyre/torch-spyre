@@ -70,6 +70,14 @@ class TestDatatypeScalarOperations:
         # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1228
         if tensor_dtype == torch.float64:
             pytest.xfail(reason="Spyre backend does not support dtype Double(FP64)")
+        # PT 2.12 promotes Tensor × np.float64 to FP64 in the compiled output
+        # rather than constant-folding to FP32, causing a segfault in the
+        # generated Spyre kernel. Xfail until the FP64-scalar handling is fixed.
+        if execution_mode == "compiled" and scalar_type is np.float64:
+            pytest.xfail(
+                reason="Spyre backend does not support FP64 scalar promotion under "
+                "torch.compile (PT 2.12). See issue #1228."
+            )
 
         def mixed_mul(x):
             if scalar_type == "python":

@@ -17,9 +17,16 @@ import dataclasses
 import sympy
 import torch
 import torch.fx as fx
-from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise, Reduction
+from torch._inductor.ir import (
+    ComputedBuffer,
+    FixedLayout,
+    MutationLayoutSHOULDREMOVE,
+    Pointwise,
+    Reduction,
+)
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
+from torch.fx.traceback import NodeSource, NodeSourceAction
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
@@ -27,6 +34,7 @@ from .logging_utils import get_inductor_logger
 from .errors import Unsupported
 from .pass_utils import replace_computed_buffer_body
 from .constants import is_ea_compatible
+from .provenance import decompose_provenance
 from torch_spyre._C import SpyreTensorLayout, ElementArrangement
 from torch_spyre.constants import DEVICE_NAME
 
@@ -243,7 +251,7 @@ def _is_invalid_compute_op(op) -> bool:
         return True
     if not isinstance(op.data, (Pointwise, Reduction)):
         return True
-    if not isinstance(op.layout, FixedLayout):
+    if not isinstance(op.layout, (FixedLayout, MutationLayoutSHOULDREMOVE))
         return True
 
     return False
@@ -290,6 +298,31 @@ def _resolve_fx_target(op_name):
             default = getattr(target, "default", None)
             return default or target
     return None
+
+
+def _set_split_child_provenance(
+    orig_node: fx.Node,
+    new_node: fx.Node,
+    target: torch.fx.node.Target,
+) -> None:
+    """Attach parent source lineage and the child's semantic op identity."""
+    if "stack_trace" in orig_node.meta:
+        new_node.meta["stack_trace"] = orig_node.meta["stack_trace"]
+
+    # This lower-IR pass creates FX nodes after upstream's graph-pass observer
+    # has finished, so record the exact derivation explicitly. NodeSource nests
+    # the parent's prior from_node chain rather than flattening or duplicating it.
+    new_node.meta["from_node"] = [
+        NodeSource(
+            orig_node,
+            "split_multi_ops",
+            NodeSourceAction.CREATE,
+        )
+    ]
+
+    # The source line belongs to the parent, while the operation identity belongs
+    # to this distinct decomposed child.
+    new_node.meta["original_aten"] = target
 
 
 def _normalize_op_args(op_name, input_fx_nodes, kwargs, out_dtype, device=None):
@@ -460,6 +493,7 @@ def _make_intermediate_bufs(
     insert_idx,
     gl,
     orig_node,
+    orig_buffer,
     final_op_name="",
 ) -> tuple[dict[tuple, str], dict[str, collections.deque]]:
     """Create intermediate buffers for operations.
@@ -484,6 +518,7 @@ def _make_intermediate_bufs(
         insert_idx: Starting index for insertion
         gl: GraphLowering instance
         orig_node: Original FX node being split
+        orig_buffer: Original ComputedBuffer being split
         final_op_name: Name of the final (consumer) op, used to skip constant
             materialization for _OPS_WITH_CONSTANT_ARGS.
 
@@ -517,6 +552,7 @@ def _make_intermediate_bufs(
                     (fill_value, out_dtype, layout.device),
                     {},
                 )
+            _set_split_child_provenance(orig_node, new_node, new_node.target)
             new_node.meta["val"] = torch.tensor(
                 fill_value, dtype=out_dtype, device="meta"
             )
@@ -527,8 +563,15 @@ def _make_intermediate_bufs(
             # tb.data.data is the SpyreConstantFallback, but keep it wrapped as TensorBox
             # in operations to preserve proper attribute initialization.
             new_buf = tb.data.data
-            # Set origins using object.__setattr__ to work around dataclass frozen fields.
+            # This child node is the sole semantic origin of the new buffer.
             object.__setattr__(new_buf, "origins", OrderedSet([new_node]))
+            decompose_provenance(
+                orig_buffer,
+                (new_buf,),
+                pass_name="split_multi_ops",
+                reason=f"materialize {op_name}",
+                inherit_origins=False,
+            )
             # Move the buffer to our desired position, then continue with it wrapped.
             gl.operations.remove(new_buf)
             operations.insert(insert_idx, new_buf)
@@ -550,6 +593,7 @@ def _make_intermediate_bufs(
 
         with gl.graph.inserting_before(orig_node):
             new_node = gl.graph.create_node("call_function", target, args, clean_kw)
+        _set_split_child_provenance(orig_node, new_node, target)
 
         # Propagate metadata for shape inference
         if input_nodes and "val" in input_nodes[0].meta:
@@ -559,8 +603,15 @@ def _make_intermediate_bufs(
 
         # Lower the FX node; _lower_fx_node extracts, removes, and reinserts.
         new_buf = _lower_fx_node(new_node, gl, operations, insert_idx)
-        # Set origins using object.__setattr__ to work around dataclass frozen fields.
+        # This child node is the sole semantic origin of the new buffer.
         object.__setattr__(new_buf, "origins", OrderedSet([new_node]))
+        decompose_provenance(
+            orig_buffer,
+            (new_buf,),
+            pass_name="split_multi_ops",
+            reason=f"materialize {op_name}",
+            inherit_origins=False,
+        )
         buf_name = new_buf.get_name()
         vid_to_bufname[vid] = buf_name
         # Track materialized compute intermediates so _IntermediateOpHandler can
@@ -628,7 +679,13 @@ def _patch_original_buf(
     # Preserve origins from the original data object (dataclasses.replace creates
     # a fresh object with empty origins; we must restore it).
     object.__setattr__(new_data, "origins", op.data.origins)
-    new_op = replace_computed_buffer_body(op, new_data, operations)
+    new_op = replace_computed_buffer_body(
+        op,
+        new_data,
+        operations,
+        pass_name="split_multi_ops",
+        reason="rewrite original buffer body",
+    )
     V.graph.name_to_buffer[new_op.get_name()] = new_op
 
 
@@ -766,7 +823,13 @@ def split_multi_ops(graph: GraphLowering):
         if _skip_splitting(op, compute_ops):
             continue
 
-        layout = op.layout
+        # Use real_layout() for MutationLayoutSHOULDREMOVE so _make_intermediate_bufs
+        # gets a valid device and dtype from the underlying FixedLayout.
+        layout = (
+            op.layout.real_layout()
+            if isinstance(op.layout, MutationLayoutSHOULDREMOVE)
+            else op.layout
+        )
         dtype_map = _propagate_dtypes(trace, layout.dtype)
         bufname_map = _init_vid_to_bufname(trace)
 
@@ -813,6 +876,7 @@ def split_multi_ops(graph: GraphLowering):
             insert_idx,
             gl,
             orig_node,
+            op,
             final_op_name=final_op_name,
         )
 

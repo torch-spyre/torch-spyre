@@ -33,6 +33,11 @@ their compile through _stage_and_e2e (stage check + e2e run); capture-based
 tests call run_e2e directly after their own assertions. The three structural
 tests (sdsc_fields, sdsc_handoff, python_bundle_generation) stay capture-only.
 
+The scenario body lives in _GatherScenarios and moves its value/source tensor
+via self.to_spyre (plain `.to("spyre")` layout, no explicit layout pin). The
+relayout pass must rotate the indexed dim outermost for multi-stick sources,
+proving the pass works independently.
+
 """
 
 import os
@@ -45,7 +50,6 @@ sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
     DIRECT_OP_SPEC,
     GATHER_OP_SPEC,
-    NO_SPYRE_OP,
     IndirectAccessTestCase,
     bundle_jsons_from_captured,
     capture_op_specs,
@@ -58,7 +62,7 @@ from indirect_access_common import (  # noqa: E402
     op_spec_has_indirect_access,
     op_spec_has_indirect_input,
     op_spec_has_indirect_output,
-    pinned_to_spyre,
+    plain_to_spyre,
 )
 
 from torch_spyre._C import DataFormats  # noqa: E402
@@ -67,13 +71,24 @@ from torch_spyre._inductor.constants import IDENTITY_OP, RESTICKIFY_OP  # noqa: 
 from torch_spyre._inductor.op_spec import find_unimplemented  # noqa: E402
 
 
-@config.patch({"sencores": 1})
-class TestGather(IndirectAccessTestCase):
-    """torch gather-family ops: one compile + all-stage checks per scenario."""
+class _GatherScenarios(IndirectAccessTestCase):
+    """torch gather-family ops: one compile + all-stage checks per scenario.
+
+    This is the shared scenario body; it is *not* collected on its own
+    (`__test__ = False`). Every scenario moves its gather value/source tensor
+    to "spyre" with plain `.to("spyre")` (no explicit layout pin), exercising
+    the gather-source relayout pass: the compiler picks the generic layout,
+    multi-stick sources arrive with their indexed dim behind the stick-count dim,
+    and the pass must rotate it outermost. Index tensors always use a plain
+    `.to("spyre")`.
+    """
+
+    __test__ = False  # base scenario body; only TestGather collects it
+    to_spyre = staticmethod(plain_to_spyre)
 
     def _xi(self, P=32, two_d=False, dtype=torch.int32, M=128, N=256, Q=192):
         """Named (x[M,N], idx) gather operands. two_d means idx[P,Q]."""
-        x = pinned_to_spyre(torch.rand(M, N, dtype=torch.float16))
+        x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
         shape = (P, Q) if two_d else (P,)
         i = torch.randint(0, M, shape, dtype=dtype).to("spyre")
         self.name_dims(x, {"M": M, "N": N})
@@ -82,7 +97,7 @@ class TestGather(IndirectAccessTestCase):
 
     def _xi3d(self, P=32, dtype=torch.int32, A=64, B=8, C=64):
         """Named (x[A,B,C], idx[P]) gather operands: 3-D value, 1-D index."""
-        x = pinned_to_spyre(torch.rand(A, B, C, dtype=torch.float16))
+        x = self.to_spyre(torch.rand(A, B, C, dtype=torch.float16))
         i = torch.randint(0, A, (P,), dtype=dtype).to("spyre")
         self.name_dims(x, {"A": A, "B": B, "C": C})
         self.name_dims(i, {"P": P})
@@ -157,6 +172,7 @@ class TestGather(IndirectAccessTestCase):
         self.assertTrue(spec.args[0].is_input, "index arg should be an input")
         self.assertFalse(spec.args[-1].is_input, "last arg should be the output")
         self.assertEqual(len([a for a in spec.args if not a.is_input]), 1)
+        self.assert_indirect_source_indexed_dim_outermost(op_specs)
         # Carry the same scenario through to SDSC and validate the indirect
         # encoding of the copy op (not just that op specs were produced).
         self.assert_indirect_sdsc_fields(bundle_jsons_from_captured(captured), "gather")
@@ -184,7 +200,7 @@ class TestGather(IndirectAccessTestCase):
         for label, fn in unaries.items():
             with self.subTest(unary=label):
                 torch._dynamo.reset()
-                x = pinned_to_spyre(torch.rand(M, N, dtype=torch.float16))
+                x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
                 idx = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
                 self.name_dims(x, {"M": M, "N": N})
                 self.name_dims(idx, {"P": P})
@@ -195,13 +211,14 @@ class TestGather(IndirectAccessTestCase):
                     any(op_spec_has_indirect_input(s) for s in op_specs),
                     f"{label}: gather signature lost",
                 )
+                self.assert_indirect_source_indexed_dim_outermost(op_specs)
                 # Each supported unary must also lower to a well-formed
                 # indirect-access SDSC bundle, not just an op spec.
                 self.assert_indirect_sdsc_fields(
                     bundle_jsons_from_captured(captured), "gather"
                 )
         torch._dynamo.reset()
-        x = pinned_to_spyre(torch.rand(M, N, dtype=torch.float16))
+        x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
         idx = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
         self.name_dims(x, {"M": M, "N": N})
         self.name_dims(idx, {"P": P})
@@ -218,6 +235,7 @@ class TestGather(IndirectAccessTestCase):
         self.assertIn("exp", ops)
         self.assertIn("tanh", ops)
         self.assertTrue(any(op_spec_has_indirect_input(s) for s in op_specs))
+        self.assert_indirect_source_indexed_dim_outermost(op_specs)
         # The fused chain must still emit a valid indirect-access SDSC bundle.
         self.assert_indirect_sdsc_fields(bundle_jsons_from_captured(captured), "gather")
         # TODO : Enable once e2e is available
@@ -239,7 +257,7 @@ class TestGather(IndirectAccessTestCase):
     def test_embedding_lookup(self):
         """LLM embedding lookup: table[token_ids] with vocab-scale shapes and int64 ids."""
         V, D, B, S = 32000, 512, 2, 128
-        table = pinned_to_spyre(torch.rand(V, D, dtype=torch.float16))
+        table = self.to_spyre(torch.rand(V, D, dtype=torch.float16))
         token_ids = torch.randint(0, V, (B, S), dtype=torch.int64).to("spyre")
         self.name_dims(table, {"V": V, "D": D})
         self.name_dims(token_ids, {"B": B, "S": S})
@@ -249,7 +267,7 @@ class TestGather(IndirectAccessTestCase):
         """1-D-index counterpart of test_embedding_lookup (which uses a 2-D
         index): table[ids] with vocab-scale shapes and 1-D int64 ids."""
         V, D, P = 32000, 512, 32
-        table = pinned_to_spyre(torch.rand(V, D, dtype=torch.float16))
+        table = self.to_spyre(torch.rand(V, D, dtype=torch.float16))
         ids = torch.randint(0, V, (P,), dtype=torch.int64).to("spyre")
         self.name_dims(table, {"V": V, "D": D})
         self.name_dims(ids, {"P": P})
@@ -275,7 +293,7 @@ class TestGather(IndirectAccessTestCase):
         )
 
     def test_index_select(self):
-        x, i = self._xi(P=32)
+        x, i = self._xi(P=32)  # source [128, 256] -> 4 sticks per row
         self._stage_and_e2e(
             lambda x, i: torch.index_select(x, 0, i), x, i, expect=GATHER_OP_SPEC
         )
@@ -303,7 +321,7 @@ class TestGather(IndirectAccessTestCase):
         CPU reference itself raises out-of-bounds once the kernel actually runs.
         """
         M, N, K = 128, 256, 64
-        x = pinned_to_spyre(torch.rand(M, N, dtype=torch.float16))
+        x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
         index = torch.randint(0, M, (M, K), dtype=torch.int64).to("spyre")
         self.name_dims(x, {"M": M, "N": N})
         self.name_dims(index, {"M": M, "K": K})
@@ -314,19 +332,19 @@ class TestGather(IndirectAccessTestCase):
     def test_embedding(self):
         """torch.embedding(weight, idx) currently falls back to CPU."""
         V, E, P = 256, 128, 32
-        weight = pinned_to_spyre(torch.rand(V, E, dtype=torch.float16))
+        weight = self.to_spyre(torch.rand(V, E, dtype=torch.float16))
         idx = torch.randint(0, V, (P,), dtype=torch.int32).to("spyre")
         self.name_dims(weight, {"V": V, "E": E})
         self.name_dims(idx, {"P": P})
         self._stage_and_e2e(
-            lambda w, i: torch.embedding(w, i), weight, idx, expect=NO_SPYRE_OP
+            lambda w, i: torch.embedding(w, i), weight, idx, expect=GATHER_OP_SPEC
         )
 
     # -- additional real gather scenarios ---------------------------------
     def test_gather_3d_data(self):
         """x[i] where x is 3-D [A,B,C] -- gather rows of higher-rank data."""
         A, B, C, P = 64, 8, 64, 16
-        x = pinned_to_spyre(torch.rand(A, B, C, dtype=torch.float16))
+        x = self.to_spyre(torch.rand(A, B, C, dtype=torch.float16))
         idx = torch.randint(0, A, (P,), dtype=torch.int32).to("spyre")
         self.name_dims(x, {"A": A, "B": B, "C": C})
         self.name_dims(idx, {"P": P})
@@ -360,7 +378,7 @@ class TestGather(IndirectAccessTestCase):
         )
 
     def test_index_select_3d(self):
-        x, i = self._xi3d(P=32)
+        x, i = self._xi3d(P=32)  # source [64, 8, 64] -> row B*C = 512 = 8 sticks
         self._stage_and_e2e(
             lambda x, i: torch.index_select(x, 0, i), x, i, expect=GATHER_OP_SPEC
         )
@@ -411,7 +429,7 @@ class TestGather(IndirectAccessTestCase):
     def test_moe(self):
         """MoE expert selection: expert_w[expert_ids] with 3D weights and 2D int64 index."""
         E, D, F, B, S = 8, 512, 2048, 2, 128
-        expert_w = pinned_to_spyre(torch.rand(E, D, F, dtype=torch.float16))
+        expert_w = self.to_spyre(torch.rand(E, D, F, dtype=torch.float16))
         expert_ids = torch.randint(0, E, (B, S), dtype=torch.int64).to("spyre")
         self.name_dims(expert_w, {"E": E, "D": D, "F": F})
         self.name_dims(expert_ids, {"B": B, "S": S})
@@ -422,15 +440,46 @@ class TestGather(IndirectAccessTestCase):
     def test_paged_kv(self):
         """Paged KV-cache gather: keys[slot_idxs] with 3D cache and 2D int64 slot index."""
         cache, H, Dh, B, Lk = 32768, 8, 128, 2, 256
-        keys = pinned_to_spyre(torch.rand(cache, H, Dh, dtype=torch.float16))
+        keys = self.to_spyre(torch.rand(cache, H, Dh, dtype=torch.float16))
         slot_idxs = torch.randint(0, cache, (B, Lk), dtype=torch.int64).to("spyre")
         self.name_dims(keys, {"cache": cache, "H": H, "Dh": Dh})
         self.name_dims(slot_idxs, {"B": B, "Lk": Lk})
+        # Source row is H*Dh = 1024 elems = 16 sticks, so the indexed dim must be
+        # relaid out to outermost or the gather reads only the first stick --
+        # check() asserts that (assert_indirect_source_indexed_dim_outermost).
         self._stage_and_e2e(lambda k, i: k[i], keys, slot_idxs, expect=GATHER_OP_SPEC)
+
+    def test_gather_multistick_source_indexed_dim_outermost(self):
+        """Gather whose source rows span several sticks: the source relayout must
+        put the indexed dim outermost in the OpSpec device coordinates.
+
+        cols=256 is 4 sticks per row, so this exercises the multi-stick striding
+        that a 1-stick source cannot. Without the relayout the indexed dim sits
+        behind the stick-count dim and the gather reads only the first stick of
+        each row. check() asserts the indexed dim landed outermost.
+        """
+        x = self.to_spyre(torch.rand(20, 256, dtype=torch.float16))
+        i = torch.tensor([0, 12, 3, 15, 7], dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"rows": 20, "cols": 256})
+        self.name_dims(i, {"P": 5})
+        self.check(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_gather_singlestick_source_indexed_dim_outermost(self):
+        """Control for the multi-stick case: a source whose row is exactly one
+        stick (cols=64). The indexed dim is already outermost, so the relayout is
+        a no-op -- this asserts the pass does not disturb the common single-stick
+        gather (the shape test_gather_1d covers) while still landing the indexed
+        dim outermost (check() asserts it).
+        """
+        x = self.to_spyre(torch.rand(20, 64, dtype=torch.float16))
+        i = torch.tensor([0, 12, 3, 15, 7], dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"rows": 20, "cols": 64})
+        self.name_dims(i, {"P": 5})
+        self.check(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
 
     def test_gather_after_reshape(self):
         """x.reshape(12, 256)[i] -- gather on a reshaped tensor."""
-        x = pinned_to_spyre(torch.rand(3, 1024, dtype=torch.float16))
+        x = self.to_spyre(torch.rand(3, 1024, dtype=torch.float16))
         i = torch.tensor((1, 2), dtype=torch.int32).to("spyre")
         self.name_dims(x, {"rows": 3, "cols": 1024})
         self.name_dims(i, {"P": 2})
@@ -440,7 +489,7 @@ class TestGather(IndirectAccessTestCase):
 
     def test_gather_after_reshape_1d(self):
         """t.reshape(16, 256)[idx] -- gather on a 1D tensor reshaped to 2D (page table)."""
-        t = pinned_to_spyre(torch.arange(4096, dtype=torch.float16))
+        t = self.to_spyre(torch.arange(4096, dtype=torch.float16))
         idx = torch.tensor((7, 3), dtype=torch.int32).to("spyre")
         self.name_dims(t, {"N": 4096})
         self.name_dims(idx, {"P": 2})
@@ -461,7 +510,7 @@ class TestGather(IndirectAccessTestCase):
     def test_gather_two_indices_added(self):
         """x[i] + x[j] -- two independent gathers feeding a binary op."""
         M, N, P = 128, 256, 32
-        x = pinned_to_spyre(torch.rand(M, N, dtype=torch.float16))
+        x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
         i = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
         j = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
         self.name_dims(x, {"M": M, "N": N})
@@ -474,10 +523,57 @@ class TestGather(IndirectAccessTestCase):
         x, i = self._xi(P=32)
         self._stage_and_e2e(lambda x, i: x[i].sum(dim=1), x, i, expect=GATHER_OP_SPEC)
 
+    def test_gather_after_producer_abs_2d(self):
+        """x.abs()[i] -- 2D gather with producer layout rewrite."""
+        M, N, P = 128, 256, 32
+        x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
+        i = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"M": M, "N": N})
+        self.name_dims(i, {"P": P})
+        self._stage_and_e2e(lambda x, i: x.abs()[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_gather_after_producer_abs_3d(self):
+        """x.abs()[i] -- 3D gather with producer layout rewrite."""
+        M, N, K, P = 64, 128, 64, 16
+        x = self.to_spyre(torch.rand(M, N, K, dtype=torch.float16))
+        i = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"M": M, "N": N, "K": K})
+        self.name_dims(i, {"P": P})
+        self._stage_and_e2e(lambda x, i: x.abs()[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_gather_after_producer_abs_4d(self):
+        """x.abs()[i] -- 4D gather with producer layout rewrite."""
+        M, N, K, L, P = 32, 32, 32, 64, 8
+        x = self.to_spyre(torch.rand(M, N, K, L, dtype=torch.float16))
+        i = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"M": M, "N": N, "K": K, "L": L})
+        self.name_dims(i, {"P": P})
+        self._stage_and_e2e(lambda x, i: x.abs()[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_gather_after_producer_abs_2d_index(self):
+        """x.abs()[i] -- 2D value tensor with 2D index tensor."""
+        M, N, P, Q = 128, 256, 16, 16
+        x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
+        i = torch.randint(0, M, (P, Q), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"M": M, "N": N})
+        self.name_dims(i, {"P": P, "Q": Q})
+        self._stage_and_e2e(lambda x, i: x.abs()[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_gather_after_complex_producer_ops(self):
+        """x.abs().neg().exp()[i] -- gather with multiple producer ops fused."""
+        M, N, P = 128, 256, 32
+        x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
+        i = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(x, {"M": M, "N": N})
+        self.name_dims(i, {"P": P})
+        self._stage_and_e2e(
+            lambda x, i: x.abs().neg().exp()[i], x, i, expect=GATHER_OP_SPEC
+        )
+
     def test_functional_embedding(self):
         """torch.nn.functional.embedding(idx, weight) -- like torch.embedding."""
         V, E, P = 256, 128, 32
-        weight = pinned_to_spyre(torch.rand(V, E, dtype=torch.float16))
+        weight = self.to_spyre(torch.rand(V, E, dtype=torch.float16))
         idx = torch.randint(0, V, (P,), dtype=torch.int32).to("spyre")
         self.name_dims(weight, {"V": V, "E": E})
         self.name_dims(idx, {"P": P})
@@ -485,7 +581,7 @@ class TestGather(IndirectAccessTestCase):
             lambda i, w: torch.nn.functional.embedding(i, w),
             idx,
             weight,
-            expect=NO_SPYRE_OP,
+            expect=GATHER_OP_SPEC,
         )
 
     # -- negative / control scenarios -------------------------------------
@@ -493,7 +589,7 @@ class TestGather(IndirectAccessTestCase):
         """x.exp() (no indexing): direct op spec, no IndirectAccess, no named
         index arg, and not flagged by detection."""
         M, N = 128, 256
-        x = pinned_to_spyre(torch.rand(M, N, dtype=torch.float16))
+        x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
         self.name_dims(x, {"M": M, "N": N})
         # x.exp() is a supported direct op, so its e2e result must match the CPU
         # reference (expect_close=True) -- unlike the indirect gathers.
@@ -521,6 +617,7 @@ class TestGather(IndirectAccessTestCase):
         op_specs = flatten_op_specs(captured)
         self.assertTrue(any(op_spec_has_indirect_input(s) for s in op_specs))
         self.assertNotIn("sin", [s.op for s in op_specs])
+        self.assert_indirect_source_indexed_dim_outermost(op_specs)
         self.assert_indirect_sdsc_fields(bundle_jsons_from_captured(captured), "gather")
         # TODO : Enable once e2e is available
         # run_e2e(self, lambda x, i: x[i].sin(), x, i)
@@ -636,8 +733,8 @@ class TestGather(IndirectAccessTestCase):
             any("sdsc" in name.lower() for name, _ in calls),
             f"expected an 'sdsc'-named kernel; got {[n for n, _ in calls]}",
         )
-        all_specs = [s for _, specs in calls for s in specs]
-        self.assertTrue(flatten_op_specs([all_specs]))
+        all_specs = flatten_op_specs([[s for _, specs in calls for s in specs]])
+        self.assertTrue(all_specs)
 
     def test_python_bundle_generation_succeeds(self):
         """Real generate_bundle runs end-to-end with the backend mocked.
@@ -663,6 +760,49 @@ class TestGather(IndirectAccessTestCase):
         ):
             result = torch.compile(lambda x, i: x[i].exp())(x, i)
         self.assertIsNotNone(result, "gather compile returned nothing")
+
+    def test_gather_multiple_indices_same_kernel(self):
+        """Test x[i] + y[i] - multiple gathers with same index in one kernel.
+
+        Verifies that when multiple gather operations use the same index tensor
+        in the same kernel, each operation correctly gets only the index tensors
+        it needs, not all indirect tensors in the kernel (regression test for
+        kernel-level indirect_vars carryover bug).
+        """
+        x, i = self._xi(P=3, two_d=True, dtype=torch.int64)
+        y = torch.randn_like(x)
+
+        def kernel(x, y, i):
+            return x[i] + y[i]
+
+        self._stage_and_e2e(kernel, x, y, i, expect=GATHER_OP_SPEC)
+
+    def test_gather_different_indices_same_kernel(self):
+        """Test x[i] + y[j] - multiple gathers with different indices in one kernel.
+
+        Verifies that when multiple gather operations use different index tensors
+        in the same kernel, each operation gets the correct index tensor without
+        cross-contamination from other gathers.
+        """
+        x, i = self._xi(P=3, two_d=True, dtype=torch.int64, M=128, N=256)
+        y, j = self._xi(P=3, two_d=True, dtype=torch.int64, M=100, N=256)
+
+        def kernel(x, y, i, j):
+            return x[i] + y[j]
+
+        self._stage_and_e2e(kernel, x, y, i, j, expect=GATHER_OP_SPEC)
+
+
+@config.patch({"sencores": 1})
+class TestGather(_GatherScenarios):
+    """Every gather scenario with a plain `.to("spyre")` source (no explicit
+    layout). The compiler picks the generic layout, so a multi-stick source
+    arrives with its indexed dim behind the stick-count dim; the gather-source
+    relayout pass must rotate it outermost.
+    """
+
+    __test__ = True
+    to_spyre = staticmethod(plain_to_spyre)
 
 
 if __name__ == "__main__":

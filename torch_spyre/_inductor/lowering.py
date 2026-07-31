@@ -25,6 +25,7 @@ import torch._inductor.ir as ir
 from typing import Any, Callable, Union
 
 from .constants import (
+    AVGPOOL2D_OP,
     BATCH_MATMUL_OP,
     COPY_BACK_CANDIDATE_ATTR,
     BATCH_MATMUL_FP8_OP,
@@ -131,6 +132,34 @@ def restore_lowerings(saved_overloads, lowering_dict):
             lowering_dict[overload] = func
 
 
+def register_fallback_over_decomp(fallback_ops):
+    """Register explicit fallback lowerings for fallback ops that also carry an
+    in-tree Inductor decomposition, returning the overloads newly added.
+
+    PT 2.12 added core-aten decompositions for several ops Spyre falls back to
+    (arange, tril, triu, isin, index_copy.out, ...). When such an op has no
+    registered lowering, Inductor's graph lowering auto-invokes
+    ``make_fallback(op)`` *without* ``override_decomp``, which asserts
+    ``both a fallback and a decomp for same op``. Pre-registering the fallback
+    with ``override_decomp=True`` installs a lowering so that auto-path — and
+    its assertion — is never reached.
+
+    Only overloads that are in ``lowering.decompositions`` and currently lack a
+    lowering are touched, so this composes with ``unregister_lowerings`` (which
+    runs first) and does not clobber Spyre's own lowerings.
+    """
+    added = []
+    for op in fallback_ops:
+        for overload in lowering.get_overloads(op):
+            if (
+                overload in lowering.decompositions
+                and overload not in lowering.lowerings
+            ):
+                lowering.make_fallback(overload, override_decomp=True)
+                added.append(overload)
+    return added
+
+
 # Overload names for aten.clamp
 _CLAMP_FUNC_OVS = ["default", "Tensor", "Tensor_minmax"]
 
@@ -154,6 +183,12 @@ def enable_spyre_lowerings():
             enable_spyre_lowerings._removed_fallbacks = {}
             enable_spyre_lowerings._removed_fallbacks = unregister_lowerings(
                 fallback_ops, lowering.lowerings, allow_missing=True
+            )
+            # Install explicit fallbacks for ops that also have an in-tree
+            # decomposition (PT 2.12), so Inductor never hits the asserting
+            # auto-``make_fallback`` path for them.
+            enable_spyre_lowerings._added_fallbacks = register_fallback_over_decomp(
+                fallback_ops
             )
             saved_intree_lowerings = {}
             for spyre_lowering_op, spyre_lowering_impl in spyre_lowerings.items():
@@ -224,6 +259,12 @@ def enable_spyre_lowerings():
                         ]
                     else:
                         lowering.lowerings.pop(spyre_lowering_op, None)
+                # Remove the fallback lowerings we added for decomp-carrying
+                # ops before restoring the originally-removed ones.
+                for overload in getattr(enable_spyre_lowerings, "_added_fallbacks", []):
+                    lowering.lowerings.pop(overload, None)
+                    lowering.fallbacks.discard(overload)
+                enable_spyre_lowerings._added_fallbacks = []
                 restore_lowerings(
                     enable_spyre_lowerings._removed_fallbacks, lowering.lowerings
                 )
@@ -698,6 +739,94 @@ def lower_topkindex(x, k, dim):
     return result
 
 
+@register_spyre_lowering(torch.ops.aten.avg_pool2d.default)
+def lower_avg_pool2d(
+    x,
+    kernel_size,
+    stride=None,
+    padding=0,
+    ceil_mode=False,
+    count_include_pad=True,
+    divisor_override=None,
+):
+    if ceil_mode:
+        raise Unsupported("avg_pool2d ceil_mode not supported")
+    if not count_include_pad:
+        raise Unsupported("avg_pool2d count_include_pad=False not supported")
+    if divisor_override is not None:
+        raise Unsupported("avg_pool2d divisor_override not supported")
+
+    kH, kW = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+    stride = stride if stride is not None else kernel_size
+    sH, sW = (stride, stride) if isinstance(stride, int) else stride
+    padding = padding if padding else 0
+    pH, pW = (padding, padding) if isinstance(padding, int) else padding
+
+    if pH > 0 or pW > 0:
+        raise Unsupported("avg_pool2d with non-zero padding not yet supported")
+
+    if kH == 1 or kW == 1:
+        # avgpoolfwd is a windowed reduction; a 1-wide kernel has no pooling
+        # window along that axis (it is an identity or a strided subsample),
+        # which the pool datapath cannot express — the DDL rejects a windowless
+        # pool ("Unknown primary dimension kind ... for a window dimension").
+        # Spyre also has no eager avg_pool2d kernel to fall back to.  So delegate
+        # to the in-tree Inductor lowering, which decomposes avg_pool2d into
+        # pointwise/reduction ops the Spyre backend does support and keeps k=1
+        # on-device.
+        return lowering.avg_pool2d(
+            x,
+            [kH, kW],
+            [sH, sW],
+            [pH, pW],
+            ceil_mode,
+            count_include_pad,
+            divisor_override,
+        )
+
+    N, C, H_in, W_in = x.get_size()
+
+    H_out = (H_in + 2 * pH - kH) // sH + 1
+    W_out = (W_in + 2 * pW - kW) // sW + 1
+
+    op_info = {
+        "constants": {
+            "kernel_h": kH,
+            "kernel_w": kW,
+            "stride_h": sH,
+            "stride_w": sW,
+            "pad_h": pH,
+            "pad_w": pW,
+            "scaling_factor": 1.0 / (kH * kW),
+        },
+    }
+
+    def inner_fn(index, reduction_index):
+        n, c, ho, wo = index
+        kh, kw = reduction_index
+        hi = ho * sH - pH + kh
+        wi = wo * sW - pW + kw
+        return x.make_loader()([n, c, hi, wi])
+
+    result = SpyreReduction.create(
+        reduction_type=AVGPOOL2D_OP,
+        input_node=x,
+        device=x.get_device(),
+        dst_dtype=x.get_dtype(),
+        src_dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=[N, C, H_out, W_out],
+        reduction_ranges=[kH, kW],
+        op_info=op_info,
+    )
+    # Realize so the pool becomes its own ComputedBuffer: codegen's
+    # kernel_store_reduction reads op_info (pool constants) off node.data.op_info,
+    # which only exists when the SpyreReduction is realized rather than fused into
+    # a consumer.
+    result.realize()
+    return result
+
+
 @register_spyre_lowering(torch.ops.aten.mean.dim)
 def lower_mean(x, axis=None, keepdim=False, *, dtype=None):
     kwargs = lowering._make_reduction_inner(
@@ -1053,6 +1182,18 @@ def _peel(node):
     return node
 
 
+def _peel_through_views(node):
+    """Like _peel, but also unwraps views (reshape/expand/slice/etc.).
+
+    A view (e.g. ir.ReinterpretView) is not a MutableBox/StorageBox, so plain
+    _peel stops at the view instead of reaching the Buffer underneath it.
+    """
+    node = _peel(node)
+    while isinstance(node, ir.BaseView):
+        node = _peel(node.data)
+    return node
+
+
 def _copy_back_candidate(dst, src) -> bool:
     """Whether ``copy_(dst, src)`` is worth checking after layout propagation.
 
@@ -1222,7 +1363,9 @@ def lower_constant_pad_nd(input, pad, value=0, align_to_stick=False):
     torch.ops.prims.convert_element_type.default,
     type_promotion_kind=None,
 )
-def to_dtype(x, dst_dtype):
+def to_dtype(x, dst_dtype, use_compute_types=True):
+    # PT 2.12 passes a ``use_compute_types`` kwarg to registered dtype-conversion
+    # lowerings; accept and forward it to the in-tree lowering.
     from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
     src_dtype = x.get_dtype()
@@ -1231,12 +1374,28 @@ def to_dtype(x, dst_dtype):
         return lowering.clone(x)
 
     # Check if conversion is supported by backend
-    if DtypeOpTable.get_operator(src_dtype, dst_dtype) is None:
+    if not DtypeOpTable.is_supported(src_dtype, dst_dtype):
         # Unsupported conversion - fall back to CPU
         op = torch.ops.spyre.to_dtype_cpu.default
         return eager_fallback(op, x, dst_dtype)
 
-    return lowering.to_dtype(x, dst_dtype, copy=True)
+    # DMA-copied bool InputBuffers have a different HBM element ordering than
+    # computation-kernel outputs, so a stick-reordering typecast (e.g.
+    # DL16TOFP32 for bool → float32) reads them back shuffled (28/64 elements).
+    # Fall back to CPU for host bools whose conversion reorders sticks; an
+    # IDENTITY byte-copy (e.g. bool → float16) is safe. On-device computed bools
+    # use the native path. Peel through views (reshape/expand) too, since a
+    # viewed host bool is still backed by the same DMA-copied InputBuffer.
+    if src_dtype == torch.bool and DtypeOpTable.bool_host_conversion_reorders_sticks(
+        dst_dtype
+    ):
+        if isinstance(_peel_through_views(x), ir.InputBuffer):
+            op = torch.ops.spyre.to_dtype_cpu.default
+            return eager_fallback(op, x, dst_dtype)
+
+    return lowering.to_dtype(
+        x, dst_dtype, copy=True, use_compute_types=use_compute_types
+    )
 
 
 def with_int64_fallback(fn, *args, convert_output=True):

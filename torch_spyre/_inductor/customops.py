@@ -414,13 +414,14 @@ def max_dim_int64_fallback(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     CPU fallback for torch.max(input, dim) when input is int64.
-    This custom op will be registered with a CPU fallback in fallbacks.py.
-    Returns a tuple (values, indices) as expected by torch.max.
+
+    The Spyre device kernel (registered in fallbacks.py via
+    register_kernel(op, ["spyre"])) handles spyre-tensor inputs. PT 2.12
+    routes calls with non-spyre tensor inputs (e.g. compare_with_cpu test
+    paths) to this CompositeExplicitAutograd body, so it must compute the
+    real result rather than raise.
     """
-    # This should never be called directly; the fallback in fallbacks.py handles it
-    raise RuntimeError(
-        "spyre::max_dim_int64_fallback should be handled by CPU fallback registration"
-    )
+    return torch.max(input, dim=dim, keepdim=keepdim)
 
 
 @max_dim_int64_fallback.register_fake
@@ -533,13 +534,11 @@ def min_dim_int64_fallback(
     input: torch.Tensor, dim: int, keepdim: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    CPU fallback for torch.min(input, dim) when input is int64.
-    This custom op will be registered with a CPU fallback in fallbacks.py.
-    Returns a tuple (values, indices) as expected by torch.min.
+    CPU fallback for torch.min(input, dim) when input is int64. See
+    max_dim_int64_fallback for the rationale on the body computing the
+    real result instead of raising.
     """
-    raise RuntimeError(
-        "spyre::min_dim_int64_fallback should be handled by CPU fallback registration"
-    )
+    return torch.min(input, dim=dim, keepdim=keepdim)
 
 
 @min_dim_int64_fallback.register_fake

@@ -285,11 +285,20 @@ if an input dimension is unnamed, or if a view transformation is
 inconsistent with the user-provided dimension names, a warning is emitted
 and propagation continues with partial or inferred information.
 
-The pass runs in `CustomPreSchedulingPasses`, after tensor layouts have been
-finalized and before work-division and scratchpad planning consume the
-resulting iteration spaces. The slot is rigid: layouts must be settled
-before tiling decisions can refer to them, and work-division must see the
-post-tiling iteration space.
+The pass runs in `CustomPreSchedulingPasses`, split across two slots. A
+hint-driven half (`propagate_named_dims`, `assign_dim_hints`, and the
+hint-derived half of coarse tiling) runs immediately after dead-code
+elimination, **before** stickification — it only needs host-side
+`FixedLayout` (size/stride) and loop-variable ranges, so there is no reason
+to wait for device layouts. A span-overflow half runs later, after
+stickification, because it needs `FixedTiledLayout.device_layout` (device
+size, stride map) to detect and correct spans that overflow the hardware
+memory budget. Both halves still run before work-division and scratchpad
+planning consume the resulting iteration spaces: work-division must see the
+post-tiling iteration space regardless of which half produced it. See
+[`coarse_tiling_loops.md`](coarse_tiling_loops.md#groups-derivation-and-placement-in-custompreschedulingpasses)
+for the full pass ordering and the rationale for the two-slot split
+(issue #3135).
 
 :::{figure} ../_static/images/wsr/pipeline-placement.png
 :alt: Where WSR runs in the Spyre Inductor pipeline
@@ -330,6 +339,17 @@ buffers crossing the loop boundary are classified — are documented in
 [`coarse_tiling_loops.md`](coarse_tiling_loops.md). The design rationale
 for those mechanics is in [RFC 1358: Coarse
 Tiling](https://github.com/torch-spyre/rfcs/blob/main/1358-CoarseTiling/1358-CoarseTiling.md).
+
+A buffer that crosses the loop boundary and is *not* marked
+`per_tile_fixed` (see [`coarse_tiling_loops.md`](coarse_tiling_loops.md))
+advances its base address once per loop iteration, so its HBM pool
+allocation must be sized for every tile it will occupy across the loop's
+run, not just one. `memory_planning.py`'s `_advance_factor` computes this
+as the product of `loop_count` over the levels the buffer is tiled on;
+sizing it for a single tile would let the loop overrun into whatever buffer
+the allocator packed next to it. See
+[`coarse_tiling_loops.md`](coarse_tiling_loops.md) for the `accum_full` /
+`accum_tile` buffers this sizing matters most for.
 
 ## Related documents
 

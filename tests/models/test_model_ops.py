@@ -108,7 +108,7 @@ def _init_model_ops_db():
 
 _init_model_ops_db()
 
-seen_case_keys = set()
+seen_case_keys: set[tuple[Any, Any, Any, Any, Any, Any]] = set()
 
 
 class TestSpyreModelOps(TestCase):

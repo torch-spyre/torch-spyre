@@ -32,7 +32,7 @@ from torch._inductor.ir import (
     Reduction,
 )
 from torch._inductor.scheduler import SchedulerNode
-from torch._inductor.dependencies import MemoryDep, ReadWrites, StarDep
+from torch._inductor.dependencies import MemoryDep, ReadWrites, StarDep, is_indirect
 from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 from torch_spyre._inductor.errors import Unsupported
@@ -41,9 +41,10 @@ from torch_spyre._inductor.op_spec import IndirectAccess
 from . import config
 from .core_mapping import core_to_slice_mapping
 from .constants import ELIDED_COPY_BACK_ATTR, MATMUL_REDUCTION_OPS
-from .ir import FixedTiledLayout, SpyreConstantFallback
+from .ir import FixedTiledLayout, SpyreConstantFallback, SpyreEmptyFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
+from .provenance import preserve_provenance
 from .views import compute_coordinates, matching_dim
 
 # PyTorch's default lower bound for size symbols (sizes 0/1 are specialised).
@@ -59,7 +60,23 @@ class SchedNodeArg(NamedTuple):
 def _fixed_read_layout(buf) -> "FixedTiledLayout":
     layout = buf.get_layout()
     if isinstance(layout, MutationLayoutSHOULDREMOVE):
-        if not getattr(buf, ELIDED_COPY_BACK_ATTR, False):
+        # Reading real_layout() through a mutation layout is only valid once
+        # the target buffer's own layout is a committed FixedTiledLayout. Two
+        # producers of this shape:
+        #  - the copy-back elision optimization (propagate_layouts.py), which
+        #    stamps ELIDED_COPY_BACK_ATTR on the producer; or
+        #  - coarse_tile.py's nested output-dim + reduction-dim tiling
+        #    (_insert_reduction_copy_op), which mutates directly into a
+        #    SpyreEmptyFallback accumulator (accum_tile) — a legitimate
+        #    in-group consumer (e.g. the next outer-tile iteration's copy-in)
+        #    reads that copy op's own output the same way an ordinary
+        #    producer's output would be read.
+        mutation_target = layout.get_buffer()
+        is_elided = getattr(buf, ELIDED_COPY_BACK_ATTR, False)
+        is_carry_into_accum = isinstance(
+            mutation_target, SpyreEmptyFallback
+        ) and isinstance(mutation_target.get_layout(), FixedTiledLayout)
+        if not (is_elided or is_carry_into_accum):
             raise RuntimeError(f"unexpected mutation layout on read buffer {buf}")
         layout = layout.real_layout()
     if not isinstance(layout, FixedTiledLayout):
@@ -124,7 +141,7 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
     if isinstance(expr, sympy.Integer):
         return int(expr)
     if hasattr(expr, "free_symbols") and expr.free_symbols:
-        return V.graph.sizevars.size_hint(expr)
+        return V.graph.sizevars.optimization_hint(expr)
     return int(expr)
 
 
@@ -190,13 +207,13 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
     min_default_g = config.min_default_granularity
 
     # When ShapeEnv has no finite upper bound, max_size came from
-    # size_hint (via compute_max_size below, merged in #2003), not from
+    # optimization_hint (via compute_max_size below, merged in #2003), not from
     # mark_dynamic(max=...). The granularity is then only as trustworthy
     # as that hint -- warn the user so they can pin it explicitly with
     # mark_dynamic(max=...).
     if finite_upper_or_none(expr) is None:
         warnings.warn(
-            f"max for symbolic dim {expr} came from size_hint, not from "
+            f"max for symbolic dim {expr} came from optimization_hint, not from "
             f"mark_dynamic(max=...). Proceeding with max={max_size} as a "
             f"best-effort estimate. Set max explicitly via mark_dynamic to "
             f"lock the bucket structure.",
@@ -257,14 +274,20 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     if not isinstance(index, sympy.Basic):
         return sympy.sympify(index)
 
-    size_syms = index.free_symbols - loop_vars
+    # Exclude indirect (gather/scatter) index symbols such as ``tmp0``. Under
+    # PT 2.12, ``optimization_hint`` concretizes an unbacked indirect symbol to
+    # ``config.unbacked_symint_fallback`` (8192) instead of raising, which would
+    # drop the symbol from the coordinate and break named-dim propagation for
+    # gathers. Only genuine dynamic-shape size symbols (s0, s1, ...) should be
+    # concretized here; indirect symbols must stay symbolic.
+    size_syms = {s for s in (index.free_symbols - loop_vars) if not is_indirect(s.name)}
     if not size_syms:
         return index
     # Try each symbol individually
     subs = {}
     for s in size_syms:
         try:
-            hint = V.graph.sizevars.size_hint(s)
+            hint = V.graph.sizevars.optimization_hint(s)
             subs[s] = hint  # Successfully concretized
         except (TypeError, ValueError):
             # Can't concretize this symbol, skip it
@@ -281,7 +304,7 @@ def compute_max_size(expr: Union[Expr, int]) -> int:
 
     Uses the ShapeEnv upper bound when one is recorded (i.e. the symbol was
     created with an explicit ``max=`` constraint using mark_dynamic API). Falls
-    back to ``size_hint`` when no finite upper bound exists.
+    back to ``optimization_hint`` when no finite upper bound exists.
 
     Needed for dynamic shape support.
     """
@@ -294,7 +317,11 @@ def compute_max_size(expr: Union[Expr, int]) -> int:
     bound = finite_upper_or_none(expr)
     if bound is not None:
         return bound
-    return V.graph.sizevars.size_hint(expr)
+    # No finite ShapeEnv bound: fall back to the permissive hint. size_hint was
+    # removed in PT 2.12; optimization_hint is its replacement and keeps the
+    # intended "best-effort max estimate" semantics (a heuristic/fallback for
+    # unbacked symbols) rather than raising.
+    return V.graph.sizevars.optimization_hint(expr)
 
 
 def compute_symbolic_bounds(expr: Union[Expr, int]) -> "tuple[int, int] | None":
@@ -771,6 +798,9 @@ def iteration_space(n: SchedulerNode) -> dict[sympy.Symbol, sympy.Expr]:
         return next(iter(n.read_writes.writes)).ranges.copy()
     elif isinstance(n.node.data, Reduction):
         # Output dims from the write dep; reduction dims appended from read deps.
+        # Inductor shares sympy symbols across all tensor accesses in a Reduction's
+        # inner_fn, so the if-not-in guard correctly deduplicates without producing
+        # spurious dims even for multi-input reductions (matmul, conv2d, etc.).
         result = next(iter(n.read_writes.writes)).ranges.copy()
         for dep in n.read_writes.reads:
             if isinstance(dep, StarDep):
@@ -791,6 +821,9 @@ def iteration_space_from_op(op: ComputedBuffer) -> dict[sympy.Symbol, sympy.Expr
         return next(iter(rw.writes)).ranges.copy()
     elif isinstance(op.data, Reduction):
         # Output dims from write dep; reduction dims appended from read deps.
+        # Inductor shares sympy symbols across all tensor accesses in a Reduction's
+        # inner_fn, so the if-not-in guard correctly deduplicates without producing
+        # spurious dims even for multi-input reductions (matmul, conv2d, etc.).
         result = next(iter(rw.writes)).ranges.copy()
         for dep in rw.reads:
             if isinstance(dep, StarDep):
@@ -810,6 +843,43 @@ _V = TypeVar("_V")
 # reduction_splits is keyed by the symbol's coefficient in the first read dep's index.
 # The two dicts use different reference indices so their keys never collide.
 ItSpaceSplits = tuple[dict[sympy.Expr, int], dict[sympy.Expr, int]]
+
+
+def coeff_through_floor(expr: sympy.Expr, sym: sympy.Symbol) -> sympy.Expr:
+    """``expr.coeff(sym)``, but also finds ``sym``'s coefficient when it
+    only appears inside a ``floor(...)`` wrapper.
+
+    ``device_tile_advance_expr`` (the only caller of this helper today) is
+    always a sympy ``Add`` where each tiled symbol contributes exactly one
+    additive term -- one minted symbol per coarse-tiling level, produced by
+    ``views.tiling_expr_to_device_expr``. That term is either a plain
+    ``Mul`` (``k*sym``) or ``sympy.floor(k*sym/d)``. ``sympy.Expr.coeff()``
+    looks through ``Mul``/``Add`` fine but refuses to look inside
+    ``floor()``, silently returning 0 for a genuine free symbol. This
+    isolates ``sym``'s own term first, then unwraps one ``floor()`` layer
+    before delegating to ``.coeff()``.
+
+    Tiles are always a whole number of sticks, so ``floor()``'s division
+    here must always be exact; a non-integer result means an earlier pass
+    or ``spyre_hint`` produced an invalid sub-stick tile boundary, and is
+    reported as ``Unsupported`` rather than silently truncated.
+    """
+    terms = expr.args if isinstance(expr, sympy.Add) else (expr,)
+    own_term = next((t for t in terms if sym in t.free_symbols), None)
+    if own_term is None:
+        return sympy.S.Zero
+    if isinstance(own_term, sympy.floor):
+        coeff = own_term.args[0].coeff(sym)
+    else:
+        coeff = own_term.coeff(sym)
+    if coeff != 0 and not coeff.is_Integer:
+        raise Unsupported(
+            f"Tile-advance coefficient {coeff} for symbol {sym} in "
+            f"{expr!r} is not an integer number of sticks -- tiling below "
+            "stick granularity is not supported (check the originating "
+            "spyre_hint or coarse-tiling pass)"
+        )
+    return coeff
 
 
 def _coeff_splits_from_index(
@@ -1080,6 +1150,9 @@ def replace_computed_buffer_body(
     op: ComputedBuffer,
     new_data: Loops,
     operations: list[Operation],
+    *,
+    pass_name: str,
+    reason: str | None = None,
 ) -> ComputedBuffer:
     """Replace the body (``data``) of a ``ComputedBuffer`` with ``new_data``.
 
@@ -1106,8 +1179,7 @@ def replace_computed_buffer_body(
         _original_reduction_ranges=op._original_reduction_ranges,
     )
     new_buf.operation_name = op.operation_name
-    new_buf.origins = op.origins
-    new_buf.origin_node = op.origin_node
+    preserve_provenance(op, new_buf, pass_name=pass_name, reason=reason)
     copy_op_metadata(op, new_buf)
     ComputedBuffer.get_default_sizes_body.clear_cache(new_buf)
 
@@ -1393,7 +1465,11 @@ class _ViewPrep(NamedTuple):
 
 
 def _prepare_per_core_view(
-    op: Operation, dep: MemoryDep, buf_name: str
+    op: Operation,
+    dep: MemoryDep,
+    buf_name: str,
+    *,
+    parts: "Optional[tuple[dict, sympy.Expr, sympy.Expr]]" = None,
 ) -> Optional[_ViewPrep]:
     """Compute the candidate-invariant pieces of a per-core view once.
 
@@ -1401,14 +1477,22 @@ def _prepare_per_core_view(
     the view is then unrepresentable for *every* candidate, so callers map
     ``None`` to the unrepresentable result without entering the per-candidate
     path.
+
+    ``parts`` supplies ``(iter_space, write_index, read_index)`` explicitly.
+    Default (None) reads them off ``op`` -- the *pre*-scheduler ranges, which is
+    what LX planning sees. Post-fusion callers pass the ``SchedulerNode``'s
+    ranges instead, so they model the order codegen will actually emit.
     """
-    # The op-level write_index / read_index (for *any* buffer the op writes /
-    # reads, not necessarily buf_name) bridge stride-keyed coeff_splits back to
-    # scheduler symbols.
-    rw = op_read_writes(op)
-    write_index = next(iter(rw.writes)).index
-    read_index = next((d.index for d in rw.reads), write_index)
-    iter_space = iteration_space_from_op(op)
+    if parts is not None:
+        iter_space, write_index, read_index = parts
+    else:
+        # The op-level write_index / read_index (for *any* buffer the op writes /
+        # reads, not necessarily buf_name) bridge stride-keyed coeff_splits back
+        # to scheduler symbols.
+        rw = op_read_writes(op)
+        write_index = next(iter(rw.writes)).index
+        read_index = next((d.index for d in rw.reads), write_index)
+        iter_space = iteration_space_from_op(op)
 
     buf_op = V.graph.get_buffer(buf_name)
     buf_layout = buf_op.layout
@@ -1669,6 +1753,38 @@ def _per_core_view_on_buf(
     return result
 
 
+def per_core_view_scheduled(
+    node: "SchedulerNode", dep: MemoryDep, buf_name: str
+) -> tuple[PerCoreView, bool, bool]:
+    """:func:`_per_core_view_on_buf` against the *post*-scheduler ranges.
+
+    Same result shape, but the iteration space and indices come from
+    ``node.read_writes`` / :func:`iteration_space` rather than the pre-scheduler
+    ``op.get_read_writes()``. Inductor's ``loop_ordering_after_fusion`` can
+    permute a fused op's ranges after LX planning has already committed, and
+    ``core_to_slice_mapping`` is positional, so only this post-fusion view
+    reflects the core->slice assignment codegen will really emit.
+    """
+    op = node.node
+    coeff_splits: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
+    if not any(n > 1 for d in coeff_splits for n in d.values()):
+        # No real split -> whole-buffer view; every core holds all of it.
+        return (PerCoreView(work_slice_dims=(), core_to_slot=()), False, True)
+
+    rw = node.read_writes
+    write_dep = next((d for d in rw.writes if isinstance(d, MemoryDep)), None)
+    if write_dep is None:
+        # StarDep-only writer: no index to reason about, so treat as
+        # unrepresentable rather than guessing.
+        return (PerCoreView(work_slice_dims=(), core_to_slot=()), False, False)
+    read_index = next(
+        (d.index for d in rw.reads if isinstance(d, MemoryDep)), write_dep.index
+    )
+    parts = (iteration_space(node), write_dep.index, read_index)
+    prep = _prepare_per_core_view(op, dep, buf_name, parts=parts)
+    return _per_core_view_from_prep(prep, coeff_splits)
+
+
 def format_operations(operations: list[Operation]) -> str:
     """Format LLIR operations including torch-spyre custom metadata"""
     buf = io.StringIO()
@@ -1691,6 +1807,8 @@ def format_operations(operations: list[Operation]) -> str:
                 buf.write(f"\n  dim_hints={dim_hints}")
             if loop_info := getattr(op, "loop_info", None):
                 buf.write(f"\n  loop_info={loop_info}")
+            if pending_per_tile_fixed := getattr(op, "_pending_per_tile_fixed", None):
+                buf.write(f"\n  _pending_per_tile_fixed={pending_per_tile_fixed}")
             buf.write(f"\n  {op.data}")
         buf.write("\n\n")
     return buf.getvalue()
