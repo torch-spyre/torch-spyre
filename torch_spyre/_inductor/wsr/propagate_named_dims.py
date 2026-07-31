@@ -557,6 +557,48 @@ def propagate_named_dims(
         _enabled = False
 
 
+def validate_named_dims(graph: GraphLowering) -> None:
+    """Assert expected_named_dims / expected_reduction_dims hints match propagation.
+
+    Reads hint keys set by spyre_hint() and compares them against the
+    _dim_prop_info written by propagate_named_dims().  Raises AssertionError
+    immediately on the first mismatch.  Ops without assertion hints are skipped.
+    Ops where _dim_prop_info is absent (propagation was skipped or the op is a
+    no-op) are also silently skipped.
+    """
+    for op in graph.operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        dp = getattr(op, "_dim_prop_info", None)
+        if dp is None:
+            continue
+        for hint_dict in get_op_hints(op).values():
+            if "expected_named_dims" in hint_dict or "expected_reduction_dims" in hint_dict:
+                logger.info(f"validate_named_dims: checking {op.get_name()} named_dims={dp.named_dims}")
+            if "expected_named_dims" in hint_dict:
+                expected = hint_dict["expected_named_dims"]
+                actual = dp.named_dims
+                if actual != expected:
+                    origins: set = getattr(op.data, "origins", set())
+                    aten_ops = [str(n.target) for n in origins if hasattr(n, "target")]
+                    raise AssertionError(
+                        f"validate_named_dims: {op.get_name()} {aten_ops}\n"
+                        f"  expected_named_dims: {expected}\n"
+                        f"  actual   named_dims: {actual}"
+                    )
+            if "expected_reduction_dims" in hint_dict:
+                expected = hint_dict["expected_reduction_dims"]
+                actual = dp.reduction_named_dims
+                if actual != expected:
+                    origins = getattr(op.data, "origins", set())
+                    aten_ops = [str(n.target) for n in origins if hasattr(n, "target")]
+                    raise AssertionError(
+                        f"validate_named_dims: {op.get_name()} {aten_ops}\n"
+                        f"  expected_reduction_dims: {expected}\n"
+                        f"  actual   reduction_dims: {actual}"
+                    )
+
+
 def _assign_dim_hints_impl(operations: list[Operation]) -> None:
     for op in operations:
         if not isinstance(op, ComputedBuffer):
