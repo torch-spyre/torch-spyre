@@ -535,41 +535,41 @@ class _GatherScenarios(IndirectAccessTestCase):
         x, i = self._xi(P=32)
         self._stage_and_e2e(lambda x, i: x[i].sum(dim=1), x, i, expect=GATHER_OP_SPEC)
 
-    def test_gather_after_producer_abs_2d(self):
-        """x.abs()[i] -- 2D gather with producer layout rewrite."""
+    def test_gather_after_producer_exp_2d(self):
+        """x.exp()[i] -- 2D gather with producer layout rewrite."""
         M, N, P = 128, 256, 32
         x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
         i = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
         self.name_dims(x, {"M": M, "N": N})
         self.name_dims(i, {"P": P})
-        self._stage_and_e2e(lambda x, i: x.abs()[i], x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(lambda x, i: x.exp()[i], x, i, expect=GATHER_OP_SPEC)
 
-    def test_gather_after_producer_abs_3d(self):
-        """x.abs()[i] -- 3D gather with producer layout rewrite."""
+    def test_gather_after_producer_exp_3d(self):
+        """x.exp()[i] -- 3D gather with producer layout rewrite."""
         M, N, K, P = 64, 128, 64, 16
         x = self.to_spyre(torch.rand(M, N, K, dtype=torch.float16))
         i = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
         self.name_dims(x, {"M": M, "N": N, "K": K})
         self.name_dims(i, {"P": P})
-        self._stage_and_e2e(lambda x, i: x.abs()[i], x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(lambda x, i: x.exp()[i], x, i, expect=GATHER_OP_SPEC)
 
-    def test_gather_after_producer_abs_4d(self):
-        """x.abs()[i] -- 4D gather with producer layout rewrite."""
+    def test_gather_after_producer_exp_4d(self):
+        """x.exp()[i] -- 4D gather with producer layout rewrite."""
         M, N, K, L, P = 32, 32, 32, 64, 8
         x = self.to_spyre(torch.rand(M, N, K, L, dtype=torch.float16))
         i = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
         self.name_dims(x, {"M": M, "N": N, "K": K, "L": L})
         self.name_dims(i, {"P": P})
-        self._stage_and_e2e(lambda x, i: x.abs()[i], x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(lambda x, i: x.exp()[i], x, i, expect=GATHER_OP_SPEC)
 
-    def test_gather_after_producer_abs_2d_index(self):
-        """x.abs()[i] -- 2D value tensor with 2D index tensor."""
+    def test_gather_after_producer_exp_2d_index(self):
+        """x.exp()[i] -- 2D value tensor with 2D index tensor."""
         M, N, P, Q = 128, 256, 16, 16
         x = self.to_spyre(torch.rand(M, N, dtype=torch.float16))
         i = torch.randint(0, M, (P, Q), dtype=torch.int32).to("spyre")
         self.name_dims(x, {"M": M, "N": N})
         self.name_dims(i, {"P": P, "Q": Q})
-        self._stage_and_e2e(lambda x, i: x.abs()[i], x, i, expect=GATHER_OP_SPEC)
+        self._stage_and_e2e(lambda x, i: x.exp()[i], x, i, expect=GATHER_OP_SPEC)
 
     def test_gather_after_complex_producer_ops(self):
         """x.abs().neg().exp()[i] -- gather with multiple producer ops fused."""
