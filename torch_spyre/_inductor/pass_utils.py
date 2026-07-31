@@ -1845,16 +1845,33 @@ def pad_small_gather_indices(graph: "torch.fx.Graph") -> None:
     ``layoutDimOrder``, satisfying the backend.  The slice discards the extra
     rows before they reach the model output.
     """
+    _GATHER_OPS = {
+        torch.ops.aten.index.Tensor,
+        torch.ops.aten.embedding.default,
+    }
+
     for node in list(graph.nodes):
-        if node.op != "call_function" or node.target is not torch.ops.aten.index.Tensor:
+        if node.op != "call_function" or node.target not in _GATHER_OPS:
             continue
 
-        x_node = node.args[0]
-        indices = node.args[1]
-        if not (len(indices) == 1 and indices[0] is not None):
-            continue
+        # --- extract index node and output shape remainder ---
+        if node.target is torch.ops.aten.index.Tensor:
+            src_node = node.args[0]
+            indices = node.args[1]
+            if not (len(indices) == 1 and indices[0] is not None):
+                continue
+            idx_node = indices[0]
+            src_val = src_node.meta.get("val")
+            out_dtype = src_val.dtype if src_val is not None else torch.float16
+            out_rest = list(src_val.shape[1:]) if src_val is not None else []
+        else:  # aten.embedding
+            src_node = node.args[0]
+            idx_node = node.args[1]
+            src_val = src_node.meta.get("val")
+            out_dtype = src_val.dtype if src_val is not None else torch.float16
+            # embedding output shape: (P, embed_dim)
+            out_rest = [int(src_val.shape[1])] if src_val is not None else []
 
-        idx_node = indices[0]
         idx_val = idx_node.meta.get("val")
         if idx_val is None or idx_val.ndim != 1:
             continue
@@ -1867,9 +1884,6 @@ def pad_small_gather_indices(graph: "torch.fx.Graph") -> None:
 
         epp = get_elem_in_stick(idx_val.dtype)
         pad_size = epp - 1
-        x_val = x_node.meta.get("val")
-        out_dtype = x_val.dtype if x_val is not None else torch.float16
-        out_rest = list(x_val.shape[1:]) if x_val is not None else []
 
         with graph.inserting_before(node):
             padded_idx = graph.call_function(
@@ -1880,17 +1894,23 @@ def pad_small_gather_indices(graph: "torch.fx.Graph") -> None:
                 epp, dtype=idx_val.dtype, device="meta"
             )
 
-            padded_gather = graph.call_function(
-                torch.ops.aten.index.Tensor,
-                (x_node, [padded_idx]),
-            )
-            padded_gather.meta["val"] = torch.empty(
+            if node.target is torch.ops.aten.index.Tensor:
+                padded_out = graph.call_function(
+                    torch.ops.aten.index.Tensor,
+                    (src_node, [padded_idx]),
+                )
+            else:
+                padded_out = graph.call_function(
+                    torch.ops.aten.embedding.default,
+                    (src_node, padded_idx) + node.args[2:],
+                )
+            padded_out.meta["val"] = torch.empty(
                 [epp] + out_rest, dtype=out_dtype, device="meta"
             )
 
             sliced = graph.call_function(
                 torch.ops.aten.slice.Tensor,
-                (padded_gather, 0, 0, 1),
+                (padded_out, 0, 0, 1),
             )
             sliced.meta["val"] = torch.empty(
                 [1] + out_rest, dtype=out_dtype, device="meta"
