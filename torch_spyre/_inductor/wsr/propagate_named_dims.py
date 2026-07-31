@@ -592,7 +592,84 @@ def validate_named_dims(graph: GraphLowering) -> None:
                     )
 
 
+_TILE_SIZE_KEY = "tile_size_per_dim"
+_COUNT_KEYS = ("tiles", "slices", "num_tiles_per_dim")
+
+
+def _hint_dims(hint_dict: dict) -> dict:
+    """The {name: value} mapping a hint scope specifies, whichever key it used."""
+    for k in (*_COUNT_KEYS, _TILE_SIZE_KEY):
+        v = hint_dict.get(k)
+        if v:
+            return v
+    return {}
+
+
+def _resolve_tile_size_counts(operations: list[Operation]) -> dict[int, dict[str, int]]:
+    """Convert tile_size_per_dim hints to trip counts, per hint scope.
+
+    The trip count is a property of the hint SCOPE, not of one op: an op that is
+    broadcast w.r.t. the hinted dim has loop_var=None and cannot derive the count
+    locally, yet must share the group's count. So resolve it once here from any op
+    that does carry the dim, and hand the same value to every op in the scope.
+
+    Requires extent % tile_size == 0. That is the padding invariant, not a
+    convenience: WSR assumes every tile is full (see
+    docs/wsr-tile-size-api-plan.md), so a non-multiple extent means the caller did
+    not pad, and the failure must be loud rather than a short final tile.
+    """
+    counts: dict[int, dict[str, int]] = {}
+    for op in operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        dp = getattr(op, "_dim_prop_info", None)
+        if not (dp and dp.loop_var_dims):
+            continue
+        op_hints = get_op_hints(op)
+        if not any(_TILE_SIZE_KEY in h for h in op_hints.values()):
+            continue
+
+        rw = op.get_read_writes()
+        extents = {
+            sym: int(v)
+            for dep in [*rw.reads, *rw.writes]
+            for sym, v in dep.ranges.items()
+        }
+        name_to_sym: dict[str, sympy.Symbol] = {}
+        for sym, names in dp.loop_var_dims.items():
+            for nm in names:
+                name_to_sym[nm] = sym
+
+        for hint_id, hint_dict in op_hints.items():
+            sizes = hint_dict.get(_TILE_SIZE_KEY)
+            if not sizes:
+                continue
+            for name, tile_size in sizes.items():
+                if counts.get(hint_id, {}).get(name) is not None:
+                    continue
+                sym = name_to_sym.get(name)
+                extent = extents.get(sym) if sym is not None else None
+                if not extent:
+                    continue  # this op does not carry the dim; another will
+                if int(tile_size) <= 0:
+                    raise Unsupported(
+                        f"spyre_hint(tile_size_per_dim={{{name!r}: {tile_size}}}): "
+                        "tile size must be positive"
+                    )
+                if extent % int(tile_size) != 0:
+                    raise Unsupported(
+                        f"spyre_hint(tile_size_per_dim={{{name!r}: {tile_size}}}): "
+                        f"dim {name!r} has extent {extent}, which is not a multiple "
+                        f"of the tile size. WSR requires full tiles -- pad {name!r} "
+                        f"to a multiple of {tile_size} (with op-appropriate identity "
+                        "values) before the tiled scope."
+                    )
+                counts.setdefault(hint_id, {})[name] = extent // int(tile_size)
+    return counts
+
+
 def _assign_dim_hints_impl(operations: list[Operation]) -> None:
+    tile_size_counts = _resolve_tile_size_counts(operations)
     for op in operations:
         if not isinstance(op, ComputedBuffer):
             continue
@@ -633,15 +710,15 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
 
         dim_hints = []
         for hint_id, hint_dict in sorted(op_hints.items()):
-            # A hint scope uses exactly one of tiles/slices/num_tiles_per_dim.
-            dims: dict[str, int] = next(
-                (
-                    v
-                    for k in ("tiles", "slices", "num_tiles_per_dim")
-                    if (v := hint_dict.get(k))
-                ),
-                {},
-            )
+            # A hint scope uses exactly one of tiles/slices/num_tiles_per_dim
+            # (trip count) or tile_size_per_dim (per-tile extent, converted to a
+            # trip count by _resolve_tile_size_counts).
+            dims: dict[str, int] = _hint_dims(hint_dict)
+            if _TILE_SIZE_KEY in hint_dict and hint_dict[_TILE_SIZE_KEY]:
+                resolved = tile_size_counts.get(hint_id, {})
+                dims = {
+                    name: resolved[name] for name in dims if name in resolved
+                } or dims
             # TODO: support multiple dimensions per spyre_hint() call.
             # hint_id_to_ranges_pos in plan_coarse_tile_groups would need to
             # become dict[int, list[int]] and _hints_levels would need to
