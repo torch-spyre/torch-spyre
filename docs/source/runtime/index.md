@@ -48,7 +48,7 @@ to handle device management and synchronization.
 |---|---|
 | `AIU_WORLD_SIZE` | Overrides the visible device count. |
 | `SPYRE_DEVICES` | Comma-separated list of device indices to expose. |
-| `FLEX_DEVICE` | Selects the underlying flex runtime mode (PF or VF). |
+| `FLEX_DEVICE` | Selects the underlying flex runtime mode (`PF`, `VF`, or `MOCK`). |
 
 The count itself comes from `flex::getNumDevices`.
 
@@ -145,8 +145,9 @@ Physical-frame (PF) and virtual-frame (VF) execution are *not* allocator strateg
 
 | Mode | Selection | Description |
 |------|-----------|-------------|
-| PF (Physical Frame) | `FLEX_DEVICE` set to a PF device | Direct hardware execution path. |
-| VF (Virtual Frame) | `FLEX_DEVICE` set to a VF device | Virtualized hardware, used in multi-tenant deployments. |
+| PF (Physical Frame) | `FLEX_DEVICE=PF` | Direct hardware execution path. |
+| VF (Virtual Frame) | `FLEX_DEVICE=VF` | Virtualized hardware, used in multi-tenant deployments. |
+| MOCK | `FLEX_DEVICE=MOCK` | Software simulation with no hardware; device count comes from `AIU_WORLD_SIZE`. |
 
 ## Eager Operations
 
