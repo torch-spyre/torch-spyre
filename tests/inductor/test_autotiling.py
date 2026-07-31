@@ -218,9 +218,8 @@ def _shape_str(shape):
     return "x".join(str(d) for d in shape)
 
 
-def _expand_rows(rows, expected_failures=None, skip_cores=None):
+def _expand_rows(rows, expected_failures=None):
     ef = expected_failures or {}
-    sc = set(skip_cores) if skip_cores else set()
     out = []
     for entry in rows:
         op_key, shape, dtypes, cores_list = entry[:4]
@@ -230,13 +229,7 @@ def _expand_rows(rows, expected_failures=None, skip_cores=None):
             for c in cores_list:
                 pid = f"{prefix}-{_DTYPE_SHORT[dtype]}-cores{c}"
                 marks = []
-                if c in sc:
-                    marks.append(
-                        pytest.mark.skip(
-                            reason="cores=1 skipped in this run -- see S12 for cores=1 coverage"
-                        )
-                    )
-                elif pid in ef:
+                if pid in ef:
                     act, reason = ef[pid]
                     marks.append(
                         pytest.mark.skip(reason=reason)
