@@ -374,7 +374,8 @@ Once `layout.allocation["lx"]` is set:
 
 ## Solvers
 
-`config.layout_solver` (`"greedy" | "firstfit" | "bestfit" | "cpsat"`)
+`config.layout_solver`
+(`"greedy" | "firstfit" | "bestfit" | "cpsat" | "simulated_annealing"`)
 picks the solver; it defaults from the `LAYOUT_SOLVER` environment
 variable (falling back to `"greedy"`).
 
@@ -431,6 +432,18 @@ solver only *places* buffers on each op's pre-determined core division;
 with `co_optimizing_lx_planning` it is driven by the joint
 `CoOptimizingAllocator` (below), which additionally chooses each op's core
 division.
+
+### SimulatedAnnealingLayoutSolver
+
+`config.layout_solver = "simulated_annealing"` selects
+`SimulatedAnnealingLayoutSolver`, which takes a first-fit, best-fit, or
+greedy placement as the initial layout and then runs a simulated-annealing
+search over buffer orderings to reduce fragmentation. Each step reinserts a
+buffer and keeps or rejects the new ordering according to a cooling
+schedule, so the search can escape the local minima that trap the
+single-pass solvers. See
+[Simulated Annealing Layout Planner](simulated_annealing_layout.md) for the
+algorithm and the tunable schedule parameters.
 
 ## Co-optimization with work-distribution
 
@@ -600,21 +613,9 @@ The remaining `@expectedFailure` cases motivate the items in
 
 ## Future work
 
-The items below are not in-tree. They sit on top of the
-`MemoryPlanSolver` and `ScratchpadOptimizationPass` interfaces so they
-can be plugged in without disturbing the rest of the planner.
-
-### Non-greedy solvers
-
-Two non-greedy solver families are being prototyped on top of the same
-`MemoryPlanSolver` interface:
-
-- **Simulated Annealing** uses a first-fit or best-fit
-  allocation as the initial guess, then perturbs the order to escape
-  local minima.
-- **Integer Linear Programming** via OR-Tools formulates placement as a
-  2D bin-packing constraint and lets a general-purpose solver search
-  exhaustively for graphs small enough to be tractable.
+The extensions below build on the current co-optimization flow through the
+`MemoryPlanSolver` and `ScratchpadOptimizationPass` interfaces, so they can
+be added without disturbing the rest of the planner.
 
 ### Richer co-optimization
 
