@@ -44,6 +44,7 @@ import os
 import sys
 from unittest.mock import patch
 
+import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -62,6 +63,7 @@ from indirect_access_common import (  # noqa: E402
     op_spec_has_indirect_access,
     op_spec_has_indirect_input,
     op_spec_has_indirect_output,
+    run_e2e,
     plain_to_spyre,
 )
 
@@ -147,8 +149,7 @@ class _GatherScenarios(IndirectAccessTestCase):
                 self.assertIsInstance(a.device_dtype, DataFormats)
                 self.assertTrue(a.device_size, "device_size should be non-empty")
                 self.assertEqual(len(a.device_coordinates), len(a.device_size))
-        # TODO : Enable once e2e is available
-        # run_e2e(self, lambda x, i: x[i].exp(), x, i)
+        run_e2e(self, lambda x, i: x[i].exp(), x, i)
 
     def test_gather_bare_index(self):
         """x[i] (no unary) produces an identity/restickify copy op.
@@ -176,8 +177,7 @@ class _GatherScenarios(IndirectAccessTestCase):
         # Carry the same scenario through to SDSC and validate the indirect
         # encoding of the copy op (not just that op specs were produced).
         self.assert_indirect_sdsc_fields(bundle_jsons_from_captured(captured), "gather")
-        # TODO : Enable once e2e is available
-        # run_e2e(self, lambda x, i: x[i], x, i)
+        run_e2e(self, lambda x, i: x[i], x, i)
 
     def test_gather_supported_unaries(self):
         """A gather fused with each supported unary keeps the gather signature.
@@ -222,8 +222,7 @@ class _GatherScenarios(IndirectAccessTestCase):
         idx = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
         self.name_dims(x, {"M": M, "N": N})
         self.name_dims(idx, {"P": P})
-        # TODO : Enable once e2e is available
-        # run_e2e(self, lambda x, i: torch.exp(x[i]), x, idx)
+        run_e2e(self, lambda x, i: torch.exp(x[i]), x, idx)
 
     def test_gather_chained_unaries(self):
         """x[i].exp().tanh(): both unaries stay on Spyre, gather keeps its indirect access."""
@@ -238,8 +237,7 @@ class _GatherScenarios(IndirectAccessTestCase):
         self.assert_indirect_source_indexed_dim_outermost(op_specs)
         # The fused chain must still emit a valid indirect-access SDSC bundle.
         self.assert_indirect_sdsc_fields(bundle_jsons_from_captured(captured), "gather")
-        # TODO : Enable once e2e is available
-        # run_e2e(self, lambda x, i: x[i].exp().tanh(), x, i)
+        run_e2e(self, lambda x, i: x[i].exp().tanh(), x, i)
 
     # -- classification of torch gather ops -------------------------------
     def test_advanced_indexing(self):
@@ -314,6 +312,13 @@ class _GatherScenarios(IndirectAccessTestCase):
             lambda x, i: torch.index_select(x, 0, i), x, i, expect=GATHER_OP_SPEC
         )
 
+    @pytest.mark.skip(
+        reason=(
+            "dxp_standalone SIGABRT: std::fmod(dsDim, size) == 0 in "
+            "GatherIndexConversion.cpp — torch.gather with a 2-D index "
+            "tensor is not yet supported by deeptools"
+        )
+    )
     def test_torch_gather(self):
         """torch.gather(x, 0, index) with a same-rank [M,K] index tensor.
 
@@ -426,6 +431,13 @@ class _GatherScenarios(IndirectAccessTestCase):
         self.name_dims(j, {"P": 32})
         self._stage_and_e2e(lambda x, i, j: x[i] + x[j], x, i, j, expect=GATHER_OP_SPEC)
 
+    @pytest.mark.skip(
+        reason=(
+            "per-core tensor span 512 MB (B=2, S=128, D=512, F=2048, fp16) "
+            "exceeds 256 MB hardware limit; work-division cannot split the "
+            "S=128 coordinate further"
+        )
+    )
     def test_moe(self):
         """MoE expert selection: expert_w[expert_ids] with 3D weights and 2D int64 index."""
         E, D, F, B, S = 8, 512, 2048, 2, 128
@@ -619,8 +631,7 @@ class _GatherScenarios(IndirectAccessTestCase):
         self.assertNotIn("sin", [s.op for s in op_specs])
         self.assert_indirect_source_indexed_dim_outermost(op_specs)
         self.assert_indirect_sdsc_fields(bundle_jsons_from_captured(captured), "gather")
-        # TODO : Enable once e2e is available
-        # run_e2e(self, lambda x, i: x[i].sin(), x, i)
+        run_e2e(self, lambda x, i: x[i].sin(), x, i)
 
     # -- SDSC generation field checks (one compile, all fields) -----------
     def _gen_sdsc(self):

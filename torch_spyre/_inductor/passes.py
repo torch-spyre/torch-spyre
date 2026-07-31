@@ -74,7 +74,7 @@ from .work_division import (
     work_distribution,
     cost_model_matmul_division,
 )
-from .pass_utils import format_operations
+from .pass_utils import format_operations, pad_small_gather_indices
 from .scratchpad.allocator import (
     scratchpad_planning,
 )
@@ -215,7 +215,7 @@ class CustomPrePasses(_SpyreGraphPassPipeline):
     """
 
     def __init__(self):
-        super().__init__([collect_spyre_hints])
+        super().__init__([pad_small_gather_indices, collect_spyre_hints])
 
 
 class CustomPostPasses(_SpyreGraphPassPipeline):

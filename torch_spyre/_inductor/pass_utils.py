@@ -1812,3 +1812,91 @@ def format_operations(operations: list[Operation]) -> str:
             buf.write(f"\n  {op.data}")
         buf.write("\n\n")
     return buf.getvalue()
+
+
+def pad_small_gather_indices(graph: "torch.fx.Graph") -> None:
+    """Pad P=1 gather index tensors to a full stick (elems_per_stick elements).
+
+    When Inductor sees ``x[i]`` where ``i.shape == (1,)`` it collapses the
+    gather loop variable entirely: the device coordinates for the index tensor
+    become fully constant, so the KERNEL_IDX ``layoutDimOrder`` is empty.
+    The backend requires a non-empty ``layoutDimOrder`` for KERNEL_IDX tensors.
+
+    P > 1 does NOT trigger this: for P >= 2 Inductor preserves the mb loop
+    variable in the iteration space and the backend schedules it correctly.
+    This pass is therefore intentionally narrow — it only fires for P == 1.
+
+    The graph rewrite for a matching node::
+
+        result = x[i]                               # i: (1,), dtype d
+
+    becomes::
+
+        padded = constant_pad_nd(i, [0, epp-1], 0)  # (epp,) — zero-pad right
+        full   = x[padded]                           # (epp, *x.shape[1:])
+        result = full[:1]                            # (1,  *x.shape[1:])
+
+    ``constant_pad_nd`` is used rather than ``cat + full``: its lowering fills
+    the padding region (positions 1..epp-1) first via SpyreConstantFallback,
+    then copies the single real index to position 0.  Position 0 therefore
+    always holds the real index value with no coordinate-offset mutations.
+
+    The padded gather (P == epp) produces a KERNEL_IDX with a non-empty
+    ``layoutDimOrder``, satisfying the backend.  The slice discards the extra
+    rows before they reach the model output.
+    """
+    for node in list(graph.nodes):
+        if node.op != "call_function" or node.target is not torch.ops.aten.index.Tensor:
+            continue
+
+        x_node = node.args[0]
+        indices = node.args[1]
+        if not (len(indices) == 1 and indices[0] is not None):
+            continue
+
+        idx_node = indices[0]
+        idx_val = idx_node.meta.get("val")
+        if idx_val is None or idx_val.ndim != 1:
+            continue
+
+        P = idx_val.shape[0]
+        # Only P == 1 collapses the mb loop variable to produce an empty
+        # layoutDimOrder. For P >= 2 the backend handles it correctly already.
+        if P != 1:
+            continue
+
+        epp = get_elem_in_stick(idx_val.dtype)
+        pad_size = epp - 1
+        x_val = x_node.meta.get("val")
+        out_dtype = x_val.dtype if x_val is not None else torch.float16
+        out_rest = list(x_val.shape[1:]) if x_val is not None else []
+
+        with graph.inserting_before(node):
+            padded_idx = graph.call_function(
+                torch.ops.aten.constant_pad_nd.default,
+                (idx_node, [0, pad_size], 0),
+            )
+            padded_idx.meta["val"] = torch.empty(
+                epp, dtype=idx_val.dtype, device="meta"
+            )
+
+            padded_gather = graph.call_function(
+                torch.ops.aten.index.Tensor,
+                (x_node, [padded_idx]),
+            )
+            padded_gather.meta["val"] = torch.empty(
+                [epp] + out_rest, dtype=out_dtype, device="meta"
+            )
+
+            sliced = graph.call_function(
+                torch.ops.aten.slice.Tensor,
+                (padded_gather, 0, 0, 1),
+            )
+            sliced.meta["val"] = torch.empty(
+                [1] + out_rest, dtype=out_dtype, device="meta"
+            )
+
+        node.replace_all_uses_with(sliced)
+        graph.erase_node(node)
+
+    graph.lint()
