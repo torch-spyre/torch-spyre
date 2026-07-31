@@ -1485,7 +1485,7 @@ def generate_sdsc(
                                             "lx": {
                                                 "isPresent": 1,
                                                 "isPadded": 1,
-                                                "isZeroPadded": 1,
+                                                "isZeroPadded": 0,
                                             },
                                         }
                                         if (

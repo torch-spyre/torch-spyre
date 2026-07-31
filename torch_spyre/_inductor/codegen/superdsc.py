@@ -243,9 +243,14 @@ def _calculate_device_stride(dev_dim_idx: int, device_size: list) -> int:
 
 
 def _get_device_dim_order(
-    arg: TensorArg, symbol_mapping: dict, op_spec: OpSpec | None = None
+    arg: TensorArg, symbol_mapping: dict, op_spec: OpSpec | None = None, arg_index: int | None = None
 ) -> tuple[list[Symbol], Symbol | None]:
-    """Return (dim_order, stick_dim) for the arg's device layout after symbol substitution."""
+    """Return (dim_order, stick_dim) for the arg's device layout after symbol substitution.
+
+    For kernel tensors in conv ops (arg_index==1), excludes size-1 output-spatial dimensions
+    (i, j) since kernels have no spatial-output dependence. This prevents synthetic
+    placeholder dimensions from leaking into kernel coordinates.
+    """
     last_coord = arg.device_coordinates[-1].subs(symbol_mapping)
     free = sorted(last_coord.free_symbols, key=str)
     stick_dim = free[0] if free else None
@@ -269,7 +274,32 @@ def _get_device_dim_order(
         if expr == 0 and stick_dim is not None and stick_dim not in dim_order:
             dim_order.append(stick_dim)
         for sym in expr.free_symbols:
-            if sym not in dim_order:
+            # For kernel tensors in conv ops, exclude size-1 output-spatial dimensions.
+            # Kernels don't depend on output spatial position, so i and j (when size-1)
+            # are synthetic placeholders that shouldn't affect kernel layout.
+            skip_sym = False
+            if (
+                op_spec is not None
+                and arg_index == 1
+                and _is_conv(op_spec.op)
+                and str(sym) in ("i", "j")
+            ):
+                # sym is already mapped to "i" or "j", but iteration_space has the original c2/c3/z0/z1 names.
+                # Find which original symbol maps to this i/j by looking up the reverse mapping.
+                orig_sym = None
+                for orig, mapped in symbol_mapping.items():
+                    if str(mapped) == str(sym):
+                        orig_sym = orig
+                        break
+
+                if orig_sym is not None and orig_sym in op_spec.iteration_space:
+                    size_expr, _ = op_spec.iteration_space[orig_sym]
+                    sym_size = _concretize_for_sdsc(size_expr)
+                    if sym_size == 1:
+                        # Skip this synthetic placeholder
+                        skip_sym = True
+
+            if not skip_sym and sym not in dim_order:
                 dim_order.append(sym)
     return dim_order, stick_dim
 
@@ -430,7 +460,7 @@ def _create_sdsc_tensors(
         if has_indirect_access and i in index_tensor_layouts:
             dim_order, stick_dim = index_tensor_layouts[i]
         else:
-            dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping, op_spec)
+            dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping, op_spec, arg_index=i)
 
         # Case 2 (MutationLayoutSHOULDREMOVE) ops carry an authoritative
         # device-stride sympy.Expr for each coarse-tiled dim's per-iteration
@@ -796,9 +826,65 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     dim_labels = _get_op_dim_labels(ndim, is_matmul, is_conv2d)
 
-    symbol_mapping = {
-        sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)
-    }
+    # For depthwise conv2d, use size-based matching to correctly identify kernel vs spatial
+    # dimensions. Positional mapping fails when kernel_size != output_size, causing dimension
+    # labels to be swapped (e.g., i gets size 5 instead of 1, ki gets size 1 instead of 5).
+    # Only apply this fix when kernel_size != output_size (the problematic case).
+    if is_conv2d and op_spec.op_info and "conv_params" in op_spec.op_info:
+        conv_params = op_spec.op_info["conv_params"]
+        kernel_h = conv_params.get("kernel_h")
+        kernel_w = conv_params.get("kernel_w")
+
+        if kernel_h is not None and kernel_w is not None:
+            # Build size map from iteration space
+            sym_list = list(op_spec.iteration_space.keys())
+            sym_to_size = {sym: _concretize_for_sdsc(size) for sym, (size, _) in op_spec.iteration_space.items()}
+
+            # Only apply size-based matching when we have the stride>1 problem:
+            # presence of output-spatial dimensions (i, j) that have mismatched sizes.
+            # Check if there are symbols of size 1 (likely i/j) and symbols matching kernel size.
+            has_size_1 = any(s == 1 for s in sym_to_size.values())
+            has_kernel_size = any(s in (kernel_h, kernel_w) for s in sym_to_size.values())
+
+            # Find symbols matching kernel sizes
+            ki_sym = None
+            kj_sym = None
+            if has_size_1 and has_kernel_size:
+                for sym in sym_list:
+                    if sym_to_size.get(sym) == kernel_h and ki_sym is None:
+                        ki_sym = sym
+                    elif sym_to_size.get(sym) == kernel_w and kj_sym is None and sym != ki_sym:
+                        kj_sym = sym
+
+            # If both kernel symbols found, build mapping with correct labels
+            if ki_sym and kj_sym:
+                symbol_mapping = {}
+                assigned = {ki_sym, kj_sym}
+                remaining_labels = [l for l in dim_labels if l not in ("ki", "kj")]
+                remaining_idx = 0
+
+                for sym in sym_list:
+                    if sym == ki_sym:
+                        symbol_mapping[sym] = Symbol("ki")
+                    elif sym == kj_sym:
+                        symbol_mapping[sym] = Symbol("kj")
+                    else:
+                        if remaining_idx < len(remaining_labels):
+                            symbol_mapping[sym] = Symbol(remaining_labels[remaining_idx])
+                            remaining_idx += 1
+                        else:
+                            symbol_mapping[sym] = Symbol(dim_labels[sym_list.index(sym)])
+            else:
+                # Couldn't match, fall back to positional
+                symbol_mapping = {sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)}
+        else:
+            # No kernel sizes, use positional
+            symbol_mapping = {sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)}
+    else:
+        # Not conv2d, use positional mapping
+        symbol_mapping = {
+            sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)
+        }
     # Minted per-(op, level) tile-advance symbols (see spyre_kernel.py's
     # _get_or_mint_level_symbol) are not iteration-space dimensions -- they are
     # loop-nesting-level markers -- so they have no dim label to rename to.
