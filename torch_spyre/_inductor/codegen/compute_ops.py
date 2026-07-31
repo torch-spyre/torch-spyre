@@ -356,6 +356,7 @@ def gen_coord_info_value(
     is_stick_dim: bool,
     is_stick_reduction: bool = False,
     conv_params=None,
+    padding: str = "nopad",
 ):
     """
     Args:
@@ -371,6 +372,7 @@ def gen_coord_info_value(
             "temporal": 0,
             "elemArr": 1,
             "padding": str(conv_params["conv_padding"]),
+            "padding": padding,
             "folds": {
                 "dim_prop_func": [
                     {
@@ -423,7 +425,7 @@ def gen_coord_info_value(
             "spatial": 3,
             "temporal": 0,
             "elemArr": 2,
-            "padding": "nopad",
+            "padding": padding,
             "folds": {
                 "dim_prop_func": [
                     {
@@ -1198,6 +1200,47 @@ def generate_sdsc(
                 for c in range(sdsc_spec.num_cores)
             }
 
+    def _filter_window_dims(dims: list) -> list:
+        """Drop the op's reduction-window dims (e.g. pool ki/kj) from a dim order.
+
+        sdsc_spec.window_dims is empty for ops without a reduction window, so
+        this is a no-op for them.
+        """
+        return [d for d in dims if str(d) not in sdsc_spec.window_dims]
+
+    def _tensor_sched_layout_dims(dim_order: list) -> list:
+        """Return a tensor's own dim_order for scheduleTree_, minus window dims.
+
+        scheduleTree_ layoutDimOrder_ must use the per-tensor dim_order, NOT the
+        layout-canonical order.  Multiple tensors may share a layout label (same
+        symbol Counter, different ordering), so sdsc_spec.layouts[label]["dim_order"]
+        is only correct for the tensor that created that label.
+        """
+        return _filter_window_dims(dim_order)
+
+    def _coord_size(dim, default: int, is_input: bool) -> int:
+        """Per-dim coordinate size, overridable for input tensors (pool pads H/W)."""
+        if is_input:
+            return sdsc_spec.input_coord_sizes.get(str(dim), default)
+        return default
+
+    def _coord_padding(dim, is_input: bool) -> str:
+        """Per-dim coordinate padding tag, overridable for input tensors."""
+        if is_input:
+            return sdsc_spec.input_coord_padding.get(str(dim), "nopad")
+        return "nopad"
+
+    def _memorg_extra(is_input: bool, alloc_node: str) -> dict:
+        """Extra memOrg_ padding fields, emitted only when the op needs them."""
+        if not sdsc_spec.emit_memorg_padding:
+            return {}
+        return {
+            "isPadded": 1 if is_input else 0,
+            "isZeroPadded": 0,
+            "dsOffset": 0,
+            "allocateNode_": alloc_node,
+        }
+
     return (
         {
             f"{idx}_{sdsc_spec.opfunc}": {
@@ -1246,6 +1289,8 @@ def generate_sdsc(
                                         dim_splits=None,
                                     )
                                     if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
+                                    {"paddingSizes_": sdsc_spec.padding_sizes}
+                                    if sdsc_spec.padding_sizes
                                     else {}
                                 ),
                             },
@@ -1301,6 +1346,7 @@ def generate_sdsc(
                                             if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
                                             else {}
                                         ),
+                                        "paddingSizes_": sdsc_spec.padding_sizes,
                                     },
                                     "el_": {
                                         "name_": "core",
@@ -1325,21 +1371,35 @@ def generate_sdsc(
                                             if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
                                             else {}
                                         ),
+                                        "paddingSizes_": sdsc_spec.padding_sizes,
                                     },
                                 }
                             },
                             "primaryDsInfo_": {
                                 label: {
                                     "layoutDimOrder_": [
-                                        str(dim) for dim in layout_info["dim_order"]
+                                        str(dim)
+                                        for dim in _filter_window_dims(
+                                            layout_info["dim_order"]
+                                        )
                                     ],
                                     "stickDimOrder_": [
                                         str(layout_info["stick_dim_order"])
                                     ],
                                     "stickSize_": [layout_info["stick_size"]],
+                                    **(
+                                        {"stickRepl_": [1]}
+                                        if sdsc_spec.stick_replication
+                                        else {}
+                                    ),
                                 }
                                 for label, layout_info in sdsc_spec.layouts.items()
                             },
+                            **(
+                                {"pdsRelation_": {"isPdsReuse": 1}}
+                                if sdsc_spec.pds_reuse
+                                else {}
+                            ),
                             "scheduleTree_": [
                                 {
                                     "nodeType_": "allocate",
@@ -1365,13 +1425,16 @@ def generate_sdsc(
                                         else {}
                                     ),
                                     "layoutDimOrder_": [
-                                        str(dim) for dim in tensor.dim_order
+                                        str(dim)
+                                        for dim in _tensor_sched_layout_dims(
+                                            tensor.dim_order
+                                        )
                                     ],
                                     "maxDimSizes_": [
                                         tensor.max_dim_sizes[dim]
-                                        for dim in sdsc_spec.layouts[tensor.layout][
-                                            "dim_order"
-                                        ]
+                                        for dim in _tensor_sched_layout_dims(
+                                            tensor.dim_order
+                                        )
                                     ],
                                     **_build_indirect_access_fields(
                                         sdsc_spec, tensor, i
@@ -1393,6 +1456,14 @@ def generate_sdsc(
                                         "data_": _start_addr_data(tensor),
                                     },
                                     **(
+                                        {"padding_": sdsc_spec.input_coord_padding}
+                                        if (
+                                            i < sdsc_spec.num_inputs
+                                            and sdsc_spec.input_coord_padding
+                                        )
+                                        else {}
+                                    ),
+                                    **(
                                         {
                                             "backGapCore_": {
                                                 str(dim): (
@@ -1408,6 +1479,13 @@ def generate_sdsc(
                                                     else {"-1": str(gap)}
                                                 )
                                                 for dim, gap in tensor.backGap.items()
+                                                if str(dim)
+                                                in {
+                                                    str(d)
+                                                    for d in _tensor_sched_layout_dims(
+                                                        tensor.dim_order
+                                                    )
+                                                }
                                             }
                                         }
                                         if tensor.backGap
@@ -1447,10 +1525,39 @@ def generate_sdsc(
                                                 sdsc_spec.work_slices[dim]
                                                 if (tensor.scales[dim] == 1)
                                                 else 1,
+                                            str(dim): gen_coord_info_value(
+                                                size=(
+                                                    _coord_size(
+                                                        str(dim),
+                                                        sdsc_spec.iteration_space[dim],
+                                                        i < sdsc_spec.num_inputs,
+                                                    )
+                                                    // sdsc_spec.work_slices[dim]
+                                                )
+                                                if (tensor.scales[dim] == 1)
+                                                else 1,
+                                                nsplits=sdsc_spec.work_slices[dim]
+                                                if (tensor.scales[dim] == 1)
+                                                else 1,
+                                                elems_per_stick=tensor.data_format.elems_per_stick(),
+                                                is_stick_dim=(
+                                                    sdsc_spec.layouts[tensor.layout][
+                                                        "stick_dim_order"
+                                                    ].has(dim)
+                                                ),
+                                                is_stick_reduction=(
+                                                    tensor.scales[dim] == -2
+                                                ),
+                                                padding=_coord_padding(
+                                                    str(dim),
+                                                    i < sdsc_spec.num_inputs,
+                                                ),
                                             )
-                                            for dim in sdsc_spec.layouts[tensor.layout][
-                                                "dim_order"
-                                            ]
+                                            for dim in _filter_window_dims(
+                                                sdsc_spec.layouts[tensor.layout][
+                                                    "dim_order"
+                                                ]
+                                            )
                                         },
                                         "coreIdToWkSlice_": {},
                                     },
@@ -1464,9 +1571,11 @@ def generate_sdsc(
                                     "dsType_": tensor.layout,
                                     "scale_": [
                                         tensor.scales[dim]
-                                        for dim in sdsc_spec.layouts[tensor.layout][
-                                            "dim_order"
-                                        ]
+                                        for dim in _filter_window_dims(
+                                            sdsc_spec.layouts[tensor.layout][
+                                                "dim_order"
+                                            ]
+                                        )
                                     ],
                                     "wordLength": num_bytes(tensor.data_format),
                                     "dataFormat_": tensor.data_format.name,
@@ -1497,6 +1606,31 @@ def generate_sdsc(
                                             "lx": {"isPresent": 1},
                                         }
                                     )
+                                    # Index tensors must reside in HBM; the Spyre
+                                    # engine does not support indirect addressing
+                                    # through LX scratchpad.
+                                    # NOTE: "hbm"/"lx" here are sdsc fields and are
+                                    # not to be confused with the internal
+                                    # layout.allocation dict keys ("hbm"/"lx"/
+                                    # "hbm_pool").
+                                    "memOrg_": {"hbm": {"isPresent": 1}}
+                                    if tensor.is_index_tensor
+                                    else {
+                                        "hbm": {
+                                            "isPresent": 1,
+                                            **_memorg_extra(
+                                                i < sdsc_spec.num_inputs,
+                                                f"allocate-Tensor{i}_hbm",
+                                            ),
+                                        },
+                                        "lx": {
+                                            "isPresent": 1,
+                                            **_memorg_extra(
+                                                i < sdsc_spec.num_inputs,
+                                                "",
+                                            ),
+                                        },
+                                    }
                                     if "lx" not in tensor.allocation
                                     else (
                                         {
