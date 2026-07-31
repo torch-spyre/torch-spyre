@@ -1116,6 +1116,15 @@ if '${cls}' in globals():
     del globals()['${cls}']
 "
     done
+    # injection_block also binds _cls_${cls} as its own module-level global for
+    # every class in NEEDS_INJECTION_CLASSES. It is still the raw TestCase, so
+    # pytest's unittest plugin collects it too unless it is deleted here.
+    for cls in "${NEEDS_INJECTION_CLASSES[@]}"; do
+        cleanup_block+="
+if '_cls_${cls}' in globals():
+    del globals()['_cls_${cls}']
+"
+    done
 
     # Separate quoted lists for restricted vs uncontrolled classes --
     # each is retrieved differently from the private module.
