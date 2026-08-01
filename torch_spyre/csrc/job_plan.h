@@ -28,7 +28,7 @@
 #include <variant>
 #include <vector>
 
-#include "util/spyrecode.h"
+#include "spyrecode-host-functions/spyrecode.h"
 
 namespace spyre {
 
