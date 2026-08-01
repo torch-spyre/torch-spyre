@@ -1305,7 +1305,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         constants["samv-maskvalue"] = _get_mask_value(op_spec.op)
 
     num_inputs = len(args[:-1]) if is_matmul or not op_spec.is_reduction else len(args)
-    print(f"======= CONV2d num_inputs: {num_inputs} dim_splits: {dim_splits} ==========")
 
     if _is_topk(op_spec.op):
         num_inputs = 1  # topk has exactly 1 input tensor and 1 output tensor

@@ -261,7 +261,6 @@ def gen_coord_info_value(
         conv_params: Dict with padding info for convolution ops; contains 'conv_padding' (pad type) and 'total_size' (per-core slice size for padding dims).
         If conv_params is not specified, pad type should default to "nopad" and total_size to size.
     """
-    print(f"DEBUG: gen_coord_info_value: size: {size} nsplits: {nsplits} elems_per_stick: {elems_per_stick} conv_params: {conv_params} padding: {padding}")
     if conv_params is None:
         conv_params = {"conv_padding": padding, "stride_len": 1, "total_size": size}
 
@@ -422,7 +421,6 @@ def get_conv_params(tensor_num, dim, opfunc, conv_params, size, splits):
             )
             padding_len = conv_params["pad_j"]
             stride_len = conv_params["stride_j"]
-    print(f"DEBUG: get_conv_params: conv_padding: {conv_padding} padding_len: {padding_len} stride_len: {stride_len} total_size: {total_size}")
     return {
         "conv_padding": conv_padding,
         "padding_len": padding_len,
