@@ -39,11 +39,11 @@ jobs:
     timeout-minutes: 10
 
     env:
-      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
-      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
-      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
-      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
-      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
+      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER_DEV }}
+      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS_DEV }}
+      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB_DEV }}
 
     steps:
       - name: Checkout ingest script
