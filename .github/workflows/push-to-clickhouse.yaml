@@ -9,6 +9,7 @@ on:
       - upstream-pytorch-tests
       - model-ops-tests
       - tests # covers torch spyre tests
+      - integration-tests # amd64 arch_override dispatch target from spyre-frameworks
       # to add more workflows
     types: [completed]
   workflow_dispatch:
@@ -18,7 +19,7 @@ on:
         required: false
         default: ''
       workflow_name:
-        description: Workflow name (model-module-tests | upstream-tests | model-ops-tests )
+        description: Workflow name (model-module-tests | upstream-tests | model-ops-tests | integration-tests)
         required: false
         default: upstream-pytorch-tests
 
