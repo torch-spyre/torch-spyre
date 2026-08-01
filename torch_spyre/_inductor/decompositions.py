@@ -710,9 +710,9 @@ def conv2d_via_bmm_decomp(
     N, C_in, H_in, W_in = input.shape
     C_out, C_in_per_group, K_h, K_w = weight.shape
 
-    # For depthwise convolutions (C_in = groups = C_out), use torch.spyre.conv2d directly
+    # For depthwise convolutions (C_in = groups = C_out), use torch.spyre.conv2d_with_bias
     if C_in == groups == C_out:
-        return torch.ops.spyre.conv2d(
+        return torch.ops.spyre.conv2d_with_bias(
             input, weight, bias, stride, padding, dilation, groups
         )
 
@@ -769,6 +769,39 @@ def conv2d_via_bmm_decomp(
         # The resulting tensor has a layout compatible with broadcasting to (N, C_out, H_out, W_out).
         bias_shaped = torch.ops.spyre.reshape_via_cpu(bias, (1, C_out, 1, 1))
         output = output + bias_shaped
+
+    return output
+
+
+@register_spyre_decompositions([torch.ops.spyre.conv2d_with_bias.default])
+def spyre_conv2d_with_bias_decomp(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    groups: int,
+) -> torch.Tensor:
+    """
+    Decompose torch.ops.spyre.conv2d_with_bias into:
+      1. torch.ops.spyre.conv2d without bias
+      2. Expand bias to (N, C_out, H_out, W_out) for broadcasting
+      3. Add the bias to the output
+
+    This keeps the spyre.conv2d lowering simple while supporting conv2d with bias.
+    """
+    # Call spyre.conv2d without bias
+    output = torch.ops.spyre.conv2d(input, weight, None, stride, padding, dilation, groups)
+
+    # If bias is present, add it
+    if bias is not None:
+        # Get output shape
+        N, C_out, H_out, W_out = output.shape
+        # Reshape bias to (1, C_out, 1, 1) then expand to (N, C_out, H_out, W_out)
+        # This avoids stick layout issues by expanding before adding
+        bias_expanded = bias.reshape(1, C_out, 1, 1).expand(N, C_out, H_out, W_out)
+        output = output + bias_expanded
 
     return output
 
