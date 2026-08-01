@@ -96,47 +96,80 @@ This skill walks a torch-spyre developer through generating a bug-reproduction t
 
 6. **Run the appropriate `testgen.main` command.**
 
-   **Important** This process might take time so run with `nohup` and direct stdout and stderr to appropriate log files, let the user know of this file. Periodically check if everything is okay. 
-   For an unresolved/open torch-spyre issue from a local `.md` file (the common case):
+   **ALWAYS run with `nohup` (or an equivalent detached form) and redirect stdout and stderr to a
+   log file.** Never run it in the foreground. Immediately tell the user the exact log-file path so
+   they can follow along. For example:
 
    ```bash
    cd /tmp/testgen-torchspyre
    uv sync
-   .venv/bin/python -m testgen.main \
-       --issue-md /path/to/issue.md \
-       --repo-path /path/to/torch-spyre \
-       --pod-yaml /path/to/pod.yaml \
-       --output-dir outputs_torchspyre
-   ```
-
-   For GLM-4.6 add `--reasoning-as-content`:
-
-   ```bash
-   .venv/bin/python -m testgen.main \
+   mkdir -p outputs_torchspyre   # the log lives here; create it before the redirect opens
+   nohup .venv/bin/python -m testgen.main \
        --issue-md /path/to/issue.md \
        --repo-path /path/to/torch-spyre \
        --pod-yaml /path/to/pod.yaml \
        --output-dir outputs_torchspyre \
-       --reasoning-as-content
+       > outputs_torchspyre/run.log 2>&1 &
+   echo "started; follow with: tail -f outputs_torchspyre/run.log"
+   ```
+
+   **BE PATIENT — this is expected to take a long time (tens of minutes to hours).** The run makes
+   many LLM calls (K-fix consensus generates K fixes + K tests, then revises over several router
+   visits) and each call to a reasoning model can take minutes; on top of that, every pod execution
+   includes scheduling, image pull, and possibly a native rebuild. **A run that is quiet is almost
+   always still working, not hung.** Do NOT kill it, do NOT assume failure, and do NOT restart it
+   just because there has been no output for a while.
+
+   **How to decide whether to keep waiting:**
+   - **Keep waiting** if the log shows normal progress (LLM-call timing lines, `[POD …]` lines,
+     agent activity) and there are no fatal errors — **including transient `503` / `502` / `429`
+     errors from the LLM endpoint or the cluster.** A few 5xx/timeout blips are normal; the LLM
+     cache and retries mean the run recovers on its own. These are NOT a reason to intervene.
+   - Poll **infrequently** (e.g. every few minutes), not in a tight loop — check with
+     `tail -n 50 <logfile>` and `oc get pods`. A running pod / recent log lines = healthy.
+   - **Only intervene** on a genuine fatal error (see *Common errors* below): `Unauthorized`/not
+     logged in, missing/invalid `--pod-yaml`, `ImagePullBackOff`, `TESTGEN_RESET_FAILED` /
+     `TESTGEN_COLLECTION_FAILED`, repeated auth (`401`/`403`) or `404` from the LLM endpoint, or the
+     process having actually exited (check with `jobs` / `ps`). Persistent (not occasional) 5xx for
+     many minutes with no progress also warrants a look at the endpoint.
+
+   For an unresolved/open torch-spyre issue from a local `.md` file (the common case) the command is
+   as above (`--issue-md` + `--repo-path` + `--pod-yaml`).
+
+   Wrap **every** variant below in the same `nohup … > <logfile> 2>&1 &` form as above — never run
+   any of them in the foreground.
+
+   For GLM-4.6 add `--reasoning-as-content`:
+
+   ```bash
+   nohup .venv/bin/python -m testgen.main \
+       --issue-md /path/to/issue.md \
+       --repo-path /path/to/torch-spyre \
+       --pod-yaml /path/to/pod.yaml \
+       --output-dir outputs_torchspyre \
+       --reasoning-as-content \
+       > outputs_torchspyre/run.log 2>&1 &
    ```
 
    If the user prefers the built-in resolved torch-spyre instance instead:
 
    ```bash
-   .venv/bin/python -m testgen.main \
+   nohup .venv/bin/python -m testgen.main \
        --torchspyre \
        --pod-yaml /path/to/pod.yaml \
-       --output-dir outputs_torchspyre
+       --output-dir outputs_torchspyre \
+       > outputs_torchspyre/run.log 2>&1 &
    ```
 
    **No OpenShift access?** Run with `--generate-only` to skip the pod:
 
    ```bash
-   .venv/bin/python -m testgen.main \
+   nohup .venv/bin/python -m testgen.main \
        --issue-md /path/to/issue.md \
        --repo-path /path/to/torch-spyre \
        --output-dir outputs_torchspyre \
-       --generate-only
+       --generate-only \
+       > outputs_torchspyre/run.log 2>&1 &
    ```
 
    Warn the user that `--generate-only` produces a test without execution feedback, so the router cannot revise it and the quality is usually much worse.
@@ -181,6 +214,85 @@ This skill walks a torch-spyre developer through generating a bug-reproduction t
    - `consensus: generated 0/3 usable fixes, 0/3 tests` — the fixer/test_generator returned empty content (likely GLM-4.6 without `--reasoning-as-content`) or hit the token limit.
 
    Explain the failure to the user and suggest the next step (fix the issue description, adjust the pod yaml, re-run with `--resume-from integrator`, pass `--reasoning-as-content`, raise `TESTGEN_MAX_TOKENS`, etc.).
+
+## Common errors and how to fix them
+
+When something goes wrong, match the symptom below before guessing. The most common class by far is **OpenShift/`oc` problems** — and the most common of those is simply *not being logged in*.
+
+### OpenShift / `oc` errors (execution)
+
+- **`oc` commands fail / `Unauthorized` / `error: You must be logged in to the server`.**
+  The user is **not logged into the cluster** (or their token expired). This is the single most
+  frequent failure. Fix: `oc login <cluster-url> --token=<token>` (or `oc login -u <user>`), then
+  re-run. Verify first with `oc whoami`.
+- **`oc: command not found`.** The OpenShift CLI is not installed / not on `PATH`. The user must
+  install `oc` (the OpenShift client) before any pod execution can happen. There is no way around
+  this except `--generate-only` (no execution).
+- **`error: the server doesn't have a resource type` / "namespace not found" / `forbidden`.**
+  The user is logged in but pointed at the **wrong project/namespace**, or lacks write access to the
+  namespace named in the `pod.yaml`. Fix: `oc project <namespace>` (e.g. `oc project torch-spyre-cicd`)
+  and confirm they can create pods there. The namespace in `--pod-yaml` must match one they can write to.
+- **`ValueError: pod_yaml_path is required` / missing `--pod-yaml`.** There is **no default pod
+  template**. The user must pass `--pod-yaml /path/to/pod.yaml`. If they don't have one, they cannot
+  run execution — offer `--generate-only`.
+- **`--pod-yaml` file not found / invalid YAML.** The path is wrong or the file is malformed. Check the
+  path exists and is a valid pod spec for their namespace/image.
+- **Pod never becomes ready / deploy timeout / `ImagePullBackOff` / `ErrImagePull`.** The cluster
+  can't schedule or pull the image (`icr.io/ai_sw_accel/2.0/torch-spyre:latest` by default). Watch with
+  `oc get pods` and `oc describe pod <name>`. Causes: busy cluster (just slow — wait), missing image-pull
+  secret, or a wrong image in the `pod.yaml`. A busy cluster is contention, not a hang.
+- **`oc cp` fails with `tar: … Cannot open: Permission denied`.** OpenShift runs the pod as an arbitrary
+  UID and `/tmp` is sticky/world-shared, so a leftover file from a prior run's UID blocks the copy. The
+  harness already copies the eval script into the pod's HOME (`/home/senuser`) with a unique name to avoid
+  this; if it still appears, the pod's HOME may not be writable — check the `pod.yaml`'s `securityContext`.
+
+### Pod-side execution markers (in the pod log / `test_output.txt`)
+
+- **`TESTGEN_RESET_FAILED`.** The pod could not `git reset --hard` to the requested commit — for a
+  resolved instance the `base_commit` isn't present in the pod's clone. Maps to `system_error`. For an
+  open issue this should be `git reset --hard HEAD` and shouldn't happen; if it does, the pod's repo is
+  in a bad state.
+- **`TESTGEN_COLLECTION_FAILED`.** pytest collected **no tests** — a bad import, a syntax error, or a
+  mismatched test node id. Maps to `system_error`. Usually a bug in the generated/placed test; re-run
+  with `--resume-from integrator` after inspecting the placed test.
+- **Stale native extension / base tests fail before the generated test runs.** On a *resolved* instance,
+  if the `uv sync … --reinstall-package torch-spyre` rebuild was skipped or interrupted, the installed
+  `.so` no longer matches the checked-out source. Also happens if a patch touches C/C++/CUDA but the
+  rebuild didn't trigger. Re-run so the rebuild completes; raise `TESTGEN_EXEC_TIMEOUT` if the compile is
+  being killed (default 1200s → try 1800s on a slow/busy cluster).
+
+### LLM / endpoint errors (generation)
+
+- **Empty responses / `consensus: generated 0/K usable fixes, 0/K tests` / nothing executes.** For
+  **GLM-4.6-style models** the answer comes back in a `reasoning` field with empty `content`. Always pass
+  `--reasoning-as-content` (or `export TESTGEN_REASONING_AS_CONTENT=1`) for GLM.
+- **Truncated responses (`out=16384` / `finish_reason=length`).** The token cap is too low for a long
+  reasoning trace. Raise it: `export TESTGEN_MAX_TOKENS=32768`. Don't lower it.
+- **`401`/`403` from the LLM endpoint.** Wrong or missing API key/header. For **IBM RITS** the key goes
+  in a custom header, not `Authorization: Bearer`: `export TESTGEN_API_KEY_HEADER=RITS_API_KEY` and
+  `export TESTGEN_LLM_API_KEY=$RITS_API_KEY`.
+- **`404` / connection errors from the LLM endpoint.** Usually `TESTGEN_LLM_BASE_URL` is wrong — it must
+  **end at `/v1`** (the OpenAI SDK appends `/chat/completions` itself), and `TESTGEN_MODEL` must exactly
+  match a model the endpoint serves.
+- **Endpoint stalls mid-run.** Every successful LLM call is cached to `<output-dir>/llm_cache.sqlite`;
+  just re-run the same command and it fast-forwards to the failed call. Don't `--clear-llm-cache` unless
+  you deliberately want fresh calls.
+
+### Input / setup errors
+
+- **`--repo-path` or `--issue-md` not found.** The paths must point at an existing local `torch-spyre`
+  clone and an existing `.md` file. `--repo-path` is cloned into `/tmp` for the code graph; `--issue-md`
+  is read as the problem statement.
+- **`uv: command not found`.** Fall back to a manual Python 3.10–3.12 venv and install from
+  `pyproject.toml`.
+- **Run takes a very long time / seems stuck.** Expected — full runs with a pod + K-fix consensus take a
+  while. Run under `nohup` with stdout/stderr redirected to a log file (see step 6), and check progress
+  with `oc get pods` and by tailing the log, not by assuming a hang.
+
+### Pod cleanup error
+- Sometimes after the pipeline has finished, the deployed pod may not be cleaned up. 
+- You can figure out when this has happend by reading the last few lines of stdout, or, by running `oc get pods` and checking if the created pod is still alive.
+- Inform the user about the status of the pod.
 
 ## Important caveats to mention
 
