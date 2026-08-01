@@ -18,7 +18,7 @@
 
 #include <pybind11/pybind11.h>
 #include <torch/csrc/utils/pybind.h>
-#include <util/sen_host_ops.h>
+#include <spyrecode-host-functions/sendataconvert/sen_host_ops.h>
 
 #include <flex/flex.hpp>
 #include <memory>

@@ -18,7 +18,7 @@
 
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
-#include <util/sendefs.h>
+#include <util/sendefs/sendefs.h>
 
 #include <functional>
 #include <optional>

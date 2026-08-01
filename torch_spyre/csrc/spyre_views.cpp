@@ -26,7 +26,7 @@
 #include <c10/util/ArrayRef.h>
 #include <torch/csrc/inductor/inductor_ops.h>
 #include <torch/library.h>
-#include <util/sen_data_convert.h>
+#include <spyrecode-host-functions/sendataconvert/sen_data_convert.h>
 
 #include <vector>
 

@@ -19,7 +19,7 @@
 #include <c10/core/ScalarType.h>
 #include <c10/util/Exception.h>  // TORCH_WARN_ONCE
 #include <module.h>
-#include <util/sendefs.h>
+#include <util/sendefs/sendefs.h>
 
 #ifdef USE_FLEX_NAMESPACE
 #include <flex/datatype/flex_datatype.hpp>
