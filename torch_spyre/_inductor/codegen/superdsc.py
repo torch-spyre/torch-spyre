@@ -36,6 +36,7 @@ from torch_spyre._inductor.constants import (
     CONV2D_LAYOUT_LABELS,
 )
 from torch_spyre._inductor import config as _spyre_config
+from torch_spyre._inductor.config import disable_conv2d_spatial_split
 from torch_spyre._inductor.core_mapping import core_to_slice_mapping
 from torch_spyre._inductor.indirect_access import (
     compute_indirect_max_dim_sizes,
@@ -1318,6 +1319,23 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                 dim_splits[_k_sym] = 1
                 work_slices[_k_sym] = 1
         num_cores = math.prod(dim_splits.values())
+
+    if is_conv2d and disable_conv2d_spatial_split:
+        # Disable splitting on spatial image dimensions (i, j) for conv2d when stride > 1.
+        # For stride > 1: splitting causes DSM/strided access complexity that degrades correctness.
+        # For stride = 1: splitting is safe but disabling it improves memory locality anyway.
+        # Controlled by SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT env var (default: 1).
+        stride_i = conv_params.get("stride_i", 1)
+        stride_j = conv_params.get("stride_j", 1)
+        has_stride = stride_i > 1 or stride_j > 1
+
+        if has_stride:
+            # For strided conv2d, always disable i/j splits (necessary for correctness).
+            for _spatial_sym in (Symbol("i"), Symbol("j")):
+                if _spatial_sym in dim_splits:
+                    dim_splits[_spatial_sym] = 1
+                    work_slices[_spatial_sym] = 1
+            num_cores = math.prod(dim_splits.values())
 
     # Pool-specific SDSC field values.  Computed here (where the op is already
     # identified) as plain data threaded onto SDSCSpec; generate_sdsc consumes
