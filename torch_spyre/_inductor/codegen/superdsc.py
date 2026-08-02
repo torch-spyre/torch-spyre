@@ -695,17 +695,44 @@ def _build_conv2d_symbol_mapping(
                     symbol_mapping[sym] = Symbol(dim_labels[sym_list.index(sym)])
         return symbol_mapping
 
-    # Couldn't match both kernel dims by size: kernel dimensions are likely implicit (e.g., kernel_size=1).
-    # When kernel dims aren't in iteration_space, map remaining symbols to non-kernel labels.
+    # Couldn't match both kernel dims by size: kernel dimensions are likely implicit (e.g., kernel_size=1)
+    # or one kernel size collides with another dimension size (e.g., kernel 1×2 where 1 matches other dims).
+    # When size-based matching fails, identify kernel dims by checking if they iterate to kernel_h/kernel_w.
+    # Otherwise fall back to positional mapping where last two dims are usually ki/kj.
     symbol_mapping = {}
-    non_kernel_labels = [
-        label for label in CONV2D_DIM_LABELS if label not in ("ki", "kj")
-    ]
-    ndim = len(sym_list)
-    actual_labels = non_kernel_labels[:ndim]
 
-    for i, sym in enumerate(sym_list):
-        symbol_mapping[sym] = Symbol(actual_labels[i])
+    # Try to identify which symbols map to ki and kj by their iteration sizes
+    remaining_symbols = list(sym_list)
+    ki_sym = None
+    kj_sym = None
+
+    for sym in reversed(remaining_symbols):
+        sym_size = sym_to_size.get(sym)
+        if sym_size == kernel_w and kj_sym is None:
+            kj_sym = sym
+        elif sym_size == kernel_h and ki_sym is None and sym != kj_sym:
+            ki_sym = sym
+
+        if ki_sym and kj_sym:
+            break
+
+    # Build mapping for all symbols
+    non_kernel_labels = [label for label in CONV2D_DIM_LABELS if label not in ("ki", "kj")]
+    label_idx = 0
+
+    for sym in sym_list:
+        if sym == ki_sym:
+            symbol_mapping[sym] = Symbol("ki")
+        elif sym == kj_sym:
+            symbol_mapping[sym] = Symbol("kj")
+        else:
+            if label_idx < len(non_kernel_labels):
+                symbol_mapping[sym] = Symbol(non_kernel_labels[label_idx])
+                label_idx += 1
+            else:
+                # Shouldn't happen, but guard against it
+                symbol_mapping[sym] = Symbol(f"unknown_{label_idx}")
+                label_idx += 1
 
     return symbol_mapping
 
@@ -1173,19 +1200,27 @@ def _inject_implicit_conv_kernel_dims(
     with their actual kernel sizes so they appear in sdsc_iteration_space and
     can be included in the kernel tensor's layoutDimOrder and coordinates_.
     """
-    if not is_conv2d or Symbol("ki") in sdsc_iteration_space:
+    if not is_conv2d:
         return
 
     conv_params = op_spec.op_info.get("conv_params", {})
     kernel_h = conv_params.get("kernel_h", 1)
     kernel_w = conv_params.get("kernel_w", 1)
 
-    sdsc_iteration_space[Symbol("ki")] = kernel_h
-    sdsc_iteration_space[Symbol("kj")] = kernel_w
-    dim_splits[Symbol("ki")] = 1
-    dim_splits[Symbol("kj")] = 1
-    work_slices[Symbol("ki")] = 1
-    work_slices[Symbol("kj")] = 1
+    ki_sym = Symbol("ki")
+    kj_sym = Symbol("kj")
+
+    # Inject missing kernel dimensions. For 1xN or Nx1 kernels, one dimension iterates
+    # naturally (already in iteration_space) and the other is implicit (needs injection).
+    if ki_sym not in sdsc_iteration_space:
+        sdsc_iteration_space[ki_sym] = kernel_h
+        dim_splits[ki_sym] = 1
+        work_slices[ki_sym] = 1
+
+    if kj_sym not in sdsc_iteration_space:
+        sdsc_iteration_space[kj_sym] = kernel_w
+        dim_splits[kj_sym] = 1
+        work_slices[kj_sym] = 1
 
 
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
