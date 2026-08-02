@@ -850,3 +850,135 @@ def spyre_prod_dim_int(
         acc = acc.unsqueeze(dim)
 
     return acc
+
+
+def _is_int64(*args) -> bool:
+    """Return True if any Tensor argument has dtype int64.
+
+    Scalar (non-Tensor) arguments are ignored.  If no Tensor is present,
+    returns False so the caller falls through to NotImplemented.
+    """
+    for a in args:
+        if isinstance(a, torch.Tensor) and a.dtype == torch.int64:
+            return True
+    return False
+
+
+def _to_fp32(v):
+    """Cast a Tensor to fp32, or convert a scalar to Python float."""
+    if isinstance(v, torch.Tensor):
+        return torch.ops.prims.convert_element_type(v, torch.float32)
+    return float(v)
+
+
+@register_spyre_decompositions([torch.ops.aten.add.Tensor, torch.ops.aten.add.Scalar])
+def spyre_add(x, y, *, alpha=1):
+    """Decompose aten.add for Spyre.
+
+    - int64 (either operand): converts both to fp32, adds (with alpha
+      scaling), converts result back to int64.
+    - fp16/fp32 with alpha != 1: scales y by alpha in the input dtype to
+      avoid unwanted type promotion from the upstream lowering.
+    - fp16/fp32 with alpha == 1: returns NotImplemented so the upstream
+      lowering handles it natively.
+
+    x or y may be a Tensor or a Python scalar.
+    """
+    if _is_int64(x, y):
+        xf, yf = _to_fp32(x), _to_fp32(y)
+        if alpha != 1:
+            yf = yf * float(alpha)
+        result = torch.ops.aten.add.Tensor(xf, yf)
+        return torch.ops.prims.convert_element_type(result, torch.int64)
+
+    if alpha != 1:
+        # For fp16/fp32: we inline "y * alpha" ourselves rather than letting
+        # the upstream Inductor lowering (torch/_inductor/lowering.py) do it.
+        #
+        # The upstream lowering multiplies y by the alpha Python float using
+        # PyTorch's standard type-promotion rules.  When alpha is a Python
+        # float (fp64-like Scalar), PyTorch can upcast an fp16 tensor to fp32.
+        # Spyre registers separate kernels per dtype, so an unexpected fp32
+        # tensor where fp16 was expected may hit a missing or wrong kernel.
+        #
+        # aten.mul.Scalar(y, Scalar) is dtype-preserving: multiplying an fp16
+        # tensor by a Python float Scalar keeps the result fp16.  We use that
+        # here so the subsequent add receives correctly-typed operands.
+        if isinstance(y, torch.Tensor):
+            y = torch.ops.aten.mul.Scalar(y, float(alpha))
+        else:
+            y = float(y) * float(alpha)
+        return torch.ops.aten.add.Tensor(x, y)
+
+    return NotImplemented
+
+
+@register_spyre_decompositions([torch.ops.aten.mul.Tensor, torch.ops.aten.mul.Scalar])
+def spyre_mul(x, y):
+    """Decompose aten.mul for int64 tensors on Spyre (int64 → fp32 → mul → int64).
+
+    For non-int64 inputs, returns NotImplemented.  x or y may be a Tensor or scalar.
+    """
+    if not _is_int64(x, y):
+        return NotImplemented
+    xf, yf = _to_fp32(x), _to_fp32(y)
+    result = torch.ops.aten.mul.Tensor(xf, yf)
+    return torch.ops.prims.convert_element_type(result, torch.int64)
+
+
+@register_spyre_decompositions([torch.ops.aten.sub.Tensor, torch.ops.aten.sub.Scalar])
+def spyre_sub(x, y, *, alpha=1):
+    """Decompose aten.sub for Spyre.
+
+    - int64 (either operand): converts both to fp32, subtracts (with alpha
+      scaling), converts result back to int64.
+    - fp16/fp32 with alpha != 1: scales y by alpha in the input dtype to
+      avoid unwanted type promotion from the upstream lowering.
+    - fp16/fp32 with alpha == 1: returns NotImplemented so the upstream
+      lowering handles it natively.
+
+    x or y may be a Tensor or a Python scalar.
+    """
+    if _is_int64(x, y):
+        xf, yf = _to_fp32(x), _to_fp32(y)
+        if alpha != 1:
+            yf = yf * float(alpha)
+        result = torch.ops.aten.sub.Tensor(xf, yf)
+        return torch.ops.prims.convert_element_type(result, torch.int64)
+
+    if alpha != 1:
+        # Same reasoning as spyre_add: use aten.mul.Scalar (dtype-preserving)
+        # rather than letting the upstream lowering's alpha path upcast fp16.
+        if isinstance(y, torch.Tensor):
+            y = torch.ops.aten.mul.Scalar(y, float(alpha))
+        else:
+            y = float(y) * float(alpha)
+        return torch.ops.aten.sub.Tensor(x, y)
+
+    return NotImplemented
+
+
+@register_spyre_decompositions([torch.ops.aten.minimum.default])
+def spyre_minimum(x, y):
+    """Decompose aten.minimum for int64 tensors on Spyre (int64 → fp32 → min → int64).
+
+    For non-int64 inputs, returns NotImplemented.  x or y may be a Tensor or scalar.
+    """
+    if not _is_int64(x, y):
+        return NotImplemented
+    xf, yf = _to_fp32(x), _to_fp32(y)
+    result = torch.ops.aten.minimum.default(xf, yf)
+    return torch.ops.prims.convert_element_type(result, torch.int64)
+
+
+@register_spyre_decompositions([torch.ops.aten.maximum.default])
+def spyre_maximum(x, y):
+    """Decompose aten.maximum for int64 tensors on Spyre (int64 → fp32 → max → int64).
+
+    For non-int64 inputs, returns NotImplemented.  x or y may be a Tensor or scalar.
+    """
+    if not _is_int64(x, y):
+        return NotImplemented
+    xf, yf = _to_fp32(x), _to_fp32(y)
+    result = torch.ops.aten.maximum.default(xf, yf)
+    return torch.ops.prims.convert_element_type(result, torch.int64)
