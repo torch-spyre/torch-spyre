@@ -261,9 +261,10 @@ def _get_device_dim_order(
 ) -> tuple[list[Symbol], Symbol | None]:
     """Return (dim_order, stick_dim) for the arg's device layout after symbol substitution.
 
-    For kernel tensors in conv ops (arg_index==1), excludes size-1 output-spatial dimensions
-    (i, j) since kernels have no spatial-output dependence. This prevents synthetic
-    placeholder dimensions from leaking into kernel coordinates.
+    For kernel tensors in conv ops (arg_index==1):
+    - Excludes size-1 output-spatial dimensions (i, j) since kernels have no spatial-output dependence.
+    - Explicitly includes kernel dimensions (ki, kj) even if they don't appear in device_coordinates
+      (e.g., when kernel_size=1, they don't iterate naturally but are still structural dimensions).
     """
     last_coord = arg.device_coordinates[-1].subs(symbol_mapping)
     free = sorted(last_coord.free_symbols, key=str)
@@ -315,6 +316,27 @@ def _get_device_dim_order(
 
             if not skip_sym and sym not in dim_order:
                 dim_order.append(sym)
+
+    # For kernel tensors in conv ops, always explicitly add ki/kj dimensions.
+    # These are spatial dimensions of the kernel tensor and should be part of its layout.
+    # They may not appear in device_coordinates when kernel_size=1, but they should still
+    # be in layoutDimOrder and coordinates_.
+    if (
+        op_spec is not None
+        and arg_index == 1
+        and _is_conv(op_spec.op)
+        and op_spec.op_info
+        and "conv_params" in op_spec.op_info
+    ):
+        conv_params = op_spec.op_info["conv_params"]
+        # Add ki and kj to dim_order if they have non-zero kernel sizes
+        for window_sym_name, kernel_key in [("ki", "kernel_h"), ("kj", "kernel_w")]:
+            kernel_size = conv_params.get(kernel_key, 1)
+            if kernel_size > 0:
+                window_sym = Symbol(window_sym_name)
+                if window_sym not in dim_order:
+                    dim_order.insert(0, window_sym)
+
     return dim_order, stick_dim
 
 
@@ -644,8 +666,17 @@ def _build_conv2d_symbol_mapping(
                     symbol_mapping[sym] = Symbol(dim_labels[sym_list.index(sym)])
         return symbol_mapping
 
-    # Couldn't match both kernel dims, fall back to positional
-    return {sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)}
+    # Couldn't match both kernel dims by size: kernel dimensions are likely implicit (e.g., kernel_size=1).
+    # When kernel dims aren't in iteration_space, map remaining symbols to non-kernel labels.
+    symbol_mapping = {}
+    non_kernel_labels = [l for l in CONV2D_DIM_LABELS if l not in ("ki", "kj")]
+    ndim = len(sym_list)
+    actual_labels = non_kernel_labels[:ndim]
+
+    for i, sym in enumerate(sym_list):
+        symbol_mapping[sym] = Symbol(actual_labels[i])
+
+    return symbol_mapping
 
 
 def _get_op_dim_labels(ndim: int, is_matmul: bool, is_conv2d: bool) -> list[str]:
@@ -1095,6 +1126,35 @@ def _extend_matmul_k_to_padded(
         sdsc_iteration_space[k_sym] = k_padded
 
 
+def _inject_implicit_conv_kernel_dims(
+    is_conv2d: bool,
+    op_spec: OpSpec,
+    sdsc_iteration_space: dict,
+    dim_splits: dict,
+    work_slices: dict,
+) -> None:
+    """Inject implicit kernel dimensions (ki, kj) for conv2d when kernel_size=1.
+
+    When kernel_size=1, the kernel dimensions don't iterate naturally (they'd be
+    0..0), so they don't appear in op_spec.iteration_space. We inject them here
+    with their actual kernel sizes so they appear in sdsc_iteration_space and
+    can be included in the kernel tensor's layoutDimOrder and coordinates_.
+    """
+    if not is_conv2d or Symbol("ki") in sdsc_iteration_space:
+        return
+
+    conv_params = op_spec.op_info.get("conv_params", {})
+    kernel_h = conv_params.get("kernel_h", 1)
+    kernel_w = conv_params.get("kernel_w", 1)
+
+    sdsc_iteration_space[Symbol("ki")] = kernel_h
+    sdsc_iteration_space[Symbol("kj")] = kernel_w
+    dim_splits[Symbol("ki")] = 1
+    dim_splits[Symbol("kj")] = 1
+    work_slices[Symbol("ki")] = 1
+    work_slices[Symbol("kj")] = 1
+
+
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
     is_conv2d = _is_conv(op_spec.op)
@@ -1168,6 +1228,11 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         symbol_mapping[sym]: wk_slice if not has_indirect_access else 1
         for sym, (_, wk_slice) in op_spec.iteration_space.items()
     }
+
+    # Inject implicit kernel dimensions for conv2d when kernel_size=1
+    _inject_implicit_conv_kernel_dims(
+        is_conv2d, op_spec, sdsc_iteration_space, dim_splits, work_slices
+    )
 
     ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
