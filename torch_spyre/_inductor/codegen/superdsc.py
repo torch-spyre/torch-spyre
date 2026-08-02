@@ -679,7 +679,7 @@ def _build_conv2d_symbol_mapping(
     # If both kernel symbols found, build mapping with correct labels
     if ki_sym and kj_sym:
         symbol_mapping = {}
-        remaining_labels = [l for l in dim_labels if l not in ("ki", "kj")]
+        remaining_labels = [label for label in dim_labels if label not in ("ki", "kj")]
         remaining_idx = 0
 
         for sym in sym_list:
@@ -698,7 +698,7 @@ def _build_conv2d_symbol_mapping(
     # Couldn't match both kernel dims by size: kernel dimensions are likely implicit (e.g., kernel_size=1).
     # When kernel dims aren't in iteration_space, map remaining symbols to non-kernel labels.
     symbol_mapping = {}
-    non_kernel_labels = [l for l in CONV2D_DIM_LABELS if l not in ("ki", "kj")]
+    non_kernel_labels = [label for label in CONV2D_DIM_LABELS if label not in ("ki", "kj")]
     ndim = len(sym_list)
     actual_labels = non_kernel_labels[:ndim]
 
