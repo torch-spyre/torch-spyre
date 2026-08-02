@@ -1135,8 +1135,8 @@ def generate_sdsc(
         return {
             "isPadded": 1 if is_input else 0,
             "isZeroPadded": 0,
-            #"dsOffset": 0,
-            #"allocateNode_": alloc_node,
+            # "dsOffset": 0,
+            # "allocateNode_": alloc_node,
         }
 
     return (
@@ -1229,7 +1229,9 @@ def generate_sdsc(
                                         "coreletSplit_": {},
                                         "rowSplit_": {},
                                         "peSfpSplit_": {},
-                                        "paddingSizes_": sdsc_spec.padding_sizes_per_core if sdsc_spec.padding_sizes_per_core else sdsc_spec.padding_sizes,
+                                        "paddingSizes_": sdsc_spec.padding_sizes_per_core
+                                        if sdsc_spec.padding_sizes_per_core
+                                        else sdsc_spec.padding_sizes,
                                     },
                                     "el_": {
                                         "name_": "core",
@@ -1245,7 +1247,9 @@ def generate_sdsc(
                                         "coreletSplit_": {},
                                         "rowSplit_": {},
                                         "peSfpSplit_": {},
-                                        "paddingSizes_": sdsc_spec.padding_sizes_per_core if sdsc_spec.padding_sizes_per_core else sdsc_spec.padding_sizes,
+                                        "paddingSizes_": sdsc_spec.padding_sizes_per_core
+                                        if sdsc_spec.padding_sizes_per_core
+                                        else sdsc_spec.padding_sizes,
                                     },
                                 }
                             },
@@ -1399,7 +1403,7 @@ def generate_sdsc(
                                                     )
                                                 )
                                             )(
-                                                #sdsc_spec.iteration_space[dim],
+                                                # sdsc_spec.iteration_space[dim],
                                                 _coord_size(
                                                     str(dim),
                                                     sdsc_spec.iteration_space[dim],
@@ -1447,18 +1451,30 @@ def generate_sdsc(
                                     else {
                                         "hbm": {
                                             "isPresent": 1,
-                                            **(_memorg_extra(
-                                                i < sdsc_spec.num_inputs,
-                                                f"allocate-Tensor{i}_hbm",
-                                            ) if sdsc_spec.opfunc != DEPTHWISE_CONV2D_OP or i == 0 else {})
+                                            **(
+                                                _memorg_extra(
+                                                    i < sdsc_spec.num_inputs,
+                                                    f"allocate-Tensor{i}_hbm",
+                                                )
+                                                if sdsc_spec.opfunc
+                                                != DEPTHWISE_CONV2D_OP
+                                                or i == 0
+                                                else {}
+                                            ),
                                         },
                                         "lx": {
                                             "isPresent": 1,
-                                            **(_memorg_extra(
-                                                i < sdsc_spec.num_inputs,
-                                                "",
-                                            ) if sdsc_spec.opfunc != DEPTHWISE_CONV2D_OP or i == 0 else {})
-                                        }
+                                            **(
+                                                _memorg_extra(
+                                                    i < sdsc_spec.num_inputs,
+                                                    "",
+                                                )
+                                                if sdsc_spec.opfunc
+                                                != DEPTHWISE_CONV2D_OP
+                                                or i == 0
+                                                else {}
+                                            ),
+                                        },
                                     }
                                     if "lx" not in tensor.allocation
                                     else (

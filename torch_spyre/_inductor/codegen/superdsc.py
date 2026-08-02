@@ -257,7 +257,10 @@ def _calculate_device_stride(dev_dim_idx: int, device_size: list) -> int:
 
 
 def _get_device_dim_order(
-    arg: TensorArg, symbol_mapping: dict, op_spec: OpSpec | None = None, arg_index: int | None = None
+    arg: TensorArg,
+    symbol_mapping: dict,
+    op_spec: OpSpec | None = None,
+    arg_index: int | None = None,
 ) -> tuple[list[Symbol], Symbol | None]:
     """Return (dim_order, stick_dim) for the arg's device layout after symbol substitution.
 
@@ -523,7 +526,9 @@ def _avgpool_sdsc_fields(iteration_space: dict, pool_params: dict) -> dict:
     }
 
 
-def _conv2d_sdsc_fields(iteration_space: dict, conv_params: dict, dim_splits: dict) -> dict:
+def _conv2d_sdsc_fields(
+    iteration_space: dict, conv_params: dict, dim_splits: dict
+) -> dict:
     """Compute conv2d-specific SDSC field values for depthwise conv2d.
 
     Computes paddingSizes_ for both top-level (full-size) and per-core (split-size)
@@ -534,7 +539,15 @@ def _conv2d_sdsc_fields(iteration_space: dict, conv_params: dict, dim_splits: di
     if not conv_params:
         return {}
 
-    def compute_padding_for_dim(suffix, pad_dim_key, kernel_key, stride_key, window_dim_key, total_size_key, dim_sizes=None):
+    def compute_padding_for_dim(
+        suffix,
+        pad_dim_key,
+        kernel_key,
+        stride_key,
+        window_dim_key,
+        total_size_key,
+        dim_sizes=None,
+    ):
         """Compute padding fields for a single dimension (i or j)."""
         pad_dim = conv_params[pad_dim_key]
         stride = conv_params[stride_key]
@@ -596,16 +609,30 @@ def _conv2d_sdsc_fields(iteration_space: dict, conv_params: dict, dim_splits: di
         """Build paddingSizes_ for one variant (top-level or per-core)."""
         return {
             str(conv_params["pad_dim_i"]): compute_padding_for_dim(
-                "i", "pad_dim_i", "kernel_h", "stride_i", "window_dim_i", "total_size_i", dim_sizes
+                "i",
+                "pad_dim_i",
+                "kernel_h",
+                "stride_i",
+                "window_dim_i",
+                "total_size_i",
+                dim_sizes,
             ),
             str(conv_params["pad_dim_j"]): compute_padding_for_dim(
-                "j", "pad_dim_j", "kernel_w", "stride_j", "window_dim_j", "total_size_j", dim_sizes
+                "j",
+                "pad_dim_j",
+                "kernel_w",
+                "stride_j",
+                "window_dim_j",
+                "total_size_j",
+                dim_sizes,
             ),
         }
 
     return {
         "padding_sizes": build_padding_sizes_variant(dim_sizes=None),
-        "padding_sizes_per_core": build_padding_sizes_variant(dim_sizes=iteration_space),
+        "padding_sizes_per_core": build_padding_sizes_variant(
+            dim_sizes=iteration_space
+        ),
         "emit_memorg_padding": True,
     }
 
@@ -629,7 +656,9 @@ def _build_conv2d_symbol_mapping(
 
     if kernel_h is None or kernel_w is None:
         # No kernel sizes available, fall back to positional mapping
-        return {sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)}
+        return {
+            sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)
+        }
 
     # Build size map from iteration space
     sym_list = list(op_spec.iteration_space.keys())
@@ -772,7 +801,9 @@ def _create_sdsc_tensors(
         if has_indirect_access and i in index_tensor_layouts:
             dim_order, stick_dim = index_tensor_layouts[i]
         else:
-            dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping, op_spec, arg_index=i)
+            dim_order, stick_dim = _get_device_dim_order(
+                arg, symbol_mapping, op_spec, arg_index=i
+            )
 
         # Case 2 (MutationLayoutSHOULDREMOVE) ops carry an authoritative
         # device-stride sympy.Expr for each coarse-tiled dim's per-iteration
@@ -1183,7 +1214,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     logger.debug(
         "symbol mapping: %s",
-        ", ".join(f"{k} -> {v}" for k, v in symbol_mapping.items()))
+        ", ".join(f"{k} -> {v}" for k, v in symbol_mapping.items()),
+    )
     # Minted per-(op, level) tile-advance symbols (see spyre_kernel.py's
     # _get_or_mint_level_symbol) are not iteration-space dimensions -- they are
     # loop-nesting-level markers -- so they have no dim label to rename to.
