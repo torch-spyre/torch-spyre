@@ -3268,27 +3268,12 @@ def test_flash_v3_tile_all():
 
 def _flash_v4_inputs(B, S, H, D):
     """TensorSpec list for flash v4 (flat fused-dim inputs)."""
-    _nd_q = {"batch_size": B, "max_seqlen_q": S, "num_heads": H, "head_dim": D}
-    _nd_kv = {"batch_size": B, "max_seqlen_kv": S, "num_heads": H, "head_dim": D}
+    _nd_q = {"B": B, "Lq": S, "H": H, "D": D}
+    _nd_kv = {"B": B, "Lk": S, "H": H, "D": D}
     return [
-        tensor(
-            "q",
-            shape=(B, S, H * D),
-            dims=["batch_size", "max_seqlen_q", "num_heads", "head_dim"],
-            named_dims=_nd_q,
-        ),
-        tensor(
-            "k",
-            shape=(B, S, H * D),
-            dims=["batch_size", "max_seqlen_kv", "num_heads", "head_dim"],
-            named_dims=_nd_kv,
-        ),
-        tensor(
-            "v",
-            shape=(B, S, H * D),
-            dims=["batch_size", "max_seqlen_kv", "num_heads", "head_dim"],
-            named_dims=_nd_kv,
-        ),
+        tensor("q", shape=(B, S, H * D), dims=["B", "Lq", "H", "D"], named_dims=_nd_q),
+        tensor("k", shape=(B, S, H * D), dims=["B", "Lk", "H", "D"], named_dims=_nd_kv),
+        tensor("v", shape=(B, S, H * D), dims=["B", "Lk", "H", "D"], named_dims=_nd_kv),
     ]
 
 
@@ -3301,132 +3286,52 @@ def _flash_v4_fn(q, k, v, *, B, S, H, D, b_tiles=1, h_tiles=1, lq_tiles=1, lk_ti
     output = torch.zeros_like(q)
     real_max = torch.full((B, H, S), float("-inf"), device=q.device, dtype=q.dtype)
     denominator = torch.zeros((B, H, S), device=q.device, dtype=q.dtype)
-    with spyre_hint(num_tiles_per_dim={"batch_size": b_tiles}):
-        with spyre_hint(num_tiles_per_dim={"num_heads": h_tiles}):
-            with spyre_hint(num_tiles_per_dim={"max_seqlen_q": lq_tiles}):
-                with spyre_hint(num_tiles_per_dim={"max_seqlen_kv": lk_tiles}):
-                    with spyre_hint(
-                        expected_named_dims=[
-                            "batch_size",
-                            "num_heads",
-                            "max_seqlen_kv",
-                            "head_dim",
-                        ]
-                    ):
+    with spyre_hint(num_tiles_per_dim={"B": b_tiles}):
+        with spyre_hint(num_tiles_per_dim={"H": h_tiles}):
+            with spyre_hint(num_tiles_per_dim={"Lq": lq_tiles}):
+                with spyre_hint(num_tiles_per_dim={"Lk": lk_tiles}):
+                    with spyre_hint(expected_named_dims=["B", "H", "Lk", "D"]):
                         scaled_keys = k * scale
-                    with spyre_hint(
-                        expected_named_dims=[
-                            "batch_size",
-                            "num_heads",
-                            "head_dim",
-                            "max_seqlen_kv",
-                        ]
-                    ):
+                    with spyre_hint(expected_named_dims=["B", "H", "D", "Lk"]):
                         keys_T = scaled_keys.transpose(-1, -2).contiguous()
-                    with spyre_hint(
-                        expected_named_dims=[
-                            "batch_size",
-                            "num_heads",
-                            "max_seqlen_q",
-                            "head_dim",
-                        ]
-                    ):
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
                         q_scaled = q * scale
-                    with spyre_hint(
-                        named_dims=[
-                            "batch_size",
-                            "num_heads",
-                            "max_seqlen_q",
-                            "max_seqlen_kv",
-                        ]
-                    ):
+                    with spyre_hint(named_dims=["B", "H", "Lq", "Lk"]):
                         scores_pre = torch.matmul(q_scaled, keys_T)
-                    with spyre_hint(
-                        expected_named_dims=[
-                            "batch_size",
-                            "num_heads",
-                            "max_seqlen_kv",
-                            "max_seqlen_q",
-                        ]
-                    ):
+                    with spyre_hint(expected_named_dims=["B", "H", "Lk", "Lq"]):
                         scores = scores_pre.transpose(-1, -2).contiguous()
                     with spyre_hint(
-                        expected_named_dims=["batch_size", "num_heads", "max_seqlen_q"],
-                        expected_reduction_dims=["max_seqlen_kv"],
+                        expected_named_dims=["B", "H", "Lq"],
+                        expected_reduction_dims=["Lk"],
                     ):
                         block_max = torch.amax(scores, dim=-2)
-                    with spyre_hint(
-                        expected_named_dims=["batch_size", "num_heads", "max_seqlen_q"]
-                    ):
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
                         running_max = torch.maximum(real_max, block_max)
-                    with spyre_hint(
-                        expected_named_dims=[
-                            "batch_size",
-                            "num_heads",
-                            "max_seqlen_kv",
-                            "max_seqlen_q",
-                        ]
-                    ):
+                    with spyre_hint(expected_named_dims=["B", "H", "Lk", "Lq"]):
                         scores_shifted = scores - running_max.unsqueeze(-2)
-                    with spyre_hint(
-                        expected_named_dims=[
-                            "batch_size",
-                            "num_heads",
-                            "max_seqlen_kv",
-                            "max_seqlen_q",
-                        ]
-                    ):
+                    with spyre_hint(expected_named_dims=["B", "H", "Lk", "Lq"]):
                         exp_scores = torch.exp(scores_shifted)
-                    with spyre_hint(
-                        expected_named_dims=["batch_size", "num_heads", "max_seqlen_q"]
-                    ):
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
                         real_max_diff = real_max - running_max
-                    with spyre_hint(
-                        expected_named_dims=["batch_size", "num_heads", "max_seqlen_q"]
-                    ):
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
                         correction = torch.exp(real_max_diff)
                     with spyre_hint(
-                        expected_named_dims=["batch_size", "num_heads", "max_seqlen_q"],
-                        expected_reduction_dims=["max_seqlen_kv"],
+                        expected_named_dims=["B", "H", "Lq"],
+                        expected_reduction_dims=["Lk"],
                     ):
                         sum_scores = exp_scores.sum(dim=-2)
-                    with spyre_hint(
-                        expected_named_dims=["batch_size", "num_heads", "max_seqlen_q"]
-                    ):
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
                         denom_corrected = denominator * correction
-                    with spyre_hint(
-                        expected_named_dims=["batch_size", "num_heads", "max_seqlen_q"]
-                    ):
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
                         new_denom = denom_corrected + sum_scores
                     denominator.copy_(new_denom)
-                    with spyre_hint(
-                        expected_named_dims=[
-                            "batch_size",
-                            "num_heads",
-                            "max_seqlen_q",
-                            "max_seqlen_kv",
-                        ]
-                    ):
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq", "Lk"]):
                         exp_scores_T = exp_scores.transpose(-1, -2).contiguous()
-                    with spyre_hint(
-                        named_dims=[
-                            "batch_size",
-                            "num_heads",
-                            "max_seqlen_q",
-                            "head_dim",
-                        ]
-                    ):
+                    with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
                         matmul_out = torch.matmul(exp_scores_T, v)
-                    # correction.unsqueeze(-1) is size-1 in head_dim — can't carry "head_dim"
+                    # correction.unsqueeze(-1) is size-1 in D — can't carry "D"
                     output_corrected = output * correction.unsqueeze(-1)
-                    with spyre_hint(
-                        expected_named_dims=[
-                            "batch_size",
-                            "num_heads",
-                            "max_seqlen_q",
-                            "head_dim",
-                        ]
-                    ):
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
                         new_output = output_corrected + matmul_out
                     output.copy_(new_output)
                     real_max.copy_(running_max)

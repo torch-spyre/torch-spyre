@@ -155,14 +155,8 @@ def compute_coordinates(
     )
 
     # Convert ModularIndexing expressions to sympy.Mod before processing
-    index_before = index
     index = convert_modular_indexing(index)
     repeat_info = find_repeat_vars([index], var_ranges)
-    print(f"DEBUG compute_coordinates: size={size} stride={stride}")
-    print(f"  index_before={index_before}")
-    print(f"  index_after_convert={index}")
-    print(f"  var_ranges={var_ranges}")
-    print(f"  repeat_info={repeat_info}")
     if not hasattr(V.graph, "_repeat_info"):
         V.graph._repeat_info = dict(repeat_info)
     else:
@@ -265,7 +259,6 @@ def compute_coordinates(
     # NOTE: indirect_access_subs substitution is NOT applied here. It is deferred to
     # after align_tensors() so that indirect symbols are decomposed as regular variables.
     # The substitution is applied in simplify_op_spec() after align_tensors completes.
-    print(f"  coordinates={coordinates}")
     return coordinates
 
 
