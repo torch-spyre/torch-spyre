@@ -2812,9 +2812,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Hint propagation into inserted restickify nodes
     # ------------------------------------------------------------------
 
-    @pytest.mark.skip(
-        reason="The transposed input produces layouts where coarse-tiling rewrites output buffer strides after restickify has already run, resulting in a stick mismatch that raises in create_op_spec."
-    )
     @config.patch(
         {
             "lx_planning": True,
@@ -3022,6 +3019,18 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         explicit running-max (real_max) formulation that updates output and
         denominator in place via copy_.
 
+        Still xfailed.  The divide sits outside the tiled scopes, so
+        `output`/`denominator` get full buffers + copy ops; each copy writes its
+        target without reading it, nothing costs that pairing, and
+        finalize_layouts overwrites the target with the writer's layout ->
+        "restickify needed but infeasible for op='buf24' input='buf26'".
+
+        Not resolvable by layout choice: writer and consumer need mutually
+        unrestickifiable candidates (forcing either aborts or gives ~70% wrong).
+        {"Lq": 2} alone reproduces it.  See
+        test_hint_flash_attention_v2_divide_in_scope for the formulation that
+        works, which localizes this to the cross-loop-group copy path.
+
         Decision xfail: failing in CI (Actions run 30385154736, job
         90362755639) on PR #3293. We've decided to xfail the coarse tiling
         tests to allow us to merge to main -- deliberate decision to unblock
@@ -3118,6 +3127,111 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             atol=0.01,
             rtol=0.1,
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
+        )
+
+    def test_hint_flash_attention_v2_divide_in_scope(self):
+        """test_hint_flash_attention_v2 with the final divide INSIDE the scope.
+
+        Outside, `output`/`denominator` are read past the loop group, so both get a
+        full buffer + copy op whose target the divide (buf24) also reads; the copy
+        writes its target without reading it, so no edge costs that pairing and
+        finalize_layouts overwrites the target with the writer's layout, killing
+        buf24's solved edge.  Inside, only `result` crosses: one copy op, target
+        has no second consumer, nothing to invalidate.
+
+        Sound only because H/Lq are output dims (each tile's denominator is final).
+        Lk tiling still needs carry propagation -- #3198.
+
+        The LoopSpec assertion is load-bearing: without it this passes even if
+        tiling is silently skipped.
+        """
+        import math
+
+        from torch_spyre._inductor import spyre_hint
+
+        B, H, Lq, Lk, D = 1, 8, 256, 256, 64
+        block_size = 128
+
+        queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
+        keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        values_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        causal = torch.tril(torch.ones(Lq, Lk, dtype=torch.bool))
+        mask_t = torch.zeros(1, 1, Lq, Lk, dtype=torch.float16)
+        mask_t.masked_fill_(~causal, float("-inf"))
+        lq_slices = Lq // block_size
+
+        def flash(queries, keys, values, mask):
+            scale = 1.0 / math.sqrt(math.sqrt(D))
+            output = torch.zeros_like(queries)
+            real_max = torch.full(
+                (B, H, Lq, 64),
+                float("-inf"),
+                device=queries.device,
+                dtype=torch.float16,
+            ).amax(dim=-1)
+            denominator = torch.zeros(
+                (B, H, Lq, 64),
+                device=queries.device,
+                dtype=torch.float16,
+            ).amax(dim=-1)
+            with spyre_hint(num_tiles_per_dim={"H": 4}):
+                with spyre_hint(num_tiles_per_dim={"Lq": lq_slices}):
+                    scaled_keys = keys * scale
+                    keys_T = scaled_keys.transpose(-1, -2)
+                    scores = torch.matmul(queries * scale, keys_T)
+                    scores = scores + mask
+
+                    block_max = torch.amax(scores, dim=-1)
+                    running_max = torch.maximum(real_max, block_max)
+
+                    exp_scores = torch.exp(scores - running_max.unsqueeze(-1))
+                    correction = torch.exp(real_max - running_max)
+
+                    denominator.copy_(denominator * correction + exp_scores.sum(dim=-1))
+                    output.copy_(
+                        output * correction.unsqueeze(-1)
+                        + torch.matmul(exp_scores, values)
+                    )
+                    real_max.copy_(running_max)
+
+                    # The one difference from test_hint_flash_attention_v2.
+                    result = output / denominator.unsqueeze(-1)
+            return result
+
+        ref = flash(queries_t, keys_t, values_t, mask_t)
+
+        queries_dev = queries_t.to("spyre")
+        keys_dev = keys_t.to("spyre")
+        values_dev = values_t.to("spyre")
+        mask_dev = mask_t.to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("Lk", Lk)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(queries_dev, ["B", "H", "Lq", "D"])
+        _name_tensor_dims(keys_dev, ["B", "H", "Lk", "D"])
+        _name_tensor_dims(values_dev, ["B", "H", "Lk", "D"])
+        _name_tensor_dims(mask_dev, ["B", "H", "Lq", "Lk"])
+
+        cfn = torch.compile(flash)
+        result, source_codes = run_and_get_code(
+            cfn, queries_dev, keys_dev, values_dev, mask_dev
+        )
+        torch.testing.assert_close(
+            result.cpu(),
+            ref,
+            equal_nan=True,
+            atol=0.01,
+            rtol=0.1,
+            msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
+        )
+        # Both hint levels must survive into codegen (H=4 outer, Lq=2 inner).
+        self.assertEqual(
+            source_codes[0].count("LoopSpec("),
+            2,
+            "expected two nested LoopSpec entries (H then Lq); coarse tiling "
+            "must not be silently skipped",
         )
 
     @config.patch(
@@ -5077,13 +5191,10 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
 # ===========================================================================
 
 
-@pytest.mark.skip(reason="SpyreEmptyFallback / ct_fill STL bug")
 def test_tiled_in_place_accumulator():
-    """Minimal reproducer for the SpyreEmptyFallback / ct_fill STL bug.
+    """Regression test for the SpyreEmptyFallback / ct_fill STL bug.
 
-    CURRENT STATUS (to delete when reorder-passes-clean is merged)
-      - Fails on main
-      - Fails on reorder-passes-clean but passes with patch XYZ and SENCORES=1
+    Was xfailed pending reorder-passes-clean (#3293, #3377, #3381); passes now.
     """
     from torch_spyre._inductor import spyre_hint
 
