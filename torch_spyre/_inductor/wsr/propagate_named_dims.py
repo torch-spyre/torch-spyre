@@ -509,24 +509,13 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
 
 
 def _graph_has_named_dims_hint(graph: GraphLowering) -> bool:
-    """True if any op carries a spyre_hint(named_dims=[...]) annotation.
-
-    This lets a decomposition name its own intermediate dims entirely in-graph
-    (e.g. the flash SDPA decomposition), without a driver-side name_tensor_dims()
-    call.  Such a hint is the only in-graph way to name a matmul output, whose
-    loop vars carry no names from inputs.
-
-    This scans graph.operations, which _propagate_named_dims_impl then scans
-    again; the extra pass is a cheap gate on a per-compilation path.  If it ever
-    shows up as a hotspot, fold the check into _propagate_named_dims_impl (run
-    unconditionally, short-circuit inside) so operations is walked once.
-    """
-    for op in graph.operations:
-        if isinstance(op, ComputedBuffer):
-            for hint_dict in get_op_hints(op).values():
-                if "named_dims" in hint_dict:
-                    return True
-    return False
+    """True if any op carries a spyre_hint(named_dims=[...]) annotation."""
+    return any(
+        "named_dims" in hint_dict
+        for op in graph.operations
+        if isinstance(op, ComputedBuffer)
+        for hint_dict in get_op_hints(op).values()
+    )
 
 
 def propagate_named_dims(
@@ -573,14 +562,20 @@ def validate_named_dims(graph: GraphLowering) -> None:
         if dp is None:
             continue
         for hint_dict in get_op_hints(op).values():
-            if "expected_named_dims" in hint_dict or "expected_reduction_dims" in hint_dict:
-                logger.info(f"validate_named_dims: checking {op.get_name()} named_dims={dp.named_dims}")
+            if (
+                "expected_named_dims" not in hint_dict
+                and "expected_reduction_dims" not in hint_dict
+            ):
+                continue
+            origins: set = getattr(op.data, "origins", set())
+            aten_ops = [str(n.target) for n in origins if hasattr(n, "target")]
+            logger.info(
+                f"validate_named_dims: checking {op.get_name()} named_dims={dp.named_dims}"
+            )
             if "expected_named_dims" in hint_dict:
                 expected = hint_dict["expected_named_dims"]
                 actual = dp.named_dims
                 if actual != expected:
-                    origins: set = getattr(op.data, "origins", set())
-                    aten_ops = [str(n.target) for n in origins if hasattr(n, "target")]
                     raise AssertionError(
                         f"validate_named_dims: {op.get_name()} {aten_ops}\n"
                         f"  expected_named_dims: {expected}\n"
@@ -590,8 +585,6 @@ def validate_named_dims(graph: GraphLowering) -> None:
                 expected = hint_dict["expected_reduction_dims"]
                 actual = dp.reduction_named_dims
                 if actual != expected:
-                    origins = getattr(op.data, "origins", set())
-                    aten_ops = [str(n.target) for n in origins if hasattr(n, "target")]
                     raise AssertionError(
                         f"validate_named_dims: {op.get_name()} {aten_ops}\n"
                         f"  expected_reduction_dims: {expected}\n"
