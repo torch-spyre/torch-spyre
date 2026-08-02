@@ -577,7 +577,7 @@ def lower_bmm(x, y):
 
 
 @register_spyre_lowering(torch.ops.spyre.conv2d.default)
-def lower_convolution(x, w, bias, stride, padding, dilation, groups):
+def lower_convolution(x, w, stride, padding, dilation, groups):
     x = V.graph.get_buffer(x.realize())
     w = V.graph.get_buffer(w.realize())
     x_loader = x.make_loader()
@@ -600,6 +600,12 @@ def lower_convolution(x, w, bias, stride, padding, dilation, groups):
             f"Depthwise conv2d currently only supports zero padding; got padding={padding}. "
             "Support for non-zero padding requires changes to the Spyre runtime to handle "
             "non-zero tensor allocation addresses."
+        )
+
+    if tuple(dilation) != (1, 1):
+        raise Unsupported(
+            f"Depthwise conv2d currently only supports dilation=1; got dilation={dilation}. "
+            "Support for dilation > 1 requires backend changes."
         )
 
     # Output spatial sizes

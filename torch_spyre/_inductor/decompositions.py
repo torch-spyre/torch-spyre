@@ -792,7 +792,7 @@ def spyre_conv2d_with_bias_decomp(
     This keeps the spyre.conv2d lowering simple while supporting conv2d with bias.
     """
     # Call spyre.conv2d without bias
-    output = torch.ops.spyre.conv2d(input, weight, None, stride, padding, dilation, groups)
+    output = torch.ops.spyre.conv2d(input, weight, stride, padding, dilation, groups)
 
     # If bias is present, add it
     if bias is not None:

@@ -596,7 +596,6 @@ def _(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 def spyre_conv2d(
     input: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
     stride: Sequence[int],
     padding: Sequence[int],
     dilation: Sequence[int],
@@ -609,7 +608,6 @@ def spyre_conv2d(
 def _(
     input: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
     stride: Sequence[int],
     padding: Sequence[int],
     dilation: Sequence[int],
