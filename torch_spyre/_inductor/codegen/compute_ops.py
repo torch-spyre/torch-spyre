@@ -1053,12 +1053,6 @@ def generate_sdsc(
             return list(dims)
         return [d for d in dims if str(d) not in sdsc_spec.window_dims]
 
-    def _tensor_layout_dims(layout_key: str) -> list:
-        """Return the layout dim_order for a layout label, minus window dims."""
-        return _filter_window_dims(
-            sdsc_spec.layouts[layout_key]["dim_order"], layout_key
-        )
-
     def _tensor_sched_layout_dims(
         dim_order: list, layout_key: str | None = None
     ) -> list:
@@ -1264,7 +1258,10 @@ def generate_sdsc(
                             "primaryDsInfo_": {
                                 label: {
                                     "layoutDimOrder_": [
-                                        str(dim) for dim in _tensor_layout_dims(label)
+                                        str(dim)
+                                        for dim in _filter_window_dims(
+                                            layout_info["dim_order"], label
+                                        )
                                     ],
                                     "stickDimOrder_": [
                                         str(layout_info["stick_dim_order"])
@@ -1309,7 +1306,9 @@ def generate_sdsc(
                                     ],
                                     "maxDimSizes_": [
                                         tensor.max_dim_sizes[dim]
-                                        for dim in _tensor_layout_dims(tensor.layout)
+                                        for dim in _tensor_sched_layout_dims(
+                                            tensor.dim_order, tensor.layout
+                                        )
                                     ],
                                     **_build_indirect_access_fields(
                                         sdsc_spec, tensor, i
@@ -1357,8 +1356,8 @@ def generate_sdsc(
                                                 if str(dim)
                                                 in {
                                                     str(d)
-                                                    for d in _tensor_layout_dims(
-                                                        tensor.layout
+                                                    for d in _tensor_sched_layout_dims(
+                                                        tensor.dim_order, tensor.layout
                                                     )
                                                 }
                                             }
@@ -1400,8 +1399,11 @@ def generate_sdsc(
                                                 if (tensor.scales[dim] == 1)
                                                 else None,
                                             )
-                                            for dim in _tensor_layout_dims(
-                                                tensor.layout
+                                            for dim in _filter_window_dims(
+                                                sdsc_spec.layouts[tensor.layout][
+                                                    "dim_order"
+                                                ],
+                                                tensor.layout,
                                             )
                                         },
                                         "coreIdToWkSlice_": {},
@@ -1416,7 +1418,12 @@ def generate_sdsc(
                                     "dsType_": tensor.layout,
                                     "scale_": [
                                         tensor.scales[dim]
-                                        for dim in _tensor_layout_dims(tensor.layout)
+                                        for dim in _filter_window_dims(
+                                            sdsc_spec.layouts[tensor.layout][
+                                                "dim_order"
+                                            ],
+                                            tensor.layout,
+                                        )
                                     ],
                                     "wordLength": num_bytes(tensor.data_format),
                                     "dataFormat_": tensor.data_format.name,

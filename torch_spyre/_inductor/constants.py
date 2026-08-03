@@ -156,6 +156,12 @@ SPYRE_FP32_OPS = [
     "to_dtype",
     "maximum",
     "minimum",
+    "greaterthan",
+    "greaterequal",
+    "lesserthan",
+    "lesserequal",
+    "equal",
+    "notequal",
     "prod",
 ]
 
