@@ -107,24 +107,22 @@ def _vision_silu(x):
 
 
 def _torch_add(x, y):
-    """torch.add(x, y) -- binary elementwise. Same-shape assumption."""
+    """torch.add(x, y) -- binary elementwise."""
     return torch.add(x, y)
 
 
 def _torch_mul(x, y):
-    """torch.mul(x, y) -- binary elementwise. Same-shape assumption."""
+    """torch.mul(x, y) -- binary elementwise."""
     return torch.mul(x, y)
 
 
 def _torch_pow(x):
-    """torch.pow(x, 2.0) -- unary elementwise. Exponent assumed to be a
-    fixed scalar (2.0/squaring), since the doc gives no exponent value."""
+    """torch.pow(x, 2.0) -- unary elementwise."""
     return torch.pow(x, 2.0)
 
 
 def _torch_rsqrt(x):
-    """torch.rsqrt(x) -- unary elementwise. rsqrt is undefined for x <= 0,
-    so abs()+eps keeps randomly generated input tensors in-domain."""
+    """torch.rsqrt(x) -- unary elementwise."""
     return torch.rsqrt(torch.abs(x) + 1e-6)
 
 
@@ -200,102 +198,8 @@ def _expand_rows(rows):
 
 # =============================================================================
 # S2 -- Per-core span overflow.
-# Real vocab/embedding shapes that exceed the 256 MiB per-core limit.
 # =============================================================================
 S2_ROWS = [
-    ("residual_add", (130000, 4096), torch.bfloat16, [1, 2, 3]),
-    ("residual_add", (130000, 4096), torch.float16, [1, 2, 3]),
-    ("residual_add", (130000, 4096), torch.float32, [1, 2, 3, 4, 5, 6, 7]),
-    ("rmsnorm_gamma_scale", (120000, 4096), torch.bfloat16, [1, 2, 3]),
-    ("rmsnorm_gamma_scale", (120000, 4096), torch.float16, [1, 2, 3]),
-    ("rmsnorm_gamma_scale", (120000, 4096), torch.float32, [1, 2, 3, 4, 5, 6]),
-    ("residual_add", (135000, 4096), torch.bfloat16, [1, 2, 3]),
-    ("residual_add", (135000, 4096), torch.float16, [1, 2, 3]),
-    ("residual_add", (195000, 2880), torch.bfloat16, [1, 2, 3]),
-    ("residual_add", (195000, 2880), torch.float16, [1, 2, 3]),
-    ("residual_add", (195000, 2880), torch.float32, [1, 2, 3, 4, 5, 6, 7]),
-    ("residual_add", (185000, 2880), torch.bfloat16, [1, 2, 3]),
-    ("residual_add", (185000, 2880), torch.float16, [1, 2, 3]),
-    ("residual_add", (48000, 2880), torch.float32, [1]),
-    ("embedding_scale", (50000, 2880), torch.bfloat16, [1]),
-    ("embedding_scale", (50000, 2880), torch.float16, [1]),
-    ("embedding_scale", (50000, 2880), torch.float32, [1, 2]),
-    ("residual_add", (125000, 5120), torch.bfloat16, [1, 2, 3, 4]),
-    ("residual_add", (125000, 5120), torch.float16, [1, 2, 3, 4]),
-    ("residual_add", (125000, 5120), torch.float32, [1, 2, 3, 5, 6, 8, 9]),
-    ("rmsnorm_gamma_scale", (140000, 5120), torch.bfloat16, [1, 2, 3, 4, 5]),
-    ("rmsnorm_gamma_scale", (140000, 5120), torch.float16, [1, 2, 3, 4, 5]),
-    ("rmsnorm_gamma_scale", (140000, 5120), torch.float32, [1, 2, 4, 5, 7, 8, 10]),
-    ("residual_add", (115000, 5120), torch.bfloat16, [1, 2, 3, 4]),
-    ("residual_add", (115000, 5120), torch.float16, [1, 2, 3, 4]),
-    ("residual_add", (98000, 4096), torch.bfloat16, [1, 2]),
-    ("residual_add", (98000, 4096), torch.float16, [1, 2]),
-    ("residual_add", (98000, 4096), torch.float32, [1, 2, 3, 4, 5]),
-    ("logit_temperature", (105000, 4096), torch.bfloat16, [1, 2, 3]),
-    ("logit_temperature", (105000, 4096), torch.float16, [1, 2, 3]),
-    ("logit_temperature", (105000, 4096), torch.float32, [1, 2, 3, 4, 5, 6]),
-    ("logit_temperature", (92000, 4096), torch.bfloat16, [1, 2]),
-    ("logit_temperature", (92000, 4096), torch.float16, [1, 2]),
-    ("residual_add", (47000, 4096), torch.bfloat16, [1]),
-    ("residual_add", (47000, 4096), torch.float16, [1]),
-    ("residual_add", (47000, 4096), torch.float32, [1, 2]),
-    ("logit_temperature", (52000, 4096), torch.bfloat16, [1]),
-    ("logit_temperature", (52000, 4096), torch.float16, [1]),
-    ("logit_temperature", (52000, 4096), torch.float32, [1, 2, 3]),
-    ("logit_temperature", (45000, 4096), torch.bfloat16, [1]),
-    ("logit_temperature", (45000, 4096), torch.float16, [1]),
-    ("residual_add", (2750, 12, 4096), torch.float32, [1]),
-    ("residual_add", (2800, 16, 4096), torch.bfloat16, [1]),
-    ("residual_add", (2800, 16, 4096), torch.float16, [1]),
-    ("residual_add", (2800, 16, 4096), torch.float32, [1, 2]),
-    ("logit_temperature", (75, 41, 49152), torch.bfloat16, [1]),
-    ("logit_temperature", (75, 41, 49152), torch.float16, [1]),
-    ("logit_temperature", (75, 41, 49152), torch.float32, [1, 2]),
-    ("logit_temperature", (65, 44, 49152), torch.float32, [1]),
-    ("rope_cos_mul", (6144, 32, 12, 128), torch.bfloat16, [1, 2]),
-    ("rope_cos_mul", (6144, 32, 12, 128), torch.float16, [1, 2]),
-    ("rope_cos_mul", (6144, 32, 12, 128), torch.float32, [1, 2, 3, 4]),
-    ("rope_cos_mul", (10000, 32, 12, 128), torch.bfloat16, [1, 2, 3]),
-    ("rope_cos_mul", (10000, 32, 12, 128), torch.float16, [1, 2, 3]),
-    ("rope_cos_mul", (10000, 32, 12, 128), torch.float32, [1, 2, 3, 4, 5, 6]),
-    ("rope_cos_mul", (28000, 32, 12, 128), torch.bfloat16, [1, 2, 3, 5, 6, 8, 9]),
-    ("rope_cos_mul", (28000, 32, 12, 128), torch.float16, [1, 2, 3, 5, 6, 8, 9]),
-    ("rope_cos_mul", (28000, 32, 12, 128), torch.float32, [1, 2, 5, 9, 12, 16, 19]),
-    ("rope_sin_mul", (30000, 32, 16, 128), torch.bfloat16, [1, 2, 4, 6, 9, 11, 13]),
-    ("rope_sin_mul", (30000, 32, 16, 128), torch.float16, [1, 2, 4, 6, 9, 11, 13]),
-    ("rope_sin_mul", (30000, 32, 16, 128), torch.float32, [1, 2, 7, 12, 17, 22, 27]),
-    ("torch_add", (125, 1064, 1024), torch.float32, [1]),
-    ("torch_add", (500, 1064, 1024), torch.bfloat16, [1, 2, 3]),
-    ("torch_add", (500, 1064, 1024), torch.float16, [1, 2, 3]),
-    ("torch_add", (500, 1064, 1024), torch.float32, [1, 2, 3, 4, 5, 6, 7]),
-    ("torch_add", (1000, 1064, 1024), torch.bfloat16, [1, 2, 3, 4, 5, 6, 7]),
-    ("torch_add", (1000, 1064, 1024), torch.float16, [1, 2, 3, 4, 5, 6, 7]),
-    ("torch_add", (1000, 1064, 1024), torch.float32, [1, 2, 5, 7, 10, 12, 15]),
-    ("torch_mul", (250, 1064, 1024), torch.bfloat16, [1]),
-    ("torch_mul", (250, 1064, 1024), torch.float16, [1]),
-    ("torch_mul", (250, 1064, 1024), torch.float32, [1, 2, 3]),
-    ("torch_mul", (750, 1064, 1024), torch.bfloat16, [1, 2, 3, 4, 5]),
-    ("torch_mul", (750, 1064, 1024), torch.float16, [1, 2, 3, 4, 5]),
-    ("torch_mul", (750, 1064, 1024), torch.float32, [1, 2, 4, 6, 7, 9, 11]),
-    ("torch_pow", (300, 1064, 1024), torch.bfloat16, [1, 2]),
-    ("torch_pow", (300, 1064, 1024), torch.float16, [1, 2]),
-    ("torch_pow", (300, 1064, 1024), torch.float32, [1, 2, 3, 4]),
-    ("torch_pow", (800, 1064, 1024), torch.bfloat16, [1, 2, 3, 4, 5, 6]),
-    ("torch_pow", (800, 1064, 1024), torch.float16, [1, 2, 3, 4, 5, 6]),
-    ("torch_pow", (800, 1064, 1024), torch.float32, [1, 2, 4, 6, 8, 10, 12]),
-    ("torch_rsqrt", (400, 1064, 1024), torch.bfloat16, [1, 2, 3]),
-    ("torch_rsqrt", (400, 1064, 1024), torch.float16, [1, 2, 3]),
-    ("torch_rsqrt", (400, 1064, 1024), torch.float32, [1, 2, 3, 4, 5, 6]),
-    ("torch_rsqrt", (600, 1064, 1024), torch.bfloat16, [1, 2, 3, 4]),
-    ("torch_rsqrt", (600, 1064, 1024), torch.float16, [1, 2, 3, 4]),
-    ("torch_rsqrt", (600, 1064, 1024), torch.float32, [1, 2, 3, 5, 6, 8, 9]),
-    ("torch_add", (125, 16, 1064, 64), torch.float32, [1]),
-    ("torch_add", (500, 16, 1064, 64), torch.bfloat16, [1, 2, 3]),
-    ("torch_add", (500, 16, 1064, 64), torch.float16, [1, 2, 3]),
-    ("torch_add", (500, 16, 1064, 64), torch.float32, [1, 2, 3, 4, 5, 6, 7]),
-    ("torch_mul", (250, 16, 1064, 64), torch.bfloat16, [1]),
-    ("torch_mul", (250, 16, 1064, 64), torch.float16, [1]),
-    ("torch_mul", (250, 16, 1064, 64), torch.float32, [1, 2, 3]),
     ("torch_mul", (1000, 16, 1064, 64), torch.bfloat16, [1, 2, 3, 4, 5, 6, 7]),
     ("torch_mul", (1000, 16, 1064, 64), torch.float16, [1, 2, 3, 4, 5, 6, 7]),
     ("torch_mul", (1000, 16, 1064, 64), torch.float32, [1, 2, 5, 7, 10, 12, 15]),
@@ -343,7 +247,6 @@ S2_ROWS = [
         [1, 2, 4, 5, 7],
         "llama3_exact-logit_temperature",
     ),
-    # gpt-oss-20b  (201088, 2880)  bf16/fp16 overflow=[1..4]  fp32=[1..8]
     (
         "residual_add",
         (201088, 2880),
@@ -429,7 +332,6 @@ S2_ROWS = [
         [1, 2, 4, 5, 8, 9],
         "mistral_exact-rmsnorm_gamma_scale",
     ),
-    # granite-4.1-8b  (100352, 4096)  bf16/fp16 overflow=[1,2,3]  fp32=[1..6]
     (
         "residual_add",
         (100352, 4096),
@@ -472,7 +374,6 @@ S2_ROWS = [
         [1, 2, 4, 5, 6],
         "granite41_exact-logit_temperature",
     ),
-    # llama3_big  (256512, 4096) = 2×128256  bf16/fp16=[1..7]  fp32=[1..15]
     (
         "residual_add",
         (256512, 4096),
@@ -515,7 +416,6 @@ S2_ROWS = [
         [1, 2, 3, 6, 9, 14, 15],
         "llama3_big-logit_temperature",
     ),
-    # gptoss20b_big  (402176, 2880) = 2×201088  bf16/fp16=[1..8]  fp32=[1..17]
     (
         "residual_add",
         (402176, 2880),
@@ -558,7 +458,6 @@ S2_ROWS = [
         [1, 2, 3, 7, 11, 16, 17],
         "gptoss20b_big-embedding_scale",
     ),
-    # mistral_big  (262144, 5120) = 2×131072  bf16/fp16=[1..9]  fp32=[1..19]
     (
         "residual_add",
         (262144, 5120),
@@ -601,7 +500,6 @@ S2_ROWS = [
         [1, 2, 3, 8, 13, 18, 19],
         "mistral_big-rmsnorm_gamma_scale",
     ),
-    # granite41_big  (200704, 4096) = 2×100352  bf16/fp16=[1..6]  fp32=[1..12]
     (
         "residual_add",
         (200704, 4096),
@@ -646,7 +544,7 @@ S2_ROWS = [
     ),
 ]
 # ---------------------------------------------------------------------------
-# S2 known-skip sets (keyed on pytest param ID)
+# S2 known-skip sets
 # Bug 2 (issue #3414): dxp_standalone SIGABRT when tiling large broadcast-weight ops (stride/offset value out of range)
 # Bug 3 (issue #3415): work_division proceeds past span limit
 # ---------------------------------------------------------------------------
@@ -775,221 +673,14 @@ _S2_SKIP_WD = {
     "residual_add-2800x16x4096-fp32-cores1",
     "residual_add-32x64x1024x2049-fp16-cores1",
     "residual_add-32x64x1024x2049-fp16-cores2",
-    "residual_add-47000x4096-fp32-cores1",
-    "residual_add-48000x2880-fp32-cores1",
-    "residual_add-98000x4096-bf16-cores1",
-    "residual_add-98000x4096-fp16-cores1",
-    "residual_add-98000x4096-fp32-cores1",
-    "rope_cos_mul-10000x32x12x128-bf16-cores1",
-    "rope_cos_mul-10000x32x12x128-fp16-cores1",
-    "rope_cos_mul-10000x32x12x128-fp32-cores1",
-    "rope_cos_mul-28000x32x12x128-bf16-cores1",
-    "rope_cos_mul-28000x32x12x128-bf16-cores2",
-    "rope_cos_mul-28000x32x12x128-bf16-cores3",
-    "rope_cos_mul-28000x32x12x128-fp16-cores1",
-    "rope_cos_mul-28000x32x12x128-fp16-cores2",
-    "rope_cos_mul-28000x32x12x128-fp16-cores3",
-    "rope_cos_mul-28000x32x12x128-fp32-cores1",
-    "rope_cos_mul-28000x32x12x128-fp32-cores2",
-    "rope_cos_mul-6144x32x12x128-bf16-cores1",
-    "rope_cos_mul-6144x32x12x128-fp16-cores1",
-    "rope_cos_mul-6144x32x12x128-fp32-cores1",
-    "rope_sin_mul-30000x32x16x128-bf16-cores1",
-    "rope_sin_mul-30000x32x16x128-bf16-cores11",
-    "rope_sin_mul-30000x32x16x128-bf16-cores13",
-    "rope_sin_mul-30000x32x16x128-bf16-cores2",
-    "rope_sin_mul-30000x32x16x128-bf16-cores4",
-    "rope_sin_mul-30000x32x16x128-bf16-cores6",
-    "rope_sin_mul-30000x32x16x128-bf16-cores9",
-    "rope_sin_mul-30000x32x16x128-fp16-cores1",
-    "rope_sin_mul-30000x32x16x128-fp16-cores11",
-    "rope_sin_mul-30000x32x16x128-fp16-cores13",
-    "rope_sin_mul-30000x32x16x128-fp16-cores2",
-    "rope_sin_mul-30000x32x16x128-fp16-cores4",
-    "rope_sin_mul-30000x32x16x128-fp16-cores6",
-    "rope_sin_mul-30000x32x16x128-fp16-cores9",
-    "rope_sin_mul-30000x32x16x128-fp32-cores1",
-    "rope_sin_mul-30000x32x16x128-fp32-cores12",
-    "rope_sin_mul-30000x32x16x128-fp32-cores17",
-    "rope_sin_mul-30000x32x16x128-fp32-cores2",
-    "rope_sin_mul-30000x32x16x128-fp32-cores22",
-    "rope_sin_mul-30000x32x16x128-fp32-cores27",
-    "rope_sin_mul-30000x32x16x128-fp32-cores7",
-    "torch_add-1000x1064x1024-bf16-cores1",
-    "torch_add-1000x1064x1024-bf16-cores2",
-    "torch_add-1000x1064x1024-bf16-cores3",
-    "torch_add-1000x1064x1024-bf16-cores4",
-    "torch_add-1000x1064x1024-bf16-cores5",
-    "torch_add-1000x1064x1024-bf16-cores6",
-    "torch_add-1000x1064x1024-fp16-cores1",
-    "torch_add-1000x1064x1024-fp16-cores2",
-    "torch_add-1000x1064x1024-fp16-cores3",
-    "torch_add-1000x1064x1024-fp16-cores4",
-    "torch_add-1000x1064x1024-fp16-cores5",
-    "torch_add-1000x1064x1024-fp16-cores6",
-    "torch_add-1000x1064x1024-fp32-cores1",
-    "torch_add-1000x1064x1024-fp32-cores2",
-    "torch_add-1000x1064x1024-fp32-cores5",
-    "torch_add-125x1064x1024-fp32-cores1",
-    "torch_add-125x16x1064x64-fp32-cores1",
-    "torch_add-500x1064x1024-bf16-cores1",
-    "torch_add-500x1064x1024-fp16-cores1",
-    "torch_add-500x1064x1024-fp32-cores1",
-    "torch_add-500x1064x1024-fp32-cores2",
-    "torch_add-500x1064x1024-fp32-cores3",
-    "torch_add-500x1064x1024-fp32-cores4",
-    "torch_add-500x1064x1024-fp32-cores5",
-    "torch_add-500x1064x1024-fp32-cores6",
-    "torch_add-500x16x1064x64-bf16-cores1",
-    "torch_add-500x16x1064x64-fp16-cores1",
-    "torch_add-500x16x1064x64-fp32-cores1",
-    "torch_add-500x16x1064x64-fp32-cores2",
-    "torch_add-500x16x1064x64-fp32-cores3",
-    "torch_mul-1000x16x1064x64-bf16-cores1",
-    "torch_mul-1000x16x1064x64-bf16-cores2",
-    "torch_mul-1000x16x1064x64-bf16-cores3",
-    "torch_mul-1000x16x1064x64-fp32-cores1",
-    "torch_mul-1000x16x1064x64-fp32-cores10",
-    "torch_mul-1000x16x1064x64-fp32-cores12",
-    "torch_mul-1000x16x1064x64-fp32-cores15",
-    "torch_mul-1000x16x1064x64-fp32-cores2",
-    "torch_mul-1000x16x1064x64-fp32-cores5",
-    "torch_mul-1000x16x1064x64-fp32-cores7",
-    "torch_mul-250x1064x1024-bf16-cores1",
-    "torch_mul-250x1064x1024-fp16-cores1",
-    "torch_mul-250x1064x1024-fp32-cores1",
-    "torch_mul-250x16x1064x64-bf16-cores1",
-    "torch_mul-250x16x1064x64-fp16-cores1",
-    "torch_mul-250x16x1064x64-fp32-cores1",
-    "torch_mul-750x1064x1024-bf16-cores1",
-    "torch_mul-750x1064x1024-fp32-cores1",
-    "torch_mul-750x1064x1024-fp32-cores2",
-    "torch_mul-750x1064x1024-fp32-cores4",
-    "torch_mul-750x1064x1024-fp32-cores6",
-    "torch_pow-300x1064x1024-bf16-cores1",
-    "torch_pow-300x1064x1024-fp16-cores1",
-    "torch_pow-300x1064x1024-fp32-cores1",
-    "torch_pow-800x1064x1024-bf16-cores1",
-    "torch_pow-800x1064x1024-fp32-cores1",
-    "torch_pow-800x1064x1024-fp32-cores2",
-    "torch_pow-800x1064x1024-fp32-cores4",
-    "torch_pow-800x1064x1024-fp32-cores6",
-    "torch_rsqrt-400x1064x1024-bf16-cores1",
-    "torch_rsqrt-400x1064x1024-fp16-cores1",
-    "torch_rsqrt-400x1064x1024-fp32-cores1",
-    "torch_rsqrt-400x1064x1024-fp32-cores2",
-    "torch_rsqrt-400x1064x1024-fp32-cores3",
-    "torch_rsqrt-400x1064x1024-fp32-cores4",
-    "torch_rsqrt-400x1064x1024-fp32-cores5",
-    "torch_rsqrt-400x1064x1024-fp32-cores6",
-    "torch_rsqrt-600x1064x1024-bf16-cores1",
-    "torch_rsqrt-600x1064x1024-fp16-cores1",
-    "torch_rsqrt-600x1064x1024-fp32-cores1",
-    "torch_rsqrt-600x1064x1024-fp32-cores2",
-    "torch_rsqrt-600x1064x1024-fp32-cores3",
-    "torch_rsqrt-600x1064x1024-fp32-cores5",
-    "torch_rsqrt-600x1064x1024-fp32-cores6",
-    "torch_rsqrt-600x1064x1024-fp32-cores8",
-    "torch_rsqrt-600x1064x1024-fp32-cores9",
 }
-
-# ---------------------------------------------------------------------------
-# S6 known-skip sets (keyed on pytest param ID)
-# Bug 2 (issue #3414): dxp_standalone SIGABRT when tiling large broadcast-weight ops (stride/offset value out of range)
-# Bug 3 (issue #3415): work_division proceeds past span limit
-# ---------------------------------------------------------------------------
-_S6_SKIP_L3 = {
-    "rmsnorm_gamma_scale-2000x14x5120-fp32-cores1",
-    "rmsnorm_gamma_scale-2000x14x5120-fp32-cores2",
-}
-_S6_SKIP_WD = {
-    "rmsnorm_gamma_scale-1900x14x5120-fp32-cores1",
-    "sdpa_scale_standalone-900x32x64x128-fp32-cores1",
-    "sdpa_scale_standalone-1200x32x64x128-bf16-cores1",
-    "sdpa_scale_standalone-1200x32x64x128-fp16-cores1",
-    "sdpa_scale_standalone-1200x32x64x128-fp32-cores1",
-    "sdpa_scale_standalone-5500x32x64x128-bf16-cores1",
-    "sdpa_scale_standalone-5500x32x64x128-bf16-cores2",
-    "sdpa_scale_standalone-5500x32x64x128-fp32-cores1",
-    "sdpa_scale_standalone-5500x32x64x128-fp32-cores2",
-    "sdpa_scale_standalone-7000x32x64x128-bf16-cores1",
-    "sdpa_scale_standalone-7000x32x64x128-bf16-cores2",
-    "sdpa_scale_standalone-7000x32x64x128-fp32-cores1",
-    "sdpa_scale_standalone-7000x32x64x128-fp32-cores2",
-    "torch_neg-250x16x1064x32-fp32-cores1",
-    "torch_neg-1000x16x1064x32-bf16-cores1",
-    "torch_neg-1000x16x1064x32-bf16-cores2",
-    "torch_neg-1000x16x1064x32-bf16-cores3",
-    "torch_neg-1000x16x1064x32-fp16-cores1",
-    "torch_neg-1000x16x1064x32-fp16-cores2",
-    "torch_neg-1000x16x1064x32-fp16-cores3",
-    "torch_neg-1000x16x1064x32-fp32-cores1",
-    "torch_neg-1000x16x1064x32-fp32-cores2",
-    "torch_neg-1000x16x1064x32-fp32-cores3",
-}
-
-# =============================================================================
-# S6 -- Plan structural correctness (prime or has very few factors).
-# =============================================================================
-S6_ROWS = [
-    ("rmsnorm_gamma_scale", (1900, 14, 5120), torch.float32, [1]),
-    ("rmsnorm_gamma_scale", (2000, 14, 5120), torch.bfloat16, [1]),
-    ("rmsnorm_gamma_scale", (2000, 14, 5120), torch.float16, [1]),
-    ("rmsnorm_gamma_scale", (2000, 14, 5120), torch.float32, [1, 2]),
-    ("sdpa_scale_standalone", (900, 32, 64, 128), torch.bfloat16, [1]),
-    ("sdpa_scale_standalone", (900, 32, 64, 128), torch.float16, [1]),
-    ("sdpa_scale_standalone", (900, 32, 64, 128), torch.float32, [1, 2, 3]),
-    ("sdpa_scale_standalone", (1200, 32, 64, 128), torch.bfloat16, [1, 2]),
-    ("sdpa_scale_standalone", (1200, 32, 64, 128), torch.float16, [1, 2]),
-    ("sdpa_scale_standalone", (1200, 32, 64, 128), torch.float32, [1, 2, 3, 4]),
-    (
-        "sdpa_scale_standalone",
-        (5500, 32, 64, 128),
-        torch.bfloat16,
-        [1, 2, 4, 5, 7, 8, 10],
-    ),
-    (
-        "sdpa_scale_standalone",
-        (5500, 32, 64, 128),
-        torch.float16,
-        [1, 2, 4, 5, 7, 8, 10],
-    ),
-    (
-        "sdpa_scale_standalone",
-        (5500, 32, 64, 128),
-        torch.float32,
-        [1, 2, 6, 9, 13, 16, 20],
-    ),
-    (
-        "sdpa_scale_standalone",
-        (7000, 32, 64, 128),
-        torch.bfloat16,
-        [1, 2, 4, 6, 9, 11, 13],
-    ),
-    (
-        "sdpa_scale_standalone",
-        (7000, 32, 64, 128),
-        torch.float16,
-        [1, 2, 4, 6, 9, 11, 13],
-    ),
-    (
-        "sdpa_scale_standalone",
-        (7000, 32, 64, 128),
-        torch.float32,
-        [1, 2, 7, 12, 16, 21, 26],
-    ),
-    ("torch_neg", (250, 16, 1064, 32), torch.float32, [1]),
-    ("torch_neg", (1000, 16, 1064, 32), torch.bfloat16, [1, 2, 3]),
-    ("torch_neg", (1000, 16, 1064, 32), torch.float16, [1, 2, 3]),
-    ("torch_neg", (1000, 16, 1064, 32), torch.float32, [1, 2, 3, 4, 5, 6, 7]),
-]
 
 
 # =============================================================================
 # TEST CLASS
 # =============================================================================
 class TestOps:
-    """S2, S6 span-overflow correctness tests."""
+    """S2 span-overflow correctness tests."""
 
     def setup_method(self):
         torch.manual_seed(0xAFFE)
@@ -1038,9 +729,6 @@ class TestOps:
         else:
             self.compare_with_cpu(fn, x, atol=atol, rtol=rtol, target=spyre_out.cpu())
 
-    # -------------------------------------------------------------------------
-    # S2 - per-core span overflow.
-    # -------------------------------------------------------------------------
     @pytest.mark.parametrize("op_key, shape, dtype, cores", _expand_rows(S2_ROWS))
     def test_S2_trigger_a_vocab_width_op(self, op_key, shape, dtype, cores, request):
         test_id = request.node.callspec.id
@@ -1050,25 +738,6 @@ class TestOps:
                 "(stride/offset value out of range) (issue #3414)"
             )
         if test_id in _S2_SKIP_WD:
-            pytest.skip(
-                "work_division proceeds past span limit; wrong result or NaN "
-                "(issue #3415)"
-            )
-        fn, a, b = _build_inputs(op_key, shape, dtype)
-        self.run_span_overflow_test(fn, a, b, cores)
-
-    # -------------------------------------------------------------------------
-    # S6 -- Plan structural correctness.
-    # -------------------------------------------------------------------------
-    @pytest.mark.parametrize("op_key, shape, dtype, cores", _expand_rows(S6_ROWS))
-    def test_S6_swiglu_plan_check(self, op_key, shape, dtype, cores, request):
-        test_id = request.node.callspec.id
-        if test_id in _S6_SKIP_L3:
-            pytest.skip(
-                "dxp_standalone SIGABRT when tiling large broadcast-weight ops "
-                "(stride/offset value out of range) (issue #3414)"
-            )
-        if test_id in _S6_SKIP_WD:
             pytest.skip(
                 "work_division proceeds past span limit; wrong result or NaN "
                 "(issue #3415)"
