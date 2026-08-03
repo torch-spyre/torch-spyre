@@ -1,0 +1,84 @@
+name: Build PyTorch from source
+description: |
+  Installs PyTorch from a pre-cloned source tree, for the
+  repository_dispatch pipeline that builds torch-spyre against an exact
+  upstream PyTorch commit instead of the pinned CPU wheel.
+
+  Assumes `pytorch_dir` is a sibling of `torch_spyre_dir`, and installs into
+  torch-spyre's own venv (`torch_spyre_dir/.venv`) rather than a separate
+  shared one, so the subsequent build-torch-spyre-local-pytorch step picks
+  up the same environment.
+
+inputs:
+  torch_spyre_dir:
+    description: Path to the checked-out torch-spyre directory (its .venv is created/reused for this build)
+    required: false
+    type: string
+    default: torch-spyre
+  pytorch_dir:
+    description: Path to the pre-cloned pytorch directory (sibling of torch_spyre_dir)
+    required: false
+    type: string
+    default: pytorch
+
+runs:
+  using: composite
+  steps:
+    - name: Build and install PyTorch (from source)
+      shell: bash
+      env:
+        TORCH_SPYRE_DIR: ${{ inputs.torch_spyre_dir }}
+        PYTORCH_DIR: ${{ inputs.pytorch_dir }}
+      run: |
+        source "$HOME/.bashrc"
+        source /etc/profile.d/ibm-aiu-setup.sh
+
+        [[ "$TORCH_SPYRE_DIR" != /* ]] && TORCH_SPYRE_DIR="${PWD}/${TORCH_SPYRE_DIR}"
+        [[ "$PYTORCH_DIR" != /* ]] && PYTORCH_DIR="${PWD}/${PYTORCH_DIR}"
+        echo "TORCH_SPYRE_DIR $TORCH_SPYRE_DIR"
+        echo "PYTORCH_DIR $PYTORCH_DIR"
+
+        VENV_DIR="${TORCH_SPYRE_DIR}/.venv"
+        if [[ ! -d "$VENV_DIR" ]]; then
+          uv venv "$VENV_DIR"
+        fi
+        source "${VENV_DIR}/bin/activate"
+
+        # Base build deps, as per torch-spyre-docs.
+        uv pip install nanobind ninja pybind11 build "cmake~=3.26" regex wheel
+
+        echo "========================================"
+        echo "========== PyTorch"
+        echo "========================================"
+
+        cd "$PYTORCH_DIR"
+
+        CMAKE_CACHE="${PYTORCH_DIR}/build/CMakeCache.txt"
+        if [ -f "$CMAKE_CACHE" ]; then
+          echo "Existing build/ directory found, removing for a clean CI build"
+          rm -rf build
+        fi
+
+        uv pip install --group dev
+        uv pip install setuptools mkl-static mkl-include
+
+        # --no-build-isolation means uv won't auto-install the build
+        # backend -- whatever this checkout's [build-system].requires
+        # declares must already be in the venv. That list has changed over
+        # time (e.g. a switch from classic setuptools to scikit-build-core),
+        # so read it from the checkout's own pyproject.toml instead of
+        # hardcoding a list that will go stale the next time it changes.
+        python3 -c '
+        import tomllib
+        with open("pyproject.toml", "rb") as f:
+            data = tomllib.load(f)
+        print("\n".join(data["build-system"]["requires"]))
+        ' | xargs -r uv pip install
+
+        # The CFLAGS/CXXFLAGS avoid a known regression in gcc 12
+        # (see https://github.com/pytorch/pytorch/issues/77939).
+        CMAKE_PREFIX_PATH="${VENV_DIR}" \
+        USE_CUDA=0 \
+        CFLAGS=" -Wno-error=maybe-uninitialized -Wno-error=uninitialized -Wno-error=restrict" \
+        CXXFLAGS=" -Wno-error=maybe-uninitialized -Wno-error=uninitialized -Wno-error=restrict" \
+        uv pip install --no-build-isolation -v .

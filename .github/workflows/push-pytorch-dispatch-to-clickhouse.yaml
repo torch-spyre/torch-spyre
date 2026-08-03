@@ -1,9 +1,14 @@
 name: push-pytorch-dispatch-to-clickhouse
 
 # Entry point for repository_dispatch events sent by pytorch/pytorch's CI
-# relay (Cross-Repository CI Relay, aka CRCR). Classifies the dispatch
-# (PR opened / new commit to existing PR / closed / merged ) and records it
-# in ClickHouse. Does not trigger any build or test pipeline.
+# relay (Cross-Repository CI Relay, aka CRCR).
+#
+# - ingest: classifies the dispatch (PR opened / new commit / closed /
+#   merged) and records it in ClickHouse.
+# - gate_and_build / build_and_test: independently gates on "merged PR
+#   targeting main", extracts the merge commit SHA, and kicks off the
+#   build-from-source + upstream test pipeline in
+#   build_test_pytorch_source.yaml.
 run-name: >-
   PyTorch CRCR CI Trigger -
   ${{
@@ -27,6 +32,9 @@ concurrency:
 
 permissions:
   contents: read
+  # Needed for OIDC when doing CRCR HUD reporting
+  # logic in build_test_pytorch_source.yaml is commented for now.
+  # id-token: write
 
 jobs:
   ingest:
@@ -91,3 +99,129 @@ jobs:
             echo "| Event type | ${{ github.event.action }} |"
             echo "| Run ID        | ${{ github.run_id }} |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  gate_and_build:
+    name: Gate on merged PR to main, extract build SHA
+    runs-on: ubuntu-latest
+    outputs:
+      pytorch_sha: ${{ steps.extract.outputs.pytorch_sha }}
+      should_build: ${{ steps.extract.outputs.should_build }}
+
+    env:
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
+      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER_DEV }}
+      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS_DEV }}
+      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB_DEV }}
+
+    steps:
+      - name: Checkout pyproject.toml
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          sparse-checkout: |
+            pyproject.toml
+          sparse-checkout-cone-mode: false
+
+      - name: Extract build parameters from payload
+        id: extract
+        env:
+          PAYLOAD_JSON: ${{ toJSON(github.event.client_payload) }}
+          EVENT_TYPE: ${{ github.event.client_payload.event_type }}
+        run: |
+          set -euo pipefail
+
+          # torch-spyre's pinned PyTorch minor version (e.g. "2.13" from
+          # "torch~=2.13.0" in pyproject.toml) maps 1:1 onto the
+          # pytorch/pytorch release branch this repo currently tracks
+          # (e.g. "release/2.13"). Recomputed on every dispatch so this
+          # keeps following whichever release branch pyproject.toml is
+          # pinned to, without needing to touch this workflow on bump.
+          PINNED_MINOR=$(grep -v '^#' pyproject.toml | grep -oE 'torch~=[0-9]+\.[0-9]+' | head -1 | grep -oE '[0-9]+\.[0-9]+')
+          if [ -z "${PINNED_MINOR}" ]; then
+            echo "::error::Could not determine pinned PyTorch version from pyproject.toml"
+            exit 1
+          fi
+          RELEASE_BRANCH="release/${PINNED_MINOR}"
+          echo "Tracking base refs: main, ${RELEASE_BRANCH}"
+
+          # ---- Filter: only merged PRs targeting main or the tracked release branch ----
+          if [ "${EVENT_TYPE}" = "pull_request" ]; then
+            ACTION=$(echo "$PAYLOAD_JSON" | jq -r '.payload.action // empty')
+            BASE_REF=$(echo "$PAYLOAD_JSON" | jq -r '.payload.pull_request.base.ref // empty')
+            if [ "${ACTION}" != "closed" ]; then
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "${BASE_REF}" != "main" ] && [ "${BASE_REF}" != "${RELEASE_BRANCH}" ]; then
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # .pull_request.merged is unreliable on repository_dispatch
+            # payloads, so gate on the "Merged" label instead.
+            HAS_MERGED=$(echo "$PAYLOAD_JSON" | jq -r '.payload.pull_request.labels // [] | map(.name) | index("Merged") // ""')
+            if [ -z "${HAS_MERGED}" ]; then
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # .pull_request.merge_commit_sha is *also* unreliable on
+            # repository_dispatch payloads (same class of issue as
+            # `.merged` above) — pytorch/pytorch's own CI relay has been
+            # observed forwarding it stale or empty. Rather than trust it,
+            # resolve the target branch's actual current HEAD directly
+            # against pytorch/pytorch
+            SHA=$(git ls-remote https://github.com/pytorch/pytorch.git "refs/heads/${BASE_REF}" | cut -f1)
+            if [ -z "${SHA}" ]; then
+              echo "::error::Could not resolve HEAD of pytorch/pytorch@${BASE_REF}"
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Resolved pytorch/pytorch@${BASE_REF} -> ${SHA}"
+            echo "pytorch_sha=${SHA}" >> "$GITHUB_OUTPUT"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          elif [ "${EVENT_TYPE}" = "push" ]; then
+            # Not wired up yet — push dispatches are ignored for now.
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Unknown event_type: ${EVENT_TYPE}"
+            exit 1
+          fi
+
+      - name: Checkout ingest script
+        if: steps.extract.outputs.should_build == 'false'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          sparse-checkout: |
+            .github/scripts/ingest_pytorch_dispatch.py
+
+      - name: Write dispatch payload to file
+        if: steps.extract.outputs.should_build == 'false'
+        env:
+          PAYLOAD_JSON: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          printf '%s' "$PAYLOAD_JSON" > payload.json
+
+      - name: Install uv
+        if: steps.extract.outputs.should_build == 'false'
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+      - name: Record gate rejection in ClickHouse
+        if: steps.extract.outputs.should_build == 'false'
+        run: |
+          uv run --with clickhouse-connect --with regex \
+            .github/scripts/ingest_pytorch_dispatch.py \
+            --payload-file payload.json \
+            --event-type "${{ github.event.action }}" \
+            --run-id   "${{ github.run_id }}" \
+            --run-link "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --job-name build_and_test \
+            --stage rejected \
+            --progress rejected
+
+  build_and_test:
+    needs: gate_and_build
+    if: ${{ needs.gate_and_build.outputs.should_build == 'true' }}
+    uses: ./.github/workflows/build_test_pytorch_source.yaml
+    secrets: inherit
+    with:
+      pytorch_sha: ${{ needs.gate_and_build.outputs.pytorch_sha }}
