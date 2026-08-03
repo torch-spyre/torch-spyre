@@ -37,7 +37,7 @@ from .errors import Unsupported
 from . import config
 from . import customops  # noqa: F401
 from . import spyre_hint
-from torch_spyre._C import DataFormats, get_device_dtype
+from torch_spyre._C import DataFormats, get_device_dtype, get_elem_in_stick
 import torch_spyre._inductor.customops  # noqa: F401
 
 
@@ -707,9 +707,18 @@ def _is_direct_conv_supported(
       for regular conv2d, so pad>0 stays on the im2col+matmul path (which pads
       correctly);
     - dilated conv: the windowed-input SDSC fields reuse the avgpool builder,
-      which assumes dilation==1, so d>1 stays on the im2col+matmul path.
+      which assumes dilation==1, so d>1 stays on the im2col+matmul path;
+    - C_in not stick-aligned: Spyre stores C as the innermost (stick) dim, and
+      the conv SDSC contracts over C_in with no partial-stick handling. A C_in
+      that is not a whole multiple of the fp16 stick width (get_elem_in_stick,
+      = 64) would need contraction-dim padding the direct path does not emit
+      (known-broken), so it stays on the im2col+matmul path.  This also makes
+      C_in == kH / kW impossible (kernels are small), which keeps the size-based
+      reduction-group label matching in codegen unambiguous.
     """
     kH, kW = weight.shape[-2], weight.shape[-1]
+    C_in = input.shape[1]
+    eps = get_elem_in_stick(torch.float16)
     return (
         not transposed
         and all(op == 0 for op in output_padding)
@@ -719,6 +728,11 @@ def _is_direct_conv_supported(
         and input.dim() == 4
         and input.dtype == torch.float16
         and not (kH == 1 and kW == 1)
+        # isinstance guard: a dynamic-shape C_in (SymInt) is not statically known
+        # to be stick-aligned, so fall back to the decomposition rather than
+        # branching on a symbolic divisibility (which would add a shape guard).
+        and isinstance(C_in, int)
+        and C_in % eps == 0
     )
 
 

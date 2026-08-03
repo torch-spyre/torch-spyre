@@ -891,6 +891,18 @@ def lower_convolution(
         # Nx1 kernel keeps one window dim and direct-lowers fine (a 1-D conv;
         # verified by the test_conv2d_direct k1x3 / k3x1 cases).
         raise Unsupported("conv2d direct lowering: 1x1 kernel (use decomposition)")
+    C_in_size = x.get_size()[1]
+    eps = get_elem_in_stick(x.get_dtype())
+    if not (isinstance(C_in_size, (int, sympy.Integer)) and int(C_in_size) % eps == 0):
+        # Spyre sticks C as the innermost dim and the conv SDSC contracts over
+        # C_in with no partial-stick handling, so a C_in that is not a whole
+        # multiple of the fp16 stick width (get_elem_in_stick == 64) would need
+        # contraction-dim padding this path does not emit. Mirrors the
+        # stick-alignment guard in _is_direct_conv_supported.
+        raise Unsupported(
+            f"conv2d direct lowering: C_in={C_in_size} not a multiple of the "
+            f"stick width {eps} (use decomposition)"
+        )
 
     x.realize()
     weight.realize()

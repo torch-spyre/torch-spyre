@@ -6660,6 +6660,36 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 run_eager=False,
             )
 
+    def test_conv2d_direct_cin_stick_alignment(self):
+        # Pure-Python guard check (no compile/hardware): the direct-lowering
+        # support predicate must reject a C_in that is not a whole multiple of
+        # the fp16 stick width and accept a stick-aligned one. This is what
+        # keeps a non-stick-aligned conv on the im2col+matmul decomposition
+        # (the direct SDSC contracts over C_in with no partial-stick handling).
+        from torch_spyre._inductor.decompositions import _is_direct_conv_supported
+        from torch_spyre._C import get_elem_in_stick
+
+        eps = get_elem_in_stick(torch.float16)  # 64 at fp16
+        common = dict(
+            transposed=False,
+            output_padding=[0, 0],
+            padding=[0, 0],
+            dilation=[1, 1],
+            groups=1,
+        )
+
+        def _supported(c_in):
+            x = torch.zeros(1, c_in, 8, 8, dtype=torch.float16)
+            w = torch.zeros(eps, c_in, 3, 3, dtype=torch.float16)
+            return _is_direct_conv_supported(x, w, **common)
+
+        self.assertTrue(_supported(eps), f"C_in={eps} should direct-lower")
+        self.assertTrue(_supported(2 * eps), f"C_in={2 * eps} should direct-lower")
+        self.assertFalse(
+            _supported(eps // 2), f"C_in={eps // 2} must fall back (not stick-aligned)"
+        )
+        self.assertFalse(_supported(3), "C_in=3 must fall back (not stick-aligned)")
+
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_index_copy_cpu(self):
         """Test torch.index_copy operation on Spyre matches CPU in eager mode.
