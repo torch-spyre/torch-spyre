@@ -311,13 +311,17 @@ TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
         cached_randn(shape, dtype=src),
         dst,
     )
-    for src, dst in [(torch.float16, torch.float32)]
+    for src in [torch.float16, torch.float32]
+    for dst in [torch.float16, torch.float32]
+    if src != dst
     for shape in TO_DTYPE_OP_SHAPES
 }
 
 TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
     f"{_dtype_name(src)}_to_{_dtype_name(dst)}_{shapes2key((shape,))}"
-    for src, dst in [(torch.float16, torch.float32)]
+    for src in [torch.float16, torch.float32]
+    for dst in [torch.float16, torch.float32]
+    if src != dst
     for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
 ]
 
@@ -647,6 +651,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((67, 256),) * 2,
                     ((67, 71, 256),) * 2,
                     ((7, 12, 32, 64),) * 2,
+                    # broadcasting case
+                    ((2880,), (1, 11, 2880)),
                 ]
             ),
         },
@@ -4404,6 +4410,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
+        ("test_round_trip_to_dtype_copy", "test_round_trip_to_dtype_copy_cpu"): {
+            "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
+            "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
+        },
         (
             "test_round_trip_to_dtype_implicit",
             "test_round_trip_to_dtype_implicit_cpu",
@@ -6299,6 +6309,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             fn,
             x,
             dst_dtype,
+            cpu_compile=False,
+            run_eager=False,
+        )
+
+    def test_round_trip_to_dtype_copy_cpu(self, s, dst_dtype):
+        d = torch.zeros_like(s, dtype=dst_dtype)
+
+        def fn(d, s):
+            d.copy_(s)
+            return d.to(s.dtype)
+
+        self.compare_with_cpu(
+            fn,
+            d,
+            s,
             cpu_compile=False,
             run_eager=False,
         )

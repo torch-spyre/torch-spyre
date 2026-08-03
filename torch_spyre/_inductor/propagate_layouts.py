@@ -444,7 +444,7 @@ def _single_arg_op_layout(
     origin_node = next(iter(data.origins))
     aten_op = origin_node.target
     match aten_op:
-        case prims.convert_element_type.default if (
+        case prims.convert_element_type.default | aten.copy.default if (
             output.dtype != torch.bool
             and stl.elems_per_stick() != get_elem_in_stick(output.dtype)
         ):
