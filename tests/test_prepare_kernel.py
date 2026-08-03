@@ -576,7 +576,7 @@ class TestPrepareKernel:
         """Correction sequence: HostCompute=True, H2D=True, Compute=True.
 
         HostCompute carries the barrier to close the WAR hazard on the reused
-        pinned correction buffer (see flex #1306). H2D and Compute inherit the
+        pinned correction buffer (see flex #1479). H2D and Compute inherit the
         safe default True; Compute must also wait for H2D (RAW on the seg-7 region).
         """
         with tempfile.TemporaryDirectory() as tmpdir:
