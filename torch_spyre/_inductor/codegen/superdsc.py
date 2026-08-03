@@ -380,6 +380,14 @@ def _is_static_one(sz) -> bool:
         return False  # symbolic/dynamic dim: never dropped
 
 
+def _try_static_int(sz) -> int | None:
+    """Return sz as a concrete int, or None if it is symbolic/dynamic."""
+    try:
+        return int(sz)
+    except (TypeError, ValueError):
+        return None
+
+
 def _align_pool_dim_labels(node_output_ranges, ndim: int) -> list[str]:
     """Return the pool dim labels aligned to the (possibly squeezed) iteration space.
 
@@ -493,6 +501,23 @@ def _match_labels_by_size(
     kernel taps keep their canonical relative order.  ``dim_label_sizes`` are the
     raw (pre-stick-padding) sizes, which is exactly what the iteration space
     carries, so the comparison is exact.
+
+    Reduction-group invariant (conv). The reduction axes ``[in, ki, kj]`` are
+    the group this reordering actually threatens, and size-matching keeps them
+    correct under two facts:
+      * ``in`` (contraction / C_in) vs the kernel taps ``ki``/``kj``: these must
+        not share a size, or ``in`` could be matched to a window label.  The
+        stick-aligned C_in guard in ``_is_direct_conv_supported`` forces C_in to
+        a multiple of 64 while kernel taps stay small, so the sizes cannot
+        collide.  ``parse_op_spec`` asserts this at the conv call site so any
+        future loosening of that guard fails loudly here rather than silently
+        mislabeling.
+      * ``ki`` vs ``kj`` (square kernel ki==kj): a genuine tie, resolved by
+        canonical order -- win_h precedes win_w in the label list, and the
+        windowed-input SDSC treats the two spatial axes symmetrically, so the
+        assignment is correct either way.
+    Squeezed size-1 taps (1xN / Nx1) never reach here as a window label: their
+    role is dropped upstream by ``_align_conv_dim_labels``.
 
     Returns None (caller falls back to positional) if any size is non-static or
     unmatched, so dynamic-shape ops keep their previous behaviour.
@@ -1072,6 +1097,22 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         role_sizes = _conv2d_role_sizes(
             op_spec.op, op_spec.node_output_ranges, op_spec.node_reduction_ranges
         )
+        # Reduction-group safety (see _match_labels_by_size): size-based matching
+        # can only disambiguate the data-dependent reduction axes (in / ki / kj)
+        # if the contraction dim does not share a size with a kernel tap. The
+        # stick-aligned C_in guard makes that impossible (C_in is a multiple of
+        # 64, taps stay small); assert it so a future loosening of that guard
+        # fails loudly here instead of silently mislabeling 'in' as a window dim.
+        _in = _try_static_int(role_sizes.get("in_channel"))
+        for _krole in ("win_h", "win_w"):
+            _k = _try_static_int(role_sizes.get(_krole))
+            if _in is not None and _k is not None and _k != 1:
+                assert _in != _k, (
+                    f"conv reduction-group size tie: in_channel={_in} == "
+                    f"{_krole}={_k}; size-based label matching cannot separate "
+                    "the contraction dim from a kernel tap (is the C_in "
+                    "stick-alignment guard in _is_direct_conv_supported intact?)"
+                )
         dim_labels = _align_conv_dim_labels(role_sizes, ndim)
         symbol_mapping = _match_labels_by_size(
             op_spec.iteration_space,
