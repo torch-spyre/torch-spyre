@@ -1791,6 +1791,7 @@ def format_operations(operations: list[Operation]) -> str:
     for op in operations:
         buf.write(f"{op.get_operation_name()}: {type(op).__name__}")
         if isinstance(op, ComputedBuffer):
+            buf.write(f"\n  buffer={op.get_name()}")
             buf.write(f"\n  layout={op.layout}")
             if allocation := getattr(op.layout, "allocation", None):
                 buf.write(f"\n  allocation={allocation}")
