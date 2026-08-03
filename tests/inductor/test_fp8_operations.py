@@ -24,7 +24,8 @@ Tests cover:
 import pytest
 import torch
 
-from torch_spyre._inductor.constants import FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
+from torch._inductor.exc import InductorError
+from torch_spyre._inductor.constants import FP8_E4M3FN_MAX, FP8_E4M3FN_MIN, FP8_E4M3_MAX
 from utils_inductor import (
     cached_randn,
     compare_with_pytorch,
@@ -35,8 +36,12 @@ FP8_E4M3_MAX_SPACING = 32.0
 
 
 # Additional test constants
-FP8_E4M3_HALF_MAX = FP8_E4M3_MAX / 2.0  # 224.0 - Half of FP8 E4M3 max for testing reduced quantization ranges
-FP16_SAFE_LARGE_VALUE = 30000.0  # Well below FP16 max (65504) to avoid overflow in edge case tests
+FP8_E4M3_HALF_MAX = (
+    FP8_E4M3_MAX / 2.0
+)  # 224.0 - Half of FP8 E4M3 max for testing reduced quantization ranges
+FP16_SAFE_LARGE_VALUE = (
+    30000.0  # Well below FP16 max (65504) to avoid overflow in edge case tests
+)
 MIXED_SIGNS_SCALE = 100.0  # Scale factor to test moderate value ranges with mixed positive/negative values
 
 
@@ -393,26 +398,24 @@ class TestFP8Operations:
 
         compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=1e-3, rtol=1e-3)
 
-
     def test_quantscalepertokenfp8_zero_input_handling(self):
         """Verify quantscalepertokenfp8 handles zero input without crashing.
-        
+
         Tests that the operation gracefully handles all-zero input tensors,
         which could potentially cause division by zero. The hardware should
         add a small epsilon to prevent this.
         """
         x = cached_randn((2, 4, 8), dtype=torch.float16, scale=1.0) * 0.0
-        
+
         def spyre_fn(x):
             return torch.ops.spyre.quantscalepertokenfp8(x)
-        
+
         def pytorch_fn(x):
             return torch.amax(torch.abs(x), dim=-1, keepdim=True) / FP8_E4M3_MAX
-        
+
         # Compare with relaxed tolerance due to hardware epsilon
         # Note: Hardware adds small epsilon to prevent division by zero
         compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=1e-5, rtol=1e-2)
-
 
     @pytest.mark.parametrize(
         "shape,scale_ub",
@@ -447,9 +450,7 @@ class TestFP8Operations:
             # CPU reference implementation
             scale = torch.amax(torch.abs(x), dim=-1, keepdim=True) / scale_ub
             x_scaled = x / scale
-            x_fp8 = x_scaled.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(
-                torch.float8_e4m3fn
-            )
+            x_fp8 = x_scaled.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
             return x_fp8.to(torch.float16) * scale
 
         # Use tolerance appropriate for FP8 quantization roundtrip
@@ -482,7 +483,10 @@ class TestFP8Operations:
             x = cached_randn(shape, dtype=torch.float16, scale=1.0) * 0.0 + 1e-6
         elif input_type == "large":
             # Near FP16 max (65504), but within safe range
-            x = cached_randn(shape, dtype=torch.float16, scale=1.0) * 0.0 + FP16_SAFE_LARGE_VALUE
+            x = (
+                cached_randn(shape, dtype=torch.float16, scale=1.0) * 0.0
+                + FP16_SAFE_LARGE_VALUE
+            )
         elif input_type == "mixed_signs":
             x = cached_randn(shape, dtype=torch.float16, scale=1.0) * MIXED_SIGNS_SCALE
         elif input_type == "large_hidden":
@@ -507,7 +511,37 @@ class TestFP8Operations:
 
         compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=atol, rtol=rtol)
 
+    @pytest.mark.parametrize(
+        "scale_ub,should_fail",
+        [
+            (0.0, True),  # Zero should fail
+            (-1.0, True),  # Negative should fail
+            (448.0, False),  # Valid default
+            (224.0, False),  # Valid half range
+        ],
+    )
+    def test_quantscalepertokenfp8_scale_ub_validation(self, scale_ub, should_fail):
+        """Test that invalid scale_ub values raise appropriate errors.
 
+        Validates:
+        - scale_ub=0.0 raises ValueError
+        - scale_ub<0 raises ValueError
+        - Valid positive values work correctly
+        """
+        x = cached_randn((2, 4, 8), dtype=torch.float16, scale=1.0).to("spyre")
+
+        @torch.compile
+        def spyre_fn(x):
+            return torch.ops.spyre.quantscalepertokenfp8(x, scale_ub=scale_ub)
+
+        if should_fail:
+            with pytest.raises(InductorError, match="scale_ub must be positive"):
+                spyre_fn(x)
+        else:
+            # Should execute without error
+            result = spyre_fn(x)
+            verify_fp16_dtype(result)
+            assert result.shape == (2, 4, 1)
 
 
 # Test utilities for FP8 operations

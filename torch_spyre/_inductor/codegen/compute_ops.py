@@ -231,7 +231,8 @@ def generate_constant_info(
     constant_info: dict[str, Any] = {}
     for name, value in constants.items():
         # For raw constants (integer values that should not be FP16-encoded).
-        # Example: clipMin in quantscalepertokenfp8 represents the hidden dimension size used for clipping.
+        # Example: clipMin in quantscalepertokenfp8 is a DDL template constant (value: 4096)
+        # that must be passed as a raw integer, not FP16-encoded.
         if name in constants_raw:
             try:
                 encoded_value = int(value)
