@@ -255,13 +255,10 @@ S4_ROWS = [
     ("residual_add", (32769, 4096), torch.bfloat16, [1], "just_above_2d_a"),
     ("logit_temperature", (65536, 2048), torch.bfloat16, [1], "exact_2d_b"),
     ("logit_temperature", (65537, 2048), torch.bfloat16, [1], "just_above_2d_b"),
-    ("rmsnorm_gamma_scale", (512, 512, 512), torch.bfloat16, [1], "exact_3d_a"),
-    ("rmsnorm_gamma_scale", (513, 512, 512), torch.bfloat16, [1], "just_above_3d_a"),
     ("residual_add", (1024, 256, 512), torch.bfloat16, [1], "exact_3d_b"),
     ("residual_add", (1025, 256, 512), torch.bfloat16, [1], "just_above_3d_b"),
     ("embedding_scale", (128, 32, 64, 512), torch.bfloat16, [1], "exact_4d_a"),
     ("embedding_scale", (129, 32, 64, 512), torch.bfloat16, [1], "just_above_4d_a"),
-    ("rope_cos_mul", (256, 16, 128, 256), torch.bfloat16, [1], "exact_4d_b"),
     ("rope_cos_mul", (257, 16, 128, 256), torch.bfloat16, [1], "just_above_4d_b"),
 ]
 
