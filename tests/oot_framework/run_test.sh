@@ -2534,10 +2534,12 @@ for i in "${!RUN_FILES[@]}"; do
             fi
         done
 
+        # `|| _probe_exit=$?` is required: exit 5 (nothing collected) is the
+        # expected signal here, and under `set -e` a bare subshell would abort
+        # the whole run before the exit code could be inspected.
         _probe_exit=0
         (cd "$run_dir" && python3 -m pytest "$run_basename" \
-            "${_PROBE_ARGS[@]}" --collect-only -q 2>/dev/null)
-        _probe_exit=$?
+            "${_PROBE_ARGS[@]}" --collect-only -q 2>/dev/null) || _probe_exit=$?
 
         if [[ $_probe_exit -eq 5 ]]; then
             # 0 tests match this marker in this file — strip -m from args.
