@@ -491,6 +491,8 @@ class TestFP8Operations:
             x = cached_randn(shape, dtype=torch.float16, scale=1.0) * MIXED_SIGNS_SCALE
         elif input_type == "large_hidden":
             x = cached_randn(shape, dtype=torch.float16, scale=1.0)
+        else:
+            raise ValueError(f"Unknown input_type: {input_type}")
 
         def spyre_fn(x):
             return torch.ops.spyre.quantscalepertokenfp8(x)

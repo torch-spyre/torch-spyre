@@ -26,14 +26,14 @@ from typing import Any, Callable, Union
 
 from .constants import (
     AVGPOOL2D_OP,
-    FP8_E4M3_MAX,
-    FP16_MAX_VALUE_ENCODED,
-    QUANTSCALEPERTOKENFP8_CLIP_MIN,
+    BATCH_MATMUL_FP8_OP,
     BATCH_MATMUL_OP,
     CONV2D_FWD_OP,
     COPY_BACK_CANDIDATE_ATTR,
-    BATCH_MATMUL_FP8_OP,
     DEPTHWISE_CONV2D_OP,
+    FP16_MAX_VALUE_ENCODED,
+    FP8_E4M3_MAX,
+    QUANTSCALEPERTOKENFP8_CLIP_MIN,
 )
 from . import config
 import torch_spyre._inductor.customops  # noqa: F401
@@ -1266,11 +1266,6 @@ def _validate_reoffset_supported(layout, offset) -> None:
         return
     if off == 0:
         return
-    if off < 0:
-        raise Unsupported(
-            f"spyre::copy_from_d2d requires non-negative storage_offset, got {off}. "
-            "Negative offsets are not supported."
-        )
     eps = get_elem_in_stick(layout.dtype)
     if off % eps != 0:
         raise Unsupported(
@@ -1888,39 +1883,22 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3_MAX):
         x, axis=[-1], keepdims=True, dtype=x.get_dtype(), override_return_dtype=None
     )
 
-    # Pre-encode constants as raw integers
+    # Compute mulConst as 1/scale_ub (will be FP16-encoded by generate_constant_info)
     mul_const = 1.0 / scale_ub
-
-    try:
-        mul_const_encoded = encode_constant(mul_const, DataFormats.SEN169_FP16)
-    except ValueError as e:
-        # Expected: invalid value for FP16 encoding
-        raise ValueError(
-            f"Cannot encode constant 'mulConst' with value {mul_const} to FP16: {e}"
-        ) from e
-    except Exception as e:
-        # Unexpected error - log and re-raise with context
-        logger.error(
-            "Unexpected error encoding mulConst=%s for quantscalepertokenfp8: %s",
-            mul_const,
-            e,
-        )
-        raise
 
     # clipMin is required by the DeepTools DDL template for quantscalepertokenfp8.
     clip_min_value = QUANTSCALEPERTOKENFP8_CLIP_MIN
 
     op_info = {
         "constants": {
-            "mulConst": mul_const_encoded,
-            "clipMin": clip_min_value,  # 4096: deeptools DLF16 encoded constant
-            "clipMax": FP16_MAX_VALUE_ENCODED,
+            "mulConst": mul_const,  # Float value, will be FP16-encoded by generate_constant_info
+            "clipMin": clip_min_value,  # 4096: DDL template constant (raw integer)
+            "clipMax": FP16_MAX_VALUE_ENCODED,  # 32255: FP16 max value (raw integer)
         },
         "constants_raw": (
-            "mulConst",
             "clipMin",
             "clipMax",
-        ),  # All three are raw integers
+        ),  # Only clipMin and clipMax are raw integers; mulConst will be FP16-encoded
     }
 
     # Use same pattern as exx2 - pass all kwargs including inner_fn

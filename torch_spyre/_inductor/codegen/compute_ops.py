@@ -217,7 +217,7 @@ def generate_constant_info(
         Dictionary of constant information for SDSC JSON
     """
     if len(constants.keys()) == 0:
-        return {}
+        return "{}"
     constants_raw = constants_raw or []
 
     # Validate constants_raw references exist in constants

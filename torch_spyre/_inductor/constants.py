@@ -200,6 +200,9 @@ QUANTSCALEPERTOKENFP8_CLIP_MIN = 4096
 
 
 # Operation name for per-token FP8 quantization scale computation
+# NOTE: quantscalepertokenfp8 is NOT in SPYRE_FP8_OPS because it takes FP16 input
+# and produces FP16 scales (not FP8 data). SPYRE_FP8_OPS contains only ops that
+# produce or consume FP8 tensors.
 QUANTSCALEPERTOKENFP8_OP = "quantscalepertokenfp8"
 
 # Operations that directly handle FP8 dtypes (SEN143_FP8)
