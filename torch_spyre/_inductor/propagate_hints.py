@@ -39,6 +39,12 @@ class DimHint:
     # None when op is broadcast w.r.t. this hint scope
     is_reduction: bool
     hint_id: int = 0  # the _hint_N counter value identifying the scope
+    # Declared per-tile extent from spyre_hint(tile_size_per_dim=...), when the
+    # scope was specified that way.  split_count above is then derived from it
+    # (extent // tile_size).  Carried so downstream passes can use the DECLARED
+    # size rather than re-deriving it -- see _planned_tile_extents_per_level,
+    # whose inner-count recurrence is the only place the two can disagree.
+    tile_size: "int | None" = None
 
 
 # op.dim_hints: list[DimHint]

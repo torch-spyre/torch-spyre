@@ -24,7 +24,6 @@ short final tile.  See docs/wsr-tile-size-api-plan.md.
 import os
 import sys
 
-import pytest
 import torch
 
 from torch._inductor.test_case import TestCase as InductorTestCase
@@ -113,9 +112,38 @@ class TestTileSizeHint(InductorTestCase):
             self._run({"tile_size_per_dim": {"A": 0}})
         self.assertIn("must be positive", str(cm.exception))
 
-    @pytest.mark.skip(
-        reason="P2: nested tile_size levels on distinct dims — needs the declared "
-        "size carried through CoarseTileInfo rather than re-derived"
-    )
     def test_nested_tile_size_levels(self):
-        pass
+        """Nested tile_size scopes on distinct dims: both levels reach codegen.
+
+        This is the P2 path -- declared sizes are used instead of
+        _per_level_extent_for's inner-count recurrence.  A dim tiled at a single
+        level has declared == derived by construction, so nesting is the only
+        place the two can disagree; _planned_tile_extents_per_level asserts if
+        they do.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        nrow, ncol = 1024, 4096
+        a = torch.rand(nrow, ncol, dtype=torch.float16)
+        b = torch.rand(nrow, ncol, dtype=torch.float16)
+        ref = a + b
+
+        _declare_tensor_dim("A", nrow)
+        _declare_tensor_dim("B", ncol)
+        ad, bd = a.to("spyre"), b.to("spyre")
+        for t in (ad, bd):
+            _name_tensor_dims(t, ["A", "B"])
+
+        def fn(x, y):
+            # A: 1024 / 256 = 4 tiles;  B: 4096 / 1024 = 4 tiles
+            with spyre_hint(tile_size_per_dim={"A": 256}):
+                with spyre_hint(tile_size_per_dim={"B": 1024}):
+                    return x + y
+
+        got, srcs = run_and_get_code(torch.compile(fn), ad, bd)
+        torch.testing.assert_close(got.cpu(), ref, equal_nan=True, atol=0.01, rtol=0.1)
+        self.assertEqual(
+            srcs[0].count("LoopSpec("),
+            2,
+            "both nested tile_size levels must survive into codegen",
+        )

@@ -269,8 +269,36 @@ def plan_coarse_tile_groups(
                         f"op {op.get_name()}"
                     )
 
+            # Declared per-tile extents from spyre_hint(tile_size_per_dim=...),
+            # parallel to `levels`, keyed the same way per_level_output is:
+            # output dims by ranges position, reduction dims offset by
+            # len(data.ranges).  Empty where the scope used a trip count instead.
+            hint_tile_size = {
+                h.hint_id: h.tile_size
+                for h in getattr(op, "dim_hints", [])
+                if getattr(h, "tile_size", None)
+            }
+            declared_sizes: list[dict[int, int]] = []
+            if hint_tile_size:
+                n_out = len(op.data.ranges) if hasattr(op.data, "ranges") else 0
+                for hint_id, _count in levels:
+                    sizes: dict[int, int] = {}
+                    ts = hint_tile_size.get(hint_id)
+                    if ts is not None:
+                        opos = hint_id_to_ranges_pos.get(hint_id)
+                        rpos = hint_id_to_reduction_ranges_pos.get(hint_id)
+                        if opos is not None:
+                            sizes[opos] = ts
+                        if rpos is not None:
+                            sizes[n_out + rpos] = ts
+                    declared_sizes.append(sizes)
+
             per_level_extents = _planned_tile_extents_per_level(
-                op, op_tiled_dims, op_tiled_reduction_dims, levels
+                op,
+                op_tiled_dims,
+                op_tiled_reduction_dims,
+                levels,
+                declared_sizes or None,
             )
 
             tiled_dims_per_read = [
@@ -312,6 +340,7 @@ def _planned_tile_extents_per_level(
     op_tiled_dims: list[list[int]],
     op_tiled_reduction_dims: list[list[int]],
     levels: list[tuple],
+    declared_sizes: "list[dict[int, int]] | None" = None,
 ) -> list[dict[int, Expr]]:
     """Per-level (not merged) tile extents, outermost-first.
 
@@ -393,6 +422,32 @@ def _planned_tile_extents_per_level(
         level_extents = _per_level_extent_for(final_extent, op_tiled_reduction_dims, d)
         for level_idx, extent in level_extents.items():
             per_level_output[level_idx][dim_key] = extent
+
+    # Where spyre_hint(tile_size_per_dim=...) DECLARED the per-tile extent, use it
+    # instead of the value _per_level_extent_for just derived.  The two agree by
+    # construction when a dim is tiled at a single level (extent // count ==
+    # tile_size); they can only diverge where a dim is tiled at more than one
+    # level, which is exactly what the inner-count recurrence above computes and
+    # where its squeeze/raw-rank handling has misfired before.  Preferring the
+    # declaration removes that inference; a mismatch means the declaration and
+    # the trip count disagree, which is a bug in the conversion, so assert.
+    if declared_sizes:
+        for level_idx, per_dim in enumerate(declared_sizes):
+            if level_idx >= len(per_level_output):
+                continue
+            for d, size in (per_dim or {}).items():
+                if d not in per_level_output[level_idx]:
+                    continue
+                derived = per_level_output[level_idx][d]
+                if isinstance(derived, (int, sympy.Integer)) and int(derived) != int(
+                    size
+                ):
+                    raise RuntimeError(
+                        f"coarse_tile: op {op.get_name()!r} level {level_idx} dim {d}: "
+                        f"declared tile_size {size} disagrees with derived extent "
+                        f"{derived} -- tile_size/trip-count conversion is inconsistent"
+                    )
+                per_level_output[level_idx][d] = sympy.Integer(int(size))
 
     return per_level_output
 

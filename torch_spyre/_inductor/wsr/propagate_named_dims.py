@@ -729,6 +729,7 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
                     f"{len(dims)} dimensions; only one is currently allowed per "
                     f"spyre_hint() call (not yet implemented)"
                 )
+            declared = hint_dict.get(_TILE_SIZE_KEY) or {}
             for name, count in dims.items():
                 sym = coord_for_name.get(name)
                 dim_hints.append(
@@ -738,6 +739,7 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
                         loop_var=sym,
                         is_reduction=name in reduction_dims,
                         hint_id=hint_id,
+                        tile_size=declared.get(name),
                     )
                 )
         op.dim_hints = dim_hints  # type: ignore[attr-defined]
