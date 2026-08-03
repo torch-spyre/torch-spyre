@@ -853,10 +853,20 @@ def lower_convolution(
     v1 scope: fp16, groups==1, non-transposed, 4D input. Bias (if present) is a
     separate pointwise add, not a fused biasadd computeOp (follow-up).
     """
-    if not config.conv2d_direct_lowering:
-        # Belt-and-suspenders: the decomposition only defers to this lowering
-        # when the flag is on, so we should never reach here otherwise.
-        raise Unsupported("conv2d direct lowering disabled (SPYRE_CONV2D_DIRECT=0)")
+    # Lock-step invariant with the decomposition: conv2d_via_bmm_decomp only
+    # declines (returns NotImplemented, letting aten.convolution survive to this
+    # lowering) when `config.conv2d_direct_lowering and _is_direct_conv_supported`
+    # (see decompositions.py). So reaching here with the flag off means the
+    # decomposition failed to run -- an internal wiring bug, not an unsupported
+    # user op -- so assert rather than raise Unsupported (which would masquerade
+    # as a graceful fallback that can no longer happen post-decomposition). The
+    # guards below mirror _is_direct_conv_supported in IR-node terms (x/weight
+    # expose get_size()/get_dtype(), not the torch.Tensor shape/dtype the
+    # predicate reads), keeping the two in lock-step.
+    assert config.conv2d_direct_lowering, (
+        "lower_convolution reached with conv2d_direct_lowering off; "
+        "conv2d_via_bmm_decomp should have decomposed the op"
+    )
     if transposed:
         raise Unsupported("conv2d direct lowering: transposed convolution")
     if any(op != 0 for op in output_padding):
