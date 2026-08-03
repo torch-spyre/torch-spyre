@@ -30,7 +30,7 @@
 #include "job_plan.h"
 #include "logging.h"
 #include "spyre_allocator.h"
-#include "util/spyrecode.h"
+#include "spyrecode-host-functions/spyrecode.h"
 
 namespace spyre {
 

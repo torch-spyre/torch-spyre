@@ -56,7 +56,11 @@ from .propagate_hints import (
     collect_spyre_hints,
     recover_spyre_hints,
 )
-from .wsr.propagate_named_dims import propagate_named_dims, assign_dim_hints
+from .wsr.propagate_named_dims import (
+    propagate_named_dims,
+    validate_named_dims,
+    assign_dim_hints,
+)
 from .propagate_layouts import (
     propagate_mutation_layouts,
     propagate_spyre_tensor_layouts,
@@ -412,6 +416,7 @@ class CustomPreSchedulingPasses:
             # ranges.  This also dissolves the insert_restickify→hint cross-phase
             # contract (issue #3135).
             propagate_named_dims,
+            validate_named_dims,
             assign_dim_hints,
             _maybe_coarse_tile_hints,
             #

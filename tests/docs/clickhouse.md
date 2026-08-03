@@ -112,6 +112,22 @@ CREATE TABLE IF NOT EXISTS spyre.pr_check_events
 )
 ```
 
+### `spyre.image_promotions`
+
+```sql
+CREATE TABLE spyre.image_promotions
+(
+    ts         DateTime DEFAULT now(),
+    component  String,
+    kind       LowCardinality(String) DEFAULT 'image',
+    id12       String,
+    channel    LowCardinality(String) DEFAULT 'default',
+    ref        String,
+    build_url  String,
+    run_id     String
+)
+```
+
 ### Performance data
 
 ### `spyre.benchmark_runs`

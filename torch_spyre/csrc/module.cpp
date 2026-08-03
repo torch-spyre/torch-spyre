@@ -21,8 +21,8 @@
 #include <pybind11/native_enum.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
-#include <util/sen_data_convert.h>
-#include <util/sendefs.h>
+#include <spyrecode-host-functions/sendataconvert/sen_data_convert.h>
+#include <util/sendefs/sendefs.h>
 
 #include <cstdlib>     // std::getenv
 #include <filesystem>  // NOLINT(build/c++17)
