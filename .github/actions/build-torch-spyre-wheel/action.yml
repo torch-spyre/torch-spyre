@@ -48,7 +48,7 @@ runs:
         # the save step below always gets the chance to publish a refreshed
         # entry. That matters because the ccache also depends on inputs this key
         # does NOT cover — above all the Spyre SDK headers (<flex/...>,
-        # <util/sendefs.h>) that come from the runner image, which 12 of the 19
+        # <util/sendefs/sendefs.h>) that come from the runner image, which 12 of the 19
         # TUs include. When one of those drifts the objects go stale while the
         # key stays identical, and since actions/cache never overwrites an entry
         # whose primary key hit, the stale entry used to be served forever (one
