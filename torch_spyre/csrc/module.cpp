@@ -46,6 +46,7 @@
 #include "prepare_kernel.h"
 #include "spyre_allocator.h"
 #include "spyre_device_enum.h"
+#include "spyre_error.h"
 #include "spyre_generator_impl.h"
 #include "spyre_guard.h"
 #include "spyre_kernel.h"
@@ -518,12 +519,36 @@ PYBIND11_MODULE(_C, m) {
       },
       py::arg("device"), "Reset peak allocator statistics");
 
-  // Returns true if any stream in the runtime has been shut down
-  // (unrecoverable). When true, no further work can be submitted on the
-  // affected streams.
-  m.def("has_stream_error", []() -> bool {
-    auto runtime = spyre::GlobalRuntime::get();
-    if (!runtime) return false;
-    return runtime->hasStreamError();
-  });
+  // ── Typed stream error API ───────────────────────────────────────────────
+
+  py::enum_<spyre::SpyreStreamError>(m, "SpyreStreamError")
+      .value("Success", spyre::SpyreStreamError::Success)
+      .value("Shutdown", spyre::SpyreStreamError::Shutdown);
+
+  py::enum_<spyre::SpyreDeviceState>(m, "SpyreDeviceState")
+      .value("Ok", spyre::SpyreDeviceState::Ok)
+      .value("NotInitialized", spyre::SpyreDeviceState::NotInitialized)
+      .value("StreamError", spyre::SpyreDeviceState::StreamError);
+
+  m.def(
+      "stream_get_error",
+      [](const spyre::SpyreStream& stream) {
+        return spyre::SpyreStreamGetError(stream);
+      },
+      py::arg("stream"),
+      "Return the SpyreStreamError state of a single stream.");
+
+  m.def(
+      "stream_get_error_string",
+      [](spyre::SpyreStreamError err) -> std::string {
+        return spyre::SpyreStreamGetErrorString(err);
+      },
+      py::arg("error"),
+      "Return a human-readable string for a SpyreStreamError value.");
+
+  m.def(
+      "get_device_state", []() { return spyre::SpyreGetDeviceState(); },
+      "Return the SpyreDeviceState aggregate for the process. "
+      "Returns NotInitialized when the runtime has not been created yet; "
+      "callers should treat this as 'proceed / no error'.");
 }
