@@ -73,6 +73,10 @@ runs:
       run: |-
         set +e
         set +o pipefail
+        # Job control: each `&` background job gets its own process group, so
+        # the stall watcher can kill TEST_PID's entire descendant tree (incl.
+        # xdist workers) via its PGID instead of only direct children.
+        set -m
 
         source "$HOME/.bashrc"
         source /etc/profile.d/ibm-aiu-setup.sh
@@ -136,13 +140,15 @@ runs:
                   echo "[stall-watcher] STALL DETECTED — killing test child processes"
                   # Marks this attempt as stalled for the parent shell to read after `wait`.
                   touch "${STALL_FLAG}.stalled"
-                  # Kill the parent and ALL child processes in order
-                  # 1. Freeze the parent process so it cannot spawn anything
-                  kill -STOP "$TEST_PID" || true
-                  # 2. Kill all existing child processes
-                  pkill -P "$TEST_PID" || true
-                  # 3. Kill the frozen parent process
-                  kill -KILL "$TEST_PID" || true
+                  # Kill TEST_PID's whole process group (set -m gives it its own
+                  # PGID == TEST_PID): `pkill -P` alone only hits direct children,
+                  # missing deeper descendants in run_test.sh -> subshell -> python3
+                  # -m pytest -> xdist worker, which can survive and keep the Spyre
+                  # device open, causing "device busy" on retry.
+                  # 1. Freeze the group so it cannot spawn anything further
+                  kill -STOP -- "-$TEST_PID" || true
+                  # 2. Kill the whole frozen group
+                  kill -KILL -- "-$TEST_PID" || true
                   return
                 fi
               else
