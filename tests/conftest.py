@@ -223,6 +223,11 @@ def pytest_addoption(parser):
         action="store_true",
         help="Disable cuda device replacement in kwargs.",
     )
+    parser.addoption(
+        "--no-device-layout",
+        action="store_true",
+        help="Disable using device specific layout based on strides and offsets.",
+    )
 
     # NEW: inventory modes
     parser.addoption(

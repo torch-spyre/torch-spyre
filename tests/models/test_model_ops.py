@@ -133,6 +133,9 @@ class TestSpyreModelOps(TestCase):
         device_replace_disabled = bool(
             pytestconfig.getoption("--no-device-replace", default=False)
         )
+        device_layout_disabled = bool(
+            pytestconfig.getoption("--no-device-layout", default=False)
+        )
 
         method_name = self._testMethodName
 
@@ -197,15 +200,29 @@ class TestSpyreModelOps(TestCase):
             case, seed, dtype, None if device_replace_disabled else test_device
         )
 
-        def to_spyre(arg):
-            if isinstance(arg, list):
-                return [x.to(test_device) for x in arg]
-            elif isinstance(arg, torch.Tensor):
-                return arg.to(test_device)
-            else:
-                return arg
+        def tensor_to_device(tensor):
+            if device_layout_disabled or "spyre" not in str(test_device):
+                return tensor.to(test_device)
+            # import Spyre specific package when test_device is spyre
+            from torch_spyre._C import SpyreTensorLayout
 
-        test_sample = cpu_sample.transform(to_spyre)
+            size = tensor.size()
+            stride = tensor.stride()
+            dtype = tensor.dtype
+            dim_order = list(range(tensor.dim()))
+            stl = SpyreTensorLayout(size, stride, dtype, dim_order)
+            # workaround to enable monkey patch by calling to("spyre")
+            _ = torch.ones(1, dtype=torch.float16).to("spyre")
+            return tensor.to(test_device, device_layout=stl)
+
+        def to_target_device(x):
+            if torch.is_tensor(x):
+                return tensor_to_device(x)
+            if isinstance(x, list):
+                return [tensor_to_device(t) if torch.is_tensor(t) else t for t in x]
+            return x
+
+        test_sample = cpu_sample.transform(to_target_device)
 
         # run target op
         try:

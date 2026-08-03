@@ -81,6 +81,8 @@ def make_tensor_from_conf(
     tconf: Dict[str, Any], *, dtype: torch.dtype, seed: Optional[int]
 ) -> torch.Tensor:
     shape = list(tconf["shape"])
+    stride = list(tconf["stride"])
+    storage_offset = tconf["storage_offset"]
     init = tconf.get("init", "rand")
     init_args = dict(tconf.get("init_args", {}))
 
@@ -116,6 +118,22 @@ def make_tensor_from_conf(
             )
         else:
             raise ValueError(f"Unknown init: {init}")
+
+    # Handle custom stride/storage_offset
+    def stride_is_descending(s):
+        return all(a >= b for a, b in zip(s, s[1:]))
+
+    if (stride is not None and not stride_is_descending(stride)) or storage_offset != 0:
+        stride = stride if stride is not None else list(t.stride())
+        needed = storage_offset + (
+            sum((s - 1) * st for s, st in zip(shape, stride)) + 1 if shape else 1
+        )
+        backing = torch.empty(needed, dtype=dtype)
+        view = torch.as_strided(backing, shape, stride, storage_offset)
+        with torch.no_grad():
+            view.copy_(t)
+
+        t = view  # strided view populated with t's logical values
 
     return t
 
