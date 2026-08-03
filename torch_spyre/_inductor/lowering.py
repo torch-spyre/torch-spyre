@@ -913,7 +913,7 @@ def lower_convolution(
         },
         # NOTE: conv iteration-space dim sizes are NOT snapshotted here.  Codegen
         # derives each dim role's size from the node's live IR ranges instead
-        # (output NCHW ranges + reduction ranges; see _conv_role_sizes /
+        # (output NCHW ranges + reduction ranges; see _conv2d_role_sizes /
         # _align_conv_dim_labels in codegen/superdsc.py), so views and
         # device-layout assignment stay authoritative -- mirroring the avgpool
         # move off op_info["pool_dim_sizes"] to OpSpec.node_output_ranges.

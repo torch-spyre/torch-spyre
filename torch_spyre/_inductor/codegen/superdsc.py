@@ -363,7 +363,7 @@ _POOL_ROLE_LABELS = list(
 # Canonical conv2d iteration-space order -> SDSC labels, mirroring
 # _POOL_ROLE_LABELS.  Conv adds the ``in_channel`` contraction role between the
 # output channel and the kernel taps.  Codegen owns these strings; per-role
-# sizes are sourced from the node's live IR ranges (see _conv_role_sizes).
+# sizes are sourced from the node's live IR ranges (see _conv2d_role_sizes).
 # Order matches CONV_DIM_LABELS.
 _CONV_ROLE_LABELS = list(
     zip(
@@ -419,16 +419,25 @@ def _align_pool_dim_labels(node_output_ranges, ndim: int) -> list[str]:
     return labels
 
 
-def _conv_role_sizes(node_output_ranges, node_reduction_ranges) -> dict:
-    """Map each conv dim role to its live size from the node's IR ranges.
+def _conv2d_role_sizes(op: str, node_output_ranges, node_reduction_ranges) -> dict:
+    """Map each conv2d dim role to its live size from the node's IR ranges.
+
+    Specific to standard conv2d: it assumes the node's NCHW output ranges
+    ``[N, C_out, H_out, W_out]`` and reduction ranges ``[C_in, kH, kW]`` layout,
+    so the caller must guard on the op (``_is_conv``) — this helper re-checks it
+    rather than trusting the caller.
 
     Replaces the lowering-time ``conv_dim_sizes`` snapshot: the output roles come
-    from the node's NCHW output ranges ``[N, C_out, H_out, W_out]`` and the
-    reduction roles from its reduction ranges ``[C_in, kH, kW]`` — both tracked
-    by the compiler (views, device-layout assignment) rather than frozen at
-    lowering.  Sourcing sizes from live IR keeps label alignment robust when the
-    compiler rewrites shapes before codegen.
+    from the node's NCHW output ranges and the reduction roles from its reduction
+    ranges — both tracked by the compiler (views, device-layout assignment)
+    rather than frozen at lowering.  Sourcing sizes from live IR keeps label
+    alignment robust when the compiler rewrites shapes before codegen.
     """
+    if not _is_conv(op):
+        raise ValueError(
+            f"_conv2d_role_sizes is specific to standard conv2d but was called "
+            f"for op {op!r} (not in CONV_OPS)"
+        )
     return {
         "batch": node_output_ranges[0],
         "channel": node_output_ranges[1],
@@ -445,7 +454,7 @@ def _align_conv_dim_labels(role_sizes: dict, ndim: int) -> list[str]:
 
     ``role_sizes`` maps each conv-domain dim role (batch, out_h, out_w, channel,
     in_channel, win_h, win_w) to its live size, sourced from the node's IR ranges
-    (see ``_conv_role_sizes``).  Codegen owns the SDSC label for each role
+    (see ``_conv2d_role_sizes``).  Codegen owns the SDSC label for each role
     (``_CONV_ROLE_LABELS``).  The pipeline drops statically size-1 dims (e.g.
     batch N=1, or ki/kj for a 1x1 kernel) before parse_op_spec runs, so a role
     whose size is 1 has no surviving dim and its label is filtered out here.
@@ -1060,8 +1069,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         # matching each dim's raw (pre-padding) size, which the iteration space
         # carries exactly; falls back to positional when sizes are non-static or
         # unmatched.
-        role_sizes = _conv_role_sizes(
-            op_spec.node_output_ranges, op_spec.node_reduction_ranges
+        role_sizes = _conv2d_role_sizes(
+            op_spec.op, op_spec.node_output_ranges, op_spec.node_reduction_ranges
         )
         dim_labels = _align_conv_dim_labels(role_sizes, ndim)
         symbol_mapping = _match_labels_by_size(
