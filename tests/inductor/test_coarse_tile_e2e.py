@@ -2307,18 +2307,18 @@ def test_view_1d_subdim_Lq2_D2():
 def test_view_named_input_view_transpose_H2():
     """flat [B,S,H*D] view+transpose before hint scope, tiled H÷2."""
     B, S, H, D = 2, 256, 8, 128
-    _nd = {"batch_size": B, "max_seqlen": S, "num_heads": H, "head_dim": D}
+    _nd = {"B": B, "S": S, "H": H, "D": D}
     inputs = [
         tensor(
             "q",
             shape=(B, S, H * D),
-            dims=["batch_size", "max_seqlen", "num_heads", "head_dim"],
+            dims=["B", "S", "H", "D"],
             named_dims=_nd,
         ),
         tensor(
             "k",
             shape=(B, S, H * D),
-            dims=["batch_size", "max_seqlen", "num_heads", "head_dim"],
+            dims=["B", "S", "H", "D"],
             named_dims=_nd,
         ),
     ]
@@ -2326,15 +2326,8 @@ def test_view_named_input_view_transpose_H2():
     def fn(q, k):
         q = q.view(B, S, H, D).transpose(1, 2)
         k = k.view(B, S, H, D).transpose(1, 2)
-        with spyre_hint(num_tiles_per_dim={"num_heads": 2}):
-            with spyre_hint(
-                expected_named_dims=[
-                    "batch_size",
-                    "num_heads",
-                    "max_seqlen",
-                    "head_dim",
-                ]
-            ):
+        with spyre_hint(num_tiles_per_dim={"H": 2}):
+            with spyre_hint(expected_named_dims=["B", "H", "S", "D"]):
                 return q * k
 
     run_coarse_tile_test(fn, inputs)
@@ -2343,18 +2336,18 @@ def test_view_named_input_view_transpose_H2():
 def test_view_named_input_view_transpose_S4():
     """flat [B,S,H*D] view+transpose before hint scope, tiled S÷4."""
     B, S, H, D = 2, 256, 8, 128
-    _nd = {"batch_size": B, "max_seqlen": S, "num_heads": H, "head_dim": D}
+    _nd = {"B": B, "S": S, "H": H, "D": D}
     inputs = [
         tensor(
             "q",
             shape=(B, S, H * D),
-            dims=["batch_size", "max_seqlen", "num_heads", "head_dim"],
+            dims=["B", "S", "H", "D"],
             named_dims=_nd,
         ),
         tensor(
             "k",
             shape=(B, S, H * D),
-            dims=["batch_size", "max_seqlen", "num_heads", "head_dim"],
+            dims=["B", "S", "H", "D"],
             named_dims=_nd,
         ),
     ]
@@ -2362,15 +2355,8 @@ def test_view_named_input_view_transpose_S4():
     def fn(q, k):
         q = q.view(B, S, H, D).transpose(1, 2)
         k = k.view(B, S, H, D).transpose(1, 2)
-        with spyre_hint(num_tiles_per_dim={"max_seqlen": 4}):
-            with spyre_hint(
-                expected_named_dims=[
-                    "batch_size",
-                    "num_heads",
-                    "max_seqlen",
-                    "head_dim",
-                ]
-            ):
+        with spyre_hint(num_tiles_per_dim={"S": 4}):
+            with spyre_hint(expected_named_dims=["B", "H", "S", "D"]):
                 return q * k
 
     run_coarse_tile_test(fn, inputs)
@@ -2379,18 +2365,18 @@ def test_view_named_input_view_transpose_S4():
 def test_view_named_input_view_transpose_H2_S4():
     """flat [B,S,H*D] view+transpose before hint scope, tiled H÷2 S÷4."""
     B, S, H, D = 2, 256, 8, 128
-    _nd = {"batch_size": B, "max_seqlen": S, "num_heads": H, "head_dim": D}
+    _nd = {"B": B, "S": S, "H": H, "D": D}
     inputs = [
         tensor(
             "q",
             shape=(B, S, H * D),
-            dims=["batch_size", "max_seqlen", "num_heads", "head_dim"],
+            dims=["B", "S", "H", "D"],
             named_dims=_nd,
         ),
         tensor(
             "k",
             shape=(B, S, H * D),
-            dims=["batch_size", "max_seqlen", "num_heads", "head_dim"],
+            dims=["B", "S", "H", "D"],
             named_dims=_nd,
         ),
     ]
@@ -2398,16 +2384,9 @@ def test_view_named_input_view_transpose_H2_S4():
     def fn(q, k):
         q = q.view(B, S, H, D).transpose(1, 2)
         k = k.view(B, S, H, D).transpose(1, 2)
-        with spyre_hint(num_tiles_per_dim={"num_heads": 2}):
-            with spyre_hint(num_tiles_per_dim={"max_seqlen": 4}):
-                with spyre_hint(
-                    expected_named_dims=[
-                        "batch_size",
-                        "num_heads",
-                        "max_seqlen",
-                        "head_dim",
-                    ]
-                ):
+        with spyre_hint(num_tiles_per_dim={"H": 2}):
+            with spyre_hint(num_tiles_per_dim={"S": 4}):
+                with spyre_hint(expected_named_dims=["B", "H", "S", "D"]):
                     return q * k
 
     run_coarse_tile_test(fn, inputs)
@@ -2421,32 +2400,25 @@ def test_view_named_input_view_transpose_H2_S4():
 def test_view_4d_transpose_H2():
     """x.view(B,S,H,D).transpose(1,2)*y tiled H÷2."""
     B, S, H, D = 2, 256, 4, 64
-    _nd = {"batch_size": B, "max_seqlen_q": S, "num_heads": H, "head_dim": D}
+    _nd = {"B": B, "Lq": S, "H": H, "D": D}
     inputs = [
         tensor(
             "x",
             shape=(B, S, H * D),
-            dims=["batch_size", "max_seqlen_q", "num_heads", "head_dim"],
+            dims=["B", "Lq", "H", "D"],
             named_dims=_nd,
         ),
         tensor(
             "y",
             shape=(B, H, S, D),
-            dims=["batch_size", "num_heads", "max_seqlen_q", "head_dim"],
+            dims=["B", "H", "Lq", "D"],
             named_dims=_nd,
         ),
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"num_heads": 2}):
-            with spyre_hint(
-                expected_named_dims=[
-                    "batch_size",
-                    "num_heads",
-                    "max_seqlen_q",
-                    "head_dim",
-                ]
-            ):
+        with spyre_hint(num_tiles_per_dim={"H": 2}):
+            with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
                 return x.view(B, S, H, D).transpose(1, 2) * y
 
     run_coarse_tile_test(fn, inputs)
@@ -2455,32 +2427,25 @@ def test_view_4d_transpose_H2():
 def test_view_4d_transpose_S4():
     """x.view(B,S,H,D).transpose(1,2)*y tiled S÷4."""
     B, S, H, D = 2, 256, 4, 64
-    _nd = {"batch_size": B, "max_seqlen_q": S, "num_heads": H, "head_dim": D}
+    _nd = {"B": B, "Lq": S, "H": H, "D": D}
     inputs = [
         tensor(
             "x",
             shape=(B, S, H * D),
-            dims=["batch_size", "max_seqlen_q", "num_heads", "head_dim"],
+            dims=["B", "Lq", "H", "D"],
             named_dims=_nd,
         ),
         tensor(
             "y",
             shape=(B, H, S, D),
-            dims=["batch_size", "num_heads", "max_seqlen_q", "head_dim"],
+            dims=["B", "H", "Lq", "D"],
             named_dims=_nd,
         ),
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"max_seqlen_q": 4}):
-            with spyre_hint(
-                expected_named_dims=[
-                    "batch_size",
-                    "num_heads",
-                    "max_seqlen_q",
-                    "head_dim",
-                ]
-            ):
+        with spyre_hint(num_tiles_per_dim={"Lq": 4}):
+            with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
                 return x.view(B, S, H, D).transpose(1, 2) * y
 
     run_coarse_tile_test(fn, inputs)
@@ -2489,33 +2454,26 @@ def test_view_4d_transpose_S4():
 def test_view_4d_transpose_H2_S4():
     """x.view(B,S,H,D).transpose(1,2)*y tiled H÷2 S÷4."""
     B, S, H, D = 2, 256, 4, 64
-    _nd = {"batch_size": B, "max_seqlen_q": S, "num_heads": H, "head_dim": D}
+    _nd = {"B": B, "Lq": S, "H": H, "D": D}
     inputs = [
         tensor(
             "x",
             shape=(B, S, H * D),
-            dims=["batch_size", "max_seqlen_q", "num_heads", "head_dim"],
+            dims=["B", "Lq", "H", "D"],
             named_dims=_nd,
         ),
         tensor(
             "y",
             shape=(B, H, S, D),
-            dims=["batch_size", "num_heads", "max_seqlen_q", "head_dim"],
+            dims=["B", "H", "Lq", "D"],
             named_dims=_nd,
         ),
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"num_heads": 2}):
-            with spyre_hint(num_tiles_per_dim={"max_seqlen_q": 4}):
-                with spyre_hint(
-                    expected_named_dims=[
-                        "batch_size",
-                        "num_heads",
-                        "max_seqlen_q",
-                        "head_dim",
-                    ]
-                ):
+        with spyre_hint(num_tiles_per_dim={"H": 2}):
+            with spyre_hint(num_tiles_per_dim={"Lq": 4}):
+                with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
                     return x.view(B, S, H, D).transpose(1, 2) * y
 
     run_coarse_tile_test(fn, inputs)
