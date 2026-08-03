@@ -474,7 +474,6 @@ class TestFP8Operations:
         - near_zero: Very small values (numerical stability)
         - large: Values near FP16 max (65504)
         - mixed_signs: Positive and negative values
-        - single_element: Minimal tensor size
         - large_hidden: Very large hidden dimension
         """
         if input_type == "zeros":
