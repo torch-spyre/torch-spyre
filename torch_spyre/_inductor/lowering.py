@@ -1860,11 +1860,16 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3_MAX):
     """
     Lower quantscalepertokenfp8 as a Reduction operation.
 
-    Maps to deeptools quantscalepertokenfp8 fused operator.
+    Maps to the deeptools quantscalepertokenfp8 fused operator.
     Uses standard reduction inner_fn pattern like exx2 and mean.
-    """
-    from torch_spyre._C import encode_constant, DataFormats
 
+    Constants forwarded to the DDL template:
+    - mulConst: 1/scale_ub, passed as a float and FP16-encoded by generate_constant_info
+    - clipMin: QUANTSCALEPERTOKENFP8_CLIP_MIN (4096), a raw DDL template integer
+    - clipMax: FP16_MAX_VALUE_ENCODED (32255 / 0x7BFF), a raw DDL template integer
+
+    clipMin and clipMax are in constants_raw so they bypass encode_constant.
+    """
     # Validate scale_ub parameter
     if scale_ub <= 0:
         raise ValueError(
@@ -1886,13 +1891,10 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3_MAX):
     # Compute mulConst as 1/scale_ub (will be FP16-encoded by generate_constant_info)
     mul_const = 1.0 / scale_ub
 
-    # clipMin is required by the DeepTools DDL template for quantscalepertokenfp8.
-    clip_min_value = QUANTSCALEPERTOKENFP8_CLIP_MIN
-
     op_info = {
         "constants": {
             "mulConst": mul_const,  # Float value, will be FP16-encoded by generate_constant_info
-            "clipMin": clip_min_value,  # 4096: DDL template constant (raw integer)
+            "clipMin": QUANTSCALEPERTOKENFP8_CLIP_MIN,  # 4096: DDL template constant (raw integer)
             "clipMax": FP16_MAX_VALUE_ENCODED,  # 32255: FP16 max value (raw integer)
         },
         "constants_raw": (

@@ -529,20 +529,20 @@ class TestFP8Operations:
         - scale_ub<0 raises ValueError
         - Valid positive values work correctly
         """
-        x = cached_randn((2, 4, 8), dtype=torch.float16, scale=1.0).to("spyre")
+        x = cached_randn((2, 4, 8), dtype=torch.float16, scale=1.0)
 
-        @torch.compile
         def spyre_fn(x):
             return torch.ops.spyre.quantscalepertokenfp8(x, scale_ub=scale_ub)
 
+        def pytorch_fn(x):
+            return torch.amax(torch.abs(x), dim=-1, keepdim=True) / scale_ub
+
         if should_fail:
             with pytest.raises(InductorError, match="scale_ub must be positive"):
-                spyre_fn(x)
+                compare_with_pytorch(spyre_fn, pytorch_fn, x)
         else:
-            # Should execute without error
-            result = spyre_fn(x)
-            verify_fp16_dtype(result)
-            assert result.shape == (2, 4, 1)
+            # Use compare_with_pytorch for proper value correctness validation
+            compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=1e-3, rtol=1e-3)
 
 
 # Test utilities for FP8 operations

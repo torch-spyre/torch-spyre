@@ -202,7 +202,7 @@ def generate_constant_info(
     constants: dict[str, Any],
     num_cores: int,
     constants_raw: list[str] | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | str:
     """Generate constant information for SDSC.
 
     Args:
@@ -214,8 +214,12 @@ def generate_constant_info(
                       represent dimension sizes or other integer metadata.
 
     Returns:
-        Dictionary of constant information for SDSC JSON
+        Dictionary of constant information for SDSC JSON, or the literal string "{}"
+        for the empty-constants case (required by DeepTools SDSC JSON consumer).
     """
+    # NOTE: Returns the literal string "{}" for the empty-constants case (not an
+    # empty dict) — required by the DeepTools SDSC JSON consumer which distinguishes
+    # between a missing constantInfo_ field and an empty one.
     if len(constants.keys()) == 0:
         return "{}"
     constants_raw = constants_raw or []
