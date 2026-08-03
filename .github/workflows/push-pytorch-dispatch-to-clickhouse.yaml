@@ -1,0 +1,93 @@
+name: push-pytorch-dispatch-to-clickhouse
+
+# Entry point for repository_dispatch events sent by pytorch/pytorch's CI
+# relay (Cross-Repository CI Relay, aka CRCR). Classifies the dispatch
+# (PR opened / new commit to existing PR / closed / merged ) and records it
+# in ClickHouse. Does not trigger any build or test pipeline.
+run-name: >-
+  PyTorch CRCR CI Trigger -
+  ${{
+    github.event.client_payload.event_type == 'pull_request' &&
+    format(
+      'PR #{0} ({1})',
+      github.event.client_payload.payload.pull_request.number,
+      github.event.client_payload.payload.action
+    ) ||
+    format('Push {0}', github.event.client_payload.payload.after)
+  }}
+on:
+  repository_dispatch:
+    types: [pull_request]
+
+concurrency:
+  group: >-
+    crcr-l2-${{ github.event.client_payload.payload.repository.full_name }}-${{
+    github.event.client_payload.payload.pull_request.number || github.run_id }}-${{ github.event.client_payload.payload.action || 'push'}}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ingest:
+    name: Classify dispatch -> ClickHouse
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - linux
+      - image_spyre_backend
+    timeout-minutes: 10
+
+    env:
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
+      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER_DEV }}
+      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS_DEV }}
+      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB_DEV }}
+
+    steps:
+      - name: Checkout ingest script
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          sparse-checkout: |
+            .github/scripts/ingest_pytorch_dispatch.py
+
+      - name: Write dispatch payload to file
+        env:
+          PAYLOAD_JSON: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          printf '%s' "$PAYLOAD_JSON" > payload.json
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+      - name: Setup venv
+        run: |
+          uv venv
+          source .venv/bin/activate
+
+      - name: Install Python dependencies
+        run: |
+          source .venv/bin/activate
+          uv pip install clickhouse-connect regex
+          echo "VIRTUAL_ENV $VIRTUAL_ENV"
+
+      - name: Classify dispatch and ingest into ClickHouse
+        run: |
+          source .venv/bin/activate
+          python3 .github/scripts/ingest_pytorch_dispatch.py \
+            --payload-file payload.json \
+            --event-type "${{ github.event.action }}" \
+            --run-id   "${{ github.run_id }}" \
+            --run-link "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Summary
+        if: always()
+        run: |-
+          {
+            echo "### PyTorch Dispatch Ingest Summary"
+            echo "| Key | Value |"
+            echo "|---|---|"
+            echo "| Event type | ${{ github.event.action }} |"
+            echo "| Run ID        | ${{ github.run_id }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

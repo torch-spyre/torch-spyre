@@ -24,7 +24,7 @@
 
 #include "spyre_allocator.h"
 #include "spyre_stream.h"
-#include "util/processSpyreCodeArtifacts.h"
+#include "spyrecode-host-functions/processSpyreCodeArtifacts.h"
 
 namespace spyre {
 
