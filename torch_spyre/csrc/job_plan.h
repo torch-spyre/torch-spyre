@@ -285,7 +285,7 @@ inline std::ostream& operator<<(std::ostream& os, const JobPlanStep& step) {
  * reused across launches. Within an iteration the HostCompute callback
  * completes (inline, on the caller thread) before its H2D is enqueued, so the
  * forward write-before-read holds; the cross-iteration WAR on the reused
- * buffer is closed by HostCompute's pipeline barrier (see flex #1306).
+ * buffer is closed by HostCompute's pipeline barrier (see flex #1479).
  */
 class JobPlanStepH2D final : public JobPlanStep {
  public:
@@ -415,9 +415,9 @@ class JobPlanStepCompute final : public JobPlanStep {
  * the buffer, and produces a RuntimeOperationHostCallback.
  *
  * The shared buffer is allocated once during PrepareKernel and reused across
- * launches. For tiled execution, the same buffer is reused across iterations —
- * FIFO ordering guarantees each iteration's H2D consumes the buffer before the
- * next iteration's HostCompute overwrites it.
+ * launches and across tiled iterations; the cross-iteration WAR on the reused
+ * buffer is closed by this step's pipeline barrier, not by FIFO (see flex
+ * #1479).
  */
 class JobPlanStepHostCompute final : public JobPlanStep {
  public:
@@ -439,7 +439,13 @@ class JobPlanStepHostCompute final : public JobPlanStep {
     // Gate on prior-stream completion: the shared pinned buffer is reused
     // across tiled iterations, so this write must wait for the previous
     // iteration's H2D to finish reading it (WAR). Under inline host dispatch,
-    // pipeline_barrier=false is unsafe. See flex #1306.
+    // pipeline_barrier=false is unsafe. See flex #1479.
+    //
+    // Precondition: this barrier closes the WAR only because HostCompute and
+    // its H2D share a stream today. The barrier drains the whole stream (all
+    // prior ops, including in-flight Compute), not just the prior H2D — correct
+    // and safe, just coarser than needed, at the cost of some HC/compute
+    // overlap. TODO: replace with a per-buffer dependency once available.
     pipeline_barrier_ = true;
   }
 
