@@ -364,6 +364,41 @@ def spyre_linear(
     return out
 
 
+def _wsr_tile_size(extent: int, block: int) -> int:
+    """Per-tile extent for ``extent`` at the requested ``block``, or no tiling.
+
+    WSR now takes the tile SIZE (spyre_hint(tile_size_per_dim=...)) rather than a
+    trip count, because the backend runs a dynamic loop count over fixed-size
+    tiles.  Full tiles are required, so ``extent`` must be a multiple of ``block``.
+
+    ============================ BEHAVIOUR CHANGE ============================
+    The previous spelling was ``tiles={dim: max(1, extent // block)}`` -- a trip
+    COUNT derived from the block, which meant the block size was only advisory
+    and the ACTUAL tile came out as ``extent / count``:
+
+        extent=384 block=128 -> count 3 -> tile 128   (as intended)
+        extent=300 block=128 -> count 2 -> tile 150   <-- LARGER than requested
+        extent=250 block=128 -> count 1 -> no tiling
+        batch=1    block=2   -> count 1 -> no tiling
+
+    So a non-divisible extent could silently produce a tile bigger than the
+    working-set budget the block was chosen to respect -- the opposite of what
+    WSR is for.  Declaring the size makes that impossible, but it also means a
+    non-divisible extent cannot be tiled at all until the input is padded (with
+    op-appropriate identity values) upstream.
+
+    Until that padding exists this declines to tile rather than erroring, which
+    preserves today's graceful degradation for short sequences and small batches.
+    The one case that differs from before is non-divisible-but-larger-than-block
+    (300/128 above): previously 2 tiles of 150, now untiled.  That is deliberate
+    -- overshooting the block was never intended.
+    =========================================================================
+    """
+    if block <= 0 or extent <= 0:
+        return max(1, extent)
+    return block if extent % block == 0 else extent
+
+
 @register_spyre_decompositions(
     [torch.ops.aten._scaled_dot_product_fused_attention_overrideable.default]
 )
@@ -444,13 +479,19 @@ def spyre__sdpa_overrideable(
             max_seqlen_q, max_seqlen_kv, query.dtype, query.device
         )
 
-    with spyre_hint(tiles={"batch_size": max(1, batch_size // 2)}):
-        with spyre_hint(tiles={"num_heads": max(1, num_heads // 4)}):
+    # Declared per-tile extents (not trip counts) -- see _wsr_tile_size for the
+    # behaviour change this carries for non-divisible extents.
+    with spyre_hint(tile_size_per_dim={"batch_size": _wsr_tile_size(batch_size, 2)}):
+        with spyre_hint(tile_size_per_dim={"num_heads": _wsr_tile_size(num_heads, 4)}):
             with spyre_hint(
-                tiles={"max_seqlen_q": max(1, max_seqlen_q // q_block_size)}
+                tile_size_per_dim={
+                    "max_seqlen_q": _wsr_tile_size(max_seqlen_q, q_block_size)
+                }
             ):
                 with spyre_hint(
-                    tiles={"max_seqlen_kv": max(1, max_seqlen_kv // kv_block_size)}
+                    tile_size_per_dim={
+                        "max_seqlen_kv": _wsr_tile_size(max_seqlen_kv, kv_block_size)
+                    }
                 ):
                     with spyre_hint(
                         work_div={"num_heads": 4, "max_seqlen_q": 8, "max_seqlen_kv": 8}

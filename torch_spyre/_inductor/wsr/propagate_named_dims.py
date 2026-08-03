@@ -716,9 +716,22 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
             dims: dict[str, int] = _hint_dims(hint_dict)
             if _TILE_SIZE_KEY in hint_dict and hint_dict[_TILE_SIZE_KEY]:
                 resolved = tile_size_counts.get(hint_id, {})
-                dims = {
-                    name: resolved[name] for name in dims if name in resolved
-                } or dims
+                missing = [name for name in dims if name not in resolved]
+                if missing:
+                    # Never fall back to using the declared SIZE as a trip count:
+                    # that silently tiles into `tile_size` pieces instead of pieces
+                    # OF tile_size, which miscompiles rather than failing.  An
+                    # unresolved name means no op in the graph carried that dim, so
+                    # the extent was never found -- almost always a name that does
+                    # not match any declared tensor dim.
+                    raise Unsupported(
+                        f"spyre_hint(tile_size_per_dim=...) names dim(s) "
+                        f"{missing} that no operation in the tiled scope carries, "
+                        "so the extent needed to derive the loop trip count could "
+                        "not be found. Check the name matches a dim declared via "
+                        "declare_tensor_dim()/name_tensor_dims()."
+                    )
+                dims = {name: resolved[name] for name in dims}
             # TODO: support multiple dimensions per spyre_hint() call.
             # hint_id_to_ranges_pos in plan_coarse_tile_groups would need to
             # become dict[int, list[int]] and _hints_levels would need to
