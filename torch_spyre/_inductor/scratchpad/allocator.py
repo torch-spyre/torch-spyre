@@ -243,9 +243,7 @@ class ScratchpadAllocator:
         lifetime: as ``op``'s own indirect write (a Scatter target), or as a
         read/index operand of any consumer in ``uses``.
 
-        LX addresses are expressed as ``affine.apply`` symbols and cannot carry
-        the data-dependent offsets indirect (gather/scatter-style) access needs,
-        so both the index tensor and the tensor it indexes into must stay off
+        Both the index tensor and the tensor it indexes into must stay off
         the scratchpad and resolve from HBM instead.
         """
         if isinstance(op, ComputedBuffer):
@@ -323,8 +321,7 @@ class ScratchpadAllocator:
             return "extern kernel user"
         if self._is_index_or_indirectly_accessed(graph, name, uses, op):
             # Index tensors and the value tensors they index into are read via
-            # data-dependent (indirect) addressing, which LX's affine.apply
-            # addressing cannot express -- both must stay off the scratchpad.
+            # data-dependent (indirect) addressing, must stay in hbm.
             return "index tensor or indirectly accessed"
         if name in graph_output_names:
             # A graph output normally can't reside (the value must land back in
