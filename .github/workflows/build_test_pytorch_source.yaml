@@ -13,13 +13,6 @@ name: build-test-pytorch-source
 # row the caller's `ingest` job created, keyed on
 # github.event.client_payload.delivery_id (shared across the whole
 # workflow_call, since the github context always reflects the caller).
-#
-# Build + test run in a SINGLE job on a card-bearing runner rather than a
-# build job + artifact + test job: build-pytorch.sh and
-# build-torch-spyre.sh --local-pytorch both produce editable installs tied
-# to absolute paths and a shared venv, which are brittle to relocate across
-# runners/pods. The tradeoff (a card sits idle during the source build) is
-# accepted since this pipeline runs per upstream merge, not per PR.
 # ---------------------------------------------------------------------------
 on:
   workflow_call:

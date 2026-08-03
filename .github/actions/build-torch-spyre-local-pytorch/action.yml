@@ -1,22 +1,7 @@
 name: Build torch-spyre against a local PyTorch checkout
 description: |
-  Builds torch-spyre as an editable install against a sibling, locally
-  built PyTorch source tree instead of the pinned CPU wheel. Mirrors
-  torch-spyre-docs/scripts/build-torch-spyre.sh's --local-pytorch path,
-  except the local pytorch path dependency is non-editable: uv's build
-  cache for a local path dependency is keyed on source-tree mtimes, so a
-  fresh `git checkout` of pytorch makes uv rebuild it here regardless of
-  what build-pytorch-from-source already installed. An editable build only
-  builds the extension without running the CMake install step that exports
-  headers (pybind11, ATen/native/DispatchStub.h, etc.) into torch/include,
-  which torch-spyre's own C++ build needs -- so this rebuild must be a full
-  install too.
-
-  Temporarily rewrites torch-spyre's pyproject.toml (and backs up
-  uv.lock), pointing the torch dependency at `{ path = "../pytorch",
-  editable = false }`. Requires build-pytorch-from-source (or an
-  equivalent) to have already installed PyTorch into torch-spyre's own
-  venv (`torch_spyre_dir/.venv`).
+  Builds torch-spyre against a local PyTorch source tree following 
+  the torch-spyre-docs. 
 
 inputs:
   torch_spyre_dir:

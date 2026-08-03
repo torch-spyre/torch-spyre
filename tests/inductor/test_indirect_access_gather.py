@@ -105,6 +105,14 @@ class _GatherScenarios(IndirectAccessTestCase):
         self.name_dims(i, {"P": P})
         return x, i
 
+    def _xi4d(self, P=32, dtype=torch.int32, A=8, B=4, C=8, D=64):
+        """Named (x[A,B,C,D], idx[P]) gather operands: 4-D value, 1-D index."""
+        x = self.to_spyre(torch.rand(A, B, C, D, dtype=torch.float16))
+        i = torch.randint(0, A, (P,), dtype=dtype).to("spyre")
+        self.name_dims(x, {"A": A, "B": B, "C": C, "D": D})
+        self.name_dims(i, {"P": P})
+        return x, i
+
     # -- core x[i].exp(): op-spec structure + detection (one compile) ------
     def test_gather_with_exp(self):
         """x[i].exp(): GATHER op spec with IndirectAccess on an input, a named
@@ -603,6 +611,231 @@ class _GatherScenarios(IndirectAccessTestCase):
         idx = torch.randint(0, V, (P,), dtype=torch.int32).to("spyre")
         self.name_dims(weight, {"V": V, "E": E})
         self.name_dims(idx, {"P": P})
+        self._stage_and_e2e(
+            lambda i, w: torch.nn.functional.embedding(i, w),
+            idx,
+            weight,
+            expect=GATHER_OP_SPEC,
+        )
+
+    # -- P=1 gather: comprehensive shape and rank coverage ----------------
+    # Verify that a single-element index (P=1) compiles and produces correct
+    # results across 2-D, 3-D, and 4-D value tensors with stick-aligned,
+    # non-stick-aligned, small, and large shapes.
+
+    # 2-D value tensor, P=1
+    def test_single_idx_2d_stick_aligned(self):
+        """P=1, 2-D value [64, 64] — both dims stick-aligned (1 stick per row)."""
+        x, i = self._xi(P=1, M=64, N=64)
+        self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_single_idx_2d_non_stick_aligned(self):
+        """P=1, 2-D value [67, 100] — non-stick-aligned row width."""
+        x, i = self._xi(P=1, M=67, N=100)
+        self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_single_idx_2d_multistick_row(self):
+        """P=1, 2-D value [128, 512] — 8 sticks per row."""
+        x, i = self._xi(P=1, M=128, N=512)
+        self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_single_idx_2d_small(self):
+        """P=1, 2-D value [8, 64] — small table, 1 stick per row."""
+        x, i = self._xi(P=1, M=8, N=64)
+        self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_single_idx_2d_int64_index(self):
+        """P=1, 2-D value, int64 index."""
+        x, i = self._xi(P=1, dtype=torch.int64)
+        self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_single_idx_2d_with_exp(self):
+        """P=1, 2-D value, fused exp."""
+        x, i = self._xi(P=1)
+        self._stage_and_e2e(
+            lambda x, i: x[i].exp(), x, i, expect=GATHER_OP_SPEC, op="exp"
+        )
+
+    def test_single_idx_2d_with_tanh(self):
+        """P=1, 2-D value, fused tanh."""
+        x, i = self._xi(P=1)
+        self._stage_and_e2e(
+            lambda x, i: x[i].tanh(), x, i, expect=GATHER_OP_SPEC, op="tanh"
+        )
+
+    def test_single_idx_2d_embedding(self):
+        """P=1, torch.embedding — single token lookup."""
+        V, E = 256, 128
+        weight = self.to_spyre(torch.rand(V, E, dtype=torch.float16))
+        idx = torch.randint(0, V, (1,), dtype=torch.int32).to("spyre")
+        self.name_dims(weight, {"V": V, "E": E})
+        self.name_dims(idx, {"P": 1})
+        self._stage_and_e2e(
+            lambda w, i: torch.embedding(w, i), weight, idx, expect=GATHER_OP_SPEC
+        )
+
+    def test_single_idx_2d_index_select(self):
+        """P=1, torch.index_select, 2-D value."""
+        x, i = self._xi(P=1)
+        self._stage_and_e2e(
+            lambda x, i: torch.index_select(x, 0, i), x, i, expect=GATHER_OP_SPEC
+        )
+
+    # 3-D value tensor, P=1
+    def test_single_idx_3d_stick_aligned(self):
+        """P=1, 3-D value [32, 4, 128] — C stick-aligned (2 sticks per row)."""
+        x, i = self._xi3d(P=1, A=32, B=4, C=128)
+        self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_single_idx_3d_non_stick_aligned(self):
+        """P=1, 3-D value [32, 4, 100] — C not stick-aligned."""
+        x, i = self._xi3d(P=1, A=32, B=4, C=100)
+        self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_single_idx_3d_small(self):
+        """P=1, 3-D value [8, 2, 64] — small A and B, single-stick C."""
+        x, i = self._xi3d(P=1, A=8, B=2, C=64)
+        self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_single_idx_3d_large(self):
+        """P=1, 3-D value [64, 16, 256] — large, 4 sticks per C."""
+        x, i = self._xi3d(P=1, A=64, B=16, C=256)
+        self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_single_idx_3d_non_power_of_two(self):
+        """P=1, 3-D value [48, 6, 96] — non-power-of-two dims."""
+        x, i = self._xi3d(P=1, A=48, B=6, C=96)
+        self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_single_idx_3d_int64_index(self):
+        """P=1, 3-D value, int64 index."""
+        x, i = self._xi3d(P=1, dtype=torch.int64)
+        self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_single_idx_3d_with_exp(self):
+        """P=1, 3-D value, fused exp."""
+        x, i = self._xi3d(P=1)
+        self._stage_and_e2e(
+            lambda x, i: x[i].exp(), x, i, expect=GATHER_OP_SPEC, op="exp"
+        )
+
+    def test_single_idx_3d_with_tanh(self):
+        """P=1, 3-D value, fused tanh."""
+        x, i = self._xi3d(P=1)
+        self._stage_and_e2e(
+            lambda x, i: x[i].tanh(), x, i, expect=GATHER_OP_SPEC, op="tanh"
+        )
+
+    def test_single_idx_3d_index_select(self):
+        """P=1, torch.index_select, 3-D value."""
+        x, i = self._xi3d(P=1)
+        self._stage_and_e2e(
+            lambda x, i: torch.index_select(x, 0, i), x, i, expect=GATHER_OP_SPEC
+        )
+
+    def test_single_idx_3d_chained_unary(self):
+        """P=1, 3-D value, chained exp+tanh fused after gather."""
+        x, i = self._xi3d(P=1)
+        self._stage_and_e2e(lambda x, i: x[i].exp().tanh(), x, i, expect=GATHER_OP_SPEC)
+
+    def test_single_idx_3d_scalar_add(self):
+        """P=1, 3-D value, scalar add fused after gather."""
+        x, i = self._xi3d(P=1)
+        self._stage_and_e2e(lambda x, i: x[i] + 1.0, x, i, expect=GATHER_OP_SPEC)
+
+    # 4-D value tensor, P=1
+    def test_single_idx_4d_stick_aligned(self):
+        """P=1, 4-D value [8, 4, 8, 64] — D stick-aligned (1 stick per row)."""
+        x, i = self._xi4d(P=1, A=8, B=4, C=8, D=64)
+        self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_single_idx_4d_non_stick_aligned(self):
+        """P=1, 4-D value [8, 4, 8, 100] — D not stick-aligned."""
+        x, i = self._xi4d(P=1, A=8, B=4, C=8, D=100)
+        self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_single_idx_4d_multistick_row(self):
+        """P=1, 4-D value [8, 4, 4, 128] — D spans 2 sticks per row."""
+        x, i = self._xi4d(P=1, A=8, B=4, C=4, D=128)
+        self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_single_idx_4d_small(self):
+        """P=1, 4-D value [4, 2, 2, 64] — small inner dims."""
+        x, i = self._xi4d(P=1, A=4, B=2, C=2, D=64)
+        self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_single_idx_4d_int64_index(self):
+        """P=1, 4-D value, int64 index."""
+        x, i = self._xi4d(P=1, dtype=torch.int64)
+        self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
+
+    def test_single_idx_4d_with_exp(self):
+        """P=1, 4-D value, fused exp."""
+        x, i = self._xi4d(P=1)
+        self._stage_and_e2e(
+            lambda x, i: x[i].exp(), x, i, expect=GATHER_OP_SPEC, op="exp"
+        )
+
+    def test_single_idx_4d_with_tanh(self):
+        """P=1, 4-D value, fused tanh."""
+        x, i = self._xi4d(P=1)
+        self._stage_and_e2e(
+            lambda x, i: x[i].tanh(), x, i, expect=GATHER_OP_SPEC, op="tanh"
+        )
+
+    def test_single_idx_4d_index_select(self):
+        """P=1, torch.index_select, 4-D value."""
+        x, i = self._xi4d(P=1)
+        self._stage_and_e2e(
+            lambda x, i: torch.index_select(x, 0, i), x, i, expect=GATHER_OP_SPEC
+        )
+
+    def test_single_idx_4d_scalar_mul(self):
+        """P=1, 4-D value, scalar multiply fused after gather."""
+        x, i = self._xi4d(P=1)
+        self._stage_and_e2e(lambda x, i: x[i] * 2.0, x, i, expect=GATHER_OP_SPEC)
+
+    # P=1 embedding API variants
+    def test_single_idx_embedding_large_vocab(self):
+        """P=1, torch.embedding, large vocab (V=4096) with a multi-stick embedding dim."""
+        V, E = 4096, 512
+        weight = self.to_spyre(torch.rand(V, E, dtype=torch.float16))
+        idx = torch.randint(0, V, (1,), dtype=torch.int32).to("spyre")
+        self.name_dims(weight, {"V": V, "E": E})
+        self.name_dims(idx, {"P": 1})
+        self._stage_and_e2e(
+            lambda w, i: torch.embedding(w, i), weight, idx, expect=GATHER_OP_SPEC
+        )
+
+    def test_single_idx_embedding_non_aligned_dim(self):
+        """P=1, torch.embedding, embedding dim not stick-aligned (E=100)."""
+        V, E = 256, 100
+        weight = self.to_spyre(torch.rand(V, E, dtype=torch.float16))
+        idx = torch.randint(0, V, (1,), dtype=torch.int32).to("spyre")
+        self.name_dims(weight, {"V": V, "E": E})
+        self.name_dims(idx, {"P": 1})
+        self._stage_and_e2e(
+            lambda w, i: torch.embedding(w, i), weight, idx, expect=GATHER_OP_SPEC
+        )
+
+    def test_single_idx_embedding_int64(self):
+        """P=1, torch.embedding, int64 index — typical token id dtype."""
+        V, E = 256, 128
+        weight = self.to_spyre(torch.rand(V, E, dtype=torch.float16))
+        idx = torch.randint(0, V, (1,), dtype=torch.int64).to("spyre")
+        self.name_dims(weight, {"V": V, "E": E})
+        self.name_dims(idx, {"P": 1})
+        self._stage_and_e2e(
+            lambda w, i: torch.embedding(w, i), weight, idx, expect=GATHER_OP_SPEC
+        )
+
+    def test_single_idx_functional_embedding(self):
+        """P=1, torch.nn.functional.embedding — single token."""
+        V, E = 256, 128
+        weight = self.to_spyre(torch.rand(V, E, dtype=torch.float16))
+        idx = torch.randint(0, V, (1,), dtype=torch.int32).to("spyre")
+        self.name_dims(weight, {"V": V, "E": E})
+        self.name_dims(idx, {"P": 1})
         self._stage_and_e2e(
             lambda i, w: torch.nn.functional.embedding(i, w),
             idx,

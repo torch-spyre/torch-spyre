@@ -525,8 +525,14 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
     try:
         from torch_spyre import _C  # noqa: PLC0415
 
-        if _C.has_stream_error():
-            pytest.skip("Device is in error state — a process restart is required")
+        state = _C.get_device_state()
+        if state == _C.SpyreDeviceState.StreamError:
+            pytest.skip(
+                f"Device is in error state ({state.name})"
+                " — a process restart is required"
+            )
+        # SpyreDeviceState.NotInitialized → proceed (runtime not started yet)
+        # SpyreDeviceState.Ok             → proceed
     except ImportError:
         # torch_spyre._C not built or not installed — nothing to check.
         pass
