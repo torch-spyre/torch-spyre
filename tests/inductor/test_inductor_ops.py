@@ -4536,10 +4536,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         # conv2d exercising the native conv2d SDSC path (lower_convolution) with
-        # the direct-lowering flag on (config.conv2d_direct_lowering). Only
-        # kernels >=2x2 direct-lower: a 1x1 kernel has size-1 window taps that
-        # DDC's conv path rejects, so it falls back to the im2col+matmul
-        # decomposition -- 1x1 is covered by the ("test_conv2d", ...) case
+        # the direct-lowering flag on (config.conv2d_direct_lowering). Only a
+        # true 1x1 kernel falls back: it has size-1 window taps on *both* axes,
+        # so the SDSC carries no window dim and DDC's conv path rejects it. A
+        # 1xN / Nx1 kernel keeps one window dim and direct-lowers (see the k1x3
+        # / k3x1 cases below) -- 1x1 is covered by the ("test_conv2d", ...) case
         # "2x3x32_ksize1" above (with NCHW input), so it is intentionally not
         # duplicated here (this test feeds channel-last input, which suits direct
         # lowering but not the decomposition's reshape path). Supported direct
@@ -4581,6 +4582,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "1x64x8x8_k3_cout32": (
                     cached_randn((1, 64, 8, 8)),
                     cached_randn((32, 64, 3, 3)),
+                    None,
+                    (1, 1),
+                ),
+                # 1xN kernel (kH==1, kW==3): a 1-D conv along width. The kH tap
+                # is size-1 and squeezed out, so the SDSC carries only the kW
+                # window dim -- DDC's conv path accepts a single window dim, so
+                # this direct-lowers (a 1-D conv) rather than falling back.
+                "1x64x8x8_k1x3": (
+                    cached_randn((1, 64, 8, 8)),
+                    cached_randn((64, 64, 1, 3)),
+                    None,
+                    (1, 1),
+                ),
+                # Nx1 kernel (kH==3, kW==1): a 1-D conv along height. Mirror of
+                # the 1xN case on the other spatial axis.
+                "1x64x8x8_k3x1": (
+                    cached_randn((1, 64, 8, 8)),
+                    cached_randn((64, 64, 3, 1)),
                     None,
                     (1, 1),
                 ),

@@ -694,12 +694,15 @@ def _is_direct_conv_supported(
     Keep this in lock-step with the guards in lower_convolution so that whenever
     the decomposition defers here, the lowering is guaranteed to accept the op.
     Everything else stays on the im2col+matmul decomposition.  Excluded:
-    - 1x1 kernel: a 1x1 conv has size-1 kernel taps (ki/kj), which the pipeline
-      squeezes out so the emitted SDSC carries no window dims -- but DDC's conv
-      path expects windowed spatial dims and aborts in dimension-mapping
-      (ddl_conversion.cpp "Unknown primary dimension kind for a window
-      dimension").  A 1x1 conv is just a channel matmul, so it stays on the
-      im2col+matmul path, which handles it exactly;
+    - 1x1 kernel: only the 1x1 case has size-1 kernel taps on *both* axes
+      (ki and kj), which the pipeline squeezes out so the emitted SDSC carries
+      no window dims at all -- and DDC's conv path expects at least one windowed
+      spatial dim, aborting in dimension-mapping (ddl_conversion.cpp "Unknown
+      primary dimension kind for a window dimension").  A 1x1 conv is just a
+      channel matmul, so it stays on the im2col+matmul path, which handles it
+      exactly.  A 1xN / Nx1 kernel squeezes only one tap and keeps the other
+      window dim, which DDC does accept (a 1-D conv) -- so those direct-lower
+      and are covered by the test_conv2d_direct k1x3 / k3x1 cases;
     - non-zero padding: the DDC zero-fill for a padded conv input is not wired
       for regular conv2d, so pad>0 stays on the im2col+matmul path (which pads
       correctly);

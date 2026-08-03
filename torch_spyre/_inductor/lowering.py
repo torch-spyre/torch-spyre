@@ -874,10 +874,12 @@ def lower_convolution(
     if x.get_dtype() != torch.float16:
         raise Unsupported(f"conv2d direct lowering: dtype {x.get_dtype()} (fp16 only)")
     if weight.get_size()[-2] == 1 and weight.get_size()[-1] == 1:
-        # A 1x1 kernel squeezes ki/kj to size-1, leaving the conv SDSC with no
-        # window dims -- which DDC's conv path rejects in dimension-mapping. A
-        # 1x1 conv is a channel matmul; it stays on the im2col+matmul
-        # decomposition (see _is_direct_conv_supported).
+        # Only a 1x1 kernel squeezes *both* ki and kj to size-1, leaving the
+        # conv SDSC with no window dims -- which DDC's conv path rejects in
+        # dimension-mapping. A 1x1 conv is a channel matmul; it stays on the
+        # im2col+matmul decomposition (see _is_direct_conv_supported). A 1xN /
+        # Nx1 kernel keeps one window dim and direct-lowers fine (a 1-D conv;
+        # verified by the test_conv2d_direct k1x3 / k3x1 cases).
         raise Unsupported("conv2d direct lowering: 1x1 kernel (use decomposition)")
 
     x.realize()
