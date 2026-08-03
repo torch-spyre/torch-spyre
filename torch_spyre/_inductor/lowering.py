@@ -28,6 +28,7 @@ from .constants import (
     AVGPOOL2D_OP,
     FP8_E4M3_MAX,
     FP16_MAX_VALUE_ENCODED,
+    QUANTSCALEPERTOKENFP8_CLIP_MIN,
     BATCH_MATMUL_OP,
     CONV2D_FWD_OP,
     COPY_BACK_CANDIDATE_ATTR,
@@ -1869,6 +1870,19 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3_MAX):
     """
     from torch_spyre._C import encode_constant, DataFormats
 
+    # Validate scale_ub parameter
+    if scale_ub <= 0:
+        raise ValueError(
+            f"scale_ub must be positive, got {scale_ub}. "
+            f"Typical value is FP8_E4M3_MAX ({FP8_E4M3_MAX})"
+        )
+    if not (1e-10 < scale_ub < 1e10):  # Reasonable FP16 range
+        logger.warning(
+            "scale_ub=%s is outside typical range [1e-10, 1e10]. "
+            "This may cause FP16 encoding issues.",
+            scale_ub,
+        )
+
     # Get reduction parameters - use standard inner_fn
     kwargs = lowering._make_reduction_inner(
         x, axis=[-1], keepdims=True, dtype=x.get_dtype(), override_return_dtype=None
@@ -1886,21 +1900,27 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3_MAX):
         ) from e
     except Exception as e:
         # Unexpected error - log and re-raise with context
-        logger.error("Unexpected error encoding mulConst=%s for quantscalepertokenfp8: %s", mul_const, e)
+        logger.error(
+            "Unexpected error encoding mulConst=%s for quantscalepertokenfp8: %s",
+            mul_const,
+            e,
+        )
         raise
 
-    # Use clipMin value from ground truth SDSC (4096)
-    # Note: clipMin is required by DDL template but not used in quantscalepertokenfp8 computation
-    # Ground truth value from granite_fp8 SDSC files
-    clip_min_value = 4096
+    # clipMin is required by the DeepTools DDL template for quantscalepertokenfp8.
+    clip_min_value = QUANTSCALEPERTOKENFP8_CLIP_MIN
 
     op_info = {
         "constants": {
             "mulConst": mul_const_encoded,
-            "clipMin": clip_min_value,  # Ground truth value: 4096 (FP16 representation of -448.0)
+            "clipMin": clip_min_value,  # 4096: deeptools DLF16 encoded constant
             "clipMax": FP16_MAX_VALUE_ENCODED,
         },
-        "constants_raw": ("mulConst", "clipMin", "clipMax"),  # All three are raw integers
+        "constants_raw": (
+            "mulConst",
+            "clipMin",
+            "clipMax",
+        ),  # All three are raw integers
     }
 
     # Use same pattern as exx2 - pass all kwargs including inner_fn

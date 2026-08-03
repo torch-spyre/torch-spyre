@@ -193,6 +193,12 @@ FP8_E4M3FN_MIN = float(FP8_E4M3FN_INFO.min)
 # Used as clipMax in quantscalepertokenfp8 operation to prevent overflow during FP8 quantization.
 FP16_MAX_VALUE_ENCODED = 32255
 
+# DDL template constant for quantscalepertokenfp8 clipMin parameter
+# Required by the DeepTools DDL template for operation compilation.
+# Value: 4096 (DLF16 encoded constant from deeptools specification)
+QUANTSCALEPERTOKENFP8_CLIP_MIN = 4096
+
+
 # Operation name for per-token FP8 quantization scale computation
 QUANTSCALEPERTOKENFP8_OP = "quantscalepertokenfp8"
 
