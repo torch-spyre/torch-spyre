@@ -624,7 +624,9 @@ def _(
     return input.new_empty(output_shape)
 
 
-@torch.library.custom_op("spyre::conv2d_with_bias", mutates_args=(), device_types="spyre")
+@torch.library.custom_op(
+    "spyre::conv2d_with_bias", mutates_args=(), device_types="spyre"
+)
 def spyre_conv2d_with_bias(
     input: torch.Tensor,
     weight: torch.Tensor,

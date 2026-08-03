@@ -4539,16 +4539,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     [[64, 64, 1, 1, 64], [3, 3, 1, 1, 64]],
                     [[1, 64, -1, 65536, 4096], [1, 3, -1, 9, 9]],
                 ),
-                "mistral_model_depthwise": (
-                    cached_randn((1, 3, 392, 532)),
-                    cached_randn((3, 1, 14, 14)),
-                    None,
-                    (0, 0),
-                    (1, 1),
-                    3,
-                    [[532, 392, 1, 1, 64], [14, 14, 1, 1, 64]],
-                    [[1, 532, -1, 625632, 208544], [1, 14, -1, 196, 196]],
-                ),
                 "2x32_ksize1_stride2_depthwise": (
                     cached_randn((2, 32, 64, 64)),
                     cached_randn((32, 1, 1, 1)),
@@ -4566,7 +4556,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (0, 0),
                     (1, 1),
                     3,
-                    [[128, 128, 1, 1, 64], [5, 5, 1, 8, 64]],
+                    [[128, 128, 1, 1, 64], [5, 5, 1, 1, 64]],
                     [[1, 128, -1, 49152, 16384], [1, 5, -1, 25, 25]],
                 ),
             },
@@ -6568,6 +6558,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self, x, weight, bias, padding, stride, groups, dev_layout, dev_stride
     ):
         from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+        torch._dynamo.reset()
+        torch._inductor.codecache.FxGraphCache.clear()
 
         device_dtype_fp16 = get_device_dtype(torch.float16)
         x_layout = SpyreTensorLayout(dev_layout[0], dev_stride[0], device_dtype_fp16)

@@ -14,30 +14,32 @@
 
 import dataclasses
 import math
-from typing import Any
 from collections import Counter
-from sympy import Integer, Symbol, Expr
+from typing import Any
 
+from sympy import Expr, Integer, Symbol
 from torch._inductor.virtualized import V
+
 from torch_spyre._C import DataFormats
+from torch_spyre._inductor import config as _spyre_config
+from torch_spyre._inductor.config import disable_conv2d_spatial_split
 from torch_spyre._inductor.constants import (
+    CONV2D_DIM_LABELS,
+    CONV2D_LAYOUT_LABELS,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
-    OUTPUT_DIM_LABELS,
     LAYOUT_LABELS,
     MATMUL_DIM_LABELS,
     MATMUL_LAYOUT_LABELS,
     MATMUL_REDUCTION_OPS,
+    OUTPUT_DIM_LABELS,
     POOL_DIM_LABELS,
     POOL_OPS,
     RESTICKIFY_OP,
     TOPK_OPS,
-    CONV2D_DIM_LABELS,
-    CONV2D_LAYOUT_LABELS,
 )
-from torch_spyre._inductor import config as _spyre_config
-from torch_spyre._inductor.config import disable_conv2d_spatial_split
 from torch_spyre._inductor.core_mapping import core_to_slice_mapping
+from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.indirect_access import (
     compute_indirect_max_dim_sizes,
     get_index_tensor_for_value,
@@ -54,7 +56,6 @@ from torch_spyre._inductor.op_spec import (
     OpSpec,
     TensorArg,
 )
-from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.pass_utils import coeff_through_floor
 
 from .compute_ops import SymbolKind, generate_sdsc, num_bytes
@@ -717,7 +718,9 @@ def _build_conv2d_symbol_mapping(
             break
 
     # Build mapping for all symbols
-    non_kernel_labels = [label for label in CONV2D_DIM_LABELS if label not in ("ki", "kj")]
+    non_kernel_labels = [
+        label for label in CONV2D_DIM_LABELS if label not in ("ki", "kj")
+    ]
     label_idx = 0
 
     for sym in sym_list:
@@ -1543,7 +1546,6 @@ def compile_op_spec(
     symbol_id_offset: int = 0,
     use_symbols: bool = False,
 ) -> tuple[Any, list[int], list[list[dict]], list[SymbolKind]]:
-
     sdsc_spec, symbol_mapping = parse_op_spec(op_spec)
     logger.debug("%s", sdsc_spec)
     # Translate tiled_symbols from OpSpec's per-level inductor symbols (innermost-

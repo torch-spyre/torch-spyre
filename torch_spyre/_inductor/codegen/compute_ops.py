@@ -15,12 +15,12 @@
 
 import dataclasses
 
-from torch_spyre._C import encode_constant, DataFormats
-from torch_spyre._inductor.constants import DEPTHWISE_CONV2D_OP
+from sympy import Symbol
 
+from torch_spyre._C import DataFormats, encode_constant
+from torch_spyre._inductor.constants import DEPTHWISE_CONV2D_OP
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import coeff_through_floor
-from sympy import Symbol
 
 
 def _build_padding_for_tensor(conv_params):
