@@ -2290,8 +2290,11 @@ def test_view_1d_subdim_Lq2_D2():
     def fn(a, b):
         a = a.view(Lq, D)
         b = b.view(Lq, D)
-        with spyre_hint(num_tiles_per_dim={"Lq": 2}):
-            with spyre_hint(num_tiles_per_dim={"D": 2}):
+        # Lq and D share one host dim (the flat Lq*D range), so tile sizes are
+        # absolute HOST-dim extents and the inner size must divide the outer:
+        # Lq/2 x D = 16384 outer, then Lq/2 x D/2 = 8192 inner.
+        with spyre_hint(tile_size_per_dim={"Lq": (Lq // 2) * D}):
+            with spyre_hint(tile_size_per_dim={"D": (Lq // 2) * (D // 2)}):
                 with spyre_hint(expected_named_dims=["Lq", "D"]):
                     return a * b
 
@@ -5516,8 +5519,10 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             _name_tensor_dims(a, ["Lq", "D"])
             _name_tensor_dims(b, ["Lq", "D"])
             c = torch.full([Lq * D], 0, device=a.device, dtype=torch.float16)
-            with spyre_hint(num_tiles_per_dim={"Lq": 2}):
-                with spyre_hint(num_tiles_per_dim={"D": 2}):
+            # Absolute HOST-dim extents; inner divides outer.  See
+            # test_view_1d_subdim_Lq2_D2 for the same pairing.
+            with spyre_hint(tile_size_per_dim={"Lq": (Lq // 2) * D}):
+                with spyre_hint(tile_size_per_dim={"D": (Lq // 2) * (D // 2)}):
                     c.copy_(a + b)
             return c
 
