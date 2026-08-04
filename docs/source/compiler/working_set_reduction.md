@@ -344,12 +344,12 @@ A buffer that crosses the loop boundary and is *not* marked
 `per_tile_fixed` (see [`coarse_tiling_loops.md`](coarse_tiling_loops.md))
 advances its base address once per loop iteration, so its HBM pool
 allocation must be sized for every tile it will occupy across the loop's
-run, not just one. `memory_planning.py`'s `_advance_factor` computes this
-as the product of `loop_count` over the levels the buffer is tiled on;
-sizing it for a single tile would let the loop overrun into whatever buffer
-the allocator packed next to it. See
-[`coarse_tiling_loops.md`](coarse_tiling_loops.md) for the `accum_full` /
-`accum_tile` buffers this sizing matters most for.
+run, not just one. `hbm_pool_planning.py`'s `_compute_size_bytes` sizes each
+buffer from its full `FixedTiledLayout.device_layout.device_size`, which
+spans every tile the buffer occupies across the loop; sizing it for a single
+tile would let the loop overrun into whatever buffer the allocator packed
+next to it. See [`coarse_tiling_loops.md`](coarse_tiling_loops.md) for the
+`accum_full` / `accum_tile` buffers this sizing matters most for.
 
 ## Related documents
 

@@ -140,6 +140,7 @@ jobs:
       }}
     outputs:
       matrix: ${{ steps.filter.outputs.matrix }}
+      resolved_test_type: ${{ steps.filter.outputs.resolved_test_type }}
     steps:
       # NORMAL: sparse-checkout the configs from github.com at the requested ref.
       - if: ${{ !inputs.prebaked_image }}
@@ -155,6 +156,8 @@ jobs:
 
       - name: Filter configs by TEST_TYPE
         id: filter
+        env:
+          RAW_TEST_TYPE: ${{ inputs.test_type || 'full' }}
         run: |
           # Prebaked: read the configs baked in the dev image; else the checkout cwd.
           # cd into the source root so every path below stays repo-relative and
@@ -167,10 +170,24 @@ jobs:
           fi
           matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
             --config-dir tests/configs/torch_spyre_tests \
-            --test-type "${{ inputs.test_type || 'full' }}" \
+            --test-type "${RAW_TEST_TYPE}" \
             --runner-map .github/runner_overrides.yaml \
             --format matrix-json)
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+          # Everything downstream of this job (TORCH_SPYRE_TEST_TYPE env var, the
+          # test_multi_spyre distributed-suite gate) compares test_type by literal
+          # string, bypassing filter_configs.py's own alias resolution -- resolve
+          # once here via the same source of truth so unit/integration/regression
+          # behave identically everywhere, not just in the label-matching path.
+          resolved=$(python3 -c "
+          import sys
+          sys.path.insert(0, 'tests/oot_framework/utils')
+          from filter_configs import resolve_test_type
+          import os
+          print(resolve_test_type(os.environ['RAW_TEST_TYPE'].strip()))
+          ")
+          echo "resolved_test_type=$resolved" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # Job 0b: build torch-spyre ONCE
@@ -262,7 +279,7 @@ jobs:
       # GitHub Actions sets CI=true which causes pytest inductor tests to fail.
       # Explicitly clear it.
       CI: ''
-      TORCH_SPYRE_TEST_TYPE: ${{ inputs.test_type || 'full' }}
+      TORCH_SPYRE_TEST_TYPE: ${{ needs.generate_matrix.outputs.resolved_test_type }}
 
     strategy:
       fail-fast: false
@@ -372,7 +389,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test_multi_spyre:
     name: ${{ matrix.suite.name }}
-    needs: build_torch_spyre
+    needs: [generate_matrix, build_torch_spyre]
     # Run for distributed-including test_types AND only when the single build
     # succeeded or was skipped (RPM path). A failed build skips this job too.
     # The leading `!cancelled() &&` is REQUIRED (see the `test` job above):
@@ -380,10 +397,10 @@ jobs:
     # this job on the RPM path, where build_torch_spyre is intentionally skipped.
     if: >-
       !cancelled() &&
-      (inputs.test_type == '' ||
-       inputs.test_type == 'full' ||
-       inputs.test_type == 'device_critical' ||
-       inputs.test_type == 'suite_distributed') &&
+      (needs.generate_matrix.outputs.resolved_test_type == '' ||
+       needs.generate_matrix.outputs.resolved_test_type == 'full' ||
+       needs.generate_matrix.outputs.resolved_test_type == 'device_critical' ||
+       needs.generate_matrix.outputs.resolved_test_type == 'suite_distributed') &&
       (needs.build_torch_spyre.result == 'success' ||
        needs.build_torch_spyre.result == 'skipped')
     runs-on:

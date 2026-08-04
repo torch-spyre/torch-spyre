@@ -81,13 +81,12 @@ class TestSpyreProfiler(TestCase):
 
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
-            with_stack=True,
-        ):  # as prof
+            with_stack=False,
+        ) as prof:
             x *= 2
-        self.assertTrue(True)
-        # TODO(#114): restore once libaiupti + kineto-spyre are rebuilt in lockstep.
-        # names = [e.name for e in prof.events()]
-        # self.assertTrue("aten::mul_" in names)
+            # TODO(#114): check with_stack=True once libaiupti + kineto-spyre are rebuilt in lockstep.
+        names = [e.name for e in prof.events()]
+        self.assertTrue("aten::mul_" in names)
 
     @unittest.skipUnless(Test_spyre, "require spyre device")
     def test_event_list(self):
@@ -192,8 +191,8 @@ def test_synchronize_callable():
     assert hasattr(torch, "spyre"), "torch.spyre namespace is missing"
     assert hasattr(torch.spyre, "synchronize"), "torch.spyre.synchronize() is missing"
 
-    x = torch.randn(64, 64, device="spyre")
-    y = torch.randn(64, 64, device="spyre")
+    x = torch.randn((64, 64), dtype=torch.float16, device="spyre")
+    y = torch.randn((64, 64), dtype=torch.float16, device="spyre")
 
     z = torch.matmul(x, y)
 

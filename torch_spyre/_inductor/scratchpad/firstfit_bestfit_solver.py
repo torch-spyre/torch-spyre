@@ -126,16 +126,19 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
         self,
         buffer: LifetimeBoundBuffer,
         placed: list[LifetimeBoundBuffer],
+        *,
+        reuse_in_place_parents: bool = True,
     ) -> list[Gap]:
         """Build free gaps for buffer, annotated with valid in-place parent addresses.
 
         Pass 1: subtract address intervals of all already-placed buffers that overlap
-        buffer's lifetime, except declared in-place parents (their slots are candidates
-        for reuse, not conflicts).
+        buffer's lifetime. During the in-place attempt, declared parents are kept as
+        reuse candidates rather than conflicts. During ordinary fallback placement,
+        they are conflicts like every other live buffer.
         Pass 2: for each remaining gap, record which declared parents fit entirely within it.
         """
         gaps: list[Gap] = [Gap(0, self.limit)]
-        parent_names = set(buffer.in_place_parents)
+        parent_names = set(buffer.in_place_parents) if reuse_in_place_parents else set()
 
         for other in placed:
             if other.address is None:
@@ -225,6 +228,15 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
                 buffer.address = names_to_addresses[parent]
                 names_to_addresses[buffer.name] = buffer.address
             else:
+                # Exact parent-slot reuse was not legal, usually because a third
+                # live buffer occupies part of that slot. Rebuild the ordinary
+                # gaps with the parent treated as a conflict; otherwise a shifted
+                # placement can partially overlap the still-live parent.
+                gaps = self._build_gaps(
+                    buffer,
+                    placed,
+                    reuse_in_place_parents=False,
+                )
                 gap = self._pick_gap(gaps, buffer.size)
                 if gap is not None:
                     buffer.address = round_up_to_alignment(gap.start, self.alignment)

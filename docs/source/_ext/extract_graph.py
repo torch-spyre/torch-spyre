@@ -829,6 +829,7 @@ def build_graph(torch_spyre_root):
         (extract_custom_ops, root / "_inductor" / "customops.py"),
         (extract_fallbacks, root / "ops" / "fallbacks.py"),
         (extract_eager_kernels, root / "ops" / "eager.py"),
+        (extract_eager_kernels, root / "_inductor" / "customops.py"),
         (extract_passes, root / "_inductor" / "passes.py"),
     ]
 
@@ -880,7 +881,11 @@ def build_graph(torch_spyre_root):
         n, e = _run_file_extractor(extract_config, config_path, repo_root)
         all_nodes.extend(n)
         all_edges.extend(e)
-    for extra_config in [root / "__init__.py", root / "logging_config.py"]:
+    for extra_config in [
+        root / "__init__.py",
+        root / "logging_config.py",
+        root / "profiler" / "_ffdc.py",
+    ]:
         if extra_config.exists():
             n, e = _run_file_extractor(extract_config, extra_config, repo_root)
             all_nodes.extend(n)

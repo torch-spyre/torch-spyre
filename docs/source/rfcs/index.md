@@ -16,14 +16,19 @@ and submit a pull request.
 | RFC | Title | Area |
 |-----|-------|------|
 | [0047](https://github.com/torch-spyre/rfcs/blob/main/0047-TiledTensors/0047-TiledTensorsRFC.md) | Tensors with Device-Specific Layouts | Tensor layouts |
+| [0099](https://github.com/torch-spyre/rfcs/blob/main/0099-MultiDevice/0099-MultiDeviceRFC.md) | Multi-Spyre Device Support in PyTorch | Distributed |
 | [0171](https://github.com/torch-spyre/rfcs/blob/main/0171-SpyreDevice/0171-SpyreDeviceRFC.md) | Spyre Device Construct in PyTorch | Device integration |
 | [0186](https://github.com/torch-spyre/rfcs/blob/main/0186-TestFrameworks/0186-TestFrameworks.md) | Test Frameworks | Testing |
 | [0601](https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md) | Spyre Profiling Toolkit | Profiling |
 | [0682](https://github.com/torch-spyre/rfcs/blob/main/0682-KtirSpec/0682-KtirSpecRFC.md) | Kernel Tile Intermediate Representation | Compiler IR |
+| [1069](https://github.com/torch-spyre/rfcs/blob/main/1069-SpyreTensorLayoutExtraction/1069-SpyreTensorLayoutExtraction.md) | SpyreTensorLayout Extraction via CPU Compilation | Tensor layouts |
 | [1287](https://github.com/torch-spyre/rfcs/blob/main/1287-SpyreTestFramework/1287-SpyreTestFrameworkRFC.md) | Test Suite Configuration for Upstream PyTorch Tests on OOT Devices | Testing |
 | [1358](https://github.com/torch-spyre/rfcs/blob/main/1358-CoarseTiling/1358-CoarseTiling.md) | Coarse Tiling | Compiler |
 | [1632](https://github.com/torch-spyre/rfcs/blob/main/1632-ModelEnablement/1632-ModelEnablement.md) | Model Enablement Tracking | Model enablement |
 | [1633](https://github.com/torch-spyre/rfcs/blob/main/1633-E2EModelPerf/1633-E2EModelPerf.md) | End-to-End Model Performance Testing | Performance |
+| [2676](https://github.com/torch-spyre/rfcs/blob/main/2676-SpyreMetricsApiExtension/2676-SpyreMetricsApiExtensionRFC.md) | Spyre Metrics API Extension Package | Profiling |
+| [2696](https://github.com/torch-spyre/rfcs/blob/main/2696-AiuSmiExtension/2696-AiuSmiExtensionRFC.md) | aiu-smi Extension Package | Profiling |
+| [2971](https://github.com/torch-spyre/rfcs/blob/main/2971-FP32ElementArrangement/2971-FP32ElementArrangementRFC.md) | FP32 Element Arrangement | Compiler |
 
 ## Summaries
 
@@ -35,6 +40,13 @@ cannot represent tiled tensors, and specifies the `SpyreTensorLayout` data
 structure that maps between PyTorch coordinates and Spyre device memory.
 
 See also: [Tensor Layouts](../user_guide/tensors_and_layouts.md)
+
+### RFC 0099 — Multi-Spyre Device Support in PyTorch
+
+Describes the additions required to bring a Spyre-based collective communication
+library into the PyTorch ecosystem. Specifies a module that implements the
+PyTorch distributed interfaces and registers as the default process group for
+Spyre devices, backed by an external Spyre communication library.
 
 ### RFC 0171 — Spyre Device Construct in PyTorch
 
@@ -72,6 +84,15 @@ memory and scratchpad in a hardware-independent form that DeepTools
 then lowers to device-specific code.
 
 See also: [Compiler Backend](../compiler/backend.md)
+
+### RFC 1069 — SpyreTensorLayout Extraction via CPU Compilation
+
+Proposes capturing the `SpyreTensorLayout` for each operation in a PyTorch model
+by compiling and running the model on the CPU. Using the CPU as a proxy for
+Spyre execution extracts the exact layouts expected on Spyre without requiring
+full operator support on the target backend.
+
+See also: [Tensor Layouts](../user_guide/tensors_and_layouts.md)
 
 ### RFC 1287 — Test Suite Configuration for Upstream PyTorch Tests on OOT Devices
 
@@ -112,3 +133,32 @@ dimensions — correctness against HuggingFace references, benchmarking
 (latency, throughput, TTFT, ITL), and quality evals (GSM8K, MMLU, and
 use-case-specific benchmarks) — leaning on upstream tooling such as
 `HfRunner`, `VLLMRunner`, `vllm bench`, and `lm-evaluation-harness`.
+
+### RFC 2676 — Spyre Metrics API Extension Package
+
+Proposes hosting `spyre-metrics-api` (Python import name `spyremetrics`) inside
+the torch-spyre repository under a top-level `extensions/` directory, as an
+independently packaged and versioned Python distribution. The package provides a
+public Python API for reading and parsing IBM Spyre performance metric files
+that contain hardware performance counters emitted by the Spyre runtime and
+driver layer. It abstracts the binary format, supports both PF- and VF-based
+metric formats, and exposes typed metric definitions with units and scaling.
+
+### RFC 2696 — aiu-smi Extension Package
+
+Proposes hosting `aiu-smi`, a performance monitoring tool for the IBM Spyre
+accelerator, inside the torch-spyre repository under the `extensions/`
+directory, as an independently packaged and versioned Python distribution.
+`aiu-smi` periodically reads Spyre metric data and prints per-device telemetry
+(power, temperature, busy percentage, PT-array utilization, memory bandwidth,
+reserved, active, and peak memory, host CPU and memory, and process mapping) in
+text or CSV form. It consumes the `spyre-metrics-api` extension.
+
+### RFC 2971 — FP32 Element Arrangement
+
+Specifies how widening a tensor's elements on device (16-bit `DL16` or `BF16` to
+32-bit `FP32`) leaves them staggered rather than in standard stick order: all
+values are correct, but within-stick position no longer matches logical order.
+The Inductor backend tracks this as an Element Arrangement (EA) per layout and
+gates op legality on it through `is_ea_compatible` and `validate_ops`. FP32 is
+ephemeral, never stored, and only a transient widening.
