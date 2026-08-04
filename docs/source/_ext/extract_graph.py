@@ -846,7 +846,7 @@ def build_graph(torch_spyre_root):
         root / "_inductor" / "optimize_restickify.py",
         root / "_inductor" / "propagate_hints.py",
         root / "_inductor" / "work_division.py",
-        root / "_inductor" / "memory_planning.py",
+        root / "_inductor" / "hbm_pool_planning.py",
         root / "device" / "interface.py",
         root / "execution" / "async_compile.py",
         root / "execution" / "kernel_runner.py",

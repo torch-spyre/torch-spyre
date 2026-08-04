@@ -21,8 +21,8 @@
 #include <pybind11/native_enum.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
-#include <util/sen_data_convert.h>
-#include <util/sendefs.h>
+#include <spyrecode-host-functions/sendataconvert/sen_data_convert.h>
+#include <util/sendefs/sendefs.h>
 
 #include <cstdlib>     // std::getenv
 #include <filesystem>  // NOLINT(build/c++17)
@@ -46,6 +46,7 @@
 #include "prepare_kernel.h"
 #include "spyre_allocator.h"
 #include "spyre_device_enum.h"
+#include "spyre_error.h"
 #include "spyre_generator_impl.h"
 #include "spyre_guard.h"
 #include "spyre_kernel.h"
@@ -517,4 +518,37 @@ PYBIND11_MODULE(_C, m) {
         allocator.resetPeakStats(device);
       },
       py::arg("device"), "Reset peak allocator statistics");
+
+  // ── Typed stream error API ───────────────────────────────────────────────
+
+  py::enum_<spyre::SpyreStreamError>(m, "SpyreStreamError")
+      .value("Success", spyre::SpyreStreamError::Success)
+      .value("Shutdown", spyre::SpyreStreamError::Shutdown);
+
+  py::enum_<spyre::SpyreDeviceState>(m, "SpyreDeviceState")
+      .value("Ok", spyre::SpyreDeviceState::Ok)
+      .value("NotInitialized", spyre::SpyreDeviceState::NotInitialized)
+      .value("StreamError", spyre::SpyreDeviceState::StreamError);
+
+  m.def(
+      "stream_get_error",
+      [](const spyre::SpyreStream& stream) {
+        return spyre::SpyreStreamGetError(stream);
+      },
+      py::arg("stream"),
+      "Return the SpyreStreamError state of a single stream.");
+
+  m.def(
+      "stream_get_error_string",
+      [](spyre::SpyreStreamError err) -> std::string {
+        return spyre::SpyreStreamGetErrorString(err);
+      },
+      py::arg("error"),
+      "Return a human-readable string for a SpyreStreamError value.");
+
+  m.def(
+      "get_device_state", []() { return spyre::SpyreGetDeviceState(); },
+      "Return the SpyreDeviceState aggregate for the process. "
+      "Returns NotInitialized when the runtime has not been created yet; "
+      "callers should treat this as 'proceed / no error'.");
 }

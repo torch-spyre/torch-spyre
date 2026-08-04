@@ -1,40 +1,49 @@
 test_suite_config:
   files:
-    # Classes: TestProfiler, TestExperimentalUtils, TestProfilerEventsParity None of these use instantiate_device_type_tests(). 
+    # Classes exercised here:
+    #   TestProfiler, TestExperimentalUtils, TestProfilerEventsParity
+    #     - do NOT use instantiate_device_type_tests(); run once on CPU.
+    #   TestProfilerDevice (NEW in PyTorch 2.13)
+    #     - DOES use instantiate_device_type_tests(), so it generates a
+    #       PrivateUse1/_spyre variant per method. In 2.12 these methods
+    #       lived in the CPU-only TestProfiler class; 2.13 moved them into
+    #       TestProfilerDevice and their payload() now runs on the device
+    #       (torch.mm on fp32) -- which Spyre does not support. The whole
+    #       class is skipped for Spyre below (see the TestProfilerDevice
+    #       entry); only genuine profiler infrastructure would need to be
+    #       enabled, and that requires an fp16/PrivateUse1-aware payload
+    #       upstream.
     - path: ${TORCH_ROOT}/test/profiler/test_profiler.py
       unlisted_test_mode: skip
       tests:
         - names:
-            - TestProfiler::test_kineto
+            # Still CPU-only in TestProfiler on 2.13 (no device param).
             - TestProfiler::test_module_hierarchy
             - TestProfiler::test_profiler_correlation_id
-            - TestProfiler::test_memory_profiler
-            - TestProfiler::test_flops
-            - TestProfiler::test_kineto_profiler_api
-            - TestProfiler::test_tensorboard_trace_handler
             - TestProfiler::test_profiler_tracing
-            - TestProfiler::test_basic_chrome_trace
-            - TestProfiler::test_cpu_annotation_overlap
-            - TestProfiler::test_user_annotation
             - TestExperimentalUtils::test_utils_compute_idle_time
           mode: mandatory_success
 
         - names:
+            # Their shared payload() runs `torch.mm(x, y)` on fp32
+            # tensors moved to the device
+            - TestProfilerDevice::test_kineto
+            - TestProfilerDevice::test_memory_profiler
+            - TestProfilerDevice::test_flops
+            - TestProfilerDevice::test_kineto_profiler_api
+            - TestProfilerDevice::test_tensorboard_trace_handler
+            - TestProfilerDevice::test_basic_chrome_trace
+            - TestProfilerDevice::test_cpu_annotation_overlap
+            - TestProfilerDevice::test_user_annotation
             # RuntimeError: VFIO DeviceOpenFail during profiler teardown ->
-            # subprocess exit 255 -> AssertionError: Kineto is not working
-            # properly with the Dynolog environment variable (segfault in
-            # ProfilerStateBase destructor). Needs PrivateUse1 activity
-            # check and device-init guard in subprocess snippet.
-            - TestProfiler::test_kineto_profiler_with_environment_variable
-            # SKIPPED: @unittest.skipUnless(TEST_CUDA or TEST_XPU, "requires gpu")
-            # Needs TEST_SPYRE added to upstream skip decorator.
-            - TestProfiler::test_basic_profile
-            # SKIPPED: @unittest.skipIf(not torch.cuda.is_available()) —
-            # needs Spyre guard; forward portion only (has backward).
-            - TestProfiler::test_event_list
-            # SKIPPED: @unittest.skipIf(not torch.cuda.is_available()) —
-            # needs Spyre guard + ProfilerActivity swap.
-            - TestProfiler::test_dynamic_toggle
+            # subprocess exit 255 (segfault in ProfilerStateBase dtor).
+            - TestProfilerDevice::test_kineto_profiler_with_environment_variable
+            # @onlyAccelerator forward payload -> fp32 device compute.
+            - TestProfilerDevice::test_basic_profile
+            # Device-parametrized; forward payload runs on device.
+            - TestProfilerDevice::test_event_list
+            # Device-parametrized; needs ProfilerActivity swap for Spyre.
+            - TestProfilerDevice::test_dynamic_toggle
             # Class-level @skipIf(not torch.cuda.is_available()) blocks
             # all 4 tests silently. Needs: class gate +
             # ProfilerActivity.CUDA -> PrivateUse1, device="cuda" -> "spyre".

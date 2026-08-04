@@ -707,6 +707,9 @@ def _extract_symbol_ids(sdsc_json: dict) -> list[int]:
                             ids.append(sym_id)
                             seen.add(sym_id)
                 for node in op_val.get("scheduleTree_", []):
+                    # NOTE: "hbm" is an sdsc component field and is
+                    # distinct from and NOT to be confused with the internal
+                    # layout.allocation dict keys ("hbm"/"lx"/"hbm_pool").
                     if node.get("component_") == "hbm":
                         data = node.get("startAddressCoreCorelet_", {}).get("data_", {})
                         for v in data.values():
@@ -732,6 +735,9 @@ def _get_tensor_core_sym_id(sdsc_json: dict, tensor_idx: int, core: int) -> int 
                 nodes = op_val.get("scheduleTree_", [])
                 if tensor_idx < len(nodes):
                     node = nodes[tensor_idx]
+                    # NOTE: "hbm" is an sdsc component field and is
+                    # distinct from and NOT to be confused with the internal
+                    # layout.allocation dict keys ("hbm"/"lx"/"hbm_pool").
                     if node.get("component_") != "hbm":
                         return None
                     data = node.get("startAddressCoreCorelet_", {}).get("data_", {})

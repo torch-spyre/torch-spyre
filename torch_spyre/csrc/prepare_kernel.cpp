@@ -30,7 +30,7 @@
 #include "job_plan.h"
 #include "logging.h"
 #include "spyre_allocator.h"
-#include "util/spyrecode.h"
+#include "spyrecode-host-functions/spyrecode.h"
 
 namespace spyre {
 
@@ -539,11 +539,21 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
       }
       void* host_addr = pinned_buffer_map_[host_handle_str].data();
 
-      // Compute CompositeAddress with offset from device_addr
-      flex::CompositeAddress comp_addr = compute_offset_address(
-          job_allocation_.at(0), device_ptr, transfer_size);
-
-      return std::make_unique<JobPlanStepD2H>(std::move(comp_addr), host_addr);
+      // If device_ptr is in segment 7, calculate CompositeAddress and store it
+      // in JobPlanStepH2D. If device_ptr is in tensor segments, store
+      // device_ptr
+      if (flex::dmvaToSegmentId(device_ptr) == flex::PROG_SEGMENT) {
+        // Compute CompositeAddress with offset from device_addr
+        flex::CompositeAddress comp_addr = compute_offset_address(
+            job_allocation_.at(0), device_ptr, transfer_size);
+        return std::make_unique<JobPlanStepD2H>(std::move(comp_addr), host_addr,
+                                                transfer_size);
+      } else {
+        TORCH_CHECK(bind_io_addresses_ == true,
+                    "D2H dev_ptr must be in program segment.")
+        return std::make_unique<JobPlanStepD2H>(device_ptr, host_addr,
+                                                transfer_size);
+      }
     }
 
     case TransferDirection::Unknown:

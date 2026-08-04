@@ -156,6 +156,12 @@ SPYRE_FP32_OPS = [
     "to_dtype",
     "maximum",
     "minimum",
+    "greaterthan",
+    "greaterequal",
+    "lesserthan",
+    "lesserequal",
+    "equal",
+    "notequal",
     "prod",
 ]
 
@@ -173,8 +179,18 @@ TOPK_OPS = {"topkvalue", "topkindex"}
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
 
+AVGPOOL2D_OP = "avgpoolfwd"
+# Pool opfunc names, mirroring TOPK_OPS. Add maxpool/minpool here as they land so
+# _is_pool stays a single membership test rather than a growing chain of ==.
+POOL_OPS = {AVGPOOL2D_OP}
 
 # Populate more valid labels from deeptools here if needed
 INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j", "ki", "kj"]
 OUTPUT_DIM_LABELS = ["out"]
 MATMUL_DIM_LABELS = ["ki", "kj", "y", "x", "mb", "out", "in"]
+# Canonical avgpool iteration-space order: batch, out-H, out-W, channel,
+# kernel-H, kernel-W. These SDSC labels are owned by the codegen layer; dim-role
+# survival is derived from the node's live output ranges
+# (OpSpec.node_output_ranges), never from these strings, so SDSC naming does not
+# leak above codegen.
+POOL_DIM_LABELS = ["mb", "i", "j", "out", "ki", "kj"]

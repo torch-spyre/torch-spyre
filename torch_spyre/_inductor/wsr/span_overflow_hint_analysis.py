@@ -26,19 +26,19 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
 from torch._inductor.virtualized import V
 
-from .constants import BATCH_MATMUL_OP
-from .errors import Unsupported
-from .ir import FixedTiledLayout, _resize_device_layout
-from .logging_utils import get_inductor_logger
-from .pass_utils import (
+from ..constants import BATCH_MATMUL_OP
+from ..errors import Unsupported
+from ..ir import FixedTiledLayout, _resize_device_layout
+from ..logging_utils import get_inductor_logger
+from ..pass_utils import (
     _fixed_read_layout,
     concretize_index,
     host_coordinates,
     indirect_info_from_op,
     op_out_coords,
 )
-from .views import compute_coordinates
-from .work_division import MAX_SPAN_BYTES
+from ..views import compute_coordinates
+from ..work_division import MAX_SPAN_BYTES
 
 
 logger = get_inductor_logger("span_overflow_hint_analysis")

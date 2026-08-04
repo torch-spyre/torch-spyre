@@ -482,6 +482,59 @@ class TestPrepareKernel:
             ):
                 torch_spyre._C.prepare_kernel(spyrecode_dir)
 
+    @staticmethod
+    def _prepare_with_symbolic_args(spyrecode_dir, symbolic_args):
+        """Run prepare_kernel with BUNDLE_SYMBOLIC_ARGS set, then restore it."""
+        old_val = os.environ.get("BUNDLE_SYMBOLIC_ARGS")
+        try:
+            os.environ["BUNDLE_SYMBOLIC_ARGS"] = "1" if symbolic_args else "0"
+            return torch_spyre._C.prepare_kernel(spyrecode_dir)
+        finally:
+            if old_val is None:
+                os.environ.pop("BUNDLE_SYMBOLIC_ARGS", None)
+            else:
+                os.environ["BUNDLE_SYMBOLIC_ARGS"] = old_val
+
+    def test_d2h_tensor_segment(self):
+        """D2H from a tensor segment builds a (deferred) D2H step when
+        addresses are bound (BUNDLE_SYMBOLIC_ARGS != "1")."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            properties = {
+                "dirn": "true",
+                "host_handle": "d2h_output",
+                "dev_ptr": "0",
+                "size": "1024",
+            }
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="DataTransfer", exec_properties=properties
+            )
+
+            job_plan = self._prepare_with_symbolic_args(
+                spyrecode_dir, symbolic_args=False
+            )
+
+            assert job_plan.num_steps() == 1
+            assert job_plan.get_step_type(0) == "D2H"
+
+    def test_d2h_tensor_segment_symbolic(self):
+        """D2H from a tensor segment is rejected under symbolic args: the
+        transfer must go through the program segment in that mode."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            properties = {
+                "dirn": "true",
+                "host_handle": "d2h_output",
+                "dev_ptr": "0",
+                "size": "1024",
+            }
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="DataTransfer", exec_properties=properties
+            )
+
+            with pytest.raises(
+                RuntimeError, match="D2H dev_ptr must be in program segment"
+            ):
+                self._prepare_with_symbolic_args(spyrecode_dir, symbolic_args=True)
+
     def test_pipeline_barrier_dma_steps_default_true(self):
         """H2D and D2H steps must carry pipeline_barrier=True by default."""
         with tempfile.TemporaryDirectory() as tmpdir:

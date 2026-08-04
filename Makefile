@@ -18,11 +18,18 @@ TEST_CONFIGS ?= tests/configs/torch_spyre_tests
 #                       D2D copies (used as the default in integration-tests.yaml,
 #                       triggered by those upstream repos)
 #   full             — everything (core + LX-planning); default for `make tests`
+#   perf             — spyre-perf-suite benchmark (shells out, not a pytest
+#                      config suite); writes report.xml into RESULTS_DIR
 #   suite_<group>    — all configs inside the <group>/ sub-directory
 #                      (e.g. suite_inductor, suite_tensors)
 #   <label>          — any arbitrary label defined in test_suite_config.labels
 # Empty / unset defaults to "full" (all configs under TEST_CONFIGS).
 TEST_TYPE ?= full
+
+# Where TEST_TYPE=perf writes its benchmark report. Flat /tmp/results so the CI
+# ClickHouse push step (ingest_xml.py globs *.xml non-recursively) finds it
+# alongside every other suite's JUnit XML, with no per-suite subdirectory.
+RESULTS_DIR ?= /tmp/results
 
 # Path to the OOT config checker script (relative to repo root)
 CHECK_SCRIPT  := tests/scripts/check_oot_configs.py
@@ -56,8 +63,21 @@ precommit: ## Run all pre-commit hooks against every file
 # ---------------------------------------------------------------------------
 
 .PHONY: tests
-tests: ## Run torch spyre tests. Narrow scope with TEST_TYPE=smoke|core|full|suite_<group>. TEST_CONFIGS may point at a config directory (filtered by TEST_TYPE) or a single config yaml file (run directly).
-ifneq ($(wildcard $(TEST_CONFIGS)/.),)
+tests: ## Run torch spyre tests. Narrow scope with TEST_TYPE=smoke|core|full|perf|suite_<group>. TEST_CONFIGS may point at a config directory (filtered by TEST_TYPE) or a single config yaml file (run directly).
+# TEST_TYPE=perf is a benchmark mode, not a pytest-config suite: it does not
+# run the OOT config machinery below. It shells out to the installed
+# spyre-perf-suite console script (a wheel dependency of the dev image) and
+# writes report.xml into RESULTS_DIR. Keeping it a mode of `tests` lets CI call
+# it through the same `make tests TEST_TYPE=...` entry point as every other
+# suite, so no new Makefile target or Jenkins wiring is needed.
+ifeq ($(TEST_TYPE),perf)
+	@mkdir -p "$(RESULTS_DIR)"
+	spyre-perf-suite --no-experimental --stacks torch-spyre \
+		--report "$(RESULTS_DIR)/report.txt"
+	@test -f "$(RESULTS_DIR)/report.xml" || \
+		{ echo "ERROR: spyre-perf-suite did not emit $(RESULTS_DIR)/report.xml" >&2; \
+		  exit 1; }
+else ifneq ($(wildcard $(TEST_CONFIGS)/.),)
 	$(eval _PATHS := $(shell python3 $(FILTER_SCRIPT) \
 		--config-dir $(TEST_CONFIGS) \
 		--test-type "$(TEST_TYPE)" \
