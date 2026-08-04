@@ -1,5 +1,9 @@
 name: integration-tests
 run-name: integration-tests (${{ inputs.test_type || 'device_critical' }})
+# NOTE: run-name intentionally shows the RAW input (pre-alias-resolution) since
+# GHA's run-name: expression can't reference a job output -- the config.yaml-facing
+# aliases (integration/regression) still show up correctly for callers using them,
+# and push-to-clickhouse.yaml's trigger_type ends up with whichever value was passed.
 
 # ---------------------------------------------------------------------------
 # Triggered by commits in upstream dependant repos (deeptools, flex, etc.) via
@@ -75,11 +79,15 @@ on:
       test_type:
         description: >-
           Suite subset to run: smoke | core | full | device_critical |
-          suite_<group> | <label>. Default: device_critical (configs whose
+          suite_<group> | <label> -- or the tier aliases integration
+          (= device_critical) | regression (= full), for callers (e.g.
+          spyre-frameworks config.yaml) that speak in tier names rather than
+          label names. Default: device_critical (configs whose
           test_suite_config.labels cover the device-layer surfaces flex and
           deeptools/dxp_standalone exercise most -- streams, job launch
           plans, codegen, LX/scratchpad planning, tensor layout,
-          allocator/GC, D2D copies). Pass "full" to run every config.
+          allocator/GC, D2D copies). Pass "full" (or "regression") to run
+          every config.
         required: false
         type: string
         default: device_critical
@@ -125,12 +133,37 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
+  # config.yaml (spyre-frameworks) and other CI callers speak in tier names
+  # (integration/regression), not test-suite label names. Resolve those aliases
+  # to the actual test_suite_config.labels values here -- device_critical/full
+  # keep their existing, more specific meaning everywhere else (Makefile,
+  # filter_configs.py, the ~40 tests/configs/**/*_config.yaml label lists), only
+  # this entry point accepts the tier-name spelling too.
+  # ---------------------------------------------------------------------------
+  resolve-test-type:
+    name: Resolve test_type alias
+    runs-on: ubuntu-latest
+    outputs:
+      test_type: ${{ steps.resolve.outputs.test_type }}
+    steps:
+      - name: Resolve
+        id: resolve
+        run: |
+          case "${{ inputs.test_type }}" in
+            integration) RESOLVED=device_critical ;;
+            regression)  RESOLVED=full ;;
+            '')          RESOLVED=device_critical ;;
+            *)           RESOLVED="${{ inputs.test_type }}" ;;
+          esac
+          echo "test_type=${RESOLVED}" >> "${GITHUB_OUTPUT}"
+
+  # ---------------------------------------------------------------------------
   # Run the test matrix, defaulting to the device_critical subset -- same
   # default as the "run-tests" job in torch_spyre_tests.yaml. Callers can
-  # still request test_type=full for complete coverage.
+  # still request test_type=full (or its alias, regression) for complete coverage.
   # ---------------------------------------------------------------------------
   run-tests:
-    needs: provenance
+    needs: [provenance, resolve-test-type]
     uses: ./.github/workflows/_test_matrix.yaml
     with:
       runner_label: linux
@@ -139,7 +172,7 @@ jobs:
       checkout_pytorch: false
       ref: ${{ inputs.ref || '' }}
       repository: ${{ inputs.repository || '' }}
-      test_type: ${{ inputs.test_type || 'device_critical' }}
+      test_type: ${{ needs.resolve-test-type.outputs.test_type }}
       prebaked_image: ${{ inputs.prebaked_image }}
 
   # ----------------------------------------------------------------------------------
