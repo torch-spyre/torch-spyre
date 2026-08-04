@@ -19,7 +19,7 @@
 #include <c10/core/ScalarType.h>
 #include <c10/util/Exception.h>  // TORCH_WARN_ONCE
 #include <module.h>
-#include <util/sendefs.h>
+#include <util/sendefs/sendefs.h>
 
 #ifdef USE_FLEX_NAMESPACE
 #include <flex/datatype/flex_datatype.hpp>
@@ -355,7 +355,8 @@ stringToSenDatatypePair(const std::string& type_name) {
 // Returns true if deeptools ConvertData_general_shuffle supports the given
 // (src, dst) DataFormats pair.  The set of supported pairs is derived from
 // the exhaustive if/else-if chain in
-// deeptools/util/sen_data_convert.cpp :: ConvertData_general_shuffle.
+// deeptools/spyrecode-host-functions/sendataconvert/sen_data_convert.cpp ::
+// ConvertData_general_shuffle.
 inline bool isDCIConversionSupported(DataFormats src, DataFormats dst) {
   // clang-format off
   using DF = DataFormats;

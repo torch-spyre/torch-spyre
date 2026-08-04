@@ -22,6 +22,7 @@ from torch._inductor.ir import (
     FixedLayout,
     MutationLayoutSHOULDREMOVE,
     Pointwise,
+    Reduction,
 )
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -245,6 +246,34 @@ class _TracingHandler:
         return self.constant(value, dtype)
 
 
+def _is_invalid_compute_op(op) -> bool:
+    if not isinstance(op, ComputedBuffer):
+        return True
+    if not isinstance(op.data, (Pointwise, Reduction)):
+        return True
+    if not isinstance(op.layout, (FixedLayout, MutationLayoutSHOULDREMOVE)):
+        return True
+
+    return False
+
+
+# In case of reduction op with single to_dtype e.g. torch.sum(t, dtype=dst_dtype)
+def _is_reduction_with_to_dtype(op, compute_ops) -> bool:
+    is_reduction = isinstance(op.data, Reduction)
+    has_type_conversion = any(record[0] in _DTYPE_OPS for record in compute_ops)
+    return is_reduction and has_type_conversion
+
+
+def _skip_splitting(op, compute_ops) -> bool:
+    if _is_reduction_with_to_dtype(op, compute_ops):
+        return False
+
+    if len(compute_ops) > 1:
+        return False
+
+    return True
+
+
 def _infer_output_dtype(input_dtypes, kwargs, fallback):
     if "dtype" in kwargs:
         return kwargs["dtype"]
@@ -353,7 +382,13 @@ def _trace_inner_fn(op):
     tracer = _TracingHandler(V.ops)
     try:
         with tracer:
-            op.data.inner_fn(syms)
+            if isinstance(op.data, Reduction):
+                r_ranges = op.data.reduction_ranges
+                r_syms = tuple(sympy.Symbol(f"_r{k}") for k in range(len(r_ranges)))
+                # Reduction inner_fn expects (index, rindex)
+                op.data.inner_fn(syms, r_syms)
+            else:
+                op.data.inner_fn(syms)
     except Exception:
         return None
     return tracer.ops
@@ -754,7 +789,7 @@ def split_multi_ops(graph: GraphLowering):
     1. Build FX node environment from name_to_users.
     2. For each eligible ComputedBuffer (Pointwise, FixedLayout):
        a. Trace inner_fn to detect multi-op structure.
-       b. Skip if only 1 compute op.
+       b. Skip if only 1 compute op and not Reduction with type conversion.
        c. Create intermediate buffers (including SpyreConstantFallback for constants).
        d. Wrap the original inner_fn with _SplitOpsHandler to redirect buffer names.
 
@@ -777,11 +812,7 @@ def split_multi_ops(graph: GraphLowering):
 
     operations = graph.operations
     for op in list(operations):
-        if not (
-            isinstance(op, ComputedBuffer)
-            and isinstance(op.data, Pointwise)
-            and isinstance(op.layout, (FixedLayout, MutationLayoutSHOULDREMOVE))
-        ):
+        if _is_invalid_compute_op(op):
             continue
 
         trace = _trace_inner_fn(op)
@@ -789,8 +820,7 @@ def split_multi_ops(graph: GraphLowering):
             continue
 
         compute_ops = _get_compute_ops(trace)
-        # Skip if nothing to split
-        if len(compute_ops) <= 1:
+        if _skip_splitting(op, compute_ops):
             continue
 
         # Use real_layout() for MutationLayoutSHOULDREMOVE so _make_intermediate_bufs
@@ -819,6 +849,10 @@ def split_multi_ops(graph: GraphLowering):
 
         intermediate_ops = compute_ops[:-1]
         final_op_name = compute_ops[-1][0]
+
+        if _is_reduction_with_to_dtype(op, compute_ops):
+            intermediate_ops = compute_ops
+            final_op_name = "reduction"
 
         logger.debug(
             "split_multi_ops: '%s' has %d compute ops: [%s] -> final: %s",
