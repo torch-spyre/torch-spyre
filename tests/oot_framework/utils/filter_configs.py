@@ -41,6 +41,7 @@ every caller sees it consistently:
   "unit"          -> "core"
   "integration"   -> "device_critical"
   "regression"    -> "full"
+  "trunk"         -> "full" (push-to-main CI; same coverage as full)
   "smoke"         -> "smoke" (already the canonical spelling, no change)
 These are the names meant for humans/CI configs to type; device_critical/full/
 core keep their existing, more specific meaning as the actual label vocabulary
@@ -148,6 +149,7 @@ TEST_TYPE_ALIASES = {
     "unit": "core",
     "integration": "device_critical",
     "regression": "full",
+    "trunk": "full",
 }
 
 

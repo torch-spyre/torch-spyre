@@ -1,5 +1,9 @@
 name: tests
 
+# One of torch-spyre's four "trunk" (push-to-main) workflows -- see
+# model_ops_tests.yaml, upstream_tests.yaml, upstream_tests_beta.yaml for the
+# others. A push run passes test_type: trunk (below) so it's distinguishable
+# from a manually-dispatched full run once tier-tagging reaches ClickHouse.
 on:
   push:
     branches: [main]
@@ -117,7 +121,7 @@ jobs:
       rpm_location: ${{ inputs.rpm_location || '' }}
       rpm_names: ${{ inputs.rpm_names || '' }}
       build_torch_spyre: ${{ inputs.build_torch_spyre == true }}
-      test_type: ${{ inputs.test_type || 'full' }}
+      test_type: ${{ inputs.test_type || (github.event_name == 'push' && 'trunk' || 'full') }}
 
   # ---------------------------------------------------------------------------
   # Job 3: run-spyre-unit-tests (required check gate)
