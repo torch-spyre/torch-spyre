@@ -31,8 +31,8 @@ from .constants import (
     CONV2D_FWD_OP,
     COPY_BACK_CANDIDATE_ATTR,
     DEPTHWISE_CONV2D_OP,
-    FP16_MAX_VALUE_ENCODED,
     FP8_E4M3_MAX,
+    QUANTSCALEPERTOKENFP8_CLIP_MAX,
     QUANTSCALEPERTOKENFP8_CLIP_MIN,
 )
 from . import config
@@ -1865,8 +1865,8 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3_MAX):
 
     Constants forwarded to the DDL template:
     - mulConst: 1/scale_ub, passed as a float and FP16-encoded by generate_constant_info
-    - clipMin: QUANTSCALEPERTOKENFP8_CLIP_MIN (4096), a raw DDL template integer
-    - clipMax: FP16_MAX_VALUE_ENCODED (32255 / 0x7BFF), a raw DDL template integer
+    - clipMin: QUANTSCALEPERTOKENFP8_CLIP_MIN (4096 / 0x1000), a raw DDL template integer
+    - clipMax: QUANTSCALEPERTOKENFP8_CLIP_MAX (32255 / 0x7DFF), a raw DDL template integer
 
     clipMin and clipMax are in constants_raw so they bypass encode_constant.
     """
@@ -1895,7 +1895,7 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3_MAX):
         "constants": {
             "mulConst": mul_const,  # Float value, will be FP16-encoded by generate_constant_info
             "clipMin": QUANTSCALEPERTOKENFP8_CLIP_MIN,  # 4096: DDL template constant (raw integer)
-            "clipMax": FP16_MAX_VALUE_ENCODED,  # 32255: FP16 max value (raw integer)
+            "clipMax": QUANTSCALEPERTOKENFP8_CLIP_MAX,  # 32255: DDL template constant (raw integer)
         },
         "constants_raw": (
             "clipMin",

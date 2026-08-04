@@ -288,7 +288,16 @@ class SpyreOpFuncs:
 
     @staticmethod
     def quantscalepertokenfp8(x, scale_ub):
-        return ReductionOp("quantscalepertokenfp8", [x], {"scale_ub": scale_ub})
+        # scale_ub must remain in the signature: Inductor dispatches this method via
+        # SpyreKernelOpsHandler._default(name, args, kwargs) passing all op arguments,
+        # so dropping it would cause a TypeError at codegen time.
+        #
+        # It is intentionally unused here: scale_ub is already baked into `mulConst`
+        # inside SpyreReduction.op_info at lowering time (lower_quantscalepertokenfp8).
+        # For reductions, kernel_store_reduction reads op_info exclusively from
+        # ir_node.data.op_info (the SpyreReduction), not from ReductionOp.op_info.
+        _ = scale_ub
+        return ReductionOp("quantscalepertokenfp8", [x])
 
     @staticmethod
     def relu(x):
