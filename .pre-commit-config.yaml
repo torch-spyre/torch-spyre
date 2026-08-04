@@ -34,7 +34,7 @@ repos:
           - --filter=-whitespace/braces,-whitespace/indent_namespace,-build/include_order,-build/include_subdir
           - --extensions=cpp,h
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.11.1
+    rev: v2.1.0
     hooks:
       - id: mypy
         types: [python]

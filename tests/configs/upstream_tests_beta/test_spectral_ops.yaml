@@ -1,0 +1,307 @@
+test_suite_config:
+
+  files:
+    - path: ${TORCH_ROOT}/test/test_spectral_ops.py
+      unlisted_test_mode: skip
+      tests:
+        # These tests exercise various FFT operations across different dtypes and tensor shapes.
+        # They are classified as mandatory_success due to the critical nature of FFT ops in signal processing.
+        # Relevant Spyre capabilities include handling empty tensors and supporting float32 dtype for FFT ops.
+        - names:
+            - TestFFT::test_empty_fft
+            - TestFFT::test_fft_half_and_bfloat16_errors
+            - TestFFT::test_fftn_invalid
+            - TestFFT::test_istft_throws
+          mode: mandatory_success
+        # These tests exercise FFT operations with various dtypes and tensor shapes.
+        # They are classified as xfail due to unsupported dtypes (ComplexFloat, ComplexDouble, Half) on the Spyre backend.
+        # The primary limitation is the lack of support for complex and half-precision floating-point dtypes.
+        - names:
+            - TestFFT::test_batch_istft
+            - TestFFT::test_complex_stft_onesided
+            - TestFFT::test_empty_ifft
+            - TestFFT::test_fft2_fftn_equivalence
+            - TestFFT::test_fft2_invalid
+            - TestFFT::test_fft_invalid_dtypes
+            - TestFFT::test_fft_plan_repeatable
+            - TestFFT::test_fftn_noop_transform
+            - TestFFT::test_fftn_round_trip
+            - TestFFT::test_hfftn
+            - TestFFT::test_ihfftn
+          mode: xfail  # xfail: RuntimeError
+        # These tests exercise FFT operations and related tensor manipulations, including input modifications and frequency shifts.
+        # They are classified as xfail due to missing 'dxp_standalone' executable and unsupported DeviceCopy operations with FixedTiledLayout.
+        # Relevant Spyre limitations include incomplete support for certain tensor layouts and missing external dependencies.
+        - names:
+            - TestFFT::test_fft_input_modification
+            - TestFFT::test_fftfreq_numpy
+            - TestFFT::test_fftshift_frequencies
+          mode: xfail  # xfail: torch._inductor.exc.InductorError
+        # These tests exercise FFT operations with various dtypes and tensor behaviors.
+        # They are classified as xfail due to unsupported dtypes (Half, ComplexFloat) and missing operators (e.g., 'aten::_fft_r2c').
+        # The most relevant Spyre limitations are the lack of support for complex dtypes and certain FFT operators.
+        - names:
+            - TestFFT::test_fft_round_trip
+            - TestFFT::test_fft_type_promotion
+            - TestFFT::test_reference_1d
+          mode: xfail  # xfail: NotImplementedError, RuntimeError
+        # These tests exercise the `fftshift` operation on tensors with `float32` dtype, which relies on the `aten::roll` operator.
+        # They are classified as `xfail` because the `aten::roll` operator is not implemented on the Spyre backend.
+        # This highlights a limitation in Spyre's operator coverage, specifically missing support for tensor manipulation ops.
+        - names:
+            - TestFFT::test_fftshift_numpy
+          mode: xfail  # xfail: NotImplementedError
+        # These tests exercise the Short-Time Fourier Transform (STFT) and Inverse STFT (ISTFT) operations, focusing on windowing and complex tensor requirements.
+        # They are classified as 'skip' because they do not engage the torch-spyre layer, which is responsible for handling device-specific operations.
+        # The relevance of these tests is limited due to Spyre's current focus on other operations and data types.
+        - names:
+            - TestFFT::test_fftfreq_out # segmentation fault
+            - TestFFT::test_stft_window_device
+            - TestFFT::test_istft_requires_window
+            - TestFFT::test_stft_align_to_window_only_requires_non_center
+            - TestFFT::test_stft_requires_complex
+            - TestFFT::test_stft_requires_window
+          mode: skip  # does not engage the torch-spyre layer
+
+  global:
+    supported_dtypes:
+      - name: bfloat16
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype

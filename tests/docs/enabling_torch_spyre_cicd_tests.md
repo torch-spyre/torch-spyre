@@ -166,6 +166,7 @@ The table below shows the currently registered suites and their configs as a ref
 | Test Prepare Kernel | `torch_spyre_tests/test_prepare_kernel_config.yaml` |
 | Test Allocator E2E | `torch_spyre_tests/test_allocator_e2e_config.yaml` |
 | Test Launch Jobplan | `torch_spyre_tests/test_launch_jobplan_config.yaml` |
+| Test Spyre Generator | `torch_spyre_tests/test_spyre_generator_config.yaml` |
 | Inductor Building Blocks | `torch_spyre_tests/inductor/test_building_blocks_config.yaml` |
 | Inductor Codegen | `torch_spyre_tests/inductor/test_codegen_config.yaml` |
 | Inductor Copy Back Elision | `torch_spyre_tests/inductor/test_copy_back_elision_config.yaml` |
@@ -200,7 +201,6 @@ The table below shows the currently registered suites and their configs as a ref
 | Inductor Scratchpad Solver | `torch_spyre_tests/inductor/test_scratchpad_solver_config.yaml` |
 | Inductor Coarse Tiling | `torch_spyre_tests/inductor/test_coarse_tiling_config.yaml` |
 | Inductor Coarse Tile E2E | `torch_spyre_tests/inductor/test_coarse_tile_e2e_config.yaml` |
-| Inductor Unroll Loop Specs | `torch_spyre_tests/inductor/test_unroll_loop_specs_config.yaml` |
 | Inductor Work Division Hint | `torch_spyre_tests/inductor/test_work_division_hint_config.yaml` |
 | Tensor Coordinates | `torch_spyre_tests/tensors/test_coordinates_config.yaml` |
 | Tensor It Space Splits | `torch_spyre_tests/tensors/test_it_space_splits_config.yaml` |

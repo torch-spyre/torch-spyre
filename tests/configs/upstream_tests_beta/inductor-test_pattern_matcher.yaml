@@ -1,0 +1,311 @@
+test_suite_config:
+
+  files:
+    - path: ${TORCH_ROOT}/test/inductor/test_pattern_matcher.py
+      unlisted_test_mode: skip
+      tests:
+        # These tests exercise pattern matching and optimization passes in PyTorch, including operations like mm, cumsum, and softmax.
+        # They are classified as mandatory_success because they validate core functionalities that must work correctly on the Spyre backend.
+        # Relevant Spyre capabilities include pattern matching, tensor operations, and optimization passes, with no specific limitations noted.
+        - names:
+            - TestPatternMatcher::test_bound_method_pattern_matcher
+          mode: mandatory_success
+        - names:
+            - TestPatternMatcher::test_scaled_softmax
+          mode: xfail
+        # These tests exercise various operations and patterns in PyTorch, including matrix multiplications (mm, addmm), concatenation (cat), and tensor manipulations (view, permute).
+        # They are classified as "skip" on the Spyre backend due to the lack of CUDA support, which is required for these tests to run successfully.
+        # The relevant Spyre capability is its support for CPU-based operations, which does not include CUDA-specific functionalities.
+        - names:
+            - TestPatternMatcher::test_input_output_same
+            - TestPatternMatcher::test_mixed_mm_cpu
+            - TestPatternMatcher::test_multioutput_register_replacement
+            - TestPatternMatcher::test_pointless_cumsum
+            - TestPatternMatcher::test_remove_noop_pass_with_remove_passes
+            - TestPatternMatcher::test_remove_pointless_clones
+            - TestPatternMatcher::test_scaled_softmax
+            - TestPatternMatcher::test_symint_pattern_matching
+            - TestPatternMatcherLogging::test_failed_match_constant_args_format_string
+            - TestPatternMatcherLogging::test_gumbel_max_trick
+            - TestPatternMatcherLogging::test_pattern_match_debug_output
+            - TestPatternMatcher::test_addmm
+            - TestPatternMatcher::test_addmm_alpha_beta_with_pointwise
+            - TestPatternMatcher::test_addmm_broadcasting_bias
+            - TestPatternMatcher::test_addmm_dtype_mismatch
+            - TestPatternMatcher::test_addmm_symbolic_scalar
+            - TestPatternMatcher::test_bmm_to_mm
+            - TestPatternMatcher::test_cat_addmm
+            - TestPatternMatcher::test_cat_mm
+            - TestPatternMatcher::test_cat_slice_cat_cuda
+            - TestPatternMatcher::test_cat_splitwithsizes
+            - TestPatternMatcher::test_duplicate_search
+            - TestPatternMatcher::test_empty_like_pattern_matching
+            - TestPatternMatcher::test_fused_int_mm_mul
+            - TestPatternMatcher::test_fused_int_mm_mul_epilogue
+            - TestPatternMatcher::test_fused_int_mm_mul_gating
+            - TestPatternMatcher::test_fwd_only_generate_original_aten_meta
+            - TestPatternMatcher::test_match_equivalent_function_invocations1
+            - TestPatternMatcher::test_match_equivalent_function_invocations2
+            - TestPatternMatcher::test_match_equivalent_function_invocations3
+            - TestPatternMatcher::test_match_with_mutation
+            - TestPatternMatcher::test_mixed_mm
+            - TestPatternMatcher::test_mixed_mm_bad_cases
+            - TestPatternMatcher::test_mixed_mm_epi_works
+            - TestPatternMatcher::test_mixed_mm_gating
+            - TestPatternMatcher::test_mm_plus_mm
+            - TestPatternMatcher::test_mutation_op_matching
+            - TestPatternMatcher::test_original_aten_preserved_split_addmm
+            - TestPatternMatcher::test_pointless_convert
+            - TestPatternMatcher::test_pointless_permute_pair
+            - TestPatternMatcher::test_pointless_permute_pair_3d
+            - TestPatternMatcher::test_pointless_view_pair
+            - TestPatternMatcher::test_pointless_view_pair_dynamic_shapes
+            - TestPatternMatcher::test_replace_mul_zero
+            - TestPatternMatcher::test_serialized_patterns_up_to_date
+            - TestPatternMatcher::test_splitwithsizes_cat
+            - TestPatternMatcher::test_stable_topological_sort
+            - TestPatternMatcher::test_unfuse_bias_addmm
+          mode: skip  # does not engage the torch-spyre layer
+
+  global:
+    supported_dtypes:
+      - name: bfloat16
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype

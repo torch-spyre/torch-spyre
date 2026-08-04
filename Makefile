@@ -9,15 +9,40 @@ help: ## Show this help message
 PYTEST_ARGS ?= -v
 TEST_CONFIGS ?= tests/configs/torch_spyre_tests
 
+# TEST_TYPE selects which suite subset to run:
+#   smoke            — fast sanity checks (~4 suites)
+#   core             — all functional tests, excludes special-purpose hardware
+#   device_critical  — device-layer surfaces flex and deeptools/dxp_standalone
+#                       exercise most: streams, job launch plans, codegen,
+#                       LX/scratchpad planning, tensor layout, allocator/GC,
+#                       D2D copies (used as the default in integration-tests.yaml,
+#                       triggered by those upstream repos)
+#   full             — everything (core + LX-planning); default for `make tests`
+#   perf             — spyre-perf-suite benchmark (shells out, not a pytest
+#                      config suite); writes report.xml into RESULTS_DIR
+#   suite_<group>    — all configs inside the <group>/ sub-directory
+#                      (e.g. suite_inductor, suite_tensors)
+#   <label>          — any arbitrary label defined in test_suite_config.labels
+# Empty / unset defaults to "full" (all configs under TEST_CONFIGS).
+TEST_TYPE ?= full
+
+# Where TEST_TYPE=perf writes its benchmark report. Flat /tmp/results so the CI
+# ClickHouse push step (ingest_xml.py globs *.xml non-recursively) finds it
+# alongside every other suite's JUnit XML, with no per-suite subdirectory.
+RESULTS_DIR ?= /tmp/results
+
 # Path to the OOT config checker script (relative to repo root)
 CHECK_SCRIPT  := tests/scripts/check_oot_configs.py
- 
+
+# Path to the config filter script (relative to repo root)
+FILTER_SCRIPT := tests/oot_framework/utils/filter_configs.py
+
 # Config directory to scan (override to narrow/broaden the scope)
 CHECK_CONFIGS ?= tests/configs/torch_spyre_tests
 
-Optional: scope checks to one test file. Unset = auto-discover all.
+# Optional: scope checks to one test file. Unset = auto-discover all.
 TEST_FILE ?=
- 
+
 # Internal: only pass --test-file when TEST_FILE is set
 _TEST_FILE_ARG := $(if $(TEST_FILE),--test-file $(TEST_FILE),)
 
@@ -38,8 +63,37 @@ precommit: ## Run all pre-commit hooks against every file
 # ---------------------------------------------------------------------------
 
 .PHONY: tests
-tests: ## Run all torch spyre tests by default (except distributed). Override with: make tests TEST_CONFIGS="tests/configs/..."
-	@bash tests/run_test.sh $(TEST_CONFIGS) $(PYTEST_ARGS)
+tests: ## Run torch spyre tests. Narrow scope with TEST_TYPE=smoke|core|full|perf|suite_<group>. TEST_CONFIGS may point at a config directory (filtered by TEST_TYPE) or a single config yaml file (run directly).
+# TEST_TYPE=perf is a benchmark mode, not a pytest-config suite: it does not
+# run the OOT config machinery below. It shells out to the installed
+# spyre-perf-suite console script (a wheel dependency of the dev image) and
+# writes report.xml into RESULTS_DIR. Keeping it a mode of `tests` lets CI call
+# it through the same `make tests TEST_TYPE=...` entry point as every other
+# suite, so no new Makefile target or Jenkins wiring is needed.
+ifeq ($(TEST_TYPE),perf)
+	@mkdir -p "$(RESULTS_DIR)"
+	spyre-perf-suite --no-experimental --stacks torch-spyre \
+		--report "$(RESULTS_DIR)/report.txt"
+	@test -f "$(RESULTS_DIR)/report.xml" || \
+		{ echo "ERROR: spyre-perf-suite did not emit $(RESULTS_DIR)/report.xml" >&2; \
+		  exit 1; }
+else ifneq ($(wildcard $(TEST_CONFIGS)/.),)
+	$(eval _PATHS := $(shell python3 $(FILTER_SCRIPT) \
+		--config-dir $(TEST_CONFIGS) \
+		--test-type "$(TEST_TYPE)" \
+		--format paths))
+	@if [ -z "$(_PATHS)" ]; then \
+		echo "ERROR: no configs matched TEST_TYPE=$(TEST_TYPE) under $(TEST_CONFIGS)" >&2; \
+		exit 1; \
+	fi
+	@TORCH_SPYRE_TEST_TYPE="$(TEST_TYPE)" bash tests/run_test.sh $(_PATHS) $(PYTEST_ARGS)
+else
+	@if [ ! -f "$(TEST_CONFIGS)" ]; then \
+		echo "ERROR: TEST_CONFIGS not found (expected a directory or a config file): $(TEST_CONFIGS)" >&2; \
+		exit 1; \
+	fi
+	@TORCH_SPYRE_TEST_TYPE="$(TEST_TYPE)" bash tests/run_test.sh $(TEST_CONFIGS) $(PYTEST_ARGS)
+endif
 
 
 # ---------------------------------------------------------------------------
@@ -59,4 +113,6 @@ clean: ## Remove auto-generated OOT wrappers, conftest files, merged configs, an
 	@find tests/ -name '_spyre_merged_config_*.yaml' -delete
 	@find tests/ -name '*.markers.json' -delete
 	@find tests/ -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+	@rm -rf torch_spyre.egg-info
+	@rm -rf tests/oot_framework/oot_framework.egg-info
 	@echo "Cleaned auto-generated files under tests/"

@@ -71,6 +71,14 @@ auto get_generic_stick_layout(std::vector<int32_t> host_dim_order)
                  host_dim_order[4], host_dim_order[5], host_dim_order[0],
                  host_dim_order[5]};
       break;
+    case 7:
+      TORCH_CHECK(host_dim_order[6] == -1,
+                  "7-element dim_order is only valid for sparse-stick (last "
+                  "entry must be -1)");
+      dim_map = {host_dim_order[1], host_dim_order[2], host_dim_order[3],
+                 host_dim_order[4], host_dim_order[5], host_dim_order[6],
+                 host_dim_order[0], host_dim_order[6]};
+      break;
     default:
       std::stringstream ss;
       ss << "Unsupported tensor rank: " << std::to_string(rank);
@@ -197,6 +205,10 @@ std::string SpyreTensorLayout::toString() const {
   }
   ss << "], device_dtype=DataFormats.";
   ss << EnumsConversion::dataFormatsToString(this->device_dtype);
+  if (this->element_arrangement != ElementArrangement::STANDARD) {
+    ss << ", element_arrangement=ElementArrangement.";
+    ss << spyre::elementArrangementToString(this->element_arrangement);
+  }
   ss << ")";
   return ss.str();
 }
@@ -238,7 +250,7 @@ SpyreTensorImpl::shallow_copy_and_detach_core(
     bool allow_tensor_metadata_change) const {
   if (key_set_.has(c10::DispatchKey::Python) &&
       !c10::impl::tls_is_dispatch_key_excluded(c10::DispatchKey::Python)) {
-    auto r = pyobj_slot_.load_pyobj_interpreter()->detach(this);
+    auto r = (*c10::impl::getGlobalPyInterpreter())->detach(this);
     if (r) {
       r->set_version_counter(version_counter);
       r->set_allow_tensor_metadata_change(allow_tensor_metadata_change);

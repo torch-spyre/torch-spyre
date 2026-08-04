@@ -1,0 +1,318 @@
+test_suite_config:
+
+  files:
+    - path: ${TORCH_ROOT}/test/nn/test_lazy_modules.py
+      unlisted_test_mode: skip
+      tests:
+        # These tests exercise the `materialize` method on lazy modules, which is essential for initializing parameters on the device.
+        # The tests are classified as xfail due to the missing `materialize` attribute in the Spyre backend.
+        # This failure highlights a limitation in Spyre's support for lazy module initialization.
+        - names:
+            - TestLazyModules::test_materialize_device
+          mode: xfail  # xfail: AttributeError
+        # These tests exercise various lazy initialization and state management functionalities in PyTorch modules, including batch normalization, convolution, instance normalization, and linear layers.
+        # They are classified as 'skip' on the Spyre backend because the tests do not specify a device argument, which is required for proper execution on the Spyre device.
+        # The most relevant Spyre capabilities are the support for various dtypes and ops, but the tests' lack of device specification prevents them from being executed on the Spyre device.
+        - names:
+            - TestLazyModules::test_chained_initialization
+            - TestLazyModules::test_invalid_functions
+            - TestLazyModules::test_lazy_batchnorm1d
+            - TestLazyModules::test_lazy_batchnorm1d_pickle
+            - TestLazyModules::test_lazy_batchnorm1d_state
+            - TestLazyModules::test_lazy_batchnorm2d
+            - TestLazyModules::test_lazy_batchnorm2d_pickle
+            - TestLazyModules::test_lazy_batchnorm2d_state
+            - TestLazyModules::test_lazy_batchnorm3d
+            - TestLazyModules::test_lazy_batchnorm3d_pickle
+            - TestLazyModules::test_lazy_batchnorm3d_state
+            - TestLazyModules::test_lazy_batchnorm_with_dict_input
+            - TestLazyModules::test_lazy_conv1d
+            - TestLazyModules::test_lazy_conv1d_pickle
+            - TestLazyModules::test_lazy_conv1d_state
+            - TestLazyModules::test_lazy_conv2d
+            - TestLazyModules::test_lazy_conv2d_pickle
+            - TestLazyModules::test_lazy_conv2d_state
+            - TestLazyModules::test_lazy_conv3d
+            - TestLazyModules::test_lazy_conv3d_pickle
+            - TestLazyModules::test_lazy_conv3d_state
+            - TestLazyModules::test_lazy_conv_transpose1d_kwargs
+            - TestLazyModules::test_lazy_conv_transpose1d_pickle
+            - TestLazyModules::test_lazy_conv_transpose1d_state
+            - TestLazyModules::test_lazy_conv_transpose2d
+            - TestLazyModules::test_lazy_conv_transpose2d_kwargs
+            - TestLazyModules::test_lazy_conv_transpose2d_pickle
+            - TestLazyModules::test_lazy_conv_transpose2d_state
+            - TestLazyModules::test_lazy_conv_transpose3d
+            - TestLazyModules::test_lazy_conv_transpose3d_kwargs
+            - TestLazyModules::test_lazy_conv_transpose3d_pickle
+            - TestLazyModules::test_lazy_conv_transpose3d_state
+            - TestLazyModules::test_lazy_conv_transposed1d
+            - TestLazyModules::test_lazy_forward_hook
+            - TestLazyModules::test_lazy_instancenorm1d
+            - TestLazyModules::test_lazy_instancenorm1d_pickle
+            - TestLazyModules::test_lazy_instancenorm1d_state
+            - TestLazyModules::test_lazy_instancenorm2d
+            - TestLazyModules::test_lazy_instancenorm2d_pickle
+            - TestLazyModules::test_lazy_instancenorm2d_state
+            - TestLazyModules::test_lazy_instancenorm3d
+            - TestLazyModules::test_lazy_instancenorm3d_pickle
+            - TestLazyModules::test_lazy_instancenorm3d_state
+            - TestLazyModules::test_lazy_linear_pickle
+            - TestLazyModules::test_lazy_linear_state_and_forward
+            - TestLazyModules::test_lazy_module_buffer
+            - TestLazyModules::test_lazy_module_jit_buffer
+            - TestLazyModules::test_lazy_module_jit_param
+            - TestLazyModules::test_lazy_module_parameter
+            - TestLazyModules::test_lazy_pre_forward_hook
+            - TestLazyModules::test_lazy_share_memory_buffer
+            - TestLazyModules::test_lazy_share_memory_param
+            - TestLazyModules::test_linear
+            - TestLazyModules::test_linear_state
+            - TestLazyModules::test_materialize_dtype
+            - TestLazyModules::test_optimizer_pass
+            - TestLazyModules::test_spectral_norm
+            - TestLazyModules::test_weight_norm
+          mode: skip  # does not engage the torch-spyre layer
+
+  global:
+    supported_dtypes:
+      - name: bfloat16
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype

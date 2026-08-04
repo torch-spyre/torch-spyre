@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "module.h"
+#include "spyre_error.h"
 #include "spyre_kernel.h"
 
 namespace spyre {
@@ -49,8 +50,6 @@ class SpyreStream {
   void copyAsync(const at::Tensor& src, const at::Tensor& dst) const;
   void copyProgramAsync(void* prog_cpu_ptr,
                         const flex::CompositeAddress* device_address) const;
-  void executeProgramAsync(const KernelArtifacts& arts,
-                           const std::vector<at::Tensor>& args) const;
 
   void launch(const JobPlan& plan, const std::vector<at::Tensor>& args) const;
 
@@ -61,9 +60,18 @@ class SpyreStream {
   void launchD2H(flex::DmaParams* params) const;
   void launchCompute(flex::ComputeParams* params) const;
   void launchHostCallback(flex::HostCallbackParams* params) const;
+  // Device-side MEMORY_FILL DMA. Routes through the typed
+  // flex::RuntimeStream::fillAsync overload, which performs the value->pattern
+  // conversion internally (no FillParams construction here).
+  void fillAsync(const flex::CompositeAddress* dst, double value,
+                 DataFormats dtype, bool use_dmai) const;
 
   // Conversions
   c10::Stream unwrap() const;
+
+  // Returns the error state of this stream without exposing the underlying
+  // flex::RuntimeStream handle to callers.
+  SpyreStreamError getError() const;
 
  private:
   flex::RuntimeStream* resolveRuntimeHandle() const;
@@ -92,6 +100,28 @@ SpyreStream getStreamFromPool(
  * @return The default SpyreStream (stream ID 0)
  */
 SpyreStream getDefaultStream(
+    c10::Device device = c10::Device(c10::DeviceType::PrivateUse1, -1));
+
+/**
+ * Get a host compute stream for a device (round-robin).
+ * Host compute streams are IDs kHostComputeStreamStartPerDevice and up; the
+ * count is set by TORCH_SPYRE_NUM_HOST_COMPUTE_STREAMS.
+ *
+ * @param device Device to get a host compute stream for
+ * @return The next host compute SpyreStream in round-robin order
+ */
+SpyreStream getHostComputeStream(
+    c10::Device device = c10::Device(c10::DeviceType::PrivateUse1, -1));
+
+/**
+ * Get a specific host compute stream by stream ID.
+ *
+ * @param id Stream ID of the host compute stream
+ * @param device Device the stream belongs to
+ * @return The host compute SpyreStream with the given ID
+ */
+SpyreStream getHostComputeStreamById(
+    c10::StreamId id,
     c10::Device device = c10::Device(c10::DeviceType::PrivateUse1, -1));
 
 /**

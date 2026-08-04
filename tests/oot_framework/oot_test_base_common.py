@@ -16,6 +16,7 @@ from oot_framework.oot_test_constants import (
     _DYNAMIC_TAG_PREFIXES,
     DEFAULT_FLOATING_PRECISION,
     ENV_TEST_CONFIG,
+    ENV_TEST_TYPE,
     MODE_MANDATORY_SUCCESS,
     MODE_SKIP,
     MODE_XFAIL,
@@ -45,6 +46,7 @@ from oot_framework.oot_upstream_patcher import (
     _OOTPrecisionOverridePatcher,
     _OOTNativeDeviceTypesPatcher,
     _OOTCpuMovePatcher,
+    _OOTNoGradPatcher,
     _OOTPlatformMarkerPatcher,
 )
 from oot_framework.oot_test_config_models import (
@@ -157,6 +159,29 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
         # Reset OOTTestBase.device_type to "privateuse1" so subsequent
         # calls generate the correct class name.
         OOTTestBase.device_type = "privateuse1"
+
+    @classmethod
+    def get_all_devices(cls):
+        # PrivateUse1TestBase.get_all_devices() builds non-primary device
+        # strings from cls.device_type, which setUpClass() above resets to
+        # "privateuse1" (for class-naming purposes) right after super()
+        # computes it as the real backend name (e.g. "spyre"). On a
+        # single-device host the resulting non-primary list is always empty
+        # so this never surfaces, but on a multi-device host (e.g. s390x with
+        # several Spyre devices) it produces invalid device strings like
+        # "privateuse1:1" that torch.device() rejects, since only the
+        # (correctly-cached) primary_device escapes the reset. Use the real
+        # registered backend name here instead of cls.device_type.
+        primary_device_idx = int(cls.get_primary_device().split(":")[1])
+        num_devices = cls.device_mod.device_count()
+        prim_device = cls.get_primary_device()
+        device_str = f"{_OOT_DEVICE_TYPE}:{{0}}"
+        non_primary_devices = [
+            device_str.format(idx)
+            for idx in range(num_devices)
+            if idx != primary_device_idx
+        ]
+        return [prim_device] + non_primary_devices
 
     # ------------------------------------------------------------------
     # Config loading  (called once per test run via instantiate_test)
@@ -276,12 +301,33 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
 
             # Create ModuleInfo and add to module_db
             try:
+                # edits.modules.include is additive: ModuleInfo.dtypes (the set
+                # of dtype variants @modules will ever generate for this
+                # module) is derived from the floating-point dtype(s) actually
+                # baked into the YAML's tensor specs, so a dtype absent from
+                # the YAML (e.g. float16 for a bfloat16-only module) is never
+                # registered and therefore never generated -- regardless of
+                # global.supported_dtypes.
+                #
+                # global.supported_dtypes (GLOBAL_SUPPORTED_DTYPES, applied in
+                # _should_run_test_case below) is purely a filter on top of
+                # that: it can only skip a dtype variant that was registered
+                # here, never add one that wasn't. Fall back to the historical
+                # default triple only when no tensor spec can be found at all
+                # (e.g. a no-input module), so such a module still gets some
+                # coverage.
+                resolved_dtypes = module_item.resolved_input_dtypes()
+                dtypes = (
+                    tuple(sorted(resolved_dtypes, key=str))
+                    if resolved_dtypes
+                    else (torch.float32, torch.float16, torch.bfloat16)
+                )
                 module_info = ModuleInfo(
                     module_cls,
                     module_inputs_func=create_module_inputs_func_from_yaml(module_item),
                     skips=(),
                     decorators=None,
-                    dtypes=(torch.float32, torch.float16),
+                    dtypes=dtypes,
                 )
                 module_db.append(module_info)
                 existing_names.add(module_name)
@@ -370,6 +416,21 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
         else:
             effective_mode = cls.UNLISTED_TEST_MODE  # only for truly unlisted tests
 
+        # per-test label filter — skip if this entry's labels don't include the
+        # active TEST_TYPE.  Empty labels means "no restriction; run whenever the
+        # suite runs" so the check is a no-op for unlabelled entries.
+        # suite_<group> values are structural (handled by filter_configs.py at the
+        # config-file level) and are ignored here.
+        if entry is not None and entry.labels:
+            test_type = os.environ.get(ENV_TEST_TYPE, "full")
+            if (
+                test_type
+                and test_type != "full"
+                and not test_type.startswith("suite_")
+                and test_type not in entry.labels
+            ):
+                return False, f"Excluded by TEST_TYPE={test_type!r}", False, False
+
         # dtype filtering — extract dtype from method_name and check against supported
         dtype_str = extract_dtype_from_name(method_name)
 
@@ -403,6 +464,19 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
         op_name = _extract_op_name_from_method(
             method_name, base_test_name, _OOT_DEVICE_TYPE
         )
+
+        # Op exclusion check (edits.ops.exclude).
+        # op_name may include a variant suffix (e.g. "addmm_decomposed" for the
+        # "addmm" OpInfo with variant_test_name="decomposed"), so we check both
+        # an exact match and a "<excluded>_" prefix match to catch all variants
+        # of an excluded op with a single exclude entry.
+        if op_name and entry is not None:
+            excluded_ops = entry.edits.ops.excluded_op_names()
+            if op_name in excluded_ops or any(
+                op_name.startswith(exc + "_") for exc in excluded_ops
+            ):
+                return False, f"Excluded op: {op_name}", False, False
+
         if effective_mode == MODE_MANDATORY_SUCCESS:
             op_cfg = cls.SUPPORTED_OPS_CONFIG.get(op_name) if op_name else None
             if op_cfg is not None and op_cfg.force_xfail:
@@ -599,11 +673,17 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
             _OOTOpDtypeExpander(test, all_extra_dtypes).patch()
 
         # Collect precision overrides: merge global + union across all entries.
-        # Per-variant selection happens below in new_methods loop.
+        # precision_overrides/tolerance_overrides are dtype-keyed only (an
+        # upstream limitation), so -- like the dtype injection above -- these
+        # can only vary per dtype, not per op within a shared test method.
+        include_dtype_precision: Dict[torch.dtype, Precision] = {}
+        for _e in all_entries_for_name:
+            include_dtype_precision.update(_e.edits.dtypes.resolved_include_precision())
+
         _OOTPrecisionOverridePatcher(
             test,
             global_dtype_precision=cls.GLOBAL_DTYPE_PRECISION,
-            include_dtype_precision={},  # handled per-variant below
+            include_dtype_precision=include_dtype_precision,
         ).patch()
 
         # Dynamically adds pytest marker to each of ops and dtype passed to @ops
@@ -725,6 +805,18 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
                         marked_fn = pytest.mark.__getattr__(tag)(marked_fn)
                     setattr(cls, method_name, marked_fn)
                 _tags_to_write[method_name] = method_tags
+
+            # Spyre's custom ops have no registered autograd formula, so a
+            # test that builds modules/tensors with ordinary
+            # requires_grad=True and never calls backward() must run under
+            # torch.no_grad() to avoid AOTAutograd tracing a backward graph
+            # at compile time. Opt in per test entry via the YAML `no_grad`
+            # flag (e.g. upstream's ModuleInfo-based test_forward). See
+            # _OOTNoGradPatcher.
+            if resolved_entry is not None and resolved_entry.no_grad:
+                existing_fn = cls.__dict__.get(method_name)
+                if existing_fn is not None:
+                    setattr(cls, method_name, _OOTNoGradPatcher.wrap(existing_fn))
 
             # apply xfail if needed
             if is_xfail:

@@ -1,0 +1,302 @@
+test_suite_config:
+
+  files:
+    - path: ${TORCH_ROOT}/test/nn/test_load_state_dict.py
+      unlisted_test_mode: skip
+      tests:
+        # These tests exercise state dict loading and assignment behaviors, including warning conditions.
+        # They are classified as mandatory_success because state dict operations are fundamental to model persistence and loading.
+        # Relevant Spyre capabilities include tensor manipulation and state management, with no specific limitations noted.
+        - names:
+            - TestLoadStateDict::test_load_state_dict_warn_assign_swap_False
+          mode: mandatory_success
+        # These tests exercise various aspects of loading state dicts, including handling of metadata, shape and stride assignments, optimizer states, and custom loaders.
+        # They are classified as 'skip' on the Spyre backend because they do not directly test operations or data types supported by Spyre, and their relevance to the backend is minimal.
+        # The most relevant Spyre capabilities are tensor manipulation and state management, but these tests focus on higher-level state dict functionalities not directly tied to backend operations.
+        - names:
+            - TestLoadStateDict::test_load_state_dict
+            - TestLoadStateDict::test_load_state_dict_warn_assign
+            - TestLoadStateDict::test_load_state_dict_BC
+            - TestLoadStateDict::test_load_state_dict_BC_swap_False
+            - TestLoadStateDict::test_load_state_dict_BC_swap_True
+            - TestLoadStateDict::test_load_state_dict_assign_meta
+            - TestLoadStateDict::test_load_state_dict_assign_meta_swap_False_keep_vars_False
+            - TestLoadStateDict::test_load_state_dict_assign_meta_swap_False_keep_vars_True
+            - TestLoadStateDict::test_load_state_dict_assign_meta_swap_True_keep_vars_False
+            - TestLoadStateDict::test_load_state_dict_assign_meta_swap_True_keep_vars_True
+            - TestLoadStateDict::test_load_state_dict_assign_shape_stride
+            - TestLoadStateDict::test_load_state_dict_assign_shape_stride_swap_False
+            - TestLoadStateDict::test_load_state_dict_assign_shape_stride_swap_True
+            - TestLoadStateDict::test_load_state_dict_assign_with_optimizer
+            - TestLoadStateDict::test_load_state_dict_assign_with_optimizer_swap_False
+            - TestLoadStateDict::test_load_state_dict_assign_with_optimizer_swap_True
+            - TestLoadStateDict::test_load_state_dict_child
+            - TestLoadStateDict::test_load_state_dict_child_swap_False
+            - TestLoadStateDict::test_load_state_dict_child_swap_True
+            - TestLoadStateDict::test_load_state_dict_custom
+            - TestLoadStateDict::test_load_state_dict_custom_swap_False
+            - TestLoadStateDict::test_load_state_dict_custom_swap_True
+            - TestLoadStateDict::test_load_state_dict_invalid
+            - TestLoadStateDict::test_load_state_dict_invalid_swap_False
+            - TestLoadStateDict::test_load_state_dict_invalid_swap_True
+            - TestLoadStateDict::test_load_state_dict_ref_cycle
+            - TestLoadStateDict::test_load_state_dict_ref_cycle_swap_False
+            - TestLoadStateDict::test_load_state_dict_swap_False
+            - TestLoadStateDict::test_load_state_dict_swap_True
+            - TestLoadStateDict::test_load_state_dict_type
+            - TestLoadStateDict::test_load_state_dict_type_swap_False
+            - TestLoadStateDict::test_load_state_dict_type_swap_True
+            - TestLoadStateDict::test_load_state_dict_warn_assign_swap_True
+            - TestLoadStateDict::test_load_state_dict_with_unexpected_key
+            - TestLoadStateDict::test_load_state_dict_with_unexpected_key_swap_False
+            - TestLoadStateDict::test_load_state_dict_with_unexpected_key_swap_True
+            - TestLoadStateDict::test_scalar_param_1d_tensor_raises
+            - TestLoadStateDict::test_scalar_param_1d_tensor_raises_swap_False
+            - TestLoadStateDict::test_scalar_param_1d_tensor_raises_swap_True
+            - TestLoadStateDictSwap::test_swap_subclass
+            - TestLoadStateDictSwap::test_swap_subclass_swap_True_assign_False
+            - TestLoadStateDictSwap::test_swap_subclass_swap_True_assign_True
+          mode: skip  # does not engage the torch-spyre layer
+
+  global:
+    supported_dtypes:
+      - name: bfloat16
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype

@@ -1,7 +1,8 @@
 name: Checkout pytorch repo
 description: |
   Re-points the pre-cloned pytorch source tree at the release branch that
-  matches the torch version pinned in torch-spyre's pyproject.toml.
+  matches the torch version pinned in torch-spyre's pyproject.toml, or at
+  an exact commit SHA when the `sha` input is set.
 
 inputs:
   torch_spyre_dir:
@@ -14,6 +15,13 @@ inputs:
     required: false
     type: string
     default: pytorch
+  sha:
+    description: |
+      Exact PyTorch commit SHA to check out. If set, takes precedence over
+      the pyproject.toml-derived release branch below.
+    required: false
+    type: string
+    default: ''
 
 runs:
   using: composite
@@ -24,6 +32,7 @@ runs:
         TORCH_SPYRE_DIR: ${{ inputs.torch_spyre_dir }}
         PYTORCH_DIR: ${{ inputs.pytorch_dir }}
         PYTORCH_REPO_URL: https://github.com/pytorch/pytorch.git
+        SHA: ${{ inputs.sha }}
       run: |
         source "$HOME/.bashrc"
         source /etc/profile.d/ibm-aiu-setup.sh
@@ -39,31 +48,49 @@ runs:
 
         git config --global --add safe.directory '*'
 
-        # Derive the target pytorch release branch from torch-spyre's
-        # pyproject.toml — single source of truth. The same script is used
-        # by the runner-image build pipeline (spyre-runtimes Dockerfile) to
-        # pick TORCH_MINOR for the pre-cloned pytorch tree, so this action
-        # always agrees with the image on what `release/X.Y` means. The
-        # script uses stdlib only (re + tomllib), so no venv activation
-        # needed here.
+        if [[ -n "$SHA" ]]; then
+          # Caller wants an exact commit (e.g. the PyTorch commit that
+          # triggered a repository_dispatch build) instead of the release
+          # branch derived from pyproject.toml.
+          FETCH_REF="$SHA"
+        else
+          # Derive the target pytorch release branch from torch-spyre's
+          # pyproject.toml — single source of truth. The same script is used
+          # by the runner-image build pipeline (spyre-runtimes Dockerfile) to
+          # pick TORCH_MINOR for the pre-cloned pytorch tree, so this action
+          # always agrees with the image on what `release/X.Y` means. The
+          # script uses stdlib only (re + tomllib), so no venv activation
+          # needed here.
 
-        cd "$TORCH_SPYRE_DIR" || exit 1
-        ls -la pyproject.toml || exit 1
-        VERSION=$(python3 tools/get_torch_minor.py pyproject.toml)
-        TARGET_BRANCH="release/${VERSION}"
-        echo "TARGET_BRANCH $TARGET_BRANCH"
+          cd "$TORCH_SPYRE_DIR" || exit 1
+          ls -la pyproject.toml || exit 1
+          VERSION=$(python3 tools/get_torch_minor.py pyproject.toml)
+          FETCH_REF="release/${VERSION}"
+        fi
+        echo "FETCH_REF $FETCH_REF"
         echo "PYTORCH_REPO_URL $PYTORCH_REPO_URL"
 
         mkdir -p "$PYTORCH_DIR" || exit 1
         cd "$PYTORCH_DIR" || exit 1
-        git init -b main
 
-        git remote add origin "$PYTORCH_REPO_URL"
-        git fetch --depth=1 origin "$TARGET_BRANCH"
-        git checkout --detach FETCH_HEAD
+        if [[ ! -d .git ]]; then
+          git init -b main
+          git remote add origin "$PYTORCH_REPO_URL"
+        fi
+
+        git fetch --depth=1 origin "$FETCH_REF"
+
+        # Self-hosted runners may reuse a workspace across jobs; a previous
+        # run's build (generated files, permission/line-ending changes from
+        # the build system, etc.) can otherwise make `git checkout` refuse to
+        # switch commits. This checkout is disposable, so force-clean it.
+        git reset --hard HEAD >/dev/null 2>&1 || true
+        git clean -fdx >/dev/null 2>&1 || true
+        git checkout --force --detach FETCH_HEAD
 
         git submodule sync --recursive
-        git submodule update --init --recursive --depth 1 --jobs 8
+        git submodule foreach --recursive 'git reset --hard HEAD && git clean -fdx' >/dev/null 2>&1 || true
+        git submodule update --init --recursive --depth 1 --jobs 8 --force
 
         git log -1 --oneline || true
 

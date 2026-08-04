@@ -1,0 +1,451 @@
+test_suite_config:
+
+  files:
+    - path: ${TORCH_ROOT}/test/optim/test_lrscheduler.py
+      unlisted_test_mode: skip
+      tests:
+        # These tests exercise learning rate scheduler behaviors and optimizer interactions.
+        # They are classified as mandatory_success because they validate core functionalities.
+        # Relevant Spyre capabilities include handling optimizer steps and scheduler updates.
+        - names:
+            - TestLRScheduler::test_new_pattern_no_warning_with_overridden_optim_step
+          mode: mandatory_success
+        - names:
+            - TestLRScheduler::test_new_pattern_no_warning
+            - TestLRScheduler::test_CosineAnnealingWarmRestarts_T_cur_reset
+            - TestLRScheduler::test_CosineAnnealingWarmRestarts_lr1
+            - TestLRScheduler::test_CosineAnnealingWarmRestarts_lr1_T_mult_1
+            - TestLRScheduler::test_CosineAnnealingWarmRestarts_lr1_T_mult_2
+            - TestLRScheduler::test_CosineAnnealingWarmRestarts_lr1_T_mult_4
+            - TestLRScheduler::test_CosineAnnealingWarmRestarts_lr2
+            - TestLRScheduler::test_CosineAnnealingWarmRestarts_lr3
+            - TestLRScheduler::test_CosineAnnealingWarmRestarts_lr_state_dict
+            - TestLRScheduler::test_add_param_group_does_not_break_reduce_lr_on_plateau
+            - TestLRScheduler::test_add_param_group_does_not_break_reduce_lr_on_plateau_min_lr_list
+            - TestLRScheduler::test_add_param_group_does_not_break_reduce_lr_on_plateau_min_lr_scalar
+            - TestLRScheduler::test_add_param_group_errors_reduce_lr_on_plateau
+            - TestLRScheduler::test_chained_lr1
+            - TestLRScheduler::test_chained_lr2
+            - TestLRScheduler::test_chained_lr2_get_last_lr_before_step
+            - TestLRScheduler::test_chained_lr3
+            - TestLRScheduler::test_chained_lr4
+            - TestLRScheduler::test_chained_lr5
+            - TestLRScheduler::test_closed_form_constantlr
+            - TestLRScheduler::test_closed_form_cos_anneal_lr
+            - TestLRScheduler::test_closed_form_exp_lr
+            - TestLRScheduler::test_closed_form_linearlr
+            - TestLRScheduler::test_closed_form_multi_step_lr
+            - TestLRScheduler::test_closed_form_poly_lr
+            - TestLRScheduler::test_closed_form_step_lr
+            - TestLRScheduler::test_compound_cosanneal_and_exp_lr
+            - TestLRScheduler::test_compound_cosanneal_and_linearlr
+            - TestLRScheduler::test_compound_cosanneal_and_multistep_lr
+            - TestLRScheduler::test_compound_cosanneal_and_step_lr
+            - TestLRScheduler::test_compound_exp_and_linearlr
+            - TestLRScheduler::test_compound_exp_and_multistep_lr
+            - TestLRScheduler::test_compound_linearlr_and_multistep_lr
+            - TestLRScheduler::test_compound_reduce_lr_on_plateau1
+            - TestLRScheduler::test_compound_reduce_lr_on_plateau2
+            - TestLRScheduler::test_compound_reduce_lr_on_plateau3
+            - TestLRScheduler::test_compound_reduce_lr_on_plateau4
+            - TestLRScheduler::test_compound_reduce_lr_on_plateau5
+            - TestLRScheduler::test_compound_step_and_constantlr
+            - TestLRScheduler::test_compound_step_and_exp_lr
+            - TestLRScheduler::test_compound_step_and_multistep_lr
+            - TestLRScheduler::test_constant_initial_lr
+            - TestLRScheduler::test_constant_initial_lr_LRClass0
+            - TestLRScheduler::test_constant_initial_lr_LRClass1
+            - TestLRScheduler::test_constant_initial_lr_LRClass2
+            - TestLRScheduler::test_constant_initial_lr_LRClass3
+            - TestLRScheduler::test_constant_initial_lr_LRClass4
+            - TestLRScheduler::test_constant_initial_lr_LRClass5
+            - TestLRScheduler::test_constant_initial_lr_LRClass6
+            - TestLRScheduler::test_constant_initial_lr_LRClass7
+            - TestLRScheduler::test_constant_initial_lr_LRClass8
+            - TestLRScheduler::test_constant_initial_lr_LRClass9
+            - TestLRScheduler::test_constant_initial_params_cyclelr
+            - TestLRScheduler::test_constant_initial_params_onecyclelr
+            - TestLRScheduler::test_constant_initial_params_swalr
+            - TestLRScheduler::test_constantlr
+            - TestLRScheduler::test_constantlr_is_constant_for_constant_epoch
+            - TestLRScheduler::test_constantlr_with_epoch
+            - TestLRScheduler::test_cos_anneal_lr
+            - TestLRScheduler::test_cos_anneal_lr_continue
+            - TestLRScheduler::test_cosine_lr_state_dict
+            - TestLRScheduler::test_cosine_then_cyclic
+            - TestLRScheduler::test_cycle_lr_cycle_momentum_fail_with_momentumless_optimizer
+            - TestLRScheduler::test_cycle_lr_cycle_momentum_with_beta1_optimizer
+            - TestLRScheduler::test_cycle_lr_exp_range_mode
+            - TestLRScheduler::test_cycle_lr_exp_range_mode_one_lr
+            - TestLRScheduler::test_cycle_lr_exp_range_mode_step_size_up_down
+            - TestLRScheduler::test_cycle_lr_invalid_mode
+            - TestLRScheduler::test_cycle_lr_removed_after_out_of_scope
+            - TestLRScheduler::test_cycle_lr_scale_fn_restored_from_state_dict
+            - TestLRScheduler::test_cycle_lr_state_dict_picklable
+            - TestLRScheduler::test_cycle_lr_triangular2_mode
+            - TestLRScheduler::test_cycle_lr_triangular2_mode_one_lr
+            - TestLRScheduler::test_cycle_lr_triangular2_mode_step_size_up_down
+            - TestLRScheduler::test_cycle_lr_triangular_mode
+            - TestLRScheduler::test_cycle_lr_triangular_mode_one_lr
+            - TestLRScheduler::test_cycle_lr_triangular_mode_one_lr_no_momentum
+            - TestLRScheduler::test_cycle_lr_triangular_mode_step_size_up_down
+            - TestLRScheduler::test_cycle_lr_with_adam
+            - TestLRScheduler::test_cycle_lr_with_momentumless_optimizer
+            - TestLRScheduler::test_error_when_getlr_has_epoch
+            - TestLRScheduler::test_exp_lr
+            - TestLRScheduler::test_exp_step_lr_state_dict
+            - TestLRScheduler::test_exponential_lr_is_constant_for_constant_epoch
+            - TestLRScheduler::test_get_last_lr_constantlr
+            - TestLRScheduler::test_get_last_lr_linearlr
+            - TestLRScheduler::test_get_last_lr_multi_step_lr
+            - TestLRScheduler::test_get_last_lr_sequentiallr
+            - TestLRScheduler::test_get_last_lr_step_lr
+            - TestLRScheduler::test_lambda_lr
+            - TestLRScheduler::test_lambda_lr_state_dict_fn
+            - TestLRScheduler::test_lambda_lr_state_dict_obj
+            - TestLRScheduler::test_linear_linearlr_is_constant_for_constant_epoch
+            - TestLRScheduler::test_linearlr
+            - TestLRScheduler::test_linearlr_start_factor_limits1
+            - TestLRScheduler::test_linearlr_start_factor_limits2
+            - TestLRScheduler::test_linearlr_with_epoch
+            - TestLRScheduler::test_lr_scheduler_checkpoint
+            - TestLRScheduler::test_lr_scheduler_checkpoint_LRClass0
+            - TestLRScheduler::test_lr_scheduler_checkpoint_LRClass1
+            - TestLRScheduler::test_lr_scheduler_checkpoint_LRClass10
+            - TestLRScheduler::test_lr_scheduler_checkpoint_LRClass11
+            - TestLRScheduler::test_lr_scheduler_checkpoint_LRClass12
+            - TestLRScheduler::test_lr_scheduler_checkpoint_LRClass2
+            - TestLRScheduler::test_lr_scheduler_checkpoint_LRClass3
+            - TestLRScheduler::test_lr_scheduler_checkpoint_LRClass4
+            - TestLRScheduler::test_lr_scheduler_checkpoint_LRClass5
+            - TestLRScheduler::test_lr_scheduler_checkpoint_LRClass6
+            - TestLRScheduler::test_lr_scheduler_checkpoint_LRClass7
+            - TestLRScheduler::test_lr_scheduler_checkpoint_LRClass8
+            - TestLRScheduler::test_lr_scheduler_checkpoint_LRClass9
+            - TestLRScheduler::test_lr_scheduler_checkpoint_on_plateau
+            - TestLRScheduler::test_lr_scheduler_state_dict_load
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass0_weights_only_False
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass0_weights_only_True
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass10_weights_only_False
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass10_weights_only_True
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass11_weights_only_False
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass11_weights_only_True
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass12_weights_only_False
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass12_weights_only_True
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass13_weights_only_False
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass13_weights_only_True
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass14_weights_only_False
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass14_weights_only_True
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass15_weights_only_False
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass15_weights_only_True
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass1_weights_only_False
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass1_weights_only_True
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass2_weights_only_False
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass2_weights_only_True
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass3_weights_only_False
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass3_weights_only_True
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass4_weights_only_False
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass4_weights_only_True
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass5_weights_only_False
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass5_weights_only_True
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass6_weights_only_False
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass6_weights_only_True
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass7_weights_only_False
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass7_weights_only_True
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass8_weights_only_False
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass8_weights_only_True
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass9_weights_only_False
+            - TestLRScheduler::test_lr_scheduler_state_dict_load_LRClass9_weights_only_True
+            - TestLRScheduler::test_multi_step_lr
+            - TestLRScheduler::test_multi_step_lr_state_dict
+            - TestLRScheduler::test_multi_step_lr_with_epoch
+            - TestLRScheduler::test_multiplicative_lr
+            - TestLRScheduler::test_multiplicative_lr_with_lr_lambda
+            - TestLRScheduler::test_new_pattern_no_warning_with_arg
+            - TestLRScheduler::test_no_cyclic_references
+            - TestLRScheduler::test_no_cyclic_references_in_step
+            - TestLRScheduler::test_old_pattern_warning
+            - TestLRScheduler::test_old_pattern_warning_resuming
+            - TestLRScheduler::test_old_pattern_warning_resuming_with_arg
+            - TestLRScheduler::test_old_pattern_warning_with_arg
+            - TestLRScheduler::test_old_pattern_warning_with_overridden_optim_step
+            - TestLRScheduler::test_onecycle_lr_cannot_calculate_total_steps
+            - TestLRScheduler::test_onecycle_lr_cosine_annealing
+            - TestLRScheduler::test_onecycle_lr_invalid_anneal_strategy
+            - TestLRScheduler::test_onecycle_lr_invalid_pct_start
+            - TestLRScheduler::test_onecycle_lr_legacy_state_dict
+            - TestLRScheduler::test_onecycle_lr_linear_annealing
+            - TestLRScheduler::test_onecycle_lr_linear_annealing_three_phases
+            - TestLRScheduler::test_poly_lr
+            - TestLRScheduler::test_polynomial_lr_is_constant_for_constant_epoch
+            - TestLRScheduler::test_raise_error_when_last_epoch_is_greater_than_0_and_initial_lr_is_not_specified
+            - TestLRScheduler::test_reduce_lr_on_plateau1
+            - TestLRScheduler::test_reduce_lr_on_plateau2
+            - TestLRScheduler::test_reduce_lr_on_plateau3
+            - TestLRScheduler::test_reduce_lr_on_plateau4
+            - TestLRScheduler::test_reduce_lr_on_plateau5
+            - TestLRScheduler::test_reduce_lr_on_plateau6
+            - TestLRScheduler::test_reduce_lr_on_plateau7
+            - TestLRScheduler::test_reduce_lr_on_plateau8
+            - TestLRScheduler::test_reduce_lr_on_plateau_get_last_lr_before_step
+            - TestLRScheduler::test_reduce_lr_on_plateau_preserves_lr_type
+            - TestLRScheduler::test_reduce_lr_on_plateau_state_dict
+            - TestLRScheduler::test_sequentiallr1
+            - TestLRScheduler::test_sequentiallr2
+            - TestLRScheduler::test_sequentiallr3
+            - TestLRScheduler::test_sequentiallr4
+            - TestLRScheduler::test_sequentiallr5
+            - TestLRScheduler::test_sequentiallr_does_not_alias_lr_and_initial_lr
+            - TestLRScheduler::test_sequentiallr_no_warnings
+            - TestLRScheduler::test_step_lr
+            - TestLRScheduler::test_step_lr_is_constant_for_constant_epoch
+            - TestLRScheduler::test_step_lr_state_dict
+            - TestLRScheduler::test_swa_lr_state_dict
+            - TestLRScheduler::test_swalr_cosine_anneal_after_multiplicative
+            - TestLRScheduler::test_swalr_hypers
+            - TestLRScheduler::test_swalr_linear_anneal_after_multiplicative
+            - TestLRScheduler::test_swalr_no_anneal
+          mode: skip  # does not engage the torch-spyre layer
+
+  global:
+    supported_dtypes:
+      - name: bfloat16
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype

@@ -1,0 +1,370 @@
+test_suite_config:
+
+  files:
+    - path: ${TORCH_ROOT}/test/nn/test_pooling.py
+      unlisted_test_mode: skip
+      tests:
+        # These tests exercise various pooling operations, including fractional and adaptive pooling, across different dtypes and tensor behaviors.
+        # They are classified as mandatory_success because the Spyre backend must support these operations to ensure compatibility with PyTorch's pooling functionalities.
+        # Relevant Spyre capabilities include handling different dtypes and ensuring backward pass stability, while limitations may involve specific dtype support and error handling.
+        - names:
+            - TestPoolingNNDeviceType::test_FractionalMaxPool3d_errors
+            - TestPoolingNNDeviceType::test_LPPool1d_kernel_size_overflow_large
+            - TestPoolingNNDeviceType::test_adaptive_avg_pooling_backward_fails
+            - TestPoolingNNDeviceType::test_adaptive_max_pooling_backward_fails
+            - TestPoolingNNDeviceType::test_adaptive_pooling_empty_output_size
+            - TestPoolingNNDeviceType::test_adaptive_pooling_no_suppot_input
+            - TestPoolingNNDeviceType::test_fractional_max_pool2d_backward_fails
+            - TestPoolingNNDeviceType::test_max_pool2d_with_indices_backward_fails
+            - TestPoolingNNDeviceType::test_max_pool_indices_corner_cases
+            - TestPoolingNNDeviceType::test_pooling_zero_stride
+          mode: mandatory_success
+        - names:
+            - TestPoolingNNDeviceType::test_pool_invalid_size
+          mode: mandatory_success
+          edits:
+            dtypes:
+              exclude:
+                - name: bfloat16
+                - name: bool
+                - name: float16
+                - name: int64
+        # These tests exercise various pooling operations (max, avg, adaptive) across different dimensions and data types, including corner cases and zero-batch scenarios.
+        # They are classified as xfail on the Spyre backend due to unsupported operations, data types, and memory formats, as well as missing type conversion support during tensor copies.
+        # Relevant Spyre limitations include lack of support for non-contiguous memory formats, certain data types (e.g., int64 for gradient requirements), and specific pooling operations with complex configurations.
+        - names:
+            - TestPoolingNNDeviceType::test_AdaptiveMaxPool1d_indices
+            - TestPoolingNNDeviceType::test_AdaptiveMaxPool2d_indices
+            - TestPoolingNNDeviceType::test_AdaptiveMaxPool3d_indices
+            - TestPoolingNNDeviceType::test_AdaptiveMaxPool_zero_batch_dim
+            - TestPoolingNNDeviceType::test_AvgPool3d_backward_after_cat_dim1_device
+            - TestPoolingNNDeviceType::test_FractionalMaxPool2d_zero_batch
+            - TestPoolingNNDeviceType::test_FractionalMaxPool2d_zero_out_size
+            - TestPoolingNNDeviceType::test_FractionalMaxPool2d_zero_samples
+            - TestPoolingNNDeviceType::test_FractionalMaxPool3d_zero_batch
+            - TestPoolingNNDeviceType::test_FractionalMaxPool3d_zero_out_size
+            - TestPoolingNNDeviceType::test_FractionalMaxPool3d_zero_samples
+            - TestPoolingNNDeviceType::test_MaxPool1d_indices
+            - TestPoolingNNDeviceType::test_MaxPool2d_indices
+            - TestPoolingNNDeviceType::test_MaxPool3d_indices
+            - TestPoolingNNDeviceType::test_MaxUnpool_zero_batch_dim
+            - TestPoolingNNDeviceType::test_adaptive_avg_pool2d_output_size_one
+            - TestPoolingNNDeviceType::test_adaptive_avg_pool3d_output_size_one
+            - TestPoolingNNDeviceType::test_adaptive_pooling_max_nhwc
+            - TestPoolingNNDeviceType::test_adaptive_pooling_zero_batch
+            - TestPoolingNNDeviceType::test_avg_pool2d_nhwc
+            - TestPoolingNNDeviceType::test_avg_pool2d_reduced_floating
+            - TestPoolingNNDeviceType::test_fractional_max_pool_nan_inf
+            - TestPoolingNNDeviceType::test_max_pool1d_corner_cases
+            - TestPoolingNNDeviceType::test_max_pool2d_corner_cases
+            - TestPoolingNNDeviceType::test_max_pool2d_nhwc
+            - TestPoolingNNDeviceType::test_max_pool3d_ndhwc
+            - TestPoolingNNDeviceType::test_max_pool_bfloat16_half
+            - TestPoolingNNDeviceType::test_max_pool_nan_inf
+            - TestPoolingNNDeviceType::test_maxpool3d_non_square_backward
+            - TestPoolingNNDeviceType::test_maxpool_indices_no_batch_dim
+            - TestPoolingNNDeviceType::test_pool3d_size_one_feature_dim
+            - TestPoolingNNDeviceType::test_pool_large_size
+            - TestPoolingNNDeviceType::test_pooling_max_nhwc
+            - TestPoolingNNDeviceType::test_pooling_shape
+          mode: xfail  # xfail: dxp_standalone not detected
+        # These tests exercise pooling operations (avg_pool2d, max_pool2d) across different tensor dimensions and data types.
+        # They are classified as xfail due to NotImplementedError, indicating that the Spyre backend lacks support for these specific pooling operations.
+        # The relevant Spyre limitation is the absence of native support for avg_pool2d and max_pool2d_with_indices.
+        - names:
+            - TestPoolingNNDeviceType::test_AvgPool2d_empty
+            - TestPoolingNNDeviceType::test_MaxPool_zero_batch_dim
+            - TestPoolingNNDeviceType::test_max_pool1d
+            - TestPoolingNNDeviceType::test_pooling_bfloat16
+          mode: xfail  # xfail: NotImplementedError
+        # These tests exercise fractional max pooling operations on 2D and 3D tensors, using the Double dtype.
+        # They are classified as xfail due to the Spyre backend's lack of support for the Double dtype.
+        # The relevant Spyre limitation is the absence of Double dtype support in pooling operations.
+        - names:
+            - TestPoolingNNDeviceType::test_fractional_max_pool2d
+            - TestPoolingNNDeviceType::test_fractional_max_pool3d
+          mode: xfail  # xfail: RuntimeError
+        # # These tests exercise pooling operations with zero stride, which are expected to fail due to the absence of the 'dxp_standalone' executable required for compilation.
+        # # The failure is classified as xfail because the Spyre backend lacks the necessary runtime support for this specific operation.
+        # # Relevant Spyre limitations include missing executables for certain compilation tasks, impacting the ability to handle specific pooling configurations.
+        # - names:
+        #     - TestPoolingNNDeviceType::test_pooling_zero_stride
+        #   mode: xfail  # xfail: torch._inductor.exc.InductorError
+        # These tests exercise various pooling operations, including average and max pooling, across different dimensions and data types.
+        # They are classified as "skip" on the Spyre backend because the backend does not support certain operations or data types required by these tests.
+        # Relevant Spyre limitations include unsupported data types (e.g., double tensors) and operations (e.g., adaptive pooling with specific configurations).
+        - names:
+            - TestAvgPool::test_avg_pool1d_ceil_mode
+            - TestAvgPool::test_avg_pool2d_ceil_mode
+            - TestAvgPool::test_avg_pool3d_ceil_mode
+            - TestAvgPool::test_doubletensor_avg_pool2d
+            - TestAvgPool::test_doubletensor_avg_pool2d_with_divisor
+            - TestAvgPool::test_doubletensor_avg_pool3d
+            - TestAvgPool::test_doubletensor_avg_pool3d_with_divisor
+            - TestPoolingNN::test_MaxUnpool2d_output_size
+            - TestPoolingNN::test_adaptive_avg_pooling_nhwc_overflow
+            - TestPoolingNN::test_adaptive_avg_pooling_overflow
+            - TestPoolingNN::test_adaptive_pooling_avg_nhwc
+            - TestPoolingNN::test_adaptive_pooling_avg_nhwc_launch_config_backward
+            - TestPoolingNN::test_adaptive_pooling_avg_nhwc_launch_config_forward
+            - TestPoolingNN::test_adaptive_pooling_avg_nhwc_non_contiguous
+            - TestPoolingNN::test_adaptive_pooling_lower_precision
+            - TestPoolingNN::test_adaptive_pooling_size_none
+            - TestPoolingNN::test_adaptive_pooling_size_overflow
+            - TestPoolingNN::test_max_unpool
+            - TestPoolingNN::test_max_unpool2d_nhwc_cpu
+            - TestPoolingNN::test_max_unpool3d_input_check
+            - TestPoolingNN::test_quantized_max_pool1d_empty_kernel
+            - TestPoolingNN::test_quantized_max_pool3d
+            - TestPoolingNNDeviceType::test_MaxPool3d_errors
+            - TestPoolingNNDeviceType::test_MaxUnpool_index_errors
+            - TestPoolingNNDeviceType::test_MaxUnpool_invalid_output_size
+            - TestPoolingNNDeviceType::test_adaptive_pool_odd_size
+            - TestPoolingNNDeviceType::test_max_pool2d
+            - TestPoolingNNDeviceType::test_max_pool2d_indices
+            - TestPoolingNNDeviceType::test_pool3d_large_size_int64
+            - TestPoolingNNDeviceType::test_pooling_large
+          mode: skip  # does not engage the torch-spyre layer
+
+  global:
+    supported_dtypes:
+      - name: bfloat16
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype

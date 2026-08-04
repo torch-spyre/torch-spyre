@@ -22,6 +22,7 @@ from torch._inductor.utils import (
     get_fused_kernel_name,
     sympy_product,
 )
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.scheduler import (
     BaseScheduling,
     BaseSchedulerNode,
@@ -33,92 +34,12 @@ from torch._inductor.codecache import code_hash
 from torch.utils._ordered_set import OrderedSet
 
 from .spyre_kernel import SpyreKernel
-from .pass_utils import iteration_space
+from .pass_utils import iteration_space, per_core_view_scheduled
 from .logging_utils import get_inductor_logger
 from .op_spec import LoopSpec
+from . import config as _spyre_config
 
 logger = get_inductor_logger("scheduler")
-
-
-def _find_leaf_sched_node(node: BaseSchedulerNode):
-    """Recursively find the first leaf SchedulerNode inside a (possibly nested) node."""
-    for snode in node.get_nodes():
-        if isinstance(snode, SchedulerNode):
-            return snode
-        result = _find_leaf_sched_node(snode)
-        if result is not None:
-            return result
-    return None
-
-
-def _tiled_syms_for_sched_node_at_depth(sched_node: SchedulerNode, depth: int) -> list:
-    """Return the OpSpec iteration-space symbols tiled at ``depth``.
-
-    Uses ``loop_tiled_dims[depth]`` and ``loop_tiled_reduction_dims[depth]``
-    from the IR node and the SchedulerNode's ``iteration_space`` (which
-    produces the same symbols as ``create_op_spec`` uses to build
-    ``OpSpec.tiled_symbols``).
-
-    ``loop_tiled_dims`` stores *host-range* dimension indices (indices into
-    ``op.data.ranges``), which include unit-size batch dimensions that are
-    skipped in the iteration space.  We must map host-range indices to
-    iteration-space key indices by walking ``op.data.ranges`` and counting
-    only the non-unit entries.
-
-    For reduction-dimension tiling (``loop_tiled_reduction_dims``), the
-    reduction symbols follow the output symbols in the iteration space key
-    list (the scheduler produces keys from reads.ranges for Reduction nodes,
-    which has output dims first then reduction dims).  The offset is the
-    number of non-unit output-dim ranges; indices in
-    ``loop_tiled_reduction_dims`` are 0-based into the reduction portion.
-    """
-    ir_op = sched_node.node
-    if ir_op is None:
-        return []
-    loop_info = getattr(ir_op, "loop_info", None)
-    if loop_info is None:
-        return []
-    raw = loop_info.loop_tiled_dims
-    raw_rdims = getattr(loop_info, "loop_tiled_reduction_dims", [])
-    if not raw and not raw_rdims:
-        return []
-    dims_per_level: list[list[int]] = raw if raw else [[] for _ in raw_rdims]
-    rdims_per_level: list[list[int]] = raw_rdims if raw_rdims else [[] for _ in raw]
-    if depth >= len(dims_per_level):
-        return []
-    it_space = iteration_space(sched_node)
-    keys = list(it_space.keys())
-
-    # Build a map from host-range index → iteration-space key index.
-    # loop_tiled_dims is only stamped on ComputedBuffer ops (Pointwise/Reduction),
-    # so data.ranges is always present here.  The iteration space simply omits
-    # unit-size dims, so we walk ranges and count only non-unit entries.
-    host_to_it: dict[int, int] = {}
-    it_idx = 0
-    for host_idx, r in enumerate(ir_op.data.ranges):
-        if int(r) != 1:
-            host_to_it[host_idx] = it_idx
-            it_idx += 1
-
-    result = []
-    for d in dims_per_level[depth]:
-        mapped = host_to_it.get(d)
-        if mapped is not None and mapped < len(keys):
-            result.append(keys[mapped])
-
-    # Map reduction-dimension indices to iteration-space symbols.  For
-    # Reduction nodes the iteration space (from reads.ranges) has output-dim
-    # symbols first, then reduction-dim symbols.  The offset is the count of
-    # non-unit output-dim ranges.
-    rdims_at_depth = rdims_per_level[depth] if depth < len(rdims_per_level) else []
-    if rdims_at_depth:
-        n_output_syms = sum(1 for r in ir_op.data.ranges if int(r) != 1)
-        for rd in rdims_at_depth:
-            sym_idx = n_output_syms + rd
-            if sym_idx < len(keys):
-                result.append(keys[sym_idx])
-
-    return result
 
 
 class CountedLoopSchedulerNode(FusedSchedulerNode):
@@ -204,6 +125,96 @@ def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
     raise AssertionError(f"Node {node.get_name()} has no loop_count for depth {depth}")
 
 
+def _regroup_by_outer_loop_key(
+    nodes: list[BaseSchedulerNode],
+) -> list[BaseSchedulerNode]:
+    """Reorder ``nodes`` so every outermost loop_group_id run is contiguous.
+
+    Inductor's own ``Scheduler.topological_sort_schedule`` runs (twice) before
+    this pass ever sees the node list, via a plain DFS over
+    ``unmet_dependencies``.  That DFS only guarantees a *valid* topological
+    order — it does not preserve the original relative order of mutually
+    independent nodes, so it can interleave unrelated nodes into the middle
+    of what coarse_tile.py built as a single contiguous loop group.
+
+    A naive "stable sort by first occurrence of the group key" is unsound: it
+    can hoist a later group member forward past an interleaved node it
+    genuinely depends on, producing an invalid order. Instead, merge every
+    node sharing an outermost loop_group_id[0] key into one virtual unit for
+    ordering purposes — its dependency set is the union of its members' real
+    unmet_dependencies on buffers produced outside the group — and run a
+    dependency-respecting DFS (mirroring topological_sort_schedule's own
+    shape) over {merged units, ungrouped nodes}. Each unit then expands back
+    into its original members in their original relative order, which is
+    always safe because that intra-group order is coarse_tile's deliberate
+    op sequence, not something this pass reorders.
+
+    The result is a valid topological order (edges are the real edges of the
+    original graph) in which every outermost loop group is contiguous by
+    construction.
+    """
+    name_to_node: dict[str, BaseSchedulerNode] = {}
+    for node in nodes:
+        for name in node.get_buffer_names():
+            name_to_node[name] = node
+
+    outer_key_to_unit: dict[object, list[BaseSchedulerNode]] = {}
+    units: list[Union[BaseSchedulerNode, list[BaseSchedulerNode]]] = []
+    unit_of_node: dict[int, Union[BaseSchedulerNode, list[BaseSchedulerNode]]] = {}
+
+    for node in nodes:
+        gid = _loop_group_id(node)
+        outer_key = gid[0] if gid is not None else None
+        if outer_key is None:
+            units.append(node)
+            unit_of_node[id(node)] = node
+            continue
+        unit = outer_key_to_unit.get(outer_key)
+        if unit is None:
+            unit = []
+            outer_key_to_unit[outer_key] = unit
+            units.append(unit)
+        unit.append(node)
+        unit_of_node[id(node)] = unit
+
+    def unit_key(unit) -> int:
+        return id(unit)
+
+    unit_deps: dict[int, OrderedSet] = {}
+    unit_members: dict[int, list[BaseSchedulerNode]] = {}
+    for unit in units:
+        members = unit if isinstance(unit, list) else [unit]
+        member_ids = {id(m) for m in members}
+        deps: OrderedSet = OrderedSet()
+        for member in members:
+            for dep in member.unmet_dependencies:
+                producer = name_to_node.get(dep.name)
+                if producer is None or id(producer) in member_ids:
+                    continue
+                deps.add(unit_key(unit_of_node[id(producer)]))
+        unit_deps[unit_key(unit)] = deps
+        unit_members[unit_key(unit)] = members
+
+    seen: set = set()
+    ordered_units: list = []
+
+    def visit(key: int) -> None:
+        if key in seen:
+            return
+        seen.add(key)
+        for dep_key in unit_deps[key]:
+            visit(dep_key)
+        ordered_units.append(key)
+
+    for unit in units:
+        visit(unit_key(unit))
+
+    result: list[BaseSchedulerNode] = []
+    for key in ordered_units:
+        result.extend(unit_members[key])
+    return result
+
+
 def _build_loop_group(
     nodes: list[BaseSchedulerNode], depth: int
 ) -> list[BaseSchedulerNode]:
@@ -211,6 +222,10 @@ def _build_loop_group(
 
     depth is the nesting level being processed (0 = outermost).  Each node's
     loop_group_id is a tuple; we group on element [depth].
+
+    Callers are expected to have already made outermost (depth 0) runs
+    contiguous via ``_regroup_by_outer_loop_key`` — this function itself only
+    scans linearly and does not tolerate gaps.
     """
     result: list[BaseSchedulerNode] = []
     i = 0
@@ -263,19 +278,24 @@ def build_loop_scheduler_nodes(
 
     loop_group_id is a tuple of ints encoding the nesting path, e.g.
     (0,) for an outermost group, (0, 1) for a nested group inside group 0.
-    Nodes sharing the same outermost key must be contiguous; a gap indicates
-    a data-flow dependency crossing the group boundary, which is a bug in
-    the tiling pass.
+    Nodes sharing the same outermost key are made contiguous by
+    ``_regroup_by_outer_loop_key`` before grouping, since Inductor's own
+    ``Scheduler.topological_sort_schedule`` (a DFS that runs twice before
+    this pass ever sees the node list) does not preserve the tiling pass's
+    intended contiguous ordering for mutually independent nodes.
 
     Running before Inductor's fusion pass ensures CountedLoopSchedulerNodes are
     visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return False),
     so loop groups survive Inductor fusion intact.  spyre_fuse_nodes is separately
-    protected because it only fuses plain SchedulerNodes (isinstance check), causing
-    CountedLoopSchedulerNodes to force a bundle boundary.
+    aware of CountedLoopSchedulerNodes: they are accumulated alongside plain
+    SchedulerNodes and may share a bundle with adjacent ops.
     """
+    nodes = _regroup_by_outer_loop_key(nodes)
     result = _build_loop_group(nodes, depth=0)
 
-    # Verify contiguity: no loop_group_id should appear in two separate runs.
+    # _regroup_by_outer_loop_key guarantees outermost runs are contiguous by
+    # construction; this is a defensive check, not the primary correctness
+    # mechanism.  A failure here would indicate a bug in that construction.
     seen: dict[tuple, str] = {}
     for node in result:
         if isinstance(node, CountedLoopSchedulerNode):
@@ -285,12 +305,174 @@ def build_loop_scheduler_nodes(
                 name = node.get_name()
                 if key in seen and seen[key] != name:
                     raise RuntimeError(
-                        f"Loop group {key} is not contiguous in the scheduler node list. "
-                        "This indicates a data-flow dependency crossing a loop group boundary."
+                        f"Loop group {key} is not contiguous in the scheduler node list "
+                        "after _regroup_by_outer_loop_key. This indicates a bug in that "
+                        "regrouping, not a data-flow issue in the tiling pass."
                     )
                 seen[key] = name
 
     return result
+
+
+def _lx_resident(node: SchedulerNode) -> bool:
+    """True if ``node``'s output buffer was pinned into LX by scratchpad planning."""
+    allocation = getattr(getattr(node.node, "layout", None), "allocation", None)
+    return allocation is not None and "lx" in allocation
+
+
+def align_lx_producer_loop_order(
+    nodes: list[BaseSchedulerNode],
+) -> list[BaseSchedulerNode]:
+    """Pre-fusion pass: match an LX buffer's producer loop order to its consumers'.
+
+    LX is per-core scratchpad, so every op touching an LX-resident buffer must
+    agree on which core owns which slice.  That mapping is *positional*:
+    ``core_to_slice_mapping`` hands out ``core_id`` strides in iteration-space
+    order, so a producer that walks the buffer in a different dim order than its
+    consumers read it gets a transposed core->slice assignment.  The split
+    factors still multiply to the same core count, so nothing downstream
+    complains -- each core simply reads the slice a different core wrote, and the
+    kernel silently returns another core's data.
+
+    Scratchpad planning creates the clone that pins a graph input into LX, and it
+    builds that clone in the buffer's natural dim order, which need not match how
+    the consumers read it.  Through PyTorch 2.12 Inductor's
+    ``loop_ordering_after_fusion`` happened to rewrite the clone into the
+    consumers' order, so the assignments lined up by accident.  As of 2.13 the
+    reorder is computed and then discarded (see
+    ``Scheduler._try_reorder_loops_for_candidates``), which exposed the
+    incoherence as wrong results for any two reductions sharing one LX-pinned
+    input.  Align the orders here so correctness does not rest on an Inductor
+    scoring heuristic.
+
+    Consumers of an LX buffer are already known to agree with each other -- a
+    disagreement is a core-division mismatch that keeps the buffer in HBM (see
+    ``get_ncores_for_buffers``) -- so matching the first consumer matches all.
+    """
+    producers: dict[str, SchedulerNode] = {}
+    for node in nodes:
+        if isinstance(node, SchedulerNode) and _lx_resident(node):
+            for dep in node.read_writes.writes:
+                if isinstance(dep, MemoryDep):
+                    producers[dep.name] = node
+
+    if not producers:
+        return nodes
+
+    # Keyed by producer, not by buffer: reordering a producer twice would leave
+    # it matching only whichever consumer came last.  A ComputedBuffer has a
+    # single output (multi-output ops carry no device_layout and never reach LX),
+    # so one alignment per producer covers every LX buffer it writes.
+    aligned: OrderedSet[str] = OrderedSet()
+    for node in nodes:
+        if not isinstance(node, SchedulerNode):
+            continue
+        for read in node.read_writes.reads:
+            if not isinstance(read, MemoryDep):
+                continue
+            producer = producers.get(read.name)
+            if producer is None or producer is node:
+                continue
+            if producer.get_name() in aligned:
+                continue
+            write = next(
+                (
+                    dep
+                    for dep in producer.read_writes.writes
+                    if isinstance(dep, MemoryDep) and dep.name == read.name
+                ),
+                None,
+            )
+            if write is None:
+                continue
+            # Reorders `producer`'s loops so its write dep matches `read`.
+            if producer.reorder_loops_by_dep_pair(write, read):
+                aligned.add(producer.get_name())
+                logger.debug(
+                    "align_lx_producer_loop_order: %s reordered to match %s's "
+                    "read of LX buffer %s",
+                    producer.get_name(),
+                    node.get_name(),
+                    read.name,
+                )
+
+    return nodes
+
+
+def demote_incoherent_lx_buffers(
+    nodes: list[BaseSchedulerNode],
+) -> list[BaseSchedulerNode]:
+    """Post-fusion pass: drop an LX buffer whose users disagree on core->slice.
+
+    LX planning runs before the Scheduler exists, so it reasons about each op's
+    *pre*-scheduler ranges. ``core_to_slice_mapping`` is positional -- it hands
+    ``core_id`` strides out in iteration-space order -- and Inductor's
+    ``loop_ordering_after_fusion`` may permute a fused op's ranges after planning
+    has already committed. When it permutes one user of an LX buffer and not
+    another, the two disagree about which core owns which slice: each core writes
+    one slice and reads back a different one. LX is per-core scratchpad with no
+    other copy, so the read is silently wrong (#2062).
+
+    Planning cannot see that permutation, so re-check here, where the ranges are
+    final, and demote any buffer whose users no longer agree. Clearing ``"lx"``
+    is all that is needed: this runs before ``hbm_pool_planning``, which claims
+    exactly the intermediates LX did not, so a demoted buffer lands in the HBM
+    intermediates segment on its way through.
+
+    Deliberately verification-only -- it never *adds* residency and never
+    rewrites a loop order, so it cannot perturb a graph whose users already
+    agree.
+
+    Complements :func:`align_lx_producer_loop_order`, which runs pre-fusion and
+    rewrites a producer's loop order to match its consumers'. That pass fixes the
+    incoherence it can reach; this one is the backstop for what it cannot -- a
+    disagreement introduced after it ran, or a view too irregular to represent --
+    where the only safe answer is to give up LX residency.
+    """
+    if not _spyre_config.lx_planning:
+        return nodes
+
+    # dep is needed per (node, buffer): a node reading and writing the same
+    # buffer contributes one entry per access, so an in-place op whose read and
+    # write views diverge is caught too.
+    users: dict[str, list[tuple[SchedulerNode, MemoryDep]]] = {}
+    lx_names: OrderedSet[str] = OrderedSet()
+    for node in nodes:
+        for inner in node.get_nodes():
+            if not isinstance(inner, SchedulerNode):
+                continue
+            if _lx_resident(inner):
+                for dep in inner.read_writes.writes:
+                    if isinstance(dep, MemoryDep):
+                        lx_names.add(dep.name)
+            rw = inner.read_writes
+            for dep in list(rw.reads) + list(rw.writes):
+                if isinstance(dep, MemoryDep):
+                    users.setdefault(dep.name, []).append((inner, dep))
+
+    for name in lx_names:
+        ref = None
+        culprit = None
+        for node, dep in users.get(name, []):
+            view, _, representable = per_core_view_scheduled(node, dep, name)
+            if not representable:
+                culprit = f"{node.get_name()} view unrepresentable"
+                break
+            if ref is None:
+                ref = view
+            elif view != ref:
+                culprit = f"{node.get_name()} disagrees: {view} != {ref}"
+                break
+        if culprit is None:
+            continue
+        buf = V.graph.try_get_buffer(name)
+        layout = getattr(buf, "layout", None)
+        allocation = getattr(layout, "allocation", None)
+        if allocation is not None:
+            allocation.pop("lx", None)
+        logger.info("demoted %s out of LX: %s", name, culprit)
+
+    return nodes
 
 
 class SuperDSCScheduling(BaseScheduling):
@@ -352,6 +534,28 @@ class SuperDSCScheduling(BaseScheduling):
                 raise RuntimeError(f"Unexpected node type: {type(node)}")
         return node_schedule
 
+    def _collect_layout_restores(self, node_schedule) -> list:
+        """Select the layout restores to emit after a kernel call.
+
+        Walks the kernel's nodes for _emit_set_layout tags set by
+        insert_post_mutation_restickify and dedups them against the ones already
+        emitted by earlier kernels, so each target restores once across the whole
+        graph. Selection is the scheduler's job (it owns the node list and the
+        cross-kernel dedup state); the kernel just emits the returned list.
+        """
+        # Dedup is graph-scoped: a target's device layout must be restored
+        # exactly once across the whole generated program, not once per kernel.
+        # The state lives on V.graph (one GraphLowering per compilation), so it
+        # starts empty for each graph without any explicit reset.
+        emitted = V.graph.__dict__.setdefault("_emitted_layout_targets", set())
+        restores = []
+        for snode in node_schedule:
+            emit = getattr(getattr(snode, "node", None), "_emit_set_layout", None)
+            if emit is not None and emit[0] not in emitted:
+                emitted.add(emit[0])
+                restores.append(emit)
+        return restores
+
     def codegen_node(
         self, node: Union[FusedSchedulerNode, SchedulerNode, CountedLoopSchedulerNode]
     ) -> None:
@@ -364,37 +568,31 @@ class SuperDSCScheduling(BaseScheduling):
 
         assert self.scheduler
         nodes = [
-            node
-            for node in node.get_nodes()
-            if node.get_name() not in self.scheduler.removed_ops
+            n
+            for n in node.get_nodes()
+            if n.get_name() not in self.scheduler.removed_ops
         ]
         if len(nodes) == 0:
             return
 
-        node_schedule = self.generate_node_schedule(nodes)
         kernel = SpyreKernel()
+        all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
-            for node in node_schedule:
-                var_ranges = iteration_space(node)
-                vars = list(var_ranges.keys())
-                index_vars = [
-                    vars[: len(node._body.iter_vars)],
-                    vars[len(node._body.iter_vars) :],
-                ]
-                node.codegen(index_vars)
+            self._codegen_into_kernel(nodes, kernel, all_schedule_nodes)
 
         with V.set_kernel_handler(kernel):
             src_code = kernel.codegen_kernel()
-        kernel_name = self.define_kernel(src_code, node_schedule, kernel)
+        kernel_name = self.define_kernel(src_code, all_schedule_nodes, kernel)
         kernel.kernel_name = kernel_name
         kernel.code_hash = code_hash(src_code)
 
         with V.set_kernel_handler(kernel):
-            for node in node_schedule:
-                node.mark_run()
+            for snode in all_schedule_nodes:
+                snode.mark_run()
 
-        self.codegen_comment(node_schedule, kernel_name)
+        self.codegen_comment(all_schedule_nodes, kernel_name)
         kernel.call_kernel(kernel.kernel_name)
+        kernel.emit_layout_restores(self._collect_layout_restores(all_schedule_nodes))
 
         V.graph.removed_buffers |= kernel.removed_buffers
         V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
@@ -412,43 +610,12 @@ class SuperDSCScheduling(BaseScheduling):
         if len(inner_nodes) == 0:
             return
 
-        # Each snode in the group may itself be a CountedLoopSchedulerNode
-        # (nested loop) or a plain SchedulerNode.  Drive them all into the
-        # same SpyreKernel so their OpSpecs land in one op_specs list.
         kernel = SpyreKernel()
         all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
-            for inner in inner_nodes:
-                if isinstance(inner, CountedLoopSchedulerNode):
-                    # Recurse: codegen the inner loop into the same kernel,
-                    # which will call wrap_op_specs_in_loop on the inner body.
-                    # We temporarily redirect codegen to this kernel.
-                    self._codegen_loop_body(inner, kernel, all_schedule_nodes)
-                else:
-                    sched = self.generate_node_schedule([inner])
-                    all_schedule_nodes.extend(sched)
-                    for snode in sched:
-                        var_ranges = iteration_space(snode)
-                        vs = list(var_ranges.keys())
-                        index_vars = [
-                            vs[: len(snode._body.iter_vars)],
-                            vs[len(snode._body.iter_vars) :],
-                        ]
-                        snode.codegen(index_vars)
+            self._codegen_into_kernel(inner_nodes, kernel, all_schedule_nodes)
 
-        # Compute per-level tiled symbols for the outer (depth=0) LoopSpec.
-        # Find a leaf SchedulerNode to read loop_tiled_dims + iteration_space.
-        outer_tiled_syms: list = []
-        for inner in inner_nodes:
-            ref = _find_leaf_sched_node(inner)
-            if ref is not None:
-                outer_tiled_syms = _tiled_syms_for_sched_node_at_depth(ref, 0)
-                break
-
-        kernel.wrap_op_specs_in_loop(
-            node.loop_count,
-            tiled_symbols=outer_tiled_syms,
-        )
+        kernel.wrap_op_specs_in_loop(node.loop_count)
 
         with V.set_kernel_handler(kernel):
             src_code = kernel.codegen_kernel()
@@ -462,6 +629,7 @@ class SuperDSCScheduling(BaseScheduling):
 
         self.codegen_comment(all_schedule_nodes, kernel_name)
         kernel.call_kernel(kernel.kernel_name)
+        kernel.emit_layout_restores(self._collect_layout_restores(all_schedule_nodes))
 
         V.graph.removed_buffers |= kernel.removed_buffers
         V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
@@ -503,24 +671,37 @@ class SuperDSCScheduling(BaseScheduling):
                     ]
                     snode.codegen(index_vars)
 
-        # Determine this level's tiled symbols using the IR's loop_tiled_dims[depth].
-        ref_sched_node = _find_leaf_sched_node(node)
-        level_syms = (
-            _tiled_syms_for_sched_node_at_depth(ref_sched_node, depth)
-            if ref_sched_node is not None
-            else []
-        )
-
         # Wrap only the newly-added op_specs entries in this inner LoopSpec.
         body = kernel.op_specs[body_start:]
         kernel.op_specs = kernel.op_specs[:body_start]
-        kernel.op_specs.append(
-            LoopSpec(
-                count=node.loop_count,
-                body=body,
-                tiled_symbols=level_syms,
-            )
-        )
+        kernel.op_specs.append(LoopSpec(count=node.loop_count, body=body))
+
+    def _codegen_into_kernel(
+        self,
+        nodes: list[BaseSchedulerNode],
+        kernel: SpyreKernel,
+        all_schedule_nodes: list[SchedulerNode],
+    ) -> None:
+        """Codegen a sequence of nodes into an existing kernel in order.
+
+        Each CountedLoopSchedulerNode is driven via _codegen_loop_body so its
+        ops land as a LoopSpec entry in kernel.op_specs.  Plain SchedulerNodes
+        are codegenned flat.  The two types may appear in any order.
+        """
+        for node in nodes:
+            if isinstance(node, CountedLoopSchedulerNode):
+                self._codegen_loop_body(node, kernel, all_schedule_nodes)
+            else:
+                sched = self.generate_node_schedule([node])
+                all_schedule_nodes.extend(sched)
+                for snode in sched:
+                    var_ranges = iteration_space(snode)
+                    vs = list(var_ranges.keys())
+                    index_vars = [
+                        vs[: len(snode._body.iter_vars)],
+                        vs[len(snode._body.iter_vars) :],
+                    ]
+                    snode.codegen(index_vars)
 
     def define_kernel(self, src_code, node_schedule, kernel):
         """
