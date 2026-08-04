@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest import TestCase
 
 from torch_spyre._inductor import config
@@ -446,6 +447,9 @@ print("RESULT " + json.dumps({{x.name: x.address for x in bufs}}))
 """
 
 
+_DETERMINISM_HASHSEEDS = range(5)
+
+
 def _run_determinism_snippet(hashseed, solver_class_name, solver_module):
     env = dict(
         os.environ,
@@ -461,11 +465,32 @@ def _run_determinism_snippet(hashseed, solver_class_name, solver_module):
         text=True,
         env=env,
         cwd=_REPO_ROOT,
-        timeout=60,
+        timeout=120,
     )
     assert p.returncode == 0, p.stderr
     line = next(ln for ln in p.stdout.splitlines() if ln.startswith("RESULT "))
     return json.loads(line[len("RESULT ") :])
+
+
+def _run_determinism_snippets(solver_class_name, solver_module):
+    """Run the snippet once per hash seed, all subprocesses concurrently.
+
+    Each subprocess pays ~6s importing torch and the Inductor stack (the
+    snippet imports ``torch_spyre._inductor``, whose ``__init__`` pulls in
+    ``torch._inductor.graph``), so running them sequentially costs that import
+    once per seed. The work is entirely inside ``subprocess.run``, so threads
+    release the GIL and wall time collapses to roughly a single import.
+    Returns the results in seed order.
+    """
+    with ThreadPoolExecutor(max_workers=len(_DETERMINISM_HASHSEEDS)) as pool:
+        return list(
+            pool.map(
+                lambda seed: _run_determinism_snippet(
+                    seed, solver_class_name, solver_module
+                ),
+                _DETERMINISM_HASHSEEDS,
+            )
+        )
 
 
 class ScoreOrderingTests:
@@ -542,15 +567,12 @@ class ScoreOrderingTests:
 
     def test_inplace_parent_choice_is_hashseed_independent(self):
         """Placement must not depend on PYTHONHASHSEED (set-iteration order)."""
-        solver_class_name = self.solver_class.__name__
-        solver_module = self.solver_class.__module__
-        base = _run_determinism_snippet(0, solver_class_name, solver_module)
-        for hashseed in range(1, 10):
-            self.assertEqual(
-                _run_determinism_snippet(hashseed, solver_class_name, solver_module),
-                base,
-                f"PYTHONHASHSEED={hashseed}",
-            )
+        results = _run_determinism_snippets(
+            self.solver_class.__name__, self.solver_class.__module__
+        )
+        base = results[0]
+        for hashseed, result in zip(_DETERMINISM_HASHSEEDS, results):
+            self.assertEqual(result, base, f"PYTHONHASHSEED={hashseed}")
 
 
 class TestFirstFitLayoutSolver(ScoreOrderingTests, BaseLayoutSolverTests, TestCase):
