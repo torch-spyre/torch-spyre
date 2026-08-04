@@ -667,7 +667,22 @@ def _resolve_tile_size_counts(operations: list[Operation]) -> dict[int, dict[str
         # levels on distinct loop vars, `remaining` is just the host extent and
         # this is identical to the previous behaviour.
         remaining: dict[sympy.Symbol, int] = {}
+        claimed_by: dict[sympy.Symbol, tuple[int, str]] = {}
         for hint_id, name, tile_size, sym in levels:
+            # Cumulative division walks NESTING levels, so two names of the SAME
+            # scope landing on one loop var is not a chain -- treating it as one
+            # would divide twice for a single level.  It is also ambiguous (which
+            # of the two is the outer split?), so refuse rather than pick.
+            prev = claimed_by.get(sym)
+            if prev is not None and prev[0] == hint_id:
+                raise Unsupported(
+                    f"spyre_hint(tile_size_per_dim=...): dims {prev[1]!r} and "
+                    f"{name!r} in the same hint scope share one host dim, so "
+                    "their tile sizes cannot both be applied at this level. "
+                    "Tile them in nested scopes instead, outermost first, with "
+                    "each inner size dividing the enclosing one."
+                )
+            claimed_by[sym] = (hint_id, name)
             avail = remaining.get(sym, extents[sym])
             if tile_size <= 0:
                 raise Unsupported(
@@ -695,6 +710,46 @@ def _resolve_tile_size_counts(operations: list[Operation]) -> dict[int, dict[str
             if counts.get(hint_id, {}).get(name) is None:
                 counts.setdefault(hint_id, {})[name] = avail // tile_size
             remaining[sym] = tile_size
+
+    # Second pass: a hinted dim that NO op carries as a loop var has no range to
+    # read an extent from, so the size -> count conversion above never fires for
+    # it.  The count spelling never needed an extent, which is why
+    # num_tiles_per_dim works for such dims today.  The DECLARED extent
+    # (declare_tensor_dim) is a legitimate second source -- unlike falling back
+    # to using the tile SIZE as the count, which would tile into `tile_size`
+    # pieces instead of pieces OF tile_size, i.e. miscompile.
+    #
+    # Deliberately a separate pass, run only where pass 1 left a gap, so a range
+    # derived from real op ranges always wins and the result does not depend on
+    # the order `operations` happens to be in.
+    for op in operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        for hint_id, hint_dict in sorted(get_op_hints(op).items()):
+            sizes = hint_dict.get(_TILE_SIZE_KEY)
+            if not sizes:
+                continue
+            for name, tile_size in sizes.items():
+                if counts.get(hint_id, {}).get(name) is not None:
+                    continue
+                declared = _named_dims.get(name)
+                if not declared:
+                    continue  # genuinely unknown -- the caller's check raises
+                tile_size = int(tile_size)
+                if tile_size <= 0:
+                    raise Unsupported(
+                        f"spyre_hint(tile_size_per_dim={{{name!r}: {tile_size}}}): "
+                        "tile size must be positive"
+                    )
+                if int(declared) % tile_size != 0:
+                    raise Unsupported(
+                        f"spyre_hint(tile_size_per_dim={{{name!r}: {tile_size}}}): "
+                        f"dim {name!r} has declared extent {declared}, which is not "
+                        f"a multiple of the tile size. WSR requires full tiles -- "
+                        f"pad {name!r} to a multiple of {tile_size} (with "
+                        "op-appropriate identity values) before the tiled scope."
+                    )
+                counts.setdefault(hint_id, {})[name] = int(declared) // tile_size
     return counts
 
 

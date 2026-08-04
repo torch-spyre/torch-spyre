@@ -2290,11 +2290,13 @@ def test_view_1d_subdim_Lq2_D2():
     def fn(a, b):
         a = a.view(Lq, D)
         b = b.view(Lq, D)
-        # Lq and D share one host dim (the flat Lq*D range), so tile sizes are
-        # absolute HOST-dim extents and the inner size must divide the outer:
-        # Lq/2 x D = 16384 outer, then Lq/2 x D/2 = 8192 inner.
-        with spyre_hint(tile_size_per_dim={"Lq": (Lq // 2) * D}):
-            with spyre_hint(tile_size_per_dim={"D": (Lq // 2) * (D // 2)}):
+        # The view() above means the op sees a 2-D [Lq, D] iteration space, so
+        # despite the flat 1-D input these are ORDINARY per-dim tile sizes --
+        # not the absolute host-dim extents the truly-flat
+        # test_hint_nested_tiling_copy_mutation_flat needs.  D is not carried by
+        # any loop var here, so its count comes from the declared extent.
+        with spyre_hint(tile_size_per_dim={"Lq": Lq // 2}):
+            with spyre_hint(tile_size_per_dim={"D": D // 2}):
                 with spyre_hint(expected_named_dims=["Lq", "D"]):
                     return a * b
 
