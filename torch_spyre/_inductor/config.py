@@ -33,6 +33,17 @@ global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == 
 # lowering does not yet support (grouped/transposed/non-fp16).
 conv2d_direct_lowering: bool = os.environ.get("SPYRE_CONV2D_DIRECT", "0") == "1"
 
+# For a strided (stride>1) direct-lowered conv2d, forbid splitting the output
+# spatial dims (i/j) across cores. A strided conv's output coordinates do not
+# map to a contiguous input span per core, so a spatial split shuffles the
+# result (same failure and fix as the depthwise conv work). Forcing
+# dim_splits[i]=dim_splits[j]=1 keeps each core computing whole spatial rows/
+# cols. Defaults on; set SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT=0 to opt
+# out (e.g. to measure the shuffle or once the planner models strided spans).
+disable_conv2d_spatial_split: bool = (
+    os.environ.get("SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT", "1") == "1"
+)
+
 allow_all_ops_in_lx_planning: bool = False
 
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))

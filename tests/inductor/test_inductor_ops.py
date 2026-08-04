@@ -4603,6 +4603,50 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     None,
                     (1, 1),
                 ),
+                # --- Strided convolutions (stride 2). Correctness needs two
+                # things: (1) the output spatial dims i/j must not be split
+                # across cores, or the per-core input span shuffles -- so
+                # disable_conv2d_spatial_split clamps i/j splits to 1 (see
+                # superdsc parse_op_spec is_conv); and (2) the input WIDTH must
+                # be evenly tiled by the strided windows. The fp16 conv opfunc
+                # tiles the output width (Tj=4) but processes height row-by-row
+                # (Ti=1), so when (W_in - kW) % sW != 0 the dangling partial
+                # column is mis-accumulated. Clean-width cases direct-lower;
+                # ragged-width cases fall back to im2col+matmul (declined in
+                # _is_direct_conv_supported). Verified on Spyre HW.
+                #
+                # Clean width ((W_in-kW) % sW == 0) -> direct lowering. 13x13
+                # (->6x6, not tile-aligned) and 17x17 (->8x8, tile-aligned)
+                # cover both output alignments.
+                "1x64x13x13_k3_s2": (
+                    cached_randn((1, 64, 13, 13)),
+                    cached_randn((64, 64, 3, 3)),
+                    None,
+                    (2, 2),
+                ),
+                "1x64x17x17_k3_s2": (
+                    cached_randn((1, 64, 17, 17)),
+                    cached_randn((64, 64, 3, 3)),
+                    None,
+                    (2, 2),
+                ),
+                # Ragged HEIGHT, clean width (H:(8-3)%2=1, W:(9-3)%2=0). Height
+                # is untiled, so a ragged height is harmless -- this still
+                # direct-lowers and matches CPU (proves the width-tiling
+                # constraint is on width only, not either spatial dim).
+                "1x64x8x9_k3_s2": (
+                    cached_randn((1, 64, 8, 9)),
+                    cached_randn((64, 64, 3, 3)),
+                    None,
+                    (2, 2),
+                ),
+                # The declined corners -- ragged input width ((W_in-kW)%sW != 0)
+                # and kernel > 3 -- are covered by the pure-Python predicate test
+                # (test_conv2d_direct_support_predicate), not end-to-end here:
+                # once declined they route to the im2col+matmul decomposition,
+                # whose custom-op reshape does not handle this test's
+                # channel-last weight layout (a separate, pre-existing issue
+                # unrelated to direct lowering).
             },
         },
         ("test_avg_pool2d", "test_avg_pool2d_base"): {
@@ -6660,17 +6704,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 run_eager=False,
             )
 
-    def test_conv2d_direct_cin_stick_alignment(self):
+    def test_conv2d_direct_support_predicate(self):
         # Pure-Python guard check (no compile/hardware): the direct-lowering
-        # support predicate must reject a C_in that is not a whole multiple of
-        # the fp16 stick width and accept a stick-aligned one. This is what
-        # keeps a non-stick-aligned conv on the im2col+matmul decomposition
-        # (the direct SDSC contracts over C_in with no partial-stick handling).
+        # support predicate must decline the corners the Spyre conv SDSC / fp16
+        # opfunc cannot handle, so those convs stay on the im2col+matmul
+        # decomposition. Covered here:
+        #  - C_in not a multiple of the fp16 stick width (the direct SDSC
+        #    contracts over C_in with no partial-stick handling);
+        #  - kernel tap > 3 (the dense C_in*kH*kW contraction overflows the
+        #    SuperDSC LX budget in DDC);
+        #  - ragged input width under stride, (W_in - kW) % sW != 0 (the fp16
+        #    opfunc tiles the output width and mis-accumulates the dangling
+        #    column; a ragged height is untiled and harmless).
         from torch_spyre._inductor.decompositions import _is_direct_conv_supported
         from torch_spyre._C import get_elem_in_stick
 
         eps = get_elem_in_stick(torch.float16)  # 64 at fp16
         common = dict(
+            stride=[1, 1],
             transposed=False,
             output_padding=[0, 0],
             padding=[0, 0],
@@ -6678,17 +6729,32 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             groups=1,
         )
 
-        def _supported(c_in):
-            x = torch.zeros(1, c_in, 8, 8, dtype=torch.float16)
-            w = torch.zeros(eps, c_in, 3, 3, dtype=torch.float16)
-            return _is_direct_conv_supported(x, w, **common)
+        def _supported(c_in, k=3, hw=8, **overrides):
+            x = torch.zeros(1, c_in, hw, hw, dtype=torch.float16)
+            w = torch.zeros(eps, c_in, k, k, dtype=torch.float16)
+            return _is_direct_conv_supported(x, w, **{**common, **overrides})
 
+        # C_in stick alignment.
         self.assertTrue(_supported(eps), f"C_in={eps} should direct-lower")
         self.assertTrue(_supported(2 * eps), f"C_in={2 * eps} should direct-lower")
         self.assertFalse(
             _supported(eps // 2), f"C_in={eps // 2} must fall back (not stick-aligned)"
         )
         self.assertFalse(_supported(3), "C_in=3 must fall back (not stick-aligned)")
+
+        # Kernel > 3 (dense contraction overflows LX).
+        self.assertTrue(_supported(eps, k=3), "k=3 should direct-lower")
+        self.assertFalse(_supported(eps, k=5), "k=5 must fall back (LX overflow)")
+
+        # Ragged input width under stride: (W_in - kW) % sW != 0.
+        self.assertTrue(
+            _supported(eps, k=3, hw=9, stride=[2, 2]),  # (9-3)%2==0, clean
+            "clean strided width should direct-lower",
+        )
+        self.assertFalse(
+            _supported(eps, k=3, hw=8, stride=[2, 2]),  # (8-3)%2==1, ragged
+            "ragged strided width must fall back",
+        )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_index_copy_cpu(self):

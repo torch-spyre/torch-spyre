@@ -1338,6 +1338,20 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             if _k_sym in dim_splits:
                 dim_splits[_k_sym] = 1
                 work_slices[_k_sym] = 1
+        # Strided conv: forbid splitting the output spatial dims (i/j) across
+        # cores. With stride>1 the per-core output coordinates no longer map to
+        # a contiguous input span, so a spatial split shuffles the result (same
+        # failure/fix as depthwise conv). Clamp i/j to a single core
+        # each; the batch/out-channel/in-channel dims still absorb the split.
+        _conv_params = (op_spec.op_info or {}).get("conv_params", {})
+        _sH = _try_static_int(_conv_params.get("stride_h", 1))
+        _sW = _try_static_int(_conv_params.get("stride_w", 1))
+        _strided = (_sH is not None and _sH > 1) or (_sW is not None and _sW > 1)
+        if _spyre_config.disable_conv2d_spatial_split and _strided:
+            for _sp_sym in (Symbol("i"), Symbol("j")):
+                if _sp_sym in dim_splits:
+                    dim_splits[_sp_sym] = 1
+                    work_slices[_sp_sym] = 1
         num_cores = math.prod(dim_splits.values())
 
     # Windowed-op SDSC field values (pool or conv).  Computed here as plain data

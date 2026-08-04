@@ -891,6 +891,13 @@ def lower_convolution(
         # Nx1 kernel keeps one window dim and direct-lowers fine (a 1-D conv;
         # verified by the test_conv2d_direct k1x3 / k3x1 cases).
         raise Unsupported("conv2d direct lowering: 1x1 kernel (use decomposition)")
+    kh_w, kw_w = int(weight.get_size()[-2]), int(weight.get_size()[-1])
+    if kh_w > 3 or kw_w > 3:
+        # k>3 overflows the dense C_in*kH*kW contraction's LX budget in DDC;
+        # mirrors the _CONV_MAX_KERNEL exclusion in _is_direct_conv_supported.
+        raise Unsupported(
+            f"conv2d direct lowering: kernel {kh_w}x{kw_w} > 3 (use decomposition)"
+        )
     C_in_size = x.get_size()[1]
     eps = get_elem_in_stick(x.get_dtype())
     if not (isinstance(C_in_size, (int, sympy.Integer)) and int(C_in_size) % eps == 0):
@@ -918,6 +925,14 @@ def lower_convolution(
 
     H_out = (H_in + 2 * pH - dilH * (kH - 1) - 1) // sH + 1
     W_out = (W_in + 2 * pW - dilW * (kW - 1) - 1) // sW + 1
+
+    # Ragged input width (W_in - kW) % sW != 0: the fp16 opfunc's width tiling
+    # mis-accumulates the dangling column; mirrors _is_direct_conv_supported.
+    if isinstance(W_in, (int, sympy.Integer)) and (int(W_in) - int(kW)) % int(sW) != 0:
+        raise Unsupported(
+            f"conv2d direct lowering: ragged input width "
+            f"(W_in={int(W_in)} - kW={int(kW)}) % sW={int(sW)} != 0 (use decomposition)"
+        )
 
     op_info = {
         # opConsts_ in the emitted SDSC must stay {} for the plain fp16 conv op

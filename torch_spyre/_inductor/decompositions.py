@@ -680,9 +680,23 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
         )
 
 
+#: Largest kernel tap (per spatial axis) the direct conv2d path accepts. A
+#: dense (groups==1) conv contracts over C_in*kH*kW; that per-output-channel
+#: weight working set grows with k**2 and, at k>3 with a stick-aligned C_in>=64,
+#: exceeds the SuperDSC initial-chunk LX budget -- DDC aborts in
+#: L3DlOpsScheduler.cpp ("initial chunk parameters must fit in LX") because the
+#: kernel taps are pinned no-split (ki/kj=1) and C_out=64 is a single stick, so
+#: there is nothing left to tile. Depthwise conv escapes this (its contraction
+#: is kH*kW only, no C_in), which is why depthwise supports k up to 9 and dense
+#: does not. Until the backend can tile the C_in*kH*kW contraction for dense
+#: conv, k>3 stays on the im2col+matmul decomposition.
+_CONV_MAX_KERNEL = 3
+
+
 def _is_direct_conv_supported(
     input: torch.Tensor,
     weight: torch.Tensor,
+    stride: list[int],
     transposed: bool,
     output_padding: list[int],
     padding: list[int],
@@ -714,12 +728,21 @@ def _is_direct_conv_supported(
       = 64) would need contraction-dim padding the direct path does not emit
       (known-broken), so it stays on the im2col+matmul path.  This also makes
       C_in == kH / kW impossible (kernels are small), which keeps the size-based
-      reduction-group label matching in codegen unambiguous.
+      reduction-group label matching in codegen unambiguous;
+    - kernel tap > _CONV_MAX_KERNEL (3): the dense C_in*kH*kW contraction working
+      set overflows the SuperDSC LX budget in DDC for k>3 and cannot be tiled
+      (see _CONV_MAX_KERNEL), so it stays on the im2col+matmul path;
+    - ragged input width under stride: when the strided windows do not exactly
+      cover the input width -- (W_in - kW) % sW != 0 -- the fp16 conv opfunc's
+      width tiling mis-accumulates the dangling partial column, so such convs
+      stay on the im2col+matmul path. A ragged *height* is harmless (height is
+      untiled) and stride==1 is never ragged, so this only excludes strided
+      convs whose width does not divide evenly (all HW-verified).
     """
     kH, kW = weight.shape[-2], weight.shape[-1]
     C_in = input.shape[1]
     eps = get_elem_in_stick(torch.float16)
-    return (
+    supported = (
         not transposed
         and all(op == 0 for op in output_padding)
         and all(p == 0 for p in padding)
@@ -728,12 +751,26 @@ def _is_direct_conv_supported(
         and input.dim() == 4
         and input.dtype == torch.float16
         and not (kH == 1 and kW == 1)
+        # Dense conv k>3 overflows the LX contraction budget in DDC (backend gap).
+        and kH <= _CONV_MAX_KERNEL
+        and kW <= _CONV_MAX_KERNEL
         # isinstance guard: a dynamic-shape C_in (SymInt) is not statically known
         # to be stick-aligned, so fall back to the decomposition rather than
         # branching on a symbolic divisibility (which would add a shape guard).
         and isinstance(C_in, int)
         and C_in % eps == 0
     )
+    if not supported:
+        return False
+    # Ragged input width (see docstring): the fp16 opfunc tiles the output width
+    # and mis-accumulates the dangling column when (W_in - kW) % sW != 0. Only
+    # decidable for a static width; a dynamic (SymInt) width stays on the direct
+    # path rather than adding a symbolic-remainder shape guard.
+    W_in = input.shape[-1]
+    sW = stride[-1]
+    if isinstance(W_in, int) and (W_in - kW) % sW != 0:
+        return False
+    return True
 
 
 @register_spyre_decompositions([torch.ops.aten.convolution.default])
@@ -761,7 +798,7 @@ def conv2d_via_bmm_decomp(
     # the compile-path target; the flag defaults off so eager and default
     # compile behavior are unchanged.
     if config.conv2d_direct_lowering and _is_direct_conv_supported(
-        input, weight, transposed, output_padding, padding, dilation, groups
+        input, weight, stride, transposed, output_padding, padding, dilation, groups
     ):
         return NotImplemented
 
