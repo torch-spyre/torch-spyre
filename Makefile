@@ -23,6 +23,10 @@ TEST_CONFIGS ?= tests/configs/torch_spyre_tests
 #   suite_<group>    — all configs inside the <group>/ sub-directory
 #                      (e.g. suite_inductor, suite_tensors)
 #   <label>          — any arbitrary label defined in test_suite_config.labels
+#
+# User-facing tier aliases (resolved by filter_configs.py, so every caller of
+# this Makefile target sees them too): unit=core, integration=device_critical,
+# regression=full.
 # Empty / unset defaults to "full" (all configs under TEST_CONFIGS).
 TEST_TYPE ?= full
 
