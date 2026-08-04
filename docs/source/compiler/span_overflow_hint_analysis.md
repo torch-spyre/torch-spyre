@@ -14,12 +14,12 @@ errors.
 coarse tiling to run those ops in smaller output-range tiles.
 
 The planner does not mutate IR directly.  It computes a `SpanOverflowTilePlan`.
-The adapter in `coarse_tile.py` converts that plan into the same `DimHint` and
-coarse-tile group format used by manual `spyre_hint`.
+The adapter in `coarse_tile_span_overflow.py` converts that plan into the same
+`DimHint` and coarse-tile group format used by manual `spyre_hint`.
 
 ```text
 span_overflow_hint_analysis
-  -> coarse_tile.span_overflow_groups
+  -> coarse_tile_span_overflow.span_overflow_groups
   -> coarse_tile
   -> CountedLoopSchedulerNode
   -> LoopSpec codegen
@@ -719,7 +719,7 @@ synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
 
 ## Adapter and Coarse Tiling
 
-`coarse_tile.span_overflow_groups(graph)`:
+`coarse_tile_span_overflow.span_overflow_groups(graph)`:
 
 1. skips auto groups if `config.ignore_wsr_hints` or
    `config.ignore_span_overflow_hints` is enabled;
@@ -787,11 +787,9 @@ pass with:
 SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS=0
 ```
 
-The broader working-set-reduction hint switch still suppresses this path:
-
-```python
-config.ignore_wsr_hints == True
-```
+The broader working-set-reduction hint switch also suppresses this path when
+set: `SPYRE_INDUCTOR_IGNORE_HINTS=1` (which populates `config.ignore_wsr_hints`,
+default off) disables both manual and automatic hints with one switch.
 
 User-authored `spyre_hint` groups take precedence per op.  Automatic hints are
 not added to ops that already carry user dim hints.
@@ -987,7 +985,8 @@ Current coverage includes:
 | File | Role |
 |---|---|
 | `torch_spyre/_inductor/wsr/span_overflow_hint_analysis.py` | Candidate collection, combo search, post-tile validation, tile-plan dataclasses |
-| `torch_spyre/_inductor/wsr/coarse_tile.py` | Adapter from tile plans to synthetic `DimHint`s; coarse-tile IR stamping |
+| `torch_spyre/_inductor/wsr/coarse_tile_span_overflow.py` | `span_overflow_groups`: adapter from tile plans to synthetic `DimHint`s |
+| `torch_spyre/_inductor/wsr/coarse_tile.py` | Coarse-tile IR stamping (`coarse_tile`, `CoarseTileInfo`) |
 | `torch_spyre/_inductor/passes.py` | Combines user hint groups and automatic span-overflow groups |
 | `torch_spyre/_inductor/propagate_layouts.py` | Preserves pointwise producer layouts from copy-back elision when automatic span-overflow is explicitly enabled |
 | `torch_spyre/_inductor/ir.py` | Spyre layout resize/reconstruction helpers |

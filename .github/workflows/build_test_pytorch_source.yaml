@@ -186,6 +186,8 @@ jobs:
             --job-name build_and_test \
             --stage completed \
             --progress completed \
+            --pytorch-sha "${{ inputs.pytorch_sha }}" \
+            --torch-spyre-sha "${{ github.sha }}" \
             --result-payload-file result_payload.json
 
       # - name: Report CI completed to pytorch/pytorch

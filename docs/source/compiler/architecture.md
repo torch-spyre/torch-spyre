@@ -34,7 +34,7 @@ A working knowledge of PyTorch's compilers is essential for understanding our fr
 Some useful resources are:
 + The [ASPLOS'24 paper on PyTorch2](https://docs.pytorch.org/assets/pytorch2-2.pdf)
 + The [ASPLOS'24 tutorial on PyTorch2](https://github.com/meta-pytorch/workshops/tree/master/ASPLOS_2024). In particular,
-the portion on [Inductor](https://github.com/pytorch/workshops/tree/master/ASPLOS_2024/inductor.pdf)
+the portion on [Inductor](https://github.com/meta-pytorch/workshops/blob/master/ASPLOS_2024/inductor.pdf)
 + General documentation on [torch.compiler](https://docs.pytorch.org/docs/stable/torch.compiler.html#)
 
 ## Front-end Compiler Overview

@@ -25,7 +25,7 @@ eligible op.**
 
 For each eligible op the planner runs three passes in order:
 
-1. **Pass 1, span reduction**, enforces the 256 MB per-core span limit.
+1. **Pass 1, span reduction**, enforces the 255.996 MiB per-core span limit.
    When a tensor's per-core span exceeds the limit, this pass commits
    the minimum splits needed to bring the span back under. When no
    tensor violates the limit, the pass leaves the op untouched.
@@ -481,8 +481,9 @@ commits the argmin. Pass 3 skips the op.
 When any planner selects a K-split, the SDSC emitter permutes physical
 core IDs so the cores collaborating on the K reduction occupy adjacent
 ring positions. The permutation is implemented in
-`_k_fast_core_to_slice_mapping` in `codegen/superdsc.py`, gated by
-`_should_use_k_fast_mapping`. It drops PSUM accumulation hops from
+`core_to_slice_mapping` in `core_mapping.py`, invoked from
+`codegen/superdsc.py` with a `contiguous_dim` argument, and gated by the
+`core_id_k_fast_emission` config flag. It drops PSUM accumulation hops from
 `m × n` to 1, which is what makes cross-core K reductions cheap at
 runtime. The flag `SPYRE_CORE_ID_K_FAST_EMISSION` (default on)
 controls this codegen-side permutation. The name is legacy from when

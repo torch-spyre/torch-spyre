@@ -8,8 +8,7 @@ references have been dropped but whose C++ storage has not yet been released.
 This page describes the Python-specific design: the GIL interaction, the
 lock-ordering contract, the per-call-site rules, and the free-threaded Python
 considerations. The underlying C++ callback contract (mutex release/re-acquire
-around any blocking work) is documented in
-[`flex/docs/lock_ordering.md`](https://github.com/torch-spyre/flex/blob/main/docs/lock_ordering.md).
+around any blocking work) is documented in `flex/docs/lock_ordering.md`.
 
 ## Why GC Can Free Device Memory
 
