@@ -27,8 +27,8 @@ TEST_CONFIGS ?= tests/configs/torch_spyre_tests
 # User-facing tier aliases (resolved by filter_configs.py, so every caller of
 # this Makefile target sees them too): unit=core, integration=device_critical,
 # regression=full.
-# Empty / unset defaults to "full" (all configs under TEST_CONFIGS).
-TEST_TYPE ?= full
+# Empty / unset defaults to "regression" (= full: all configs under TEST_CONFIGS).
+TEST_TYPE ?= regression
 
 # Where TEST_TYPE=perf writes its benchmark report. Flat /tmp/results so the CI
 # ClickHouse push step (ingest_xml.py globs *.xml non-recursively) finds it
