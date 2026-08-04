@@ -33,6 +33,19 @@ Selection rules
   <other>            Treated as an arbitrary label name; matches configs
                      whose labels array contains the value.
 
+User-facing tier aliases
+-------------------------
+Every caller (Makefile, GHA _test_matrix.yaml, Jenkins, config.yaml) resolves
+--test-type through this one script, so the alias mapping lives here once and
+every caller sees it consistently:
+  "unit"          -> "core"
+  "integration"   -> "device_critical"
+  "regression"    -> "full"
+  "smoke"         -> "smoke" (already the canonical spelling, no change)
+These are the names meant for humans/CI configs to type; device_critical/full/
+core keep their existing, more specific meaning as the actual label vocabulary
+tests/configs/**/*.yaml declares.
+
 Configs with no labels field default to ["full"] (backward compatible) --
 they run under "full" but are excluded from every narrower test_type
 (smoke, core, device_critical, suite_<group>, custom labels). Every config
@@ -127,6 +140,22 @@ def _load_runner_map(runner_map_path: str) -> dict:
     return {k: str(v) for k, v in data.items()}
 
 
+# User-facing tier name -> actual test_suite_config.labels vocabulary. Single
+# source of truth: every caller (Makefile, _test_matrix.yaml, Jenkins,
+# config.yaml) shells out to this script, so resolving here is sufficient --
+# no caller needs its own copy of this mapping.
+TEST_TYPE_ALIASES = {
+    "unit": "core",
+    "integration": "device_critical",
+    "regression": "full",
+}
+
+
+def resolve_test_type(test_type: str) -> str:
+    """Resolve a user-facing tier alias to its underlying label/value."""
+    return TEST_TYPE_ALIASES.get(test_type, test_type)
+
+
 def _matches(labels: list, config_path: Path, test_type: str) -> bool:
     """Return True if *config_path* should be included for *test_type*."""
     if not test_type or test_type == "full":
@@ -162,8 +191,9 @@ def main() -> None:
         default="full",
         metavar="TYPE",
         help=(
-            "Selection type: smoke | core | full | suite_<group> | <label>. "
-            "Default: full (all configs)."
+            "Selection type: smoke | core | full | device_critical | "
+            "suite_<group> | <label> -- or the user-facing tier aliases "
+            "unit | integration | regression. Default: full (all configs)."
         ),
     )
     ap.add_argument(
@@ -191,7 +221,7 @@ def main() -> None:
     if not config_dir.is_dir():
         sys.exit(f"ERROR: --config-dir does not exist: {config_dir}")
 
-    test_type = args.test_type.strip()
+    test_type = resolve_test_type(args.test_type.strip())
 
     runner_map: dict = {}
     if args.runner_map:

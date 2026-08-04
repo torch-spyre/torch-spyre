@@ -496,6 +496,7 @@ def insert_run(client, run_id: str, run: dict, args):
                 run["errors"],
                 run["xpass"],
                 run["duration_s"],
+                getattr(args, "trigger_type", "") or "unknown",
             ]
         ],
         column_names=[
@@ -517,6 +518,7 @@ def insert_run(client, run_id: str, run: dict, args):
             "errors",
             "xpass",
             "duration_s",
+            "trigger_type",
         ],
     )
 
@@ -608,6 +610,11 @@ def main():
     parser.add_argument("--run-id", default="")
     parser.add_argument("--triggered-at", default="")
     parser.add_argument("--pr-number", default="")
+    parser.add_argument(
+        "--trigger-type",
+        default="",
+        help="Suite tier that produced this run, e.g. regression | integration | unit | smoke",
+    )
     args = parser.parse_args()
 
     if args.xml_file:
