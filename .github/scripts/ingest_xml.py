@@ -610,7 +610,11 @@ def main():
     parser.add_argument("--run-id", default="")
     parser.add_argument("--triggered-at", default="")
     parser.add_argument("--pr-number", default="")
-    parser.add_argument("--trigger-type", default="", help="Suite tier that produced this run, e.g. integration | regression | smoke | full")
+    parser.add_argument(
+        "--trigger-type",
+        default="",
+        help="Suite tier that produced this run, e.g. regression | integration | unit | smoke",
+    )
     args = parser.parse_args()
 
     if args.xml_file:
