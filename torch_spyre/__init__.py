@@ -266,6 +266,11 @@ def _autoload():
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
     torch._register_device_module(DEVICE_NAME, make_spyre_module())
 
+    # Must run before torch_spyre._C loads anywhere below (ops.eager,
+    # decompositions both import it). _C's impl registration needs this
+    # module's schema to already exist, or import torch crashes.
+    from torch_spyre._inductor.distributed import spyre_library  # noqa: F401
+
     import torch_spyre.ops.eager  # noqa: F401
     from torch_spyre._inductor import _light_autoload
 

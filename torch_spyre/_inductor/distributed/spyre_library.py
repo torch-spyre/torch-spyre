@@ -8,6 +8,16 @@ import torch
 # This file only registers the abstract (fake/meta) kernels needed by torch.compile
 # for shape inference during tracing.
 
+# Schema defined in Python, not C++: the C++ side only registers PrivateUse1
+# impls (spyre_distributed.cpp) and needs this schema to exist first.
+# torch_spyre/__init__.py imports this module before torch_spyre._C to
+# guarantee that order. Kept as a module-level var so it isn't GC'd.
+_spyre_distributed_lib = torch.library.Library("spyre", "FRAGMENT")
+_spyre_distributed_lib.define(
+    "broadcast_async(Tensor input, int src_rank, str group_name) -> Tensor"
+)
+_spyre_distributed_lib.define("wait_work(Tensor(a!) tensor) -> Tensor(a)")
+
 
 @torch.library.register_fake("spyre::broadcast_async")
 def _(x: torch.Tensor, src_rank: int = 0, group_name: str = "default") -> torch.Tensor:
