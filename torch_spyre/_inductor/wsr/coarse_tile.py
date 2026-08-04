@@ -1435,15 +1435,11 @@ def coarse_tile(
     ] = []
     for group_idx, (group_ops, levels) in enumerate(groups, start=group_idx_offset):
         group_id: tuple[int, ...] = (group_idx,)
-        name_map = _replace_constant_fill_predecessors(
-            group_ops, levels, operations, group_id
-        )
         op_to_position = {op.get_operation_name(): i for i, op in enumerate(operations)}
         stamped_group_id = group_id + (0,) * (len(levels) - 1)
         retiled_infos = _apply_plan(
             group_ops, stamped_group_id, levels, op_to_position, plan
         )
-        _apply_fill_name_swap(group_ops, name_map, operations)
         retiled_infos_by_group.append((stamped_group_id, group_ops, retiled_infos))
 
     insert_tiling_propagation(operations, groups)
