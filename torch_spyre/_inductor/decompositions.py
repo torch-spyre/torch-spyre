@@ -683,7 +683,7 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
 #: Largest kernel tap (per spatial axis) the direct conv2d path accepts. A
 #: dense (groups==1) conv contracts over C_in*kH*kW; that per-output-channel
 #: weight working set grows with k**2 and, at k>3 with a stick-aligned C_in>=64,
-#: exceeds the SuperDSC initial-chunk LX budget -- DDC aborts in
+#: exceeds the SuperDSC initial-chunk LX budget -- the backend aborts in
 #: L3DlOpsScheduler.cpp ("initial chunk parameters must fit in LX") because the
 #: kernel taps are pinned no-split (ki/kj=1) and C_out=64 is a single stick, so
 #: there is nothing left to tile. Depthwise conv escapes this (its contraction
@@ -710,14 +710,14 @@ def _is_direct_conv_supported(
     Everything else stays on the im2col+matmul decomposition.  Excluded:
     - 1x1 kernel: only the 1x1 case has size-1 kernel taps on *both* axes
       (ki and kj), which the pipeline squeezes out so the emitted SDSC carries
-      no window dims at all -- and DDC's conv path expects at least one windowed
-      spatial dim, aborting in dimension-mapping (ddl_conversion.cpp "Unknown
-      primary dimension kind for a window dimension").  A 1x1 conv is just a
-      channel matmul, so it stays on the im2col+matmul path, which handles it
-      exactly.  A 1xN / Nx1 kernel squeezes only one tap and keeps the other
-      window dim, which DDC does accept (a 1-D conv) -- so those direct-lower
-      and are covered by the test_conv2d_direct k1x3 / k3x1 cases;
-    - non-zero padding: the DDC zero-fill for a padded conv input is not wired
+      no window dims at all -- and the backend's conv path expects at least one
+      windowed spatial dim, aborting in dimension-mapping (ddl_conversion.cpp
+      "Unknown primary dimension kind for a window dimension").  A 1x1 conv is
+      just a channel matmul, so it stays on the im2col+matmul path, which handles
+      it exactly.  A 1xN / Nx1 kernel squeezes only one tap and keeps the other
+      window dim, which the backend does accept (a 1-D conv) -- so those
+      direct-lower and are covered by the test_conv2d_direct k1x3 / k3x1 cases;
+    - non-zero padding: the backend zero-fill for a padded conv input is not wired
       for regular conv2d, so pad>0 stays on the im2col+matmul path (which pads
       correctly);
     - dilated conv: the windowed-input SDSC fields reuse the avgpool builder,
@@ -730,7 +730,7 @@ def _is_direct_conv_supported(
       C_in == kH / kW impossible (kernels are small), which keeps the size-based
       reduction-group label matching in codegen unambiguous;
     - kernel tap > _CONV_MAX_KERNEL (3): the dense C_in*kH*kW contraction working
-      set overflows the SuperDSC LX budget in DDC for k>3 and cannot be tiled
+      set overflows the SuperDSC LX budget in the backend for k>3 and cannot be tiled
       (see _CONV_MAX_KERNEL), so it stays on the im2col+matmul path;
     - ragged input width under stride: when the strided windows do not exactly
       cover the input width -- (W_in - kW) % sW != 0 -- the fp16 conv opfunc's
@@ -751,7 +751,7 @@ def _is_direct_conv_supported(
         and input.dim() == 4
         and input.dtype == torch.float16
         and not (kH == 1 and kW == 1)
-        # Dense conv k>3 overflows the LX contraction budget in DDC (backend gap).
+        # Dense conv k>3 overflows the LX contraction budget in the backend.
         and kH <= _CONV_MAX_KERNEL
         and kW <= _CONV_MAX_KERNEL
         # isinstance guard: a dynamic-shape C_in (SymInt) is not statically known

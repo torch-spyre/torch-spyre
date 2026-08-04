@@ -885,7 +885,7 @@ def lower_convolution(
         raise Unsupported(f"conv2d direct lowering: dtype {x.get_dtype()} (fp16 only)")
     if weight.get_size()[-2] == 1 and weight.get_size()[-1] == 1:
         # Only a 1x1 kernel squeezes *both* ki and kj to size-1, leaving the
-        # conv SDSC with no window dims -- which DDC's conv path rejects in
+        # conv SDSC with no window dims -- which the backend's conv path rejects in
         # dimension-mapping. A 1x1 conv is a channel matmul; it stays on the
         # im2col+matmul decomposition (see _is_direct_conv_supported). A 1xN /
         # Nx1 kernel keeps one window dim and direct-lowers fine (a 1-D conv;
@@ -893,7 +893,7 @@ def lower_convolution(
         raise Unsupported("conv2d direct lowering: 1x1 kernel (use decomposition)")
     kh_w, kw_w = int(weight.get_size()[-2]), int(weight.get_size()[-1])
     if kh_w > 3 or kw_w > 3:
-        # k>3 overflows the dense C_in*kH*kW contraction's LX budget in DDC;
+        # k>3 overflows the dense C_in*kH*kW contraction's LX budget in the backend;
         # mirrors the _CONV_MAX_KERNEL exclusion in _is_direct_conv_supported.
         raise Unsupported(
             f"conv2d direct lowering: kernel {kh_w}x{kw_w} > 3 (use decomposition)"

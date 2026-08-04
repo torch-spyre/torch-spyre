@@ -832,9 +832,9 @@ def _create_sdsc_tensors(
             # ki/kj is in the iteration space), dev_dim_size (the padded input
             # extent) legitimately exceeds it_dim_size (the output count) by the
             # window overlap.  That difference is already covered by the fullspan
-            # window read, so a backGap here is double-counting: DDC adds the gap
-            # to the input buffer size (getBufferCapacityForNodePerDim ->
-            # dimSize + gap), inflating the row stride by (kW-1) and mis-striding
+            # window read, so a backGap here is double-counting: the backend
+            # adds the gap to the input buffer size (getBufferCapacityForNodePerDim
+            # -> dimSize + gap), inflating the row stride by (kW-1) and mis-striding
             # every ki>0 window tap.  Keep the offset/stride handling (needed for
             # correct per-output-position stepping) but skip the backGap.
             _window_of = {"i": "ki", "j": "kj"}
