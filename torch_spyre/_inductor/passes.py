@@ -14,8 +14,8 @@
 
 
 import inspect
-import io
 import logging
+import time
 from typing import Optional, Any, Callable
 
 import torch
@@ -32,82 +32,90 @@ except ImportError:
 
 
 from torch._inductor.graph import GraphLowering
-from torch._inductor.ir import ComputedBuffer, Operation
+from torch._inductor.ir import Operation
 from torch._inductor.scheduler import BaseSchedulerNode
 
 from .logging_utils import get_inductor_logger
+from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
 from .padding import insert_bmm_padding
 from .temp_passes import (
     bmm_unflatten_pass,
+    decompose_addmm,
     mark_direct_unit_bmm_pass,
     mm_to_bmm_pass,
 )
-from .coarse_tile import (
+from .wsr.coarse_tile import validate_coarse_tile_groups
+from .wsr.coarse_tile_span_overflow import span_overflow_groups
+from .wsr.coarse_tile_hints import (
     hints_to_coarse_tile_groups,
     reorder_unhinted_interlopers,
-    span_overflow_groups,
 )
 from . import config
 from .propagate_hints import (
     collect_spyre_hints,
     recover_spyre_hints,
 )
-from .propagate_named_dims import propagate_named_dims, assign_dim_hints
+from .wsr.propagate_named_dims import (
+    propagate_named_dims,
+    validate_named_dims,
+    assign_dim_hints,
+)
 from .propagate_layouts import (
     propagate_mutation_layouts,
     propagate_spyre_tensor_layouts,
 )
 from .optimize_restickify import optimize_restickify_locations
-from .insert_restickify import insert_restickify, finalize_layouts
-from .memory_planning import memory_planning
+from .insert_restickify import (
+    finalize_layouts,
+    insert_post_mutation_restickify,
+    insert_restickify,
+)
+from .enforce_indirect_access_layout import enforce_indirect_access_layout
+from .hbm_pool_planning import hbm_pool_planning
 from .work_division import (
     span_reduction,
     work_distribution,
     cost_model_matmul_division,
 )
-from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
+from .pass_utils import format_operations
 from .scratchpad.allocator import (
-    StrategyBCoOptimizingAllocator,
     scratchpad_planning,
 )
 from .fusion import spyre_fuse_nodes
-from .scheduler import build_loop_scheduler_nodes
+from .scheduler import (
+    align_lx_producer_loop_order,
+    build_loop_scheduler_nodes,
+    demote_incoherent_lx_buffers,
+)
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
-from .chunk_large_tensors import chunk_large_tensors
-from .coarse_tile import coarse_tile
+from .wsr.coarse_tile import coarse_tile
 from .split_multi_ops import split_multi_ops, validate_ops
 
 
 logger = get_inductor_logger("passes")
 
 
-def _format_operations(operations: list[Operation]) -> str:
-    buf = io.StringIO()
-    for op in operations:
-        buf.write(f"{op.get_operation_name()}: {type(op).__name__}")
-        if isinstance(op, ComputedBuffer):
-            buf.write(f"\n  layout={op.layout}")
-            if allocation := getattr(op.layout, "allocation", None):
-                buf.write(f"\n  allocation={allocation}")
-            if splits := getattr(op, "op_it_space_splits", None):
-                rw = op.get_read_writes()
-                write_index = next(iter(rw.writes)).index
-                read_index = next((d.index for d in rw.reads), write_index)
-                it_space = iteration_space_from_op(op)
-                readable_splits = apply_splits_from_index_coeff(
-                    splits, write_index, read_index, it_space
-                )
-                buf.write(f"\n  op_it_space_splits={readable_splits}")
-            if dim_hints := getattr(op, "dim_hints", None):
-                buf.write(f"\n  dim_hints={dim_hints}")
-            if loop_info := getattr(op, "loop_info", None):
-                buf.write(f"\n  loop_info={loop_info}")
-            buf.write(f"\n  {op.data}")
-        buf.write("\n\n")
-    return buf.getvalue()
+def _get_pass_name(pass_fn: Callable) -> str:
+    """Get a human-readable name for a pass function."""
+    if hasattr(pass_fn, "__name__"):
+        return pass_fn.__name__
+    if hasattr(pass_fn, "__func__"):
+        return pass_fn.__func__.__name__
+    return type(pass_fn).__name__
+
+
+def _should_log_pass(pass_name: str) -> bool:
+    """Check if per-pass logging is enabled for the given pass name."""
+    log_passes_cfg = config.log_passes
+    if not log_passes_cfg:
+        return False
+    if log_passes_cfg in ("all", "1"):
+        return True
+    selected = {s.strip() for s in log_passes_cfg.split(",")}
+    return pass_name in selected
 
 
 def _graph_has_spyre_device(graph: torch.fx.graph.Graph) -> bool:
@@ -155,6 +163,9 @@ class _SpyreGraphPassPipeline(CustomGraphPass):
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
         if not self._has_spyre_device(graph):
             return
+        # FX-graph passes are already observed by upstream Inductor's
+        # GraphTransformObserver (populates node.meta["from_node"]); no Spyre
+        # observer is wrapped here.
         for p in self.passes:
             p(graph)
 
@@ -174,8 +185,17 @@ class _SpyreNodePassPipeline(CustomSchedulerPass):
     def __call__(self, target: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         if not self._has_spyre_device(target):
             return target
+        # This pipeline is a per-compile entry point for the observed passes,
+        # so clear the dedup here so each compile warns afresh.
+        reset_provenance_warnings()
         for pass_fn in self.passes:
-            target = pass_fn(target)
+            name = _get_pass_name(pass_fn)
+            observer = SpyreGraphTransformObserver(target, name, kind="node")
+            with observer:
+                target = pass_fn(target)
+                # Reconcile the returned list while recursively inspecting the
+                # underlying buffers through scheduler get_nodes().
+                observer.target = target
         return target
 
     def uuid(self) -> Any | None:
@@ -212,6 +232,12 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
         super().__init__(
             [
                 recover_spyre_hints,
+                # Undo the post-grad re-fusion of add(input, mm(a, b)) back into
+                # aten.addmm, so the resulting mul.Scalar alpha/beta nodes (whose
+                # constants are materialized later by the LoopLevel IR multi-ops
+                # pass) and the mm flow through the Spyre lowerings instead of
+                # falling back to extern_kernels.addmm.
+                decompose_addmm,
                 mm_to_bmm_pass.apply,
                 mark_direct_unit_bmm_pass,
                 bmm_unflatten_pass.apply,
@@ -234,7 +260,16 @@ class CustomPreFusionPasses(_SpyreNodePassPipeline):
     # are visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return
     # False), so loop groups survive Inductor fusion intact.
     def __init__(self):
-        super().__init__([propagate_mutation_layouts, build_loop_scheduler_nodes])
+        # align_lx_producer_loop_order runs before build_loop_scheduler_nodes so
+        # it still sees plain SchedulerNodes (the only kind that can reorder
+        # their loops) rather than CountedLoopSchedulerNode wrappers.
+        super().__init__(
+            [
+                propagate_mutation_layouts,
+                align_lx_producer_loop_order,
+                build_loop_scheduler_nodes,
+            ]
+        )
 
 
 class CustomPostFusionPasses(_SpyreNodePassPipeline):
@@ -247,7 +282,12 @@ class CustomPostFusionPasses(_SpyreNodePassPipeline):
     """
 
     def __init__(self):
-        super().__init__([memory_planning, spyre_fuse_nodes])
+        # demote_incoherent_lx_buffers runs first: it re-checks LX core->slice
+        # coherence now that loop orders are final, and anything it demotes must
+        # still be visible to hbm_pool_planning as an unclaimed intermediate.
+        super().__init__(
+            [demote_incoherent_lx_buffers, hbm_pool_planning, spyre_fuse_nodes]
+        )
 
 
 # Several pre-scheduling steps are config-gated or need arguments beyond the
@@ -268,29 +308,75 @@ def _runs(*passes: Callable) -> Callable[[Callable], Callable]:
     return annotate
 
 
-@_runs(chunk_large_tensors)
-def _maybe_chunk_large_tensors(graph: GraphLowering) -> None:
-    if config.chunk_large_tensors:
-        chunk_large_tensors(graph)
+@_runs(
+    reorder_unhinted_interlopers,
+)
+def _maybe_reorder_unhinted_interlopers(graph: GraphLowering) -> None:
+    """Move unhinted ComputedBuffer ops that interrupt hint-group runs."""
+    if config.ignore_wsr_hints:
+        return
+    reorder_unhinted_interlopers(graph)
 
 
 @_runs(
-    reorder_unhinted_interlopers,
     hints_to_coarse_tile_groups,
-    span_overflow_groups,
+    validate_coarse_tile_groups,
     coarse_tile,
 )
-def _maybe_coarse_tile(graph: GraphLowering) -> None:
-    groups = []
-    if not config.ignore_wsr_hints:
-        reorder_unhinted_interlopers(graph)
-        groups += hints_to_coarse_tile_groups(graph)
-    if not config.ignore_span_overflow_hints:
-        groups += span_overflow_groups(graph)
-    if groups:
-        op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
-        groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
-        coarse_tile(graph, groups=groups)
+def _maybe_coarse_tile_hints(graph: GraphLowering) -> None:
+    """Hint-driven coarse tiling only.  Runs PRE-stickification.
+
+    span_overflow_groups is intentionally absent: it requires FixedTiledLayout
+    (device_layout) and must run post-stickification.
+    """
+    if config.ignore_wsr_hints:
+        return
+    groups = hints_to_coarse_tile_groups(graph)
+    if not groups:
+        return
+    op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
+    groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
+    validate_coarse_tile_groups(groups)
+    coarse_tile(graph, groups=groups)
+
+
+@_runs(
+    span_overflow_groups,
+    validate_coarse_tile_groups,
+    coarse_tile,
+)
+def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
+    """Span-overflow coarse tiling only.  Runs POST-stickification.
+
+    Requires FixedTiledLayout (device_layout) on all ops.
+    hint-driven groups (hints_to_coarse_tile_groups) are intentionally
+    absent: they have already run pre-stickification.
+    """
+    if config.ignore_span_overflow_hints:
+        return
+    groups, dim_hint_assignments = span_overflow_groups(graph)
+    if not groups:
+        return
+    # span_overflow_groups is a pure planning step: it decides each op's
+    # dim_hints but does not set them.  Apply them now, before
+    # validate_coarse_tile_groups/coarse_tile run, since dim_hints is an
+    # input those consume (via plan_coarse_tile_groups's hint lookups), not
+    # something they produce.
+    for op, dim_hints in dim_hint_assignments:
+        op.dim_hints = dim_hints  # type: ignore[attr-defined]
+    # Compute offset to avoid loop_group_id collision with any hint-driven
+    # groups already stamped by _maybe_coarse_tile_hints.
+    # E.g. if hints used groups 0 and 1, span-overflow groups start at 2.
+    used_ids = [
+        op.loop_info.loop_group_id[0]
+        for op in graph.operations
+        if hasattr(op, "loop_info") and op.loop_info is not None
+    ]
+    group_idx_offset = max(used_ids, default=-1) + 1
+    op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
+    groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
+    validate_coarse_tile_groups(groups)
+    coarse_tile(graph, groups=groups, group_idx_offset=group_idx_offset)
 
 
 @_runs(cost_model_matmul_division, work_distribution)
@@ -305,10 +391,9 @@ def _distribute_work(graph: GraphLowering) -> None:
 def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
     if not config.lx_planning:
         return
-    allocator = (
-        StrategyBCoOptimizingAllocator() if config.co_optimizing_lx_planning else None
-    )
-    scratchpad_planning(graph, allocator=allocator)
+    # The allocator (and its layout solver) is selected from config by
+    # scratchpad_planning -> select_allocator; no allocator wiring here.
+    scratchpad_planning(graph)
 
 
 class CustomPreSchedulingPasses:
@@ -331,6 +416,19 @@ class CustomPreSchedulingPasses:
         self.passes = [
             deadcode_elimination,
             #
+            # Working Set Reduction (hint-driven, pre-stickification)
+            # These passes only need host-side FixedLayout (size/stride) and
+            # loop variable ranges.  Running before stickification means
+            # _divide_ranges does not call _resize_device_layout: stickification
+            # computes the correct SpyreTensorLayout from the already-divided
+            # ranges.  This also dissolves the insert_restickify→hint cross-phase
+            # contract (issue #3135).
+            propagate_named_dims,
+            validate_named_dims,
+            assign_dim_hints,
+            _maybe_reorder_unhinted_interlopers,
+            _maybe_coarse_tile_hints,
+            #
             # Tensor Layout (Stickification)
             split_multi_ops,
             propagate_spyre_tensor_layouts,
@@ -338,15 +436,16 @@ class CustomPreSchedulingPasses:
             optimize_restickify_locations,
             finalize_layouts,
             insert_restickify,
+            enforce_indirect_access_layout,
+            insert_post_mutation_restickify,
             insert_bmm_padding,
             #
             dedup_and_promote_constants,
             #
-            # Working Set Reduction
-            _maybe_chunk_large_tensors,
-            propagate_named_dims,
-            assign_dim_hints,
-            _maybe_coarse_tile,
+            # Working Set Reduction (device-layout-aware, post-stickification)
+            # These passes require FixedTiledLayout.device_layout (device_size,
+            # stride_map, elems_per_stick) for physical span arithmetic.
+            _maybe_coarse_tile_span_overflow,
             #
             # Core Division
             span_reduction,
@@ -360,18 +459,38 @@ class CustomPreSchedulingPasses:
         if not _operations_have_spyre_device(graph.operations):
             return
 
+        # This pipeline is a per-compile entry point for the observed passes,
+        # so clear the dedup here so each compile warns afresh.
+        reset_provenance_warnings()
+
         if logger.isEnabledFor(logging.INFO):
             logger.info(
-                "BEFORE PRE-SCHEDULING\n%s", _format_operations(graph.operations)
+                "BEFORE PRE-SCHEDULING\n%s", format_operations(graph.operations)
             )
 
         for pass_fn in self.passes:
-            pass_fn(graph)
+            pass_name = _get_pass_name(pass_fn)
+            # `graph` is the same object throughout -- passes mutate
+            # `graph.operations` in place -- so before/after reconciliation
+            # is exact here.
+            with SpyreGraphTransformObserver(graph, pass_name, kind="graphlowering"):
+                t0 = time.perf_counter()
+                pass_fn(graph)
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+
+            if logger.isEnabledFor(logging.INFO):
+                logger.info(
+                    "elapsed %5dms  %s",
+                    elapsed_ms,
+                    pass_name,
+                )
+            if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):
+                logger.debug(
+                    "AFTER %s\n%s", pass_name, format_operations(graph.operations)
+                )
 
         if logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "AFTER PRE-SCHEDULING\n%s", _format_operations(graph.operations)
-            )
+            logger.info("AFTER PRE-SCHEDULING\n%s", format_operations(graph.operations))
 
     def uuid(self) -> Any | None:
         return _uuid(self.passes)

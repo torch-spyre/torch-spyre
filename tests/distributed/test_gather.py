@@ -19,6 +19,8 @@ import torch
 import torch.distributed as dist
 from torch.testing._internal.common_utils import TestCase, run_tests
 
+from utils import _assert_tensor_equal
+
 # Skip all tests if RANK is not defined, or WORLD_SIZE is not set or less than 2
 if "RANK" not in os.environ:
     pytest.skip(
@@ -72,57 +74,6 @@ class TestGather(TestCase):
         if dist.is_initialized():
             dist.destroy_process_group()
 
-    def _assert_tensor_equal(self, result, expected, dtype, message_prefix):
-        if dtype.is_floating_point:
-            matches = torch.allclose(result, expected, rtol=1e-5, atol=1e-5)
-            if not matches:
-                # Find first mismatch for detailed error reporting
-                diff = torch.abs(result - expected)
-                mismatch_mask = diff > (1e-5 + 1e-5 * torch.abs(expected))
-                if mismatch_mask.any():
-                    mismatch_indices = torch.nonzero(mismatch_mask, as_tuple=False)
-                    first_mismatch = mismatch_indices[0].tolist()
-                    first_mismatch_idx = (
-                        tuple(first_mismatch)
-                        if len(first_mismatch) > 1
-                        else first_mismatch[0]
-                    )
-                    error_msg = (
-                        f"{message_prefix}\n"
-                        f"First mismatch at index {first_mismatch_idx}:\n"
-                        f"  Expected: {expected[first_mismatch_idx]}\n"
-                        f"  Got:      {result[first_mismatch_idx]}\n"
-                        f"First 10 expected: {expected.flatten()[:10]}\n"
-                        f"First 10 result:   {result.flatten()[:10]}"
-                    )
-                else:
-                    error_msg = f"{message_prefix}: tensors not close"
-                self.assertTrue(False, error_msg)
-        else:
-            matches = torch.equal(result, expected)
-            if not matches:
-                # Find first mismatch for detailed error reporting
-                mismatch_mask = result != expected
-                if mismatch_mask.any():
-                    mismatch_indices = torch.nonzero(mismatch_mask, as_tuple=False)
-                    first_mismatch = mismatch_indices[0].tolist()
-                    first_mismatch_idx = (
-                        tuple(first_mismatch)
-                        if len(first_mismatch) > 1
-                        else first_mismatch[0]
-                    )
-                    error_msg = (
-                        f"{message_prefix}\n"
-                        f"First mismatch at index {first_mismatch_idx}:\n"
-                        f"  Expected: {expected[first_mismatch_idx]}\n"
-                        f"  Got:      {result[first_mismatch_idx]}\n"
-                        f"First 10 expected: {expected.flatten()[:10]}\n"
-                        f"First 10 result:   {result.flatten()[:10]}"
-                    )
-                else:
-                    error_msg = f"{message_prefix}: tensors not equal"
-                self.assertTrue(False, error_msg)
-
     def _test_gather_helper(self, shape, dtype, dst):
         """
         Helper method to test gather with specific parameters.
@@ -134,6 +85,11 @@ class TestGather(TestCase):
         """
         # Calculate total number of elements in the tensor
         num_elements = torch.tensor(shape).prod().item()
+
+        if dtype == torch.float16:
+            assert self.comm_size * num_elements <= 1024, (
+                f"float16 exact-integer range exceeded: rank {self.comm_rank}"
+            )
 
         # Create contiguous range for this rank: rank 0 gets [0..num_elements-1],
         # rank 1 gets [num_elements..2*num_elements-1], etc.
@@ -150,20 +106,21 @@ class TestGather(TestCase):
             ]
             dist.gather(input_device, gather_list=gather_list, dst=dst)
 
-            for rank_idx in range(self.comm_size):
-                result = gather_list[rank_idx].to("cpu")
-                # Expected values for each rank: contiguous range starting at rank_idx * num_elements
-                rank_start = rank_idx * num_elements
-                rank_end = rank_start + num_elements
-                expected = torch.arange(rank_start, rank_end, dtype=dtype).reshape(
-                    shape
-                )
-                self._assert_tensor_equal(
-                    result,
-                    expected,
-                    dtype,
-                    f"Rank {self.comm_rank}: gather result incorrect for source rank {rank_idx} at destination rank {dst}",
-                )
+            # Build all expected slices at once and compare in bulk.
+            # All ranks contribute contiguous blocks: rank r owns [r*N .. (r+1)*N - 1],
+            # so the full expected output is simply arange(comm_size * N) reshaped.
+            all_results = torch.stack(
+                [gather_list[r].to("cpu") for r in range(self.comm_size)]
+            )
+            all_expected = torch.arange(
+                self.comm_size * num_elements, dtype=dtype
+            ).reshape(self.comm_size, *shape)
+            _assert_tensor_equal(
+                all_results,
+                all_expected,
+                dtype,
+                f"Rank {self.comm_rank}: gather result incorrect at destination rank {dst}",
+            )
         else:
             dist.gather(input_device, gather_list=None, dst=dst)
             self.assertTrue(True, "Non-destination rank completed gather successfully")

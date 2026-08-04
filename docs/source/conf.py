@@ -22,6 +22,7 @@ extensions = [
     "sphinx.ext.viewcode",  # add [source] links to API pages
     "sphinx.ext.todo",  # support .. todo:: directives
     "myst_parser",  # parse Markdown (.md) files
+    "sphinxcontrib.mermaid",  # render Mermaid diagrams
     "knowledge_graph_ext",  # auto-generate operation explorer graph
 ]
 
@@ -30,6 +31,11 @@ myst_enable_extensions = [
     "colon_fence",  # ::: fenced directives
     "deflist",  # definition lists
 ]
+
+# Render plain ```mermaid fenced blocks (GitHub-native syntax) via the
+# sphinxcontrib-mermaid directive, so the same Markdown renders on both GitHub
+# and readthedocs.
+myst_fence_as_directive = ["mermaid"]
 
 # Auto-generate heading anchors up to H3, so links like
 # `[text](other.md#some-heading)` resolve across Markdown files.

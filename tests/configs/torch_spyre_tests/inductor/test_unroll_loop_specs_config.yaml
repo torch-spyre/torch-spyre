@@ -1,5 +1,0 @@
-test_suite_config:
-  labels: [core, full]
-  files:
-    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_unroll_loop_specs.py
-      unlisted_test_mode: mandatory_success

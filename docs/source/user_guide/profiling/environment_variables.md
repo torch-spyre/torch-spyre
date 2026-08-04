@@ -24,6 +24,12 @@ Debug-oriented variables (`TORCH_SPYRE_DEBUG`, `TORCH_COMPILE_DEBUG`,
 |---|---|
 | `SENCORES=<1..32>` | Number of Spyre cores to target (default 32) |
 
+## FFDC (First Failure Data Capture)
+
+| Variable | Effect |
+|---|---|
+| `USE_SPYRE_PROFILER=1` | Opt in to automatic FFDC JSON reports on Spyre compile / runtime / unimplemented failures. Retrieve with `torch.spyre.get_diagnostic_report()`. (Same name as the CMake profiler build flag; at runtime this env var alone gates capture.) |
+
 ## Device enumeration
 
 Read by torch-spyre
@@ -34,7 +40,7 @@ at startup to discover the Spyre devices visible to the process.
 |---|---|
 | `PCIDEVICE_IBM_COM_AIU_PF` | Comma-separated list of PCI bus IDs assigned to the container (set by the OpenShift AIU operator or manually) |
 | `AIU_WORLD_RANK_<N>` | PCI bus ID bound to rank `N` |
-| `SPYRE_VISIBLE_DEVICES` | Override the device list explicitly (takes priority over `PCIDEVICE_IBM_COM_AIU_PF`) |
+| `SPYRE_DEVICES` | Comma-separated list of device indices to use (e.g., `0,2,3`); overrides the default enumeration |
 | `LOCAL_RANK` | Per-process rank set by `torchrun`; used to select the device for each child process |
 
 ## Runtime / driver (for `aiu-smi` and `aiu-trace-analyzer`)

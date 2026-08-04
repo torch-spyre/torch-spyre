@@ -17,8 +17,8 @@
 #pragma once
 
 #include <pybind11/pybind11.h>
+#include <spyrecode-host-functions/sendataconvert/sen_host_ops.h>
 #include <torch/csrc/utils/pybind.h>
-#include <util/sen_host_ops.h>
 
 #include <flex/flex.hpp>
 #include <memory>
@@ -52,6 +52,7 @@ class GlobalRuntime {
 };
 bool get_downcast_warn_enabled();
 bool is_supported_dtype(c10::ScalarType dtype);
+DataFormats get_device_dtype(c10::ScalarType torch_dtype);
 
 int device_count();
 void startRuntime();

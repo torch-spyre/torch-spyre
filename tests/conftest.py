@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 import yaml
 import pytest
-
+import regex as re
 
 import shared_config
 from oot_framework.oot_test_utilities import _RUNTIME_TAGS, _RUNTIME_SHAPES
@@ -51,6 +51,16 @@ def pytest_runtest_makereport(item, call):
             rep._spyre_tags = tags
 
         shapes = _RUNTIME_SHAPES.get(method_name)
+        if not shapes:
+            # Fallback: extract op unique_name from the variant method name
+            # e.g. "test_model_ops_db_torch_mul__1_spyre_float16" -> "torch_mul__1"
+            # _RUNTIME_SHAPES is pre-populated at collection time with this key.
+            # This covers the case where the test body never ran (runner crash /
+            # fresh-process retry), mirroring the _oot_method_tags fallback above.
+            m = re.search(r"^test_model_ops_db_(\w+__\d+)", method_name)
+            if m:
+                shapes = _RUNTIME_SHAPES.get(m.group(1))
+
         if shapes:
             rep._spyre_shapes = shapes
 
@@ -498,9 +508,35 @@ def _is_spyre_hardware_available() -> bool:
 
 def pytest_runtest_setup(item: pytest.Item) -> None:
     """
-    Automatically skip tests marked with @pytest.mark.requires_spyre_profiler
-    when the Spyre profiler is not available.
+    Skip tests marked with @pytest.mark.requires_spyre_profiler when the
+    Spyre profiler is not available.
+
+    Also skips any test when the device has entered an error state from a
+    previous test. This check runs before every test so that a single
+    hardware fault does not cascade into a wall of misleading FAILED results.
     """
+    # Skip if the device is in an error state from a prior test failure.
+    # NOTE: This hook only guarantees that tests running AFTER a device fault are
+    # cleanly SKIPPED — it does NOT guarantee the faulting test itself is the one
+    # that FAILS. A hardware fault flips the shutdown flag asynchronously, so it may
+    # not be visible until a later test's setup; the faulting test can pass and a
+    # later test gets skipped instead. Attributing the failure to the triggering
+    # test is out of scope here (tracked separately).
+    try:
+        from torch_spyre import _C  # noqa: PLC0415
+
+        state = _C.get_device_state()
+        if state == _C.SpyreDeviceState.StreamError:
+            pytest.skip(
+                f"Device is in error state ({state.name})"
+                " — a process restart is required"
+            )
+        # SpyreDeviceState.NotInitialized → proceed (runtime not started yet)
+        # SpyreDeviceState.Ok             → proceed
+    except ImportError:
+        # torch_spyre._C not built or not installed — nothing to check.
+        pass
+
     if "requires_spyre_profiler" in item.keywords:
         use_profiler = os.environ.get("USE_SPYRE_PROFILER") == "1"
         hardware_available = _is_spyre_hardware_available()

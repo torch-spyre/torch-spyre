@@ -8,4 +8,9 @@
 # than inside the test suite config files themselves.
 
 inductor/test_inductor_ops_misc_shape_a_config.yaml: spyre_pf_x2
-inductor/test_ops_lx_planning_config.yaml: spyre_pf_x4
+
+# The following 4-card is blocking users from getting spyre cards 
+# for PR commit checks + Merge Queues. Thus commenting out
+# to keep to default spyre_pf_x1 label (1 card)
+
+# inductor/test_ops_lx_planning_config.yaml: spyre_pf_x4

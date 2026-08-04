@@ -23,20 +23,11 @@ lx_planning: bool = os.environ.get("LX_PLANNING", "1") == "1"
 co_optimizing_lx_planning: bool = (
     os.environ.get("CO_OPTIMIZING_LX_PLANNING", "0") == "1"
 )
-hbm_planning: bool = _get_env_bool("SPYRE_INDUCTOR_MEMORY_PLAN", True)
-chunk_large_tensors: bool = os.environ.get("CHUNK_LARGE_TENSORS", "0") == "1"
+hbm_pool_planning: bool = _get_env_bool("HBM_POOL_PLANNING", True)
 
 global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == "1"
 
 allow_all_ops_in_lx_planning: bool = False
-
-# Insert clone ops at graph input/output boundaries so those buffers can be
-# LX-pinned (see scratchpad.utils.clone_at_graph_boundaries). This path is not
-# yet correct for all op types (e.g. matmul/layernorm/split under multi-core
-# K-split) and is kept off by default. Deliberately separate from
-# allow_all_ops_in_lx_planning, which only widens *intermediate* output
-# eligibility and must not, on its own, enable boundary clone insertion.
-lx_boundary_clones: bool = os.environ.get("LX_BOUNDARY_CLONES", "0") == "1"
 
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
 
@@ -62,12 +53,34 @@ ignore_work_division_hints: bool = (
 
 ignore_wsr_hints: bool = os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
 
+# Per-pass operation logging for CustomPreSchedulingPasses.
+# Set to "all" or "1" to log after every pass, or a comma-separated list of
+# pass function names (e.g., "split_multi_ops,insert_restickify") to log only
+# after specific passes. Set via SPYRE_LOG_PASSES env var or programmatically.
+log_passes: str = os.environ.get("SPYRE_LOG_PASSES", "")
+
 # Disable compiler-generated span-overflow coarse-tiling hints.  The global
 # SPYRE_INDUCTOR_IGNORE_HINTS flag also disables these so one switch can still
 # suppress all WSR/coarse-tiling hint paths.
+#
+# Defaults to disabled (opt-in): span-overflow auto-tiling can synchronize
+# compatible contiguous pointwise groups, but incompatible producer/consumer
+# groups and reduction-dim tiling still need broader support. Set
+# SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS=0 to opt in;
+# tests exercising this path directly should override via
+# config.patch({"ignore_span_overflow_hints": False}).
 ignore_span_overflow_hints: bool = (
     ignore_wsr_hints
-    or os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "0") == "1"
+    or os.environ.get("SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS", "1") == "1"
+)
+
+# Enable reduction-dim (Lk-style) coarse tiling. Defaults to enabled — this
+# capability is exercised by passing tests today. Disabling it (or a future
+# hardware limitation that can't support it) makes planning treat any op
+# whose group requests reduction-dim tiling as unsupported, raising
+# Unsupported rather than attempting to tile it.
+enable_reduction_tiling: bool = (
+    os.environ.get("SPYRE_INDUCTOR_ENABLE_REDUCTION_TILING", "1") == "1"
 )
 
 # For K-split matmuls, permute physical core IDs so the cores collaborating on a
@@ -78,33 +91,25 @@ core_id_k_fast_emission: bool = (
     os.environ.get("SPYRE_CORE_ID_K_FAST_EMISSION", "1") == "1"
 )
 
-# When True, HBM tensor addresses are emitted as runtime symbols (%sym_N
-# constants) in bundle.mlir and resolved via affine.apply for tiled loops.
-# Requires backend compiler support for the sdscbundle symbol table.
-# Independent of bundle_symbolic_args: you can have symbols in the SDSC JSON
-# without exposing them as function arguments (staged adoption).
-bundle_hbm_symbols: bool = os.environ.get("BUNDLE_HBM_SYMBOLS", "1") == "1"
-
-# When False (default), HBM tensor addresses are baked as concrete integers
+# When True (default), HBM tensor addresses are emitted as runtime symbols
+# with !sdscbundle.input_arg<index> parameters and input_arg_extract ops
+# in the bundle.mlir.
+# When False, HBM tensor addresses are baked as concrete integers
 # into the SDSC JSON and bundle.mlir emits sdsc_execute with no operands.
-# When True, addresses are emitted as runtime symbols with
-# !sdscbundle.input_arg<index> parameters, input_arg_extract ops, and
-# affine.apply indirection for tiled loops.
-# Requires bundle_hbm_symbols=True to have any effect.
-bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "0") == "1"
+bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 
-# When True (default), LoopSpec nodes are fully unrolled into flat OpSpecs
-# before generate_bundle runs.  Set to False to pass LoopSpecs through intact
-# for the scf.for / affine.apply path.
-unroll_loops: bool = os.environ.get("UNROLL_LOOPS", "1") == "1"
-
-# Layout solver class used by default in scratchpad.allocator.DefaultAllocator.
+# Layout solver class used by default in scratchpad.allocator.ScratchpadAllocator.
 # Options:
-#  "greedy":   GreedyLayoutSolver (default),
-#  "bestfit":  BestFitLayoutSolver,
-#  "firstfit": FirstFitLayoutSolver.
+#  "greedy":       GreedyLayoutSolver (default),
+#  "bestfit":      BestFitLayoutSolver,
+#  "firstfit":     FirstFitLayoutSolver,
+#  "simulated_annealing":  SimulatedAnnealingLayoutSolver,
+#  "cpsat":    CpSatLayoutSolver (OR-Tools CP-SAT joint core-division +
+#              LX placement, minimizing HBM transfer traffic).
 
 # TODO(isuruf): Change to firstfit when deeptools PR4298 lands
-layout_solver: Literal["greedy", "bestfit", "firstfit"] = "greedy"
+layout_solver: Literal[
+    "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
+] = os.environ.get("LAYOUT_SOLVER", "greedy")  # type: ignore[assignment]
 
 install_config_module(sys.modules[__name__])

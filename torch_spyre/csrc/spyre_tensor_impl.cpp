@@ -205,6 +205,10 @@ std::string SpyreTensorLayout::toString() const {
   }
   ss << "], device_dtype=DataFormats.";
   ss << EnumsConversion::dataFormatsToString(this->device_dtype);
+  if (this->element_arrangement != ElementArrangement::STANDARD) {
+    ss << ", element_arrangement=ElementArrangement.";
+    ss << spyre::elementArrangementToString(this->element_arrangement);
+  }
   ss << ")";
   return ss.str();
 }
@@ -246,7 +250,7 @@ SpyreTensorImpl::shallow_copy_and_detach_core(
     bool allow_tensor_metadata_change) const {
   if (key_set_.has(c10::DispatchKey::Python) &&
       !c10::impl::tls_is_dispatch_key_excluded(c10::DispatchKey::Python)) {
-    auto r = pyobj_slot_.load_pyobj_interpreter()->detach(this);
+    auto r = (*c10::impl::getGlobalPyInterpreter())->detach(this);
     if (r) {
       r->set_version_counter(version_counter);
       r->set_allow_tensor_metadata_change(allow_tensor_metadata_change);

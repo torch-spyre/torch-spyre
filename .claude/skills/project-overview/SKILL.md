@@ -50,7 +50,7 @@ torch-spyre/
 │   ├── _monkey_patch.py         # Patches torch.Tensor for Spyre awareness
 │   ├── constants.py             # DEVICE_NAME = "spyre"
 │   ├── csrc/                    # C++ sources (pybind11 → torch_spyre._C and ._hooks)
-│   │   ├── module.cpp           # Main pybind11 module: startRuntime, launchKernel, encodeConstant
+│   │   ├── module.cpp           # Main pybind11 module: startRuntime, encodeConstant
 │   │   ├── spyre_tensor_impl.*  # SpyreTensorLayout, SpyreTensorImpl (tiled tensor layout)
 │   │   ├── spyre_mem.*          # Device memory allocation (spyre_empty_strided, etc.)
 │   │   ├── spyre_hooks.cpp      # PrivateUse1 hooks + SpyreGuardImpl (separate ._hooks module)
@@ -81,7 +81,7 @@ torch-spyre/
 │
 ├── examples/                    # Usage examples (softmax, gelu, mul, etc.)
 ├── setup.py                     # Build: C++ extension compilation
-├── pyproject.toml               # PEP 517/518 metadata, deps (torch~=2.11.0)
+├── pyproject.toml               # PEP 517/518 metadata, deps (torch~=2.13.0)
 └── tools/                       # Developer tooling (lint, format, mypy)
 ```
 
@@ -105,7 +105,7 @@ torch.compile(model)
   → SpyreKernel codegen (spyre_kernel.py) — LoopLevelIR → KernelSpec
   → SuperDSC generation (codegen/superdsc.py) — KernelSpec → JSON descriptor
   → dxp_standalone (backend compiler) — JSON → g2.graph.cbor binary
-  → SpyreSDSCKernelRunner — calls _C.launch_kernel() at runtime
+  → SpyreSDSCKernelRunner — calls _C.launch_jobplan() at runtime
 ```
 
 ### Key Files
@@ -131,7 +131,7 @@ torch.compile(model)
 | `temp_passes.py` | `relayout_linear_weights` — ensures weight contiguity for mm |
 | `runtime/__init__.py` | `KernelSpec`, `TensorArg`, `ConstantArg` dataclasses |
 | `runtime/async_compile.py` | `SpyreAsyncCompile` — SDSC→binary compilation |
-| `runtime/kernel_runner.py` | `SpyreSDSCKernelRunner` — kernel execution via `_C.launch_kernel` |
+| `runtime/kernel_runner.py` | `SpyreSDSCKernelRunner` — kernel execution via `_C.launch_jobplan` |
 | `codegen/superdsc.py` | `generate_sdsc()` — KernelSpec → SuperDSC JSON |
 | `codegen/compute_ops.py` | Pointwise/reduction/matmul SDSC generation |
 | `codegen/data_ops.py` | Transpose/clone/slice SDSC generation |
@@ -194,7 +194,7 @@ Two separate pybind11 modules:
    against `sendnn`, `flex`
 2. **Entry point**: `torch.backends` → `torch_spyre = torch_spyre:_autoload`
 
-Key external deps: `torch~=2.11.0`, `sendnn`, `flex`, `dxp_standalone`
+Key external deps: `torch~=2.13.0`, `sendnn`, `flex`, `dxp_standalone`
 
 ---
 

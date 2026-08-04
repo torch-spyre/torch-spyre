@@ -218,9 +218,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         index = x + tmp0
         loop_vars = {x}
 
-        # Mock size_hint to raise TypeError for tmp0
+        # Mock optimization_hint to raise TypeError for tmp0
         with patch("torch_spyre._inductor.pass_utils.V") as mock_v:
-            mock_v.graph.sizevars.size_hint.side_effect = TypeError(
+            mock_v.graph.sizevars.optimization_hint.side_effect = TypeError(
                 "Cannot convert symbols to int"
             )
 
@@ -233,19 +233,19 @@ class TestPassUtils(unittest.TestCase):
     """Unit tests for helpers in ``torch_spyre._inductor.pass_utils``."""
 
     @staticmethod
-    def _mock_v(lower=None, upper=None, size_hint=None):
+    def _mock_v(lower=None, upper=None, optimization_hint=None):
         """Build a mock ``V`` whose ShapeEnv reports the given bounds.
 
-        ``size_hint`` is wired only when provided; tests that should
-        never reach the size_hint fallback can omit it (any accidental
-        call would raise ``AttributeError`` and fail the test loudly).
+        ``optimization_hint`` is wired only when provided; tests that should
+        never reach the hint fallback can omit it (any accidental call would
+        raise ``AttributeError`` and fail the test loudly).
         """
         shape_env = SimpleNamespace(
             bound_sympy=lambda _e: SimpleNamespace(lower=lower, upper=upper)
         )
         sizevars = SimpleNamespace(shape_env=shape_env)
-        if size_hint is not None:
-            sizevars.size_hint = lambda _e: size_hint
+        if optimization_hint is not None:
+            sizevars.optimization_hint = lambda _e: optimization_hint
         return SimpleNamespace(graph=SimpleNamespace(sizevars=sizevars))
 
     def test_compute_max_size(self):
@@ -257,21 +257,21 @@ class TestPassUtils(unittest.TestCase):
         s = sympy.Symbol("s0", integer=True, positive=True)
 
         # Finite ShapeEnv upper bound is recorded, return it.
-        # ``size_hint`` is wired to a deliberately wrong value so a
-        # regression that falls through to size_hint would fail loudly.
-        mock_v = self._mock_v(upper=sympy.Integer(576), size_hint=9999)
+        # ``optimization_hint`` is wired to a deliberately wrong value so a
+        # regression that falls through to the hint would fail loudly.
+        mock_v = self._mock_v(upper=sympy.Integer(576), optimization_hint=9999)
         with patch("torch_spyre._inductor.pass_utils.V", mock_v):
             assert compute_max_size(s) == 576
 
-        # No usable upper bound (sympy.oo) -- fall back to size_hint.
-        mock_v = self._mock_v(upper=sympy.oo, size_hint=64)
+        # No usable upper bound (sympy.oo) -- fall back to optimization_hint.
+        mock_v = self._mock_v(upper=sympy.oo, optimization_hint=64)
         with patch("torch_spyre._inductor.pass_utils.V", mock_v):
             assert compute_max_size(s) == 64
 
         # Edge case: the ``finite_upper_or_none`` predicate filters
         # non-positive bounds (``int(vr.upper) > 0``). Zero upper must
-        # fall through to size_hint just like sympy.oo does.
-        mock_v = self._mock_v(upper=sympy.Integer(0), size_hint=42)
+        # fall through to optimization_hint just like sympy.oo does.
+        mock_v = self._mock_v(upper=sympy.Integer(0), optimization_hint=42)
         with patch("torch_spyre._inductor.pass_utils.V", mock_v):
             assert compute_max_size(s) == 42
 
@@ -311,8 +311,8 @@ class TestPassUtils(unittest.TestCase):
         assert granularity == 32
         assert any("defaulting granularity" in str(x.message) for x in w)
 
-    def test_compute_granularity_size_hint_fallback_emits_warning(self):
-        # No finite upper bound -> max came from size_hint; helper warns.
+    def test_compute_granularity_hint_fallback_emits_warning(self):
+        # No finite upper bound -> max came from optimization_hint; helper warns.
         expr = sympy.Symbol("s0", integer=True, positive=True)
         mock_v = self._mock_v(sympy.Integer(2), sympy.oo)
         with patch("torch_spyre._inductor.pass_utils.V", mock_v):
@@ -320,7 +320,7 @@ class TestPassUtils(unittest.TestCase):
                 warnings.simplefilter("always")
                 granularity = compute_granularity(expr, max_size=1024)
         assert granularity == 32
-        assert any("came from size_hint" in str(x.message) for x in w)
+        assert any("came from optimization_hint" in str(x.message) for x in w)
 
     def test_compute_symbolic_bounds_concrete_int_returns_none(self):
         with patch("torch_spyre._inductor.pass_utils.V", self._mock_v()):
@@ -345,21 +345,23 @@ class TestPassUtils(unittest.TestCase):
         mock_v = self._mock_v(
             lower=sympy.Integer(64),
             upper=sympy.Integer(1024),
-            size_hint=512,
+            optimization_hint=512,
         )
         with patch("torch_spyre._inductor.pass_utils.V", mock_v):
             result = compute_symbolic_bounds(s0)
         assert result == (1024, 64)
 
-    def test_compute_symbolic_bounds_infinite_upper_falls_back_to_size_hint(self):
+    def test_compute_symbolic_bounds_infinite_upper_falls_back_to_hint(self):
         # dynamic=True without mark_dynamic(max=...) gives upper=oo.
-        # max_size must fall back to size_hint, not oo. lower=2 is
+        # max_size must fall back to optimization_hint, not oo. lower=2 is
         # ShapeEnv's default (no mark_dynamic(min=...) given), so
         # granularity comes from compute_granularity's default-divisor
         # branch: smallest divisor of 256 >= min_default_granularity(4)
         # with 256/d <= max_buckets(32) is 8.
         s0 = sympy.Symbol("s0", integer=True, positive=True)
-        mock_v = self._mock_v(lower=sympy.Integer(2), upper=sympy.oo, size_hint=256)
+        mock_v = self._mock_v(
+            lower=sympy.Integer(2), upper=sympy.oo, optimization_hint=256
+        )
         with patch("torch_spyre._inductor.pass_utils.V", mock_v):
             with warnings.catch_warnings(record=True):
                 warnings.simplefilter("always")
