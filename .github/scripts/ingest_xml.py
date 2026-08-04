@@ -608,6 +608,13 @@ def main():
     parser.add_argument("--run-id", default="")
     parser.add_argument("--triggered-at", default="")
     parser.add_argument("--pr-number", default="")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Parse the XML and print what would be ingested, without "
+        "connecting to ClickHouse or inserting anything. Useful for testing "
+        "the parsers against sample XML.",
+    )
     args = parser.parse_args()
 
     if args.xml_file:
@@ -622,13 +629,17 @@ def main():
         print("No XML files found — nothing to ingest.")
         sys.exit(0)
 
-    print(
-        f"Connecting to ClickHouse at "
-        f"{os.environ['CLICKHOUSE_HOST']}:{os.environ.get('CLICKHOUSE_PORT', 443)} ..."
-    )
-    client = get_client()
-    client.command("SELECT 1")
-    print("Connected.\n")
+    if args.dry_run:
+        client = None
+        print("[dry-run] Skipping ClickHouse connection — parsing only.\n")
+    else:
+        print(
+            f"Connecting to ClickHouse at "
+            f"{os.environ['CLICKHOUSE_HOST']}:{os.environ.get('CLICKHOUSE_PORT', 443)} ..."
+        )
+        client = get_client()
+        client.command("SELECT 1")
+        print("Connected.\n")
 
     total_cases = 0
     total_benchmarks = 0
@@ -644,6 +655,11 @@ def main():
             print("  Detected: performance benchmark XML")
             run_meta, benchmarks = parse_benchmark_xml(xml_path)
             if run_meta is None:
+                continue
+
+            if args.dry_run:
+                print(f"  [dry-run] parsed {len(benchmarks)} benchmark row(s)")
+                total_benchmarks += len(benchmarks)
                 continue
 
             # Deduplication: skip if source_file already in benchmark_runs
@@ -671,6 +687,17 @@ def main():
             print("  Detected: test-result XML")
             run, cases = parse_test_xml(xml_path)
             if run is None:
+                continue
+
+            if args.dry_run:
+                print(
+                    f"  [dry-run] parsed {run['total_tests']} test case(s)  "
+                    f"passed={run['passed']}  failed={run['failed']}  "
+                    f"xpass={run['xpass']}  xfail={run['xfail']}  "
+                    f"skipped={run['skipped']}  "
+                    f"properties={sum(len(c['properties']) for c in cases)}"
+                )
+                total_cases += len(cases)
                 continue
 
             # Deduplication
@@ -723,9 +750,12 @@ def main():
                 f"{sum(len(c['properties']) for c in cases)} properties"
             )
 
+    # Under --dry-run nothing is inserted, so the totals are what we parsed,
+    # not what we ingested. Label them accordingly.
+    verb = "parsed" if args.dry_run else "ingested"
     print(f"\nDone. {len(xml_files)} file(s) processed.")
-    print(f"  Test cases ingested:  {total_cases}")
-    print(f"  Benchmarks ingested:  {total_benchmarks}")
+    print(f"  Test cases {verb}:  {total_cases}")
+    print(f"  Benchmarks {verb}:  {total_benchmarks}")
 
 
 if __name__ == "__main__":

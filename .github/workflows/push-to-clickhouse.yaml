@@ -92,21 +92,24 @@ jobs:
           sparse-checkout: |
             .github/scripts/ingest_xml.py
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
-
-      - name: setup venv
-        run: |
-          pwd
-          ls -la
-          uv venv
-          source .venv/bin/activate
-          echo "VIRTUAL_ENV $VIRTUAL_ENV"
-
+      # This job runs on the self-hosted image_spyre_backend runner, whose image
+      # already ships python3 (3.12) — no uv/venv setup is needed (that was a
+      # leftover from when this ran on ubuntu-latest). Install the ingest
+      # script's deps into the user site of the system python. `regex` is
+      # required because ingest_xml.py does `import regex as re`.
+      #
+      # Versions are pinned exactly (not `--upgrade` to whatever PyPI serves at
+      # run time) so ingestion behaviour is reproducible and can't silently
+      # break when a new release lands. These pins were resolved and tested on
+      # the 2.0/torch-spyre:amd64 image (python 3.12.13); bump them deliberately.
       - name: Install Python dependencies
         run: |
-          source .venv/bin/activate
-          uv pip install requests clickhouse-driver clickhouse-connect lxml regex
+          python3 -m pip install --user \
+            regex==2026.7.19 \
+            lxml==6.1.1 \
+            clickhouse-connect==1.6.0 \
+            clickhouse-driver==0.2.11 \
+            requests==2.34.2
 
       - name: Install gh CLI
         run: |
@@ -177,7 +180,6 @@ jobs:
       # ---------------------------------------------------------------------------
       - name: Ingest XML files into ClickHouse
         run: |
-          source .venv/bin/activate
           python3 .github/scripts/ingest_xml.py \
             --xml-dir xml_artifacts \
             --workflow "${TRIGGERING_WORKFLOW}" \
