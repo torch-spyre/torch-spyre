@@ -69,7 +69,10 @@ jobs:
   build:
     name: Build torch-spyre wheel (once)
     needs: changes
-    if: needs.changes.outputs.code_changed == 'true'
+    # Also skipped when `integration-test` is labeled -- Jenkins handles it instead
+    if: |
+      needs.changes.outputs.code_changed == 'true' &&
+      !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'integration-test'))
     # Compile-only: needs the backend image + SDK toolchain but NO physical Spyre
     # card, so it targets the cardless spyre_pf_x0 pool and leaves card runners
     # for the test jobs.
