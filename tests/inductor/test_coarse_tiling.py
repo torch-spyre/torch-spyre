@@ -563,6 +563,7 @@ def _make_sdsc_spec(
         },
         args=[tensor],
         constants={},
+        conv_params={},
         coordinate_masking={},
     )
 
@@ -2463,6 +2464,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             layouts={"A": {"dim_order": [s], "stick_dim_order": s, "stick_size": 64}},
             args=[tensor],
             constants={},
+            conv_params={},
             coordinate_masking={},
         )
         symbols: list[int] = []
@@ -5719,6 +5721,7 @@ class TestSymbolKind(unittest.TestCase):
             layouts={"A": {"dim_order": [s], "stick_dim_order": s, "stick_size": 64}},
             args=[tensor],
             constants={},
+            conv_params={},
             coordinate_masking={},
         )
         symbols: list[int] = []

@@ -39,6 +39,7 @@ from .constants import (
     POOL_OPS,
     RESTICKIFY_OP,
     SEGMENT_OFFSETS,
+    DEPTHWISE_CONV2D_OP,
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
 from . import config as _spyre_config
@@ -1152,6 +1153,23 @@ class SpyreKernel(Kernel[CSEVariable]):
             args = [
                 self.create_tensor_arg(True, x.name, x),
                 self.create_tensor_arg(True, y.name, y),
+                self.create_tensor_arg(False, real_dst_name, dst),
+            ]
+            self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
+        elif value.op == DEPTHWISE_CONV2D_OP:
+            if (
+                len(value.arguments) < 2
+                or (not isinstance(value.arguments[0], TensorAccess))
+                or (not isinstance(value.arguments[1], TensorAccess))
+            ):
+                raise Unsupported(
+                    f"invalid depthwiseconv2dnative arguments {value.arguments}"
+                )
+            x = value.arguments[0]
+            w = value.arguments[1]
+            args = [
+                self.create_tensor_arg(True, x.name, x),
+                self.create_tensor_arg(True, w.name, w),
                 self.create_tensor_arg(False, real_dst_name, dst),
             ]
             self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))

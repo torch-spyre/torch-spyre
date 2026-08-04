@@ -15,10 +15,24 @@
 
 import dataclasses
 
-from torch_spyre._C import encode_constant, DataFormats
+from sympy import Symbol
+
+from torch_spyre._C import DataFormats, encode_constant
+from torch_spyre._inductor.constants import DEPTHWISE_CONV2D_OP
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import coeff_through_floor
-from sympy import Symbol
+
+
+def _build_padding_for_tensor(conv_params):
+    """Build padding_ for tensor allocations, only when conv_params is non-empty."""
+    if not conv_params:
+        return {}
+    return {
+        "padding_": {
+            str(conv_params["pad_dim_i"]): conv_params["pad_type"],
+            str(conv_params["pad_dim_j"]): conv_params["pad_type"],
+        }
+    }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -239,19 +253,28 @@ def gen_coord_info_value(
     elems_per_stick: int,
     is_stick_dim: bool,
     is_stick_reduction: bool = False,
+    conv_params=None,
     padding: str = "nopad",
 ):
+    """
+    Args:
+        conv_params: Dict with padding info for convolution ops; contains 'conv_padding' (pad type) and 'total_size' (per-core slice size for padding dims).
+        If conv_params is not specified, pad type should default to "nopad" and total_size to size.
+    """
+    if conv_params is None:
+        conv_params = {"conv_padding": padding, "stride_len": 1, "total_size": size}
+
     return (
         {
             "spatial": 3,
             "temporal": 0,
             "elemArr": 1,
-            "padding": padding,
+            "padding": str(conv_params["conv_padding"]),
             "folds": {
                 "dim_prop_func": [
                     {
                         "Affine": {
-                            "alpha_": size,
+                            "alpha_": size * conv_params["stride_len"],
                             "beta_": 0,
                         }
                     },
@@ -288,7 +311,7 @@ def gen_coord_info_value(
                         "label_": "row_fold",
                     },
                     {
-                        "factor_": size,
+                        "factor_": conv_params["total_size"],
                         "label_": "elem_arr_0",
                     },
                 ],
@@ -360,6 +383,50 @@ def gen_coord_info_value(
             },
         }
     )
+
+
+def get_conv_params(tensor_num, dim, opfunc, conv_params, size, splits):
+    conv_padding = "nopad"
+    total_size = size // splits
+    padding_len = 0
+    stride_len = 1
+    if tensor_num == 0 and opfunc == DEPTHWISE_CONV2D_OP:
+        required_keys = [
+            "pad_dim_i",
+            "pad_dim_j",
+            "stride_i",
+            "stride_j",
+            "kernel_h",
+            "kernel_w",
+        ]
+        missing = [k for k in required_keys if k not in conv_params]
+        if missing:
+            raise ValueError(f"Missing conv_params keys: {missing}")
+        if "pad_type" in conv_params and (
+            str(dim) == str(conv_params["pad_dim_i"])
+            or str(dim) == str(conv_params["pad_dim_j"])
+        ):
+            conv_padding = conv_params["pad_type"]
+            padding_len = conv_params["pad_i"]
+            stride_len = conv_params["stride_i"]
+        if "pad_dim_i" in conv_params and str(dim) == str(conv_params["pad_dim_i"]):
+            total_size = (
+                (size // splits) * conv_params["stride_i"] + conv_params["kernel_h"] - 1
+            )
+            padding_len = conv_params["pad_i"]
+            stride_len = conv_params["stride_i"]
+        elif "pad_dim_j" in conv_params and str(dim) == str(conv_params["pad_dim_j"]):
+            total_size = (
+                (size // splits) * conv_params["stride_j"] + conv_params["kernel_w"] - 1
+            )
+            padding_len = conv_params["pad_j"]
+            stride_len = conv_params["stride_j"]
+    return {
+        "conv_padding": conv_padding,
+        "padding_len": padding_len,
+        "stride_len": stride_len,
+        "total_size": total_size,
+    }
 
 
 def _symbolic_split_info(
@@ -524,6 +591,7 @@ def generate_sdsc(
     use_symbols: bool = False,
 ):
     """Generate SDSC JSON for one OpSpec.
+    print(f"DEBUG: generate_sdsc: sdsc_spec: {sdsc_spec}")
 
     Returns a 4-tuple ``(sdsc_json, base_symbol_values, affine_strides, symbol_kinds)``:
     - ``sdsc_json``: the JSON dict to write to ``sdsc_N.json``
@@ -1067,8 +1135,8 @@ def generate_sdsc(
         return {
             "isPadded": 1 if is_input else 0,
             "isZeroPadded": 0,
-            "dsOffset": 0,
-            "allocateNode_": alloc_node,
+            # "dsOffset": 0,
+            # "allocateNode_": alloc_node,
         }
 
     return (
@@ -1161,7 +1229,9 @@ def generate_sdsc(
                                         "coreletSplit_": {},
                                         "rowSplit_": {},
                                         "peSfpSplit_": {},
-                                        "paddingSizes_": sdsc_spec.padding_sizes,
+                                        "paddingSizes_": sdsc_spec.padding_sizes_per_core
+                                        if sdsc_spec.padding_sizes_per_core
+                                        else sdsc_spec.padding_sizes,
                                     },
                                     "el_": {
                                         "name_": "core",
@@ -1177,7 +1247,9 @@ def generate_sdsc(
                                         "coreletSplit_": {},
                                         "rowSplit_": {},
                                         "peSfpSplit_": {},
-                                        "paddingSizes_": sdsc_spec.padding_sizes,
+                                        "paddingSizes_": sdsc_spec.padding_sizes_per_core
+                                        if sdsc_spec.padding_sizes_per_core
+                                        else sdsc_spec.padding_sizes,
                                     },
                                 }
                             },
@@ -1219,6 +1291,12 @@ def generate_sdsc(
                                     "component_": "lx"
                                     if "lx" in tensor.allocation
                                     else "hbm",
+                                    **(
+                                        _build_padding_for_tensor(sdsc_spec.conv_params)
+                                        if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
+                                        and i == 0
+                                        else {}
+                                    ),
                                     **(
                                         {"isStartAddrSymbolic_": 1}
                                         if use_symbols and "lx" not in tensor.allocation
@@ -1289,37 +1367,51 @@ def generate_sdsc(
                                             }
                                         }
                                         if tensor.backGap
+                                        and sdsc_spec.opfunc != DEPTHWISE_CONV2D_OP
                                         else {}
                                     ),
                                     "coordinates_": {
                                         "coordInfo": {
-                                            str(dim): gen_coord_info_value(
-                                                size=(
-                                                    _coord_size(
-                                                        str(dim),
-                                                        sdsc_spec.iteration_space[dim],
-                                                        i < sdsc_spec.num_inputs,
+                                            str(dim): (
+                                                lambda dim_size, dim_nsplits: (
+                                                    gen_coord_info_value(
+                                                        size=dim_size // dim_nsplits,
+                                                        nsplits=dim_nsplits,
+                                                        elems_per_stick=tensor.data_format.elems_per_stick(),
+                                                        is_stick_dim=(
+                                                            sdsc_spec.layouts[
+                                                                tensor.layout
+                                                            ]["stick_dim_order"].has(
+                                                                dim
+                                                            )
+                                                        ),
+                                                        is_stick_reduction=(
+                                                            tensor.scales[dim] == -2
+                                                        ),
+                                                        conv_params=get_conv_params(
+                                                            i,
+                                                            dim,
+                                                            sdsc_spec.opfunc,
+                                                            sdsc_spec.conv_params,
+                                                            dim_size,
+                                                            dim_nsplits,
+                                                        ),
+                                                        padding=_coord_padding(
+                                                            str(dim),
+                                                            i < sdsc_spec.num_inputs,
+                                                        ),
                                                     )
-                                                    // sdsc_spec.work_slices[dim]
                                                 )
-                                                if (tensor.scales[dim] == 1)
-                                                else 1,
-                                                nsplits=sdsc_spec.work_slices[dim]
-                                                if (tensor.scales[dim] == 1)
-                                                else 1,
-                                                elems_per_stick=tensor.data_format.elems_per_stick(),
-                                                is_stick_dim=(
-                                                    sdsc_spec.layouts[tensor.layout][
-                                                        "stick_dim_order"
-                                                    ].has(dim)
-                                                ),
-                                                is_stick_reduction=(
-                                                    tensor.scales[dim] == -2
-                                                ),
-                                                padding=_coord_padding(
+                                            )(
+                                                # sdsc_spec.iteration_space[dim],
+                                                _coord_size(
                                                     str(dim),
+                                                    sdsc_spec.iteration_space[dim],
                                                     i < sdsc_spec.num_inputs,
                                                 ),
+                                                sdsc_spec.work_slices[dim]
+                                                if (tensor.scales[dim] == 1)
+                                                else 1,
                                             )
                                             for dim in _filter_window_dims(
                                                 sdsc_spec.layouts[tensor.layout][
@@ -1359,21 +1451,46 @@ def generate_sdsc(
                                     else {
                                         "hbm": {
                                             "isPresent": 1,
-                                            **_memorg_extra(
-                                                i < sdsc_spec.num_inputs,
-                                                f"allocate-Tensor{i}_hbm",
+                                            **(
+                                                _memorg_extra(
+                                                    i < sdsc_spec.num_inputs,
+                                                    f"allocate-Tensor{i}_hbm",
+                                                )
+                                                if sdsc_spec.opfunc
+                                                != DEPTHWISE_CONV2D_OP
+                                                or i == 0
+                                                else {}
                                             ),
                                         },
                                         "lx": {
                                             "isPresent": 1,
-                                            **_memorg_extra(
-                                                i < sdsc_spec.num_inputs,
-                                                "",
+                                            **(
+                                                _memorg_extra(
+                                                    i < sdsc_spec.num_inputs,
+                                                    "",
+                                                )
+                                                if sdsc_spec.opfunc
+                                                != DEPTHWISE_CONV2D_OP
+                                                or i == 0
+                                                else {}
                                             ),
                                         },
                                     }
                                     if "lx" not in tensor.allocation
-                                    else {"lx": {"isPresent": 1}},
+                                    else (
+                                        {
+                                            "lx": {
+                                                "isPresent": 1,
+                                                "isPadded": 1,
+                                                # "isPresent": 1
+                                            }
+                                        }
+                                        if (
+                                            i == 0
+                                            and sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
+                                        )
+                                        else {"lx": {"isPresent": 1}}
+                                    ),
                                 }
                                 for i, tensor in enumerate(sdsc_spec.args)
                             ],
