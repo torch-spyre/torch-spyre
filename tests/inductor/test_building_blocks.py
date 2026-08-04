@@ -306,7 +306,7 @@ class TestBuildingBlocks(unittest.TestCase):
             # abs is a plain SchedulerNode; neg inside the hint becomes a
             # CountedLoopSchedulerNode.  The two must fuse into one bundle.
             y = torch.abs(x)
-            with sh(num_tiles_per_dim={"T": 2}):
+            with sh(tile_size_per_dim={"T": 64}):
                 return torch.neg(y)
 
         cfn = torch.compile(fn)
@@ -338,7 +338,7 @@ class TestBuildingBlocks(unittest.TestCase):
         _pnd.name_tensor_dims(x_dev, ["T", "D"])
 
         def fn(x):
-            with sh(num_tiles_per_dim={"T": 2}):
+            with sh(tile_size_per_dim={"T": 64}):
                 return x + x
 
         captured_op_specs = []
