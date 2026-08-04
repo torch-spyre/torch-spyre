@@ -1,4 +1,5 @@
 name: integration-tests
+run-name: integration-tests (${{ inputs.test_type || 'device_critical' }})
 
 # ---------------------------------------------------------------------------
 # Triggered by commits in upstream dependant repos (deeptools, flex, etc.) via
