@@ -77,12 +77,18 @@ def is_benchmark_xml(root) -> bool:
     return all("benchmark" in (tc.get("classname", "")) for tc in cases)
 
 
-def parse_benchmark_xml(xml_path: Path):
+def parse_benchmark_xml(xml_path: Path, workflow: str = ""):
     """
     Parse a performance-benchmark XML into (run_meta, list[benchmark_row]).
 
     Groups the 5 per-op-shape metric cases into one perf_benchmarks row each,
     pivoting the metric values into the appropriate columns.
+
+    Args:
+        xml_path: the benchmark XML to parse.
+        workflow: caller-supplied run identity (the Jenkins caller passes
+            "jenkins-<product>-<suite>-<arch>"). Recorded on the run and folded
+            into source_file to keep the dedup key unique -- see run_meta below.
 
     Returns:
         run_meta  : dict  – data for benchmark_runs
@@ -214,10 +220,20 @@ def parse_benchmark_xml(xml_path: Path):
             }
         )
 
+    # source_file is the dedup key. Every perf run emits the same basename
+    # (report.xml), so on its own it lets the FIRST run ever ingest and silently
+    # skips every later one -- including the other arches of the same night.
+    # Qualify it with the workflow (carries product/suite/arch) and the suite
+    # timestamp so each run is distinct while re-ingesting one file stays a no-op.
+    source_file = "/".join(
+        p for p in (workflow, created_at.strftime("%Y%m%dT%H%M%SZ"), xml_path.name) if p
+    )
+
     run_meta = {
-        "source_file": xml_path.name,
+        "source_file": source_file,
         "created_at": created_at,
         "version_info": version_info,
+        "workflow": workflow,
     }
     return run_meta, benchmarks
 
@@ -236,9 +252,16 @@ def insert_benchmark_run(client, run_id: int, run_meta: dict) -> None:
                 run_meta["source_file"],
                 run_meta.get("version_info"),
                 run_meta["created_at"].replace(tzinfo=None),
+                run_meta.get("workflow", ""),
             ]
         ],
-        column_names=["run_id", "source_file", "version_info", "created_at"],
+        column_names=[
+            "run_id",
+            "source_file",
+            "version_info",
+            "created_at",
+            "workflow",
+        ],
     )
 
 
@@ -642,7 +665,7 @@ def main():
         # ── Dispatch: benchmark vs test-result ─────────────────────────────
         if is_benchmark_xml(root):
             print("  Detected: performance benchmark XML")
-            run_meta, benchmarks = parse_benchmark_xml(xml_path)
+            run_meta, benchmarks = parse_benchmark_xml(xml_path, args.workflow)
             if run_meta is None:
                 continue
 
