@@ -616,7 +616,7 @@ Key observations:
   `device_tile_advance_expr` means `generate_bundle` addresses that
   `TensorArg` with a fixed, non-advancing address — no `affine.apply` per
   iteration — whether or not `per_tile_fixed` is actually set; see
-  `compute_ops.py`'s `_tensor_tiled_by_symbol`, which treats "no advance
+  `codegen/compute_ops.py`'s `_tensor_tiled_by_symbol`, which treats "no advance
   expression" and "`per_tile_fixed`" as the same "does not advance" case for
   `bundle.mlir` purposes. `op0`'s (`add`'s) own two inputs reuse the same
   fixed `a_tile`/`b_tile` `hbm_pool` addresses the read copies just wrote —
@@ -677,7 +677,7 @@ Key observations:
   it were too large, or scratchpad were otherwise full),
   `scratchpad_planning` would fall back to `allocation={'hbm_pool': ...}`
   instead — the same bulk-allocated HBM region
-  (`memory_planning.py`'s `INTERMEDIATES_SEGMENT`) that `a_tile`/`b_tile`/
+  (`constants.py`'s `INTERMEDIATES_SEGMENT`) that `a_tile`/`b_tile`/
   `c_tile` already use — and the buffer would still carry
   `per_tile_fixed=True`, since that flag reflects the loop-internal-scratch
   *lifetime* of the buffer, not which memory it happens to land in.
@@ -1386,7 +1386,7 @@ both already iterating per arg:
   (`supertile_count`) — `supertile_count` is host/op-level loop-structure
   metadata, not device-layout-derived, so it is legitimately the same
   across every arg of the op even though `tile_size` is not.
-- **`compute_ops.py`'s `generate_sdsc`** uses each tensor's own
+- **`codegen/compute_ops.py`'s `generate_sdsc`** uses each tensor's own
   `device_tile_advance_expr` to build `affine_strides` — the actual
   per-iteration advance for each nesting level. This is the one place in
   the whole pipeline that already iterates per level and per tensor arg,
