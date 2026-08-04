@@ -169,7 +169,7 @@ jobs:
             config: inductor-test_config.yaml
           - name: Inductor test control flow
             config: inductor-test_control_flow.yaml
-          # Inductor test cpu select algorithm is split it into 3 parts to prevent job timeout
+          # Inductor test cpu select algorithm is split it into three parts to prevent job timeout
           - name: Inductor test cpu select algorithm part 1
             config: inductor-test_cpu_select_algorithm_part1.yaml
           - name: Inductor test cpu select algorithm part 2
