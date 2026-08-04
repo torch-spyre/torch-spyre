@@ -3,16 +3,6 @@
 Aggregates passed/failed/skipped/error/xfailed/xpassed counts from a pytest
 JUnit XML report and reports them to the calling GHA step.
 
-xfailed is reliable: pytest's junitxml plugin emits
-<skipped type="pytest.xfail"> for expected failures. xpassed is best-effort
-only: a *non-strict* xpass (torch-spyre does not set xfail_strict) is
-written as an ordinary empty <testcase/>, indistinguishable from a plain
-pass — only a strict xpass would show up here (as a <skipped> with a
-"passes unexpectedly" message).
-
-Writes the counts as a Markdown table to $GITHUB_STEP_SUMMARY (if set) and
-as `test_results_json=<json>` to $GITHUB_OUTPUT (if set), so a later step
-can read `steps.<id>.outputs.test_results_json`.
 
 Usage (called by the GHA workflow):
     python3 parse_junit_xml_counts.py \

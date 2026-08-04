@@ -102,7 +102,11 @@ jobs:
 
   gate_and_build:
     name: Gate on merged PR to main, extract build SHA
-    runs-on: ubuntu-latest
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - linux
+      - image_spyre_backend
     outputs:
       pytorch_sha: ${{ steps.extract.outputs.pytorch_sha }}
       should_build: ${{ steps.extract.outputs.should_build }}

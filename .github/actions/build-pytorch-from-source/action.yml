@@ -1,13 +1,9 @@
 name: Build PyTorch from source
 description: |
-  Installs PyTorch from a pre-cloned source tree, for the
-  repository_dispatch pipeline that builds torch-spyre against an exact
-  upstream PyTorch commit instead of the pinned CPU wheel.
+  Installs PyTorch from a pre-cloned source tree following torch-spyre-docs.
 
   Assumes `pytorch_dir` is a sibling of `torch_spyre_dir`, and installs into
-  torch-spyre's own venv (`torch_spyre_dir/.venv`) rather than a separate
-  shared one, so the subsequent build-torch-spyre-local-pytorch step picks
-  up the same environment.
+  torch-spyre's own venv (`torch_spyre_dir/.venv`) rather than a separate one.
 
 inputs:
   torch_spyre_dir:
