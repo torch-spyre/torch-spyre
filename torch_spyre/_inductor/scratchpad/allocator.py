@@ -247,7 +247,7 @@ class ScratchpadAllocator:
         the scratchpad and resolve from HBM instead.
         """
         if isinstance(op, ComputedBuffer):
-            writes = op.get_read_writes().writes
+            writes = op_read_writes(op).writes
             if any(isinstance(dep, MemoryDep) and dep.is_indirect() for dep in writes):
                 return True
         for u in uses:
@@ -257,7 +257,7 @@ class ScratchpadAllocator:
             index_names, _, _ = indirect_info_from_op(consumer)
             if name in index_names:
                 return True
-            reads = consumer.get_read_writes().reads
+            reads = op_read_writes(consumer).reads
             if any(
                 dep.name == name and isinstance(dep, MemoryDep) and dep.is_indirect()
                 for dep in reads
