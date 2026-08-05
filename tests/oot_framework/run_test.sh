@@ -705,13 +705,81 @@ def analyze(path):
     # can gate them via the YAML config, AND need cleanup so the raw star-imported
     # instance is not collected by pytest as a plain TestCase.
     class_level_parametrized_mixed = set()
+    # is_upstream/is_oot for THIS file, computed once up front (reused below).
+    import os as _os
+    _torch_root = _os.environ.get("TORCH_ROOT", "")
+    _torch_device_root = _os.environ.get("TORCH_DEVICE_ROOT", "")
+    _is_upstream_file = bool(
+        _torch_root
+        and _os.path.abspath(path).startswith(_os.path.abspath(_torch_root))
+    )
+    _is_oot_file = bool(
+        _torch_device_root
+        and _os.path.abspath(path).startswith(_os.path.abspath(_torch_device_root))
+    )
+    _apply_transitive_closure = _is_upstream_file and not _is_oot_file
+
+    # Transitive closure: a class counts as a TestCase subclass if any of its
+    # bases (directly or transitively, through locally-defined intermediate
+    # classes) is TestCase-like. This catches chains like
+    # `class FooBase(TestCase)` -> `class Foo(FooBase)` regardless of naming,
+    # e.g. TestPatternMatcher(TestPatternMatcherBase) in
+    # test_mkldnn_pattern_matcher.py, whose base name does not literally end
+    # in "TestBase" and was previously invisible to this scan entirely
+    # (see issue #3188).
+    #
+    # Scoped to upstream-only files: OOT-native files under TORCH_DEVICE_ROOT
+    # commonly use non-"TestCase"/"TestBase"-named helper base classes on
+    # purpose for classes that already hand-roll direct Spyre-device testing
+    # without any instantiate_device_type_tests() dispatch (e.g.
+    # BaseTestScratchpadUsage in test_scratchpad_use.py). Making those newly
+    # "visible" here sweeps them into needs_injection/uncontrolled below, and
+    # instantiate_device_type_tests() rebuilding them via multiple inheritance
+    # silently changes their setUp()/MRO — verified this regressed
+    # test_scratchpad_use.py from 109 passed (main) to 39 failed when the
+    # transitive check was applied unconditionally. So for non-upstream files
+    # we keep the original direct-only check.
+    _local_bases = {}
+    if _apply_transitive_closure:
+        for _n in ast.iter_child_nodes(tree):
+            if isinstance(_n, ast.ClassDef):
+                _names = []
+                for _b in _n.bases:
+                    if isinstance(_b, ast.Name):        _names.append(_b.id)
+                    elif isinstance(_b, ast.Attribute): _names.append(_b.attr)
+                _local_bases[_n.name] = _names
+
+    def _is_testcase_like(name, _seen=None):
+        if "TestCase" in name or name.endswith("TestBase"):
+            return True
+        if not _apply_transitive_closure:
+            return False
+        _seen = _seen or set()
+        if name in _seen:
+            return False
+        _seen.add(name)
+        return any(_is_testcase_like(_b, _seen) for _b in _local_bases.get(name, []))
+
+    # Classes whose TestCase-ness is established ONLY via the transitive
+    # closure above (their immediate base name does not itself contain
+    # "TestCase" / end in "TestBase") — e.g. TestPatternMatcher, whose direct
+    # base "TestPatternMatcherBase" does not match the direct check. These are
+    # newly-visible classes (see issue #3188) and are treated more carefully
+    # below when classifying standalone instantiate_parametrized_tests() calls,
+    # since long-established directly-visible classes (e.g. TestConvolutionNN
+    # in test_convolution.py, based directly on NNTestCase) must keep their
+    # existing classification to avoid changing behavior for unrelated suites.
+    transitive_only_classes = set()
+
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.ClassDef):
             for base in node.bases:
                 base_name = ""
                 if isinstance(base, ast.Name):        base_name = base.id
                 elif isinstance(base, ast.Attribute): base_name = base.attr
-                if "TestCase" in base_name or base_name.endswith("TestBase"):
+                if _is_testcase_like(base_name):
+                    if not ("TestCase" in base_name or base_name.endswith("TestBase")):
+                        transitive_only_classes.add(node.name)
                     has_device, all_parametrized, _ = class_methods_info(node, parametrize_names)
                     all_classes[node.name] = has_device
                     # Check for @instantiate_parametrized_tests as a class decorator.
@@ -787,7 +855,33 @@ def analyze(path):
             elif fname == "instantiate_parametrized_tests" and node.args:
                 arg = node.args[0]
                 if isinstance(arg, ast.Name):
-                    parametrized_instantiated.add(arg.id)
+                    cls_name = arg.id
+                    # Standalone-call form only expands @parametrize methods; it
+                    # says nothing about per-device dispatch. Treating it alone as
+                    # "fully handled" leaves upstream classes that are NEVER also
+                    # passed to instantiate_device_type_tests() completely
+                    # unwrapped, so TorchTestBase never sees them and YAML
+                    # mode:skip/xfail entries are silently ignored (see issue
+                    # #3188: TestPatternMatcher in test_mkldnn_pattern_matcher.py
+                    # hardcodes device="cpu" and is only ever passed to
+                    # instantiate_parametrized_tests()).
+                    #
+                    # Scope this correction to transitive_only_classes: classes
+                    # that are only newly visible to this analyzer via the
+                    # transitive-closure TestCase check above (itself already
+                    # scoped to upstream-only files via _apply_transitive_closure).
+                    # Long-established directly-visible classes using this same
+                    # standalone-call pattern (e.g. TestConvolutionNN in
+                    # test_convolution.py, TestLRScheduler in
+                    # test_lrscheduler.py) keep their prior "fully handled"
+                    # classification unchanged, since other YAML suites already
+                    # depend on that behavior and default to unlisted_test_mode:
+                    # skip — reclassifying them here would silently drop
+                    # coverage for tests not explicitly listed in those
+                    # unrelated configs.
+                    if cls_name in transitive_only_classes:
+                        continue  # leave out of parametrized_instantiated -> uncontrolled
+                    parametrized_instantiated.add(cls_name)
     # A class that appears in BOTH open and restricted sets (e.g. the file
     # calls instantiate_device_type_tests twice for the same class, once with
     # only_for and once without) is treated as open: the open call already
@@ -1020,6 +1114,15 @@ _restore_staticmethods(_cls_${cls}, globals())
 # left in globals() by the star-import.
 if '${cls}' in globals():
     del globals()['${cls}']
+"
+    done
+    # injection_block also binds _cls_${cls} as its own module-level global for
+    # every class in NEEDS_INJECTION_CLASSES. It is still the raw TestCase, so
+    # pytest's unittest plugin collects it too unless it is deleted here.
+    for cls in "${NEEDS_INJECTION_CLASSES[@]}"; do
+        cleanup_block+="
+if '_cls_${cls}' in globals():
+    del globals()['_cls_${cls}']
 "
     done
 
@@ -2431,10 +2534,12 @@ for i in "${!RUN_FILES[@]}"; do
             fi
         done
 
+        # `|| _probe_exit=$?` is required: exit 5 (nothing collected) is the
+        # expected signal here, and under `set -e` a bare subshell would abort
+        # the whole run before the exit code could be inspected.
         _probe_exit=0
         (cd "$run_dir" && python3 -m pytest "$run_basename" \
-            "${_PROBE_ARGS[@]}" --collect-only -q 2>/dev/null)
-        _probe_exit=$?
+            "${_PROBE_ARGS[@]}" --collect-only -q 2>/dev/null) || _probe_exit=$?
 
         if [[ $_probe_exit -eq 5 ]]; then
             # 0 tests match this marker in this file — strip -m from args.

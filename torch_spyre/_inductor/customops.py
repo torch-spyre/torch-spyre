@@ -244,15 +244,39 @@ def _(input: torch.Tensor):
 def copy_from_d2d(
     src: torch.Tensor,
     dst: torch.Tensor,
+    src_off: int,
+    dst_off: int,
     compiled,
 ) -> None:
-    return compiled(src, dst)
+    # src_off/dst_off are the src/dst storage_offsets, passed as explicit ints
+    # because a sliced tensor's offset is invisible to the compiled kernel
+    # otherwise: a graph input's storage_offset is dropped by Inductor (its
+    # FixedLayout.offset is 0 and SpyreTensorLayout has no offset field), so the
+    # kernel binds the storage BASE pointer and reads from element 0. The
+    # lowering (lower_spyre_from_d2d) consumes these ints to re-introduce the
+    # offsets in-graph via a ReinterpretView, putting them into the coordinate
+    # that superdsc bakes into the SDSC binary.
+    #
+    # specialize_int=True is required on top of that: dynamo's TENSOR_MATCH
+    # guard keys on dtype/device/size/stride but NOT storage_offset, and its
+    # default auto-dynamic promotes the offset int to a symbol after the second
+    # distinct value — a symbolic offset cannot be baked as a constant into the
+    # coordinate. specialize_int installs int-equality guards so each distinct
+    # offset triggers a fresh trace and a fresh SDSC binary with the offset
+    # baked as a constant. This mirrors the spyre.overwrite fix above (PR
+    # #2084). Patch is call-scoped to leave process-wide dynamo behavior alone.
+    # Note: one compiled binary per unique (input shape, offsets) tuple;
+    # dynamo's cache_size_limit is bumped to 1024 in torch_spyre/__init__.py.
+    with torch._dynamo.config.patch(specialize_int=True):
+        return compiled(src, dst, src_off, dst_off)
 
 
 @copy_from_d2d.register_fake
 def _(
     src: torch.Tensor,
     dst: torch.Tensor,
+    src_off: int,
+    dst_off: int,
 ) -> None:
     pass
 
@@ -390,13 +414,14 @@ def max_dim_int64_fallback(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     CPU fallback for torch.max(input, dim) when input is int64.
-    This custom op will be registered with a CPU fallback in fallbacks.py.
-    Returns a tuple (values, indices) as expected by torch.max.
+
+    The Spyre device kernel (registered in fallbacks.py via
+    register_kernel(op, ["spyre"])) handles spyre-tensor inputs. PT 2.12
+    routes calls with non-spyre tensor inputs (e.g. compare_with_cpu test
+    paths) to this CompositeExplicitAutograd body, so it must compute the
+    real result rather than raise.
     """
-    # This should never be called directly; the fallback in fallbacks.py handles it
-    raise RuntimeError(
-        "spyre::max_dim_int64_fallback should be handled by CPU fallback registration"
-    )
+    return torch.max(input, dim=dim, keepdim=keepdim)
 
 
 @max_dim_int64_fallback.register_fake
@@ -509,13 +534,11 @@ def min_dim_int64_fallback(
     input: torch.Tensor, dim: int, keepdim: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    CPU fallback for torch.min(input, dim) when input is int64.
-    This custom op will be registered with a CPU fallback in fallbacks.py.
-    Returns a tuple (values, indices) as expected by torch.min.
+    CPU fallback for torch.min(input, dim) when input is int64. See
+    max_dim_int64_fallback for the rationale on the body computing the
+    real result instead of raising.
     """
-    raise RuntimeError(
-        "spyre::min_dim_int64_fallback should be handled by CPU fallback registration"
-    )
+    return torch.min(input, dim=dim, keepdim=keepdim)
 
 
 @min_dim_int64_fallback.register_fake

@@ -659,18 +659,18 @@ class _OOTPrecisionOverridePatcher:
                 # tolerance_overrides takes precedence over precision_overrides
                 # in upstream instantiate_test.
                 if not hasattr(self._underlying_fn, "tolerance_overrides"):
-                    self._underlying_fn.tolerance_overrides = {}
-                self._underlying_fn.tolerance_overrides[dtype] = _tol(
+                    setattr(self._underlying_fn, "tolerance_overrides", {})
+                getattr(self._underlying_fn, "tolerance_overrides")[dtype] = _tol(
                     atol=atol if atol is not None else 0.0,
                     rtol=rtol,
                 )
             elif atol is not None:
                 # atol only - use precision_overrides (simpler, matches @precisionOverride)
                 if not hasattr(self._underlying_fn, "precision_overrides"):
-                    self._underlying_fn.precision_overrides = {}
+                    setattr(self._underlying_fn, "precision_overrides", {})
                 # setdefault for global, direct assign for include (already merged above
                 # so just assign - include already won priority during merge)
-                self._underlying_fn.precision_overrides[dtype] = atol
+                getattr(self._underlying_fn, "precision_overrides")[dtype] = atol
 
 
 class _OOTPlatformMarkerPatcher:
@@ -704,8 +704,10 @@ class _OOTPlatformMarkerPatcher:
         # Attach to pytestmark list so @wraps-based propagation carries it
         # through every decorator layer that instantiate_test applies later.
         if not hasattr(self._underlying_fn, "pytestmark"):
-            self._underlying_fn.pytestmark = []
-        self._underlying_fn.pytestmark = list(self._underlying_fn.pytestmark) + [mark]
+            self._underlying_fn.pytestmark = []  # type: ignore[union-attr]
+        self._underlying_fn.pytestmark = (  # type: ignore[union-attr]
+            list(self._underlying_fn.pytestmark) + [mark]  # type: ignore[union-attr]
+        )
 
 
 class _OOTOpMarkerPatcher:
@@ -735,7 +737,7 @@ class _OOTOpMarkerPatcher:
 
         import pytest
 
-        original_parametrize_fn = self._underlying_fn.parametrize_fn
+        original_parametrize_fn = getattr(self._underlying_fn, "parametrize_fn")
 
         def patched_parametrize_fn(test, generic_cls, device_cls):
             for (
@@ -768,7 +770,7 @@ class _OOTOpMarkerPatcher:
                 yield test_wrapper, test_name, param_kwargs, decorator_fn
 
         # Replacing on the function object itself because this is what the upstream reads.
-        self._underlying_fn.parametrize_fn = patched_parametrize_fn
+        setattr(self._underlying_fn, "parametrize_fn", patched_parametrize_fn)
 
 
 class _OOTModuleMarkerPatcher:
@@ -802,7 +804,7 @@ class _OOTModuleMarkerPatcher:
 
         import pytest
 
-        original_parametrize_fn = self._underlying_fn.parametrize_fn
+        original_parametrize_fn = getattr(self._underlying_fn, "parametrize_fn")
 
         def patched_parametrize_fn(test, generic_cls, device_cls):
             for (
@@ -839,7 +841,7 @@ class _OOTModuleMarkerPatcher:
 
                 yield test_wrapper, test_name, param_kwargs, decorator_fn
 
-        self._underlying_fn.parametrize_fn = patched_parametrize_fn
+        setattr(self._underlying_fn, "parametrize_fn", patched_parametrize_fn)
         # Also set directly on the test object in case getattr(test, ...)
         # resolves differently from getattr(test.__func__, ...)
         try:

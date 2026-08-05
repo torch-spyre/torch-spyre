@@ -11,12 +11,17 @@ __all__: list[str] = [
     "DataFormats",
     "JobPlan",
     "ElementArrangement",
+    "SpyreStreamError",
+    "SpyreDeviceState",
     "SpyreTensorLayout",
     "_SpyreStreamBase",
     "current_stream",
     "default_stream",
+    "get_device_state",
     "get_stream_from_pool",
     "set_current_stream",
+    "stream_get_error",
+    "stream_get_error_string",
     "synchronize",
     "as_strided_with_layout",
     "empty_with_layout",
@@ -378,5 +383,42 @@ def spyre_empty_with_layout(
     arg2: torch.dtype,
     arg3: SpyreTensorLayout,
 ) -> torch.Tensor: ...
+
+class SpyreStreamError:
+    Success: typing.ClassVar[SpyreStreamError]  # value = <SpyreStreamError.Success: 0>
+    Shutdown: typing.ClassVar[
+        SpyreStreamError
+    ]  # value = <SpyreStreamError.Shutdown: 1>
+    __members__: typing.ClassVar[dict[str, SpyreStreamError]]
+    def __eq__(self, other: typing.Any) -> bool: ...
+    def __hash__(self) -> int: ...
+    def __int__(self) -> int: ...
+    def __repr__(self) -> str: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> int: ...
+
+class SpyreDeviceState:
+    Ok: typing.ClassVar[SpyreDeviceState]  # value = <SpyreDeviceState.Ok: 0>
+    NotInitialized: typing.ClassVar[
+        SpyreDeviceState
+    ]  # value = <SpyreDeviceState.NotInitialized: 1>
+    StreamError: typing.ClassVar[
+        SpyreDeviceState
+    ]  # value = <SpyreDeviceState.StreamError: 2>
+    __members__: typing.ClassVar[dict[str, SpyreDeviceState]]
+    def __eq__(self, other: typing.Any) -> bool: ...
+    def __hash__(self) -> int: ...
+    def __int__(self) -> int: ...
+    def __repr__(self) -> str: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> int: ...
+
+def stream_get_error(stream: _SpyreStreamBase) -> SpyreStreamError: ...
+def stream_get_error_string(error: SpyreStreamError) -> str: ...
+def get_device_state() -> SpyreDeviceState: ...
 def start_runtime() -> None: ...
 def to_with_layout(arg0: torch.Tensor, arg1: SpyreTensorLayout) -> torch.Tensor: ...

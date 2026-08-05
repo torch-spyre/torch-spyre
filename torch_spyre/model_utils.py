@@ -142,6 +142,73 @@ def _dma_to_spyre_dim_order_swapped(
 # --- Model loading ---------------------------------------------------
 
 
+def _module_overrides_apply(module: nn.Module) -> bool:
+    """True if ``module`` customizes ``_apply`` and should govern its own subtree."""
+    apply = module._apply
+    return getattr(apply, "__func__", apply) is not nn.Module._apply
+
+
+def _transfer_module(
+    module: nn.Module,
+    dtype: torch.dtype | None,
+    counts: dict[str, int],
+    prefix: str = "",
+) -> None:
+    """Recursively move ``module``'s params/buffers to Spyre, honoring ``_apply``.
+
+    Mirrors ``nn.Module._apply``'s virtual recursion: a submodule that overrides
+    ``_apply`` is delegated to and pruned from the walk. Normal modules get the
+    optimal ``dim_order=[1, 0]`` layout for 2D ``nn.Linear`` weights and the
+    default layout for everything else. Tensors already on Spyre are skipped
+    (idempotent). ``counts`` accumulates transferred-tensor tallies for logging;
+    ``prefix`` is the module's dotted path (as in ``named_modules``) for logs.
+    """
+    if _module_overrides_apply(module):
+        module._apply(
+            lambda t: _dma_to_spyre_default(t, target_dtype=dtype)
+            if t is not None and t.device.type != DEVICE_NAME
+            else t
+        )
+        return
+
+    for child_name, child in module.named_children():
+        child_prefix = f"{prefix}.{child_name}" if prefix else child_name
+        _transfer_module(child, dtype, counts, child_prefix)
+
+    is_linear = isinstance(module, nn.Linear)
+    for name, param in list(module._parameters.items()):
+        if param is None or param.device.type == DEVICE_NAME:
+            continue
+        p = param.data
+        # 2D Linear weight -> optimal stickified layout; everything else
+        # (bias, embeddings, norms, ...) -> default layout.
+        if is_linear and name == "weight" and p.ndim == 2:
+            logger.debug(
+                "  %s.%s: shape=%s -> Spyre dim_order=[1, 0]",
+                prefix,
+                name,
+                list(p.shape),
+            )
+            dev = _dma_to_spyre_dim_order_swapped(p, target_dtype=dtype)
+            counts["linear"] += 1
+        else:
+            logger.debug(
+                "  %s.%s: shape=%s -> Spyre default layout",
+                prefix,
+                name,
+                list(p.shape),
+            )
+            dev = _dma_to_spyre_default(p, target_dtype=dtype)
+            counts["other"] += 1
+        module._parameters[name] = nn.Parameter(dev, requires_grad=param.requires_grad)
+
+    for name, buf in list(module._buffers.items()):
+        if buf is None or buf.device.type == DEVICE_NAME:
+            continue
+        module._buffers[name] = _dma_to_spyre_default(buf, target_dtype=dtype)
+        counts["buffer"] += 1
+
+
 def load_model_to_spyre(
     model: nn.Module,
     dtype: torch.dtype | None = None,
@@ -155,6 +222,7 @@ def load_model_to_spyre(
 
     All other parameters and buffers use the default Spyre layout.
 
+    Submodules that override ``_apply`` are honored, matching ``nn.Module.to`` semantics.
     Idempotent: parameters already on Spyre are skipped.
     """
     if dtype is not None:
@@ -162,59 +230,15 @@ def load_model_to_spyre(
     # Ensure Spyre runtime is initialized before using _C functions
     _ensure_spyre_runtime()
 
-    linear_count = 0
-    other_param_count = 0
-    buffer_count = 0
-
-    for name, module in model.named_modules():
-        is_linear = isinstance(module, nn.Linear)
-
-        for param_name, param in list(module._parameters.items()):
-            if param is None:
-                continue
-            if param.device.type == DEVICE_NAME:
-                continue
-
-            p = param.data
-
-            # 2D Linear weight -> optimal stickified layout via dim_order.
-            # Everything else (bias, embeddings, norms, ...) -> default layout.
-            if is_linear and param_name == "weight" and p.ndim == 2:
-                logger.debug(
-                    "  %s.%s: shape=%s -> Spyre dim_order=[1, 0]",
-                    name,
-                    param_name,
-                    list(p.shape),
-                )
-                dev = _dma_to_spyre_dim_order_swapped(p, target_dtype=dtype)
-                linear_count += 1
-            else:
-                logger.debug(
-                    "  %s.%s: shape=%s -> Spyre default layout",
-                    name,
-                    param_name,
-                    list(p.shape),
-                )
-                dev = _dma_to_spyre_default(p, target_dtype=dtype)
-                other_param_count += 1
-
-            module._parameters[param_name] = nn.Parameter(
-                dev, requires_grad=param.requires_grad
-            )
-
-        for buf_name, buf in list(module._buffers.items()):
-            if buf is None or buf.device.type == DEVICE_NAME:
-                continue
-            module._buffers[buf_name] = _dma_to_spyre_default(buf, target_dtype=dtype)
-            buffer_count += 1
-
+    counts = {"linear": 0, "other": 0, "buffer": 0}
+    _transfer_module(model, dtype, counts)
     logger.info(
         "load_model_to_spyre: %d Linear weights optimized "
         "(dim_order=[1,0]), %d other params and %d buffers "
         "transferred with default layout",
-        linear_count,
-        other_param_count,
-        buffer_count,
+        counts["linear"],
+        counts["other"],
+        counts["buffer"],
     )
     return model
 

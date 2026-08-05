@@ -15,6 +15,7 @@
 # Owner(s): ["module: stream"]
 
 import torch
+import torch_spyre
 from torch.testing._internal.common_utils import run_tests, TestCase
 
 
@@ -196,6 +197,31 @@ class TestSpyreStream(TestCase):
         # Operations without explicit stream should use default stream
         a = torch.randn(5, 5, device="spyre")
         self.assertEqual(a.device.type, "spyre")
+
+    def test_host_compute_stream_round_robin(self):
+        """Host compute streams are handed out round-robin with no duplicates
+        within a cycle, whatever the configured count is."""
+        first = torch_spyre._C.host_compute_stream(self.device).id()
+        seen = [first]
+        # Walk one full cycle: keep pulling streams until we wrap back to the
+        # first one. Every stream seen before wrapping must be distinct.
+        while True:
+            sid = torch_spyre._C.host_compute_stream(self.device).id()
+            if sid == first:
+                break
+            self.assertNotIn(sid, seen)
+            seen.append(sid)
+
+    def test_host_compute_stream_synchronize(self):
+        """A host compute stream can be synchronized without errors."""
+        stream = torch_spyre._C.host_compute_stream(self.device)
+        stream.synchronize()
+
+    def test_host_compute_stream_by_id(self):
+        """host_compute_stream_by_id returns the stream with the requested ID."""
+        expected_id = torch_spyre._C.host_compute_stream(self.device).id()
+        stream = torch_spyre._C.host_compute_stream_by_id(expected_id, self.device)
+        self.assertEqual(stream.id(), expected_id)
 
     def test_stream_query_after_context(self):
         """Test querying stream after exiting context."""

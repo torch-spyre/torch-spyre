@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import heapq
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import Optional, Callable
 
@@ -21,16 +22,13 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     MemoryPlanSolver,
     _assert_in_place_relationships,
 )
+from torch_spyre._inductor.scratchpad.utils import round_up_to_alignment
 
 __all__ = [
     "FirstFitLayoutSolver",
     "BestFitLayoutSolver",
     "_assert_in_place_relationships",
 ]
-
-
-def round_up_to_alignment(arg: int, alignment: int) -> int:
-    return ((arg + alignment - 1) // alignment) * alignment
 
 
 @dataclass(frozen=True)
@@ -51,7 +49,12 @@ def _topological_sort(
 
     for i, child in enumerate(buffers):
         for parent_name in child.in_place_parents:
-            p = name_to_idx[parent_name]
+            # A parent barred from LX (or otherwise absent from the candidate
+            # set) imposes no ordering: there is no slot for the child to
+            # inherit, so it is placed on its own like any other buffer.
+            p = name_to_idx.get(parent_name)
+            if p is None:
+                continue
             children[p].append(i)
             in_degree[i] += 1
 
@@ -123,16 +126,19 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
         self,
         buffer: LifetimeBoundBuffer,
         placed: list[LifetimeBoundBuffer],
+        *,
+        reuse_in_place_parents: bool = True,
     ) -> list[Gap]:
         """Build free gaps for buffer, annotated with valid in-place parent addresses.
 
         Pass 1: subtract address intervals of all already-placed buffers that overlap
-        buffer's lifetime, except declared in-place parents (their slots are candidates
-        for reuse, not conflicts).
+        buffer's lifetime. During the in-place attempt, declared parents are kept as
+        reuse candidates rather than conflicts. During ordinary fallback placement,
+        they are conflicts like every other live buffer.
         Pass 2: for each remaining gap, record which declared parents fit entirely within it.
         """
         gaps: list[Gap] = [Gap(0, self.limit)]
-        parent_names = set(buffer.in_place_parents)
+        parent_names = set(buffer.in_place_parents) if reuse_in_place_parents else set()
 
         for other in placed:
             if other.address is None:
@@ -151,7 +157,10 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
         placed_by_name = {b.name: b for b in placed}
         for i, gap in enumerate(gaps):
             new_parents = list(gap.in_place_parents)
-            for parent_name in parent_names:
+            # Don't use the set for iteration: plan_layout reuses in_place_parents[0], so a
+            # hash-ordered append here would pick a different in-place parent (hence
+            # a different address) run-to-run under PYTHONHASHSEED.
+            for parent_name in buffer.in_place_parents:
                 parent = placed_by_name.get(parent_name)
                 if parent is None or parent.address is None:
                     continue
@@ -175,7 +184,7 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
         return None
 
     def plan_layout(
-        self, buffers: list[LifetimeBoundBuffer], log_lx_usage: bool = False
+        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
     ) -> list[LifetimeBoundBuffer]:
         if not buffers:
             return []
@@ -184,8 +193,11 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
         )
         _assert_in_place_relationships(buffers)
 
+        # Barred buffers keep address=None and are never candidates for a gap,
+        # nor obstacles in one (they occupy no LX).
+        placeable, _ = self.partition(buffers)
         buffers_filtered = [
-            buffer for buffer in buffers if buffer.end_time >= buffer.start_time + 1
+            buffer for buffer in placeable if buffer.end_time >= buffer.start_time + 1
         ]
         parent_names = {p for b in buffers_filtered for p in b.in_place_parents}
 
@@ -216,12 +228,21 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
                 buffer.address = names_to_addresses[parent]
                 names_to_addresses[buffer.name] = buffer.address
             else:
+                # Exact parent-slot reuse was not legal, usually because a third
+                # live buffer occupies part of that slot. Rebuild the ordinary
+                # gaps with the parent treated as a conflict; otherwise a shifted
+                # placement can partially overlap the still-live parent.
+                gaps = self._build_gaps(
+                    buffer,
+                    placed,
+                    reuse_in_place_parents=False,
+                )
                 gap = self._pick_gap(gaps, buffer.size)
                 if gap is not None:
                     buffer.address = round_up_to_alignment(gap.start, self.alignment)
                     names_to_addresses[buffer.name] = buffer.address
 
-        return buffers
+        return list(buffers)
 
 
 class BestFitLayoutSolver(FirstFitLayoutSolver):

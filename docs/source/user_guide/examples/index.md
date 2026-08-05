@@ -27,20 +27,32 @@ common Torch-Spyre use cases.
 | `distributed/broadcast.py` | Broadcast collective on Spyre |
 | `distributed/gather.py` | Gather collective on Spyre |
 | `distributed/reduce.py` | Reduce collective on Spyre |
+| `broadcast_demo_multirank.py` | Multi-rank broadcast walkthrough with pre- and post-broadcast computation |
+
+## Scratchpad Planning Examples
+
+These scripts model the LX scratchpad layout solver in isolation and plot the
+resulting buffer layouts. They require `matplotlib` and `numpy`.
+
+| Script | Description |
+|--------|-------------|
+| `scratchpad/toy_layout.py` | Plot the layout for a fixed ordering of four buffers, with no annealing |
+| `scratchpad/random_buffers.py` | Compare first-fit against simulated-annealing quality on a set of random buffers |
+| `scratchpad/inplace_annealing.py` | Convergence study on an 18-buffer workload with in-place reuse |
 
 ## Provenance Audit
 
 A multi-stage audit that traces a model through the compilation pipeline and
 records, at each stage, which source-to-kernel provenance fields are carried or
 dropped ([issue #2574](https://github.com/torch-spyre/torch-spyre/issues/2574)).
+The **README** explains how to run the audit; the **example** is one generated
+artifact from auditing `SimpleMLP`.
 
 ```{toctree}
 :maxdepth: 1
-:caption: Provenance Audit
 
 provenance/README
 provenance/provenance_audit
-provenance/provenance_analysis
 ```
 
 ## Running an Example

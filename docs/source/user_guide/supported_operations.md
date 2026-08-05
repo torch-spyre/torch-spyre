@@ -18,11 +18,12 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch._scaled_mm` | | Y | Spyre | Compiled only; lowering in `_inductor/lowering.py` |
 | `torch.nn.functional.linear` | Y | Y | Spyre | Decomposed to `matmul` + `add` |
 | `torch.nn.functional.conv2d` | Y | Y | Spyre | Custom decomposition (`conv2d_via_bmm`); CPU fallback for the im2col step |
+| `torch.nn.functional.avg_pool2d` | | Y | Spyre | Compiled only; custom lowering |
 | **Activation Functions** | | | | |
 | `torch.nn.functional.softmax` | Y | Y | Spyre | |
 | `torch.nn.functional.layer_norm` | Y | Y | Spyre | Custom decomposition |
 | `torch.nn.functional.rms_norm` | Y | Y | Spyre | Custom decomposition |
-| `torch.nn.functional.gelu` | | Y | Spyre | Custom op + lowering |
+| `torch.nn.functional.gelu` | | Y | Spyre | Compiled only; the `spyre::gelu` custom op has no eager implementation |
 | `torch.nn.functional.silu` | Y | Y | Spyre | |
 | `torch.nn.functional.relu` | Y | Y | Spyre | |
 | `torch.nn.functional.sigmoid` | Y | Y | Spyre | |
@@ -54,7 +55,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.maximum` | Y | Y | Spyre | |
 | `torch.minimum` | Y | Y | Spyre | |
 | `torch.bitwise_and` | Y | Y | Spyre | Custom decomposition |
-| `torch.where` | Y | Y | Spyre | `where.self` registered eagerly; `where.Scalar*` overloads via custom decomposition |
+| `torch.where` | Y | Y | Spyre | `where.self` registered eagerly; `where.Scalar*` overloads via custom decomposition; `where.default` (condition-only form) falls back to CPU |
 | **Comparison** | | | | |
 | `torch.eq` | Y | Y | Spyre | |
 | `torch.ne` | Y | Y | Spyre | |
@@ -67,17 +68,17 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.mean` | Y | Y | Spyre | |
 | `torch.amax` | Y | Y | Spyre | |
 | `torch.amin` | | Y | Spyre | Custom decomposition |
-| `torch.aminmax` | | Y | Spyre | Decomposes to `amax` + `amin` |
 | `torch.prod` | | Y | Spyre | Requires `dim` argument; custom decomposition + lowering |
-| `torch.max` | Y | Y | Spyre | `max.dim` via custom decomposition |
-| `torch.min` | Y | Y | Spyre | `min.dim` via custom decomposition (fp16) |
+| `torch.max` | Y | Y | Spyre | `max.dim` via custom decomposition; int64 falls back to CPU |
+| `torch.min` | Y | Y | Spyre | `min.dim` via custom decomposition (fp16 eager); int64 falls back to CPU |
 | `torch.topk` | | Y | Spyre | Custom decomposition + custom ops (`spyre::topkvalue`, `spyre::topkindex`) |
-| `torch.linalg.vector_norm` | Y | Y | Spyre | |
-| `torch.linalg.norm` | | Y | Spyre | Compiled only |
-| `torch.linalg.matrix_norm` | | Y | Spyre | Compiled only |
+| `torch.linalg.vector_norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
+| `torch.linalg.matrix_norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
+| `torch.linalg.norm` | | Y | Spyre | Compiled only; eager misroutes the `ord` argument |
+| `torch.aminmax` | | Y | Spyre | Compiled only; eager not yet supported |
 | **View Ops** [^views] | | | | |
 | `torch.reshape` / `torch.view` | | Y | Spyre | Includes `_reshape_alias` (a C++ device view, not an Inductor lowering) |
-| `torch.transpose` | | Y | Spyre | |
+| `torch.transpose` | Y | Y | Spyre | |
 | `torch.t` | Y | Y | Spyre | View op |
 | `torch.permute` | Y | Y | Spyre | |
 | `torch.clone` | | Y | Spyre | Compiled-tested as `clone().contiguous()`; standalone `clone` is also lowered and used by many decompositions |
@@ -103,13 +104,16 @@ see [Adding Operations](../compiler/adding_operations.md).
 | **In-place / Initialization** | | | | |
 | `torch.Tensor.fill_` | | Y | Spyre | Compiled only; eager kernel registered but not yet stable |
 | `torch.Tensor.normal_` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
-| `torch.Tensor.uniform_` | Y | | Spyre | Eager only |
+| `torch.Tensor.uniform_` | Y | | CPU fallback | Eager only; random values generated on CPU, copied back |
 | `torch.Tensor.random_` | Y | | CPU fallback | Eager only; `from` overload |
 | `torch.is_nonzero` | | Y | Spyre | Compiled only |
+| **Indexing** | | | | |
+| `torch.embedding` | Y | Y | Spyre | Registered on the compiled path (`ops/eager.py`) |
+| `torch.index_select` | Y | Y | Spyre | Registered on the compiled path (`ops/eager.py`) |
 | **Utility** | | | | |
 | `torch.item` | Y | Y | Spyre | Copies to CPU, returns Python scalar |
+| `torch.Tensor.to` (dtype cast) | | Y | Spyre | Compiled only; eager dtype casts not yet supported |
 | **CPU Fallback** | | | | |
-| `torch.embedding` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.arange` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.sin` | Y | Y | CPU fallback | Runs on CPU, result transferred back |
 | `torch.cos` | Y | Y | CPU fallback | Runs on CPU, result transferred back |

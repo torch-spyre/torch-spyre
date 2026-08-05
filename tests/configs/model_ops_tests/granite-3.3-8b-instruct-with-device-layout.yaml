@@ -1,0 +1,2794 @@
+test_suite_config:
+  global:
+    supported_dtypes:
+      - name: float16
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: float32
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: float64
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: bfloat16
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: int8
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: int16
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: int32
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: int64
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: uint8
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: uint16
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: uint32
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: uint64
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: complex32
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: complex64
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: complex128
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: bool
+        precision:
+          atol: 0.005
+          rtol: 0.005
+      - name: half
+        precision:
+          atol: 0.005
+          rtol: 0.005
+    input_config:
+      seed: 123
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/models/test_model_ops_v2.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestSpyreModelOps::test_model_ops_db
+          mode: xfail
+          tags:
+            - model__granite-3.3-8b-instruct
+          edits:
+            ops:
+              include:
+                - name: torch.nn.functional.embedding
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41]
+                          stride: [41, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2147483647
+                      - tensor:
+                          shape: [49159, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 0
+                      - value: null
+                      - value: 2.0
+                      - value: false
+                      - value: false
+                  description: 'Operation: torch.nn.functional.embedding, Node: inputs_embeds'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.nn.functional.embedding.1
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 12.0
+                  description: 'Operation: torch.mul, Node: inputs_embeds_1'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.mul.1
+                - name: torch.arange
+                  sample_inputs_func:
+                    args:
+                      - value: 1
+                  description: 'Operation: torch.arange, Node: batch_arange'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.arange.1
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [41]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2147483647
+                      - value: 0
+                  description: 'Operation: torch.add, Node: q_arange'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.add.1
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [41]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2147483647
+                  description: 'Operation: torch.getitem, Node: q_indices'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.getitem.1
+                - name: torch.le
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1, 41]
+                          stride: [41, 41, 41, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2147483647
+                      - tensor:
+                          shape: [1, 1, 41, 1]
+                          stride: [41, 41, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2147483647
+                  description: 'Operation: torch.le, Node: attention_mask'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.le.1
+                - name: torch.Tensor.expand
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 41, 41]
+                          stride: [1681, 1681, 41, 1]
+                          storage_offset: 0
+                          dtype: torch.bool
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2
+                      - value: 1
+                      - value: -1
+                      - value: 41
+                      - value: 41
+                  description: 'Operation: torch.Tensor.expand, Node: attention_mask_1'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.expand.1
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [64]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.getitem, Node: getitem_4'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.getitem.2
+                - name: torch.Tensor.float
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1]
+                          stride: [64, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.Tensor.float, Node: float_1'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.float.1
+                - name: torch.Tensor.expand
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1]
+                          stride: [64, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: -1
+                      - value: 1
+                  description: 'Operation: torch.Tensor.expand, Node: expand_1'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.expand.2
+                - name: torch.Tensor.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1]
+                          stride: [64, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.Tensor.to, Node: inv_freq_expanded'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.to.1
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41]
+                          stride: [41, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2147483647
+                  description: 'Operation: torch.getitem, Node: getitem_5'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.getitem.3
+                - name: torch.Tensor.float
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 41]
+                          stride: [41, 41, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2147483647
+                          device_layout:
+                            device_size: [2, 1, 32]
+                            stride_map: [32, -1, 1]
+                            device_dtype: torch.int32
+                  description: 'Operation: torch.Tensor.float, Node: position_ids_expanded'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.float.2_spyre
+                - name: torch.Tensor.float
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 41]
+                          stride: [41, 41, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.Tensor.float, Node: float_4'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.float.3
+                - name: torch.matmul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1]
+                          stride: [64, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 41]
+                          stride: [41, 41, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.matmul, Node: matmul'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.matmul.1_spyre
+                - name: torch.Tensor.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 41]
+                          stride: [2624, 41, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'Operation: torch.Tensor.transpose, Node: freqs'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.transpose.1
+                - name: torch.cat
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 41, 64]
+                            stride: [2624, 1, 41]
+                            storage_offset: 0
+                            dtype: torch.float32
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 41, 64]
+                            stride: [2624, 1, 41]
+                            storage_offset: 0
+                            dtype: torch.float32
+                            device: cuda:0
+                            init: rand
+                  description: 'Operation: torch.cat, Node: emb'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.cat.1
+                - name: torch.Tensor.cos
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 128]
+                          stride: [5248, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.Tensor.cos, Node: cos'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.cos.1
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 128]
+                          stride: [5248, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0
+                  description: 'Operation: torch.mul, Node: cos_1'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.mul.2
+                - name: torch.Tensor.sin
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 128]
+                          stride: [5248, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.Tensor.sin, Node: sin'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.sin.1
+                - name: torch.Tensor.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 128]
+                          stride: [5248, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.Tensor.to, Node: cos_2'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.to.2
+                - name: torch._C._log_api_usage_once
+                  sample_inputs_func:
+                    args:
+                      - value: python.nn_module
+                  description: 'Operation: torch._C._log_api_usage_once, Node: _log_api_usage_once'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch._C._log_api_usage_once.1
+                - name: torch.Tensor.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.Tensor.to, Node: hidden_states'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.to.3_spyre
+                - name: torch.Tensor.pow
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                  description: 'Operation: torch.Tensor.pow, Node: pow_1'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.pow.1
+                - name: torch.Tensor.mean
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: -1
+                  description: 'Operation: torch.Tensor.mean, Node: variance'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.mean.1
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 1]
+                          stride: [41, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0e-05
+                  description: 'Operation: torch.add, Node: add_2'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.add.2_spyre
+                - name: torch.rsqrt
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 1]
+                          stride: [41, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.rsqrt, Node: rsqrt'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.rsqrt.1
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 41, 1]
+                          stride: [41, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.mul, Node: hidden_states_1'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.mul.3
+                - name: torch.Tensor.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.Tensor.to, Node: to_4'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.to.4
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4096]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.mul, Node: hidden_states_2'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.mul.4
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4096, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'Operation: torch.nn.functional.linear, Node: linear'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.linear.1
+                - name: torch.Tensor.view
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: '[1, 41, -1, 128]'
+                  description: 'Operation: torch.Tensor.view, Node: view'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.view.1
+                - name: torch.Tensor.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 32, 128]
+                          stride: [167936, 4096, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'Operation: torch.Tensor.transpose, Node: query_states'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.transpose.2
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1024, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'Operation: torch.nn.functional.linear, Node: linear_1'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.linear.2_spyre
+                - name: torch.Tensor.view
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 1024]
+                          stride: [41984, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: '[1, 41, -1, 128]'
+                  description: 'Operation: torch.Tensor.view, Node: view_1'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.view.2
+                - name: torch.Tensor.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 8, 128]
+                          stride: [41984, 1024, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'Operation: torch.Tensor.transpose, Node: key_states'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.transpose.3
+                - name: torch.Tensor.unsqueeze
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 128]
+                          stride: [5248, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                  description: 'Operation: torch.Tensor.unsqueeze, Node: cos_3'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.unsqueeze.1
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 41, 128]
+                          stride: [167936, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 41, 128]
+                          stride: [5248, 5248, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.mul, Node: mul_5'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.mul.5
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 41, 128]
+                          stride: [167936, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.getitem, Node: x1'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.getitem.4
+                - name: torch.neg
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 41, 64]
+                          stride: [167936, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.neg, Node: neg'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.neg.1
+                - name: torch.cat
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 32, 41, 64]
+                            stride: [83968, 64, 2048, 1]
+                            storage_offset: 0
+                            dtype: torch.bfloat16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 32, 41, 64]
+                            stride: [167936, 128, 4096, 1]
+                            storage_offset: 0
+                            dtype: torch.bfloat16
+                            device: cuda:0
+                            init: rand
+                  description: 'Operation: torch.cat, Node: cat_1'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.cat.2_spyre
+                  kwargs:
+                    dim: -1
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 41, 128]
+                          stride: [167936, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 41, 128]
+                          stride: [167936, 5248, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.add, Node: q_embed'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.add.3
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 41, 128]
+                          stride: [41984, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 41, 128]
+                          stride: [5248, 5248, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.mul, Node: mul_7'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.mul.6
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 41, 128]
+                          stride: [41984, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.getitem, Node: x1_1'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.getitem.5
+                - name: torch.neg
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 41, 64]
+                          stride: [41984, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.neg, Node: neg_1'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.neg.2
+                - name: torch.cat
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 8, 41, 64]
+                            stride: [20992, 64, 512, 1]
+                            storage_offset: 0
+                            dtype: torch.bfloat16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 8, 41, 64]
+                            stride: [41984, 128, 1024, 1]
+                            storage_offset: 0
+                            dtype: torch.bfloat16
+                            device: cuda:0
+                            init: rand
+                  description: 'Operation: torch.cat, Node: cat_2'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.cat.3_spyre
+                  kwargs:
+                    dim: -1
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 41, 128]
+                          stride: [41984, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 8, 41, 128]
+                          stride: [41984, 5248, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.add, Node: k_embed'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.add.4_spyre
+                - name: torch.tensor
+                  description: 'Operation: torch.tensor, Node: tensor'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.tensor.1
+                - name: torch.cat
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [0]
+                            stride: [1]
+                            storage_offset: 0
+                            dtype: torch.bfloat16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 8, 41, 128]
+                            stride: [41984, 128, 1024, 1]
+                            storage_offset: 0
+                            dtype: torch.bfloat16
+                            device: cuda:0
+                            init: rand
+                  description: 'Operation: torch.cat, Node: keys'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.cat.4
+                - name: torch.Tensor.expand
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 41, 128]
+                          stride: [41984, 5248, 5248, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 8
+                      - value: 4
+                      - value: 41
+                      - value: 128
+                  description: 'Operation: torch.Tensor.expand, Node: hidden_states_3'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.expand.3
+                - name: torch.Tensor.reshape
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 4, 41, 128]
+                          stride: [41984, 5248, 0, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 32
+                      - value: 41
+                      - value: 128
+                  description: 'Operation: torch.Tensor.reshape, Node: key'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.reshape.1
+                - name: torch.nn.functional.scaled_dot_product_attention
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 41, 128]
+                          stride: [167936, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 41, 128]
+                          stride: [167936, 5248, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 41, 128]
+                          stride: [167936, 5248, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.nn.functional.scaled_dot_product_attention, Node: attn_output'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.scaled_dot_product_attention.1_spyre
+                  kwargs:
+                    dropout_p: 0.0
+                    scale: 0.0078125
+                    is_causal: false
+                - name: torch.Tensor.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 41, 128]
+                          stride: [167936, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'Operation: torch.Tensor.transpose, Node: transpose_4'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.transpose.4
+                - name: torch.Tensor.contiguous
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 32, 128]
+                          stride: [167936, 4096, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.Tensor.contiguous, Node: attn_output_1'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.contiguous.1
+                - name: torch.Tensor.reshape
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 32, 128]
+                          stride: [167936, 4096, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 41
+                      - value: -1
+                  description: 'Operation: torch.Tensor.reshape, Node: reshape_2'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.reshape.2
+                - name: torch.Tensor.contiguous
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.Tensor.contiguous, Node: attn_output_2'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.contiguous.2
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.add, Node: hidden_states_5'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.add.5_spyre
+                - name: torch.Tensor.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.Tensor.to, Node: hidden_states_6'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.to.5
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 1]
+                          stride: [41, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0e-05
+                  description: 'Operation: torch.add, Node: add_6'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.add.6
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [12800, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'Operation: torch.nn.functional.linear, Node: linear_4'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.linear.3_spyre
+                - name: torch.nn.functional.silu
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 12800]
+                          stride: [524800, 12800, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.nn.functional.silu, Node: silu'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.silu.1_spyre
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 12800]
+                          stride: [524800, 12800, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 41, 12800]
+                          stride: [524800, 12800, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.mul, Node: mul_12'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.mul.7
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 12800]
+                          stride: [524800, 12800, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4096, 12800]
+                          stride: [12800, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'Operation: torch.nn.functional.linear, Node: down_proj'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.linear.4
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.add, Node: hidden_states_9'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.add.7
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.add, Node: hidden_states_15'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.add.8_spyre
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 1]
+                          stride: [41, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0e-05
+                  description: 'Operation: torch.add, Node: add_12'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.add.9_spyre
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                          device_layout:
+                            device_size: [1, 41, 4096]
+                            stride_map: [167936, 4096, 1]
+                            device_dtype: torch.bfloat16
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.add, Node: hidden_states_19'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.add.10_spyre
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                          device_layout:
+                            device_size: [1, 41, 4096]
+                            stride_map: [167936, 4096, 1]
+                            device_dtype: torch.bfloat16
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.add, Node: hidden_states_139'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.add.11_spyre
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 1]
+                          stride: [41, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0e-05
+                  description: 'Operation: torch.add, Node: add_86'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.add.12_spyre
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                          device_layout:
+                            device_size: [1, 41, 4096]
+                            stride_map: [167936, 4096, 1]
+                            device_dtype: torch.bfloat16
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.add, Node: hidden_states_145'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.add.13_spyre
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                          device_layout:
+                            device_size: [1, 41, 4096]
+                            stride_map: [167936, 4096, 1]
+                            device_dtype: torch.bfloat16
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.add, Node: hidden_states_399'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.add.14_spyre
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.getitem, Node: getitem_246'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.getitem.6
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [49159, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'Operation: torch.nn.functional.linear, Node: logits'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.linear.5
+                - name: torch.truediv
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 49159]
+                          stride: [2015519, 49159, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 16.0
+                  description: 'Operation: torch.truediv, Node: logits_1'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.truediv.1_spyre
+                - name: torch.nn.functional.embedding
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1]
+                          stride: [1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2147483647
+                      - tensor:
+                          shape: [49159, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 0
+                      - value: null
+                      - value: 2.0
+                      - value: false
+                      - value: false
+                  description: 'Operation: torch.nn.functional.embedding, Node: inputs_embeds'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.nn.functional.embedding.2
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 12.0
+                  description: 'Operation: torch.mul, Node: inputs_embeds_1'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.mul.8
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2147483647
+                      - value: 41
+                  description: 'Operation: torch.add, Node: q_arange'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.add.15
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [42]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2147483647
+                      - value: 0
+                  description: 'Operation: torch.add, Node: kv_arange'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.add.16
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2147483647
+                  description: 'Operation: torch.getitem, Node: q_indices'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.getitem.7
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [42]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2147483647
+                  description: 'Operation: torch.getitem, Node: kv_indices'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.getitem.8
+                - name: torch.le
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1, 42]
+                          stride: [42, 42, 42, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2147483647
+                      - tensor:
+                          shape: [1, 1, 1, 1]
+                          stride: [1, 1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2147483647
+                  description: 'Operation: torch.le, Node: attention_mask'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.le.2
+                - name: torch.Tensor.expand
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1, 42]
+                          stride: [42, 42, 42, 1]
+                          storage_offset: 0
+                          dtype: torch.bool
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2
+                      - value: 1
+                      - value: -1
+                      - value: 1
+                      - value: 42
+                  description: 'Operation: torch.Tensor.expand, Node: attention_mask_1'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.expand.4
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1]
+                          stride: [1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2147483647
+                  description: 'Operation: torch.getitem, Node: getitem_5'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.getitem.9
+                - name: torch.Tensor.float
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2147483647
+                  description: 'Operation: torch.Tensor.float, Node: position_ids_expanded'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.float.4
+                - name: torch.Tensor.float
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.Tensor.float, Node: float_4'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.float.5
+                - name: torch.matmul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1]
+                          stride: [64, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.matmul, Node: matmul'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.matmul.2
+                - name: torch.Tensor.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1]
+                          stride: [64, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'Operation: torch.Tensor.transpose, Node: freqs'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.transpose.5
+                - name: torch.cat
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 1, 64]
+                            stride: [64, 1, 1]
+                            storage_offset: 0
+                            dtype: torch.float32
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 1, 64]
+                            stride: [64, 1, 1]
+                            storage_offset: 0
+                            dtype: torch.float32
+                            device: cuda:0
+                            init: rand
+                  description: 'Operation: torch.cat, Node: emb'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.cat.5
+                - name: torch.Tensor.cos
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 128]
+                          stride: [128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.Tensor.cos, Node: cos'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.cos.2
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 128]
+                          stride: [128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0
+                  description: 'Operation: torch.mul, Node: cos_1'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.mul.9
+                - name: torch.Tensor.sin
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 128]
+                          stride: [128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.Tensor.sin, Node: sin'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.sin.2
+                - name: torch.Tensor.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 128]
+                          stride: [128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.Tensor.to, Node: cos_2'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.to.6
+                - name: torch.Tensor.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.Tensor.to, Node: hidden_states'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.to.7_spyre
+                - name: torch.Tensor.pow
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                  description: 'Operation: torch.Tensor.pow, Node: pow_1'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.pow.2
+                - name: torch.Tensor.mean
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: -1
+                  description: 'Operation: torch.Tensor.mean, Node: variance'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.mean.2
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0e-05
+                  description: 'Operation: torch.add, Node: add_2'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.add.17_spyre
+                - name: torch.rsqrt
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.rsqrt, Node: rsqrt'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.rsqrt.2
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.mul, Node: hidden_states_1'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.mul.10
+                - name: torch.Tensor.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.Tensor.to, Node: to_4'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.Tensor.to.8
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4096]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.mul, Node: hidden_states_2'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.mul.11
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4096, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'Operation: torch.nn.functional.linear, Node: linear'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.linear.6
+                - name: torch.Tensor.view
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: '[1, 1, -1, 128]'
+                  description: 'Operation: torch.Tensor.view, Node: view'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.view.3
+                - name: torch.Tensor.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 32, 128]
+                          stride: [4096, 4096, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'Operation: torch.Tensor.transpose, Node: query_states'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.transpose.6
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1024, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'Operation: torch.nn.functional.linear, Node: linear_1'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.linear.7_spyre
+                - name: torch.Tensor.view
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1024]
+                          stride: [1024, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: '[1, 1, -1, 128]'
+                  description: 'Operation: torch.Tensor.view, Node: view_1'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.view.4
+                - name: torch.Tensor.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 8, 128]
+                          stride: [1024, 1024, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'Operation: torch.Tensor.transpose, Node: key_states'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.transpose.7
+                - name: torch.Tensor.unsqueeze
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 128]
+                          stride: [128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                  description: 'Operation: torch.Tensor.unsqueeze, Node: cos_3'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.unsqueeze.2
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1, 128]
+                          stride: [128, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.mul, Node: mul_5'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.mul.12
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.getitem, Node: x1'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.getitem.10
+                - name: torch.neg
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 64]
+                          stride: [4096, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.neg, Node: neg'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.neg.3
+                - name: torch.cat
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 32, 1, 64]
+                            stride: [2048, 64, 64, 1]
+                            storage_offset: 0
+                            dtype: torch.bfloat16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 32, 1, 64]
+                            stride: [4096, 128, 4096, 1]
+                            storage_offset: 0
+                            dtype: torch.bfloat16
+                            device: cuda:0
+                            init: rand
+                  description: 'Operation: torch.cat, Node: cat_1'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.cat.6_spyre
+                  kwargs:
+                    dim: -1
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.add, Node: q_embed'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.add.18
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1, 128]
+                          stride: [128, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.mul, Node: mul_7'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.mul.13
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.getitem, Node: x1_1'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.getitem.11
+                - name: torch.neg
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 64]
+                          stride: [1024, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.neg, Node: neg_1'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.neg.4
+                - name: torch.cat
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 8, 1, 64]
+                            stride: [512, 64, 64, 1]
+                            storage_offset: 0
+                            dtype: torch.bfloat16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 8, 1, 64]
+                            stride: [1024, 128, 1024, 1]
+                            storage_offset: 0
+                            dtype: torch.bfloat16
+                            device: cuda:0
+                            init: rand
+                  description: 'Operation: torch.cat, Node: cat_2'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.cat.7_spyre
+                  kwargs:
+                    dim: -1
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.add, Node: k_embed'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.add.19_spyre
+                - name: torch.cat
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 8, 41, 128]
+                            stride: [41984, 128, 1024, 1]
+                            storage_offset: 0
+                            dtype: torch.bfloat16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 8, 1, 128]
+                            stride: [1024, 128, 128, 1]
+                            storage_offset: 0
+                            dtype: torch.bfloat16
+                            device: cuda:0
+                            init: rand
+                  description: 'Operation: torch.cat, Node: keys'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.cat.8
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 42, 128]
+                          stride: [43008, 5376, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.getitem, Node: getitem_10'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.getitem.12
+                - name: torch.Tensor.expand
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 42, 128]
+                          stride: [43008, 5376, 5376, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 8
+                      - value: 4
+                      - value: 42
+                      - value: 128
+                  description: 'Operation: torch.Tensor.expand, Node: hidden_states_3'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.expand.5
+                - name: torch.Tensor.reshape
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 4, 42, 128]
+                          stride: [43008, 5376, 0, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 32
+                      - value: 42
+                      - value: 128
+                  description: 'Operation: torch.Tensor.reshape, Node: key'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.reshape.3
+                - name: torch.nn.functional.scaled_dot_product_attention
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 42, 128]
+                          stride: [172032, 5376, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 42, 128]
+                          stride: [172032, 5376, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.nn.functional.scaled_dot_product_attention, Node: attn_output'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.scaled_dot_product_attention.2_spyre
+                  kwargs:
+                    dropout_p: 0.0
+                    scale: 0.0078125
+                    is_causal: false
+                - name: torch.Tensor.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'Operation: torch.Tensor.transpose, Node: transpose_4'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.transpose.8
+                - name: torch.Tensor.contiguous
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 32, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.Tensor.contiguous, Node: attn_output_1'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.contiguous.3
+                - name: torch.Tensor.reshape
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 32, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 1
+                      - value: -1
+                  description: 'Operation: torch.Tensor.reshape, Node: reshape_2'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.reshape.4
+                - name: torch.Tensor.contiguous
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.Tensor.contiguous, Node: attn_output_2'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.contiguous.4
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.add, Node: hidden_states_5'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.add.20_spyre
+                - name: torch.Tensor.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.Tensor.to, Node: hidden_states_6'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.to.9
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0e-05
+                  description: 'Operation: torch.add, Node: add_6'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.add.21
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [12800, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'Operation: torch.nn.functional.linear, Node: linear_4'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.linear.8_spyre
+                - name: torch.nn.functional.silu
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 12800]
+                          stride: [12800, 12800, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.nn.functional.silu, Node: silu'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.silu.2_spyre
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 12800]
+                          stride: [12800, 12800, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 12800]
+                          stride: [12800, 12800, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.mul, Node: mul_12'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.mul.14
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 12800]
+                          stride: [12800, 12800, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [4096, 12800]
+                          stride: [12800, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'Operation: torch.nn.functional.linear, Node: down_proj'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.linear.9
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.add, Node: hidden_states_9'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.add.22
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.add, Node: hidden_states_15'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.add.23_spyre
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0e-05
+                  description: 'Operation: torch.add, Node: add_12'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.add.24_spyre
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                          device_layout:
+                            device_size: [1, 1, 4096]
+                            stride_map: [4096, 4096, 1]
+                            device_dtype: torch.bfloat16
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.add, Node: hidden_states_19'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.add.25_spyre
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                          device_layout:
+                            device_size: [1, 1, 4096]
+                            stride_map: [4096, 4096, 1]
+                            device_dtype: torch.bfloat16
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.add, Node: hidden_states_139'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.add.26_spyre
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0e-05
+                  description: 'Operation: torch.add, Node: add_86'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.add.27_spyre
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                          device_layout:
+                            device_size: [1, 1, 4096]
+                            stride_map: [4096, 4096, 1]
+                            device_dtype: torch.bfloat16
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.add, Node: hidden_states_145'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.add.28_spyre
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                          device_layout:
+                            device_size: [1, 1, 4096]
+                            stride_map: [4096, 4096, 1]
+                            device_dtype: torch.bfloat16
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.add, Node: hidden_states_399'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.add.29_spyre
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'Operation: torch.getitem, Node: getitem_246'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.getitem.13
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [49159, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: null
+                  description: 'Operation: torch.nn.functional.linear, Node: logits'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.linear.10
+                - name: torch.truediv
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 49159]
+                          stride: [49159, 49159, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 16.0
+                  description: 'Operation: torch.truediv, Node: logits_1'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.truediv.2_spyre

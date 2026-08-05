@@ -38,6 +38,8 @@ from torch_spyre._inductor import passes
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreConstantFallback
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+from torch_spyre._inductor.scratchpad import allocator
+from torch_spyre._inductor.scratchpad import utils as scratchpad_utils
 
 
 Ts = TypeVarTuple("Ts")
@@ -86,6 +88,17 @@ class TestInsertPaddingIR(unittest.TestCase):
 
         self.patchers.append(t_inductor_config.patch("force_disable_caches", True))
         self.patchers.append(ts_inductor_config.patch("sencores", 1))
+        # These tests assert the exact op sequence insert_bmm_padding produces.
+        # Clone-at-boundaries runs later in the same pass pipeline and can
+        # insert an unrelated aten.clone ComputedBuffer for a graph input read
+        # by both the padding copy op and the matmul -- disable it here (in
+        # both the allocator and utils bindings) so the captured ops reflect
+        # only insert_bmm_padding's own output. tearDown's loop restores both
+        # via the same patchers list as everything else here.
+        self.patchers.extend(
+            patch.object(mod, "clone_at_graph_boundaries", lambda: False)
+            for mod in (allocator, scratchpad_utils)
+        )
 
         CustomPreSchedulingPassesWithCapture.initialize(self)
         self.patchers.append(
