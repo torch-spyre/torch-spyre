@@ -617,6 +617,30 @@ def _resolve_tile_size_counts(operations: list[Operation]) -> dict[int, dict[str
     convenience: WSR assumes every tile is full (see
     docs/wsr-tile-size-api-plan.md), so a non-multiple extent means the caller did
     not pad, and the failure must be loud rather than a short final tile.
+
+    THE CONTRACT FOR DIMS THAT SHARE A LOOP VAR
+    -------------------------------------------
+    Several named dims can land on ONE loop var -- a flat shape=(Lq*D,) named
+    ["Lq","D"], or a [B,H,...] tensor where B=1 is degenerate and the backend
+    folds B in with H onto a loop var of extent B*H. For those, a tile SIZE is
+    read in the units of the LOOP VAR, i.e. **absolute host-dim extents**,
+    outermost-first, each inner size dividing the enclosing one. So for
+    ["B","H"] with B=1, H=8 (loop var extent 8), "B" is 8 (do not tile) and NOT
+    B // b_tiles == 1 -- the latter is a count of B steps, not an extent of
+    anything this divides.
+
+    That ambiguity is not detectable in general: a host-unit size of 1 is
+    perfectly legal (extent-many tiles of one element), so it cannot be told
+    apart from a per-dim 1 that was meant as something else. What IS checkable is
+    the alignment below -- a size for one name of a fused group must be a
+    multiple of the product of its INNER siblings' extents, because that name can
+    only cut the host range at multiples of what sits inside it. That rejects the
+    common mistake (per-dim units) while accepting every valid host-unit size.
+
+    A COUNT is invariant to which loop var a name lands on; a SIZE is not. Where
+    the grouping depends on the shape -- e.g. a test helper parameterised over
+    many shapes -- the count spelling is the only one that can be written as a
+    fixed expression. See tests/inductor/test_coarse_tile_e2e.py's flash helpers.
     """
     counts: dict[int, dict[str, int]] = {}
     for op in operations:
@@ -683,6 +707,39 @@ def _resolve_tile_size_counts(operations: list[Operation]) -> dict[int, dict[str
                     "each inner size dividing the enclosing one."
                 )
             claimed_by[sym] = (hint_id, name)
+
+            # Alignment check for a dim sharing its loop var with others: the
+            # size is in LOOP-VAR units, and this name can only cut the host
+            # range at multiples of what sits inside it, so it must be a multiple
+            # of the product of its INNER siblings' extents.  Rejects the common
+            # mistake of passing per-dim units (["B","H"], B=1, H=8: a "B" of 1
+            # is not a multiple of 8) without touching any valid host-unit size.
+            # Skipped when a sibling's extent is not declared -- then there is
+            # nothing to compute the stride from.
+            group = dp.loop_var_dims.get(sym) or []
+            if len(group) > 1 and name in group:
+                inner = 1
+                known = True
+                for sib in group[group.index(name) + 1 :]:
+                    sz = _named_dims.get(sib)
+                    if not sz:
+                        known = False
+                        break
+                    inner *= int(sz)
+                if known and inner > 1 and tile_size % inner != 0:
+                    raise Unsupported(
+                        f"spyre_hint(tile_size_per_dim={{{name!r}: {tile_size}}}): "
+                        f"dim {name!r} shares one loop var with {group}, so its "
+                        f"tile size is an ABSOLUTE extent in that loop var's "
+                        f"units and must be a multiple of {inner} (the product of "
+                        f"the extents inside it: {group[group.index(name) + 1 :]}). "
+                        f"{tile_size} is not. A per-dim size such as "
+                        f"extent // count is the wrong quantity here -- use the "
+                        f"product over the whole group, a hinted name "
+                        f"contributing extent // count and an unhinted one its "
+                        f"full extent."
+                    )
+
             avail = remaining.get(sym, extents[sym])
             if tile_size <= 0:
                 raise Unsupported(
