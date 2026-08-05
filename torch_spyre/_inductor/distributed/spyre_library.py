@@ -8,17 +8,25 @@ import torch
 # This file only registers the abstract (fake/meta) kernels needed by torch.compile
 # for shape inference during tracing.
 
+# The spyre::* distributed operators are only compiled into the C++ extension
+# when torch-spyre is built with USE_SPYRE_CCL=1 (see setup.py: spyre_distributed.cpp
+# is added to the sources only when use_spyre_ccl is true). Registering a fake
+# kernel for an operator that was not compiled in raises "operator spyre::... does
+# not exist", which would break `import torch` on any USE_SPYRE_CCL=0 build. Only
+# register the fakes when the real operators are actually present.
+if torch._C._dispatch_has_kernel("spyre::broadcast_async"):
 
-@torch.library.register_fake("spyre::broadcast_async")
-def _(x: torch.Tensor, src_rank: int = 0, group_name: str = "default") -> torch.Tensor:
-    """Fake implementation for shape inference during compilation.
+    @torch.library.register_fake("spyre::broadcast_async")
+    def _(
+        x: torch.Tensor, src_rank: int = 0, group_name: str = "default"
+    ) -> torch.Tensor:
+        """Fake implementation for shape inference during compilation.
 
-    Broadcast preserves shape, dtype, and stride.
-    """
-    return torch.empty_strided(x.shape, x.stride(), dtype=x.dtype, device=x.device)
+        Broadcast preserves shape, dtype, and stride.
+        """
+        return torch.empty_strided(x.shape, x.stride(), dtype=x.dtype, device=x.device)
 
-
-@torch.library.register_fake("spyre::wait_work")
-def _(x: torch.Tensor) -> torch.Tensor:
-    """Fake implementation — pass through the tensor."""
-    return x
+    @torch.library.register_fake("spyre::wait_work")
+    def _(x: torch.Tensor) -> torch.Tensor:
+        """Fake implementation — pass through the tensor."""
+        return x

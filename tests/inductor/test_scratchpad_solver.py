@@ -513,6 +513,18 @@ class ScoreOrderingTests:
         self.assertEqual(by_name["child"], 0)  # child reuses parent's slot
         self.assertIsNone(by_name["plain"])
 
+    def test_failed_inplace_reuse_does_not_overlap_live_parent(self):
+        parent = LifetimeBoundBuffer("parent", 20, [0, 4])
+        blocker = LifetimeBoundBuffer("blocker", 5, [5, 8])
+        child = LifetimeBoundBuffer("child", 10, [4, 8], in_place_parents=["parent"])
+
+        result = self.solve([parent, blocker, child], size=30)
+        by_name = {buffer.name: buffer.address for buffer in result}
+
+        self.assertEqual(by_name["parent"], 0)
+        self.assertEqual(by_name["blocker"], 0)
+        self.assertEqual(by_name["child"], 20)
+
     def test_write_first_buffer_placed_before_read_only(self):
         # Identical span (5) and use count (2). `writer`'s first use is a write
         # (first_use_is_read=False), so pinning it also saves the more expensive

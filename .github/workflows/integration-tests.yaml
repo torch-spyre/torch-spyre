@@ -1,4 +1,9 @@
 name: integration-tests
+run-name: integration-tests (${{ inputs.test_type || 'device_critical' }})
+# NOTE: run-name intentionally shows the RAW, user-facing input (before
+# filter_configs.py resolves unit/integration/regression to core/device_critical/
+# full) -- this is also what push-to-clickhouse.yaml's trigger_type ends up
+# recording, so ClickHouse sees the tier name callers actually asked for.
 
 # ---------------------------------------------------------------------------
 # Triggered by commits in upstream dependant repos (deeptools, flex, etc.) via
@@ -74,11 +79,15 @@ on:
       test_type:
         description: >-
           Suite subset to run: smoke | core | full | device_critical |
-          suite_<group> | <label>. Default: device_critical (configs whose
-          test_suite_config.labels cover the device-layer surfaces flex and
-          deeptools/dxp_standalone exercise most -- streams, job launch
-          plans, codegen, LX/scratchpad planning, tensor layout,
-          allocator/GC, D2D copies). Pass "full" to run every config.
+          suite_<group> | <label> -- or the user-facing tier aliases unit
+          (= core) | integration (= device_critical) | regression (= full),
+          for callers (e.g. spyre-frameworks config.yaml) that speak in tier
+          names rather than label names. Default: device_critical (configs
+          whose test_suite_config.labels cover the device-layer surfaces
+          flex and deeptools/dxp_standalone exercise most -- streams, job
+          launch plans, codegen, LX/scratchpad planning, tensor layout,
+          allocator/GC, D2D copies). Pass "full" (or "regression") to run
+          every config.
         required: false
         type: string
         default: device_critical
@@ -126,7 +135,11 @@ jobs:
   # ---------------------------------------------------------------------------
   # Run the test matrix, defaulting to the device_critical subset -- same
   # default as the "run-tests" job in torch_spyre_tests.yaml. Callers can
-  # still request test_type=full for complete coverage.
+  # still request test_type=full (or its alias, regression) for complete
+  # coverage. Tier aliases (unit/integration/regression) are resolved inside
+  # _test_matrix.yaml's generate_matrix job -- the single choke point every
+  # test_type caller (Makefile, Jenkins, GHA) passes through -- so the raw
+  # input is forwarded unchanged here.
   # ---------------------------------------------------------------------------
   run-tests:
     needs: provenance

@@ -56,6 +56,7 @@ def check_libflex():
 ROOT_DIR = Path(__file__).absolute().parent
 CSRC_DIR = ROOT_DIR / PATH_NAME / "csrc"
 DISTRIBUTED_SRC_DIR = CSRC_DIR / "distributed"
+PROFILER_SRC_DIR = CSRC_DIR / "profiler"
 
 
 # Automatically download json.hpp if not present
@@ -94,6 +95,8 @@ INCLUDE_DIRS += [Path(p) for p in extra_include_dirs if p]
 cmake_library_path = os.environ.get("CMAKE_LIBRARY_PATH", "")
 extra_library_dirs = cmake_library_path.split(":") if cmake_library_path else []
 LIBRARY_DIRS += [Path(p) for p in extra_library_dirs if p]
+
+COMPILE_AIUPTI = os.environ.get("USE_SPYRE_PROFILER", "1") == "1"
 
 if "RUNTIME_INSTALL_DIR" in os.environ:
     # take lower precedence than CMAKE_LIBRARY_PATH and CMAKE_INCLUDE_PATH
@@ -155,11 +158,26 @@ else:
 INCLUDE_DIRS += [os.environ["SEN_COMMON_HEADERS"]]
 
 use_new_system = os.environ.get("NEW_SYSTEM_SETUP", "0") == "1"
-
 if use_new_system:
     LIBRARIES = ["flex"]
 else:
     LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
+
+
+if COMPILE_AIUPTI:  # Include kineto and libaiupti headers
+    import torch
+
+    KINETO_INCLUDE_DIR = Path(torch.__path__[0]) / "include" / "kineto"
+    INCLUDE_DIRS += [KINETO_INCLUDE_DIR]
+
+    # On default system install, aiupti is installed in runtime folders
+    if os.environ.get("LIBAIUPTI_INSTALL_DIR", "") != "":
+        LIBAIUPTI_DIR = Path(os.environ["LIBAIUPTI_INSTALL_DIR"])
+        LIBRARY_DIRS += [LIBAIUPTI_DIR / "lib"]
+        INCLUDE_DIRS += [LIBAIUPTI_DIR / "include"]
+
+    LIBRARIES.insert(-1, "aiupti")  # Build dependency on flex
+
 if use_spyre_ccl:
     LIBRARIES.append("spyre_comms")
 
@@ -214,6 +232,9 @@ if __name__ == "__main__":
         from torch.utils.cpp_extension import BuildExtension, CppExtension
 
         sources = list(CSRC_DIR.glob("*.cpp"))
+        profiler_sources = (
+            list(PROFILER_SRC_DIR.glob("*.cpp")) if COMPILE_AIUPTI else []
+        )
         distributed_sources = (
             list(DISTRIBUTED_SRC_DIR.glob("*.cpp")) if use_spyre_ccl else []
         )
@@ -221,6 +242,9 @@ if __name__ == "__main__":
         core_src_paths = [p.relative_to(ROOT_DIR).as_posix() for p in sorted(sources)]
         distributed_src_paths = [
             p.relative_to(ROOT_DIR).as_posix() for p in sorted(distributed_sources)
+        ]
+        profiler_src_paths = [
+            p.relative_to(ROOT_DIR).as_posix() for p in sorted(profiler_sources)
         ]
 
         # Build define_macros list conditionally
@@ -234,11 +258,15 @@ if __name__ == "__main__":
             base_define_macros.append(("USE_SPYRE_CCL", None))
         if use_new_system:
             base_define_macros.append(("USE_FLEX_NAMESPACE", None))
+        if COMPILE_AIUPTI:
+            base_define_macros.append(("HAS_AIUPTI", None))
+            base_define_macros.append(("USE_KINETO", None))
+            base_define_macros.append(("FMT_HEADER_ONLY", None))
 
         ext_modules = [
             CppExtension(
                 name=f"{PACKAGE_NAME}._C",
-                sources=core_src_paths + distributed_src_paths,
+                sources=core_src_paths + distributed_src_paths + profiler_src_paths,
                 include_dirs=[str(p) for p in INCLUDE_DIRS],
                 library_dirs=[str(p) for p in LIBRARY_DIRS],
                 libraries=LIBRARIES,

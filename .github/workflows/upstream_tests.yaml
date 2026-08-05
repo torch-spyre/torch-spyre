@@ -1,5 +1,8 @@
 name: upstream-pytorch-tests
 
+# One of torch-spyre's four "trunk" (push-to-main) workflows -- see
+# torch_spyre_tests.yaml, model_ops_tests.yaml, upstream_tests_beta.yaml for
+# the others. No test_type input here, so no trunk wiring beyond this label.
 on:
   # Run automatically on every merge to main
   push:
@@ -69,7 +72,10 @@ jobs:
   build:
     name: Build torch-spyre wheel (once)
     needs: changes
-    if: needs.changes.outputs.code_changed == 'true'
+    # Also skipped when `integration-test` is labeled -- Jenkins handles it instead
+    if: |
+      needs.changes.outputs.code_changed == 'true' &&
+      !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'integration-test'))
     # Compile-only: needs the backend image + SDK toolchain but NO physical Spyre
     # card, so it targets the cardless spyre_pf_x0 pool and leaves card runners
     # for the test jobs.
