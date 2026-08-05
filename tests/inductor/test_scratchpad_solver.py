@@ -292,15 +292,47 @@ class BaseLayoutSolverTests:
     # read on that tick, so that remainder belongs to nobody else until the
     # parent's lifetime ends.
 
-    def test_live_parent_footprint_not_reused_at_handoff(self):
-        # `child` takes over the low 5 bytes of a 40-byte parent. `stranger`
-        # enters at the handoff tick, so it may not be handed any of the
-        # remaining 35 -- and `child` itself may not sit part-way into the
-        # parent. `_assert_legal_layout` in solve() is the real assertion; the
-        # checks below name the specific pair for a readable failure.
+    def test_write_only_in_place_parent_is_rejected(self):
+        # Whether the pair is expressible at all, before any question of where
+        # it lands. A computed parent whose only use is its write has nothing to
+        # hand over, so every solver must reject it rather than place the child
+        # over data nothing consumes.
+        #
+        # The two solver families check this at different points -- the gap-based
+        # and ILP solvers in ``_assert_in_place_relationships``, the
+        # permutation-based ones (which simulated annealing drives) in
+        # ``_compute_inplace_partners`` -- and they share no base class, so
+        # running one case against all of them is what pins the coverage.
+        # Matched on the message: ``solve`` also asserts layout legality, and a
+        # bare ``assertRaises`` would accept that unrelated failure as a pass.
         parent = self.make_buffer("parent", 40, [0])
-        child = self.make_buffer("child", 5, [0, 2], in_place_parents=["parent"])
-        stranger = self.make_buffer("stranger", 20, [0, 1])
+        child = self.make_buffer("child", 40, [0, 2], in_place_parents=["parent"])
+        with self.assertRaisesRegex(
+            AssertionError, "computed buffer that is never read"
+        ):
+            self.solve([parent, child], size=120)
+
+    def test_single_use_in_place_parent_allowed_for_an_input(self):
+        # The same shape is legal when the parent is a graph input: every use of
+        # one is a read, so the single use is a genuine read before the handoff.
+        # The contrast shows the rejection above keys on the missing read rather
+        # than on ``len(uses) == 1``. Only that it solves is asserted -- an input
+        # parent has no producer write to save and its one read is the clone-in,
+        # so a cost-driven solver may legitimately decline to place it.
+        parent = self.make_buffer("parent", 40, [0], first_use_is_read=True)
+        child = self.make_buffer("child", 40, [0, 2], in_place_parents=["parent"])
+        self.solve([parent, child], size=120)
+
+    def test_live_parent_footprint_not_reused_at_handoff(self):
+        # `child` takes over the low 5 bytes of a 40-byte parent at tick 1, the
+        # parent's read. `stranger` enters at that handoff tick, so it may not be
+        # handed any of the remaining 35 -- and `child` itself may not sit
+        # part-way into the parent. `_assert_legal_layout` in solve() is the real
+        # assertion; the checks below name the specific pair for a readable
+        # failure.
+        parent = self.make_buffer("parent", 40, [0, 1])
+        child = self.make_buffer("child", 5, [1, 3], in_place_parents=["parent"])
+        stranger = self.make_buffer("stranger", 20, [1, 2])
         result = {b.name: b for b in self.solve([parent, child, stranger], size=120)}
 
         p = result["parent"]
@@ -324,9 +356,9 @@ class BaseLayoutSolverTests:
         # ordering prefers. The other has to be placed on its own: those bytes now
         # belong to the first child, and the rest still belongs to the parent for
         # the handoff tick.
-        parent = self.make_buffer("parent", 40, [0])
-        first = self.make_buffer("first", 20, [0, 2], in_place_parents=["parent"])
-        second = self.make_buffer("second", 5, [0], in_place_parents=["parent"])
+        parent = self.make_buffer("parent", 40, [0, 1])
+        first = self.make_buffer("first", 20, [1, 3], in_place_parents=["parent"])
+        second = self.make_buffer("second", 5, [1], in_place_parents=["parent"])
         result = {b.name: b for b in self.solve([parent, first, second], size=120)}
 
         placed = [b for b in result.values() if b.address is not None]
@@ -351,8 +383,8 @@ class BaseLayoutSolverTests:
         buffers = [
             self.make_buffer("stacked", 20, [0, 2]),
             self.make_buffer("late", 5, [6]),
-            self.make_buffer("parent", 20, [0]),
-            self.make_buffer("child", 5, [0, 2, 5, 6], in_place_parents=["parent"]),
+            self.make_buffer("parent", 20, [0, 1]),
+            self.make_buffer("child", 5, [1, 2, 5, 6], in_place_parents=["parent"]),
         ]
         for b in self.solve(buffers, size=30, alignment=10):
             if b.address is not None:
@@ -581,6 +613,25 @@ class BaseLayoutSolverTests:
         with self.assertRaises(AssertionError):
             _assert_in_place_relationships([p, c])
 
+    def test_assert_rejects_write_only_computed_parent(self):
+        # P's single use is its write, so it is never read: C would take over
+        # storage holding data nothing consumes, and the two would come alive on
+        # the same tick. P.end_time == C.start_time + 1 still holds, so only the
+        # read-count invariant rejects this.
+        p = LifetimeBoundBuffer("P", 20, [3])
+        c = LifetimeBoundBuffer("C", 15, [3, 8], in_place_parents=["P"])
+        self.assertEqual(p.end_time, c.start_time + 1)
+        with self.assertRaises(AssertionError):
+            _assert_in_place_relationships([p, c])
+
+    def test_assert_allows_single_use_input_parent(self):
+        # A graph input's single use is a read, so handing its storage over is
+        # legitimate; first_use_is_read is what distinguishes it from the
+        # computed buffer above.
+        p = LifetimeBoundBuffer("P", 20, [3], first_use_is_read=True)
+        c = LifetimeBoundBuffer("C", 15, [3, 8], in_place_parents=["P"])
+        _assert_in_place_relationships([p, c])
+
     def test_uses_must_be_strictly_increasing(self):
         # One distinct index per accessing op. A repeat would describe a buffer
         # written and read by the same operation, i.e. with a single live tick,
@@ -594,6 +645,28 @@ class BaseLayoutSolverTests:
         # Empty is allowed: buffers may be registered before their uses are
         # known and filled in afterwards.
         LifetimeBoundBuffer("P", 20, [])
+
+    def test_repeated_index_cannot_pass_as_a_read(self):
+        # The in-place rule tests for a use strictly after the first rather than
+        # relying on read_count, so a buffer whose uses were mutated into a
+        # repeat after construction still cannot be an in-place parent.
+        #
+        # The mutation rewrites uses[0] only, leaving end_time untouched, so the
+        # handoff geometry still lines up afterwards. That is what makes the read
+        # rule the assertion under test: end_time == uses[-1] + 1, so a mutation
+        # that moved the tail would trip the abutment check first and this would
+        # pass without ever reaching the rule it is named for. Matched on the
+        # message for the same reason.
+        p = LifetimeBoundBuffer("P", 20, [2, 3])
+        c = LifetimeBoundBuffer("C", 15, [3, 8], in_place_parents=["P"])
+        _assert_in_place_relationships([p, c])  # baseline: accepted
+        p.uses = [3, 3]  # bypasses __post_init__
+        self.assertEqual(p.end_time, c.start_time + 1)  # geometry still holds
+        self.assertEqual(p.read_count, 1)  # read_count is fooled...
+        with self.assertRaisesRegex(  # ...the invariant is not
+            AssertionError, "computed buffer that is never read"
+        ):
+            _assert_in_place_relationships([p, c])
 
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -1063,7 +1136,20 @@ class TestCpSatJointDivision(JointDivisionSolverTests, TestCase):
         # zero-width time interval, which the 2D propagator ignores -- the child
         # still holds the shared slot. The merge must fire (capacity fits only
         # one 100-byte buffer) and the child must reuse the parent's address.
-        gp = CoreDivisionBuffer("gp", 100, [0], core_divisions=_whole())  # end_time=1
+        #
+        # ``gp`` has to be an input clone (``first_use_is_read``) rather than a
+        # computed buffer: a computed buffer's lone use is its write, so it is
+        # never read and cannot hand storage over at all -- forbidden by
+        # ``_assert_in_place_relationships``. A clone read exactly once is the
+        # real shape of a single-use in-place parent. The flag does reach
+        # ``spill_cost`` -- it is read there unconditionally -- but cancels: it
+        # raises ``read_count`` by one and is discounted by one, so the cost is
+        # 100 with it or without it. (``boundary`` decides only ``is_intermediate``,
+        # and ``CoreDivisionBuffer`` tracks that independently of the flag.) So
+        # the flag leaves the zero-width interval under test.
+        gp = CoreDivisionBuffer(
+            "gp", 100, [0], first_use_is_read=True, core_divisions=_whole()
+        )  # end_time=1
         c = CoreDivisionBuffer(
             "c",
             100,

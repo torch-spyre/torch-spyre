@@ -57,9 +57,20 @@ def _random_buffers(rng, n, horizon=12, max_size=200):
         if rng.random() < 0.25:
             parent = buffers[rng.randrange(child_i)]
             child = buffers[child_i]
-            new_start = parent.uses[-1]
-            new_last = max(child.uses[-1], parent.uses[-1])
-            child.uses = [new_start] if new_start == new_last else [new_start, new_last]
+            if parent.read_count == 0:
+                # A write-only parent has nothing to hand over, so the pair is
+                # not expressible at all (see ``assert_in_place_parent_is_read``).
+                # Drawing one is possible because a base buffer may land on a
+                # single-tick lifetime; skip rather than reshaping the parent,
+                # which could invalidate a pair already wired to it.
+                continue
+            # The child is defined at the parent's last live tick. Its own read
+            # has to fall strictly after that write, both because uses is
+            # strictly increasing and so that the child can itself be drawn as a
+            # parent later in this loop; extend by a tick when the child's own
+            # end is too early to supply one.
+            handoff = parent.uses[-1]
+            child.uses = [handoff, max(child.uses[-1], handoff + 1)]
             child.size = rng.randint(1, parent.size)
             child.in_place_parents = [parent.name]
     return buffers
