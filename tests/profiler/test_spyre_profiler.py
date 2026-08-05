@@ -145,19 +145,19 @@ class TestSpyreProfiler(TestCase):
 
     @unittest.skipUnless(Test_spyre, "requires spyre device")
     def test_no_zero_timestamp_or_duration(self) -> None:
-        """Verify no Chrome trace event has ts == 0 or dur == 0 after an attention op."""
+        """Verify no Chrome trace event has ts == 0 or dur == 0 after add/gelu/sum ops."""
         import os
         import tempfile
 
-        B, H, S, D = 1, 4, 16, 32
-        q = torch.randn(B, H, S, D, dtype=torch.float16, device="spyre")
-        k = torch.randn(B, H, S, D, dtype=torch.float16, device="spyre")
-        v = torch.randn(B, H, S, D, dtype=torch.float16, device="spyre")
+        device = torch.device("spyre")
+        x, y = (torch.rand((4, 4), dtype=torch.float16).to(device) for _ in range(2))
 
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
         ) as prof:
-            F.scaled_dot_product_attention(q, k, v)
+            z = torch.add(x, y)
+            z = F.gelu(z)
+            z = torch.sum(z)
 
         fd, trace_path = tempfile.mkstemp(suffix=".json")
         os.close(fd)
