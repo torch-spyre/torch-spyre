@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import json
 import pytest
 import unittest
@@ -366,3 +367,88 @@ class TestMemoryProfilerTimeline(TestCase):
 
         for event in expected:
             self.assertTrue(event in actual, f"event: {event} was not found in actual.")
+
+
+def test_no_zero_timestamp_or_duration(trace_dir: str) -> None:
+    """Check every Chrome trace file in ``trace_dir`` for zero timestamps or durations.
+
+    Args:
+        trace_dir: Path to a directory containing one or more Chrome trace JSON
+            files produced by the profiler.
+
+    For each file the function checks three categories of complete ('X') events:
+
+    * **cpu_op / all complete events** — zero ``ts`` across all events.
+    * **gpu_memcpy** — HtoD and DtoH transfers with ``dur == 0``.
+    * **kernel** — compute kernel events with ``dur == 0``.
+
+    Both ``ts`` and ``dur`` are in nanoseconds as declared by ``displayTimeUnit``.
+    """
+    trace_files = sorted(
+        os.path.join(trace_dir, f) for f in os.listdir(trace_dir) if f.endswith(".json")
+    )
+    assert trace_files, f"No .json trace files found in '{trace_dir}'"
+
+    for trace_file in trace_files:
+        print(f"\n[{os.path.basename(trace_file)}]")
+
+        with open(trace_file) as f:
+            data = json.load(f)
+
+        if "traceEvents" not in data:
+            print("  SKIP — no 'traceEvents' key")
+            continue
+
+        complete_events = [e for e in data["traceEvents"] if e.get("ph") == "X"]
+        if not complete_events:
+            print("  SKIP — no complete ('X') events")
+            continue
+
+        # --- zero timestamps (all complete events) ---
+        zero_ts = [e for e in complete_events if e.get("ts", 1) == 0]
+        if zero_ts:
+            print(
+                f"  FAIL — {len(zero_ts)} event(s) have ts == 0: "
+                + ", ".join(e.get("name", "<unnamed>") for e in zero_ts)
+            )
+        else:
+            print("  OK   — no zero timestamps")
+
+        # --- gpu_memcpy: HtoD and DtoH with dur == 0 ---
+        memcpy_events = [e for e in complete_events if e.get("cat") == "gpu_memcpy"]
+        htod_zero = [
+            e
+            for e in memcpy_events
+            if "HtoD" in e.get("name", "") and e.get("dur", 1) == 0
+        ]
+        dtoh_zero = [
+            e
+            for e in memcpy_events
+            if "DtoH" in e.get("name", "") and e.get("dur", 1) == 0
+        ]
+        if htod_zero:
+            print(
+                f"  FAIL — {len(htod_zero)} HtoD memcpy event(s) have dur == 0: "
+                + ", ".join(e.get("name", "<unnamed>") for e in htod_zero)
+            )
+        else:
+            print("  OK   — no zero-duration HtoD memcpy events")
+
+        if dtoh_zero:
+            print(
+                f"  FAIL — {len(dtoh_zero)} DtoH memcpy event(s) have dur == 0: "
+                + ", ".join(e.get("name", "<unnamed>") for e in dtoh_zero)
+            )
+        else:
+            print("  OK   — no zero-duration DtoH memcpy events")
+
+        # --- kernel: compute kernel events with dur == 0 ---
+        kernel_events = [e for e in complete_events if e.get("cat") == "kernel"]
+        kernel_zero_dur = [e for e in kernel_events if e.get("dur", 1) == 0]
+        if kernel_zero_dur:
+            print(
+                f"  FAIL — {len(kernel_zero_dur)} kernel event(s) have dur == 0: "
+                + ", ".join(e.get("name", "<unnamed>") for e in kernel_zero_dur)
+            )
+        else:
+            print("  OK   — no zero-duration kernel events")
