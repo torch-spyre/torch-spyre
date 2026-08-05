@@ -6645,6 +6645,45 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             index_copy_fn, cache, index, source, run_compile=False, run_eager=True
         )
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_index_put_cpu(self):
+        """Test aten::_index_put_impl_ (tensor[indices] = values) falls back to CPU.
+
+        Covers the upstream test_advanced_indexing_assignment pattern:
+        t[rows, cols] = 0, where rows and cols are 2D index tensors.
+        """
+
+        def fn(t, rows, cols):
+            t = t.clone()
+            t[rows, cols] = 0
+            return t
+
+        # 2D advanced indexing (the issue's motivating case)
+        t = torch.ones(3, 3, dtype=torch.float16)
+        rows = torch.tensor([[0, 0], [2, 2]], dtype=torch.int64)
+        cols = torch.tensor([[0, 1], [2, 2]], dtype=torch.int64)
+        self.compare_with_cpu(fn, t, rows, cols, run_compile=False, run_eager=True)
+
+        # 1D advanced indexing
+        def fn_1d(t, idx):
+            t = t.clone()
+            t[idx] = 0
+            return t
+
+        t1d = torch.ones(8, dtype=torch.float16)
+        idx1d = torch.tensor([1, 3, 5], dtype=torch.int64)
+        self.compare_with_cpu(fn_1d, t1d, idx1d, run_compile=False, run_eager=True)
+
+        # accumulate=True variant
+        def fn_accum(t, rows, cols):
+            t = t.clone()
+            t[rows, cols] += 1
+            return t
+
+        self.compare_with_cpu(
+            fn_accum, t, rows, cols, run_compile=False, run_eager=True
+        )
+
     def test_repeat_cpu(self, x, *repeat_args):
         def fn(a):
             return a.repeat(*repeat_args)

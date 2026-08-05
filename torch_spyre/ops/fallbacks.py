@@ -259,11 +259,19 @@ register_fallback_default(
 
 
 # Manually append to fallback_ops: register_fallback cannot be used here because
-# normal_ is an in-place op — register_fallback is designed for out-of-place ops
+# these are in-place ops — register_fallback is designed for out-of-place ops
 # and would leave the original Spyre tensor unfilled.
-# The kernel itself is registered in ops.py.
+# The kernels themselves are registered in eager.py.
 fallback_ops.append(aten.normal_.default)
 fallback_ops.append(getattr(aten.random_, "from"))
+# _index_put_impl_ is in-place (self is mutated); the kernel is in eager.py.
+# index_put_.default decomposes into _index_put_impl_, so registering
+# _index_put_impl_ here prevents Inductor from expanding it away.
+fallback_ops.append(aten._index_put_impl_.default)
+# index.Tensor (gather by index) cannot use register_fallback_default because the
+# registered function would be the op itself and re-enter the Spyre kernel after
+# _move_tensors moves args to CPU. The explicit kernel below avoids the cycle.
+fallback_ops.append(aten.index.Tensor)
 
 
 @register_fallback(["spyre::max_dim_int64_fallback"])

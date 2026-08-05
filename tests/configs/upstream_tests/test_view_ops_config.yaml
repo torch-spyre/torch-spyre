@@ -7,6 +7,7 @@ test_suite_config:
             - TestViewOps::test_as_strided_gradients
             - TestViewOps::test_contiguous_self
             - TestViewOps::test_unbind
+            - TestViewOps::test_advanced_indexing_assignment
             - TestOldViewOps::test_atleast_gradient
             - TestOldViewOps::test_contiguous
             - TestOldViewOps::test_resize_as_preserves_strides
@@ -78,7 +79,6 @@ test_suite_config:
             # ---------------------- Few tests removed from this list since its throwing a seg fault ---------------------------------
             # ------------------------------------------------------------------------------------------------------------------------
             - TestViewOps::test_advanced_indexing_nonview   # NotImplementedError: Could not run 'aten::index.Tensor_out' https://github.com/torch-spyre/torch-spyre/issues/1219
-            - TestViewOps::test_advanced_indexing_assignment   # NotImplementedError aten::_index_put_impl_ https://github.com/torch-spyre/torch-spyre/issues/692
             # - TestViewOps::test_flatten_view    # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
             - TestViewOps::test_unfold_view   # RuntimeError: Comparing, Error in codegen for ComputedBuffer https://github.com/torch-spyre/torch-spyre/issues/1226
             # - TestViewOps::test_T_view   # RuntimeError: Error: In-device copy not implemented https://github.com/torch-spyre/torch-spyre/issues/80 
