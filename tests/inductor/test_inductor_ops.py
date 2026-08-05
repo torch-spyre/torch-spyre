@@ -398,12 +398,12 @@ _SCALED_MM_SHAPES = [
 
 # scale_a, scale_b
 _SCALED_MM_PARAMS = [
-    (1.0, 1.0, 0.0),   # unit scales, no bias — baseline
-    (2.0, 1.0, 0.0),   # non-unit scale_a
-    (1.0, 3.0, 0.0),   # non-unit scale_b
-    (2.0, 3.0, 0.0),   # both non-unit scales
-    (1.0, 1.0, 5.0),   # unit scales with bias
-    (2.0, 3.0, 0.5),   # non-unit scales with bias
+    (1.0, 1.0, 0.0),  # unit scales, no bias — baseline
+    (2.0, 1.0, 0.0),  # non-unit scale_a
+    (1.0, 3.0, 0.0),  # non-unit scale_b
+    (2.0, 3.0, 0.0),  # both non-unit scales
+    (1.0, 1.0, 5.0),  # unit scales with bias
+    (2.0, 3.0, 0.5),  # non-unit scales with bias
 ]
 
 SCALED_MM_TESTS = {
@@ -6753,7 +6753,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             q_a = torch.ops.spyre.quantize_fp8_with_scale(a, scale_a)
             q_b = torch.ops.spyre.quantize_weight_fp8_with_scale(b, scale_b)
             return torch.ops.aten._scaled_mm(
-                q_a, q_b, scale_a=scale_a, scale_b=scale_b, bias=bias, out_dtype=torch.float16
+                q_a,
+                q_b,
+                scale_a=scale_a,
+                scale_b=scale_b,
+                bias=bias,
+                out_dtype=torch.float16,
             )
 
         def pytorch_fn(a, b, scale_a, scale_b, bias):
