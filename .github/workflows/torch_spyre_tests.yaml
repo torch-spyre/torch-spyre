@@ -1,5 +1,9 @@
 name: tests
 
+# One of torch-spyre's four "trunk" (push-to-main) workflows -- see
+# model_ops_tests.yaml, upstream_tests.yaml, upstream_tests_beta.yaml for the
+# others. A push run passes test_type: trunk (below) so it's distinguishable
+# from a manually-dispatched full run once tier-tagging reaches ClickHouse.
 on:
   push:
     branches: [main]
@@ -100,10 +104,13 @@ jobs:
   #
   # Only runs when `changes.code_changed == 'true'`. For docs-only PRs the
   # reusable workflow is never invoked — no hardware runners are consumed.
+  # Also skipped when `integration-test` is labeled -- spyre-framework handles it
   # ---------------------------------------------------------------------------
   run-tests:
     needs: changes
-    if: needs.changes.outputs.code_changed == 'true'
+    if: |
+      needs.changes.outputs.code_changed == 'true' &&
+      !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'integration-test'))
     uses: ./.github/workflows/_test_matrix.yaml
     with:
       runner_label: linux
@@ -117,7 +124,7 @@ jobs:
       rpm_location: ${{ inputs.rpm_location || '' }}
       rpm_names: ${{ inputs.rpm_names || '' }}
       build_torch_spyre: ${{ inputs.build_torch_spyre == true }}
-      test_type: ${{ inputs.test_type || 'full' }}
+      test_type: ${{ inputs.test_type || (github.event_name == 'push' && 'trunk' || 'full') }}
 
   # ---------------------------------------------------------------------------
   # Job 3: run-spyre-unit-tests (required check gate)
@@ -130,12 +137,16 @@ jobs:
   #   run-tests result = success -> all suites passed      -> green
   #   run-tests result = skipped -> docs-only PR, no tests -> green (instant)
   #   run-tests result = failure -> one or more suites bad -> red   (blocks merge)
+  #
+  # For an `integration-test`-labeled PR this job doesn't run at all
   # ---------------------------------------------------------------------------
   run-spyre-unit-tests:
     name: Run Spyre unit tests
     runs-on: ubuntu-latest
     needs: [changes, run-tests]
-    if: always()
+    if: |
+      always() &&
+      !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'integration-test'))
     steps:
       - name: Evaluate test results
         run: |-

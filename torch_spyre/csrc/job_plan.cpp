@@ -19,11 +19,12 @@
 #include <iostream>
 #include <memory>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "spyre_allocator.h"
 #include "spyre_stream.h"
-#include "util/processSpyreCodeArtifacts.h"
+#include "spyrecode-host-functions/processSpyreCodeArtifacts.h"
 
 namespace spyre {
 
@@ -40,24 +41,67 @@ void JobPlanStepH2D::construct(LaunchContext&,
 void JobPlanStepH2D::write(std::ostream& os) const {
   os << "  H2D (Host-to-Device)\n";
   os << "    Host address: " << host_address_ << "\n";
-  os << "    Device address: " << device_address_ << "\n";
+  os << "    Device CompositeAddress: " << device_address_ << "\n";
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")
      << "\n";
 }
 
-void JobPlanStepD2H::construct(LaunchContext&,
+void JobPlanStepD2H::construct(LaunchContext& ctx,
                                const SpyreStream& stream) const {
-  auto* params =
-      flex::createDmaParams(host_address_, device_address_.total_size(),
-                            /*to_device=*/false, &device_address_);
-  params->pipeline_barrier = pipeline_barrier_;
-  stream.launchD2H(params);
-  flex::destroyDmaParams(params);
+  if (std::holds_alternative<flex::CompositeAddress>(device_address_)) {
+    const auto& device_address =
+        std::get<flex::CompositeAddress>(device_address_);
+    auto* params =
+        flex::createDmaParams(host_address_, device_address.total_size(),
+                              /*to_device=*/false, &device_address);
+    params->pipeline_barrier = pipeline_barrier_;
+    stream.launchD2H(params);
+    flex::destroyDmaParams(params);
+  } else {
+    const uint64_t dmva = std::get<Dmva>(device_address_).value;
+    auto segment_id = flex::dmvaToSegmentId(dmva);
+    TORCH_CHECK(segment_id < ctx.inputs_outputs.size(),
+                "D2H tensor-segment lookup out of range: segment ", segment_id,
+                " but only ", ctx.inputs_outputs.size(),
+                " launch args were provided");
+    const auto& tensor = ctx.inputs_outputs.at(segment_id);
+    const auto& tensor_address =
+        static_cast<SharedOwnerCtx*>(tensor.storage().data_ptr().get_context())
+            ->composite_addr;
+    TORCH_CHECK(tensor_address.chunks().size() == 1,
+                "Tensor address must have 1 chunk");
+    const auto& base_chunk = tensor_address.chunks()[0];
+    uint64_t segment_offset = dmva - (segment_id << flex::SEGMENT_SIZE_BITS);
+    TORCH_CHECK(segment_offset + size_ <= tensor_address.total_size(),
+                "D2H transfer out of bounds: offset ", segment_offset,
+                " + size ", size_, " exceeds tensor allocation size ",
+                tensor_address.total_size());
+    flex::LogicalAddress offset_addr(base_chunk.addr.region_id,
+                                     base_chunk.addr.offset + segment_offset);
+    flex::Chunk offset_chunk(offset_addr, size_, base_chunk.domain_id);
+
+    // Create shared_ptr to manage lifetime - will be kept alive by callback
+    auto device_address =
+        std::make_shared<flex::CompositeAddress>(offset_chunk);
+
+    auto* params =
+        flex::createDmaParams(host_address_, device_address->total_size(),
+                              /*to_device=*/false, device_address.get());
+    params->pipeline_barrier = pipeline_barrier_;
+    params->callback = [device_address](void*) {};
+    stream.launchD2H(params);
+    flex::destroyDmaParams(params);
+  }
 }
 
 void JobPlanStepD2H::write(std::ostream& os) const {
   os << "  D2H (Device-to-Host)\n";
-  os << "    Device address: " << device_address_ << "\n";
+  if (std::holds_alternative<flex::CompositeAddress>(device_address_)) {
+    os << "    Device CompositeAddress: "
+       << std::get<flex::CompositeAddress>(device_address_) << "\n";
+  } else {
+    os << "    Device dmva: " << std::get<Dmva>(device_address_).value << "\n";
+  }
   os << "    Host address: " << host_address_ << "\n";
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")
      << "\n";
@@ -85,7 +129,7 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
 void JobPlanStepCompute::write(std::ostream& os) const {
   os << "  Device Compute\n";
   os << "    Name: " << (name_.empty() ? "(unnamed)" : name_) << "\n";
-  os << "    Program address: " << program_address_ << "\n";
+  os << "    Program CompositeAddress: " << program_address_ << "\n";
   os << "    Bind I/O addresses: " << (bind_io_addresses_ ? "yes" : "no")
      << "\n";
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")

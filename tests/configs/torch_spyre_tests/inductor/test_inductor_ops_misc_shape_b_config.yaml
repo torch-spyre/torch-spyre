@@ -17,6 +17,9 @@ test_suite_config:
         - names:
             # shape ops
             - TestOps::test_flatten.*
+            # flip: non-stick dims reverse via index_select; the stick-dim
+            # cases are strict xfails inside the test itself
+            - TestOps::test_flip.*
             - TestOps::test_permute.*
             - TestOps::test_unbind.*
             - TestOps::test_size_one.*
@@ -35,6 +38,7 @@ test_suite_config:
             # dtype conversion — test_to_dtype.* covers test_to_dtype_op_map too
             - TestOps::test_to_dtype.*
             - TestOps::test_round_trip_to_dtype.*
+            - TestOps::test_reduction_with_to_dtype.*
             - TestOps::test_add_constant.*
             - TestOps::test_repeat.*
             - TestOps::test_restickify_fp32_unsupported_xfail

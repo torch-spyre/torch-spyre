@@ -18,11 +18,43 @@ from . import config
 
 import threading
 from functools import wraps
+from typing import Any
 
 from .propagate_hints import spyre_hint, get_op_hints  # noqa: F401
 from torch_spyre.profiler._ffdc import CATEGORY_COMPILE, try_collect
 
 _autoload_lock = threading.Lock()
+
+
+def _spyre_inner_compile(*args: Any, **kwargs: Any) -> Any:
+    """Wrapper around ``compile_fx_inner`` that pins a picklable ``get_decomp_fn``.
+
+    Background: passing ``decompositions=<dict>`` to ``compile_fx`` causes it
+    to wrap the dict in a local ``def get_decomp_fn`` closure (compile_fx.py).
+    That closure is unpicklable, so the FX graph cache silently bypasses
+    itself with ``BypassFxGraphCache("Failed to pickle cache key")``.
+
+    Two-stage decomposition design (these are not contradictory):
+
+    * Outer stage — ``enable_spyre_compile_fx_wrapper``'s ``_wrapper`` DOES pass
+      ``decompositions=get_spyre_decomp_table()`` to ``compile_fx``. That dict
+      only feeds AOTAutograd's joint-graph decomposition; it is consumed before
+      the FX graph cache key is built, so its unpicklable ``get_decomp_fn``
+      closure is never part of the cache key.
+
+    * Inner stage — this wrapper (installed as ``inner_compile``) never receives
+      ``decompositions=``. Instead it clobbers ``get_decomp_fn`` at call time
+      with the module-level ``get_spyre_decomp_table`` — a picklable,
+      name-resolvable callable — so the post-AOT inner compile decomposes with
+      the same table while keeping the FX graph cache key picklable.
+
+    NOTE: We are working on improving this in upstream PyTorch
+    """
+    from torch._inductor.compile_fx import compile_fx_inner
+    from torch_spyre._inductor.decompositions import get_spyre_decomp_table
+
+    kwargs["get_decomp_fn"] = get_spyre_decomp_table
+    return compile_fx_inner(*args, **kwargs)
 
 
 def enable_spyre_compile_fx_wrapper():
@@ -101,31 +133,31 @@ def enable_spyre_compile_fx_wrapper():
 
         @wraps(_orig)
         def _wrapper(gm, example_inputs, *args, **kwargs):
-            decomps = kwargs.setdefault(
-                "decompositions", torch._inductor.decomposition.decompositions
-            )
             uses_spyre = _uses_spyre(gm, example_inputs)
 
             try:
                 if uses_spyre:
                     torch.spyre._impl._lazy_init()
+                    # AOTAutograd uses the dict passed via ``decompositions=``
+                    # to decompose the joint graph; Spyre-specific
+                    # decompositions must be applied at this stage so ops like
+                    # aten.logical_not / aten.ceil / aten.sign are reduced to
+                    # primitives the Spyre OpFuncs handler implements.
+                    from torch_spyre._inductor.decompositions import (
+                        get_spyre_decomp_table,
+                    )
 
-                    with enable_spyre_context(
-                        example_inputs, decomps=decomps
-                    ) as spyre_context_decompositions:
-                        # The `decomps` is the updated in the context manager
-                        # with the appropriate spyre decompositions
-                        # and yielded as `spyre_context_decompositions` from the CM
+                    kwargs.setdefault("decompositions", get_spyre_decomp_table())
+                    # Route inner compilation through _spyre_inner_compile,
+                    # which re-binds ``get_decomp_fn`` to a picklable
+                    # module-level callable so the FX graph cache key stays
+                    # serializable.
+                    kwargs.setdefault("inner_compile", _spyre_inner_compile)
+                    with enable_spyre_context(example_inputs):
+                        return _orig(gm, example_inputs, *args, **kwargs)
 
-                        kwargs["decompositions"] = spyre_context_decompositions
-                        return _orig(
-                            gm,
-                            example_inputs,
-                            *args,
-                            **kwargs,
-                        )
-
-                # Non-Spyre graphs: no FFDC — avoids capturing unrelated CPU compiles.
+                # Non-Spyre graphs: no FFDC — avoids capturing unrelated CPU
+                # compiles.
                 return _orig(gm, example_inputs, *args, **kwargs)
             except Exception as exc:
                 if uses_spyre:

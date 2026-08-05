@@ -614,8 +614,9 @@ Environment Variables
        ``scratchpad_planning`` pass)
    * - ``CO_OPTIMIZING_LX_PLANNING``
      - Use the co-optimizing LX allocator strategy (default ``0``)
-   * - ``SPYRE_INDUCTOR_MEMORY_PLAN``
-     - Enable HBM / device-buffer memory planning (default ``1``)
+   * - ``HBM_POOL_PLANNING``
+     - Enable HBM-pool planning for intermediates not in LX
+       (default ``1``)
    * - ``GLOBAL_STICK_OPTIMIZER``
      - Enable the global stick-dimension optimizer (default ``1``)
    * - ``SPYRE_CORE_ID_K_FAST_EMISSION``
@@ -625,17 +626,16 @@ Environment Variables
    * - ``BUNDLE_SYMBOLIC_ARGS``
      - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
        integers (default ``1``)
-   * - ``UNROLL_LOOPS``
-     - Fully unroll ``LoopSpec`` nodes into flat ``OpSpec``\s before bundle
-       generation (default ``1``; set ``0`` to keep the
-       ``scf.for`` / ``affine.apply`` path)
-   * - ``LX_BOUNDARY_CLONES``
-     - Insert boundary clones at LX scratchpad planning edges (default
-       ``0``)
    * - ``LAYOUT_SOLVER``
      - LX scratchpad layout solver strategy: ``greedy`` (default),
-       ``bestfit``, ``firstfit``, ``cpsat``.
+       ``bestfit``, ``firstfit``, ``cpsat``, ``simulated_annealing``.
        See :doc:`/compiler/scratchpad_planning`
+   * - ``SPYRE_INDUCTOR_ENABLE_REDUCTION_TILING``
+     - Enable reduction tiling in the pre-scheduling pipeline (default
+       ``1``)
+   * - ``SPYRE_LOG_PASSES``
+     - Comma-separated list of pass names after which to log the
+       op-spec IR at pipeline stage boundaries (default empty)
    * - ``MAX_BUCKETS``
      - Maximum number of work division buckets (default ``32``)
    * - ``MIN_DEFAULT_GRANULARITY``

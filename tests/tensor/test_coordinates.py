@@ -256,6 +256,48 @@ class TestUnrepresentableStickCandidates(TestCase):
         d2 = sympy.Symbol("d2", integer=True, nonnegative=True)
         self.assertEqual(device_coordinates(good, dep, None)[-1].free_symbols, {d2})
 
+    def test_reversed_dim_rejected(self):
+        # prims.rev / Tensor.flip(0) on a (4, 64) tensor reads
+        # x[64*(3 - p0) + p1], i.e. p0 carries a negative coefficient.  No
+        # device coordinate can walk a dim backwards, and the term used to be
+        # dropped silently, leaving coord=3 for every p0 (issue #3558).
+        with self.assertRaisesRegex(Unsupported, "runs backwards"):
+            compute_coordinates(
+                [4, 64],
+                [64, 1],
+                {p0: 4, p1: 64},
+                192 - 64 * p0 + p1,
+            )
+
+        # Same for a reversal of the innermost (stick) dim.
+        with self.assertRaisesRegex(Unsupported, "runs backwards"):
+            compute_coordinates(
+                [4, 64],
+                [64, 1],
+                {p0: 4, p1: 64},
+                64 * p0 - p1 + 63,
+            )
+
+        # The guard keys off the direction of travel, not the sign of ``step``:
+        # an ascending term whose ``step`` is dragged negative by a constant
+        # folded into it must still be accepted.
+        cx = compute_coordinates(
+            [4, 64],
+            [64, 1],
+            {p0: 4, p1: 64},
+            64 * p0 + p1 - 5,
+        )
+        self.assertEqual(len(cx), 2)
+
+        # The ordinary ascending access is untouched.
+        cx = compute_coordinates(
+            [4, 64],
+            [64, 1],
+            {p0: 4, p1: 64},
+            64 * p0 + p1,
+        )
+        self.assertEqual(cx, [p0, p1])
+
     def test_check_supported_input_sticks_tolerates_mixed_list(self):
         # arg with one unrepresentable candidate and one valid one: the guard
         # must not raise (it previously aborted the whole compile).
@@ -290,6 +332,21 @@ class TestTilingExprToDeviceExpr(TestCase):
         index = 512 * p0 + 1024 * 1024 * p1
         result = tiling_expr_to_device_expr([64, 1024, 64], [65536, 1, 1024], index)
         self.assertEqual(result, 32768 * p0 + 1048576 * p1)
+
+    def test_tiling_expr_bare_symbol_degenerate_substitution(self):
+        # index == p0 with coefficient 1 and no other additive term: sympy
+        # auto-simplifies Mul(1, p0) to the bare Symbol p0, so
+        # index.xreplace({p0: 1}) returns a raw Python int 1 (not
+        # sympy.Integer(1)) rather than the usual sympy numeric type -- the
+        # degenerate case that used to make the function's second .xreplace
+        # call crash with AttributeError: 'int' object has no attribute
+        # 'xreplace'. This mirrors the real _general_tile_advance call shape
+        # when a tiled dim's extent is 1 and no other term survives
+        # substitution (see tests/inductor/test_coarse_tile_e2e.py's
+        # test_hint_nested_loop_with_scratchpad).
+        index = p0
+        result = tiling_expr_to_device_expr([64, 1024, 64], [64, 4096, 1], index)
+        self.assertEqual(result, p0)
 
 
 if __name__ == "__main__":

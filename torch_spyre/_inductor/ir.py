@@ -98,7 +98,6 @@ class FixedTiledLayout(FixedLayout):
         super().__init__(device, dtype, size, stride)
         self.device_layout: SpyreTensorLayout = device_layout
         self.allocation: dict[str, Any] = {}
-        self.per_tile_fixed: bool = False
 
     def __str__(self) -> str:
         device_index_str = "" if self.device.index is None else f":{self.device.index}"
@@ -405,8 +404,9 @@ class SpyreEmptyFallback(ir.ExternKernel):
     SpyrePythonWrapperCodegen.make_buffer_allocation emits
     spyre_empty_with_layout(size, stride, dtype, device_layout) when the layout is
     a FixedTiledLayout; the placeholder FixedLayout set at construction time must be
-    replaced with a FixedTiledLayout before codegen runs (lower_pad_sequence does
-    this immediately after calling run_node).  If the layout is never upgraded the
+    replaced with a FixedTiledLayout before codegen runs.  This upgrade happens via
+    finalize_layouts (post-stickify hint-driven path) or lower_pad_sequence
+    (post-stickify span-overflow path).  If the layout is never upgraded the
     wrapper falls back to the generic CPU allocator, which is incorrect on Spyre.
     codegen() is a no-op because the allocation IS the result — there is no
     separate kernel call.
@@ -417,7 +417,7 @@ class SpyreEmptyFallback(ir.ExternKernel):
 
     def should_allocate(self) -> bool:
         layout = self.get_layout()
-        if isinstance(layout, FixedTiledLayout) and "pool" in layout.allocation:
+        if isinstance(layout, FixedTiledLayout) and "hbm_pool" in layout.allocation:
             return False
         return True
 

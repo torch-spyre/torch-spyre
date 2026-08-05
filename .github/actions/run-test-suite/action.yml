@@ -1,7 +1,8 @@
 name: Run test suite (with retry + stall watcher)
 description: >
   Runs a single run_test.sh config with up to MAX_ATTEMPTS retries,
-  a stall watchdog, and DTLOG_LEVEL=Info on the final attempt.
+  a stall watchdog, DTLOG_LEVEL=Info on retry attempts, and -n1
+  (pytest-xdist worker isolation) on the attempt following a stall.
 
 inputs:
   torch_spyre_dir:
@@ -72,6 +73,10 @@ runs:
       run: |-
         set +e
         set +o pipefail
+        # Job control: each `&` background job gets its own process group, so
+        # the stall watcher can kill TEST_PID's entire descendant tree (incl.
+        # xdist workers) via its PGID instead of only direct children.
+        set -m
 
         source "$HOME/.bashrc"
         source /etc/profile.d/ibm-aiu-setup.sh
@@ -112,6 +117,9 @@ runs:
         fi
 
         attempt=0
+        # Set by stall_watcher when it kills a hung attempt; read after `wait`
+        # to make the next attempt add -n1 (pytest-xdist worker isolation).
+        _STALLED_LAST_ATTEMPT=0
         while [[ $attempt -lt $MAX_ATTEMPTS ]]; do
           attempt=$(( attempt + 1 ))
           echo "=== Attempt ${attempt}/${MAX_ATTEMPTS}: ${{ inputs.suite_name }} ==="
@@ -130,13 +138,17 @@ runs:
                 echo "[stall-watcher] No new output for ${elapsed_stall}s (lines=${current_lines})"
                 if [[ $elapsed_stall -ge $STALL_TIMEOUT_SECS ]]; then
                   echo "[stall-watcher] STALL DETECTED — killing test child processes"
-                  # Kill the parent and ALL child processes in order
-                  # 1. Freeze the parent process so it cannot spawn anything
-                  kill -STOP "$TEST_PID" || true
-                  # 2. Kill all existing child processes
-                  pkill -P "$TEST_PID" || true
-                  # 3. Kill the frozen parent process
-                  kill -KILL "$TEST_PID" || true
+                  # Marks this attempt as stalled for the parent shell to read after `wait`.
+                  touch "${STALL_FLAG}.stalled"
+                  # Kill TEST_PID's whole process group (set -m gives it its own
+                  # PGID == TEST_PID): `pkill -P` alone only hits direct children,
+                  # missing deeper descendants in run_test.sh -> subshell -> python3
+                  # -m pytest -> xdist worker, which can survive and keep the Spyre
+                  # device open, causing "device busy" on retry.
+                  # 1. Freeze the group so it cannot spawn anything further
+                  kill -STOP -- "-$TEST_PID" || true
+                  # 2. Kill the whole frozen group
+                  kill -KILL -- "-$TEST_PID" || true
                   return
                 fi
               else
@@ -171,6 +183,13 @@ runs:
             _JUNIT_FLAG="--junit-xml=${{ inputs.junit_xml_path }}"
           fi
 
+          # Previous attempt stalled: isolate each test in its own xdist worker subprocess.
+          _XDIST_FLAG=""
+          if [[ $_STALLED_LAST_ATTEMPT -eq 1 ]]; then
+            echo "  xdist         : -n1 (previous attempt stalled)"
+            _XDIST_FLAG="-n1"
+          fi
+
           FIFO="$(mktemp -u /tmp/test_fifo_XXXXXX)"
           mkfifo "$FIFO"
 
@@ -184,7 +203,7 @@ runs:
             _PARALLEL_FLAG="--parallel"
           fi
 
-          env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" ${_PARALLEL_FLAG} ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} \
+          env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" ${_PARALLEL_FLAG} ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} ${_XDIST_FLAG} \
             >&"$FIFO_FD" 2>&1 &
           TEST_PID=$!
 
@@ -204,21 +223,26 @@ runs:
           wait "$TEE_PID" 2>/dev/null || true
           rm -f "$FIFO"
 
+          _STALLED_LAST_ATTEMPT=0
+          [[ -f "${STALL_FLAG}.stalled" ]] && _STALLED_LAST_ATTEMPT=1
+
           if [[ $TEST_EXIT -eq 0 ]]; then
             echo "=== Attempt ${attempt} PASSED ==="
             echo "${{ inputs.suite_name }} tests done"
-            rm -f "$LOG_FILE" "$STALL_FLAG" "${STALL_FLAG}.done"
+            rm -f "$LOG_FILE" "$STALL_FLAG" "${STALL_FLAG}.done" "${STALL_FLAG}.stalled"
             exit 0
           fi
 
           echo "=== Attempt ${attempt} FAILED (exit=${TEST_EXIT}) ==="
           if grep -qE "ResponseTimeout|Exceeded max iterations|Fatal Python error: Aborted|LX logout" "$LOG_FILE"; then
             echo "    --> Hardware RAS timeout detected — will retry"
+          elif [[ $_STALLED_LAST_ATTEMPT -eq 1 ]]; then
+            echo "    --> Stall detected — will retry with -n1 (xdist worker isolation)"
           else
             echo "    --> Non-hardware failure — will retry (up to ${MAX_ATTEMPTS} total)"
           fi
 
-          rm -f "$LOG_FILE" "$STALL_FLAG" "${STALL_FLAG}.done"
+          rm -f "$LOG_FILE" "$STALL_FLAG" "${STALL_FLAG}.done" "${STALL_FLAG}.stalled"
           [[ $attempt -lt $MAX_ATTEMPTS ]] && sleep 10
         done
 

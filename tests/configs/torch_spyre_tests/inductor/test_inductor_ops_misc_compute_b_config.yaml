@@ -59,6 +59,8 @@ test_suite_config:
             - TestOps::test_uniform_custom_range_cpu.*
             - TestOps::test_random_from_cpu.*
             - TestOps::test_where.*
+            # pooling
+            - TestOps::test_avg_pool2d.*
             # invalid-dim error-path tests
             - TestOps::test_core_reduction_invalid_dims_api.*
             - TestOps::test_core_reduction_invalid_dims_spyre.*

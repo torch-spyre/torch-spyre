@@ -34,7 +34,11 @@ from torch_spyre._inductor.codegen.compute_ops import (
     _symbolic_split_info,
     _tensor_has_symbolic_split,
 )
-from torch_spyre._inductor.codegen.superdsc import _resolve_sdsc_size, compile_op_spec
+from torch_spyre._inductor.codegen.superdsc import (
+    _align_pool_dim_labels,
+    _resolve_sdsc_size,
+    compile_op_spec,
+)
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 from torch_spyre._inductor.work_division import (
     _collect_symbol_metadata,
@@ -133,7 +137,7 @@ class TestSpyreConfig(InductorTestCase):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _mock_v(lower=None, upper=None, size_hint=None):
+    def _mock_v(lower=None, upper=None, optimization_hint=None):
         """
         Mock V whose ShapeEnv reports the given lower / upper bounds.
         """
@@ -141,8 +145,8 @@ class TestSpyreConfig(InductorTestCase):
             bound_sympy=lambda _e: SimpleNamespace(lower=lower, upper=upper)
         )
         sizevars = SimpleNamespace(shape_env=shape_env)
-        if size_hint is not None:
-            sizevars.size_hint = lambda _e: size_hint
+        if optimization_hint is not None:
+            sizevars.optimization_hint = lambda _e: optimization_hint
         return SimpleNamespace(graph=SimpleNamespace(sizevars=sizevars))
 
     def test_collect_symbol_metadata_opt_in(self):
@@ -169,7 +173,9 @@ class TestSpyreConfig(InductorTestCase):
         s0 = sympy.Symbol("s0", integer=True, positive=True)
         with patch(
             "torch_spyre._inductor.pass_utils.V",
-            self._mock_v(lower=sympy.Integer(2), upper=sympy.oo, size_hint=1024),
+            self._mock_v(
+                lower=sympy.Integer(2), upper=sympy.oo, optimization_hint=1024
+            ),
         ):
             self.assertEqual(_collect_symbol_metadata({s0: s0}), {})
 
@@ -253,13 +259,82 @@ class TestResolveSdscSize(InductorTestCase):
         s0 = sympy.Symbol("s0", integer=True, positive=True)
         self.assertEqual(_resolve_sdsc_size(s0, {"s0": (1024, 64)}), 1024)
 
-    def test_symbolic_not_in_bounds_falls_back_to_size_hint(self):
-        # Symbol absent from bounds → _concretize_for_sdsc → size_hint.
+    def test_symbolic_not_in_bounds_uses_guarding_hint(self):
+        # Symbol absent from bounds → _concretize_for_sdsc → guarding_hint_or_throw.
+        # The SDSC/DeepTools boundary is correctness-critical, so it must resolve
+        # the *true* concrete size (guarding_hint_or_throw), not an optimization
+        # heuristic that could silently emit a fallback (e.g. sys.maxsize).
         s0 = sympy.Symbol("s0", integer=True, positive=True)
-        sizevars = SimpleNamespace(size_hint=lambda _: 128)
+        sizevars = SimpleNamespace(guarding_hint_or_throw=lambda _: 128)
         mock_v = SimpleNamespace(graph=SimpleNamespace(sizevars=sizevars))
         with patch("torch_spyre._inductor.codegen.superdsc.V", mock_v):
             self.assertEqual(_resolve_sdsc_size(s0, {}), 128)
+
+    def test_symbolic_not_in_bounds_raises_on_unbacked(self):
+        # An unbacked symbol at the SDSC boundary must fail loudly rather than
+        # produce a bogus concrete size, so guarding_hint_or_throw's raise
+        # propagates out of _concretize_for_sdsc.
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+
+        def _raise(_e):
+            raise RuntimeError("unbacked symbol at SDSC boundary")
+
+        sizevars = SimpleNamespace(guarding_hint_or_throw=_raise)
+        mock_v = SimpleNamespace(graph=SimpleNamespace(sizevars=sizevars))
+        with patch("torch_spyre._inductor.codegen.superdsc.V", mock_v):
+            with self.assertRaises(RuntimeError):
+                _resolve_sdsc_size(s0, {})
+
+
+class TestAlignPoolDimLabels(InductorTestCase):
+    """Unit tests for superdsc._align_pool_dim_labels.
+
+    Survival of each pool dim role is derived from the node's live NCHW output
+    ranges [N, C, H_out, W_out]; statically size-1 output dims are dropped from
+    the emitted (NHWC) label list.  Window dims always survive (kH>1, kW>1 is
+    guaranteed by the lowering delegation guard).  These cases mirror the shapes
+    exercised by the hardware-only test_avg_pool2d_base.
+    """
+
+    def test_all_dims_present(self):
+        # N=2, C=3, H_out=W_out=8 -> every role survives.
+        labels = _align_pool_dim_labels((2, 3, 8, 8), 6)
+        self.assertEqual(labels, ["mb", "i", "j", "out", "ki", "kj"])
+
+    def test_batch_dropped(self):
+        # N=1 -> "mb" filtered out; iteration space rank 5.
+        labels = _align_pool_dim_labels((1, 3, 8, 8), 5)
+        self.assertEqual(labels, ["i", "j", "out", "ki", "kj"])
+
+    def test_channel_dropped(self):
+        # C=1 -> "out" filtered out; iteration space rank 5.
+        labels = _align_pool_dim_labels((2, 1, 8, 8), 5)
+        self.assertEqual(labels, ["mb", "i", "j", "ki", "kj"])
+
+    def test_batch_and_channel_dropped(self):
+        # N=1 and C=1 -> both "mb" and "out" filtered out; rank 4.
+        labels = _align_pool_dim_labels((1, 1, 8, 8), 4)
+        self.assertEqual(labels, ["i", "j", "ki", "kj"])
+
+    def test_symbolic_dims_never_dropped(self):
+        # A symbolic (dynamic) output dim must not be treated as size-1.
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+        labels = _align_pool_dim_labels((s0, 3, 8, 8), 6)
+        self.assertEqual(labels, ["mb", "i", "j", "out", "ki", "kj"])
+
+    def test_rank_mismatch_raises(self):
+        # Label count disagreeing with the reported iteration-space rank is a
+        # loud error rather than silent wrong-code.
+        with self.assertRaises(ValueError):
+            _align_pool_dim_labels((2, 3, 8, 8), 5)
+
+    def test_missing_ranges_raises(self):
+        with self.assertRaises(ValueError):
+            _align_pool_dim_labels(None, 6)
+
+    def test_wrong_rank_ranges_raises(self):
+        with self.assertRaises(ValueError):
+            _align_pool_dim_labels((2, 3, 8), 5)
 
 
 class TestSymbolKindDimension(InductorTestCase):

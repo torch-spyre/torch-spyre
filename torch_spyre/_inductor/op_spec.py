@@ -16,10 +16,10 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 from sympy import Symbol, Expr, Function
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 import torch
 
 
@@ -67,12 +67,43 @@ class SourceLoc:
         return dataclasses.asdict(self)
 
 
+ProvenanceTransformKind = Literal[
+    "rewrite", "fusion", "decomposition", "clone", "remap"
+]
+
+
+@dataclasses.dataclass(frozen=True)
+class ProvenanceTransform:
+    """One structured lower-IR transformation in a provenance history.
+
+    ``kind`` identifies the rewrite shape (for example ``fusion`` or
+    ``decomposition``); ``pass_name`` and optional ``reason`` are deliberately
+    separate so the record maps cleanly to MLIR location metadata.
+
+    Histories are immutable tuples so reconstructed buffers cannot accidentally
+    share and mutate provenance state.
+    """
+
+    kind: ProvenanceTransformKind
+    pass_name: str
+    reason: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "pass_name": self.pass_name,
+            "reason": self.reason,
+        }
+
+
 @dataclasses.dataclass(frozen=True)
 class DebugHandle:
     """Source-to-kernel provenance handle.
 
     Nestable to map onto MLIR locations: ``NameLoc(aten_op) -> SourceLoc``,
-    ``fused_from -> FusedLoc``, ``ir_chain -> CallSiteLoc`` lineage.
+    ``fused_from -> FusedLoc``, and ``ir_chain -> CallSiteLoc`` lineage.
+    ``transform_history`` retains structured lower-IR rewrite metadata rather
+    than overloading one scalar fusion label.
 
     A ``None`` ``source`` or ``aten_op`` is a *normal, expected* value, not a
     missing-data error: when an op fuses origins from several distinct source
@@ -86,7 +117,7 @@ class DebugHandle:
     aten_op: str | None
     ir_chain: tuple[str, ...]
     fused_from: tuple["DebugHandle", ...] = ()
-    fusion_context: str | None = None
+    transform_history: tuple[ProvenanceTransform, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -99,7 +130,7 @@ class DebugHandle:
             "aten_op": self.aten_op,
             "ir_chain": list(self.ir_chain),
             "fused_from": [h.to_dict() for h in self.fused_from],
-            "fusion_context": self.fusion_context,
+            "transform_history": [t.to_dict() for t in self.transform_history],
         }
 
 
@@ -115,7 +146,25 @@ class TensorArg:
         device_size: The device size (as per SpyreTensorLayout) of the Tensor
         device_coordinates: The sympy Exprs that describe how elements in the Tensor are accessed.
                 Free variables in device_coordinates refer to entries in the OpSpec's iteration_space.
-        allocation: If present, the offset in scratchpad memory assigned to the Tensor.
+        allocation: dict tagging where this Tensor's data lives. Mirrors
+                layout.allocation and carries exactly one of three
+                mutually-exclusive keys:
+                - "hbm": graph input/output or fallback-kernel input/output,
+                  addressed directly in HBM.
+                - "lx": placed in on-chip LX scratchpad by LX planning
+                  (scratchpad/allocator.py).
+                - "hbm_pool": intermediate that didn't fit in LX, bump-
+                  allocated into the off-chip HBM intermediates segment by
+                  hbm_pool_planning.py. See
+                  docs/source/compiler/hbm_pool_planning.md.
+        device_tile_advance_expr: This arg's own device-*element*-offset sympy.Expr for one
+            unit step of each tiled Inductor iteration symbol (d0, d1, ...), built by
+            SpyreKernel._general_tile_advance from CoarseTileInfo.tiled_dims_per_read /
+            output_tiled_dims's per-level (dim, extent) decisions: one term per nesting
+            level, substituted with that level's own minted symbol, reprojected to
+            device-element space via views.tiling_expr_to_device_expr, and summed into a
+            single combined Expr. This is the sole tile-advance mechanism. ``None`` for
+            ops without loop_info/coarse tiling.
     """
 
     is_input: bool
@@ -124,8 +173,11 @@ class TensorArg:
     device_size: list[int]
     device_coordinates: list[Expr]
     allocation: Any
-    per_tile_fixed: bool = False
     name: str | None = None
+    device_tile_advance_expr: Expr | None = None
+    element_arrangement: ElementArrangement = dataclasses.field(
+        default_factory=lambda: ElementArrangement.STANDARD
+    )
 
 
 @dataclasses.dataclass
@@ -153,6 +205,16 @@ class OpSpec:
             The bundle path (compile_op_spec / generate_sdsc) reverses this list to
             outermost-first and builds per-level affine.apply stride maps, mapping
             each level's strides to the correct loop variable by explicit index.
+        tiled_symbol_trip_counts: Maps each symbol appearing in tiled_symbols
+            to its own nesting level's trip count (CoarseTileInfo.loop_count
+            for that level). Used by SDSC codegen to compute each tiled
+            tensor's full pre-tiling extent as
+            (per-unit-step device element advance) * trip_count, without
+            needing a separately tracked full-extent field on TensorArg.
+            Only correct when a symbol belongs to exactly one nesting level
+            -- a symbol tiled at more than one level has no single trip
+            count this field could hold, so this is scoped to the common
+            one-level-per-symbol case -- empty for non-tiled ops.
     """
 
     op: str
@@ -161,12 +223,21 @@ class OpSpec:
     args: Sequence[TensorArg]
     op_info: dict[str, Any]
     tiled_symbols: list[list[Symbol]] = dataclasses.field(default_factory=list)
+    tiled_symbol_trip_counts: dict[Symbol, int] = dataclasses.field(
+        default_factory=dict
+    )
     # Maps PyTorch symbol name (e.g. 's97') -> (max, granularity) bounds.
     # Populated by compute_symbolic_bounds during
     # create_op_spec; empty for concrete dims.
     symbolic_dim_bounds: dict[str, tuple[int, int]] = dataclasses.field(
         default_factory=dict
     )
+    # Full logical output ranges of the write/reduction node (NCHW for pools),
+    # including unit dims.  Distinct from the squeezed, permuted iteration_space:
+    # pool codegen derives which dim roles survived (and the channel count) from
+    # these live ranges rather than a lowering-time size snapshot.  None when the
+    # node exposes no data.ranges.
+    node_output_ranges: tuple[Expr, ...] | None = None
     debug_handle: DebugHandle | None = None
 
 
@@ -252,6 +323,7 @@ def format_op_spec_list(specs: list, indent: int = 0) -> str:
                     f"arg_index={arg.arg_index}, "
                     f"device_size={arg.device_size}, "
                     f"device_coordinates={arg.device_coordinates}, "
+                    f"device_tile_advance_expr={arg.device_tile_advance_expr}, "
                     f"allocation={arg.allocation})"
                 )
             if item.tiled_symbols:

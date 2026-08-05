@@ -1,5 +1,8 @@
 name: upstream-pytorch-tests-beta
 
+# One of torch-spyre's four "trunk" (push-to-main) workflows -- see
+# torch_spyre_tests.yaml, model_ops_tests.yaml, upstream_tests.yaml for the
+# others. No test_type input here, so no trunk wiring beyond this label.
 on:
   # Run automatically on every merge to main
   push:

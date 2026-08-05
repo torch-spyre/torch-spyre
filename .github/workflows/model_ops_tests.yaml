@@ -1,5 +1,8 @@
 name: model-ops-tests
 
+# One of torch-spyre's four "trunk" (push-to-main) workflows -- see
+# torch_spyre_tests.yaml, upstream_tests.yaml, upstream_tests_beta.yaml for
+# the others. No test_type input here, so no trunk wiring beyond this label.
 on:
   # Run automatically on every merge to main
   push:
@@ -127,6 +130,10 @@ jobs:
             config: Mistral-Small-3.2-24B-Instruct-2506.yaml
           - name: Mistral Small 3.2 24B Instruct 2506 Spyre
             config: Mistral-Small-3.2-24B-Instruct-2506_spyre.yaml
+          - name: Qwen 2.5
+            config: Qwen2.5-7B-Instruct.yaml
+          - name: Qwen 2.5 7B Spyre
+            config: Qwen2.5-7B-Instruct_spyre.yaml
 
     steps:
       # Sparse checkout into the GHA workspace so the local composite
