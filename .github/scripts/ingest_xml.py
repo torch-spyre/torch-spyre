@@ -77,18 +77,12 @@ def is_benchmark_xml(root) -> bool:
     return all("benchmark" in (tc.get("classname", "")) for tc in cases)
 
 
-def parse_benchmark_xml(xml_path: Path, workflow: str = ""):
+def parse_benchmark_xml(xml_path: Path, workflow: str = "", ci_run_id: str = ""):
     """
     Parse a performance-benchmark XML into (run_meta, list[benchmark_row]).
 
     Groups the 5 per-op-shape metric cases into one perf_benchmarks row each,
     pivoting the metric values into the appropriate columns.
-
-    Args:
-        xml_path: the benchmark XML to parse.
-        workflow: caller-supplied run identity (the Jenkins caller passes
-            "jenkins-<product>-<suite>-<arch>"). Recorded on the run and folded
-            into source_file to keep the dedup key unique -- see run_meta below.
 
     Returns:
         run_meta  : dict  – data for benchmark_runs
@@ -220,10 +214,10 @@ def parse_benchmark_xml(xml_path: Path, workflow: str = ""):
             }
         )
 
-    # dedup key: bare basename collides across arches and nights
-    source_file = "/".join(
-        p for p in (workflow, created_at.strftime("%Y%m%dT%H%M%SZ"), xml_path.name) if p
-    )
+    # dedup key: bare basename collides across arches and nights. ci_run_id is
+    # stable per run, so a re-ingest of the same file is still a no-op.
+    run_key = ci_run_id or created_at.strftime("%Y%m%dT%H%M%SZ")
+    source_file = "/".join(p for p in (workflow, run_key, xml_path.name) if p)
 
     run_meta = {
         "source_file": source_file,
@@ -673,7 +667,9 @@ def main():
         # ── Dispatch: benchmark vs test-result ─────────────────────────────
         if is_benchmark_xml(root):
             print("  Detected: performance benchmark XML")
-            run_meta, benchmarks = parse_benchmark_xml(xml_path, args.workflow)
+            run_meta, benchmarks = parse_benchmark_xml(
+                xml_path, args.workflow, args.run_id
+            )
             if run_meta is None:
                 continue
 
