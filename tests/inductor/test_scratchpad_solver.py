@@ -581,6 +581,20 @@ class BaseLayoutSolverTests:
         with self.assertRaises(AssertionError):
             _assert_in_place_relationships([p, c])
 
+    def test_uses_must_be_strictly_increasing(self):
+        # One distinct index per accessing op. A repeat would describe a buffer
+        # written and read by the same operation, i.e. with a single live tick,
+        # and would make read_count overstate the reads.
+        with self.assertRaises(AssertionError):
+            LifetimeBoundBuffer("P", 20, [3, 3])
+        with self.assertRaises(AssertionError):
+            LifetimeBoundBuffer("P", 20, [4, 3])
+        LifetimeBoundBuffer("P", 20, [3, 4])  # fine
+        LifetimeBoundBuffer("P", 20, [3])  # fine
+        # Empty is allowed: buffers may be registered before their uses are
+        # known and filled in afterwards.
+        LifetimeBoundBuffer("P", 20, [])
+
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -589,7 +603,8 @@ import json
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 from {solver_module} import {solver_class}
 def b(n, s, st, en, ipp=None):
-    return LifetimeBoundBuffer(name=n, size=s, uses=[st, en - 1], in_place_parents=ipp or [])
+    uses = [st] if en - 1 == st else [st, en - 1]
+    return LifetimeBoundBuffer(name=n, size=s, uses=uses, in_place_parents=ipp or [])
 # c has two in-place parents at distinct addresses, both in-place candidates for
 # its gap -> _build_gaps' iteration order decides in_place_parents[0].
 bufs = [b("pA", 100, 0, 3), b("pB", 80, 1, 3), b("c", 50, 2, 5, ["pA", "pB"])]

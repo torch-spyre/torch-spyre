@@ -45,13 +45,23 @@ class LifetimeBoundBuffer:
     """
     Defines the data fields required for a plan solver.
 
-    ``uses`` is the sorted list of operation indices at which the buffer is
-    accessed (as returned by ``calculate_liveness``).  It must be non-empty:
-    the ``start_time``/``end_time`` properties index into it and the
-    FirstFit/BestFit scoring divides by ``len(uses)``, so callers must only
-    construct buffers for names that are actually used.  ``first_use_is_read``
-    is True for graph inputs (all accesses are reads) and False for computed
-    buffers (first access is a write, all subsequent accesses are reads).
+    ``uses`` is the strictly increasing list of operation indices at which the
+    buffer is accessed (as returned by ``calculate_liveness``).  It is normally
+    non-empty, and callers that read ``start_time``/``end_time`` require that,
+    since those properties index into it; the FirstFit/BestFit scoring divides
+    by ``len(uses)`` plus a write bonus, which is non-zero for a computed buffer
+    even when ``uses`` is empty.  Emptiness is nevertheless allowed at
+    construction -- see :meth:`__post_init__` for the registration state that
+    needs it.  ``first_use_is_read`` is True for graph inputs (all accesses are
+    reads) and False for computed buffers (first access is a write, all
+    subsequent accesses are reads).
+
+    Both properties of ``uses`` are asserted in ``__post_init__``.  Strictness
+    is what makes ``read_count`` trustworthy: one entry per accessing op means
+    ``read_count == 0`` is exactly "written, never read", which the in-place
+    invariants rely on (see :func:`assert_in_place_parent_is_read`).  A repeated
+    index would describe a buffer written and read by the same op, i.e. with a
+    single live tick, and would let such a buffer pass as an in-place parent.
 
     ``start_time`` and ``end_time`` are convenience properties derived from
     ``uses``: ``uses[0]`` and ``uses[-1] + 1`` respectively.
@@ -67,9 +77,26 @@ class LifetimeBoundBuffer:
     # or solver logic paths.
     residency_reason: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        # Not also asserted non-empty: buffers are sometimes registered before
+        # their uses are known and filled in afterwards (see
+        # ``make_buffer_registry`` in tests/inductor/test_scratchpad_patterns.py),
+        # and an empty list is vacuously strictly increasing. Callers that read
+        # ``start_time``/``end_time`` still require a non-empty list.
+        #
+        # This runs at construction only, so it does not see later mutation of
+        # ``uses``; the in-place invariants therefore test the property they need
+        # directly rather than inferring it from ``read_count``.
+        assert all(a < b for a, b in zip(self.uses, self.uses[1:])), (
+            f"buffer {self.name} has uses={self.uses}, which is not strictly "
+            "increasing; uses carries one distinct index per accessing operation"
+        )
+
     @property
     def read_count(self) -> int:
-        """Reports the number of reads base on the number of uses."""
+        """Number of reads: every use but the first, which is the producing
+        write for a computed buffer.  Exact because ``uses`` holds one distinct
+        index per accessing op."""
         return max(0, len(self.uses) - 1)
 
     @property

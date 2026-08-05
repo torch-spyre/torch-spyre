@@ -56,10 +56,13 @@ def _random_buffers(rng, n, horizon=12, max_size=200, inplace_prob=0.25):
             parent_i = rng.randrange(child_i)
             parent = buffers[parent_i]
             child = buffers[child_i]
-            if parent.end_time > child.end_time:
-                child.uses = [parent.end_time - 1]
-            else:
-                child.uses = [parent.end_time - 1, child.end_time - 1]
+            # The child is defined at the parent's last live tick, so that
+            # parent.end_time == child.start_time + 1. Its own read has to fall
+            # strictly after that write, both because uses is strictly increasing
+            # and so that the child can itself act as an in-place parent; extend
+            # by a tick when the child's own end is too early to supply one.
+            handoff = parent.end_time - 1
+            child.uses = [handoff, max(child.end_time - 1, handoff + 1)]
             child.size = rng.randint(1, parent.size)
             child.in_place_parents = [parent.name]
     return buffers
@@ -178,10 +181,15 @@ def _above_named(plan, name):
 
 
 def _buf(name, size, start, end, in_place_parents=None):
+    # A lifetime of [start, end) is expressed as a write at start and a read at
+    # end - 1. When end == start + 1 those are the same operation, so the buffer
+    # has a single use: uses carries one distinct index per accessing op (see
+    # LifetimeBoundBuffer), and such a buffer is written without being read.
+    uses = [start] if end - 1 == start else [start, end - 1]
     return LifetimeBoundBuffer(
         name=name,
         size=size,
-        uses=[start, end - 1],
+        uses=uses,
         in_place_parents=in_place_parents or [],
     )
 
@@ -307,7 +315,10 @@ class ReferencePlacementTests(TestCase):
         buffers = [_buf("a", 64, 0, 1), _buf("b", 64, 2, 3), _buf("c", 64, 4, 5)]
         plan = self.plan(buffers, [0, 1, 2])
         self.assertEqual([_addr(plan, n) for n in "abc"], [0, 0, 0])
-        self.assertEqual(plan.quality(), 480)  # 2.5 * (64 + 64 + 64)
+        # Each buffer lives for a single tick, so it has one use (its write) and
+        # weight 1 + 0.5. Contrast test_overlapping_lifetimes_stack, whose
+        # two-tick buffers carry a write and a read and so weigh 2 + 0.5.
+        self.assertEqual(plan.quality(), 288)  # 1.5 * (64 + 64 + 64)
 
     def test_overlapping_lifetimes_stack(self):
         buffers = [_buf("a", 64, 0, 2), _buf("b", 50, 1, 3)]
