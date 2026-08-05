@@ -31,10 +31,12 @@ from torch._inductor.ir import (
     ReinterpretView,
 )
 from torch._inductor.graph import GraphLowering
+from torch._inductor.dependencies import MemoryDep
 
 from torch_spyre._inductor.pass_utils import (
     apply_splits_from_index_coeff,
     concretize_expr,
+    indirect_info_from_op,
     iteration_space_from_op,
     splits_by_index_coeff,
     op_read_writes,
@@ -229,6 +231,40 @@ class ScratchpadAllocator:
         ``LifetimeBoundBuffer.read_count``."""
         return max(0, len(uses) - 1)
 
+    @staticmethod
+    def _is_index_or_indirectly_accessed(
+        graph: GraphLowering,
+        name: str,
+        uses: list[int],
+        op: Optional[Operation],
+    ) -> bool:
+        """True if ``name`` is an index tensor, or is itself accessed
+        indirectly (a gather/scatter value tensor), on either side of its
+        lifetime: as ``op``'s own indirect write (a Scatter target), or as a
+        read/index operand of any consumer in ``uses``.
+
+        Both the index tensor and the tensor it indexes into must stay off
+        the scratchpad and resolve from HBM instead.
+        """
+        if isinstance(op, ComputedBuffer):
+            writes = op_read_writes(op).writes
+            if any(isinstance(dep, MemoryDep) and dep.is_indirect() for dep in writes):
+                return True
+        for u in uses:
+            consumer = graph.operations[u]
+            if not isinstance(consumer, ComputedBuffer):
+                continue
+            index_names, _, _ = indirect_info_from_op(consumer)
+            if name in index_names:
+                return True
+            reads = op_read_writes(consumer).reads
+            if any(
+                dep.name == name and isinstance(dep, MemoryDep) and dep.is_indirect()
+                for dep in reads
+            ):
+                return True
+        return False
+
     def _buffer_residency_reason(
         self,
         graph: GraphLowering,
@@ -283,6 +319,10 @@ class ScratchpadAllocator:
             return restickify
         if any(isinstance(graph.operations[u], ExternKernel) for u in uses):
             return "extern kernel user"
+        if self._is_index_or_indirectly_accessed(graph, name, uses, op):
+            # Index tensors and the value tensors they index into are read via
+            # data-dependent (indirect) addressing, must stay in hbm.
+            return "index tensor or indirectly accessed"
         if name in graph_output_names:
             # A graph output normally can't reside (the value must land back in
             # HBM), but with boundary cloning on it is pinned via an output clone
@@ -334,6 +374,8 @@ class ScratchpadAllocator:
             return "graph input (no clone)"
         if self._read_count(uses) == 0:
             return "no consumer reads it from LX"
+        if self._is_index_or_indirectly_accessed(graph, name, uses, None):
+            return "index tensor or indirectly accessed"
         if not GraphEditor.all_uses_are_rewritable(graph, uses):
             return "use is not rewritable to the clone"
         if buffer_not_read_in_full(graph, name):

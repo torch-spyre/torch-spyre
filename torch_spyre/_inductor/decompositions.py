@@ -32,7 +32,7 @@ from typing import Any, Callable, Optional, Sequence, Union
 import torch
 import torch._decomp as decomp
 
-from .constants import DEVICE_NAME, FP8_E4M3_MAX
+from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from .errors import Unsupported
 from . import config
 from . import customops  # noqa: F401
@@ -928,8 +928,18 @@ def spyre_quantize_fp8_with_scale(
 ) -> torch.Tensor:
     inv_scale = torch.reciprocal(scale)
     x_scaled = input * inv_scale
-    x_clamped = torch.ops.spyre.clamp(x_scaled, -FP8_E4M3_MAX, FP8_E4M3_MAX)
+    x_clamped = torch.ops.spyre.clamp(x_scaled, FP8_E4M3FN_MIN, FP8_E4M3FN_MAX)
     return torch.ops.spyre.qfp8ch(x_clamped)
+
+
+@register_spyre_decompositions([torch.ops.spyre.quantize_weight_fp8_with_scale])
+def spyre_quantize_weight_fp8_with_scale(
+    input: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    inv_scale = torch.reciprocal(scale)
+    x_scaled = input * inv_scale
+    x_clamped = torch.ops.spyre.clamp(x_scaled, FP8_E4M3FN_MIN, FP8_E4M3FN_MAX)
+    return torch.ops.spyre.qfp8wt(x_clamped)
 
 
 @register_spyre_decompositions([torch.ops.aten.prod.dim_int])

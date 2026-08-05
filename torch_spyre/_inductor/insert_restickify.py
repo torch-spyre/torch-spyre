@@ -29,6 +29,7 @@ from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
     InputBuffer,
+    IRNode,
     MutationLayoutSHOULDREMOVE,
     Operation,
     ReinterpretView,
@@ -94,7 +95,16 @@ def _create_restickify_node(
     Inserts a spyre.restickify call into the FX graph, lowers it via
     graph_lowering.run_node(), and assigns the target layout.  Returns
     (old_buffer_name, new_computed_buffer).
+
+    For synthetically-created buffers that have no FX node (e.g.
+    coarse_tile_read_copy_* buffers created by coarse_tile.py), the FX env
+    lookup is skipped and lower_restickify is called directly with a TensorBox
+    wrapping the ComputedBuffer.
     """
+    from .lowering import (
+        lower_restickify,
+    )  # deferred: lowering.py imports insert_restickify at module level
+
     arg_name = restick_arg_info["arg_name"]
 
     graph_lowering = V.graph
@@ -114,12 +124,48 @@ def _create_restickify_node(
 
     # Search env by buffer name to find the FX node to pass to restickify.
     fx_arg_node = next(
-        fx_node
-        for fx_node, tb in graph_lowering.env.items()
-        if isinstance(fx_node, torch.fx.Node)
-        and isinstance(tb, TensorBox)
-        and tb.get_name() == arg_name
+        (
+            fx_node
+            for fx_node, tb in graph_lowering.env.items()
+            if isinstance(fx_node, torch.fx.Node)
+            and isinstance(tb, TensorBox)
+            and tb.get_name() == arg_name
+        ),
+        None,
     )
+
+    if fx_arg_node is None:
+        # Synthetically-created buffers (e.g. coarse_tile_read_copy_*) have no
+        # FX node. Build a TensorBox from the buffer and call lower_restickify
+        # directly; realize() inside lower_restickify registers the output in
+        # graph.buffers and graph.operations.
+        arg_buf = graph_lowering.get_buffer(arg_name)
+        assert isinstance(arg_buf, ComputedBuffer), (
+            f"_create_restickify_node: buffer {arg_name!r} not found in env and is "
+            f"{type(arg_buf).__name__}, not ComputedBuffer — cannot restickify"
+        )
+        arg_tb = TensorBox(StorageBox(arg_buf))
+        # Insert a synthetic FX node for origins — downstream code (e.g.
+        # _single_arg_op_layout in propagate_layouts.py) requires non-empty origins.
+        first_compute_node = next(n for n in fx_graph.nodes if n.op != "placeholder")
+        with fx_graph.inserting_before(first_compute_node):
+            restick_fx_node = fx_graph.create_node(
+                "call_function", torch.ops.spyre.restickify.default, ()
+            )
+        with (
+            IRNode.current_origins(OrderedSet([restick_fx_node])),
+            V.set_current_node(restick_fx_node),
+        ):
+            restick_tb = lower_restickify(arg_tb)
+        restick_buff = restick_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
+        assert isinstance(restick_buff, ComputedBuffer), (
+            f"Expected ComputedBuffer, got {type(restick_buff).__name__}"
+        )
+        restick_buff.origins = OrderedSet([restick_fx_node])
+        graph_lowering.env[restick_fx_node] = restick_tb
+        restick_buff.layout = restick_arg_info["target_layout"]
+        return arg_name, restick_buff
+
     # Insert at a valid position in the FX graph; the operations list order is
     # authoritative pre-scheduler, not position in the FX graph.
     first_compute_node = next(n for n in fx_graph.nodes if n.op != "placeholder")

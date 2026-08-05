@@ -139,10 +139,40 @@ jobs:
             --out     "${JSON_FILE}" \
             --log-out "${LOG_FILE}"
 
+          # Guard: skip ingest when parse produced no variant data (all-zero suites).
+          # This happens when GHA job logs are not yet available or the test run had
+          # no parseable XPASS/XFAIL lines (e.g. the run was still in progress when
+          # the ingest workflow triggered).
+          TOTAL_VARIANTS=$(python3 -c "
+          import json, sys
+          try:
+              recs = json.load(open('${JSON_FILE}'))
+              total = sum(
+                  len(op.get('variants', []))
+                  for r in recs
+                  for cat in (r.get('operations') or {}).values()
+                  for op in (cat if isinstance(cat, list) else [])
+              )
+              print(total)
+          except Exception as e:
+              print(0)
+          " 2>/dev/null || echo 0)
+
+          echo "TOTAL_VARIANTS=${TOTAL_VARIANTS}" >> "$GITHUB_ENV"
+          echo "[info] Total parsed variants: ${TOTAL_VARIANTS}"
+          if [ "${TOTAL_VARIANTS}" -eq 0 ]; then
+            echo "HAS_VARIANT_DATA=false" >> "$GITHUB_ENV"
+            echo "[warn] No variant data found in parsed JSON — skipping ClickHouse ingest to avoid overwriting good data with empty suites."
+          else
+            echo "HAS_VARIANT_DATA=true" >> "$GITHUB_ENV"
+          fi
+
       # -----------------------------------------------------------------
       # Ingest the JSON into ClickHouse (creates the table if absent).
+      # Skipped when the parse step produced no variant data.
       # -----------------------------------------------------------------
       - name: Ingest into ClickHouse
+        if: env.HAS_VARIANT_DATA == 'true'
         run: |
           source .venv/bin/activate
           python3 .github/scripts/ingest_model_ops.py \
