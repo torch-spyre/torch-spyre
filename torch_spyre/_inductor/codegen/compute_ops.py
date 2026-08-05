@@ -521,6 +521,9 @@ def _tensor_tiled_by_symbol(tensor, sym) -> bool:
     contains a minted symbol's term when this tensor genuinely advances
     at that level, so the coefficient check alone is both necessary and
     sufficient for minted symbols.
+
+    This is the sole test for whether a reference advances -- callers do
+    not pre-filter by any other per-tensor flag.
     """
     if sym in tensor.strides and tensor.scales.get(sym, 1) <= 0:
         return False
@@ -730,9 +733,10 @@ def generate_sdsc(
                 # affine.apply can never target an LX address today. A tiled
                 # (advancing) lx tensor therefore has no way to express its
                 # per-iteration address change in this preserved-loop path.
-                # per_tile_fixed lx tensors are fine: they don't advance, same as
-                # non-tiled tensors, so [{}] * n_levels is correct either way.
-                is_tiled_lx = tensor.per_tile_fixed is False and any(
+                # A non-advancing reference has no term in
+                # device_tile_advance_expr, which _tensor_tiled_by_symbol
+                # already detects directly.
+                is_tiled_lx = any(
                     _tensor_tiled_by_symbol(tensor, s)
                     for level_syms in tiled_symbols
                     for s in level_syms
@@ -875,27 +879,26 @@ def generate_sdsc(
             # whose stride describes element layout within one tile, not the advance
             # between tiles.  Tiling by a reduction-dim symbol would incorrectly
             # advance the base address of a pool output past its single allocated slot.
-            # per_tile_fixed tensors (tile-local scratch reused every iteration, see
-            # unroll.py) never advance either, regardless of allocation type.
+            # A tile-local scratch tensor reused every iteration (see unroll.py)
+            # never advances either -- it simply has no term in
+            # device_tile_advance_expr, which _tensor_tiled_by_symbol already
+            # detects directly.
             per_level_strides: list[dict] = []
             any_tiled = False
-            if not tensor.per_tile_fixed:
-                for level_idx, level_syms in enumerate(tiled_symbols):
-                    tensor_tiled_at_level = [
-                        s for s in level_syms if _tensor_tiled_by_symbol(tensor, s)
-                    ]
-                    strides_for_level: dict = {}
-                    for s in tensor_tiled_at_level:
-                        coeff = (
-                            coeff_through_floor(tensor.device_tile_advance_expr, s)
-                            if tensor.device_tile_advance_expr is not None
-                            else 0
-                        )
-                        strides_for_level[s] = int(coeff) * nb
-                        any_tiled = True
-                    per_level_strides.append(strides_for_level)
-            else:
-                per_level_strides = [{} for _ in tiled_symbols]
+            for level_idx, level_syms in enumerate(tiled_symbols):
+                tensor_tiled_at_level = [
+                    s for s in level_syms if _tensor_tiled_by_symbol(tensor, s)
+                ]
+                strides_for_level: dict = {}
+                for s in tensor_tiled_at_level:
+                    coeff = (
+                        coeff_through_floor(tensor.device_tile_advance_expr, s)
+                        if tensor.device_tile_advance_expr is not None
+                        else 0
+                    )
+                    strides_for_level[s] = int(coeff) * nb
+                    any_tiled = True
+                per_level_strides.append(strides_for_level)
             if not any_tiled:
                 # Non-tiled HBM: register per-core addresses.
                 for c in range(sdsc_spec.num_cores):
