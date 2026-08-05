@@ -145,19 +145,28 @@ class TestSpyreProfiler(TestCase):
 
     @unittest.skipUnless(Test_spyre, "requires spyre device")
     def test_no_zero_timestamp_or_duration(self) -> None:
-        """Verify no Chrome trace event has ts == 0 or dur == 0 after add/gelu/sum ops."""
+        """Verify no Chrome trace event has ts == 0 or dur == 0 after scaled_dot_product_attention."""
         import os
         import tempfile
 
         device = torch.device("spyre")
-        x, y = (torch.rand((4, 4), dtype=torch.float16).to(device) for _ in range(2))
+        B, H, S, D = 1, 4, 16, 32
+        q = torch.rand(B, H, S, D, dtype=torch.float16).to(device)
+        k = torch.rand(B, H, S, D, dtype=torch.float16).to(device)
+        v = torch.rand(B, H, S, D, dtype=torch.float16).to(device)
+
+        def fn(q, k, v):
+            return F.scaled_dot_product_attention(q, k, v)
+
+        compiled_fn = torch.compile(fn, backend="inductor")
+        # Warm up: trigger compilation outside the profiled region.
+        compiled_fn(q, k, v)
 
         with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+            acc_events=True,
         ) as prof:
-            z = torch.add(x, y)
-            z = F.gelu(z)
-            z = torch.sum(z)
+            compiled_fn(q, k, v)
 
         fd, trace_path = tempfile.mkstemp(suffix=".json")
         os.close(fd)
