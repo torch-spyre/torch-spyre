@@ -16,3 +16,7 @@ test_suite_config:
             - TestSpyreProfiler::test_event_list
             - TestSpyreProfiler::test_profiler_timestamp_consistency
           mode: mandatory_success
+        - names:
+            - TestMemoryProfilerTimeline::test_memory_timeline_no_id_spyre
+            - TestMemoryProfilerTimeline::test_memory_timeline_no_id_cpu
+          mode: mandatory_success
