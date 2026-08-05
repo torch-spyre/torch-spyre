@@ -25,8 +25,10 @@ d = torch.rand(64, 256, dtype=torch.float16)  # M N
 
 
 def f(a, b, c, d):
-    with spyre_hint(tiles={"K": 2}):
-        with spyre_hint(tiles={"M": 4}):
+    # tile_size_per_dim declares the PER-TILE extent, not the number of tiles:
+    # K=128 in tiles of 64 (2 tiles), M=64 in tiles of 16 (4 tiles).
+    with spyre_hint(tile_size_per_dim={"K": 64}):
+        with spyre_hint(tile_size_per_dim={"M": 16}):
             x = a + b
         y = x @ c
     return y + d

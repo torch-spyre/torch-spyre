@@ -1809,8 +1809,8 @@ def test_copy_running_max_4d_H4_Lq4():
         real_max = torch.full(
             (B, H, Lq), float("-inf"), device=scores.device, dtype=scores.dtype
         )
-        with spyre_hint(num_tiles_per_dim={"H": H // h_block_size}):
-            with spyre_hint(num_tiles_per_dim={"Lq": Lq // lq_block_size}):
+        with spyre_hint(tile_size_per_dim={"H": h_block_size}):
+            with spyre_hint(tile_size_per_dim={"Lq": lq_block_size}):
                 with spyre_hint(
                     expected_named_dims=["B", "H", "Lq"], expected_reduction_dims=["Lk"]
                 ):
@@ -2576,6 +2576,13 @@ def _flash_v1_fn(
         denominator = torch.zeros(
             (B, H, Lq), device=queries.device, dtype=torch.float16
         )
+    # These stay on num_tiles_per_dim deliberately.  A tile SIZE must be given in
+    # the units of the LOOP VAR the dim lands on, and that grouping is
+    # shape-dependent: with B=1 the backend folds B in with H onto one loop var
+    # of extent B*H, so "B" would need (B//b_tiles)*H rather than B//b_tiles --
+    # and in _flash_v4_fn both Lq and Lk come from S.  A helper parameterised
+    # over many shapes cannot write that as a fixed expression.  A COUNT is
+    # invariant to which loop var a name lands on; a size is not.  See #3520.
     with spyre_hint(num_tiles_per_dim={"B": b_tiles}):
         with spyre_hint(num_tiles_per_dim={"H": h_tiles}):
             with spyre_hint(num_tiles_per_dim={"Lq": lq_tiles}):
@@ -2798,6 +2805,13 @@ def _flash_v2_fn(
         device=queries.device,
         dtype=torch.float16,
     ).amax(dim=-1)
+    # These stay on num_tiles_per_dim deliberately.  A tile SIZE must be given in
+    # the units of the LOOP VAR the dim lands on, and that grouping is
+    # shape-dependent: with B=1 the backend folds B in with H onto one loop var
+    # of extent B*H, so "B" would need (B//b_tiles)*H rather than B//b_tiles --
+    # and in _flash_v4_fn both Lq and Lk come from S.  A helper parameterised
+    # over many shapes cannot write that as a fixed expression.  A COUNT is
+    # invariant to which loop var a name lands on; a size is not.  See #3520.
     with spyre_hint(num_tiles_per_dim={"B": b_tiles}):
         with spyre_hint(num_tiles_per_dim={"H": h_tiles}):
             with spyre_hint(num_tiles_per_dim={"Lq": lq_tiles}):
@@ -2991,8 +3005,8 @@ def test_flash_v2_tile_all():
 
 
 # ---------------------------------------------------------------------------
-# Flash v3: causal mask, copy_ accumulators, scores transposed, tiles= API
-# Uses num_tiles_per_dim= (normalized from tiles=) for consistency
+# Flash v3: causal mask, copy_ accumulators, scores transposed
+# Declares tile_size_per_dim= (per-tile extent), like every other site here
 # ---------------------------------------------------------------------------
 
 
@@ -3038,6 +3052,13 @@ def _flash_v3_fn(
         (B, H, Lq), float("-inf"), device=queries.device, dtype=torch.float16
     )
     denominator = torch.zeros((B, H, Lq), device=queries.device, dtype=torch.float16)
+    # These stay on num_tiles_per_dim deliberately.  A tile SIZE must be given in
+    # the units of the LOOP VAR the dim lands on, and that grouping is
+    # shape-dependent: with B=1 the backend folds B in with H onto one loop var
+    # of extent B*H, so "B" would need (B//b_tiles)*H rather than B//b_tiles --
+    # and in _flash_v4_fn both Lq and Lk come from S.  A helper parameterised
+    # over many shapes cannot write that as a fixed expression.  A COUNT is
+    # invariant to which loop var a name lands on; a size is not.  See #3520.
     with spyre_hint(num_tiles_per_dim={"B": b_tiles}):
         with spyre_hint(num_tiles_per_dim={"H": h_tiles}):
             with spyre_hint(num_tiles_per_dim={"Lq": lq_tiles}):
@@ -3249,6 +3270,13 @@ def _flash_v4_fn(q, k, v, *, B, S, H, D, b_tiles=1, h_tiles=1, lq_tiles=1, lk_ti
     output = torch.zeros_like(q)
     real_max = torch.full((B, H, S), float("-inf"), device=q.device, dtype=q.dtype)
     denominator = torch.zeros((B, H, S), device=q.device, dtype=q.dtype)
+    # These stay on num_tiles_per_dim deliberately.  A tile SIZE must be given in
+    # the units of the LOOP VAR the dim lands on, and that grouping is
+    # shape-dependent: with B=1 the backend folds B in with H onto one loop var
+    # of extent B*H, so "B" would need (B//b_tiles)*H rather than B//b_tiles --
+    # and in _flash_v4_fn both Lq and Lk come from S.  A helper parameterised
+    # over many shapes cannot write that as a fixed expression.  A COUNT is
+    # invariant to which loop var a name lands on; a size is not.  See #3520.
     with spyre_hint(num_tiles_per_dim={"B": b_tiles}):
         with spyre_hint(num_tiles_per_dim={"H": h_tiles}):
             with spyre_hint(num_tiles_per_dim={"Lq": lq_tiles}):
@@ -3681,13 +3709,15 @@ class TestCoarseTileSpyreHints(InductorTestCase):
           B=256 → 4 tiles of 64 rows each.  Iteration space per tile: [64, D].
 
         op_b = neg(y): tensor named ["B0","B1","D0","D1"] with B0×B1=B and
-          D0×D1=D.  Outer hint num_tiles_per_dim={"B0": 4} tiles dim 0 (c0,
-          range 256) into 4.  Inner hint num_tiles_per_dim={"D0": 4} tiles
-          dim 1 (c1, range 128) into 4.  Iteration space per tile: [64, 32].
-          These two stay on num_tiles_per_dim: B0/D0 are sub-dims of a fused
-          host dim, so their declared extents are the split factors (4), not
-          the host ranges (256/128), and a tile size derived from them would
-          not describe the host tile.
+          D0×D1=D.  Outer hint tiles dim 0 (c0, range 256) into 4, inner hint
+          tiles dim 1 (c1, range 128) into 4.  Iteration space per tile:
+          [64, 32].
+
+          A tile SIZE for a sub-dim name must be in HOST-dim units, which for a
+          sub-dim decomposition is just the sibling's extent: B0×B1=256 split
+          into B0=4 parts is B1=64 rows per tile.  Deriving it from B0's own
+          declared extent would give 4//4 = 1 -- a count of B0 steps per tile,
+          not an extent of anything the backend divides.
 
         Both ops form separate groups → ≥2 LoopSpec entries, each with
         count=sympify('4').
@@ -3720,8 +3750,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         def fn(x, y):
             with spyre_hint(tile_size_per_dim={"B": 64}):
                 out_x = torch.abs(x)
-            with spyre_hint(num_tiles_per_dim={"B0": 4}):
-                with spyre_hint(num_tiles_per_dim={"D0": 4}):
+            # Host-dim units: B0xB1=B split into B0=4 parts is B1 rows per tile,
+            # and likewise D1 cols.  Deriving from B0's own declared extent (4)
+            # would give 4//4 = 1, a count of B0 steps rather than an extent --
+            # see the docstring and #3520.
+            with spyre_hint(tile_size_per_dim={"B0": B1}):
+                with spyre_hint(tile_size_per_dim={"D0": D1}):
                     out_y = torch.neg(y)
             return out_x, out_y
 
@@ -4073,7 +4107,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         # The Lk hint was previously a no-op (dropped by _hints_levels bug fixed
         # on this branch).  Now that Lk tiling is correctly applied, the result
         # is numerically wrong (~90% element mismatch).  Investigate and fix
-        # before re-adding spyre_hint(num_tiles_per_dim={"Lk": lk_slices}).
+        # before re-adding spyre_hint(tile_size_per_dim={"Lk": <per-tile Lk extent>}).
 
         Decision xfail: failing in CI (Actions run 30385154736, job
         90362755639) on PR #3293. We've decided to xfail the coarse tiling
@@ -4085,14 +4119,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         from torch_spyre._inductor import spyre_hint
 
         B, H, Lq, Lk, D = 1, 8, 256, 256, 64
-        block_size = 128
 
         queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
         keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
         values_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
 
         scale = 1.0 / math.sqrt(math.sqrt(D))
-        lk_slices = Lk // block_size  # noqa: F841 — used in commented-out Lk hint
 
         def flash(queries, keys, values):
             with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
@@ -4113,7 +4145,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             ):  # 3 nested scopes exercises multi-hint logic
                 with spyre_hint(tile_size_per_dim={"H": 2}):
                     # TODO: re-enable once numerical error with Lk tiling is fixed
-                    # with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
+                    # with spyre_hint(tile_size_per_dim={"Lk": <per-tile Lk extent>}):
                     keys_T = keys.transpose(-1, -2).contiguous()
                     scores = torch.matmul(queries * scale, keys_T * scale)
                     scores = scores.transpose(-1, -2).contiguous()
@@ -4194,7 +4226,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         causal = torch.tril(torch.ones(Lq, Lk, dtype=torch.bool))
         mask_t = torch.zeros(1, 1, Lq, Lk, dtype=torch.float16)
         mask_t.masked_fill_(~causal, float("-inf"))
-        lq_slices = Lq // block_size
 
         def flash(queries, keys, values, mask):
             scale = 1.0 / math.sqrt(math.sqrt(D))
@@ -4217,7 +4248,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 tile_size_per_dim={"B": 1}
             ):  # 3 nested scopes exercises multi-hint logic
                 with spyre_hint(tile_size_per_dim={"H": 2}):
-                    with spyre_hint(num_tiles_per_dim={"Lq": lq_slices}):
+                    with spyre_hint(tile_size_per_dim={"Lq": block_size}):
                         scaled_keys = keys * scale  # B, H, Lk, D
                         keys_T = scaled_keys.transpose(-1, -2)  # B, H, D, Lk
                         scores = torch.matmul(queries * scale, keys_T)  # B, H, Lq, Lk
@@ -4303,7 +4334,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         causal = torch.tril(torch.ones(Lq, Lk, dtype=torch.bool))
         mask_t = torch.zeros(1, 1, Lq, Lk, dtype=torch.float16)
         mask_t.masked_fill_(~causal, float("-inf"))
-        lq_slices = Lq // block_size
 
         def flash(queries, keys, values, mask):
             scale = 1.0 / math.sqrt(math.sqrt(D))
@@ -4320,7 +4350,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 dtype=torch.float16,
             ).amax(dim=-1)
             with spyre_hint(tile_size_per_dim={"H": 2}):
-                with spyre_hint(num_tiles_per_dim={"Lq": lq_slices}):
+                with spyre_hint(tile_size_per_dim={"Lq": block_size}):
                     scaled_keys = keys * scale
                     keys_T = scaled_keys.transpose(-1, -2)
                     scores = torch.matmul(queries * scale, keys_T)
@@ -4425,10 +4455,10 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 (B, H, Lq), device=queries.device, dtype=torch.float16
             )
 
-            with spyre_hint(tiles={"B": B // b_block_size}):
-                with spyre_hint(tiles={"H": H // h_block_size}):
-                    with spyre_hint(tiles={"Lq": Lq // q_block_size}):
-                        with spyre_hint(tiles={"Lk": Lk // kv_block_size}):
+            with spyre_hint(tile_size_per_dim={"B": b_block_size}):
+                with spyre_hint(tile_size_per_dim={"H": h_block_size}):
+                    with spyre_hint(tile_size_per_dim={"Lq": q_block_size}):
+                        with spyre_hint(tile_size_per_dim={"Lk": kv_block_size}):
                             # with spyre_hint(work_div={"H": 4, "Lq": 8, "Lk": 8}):
                             scaled_keys = keys * scale  # B, H, Lk, D
                             keys_T = scaled_keys.transpose(-1, -2)  # B, H, D, Lk
@@ -4529,10 +4559,10 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 (B, H, Lq), device=queries.device, dtype=torch.float16
             )
 
-            with spyre_hint(tiles={"B": B // b_block_size}):
-                with spyre_hint(tiles={"H": H // h_block_size}):
-                    with spyre_hint(tiles={"Lq": Lq // q_block_size}):
-                        with spyre_hint(tiles={"Lk": Lk // kv_block_size}):
+            with spyre_hint(tile_size_per_dim={"B": b_block_size}):
+                with spyre_hint(tile_size_per_dim={"H": h_block_size}):
+                    with spyre_hint(tile_size_per_dim={"Lq": q_block_size}):
+                        with spyre_hint(tile_size_per_dim={"Lk": kv_block_size}):
                             scaled_keys = keys * scale  # B, H, Lk, D
                             keys_T = scaled_keys.transpose(-1, -2)  # B, H, D, Lk
                             scores = torch.matmul(
@@ -4619,8 +4649,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             real_max = torch.full(
                 (B, H, Lq), float("-inf"), device=scores.device, dtype=scores.dtype
             )
-            with spyre_hint(tiles={"H": H // h_block_size}):
-                with spyre_hint(tiles={"Lq": Lq // lq_block_size}):
+            with spyre_hint(tile_size_per_dim={"H": h_block_size}):
+                with spyre_hint(tile_size_per_dim={"Lq": lq_block_size}):
                     with spyre_hint(
                         expected_named_dims=["B", "H", "Lq"],
                         expected_reduction_dims=["Lk"],
@@ -4691,11 +4721,11 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             )
             denominator = torch.zeros((B, H, S), device=q.device, dtype=q.dtype)
 
-            with spyre_hint(tiles={"batch_size": max(1, B // 2)}):
-                with spyre_hint(tiles={"num_heads": max(1, H // 4)}):
-                    with spyre_hint(tiles={"max_seqlen_q": max(1, S // q_block_size)}):
+            with spyre_hint(tile_size_per_dim={"batch_size": 2}):
+                with spyre_hint(tile_size_per_dim={"num_heads": 4}):
+                    with spyre_hint(tile_size_per_dim={"max_seqlen_q": q_block_size}):
                         with spyre_hint(
-                            tiles={"max_seqlen_kv": max(1, S // kv_block_size)}
+                            tile_size_per_dim={"max_seqlen_kv": kv_block_size}
                         ):
                             scaled_keys = k * scale
                             keys_T = scaled_keys.transpose(-1, -2).contiguous()
@@ -4830,7 +4860,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         B, H, Lq, Lk, D = 1, 8, 256, 256, 64
         block_size = 128
         scale = 1.0 / math.sqrt(math.sqrt(D))
-        lk_slices = Lk // block_size  # 2
 
         queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
         keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
@@ -4865,7 +4894,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 )
             with spyre_hint(tile_size_per_dim={"B": 1}):
                 with spyre_hint(tile_size_per_dim={"H": 2}):
-                    with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
+                    with spyre_hint(tile_size_per_dim={"Lk": block_size}):
                         keys_T = keys.transpose(-1, -2).contiguous()
                         scores = torch.matmul(queries * scale, keys_T * scale)
                         scores = scores.transpose(-1, -2).contiguous()
@@ -4991,7 +5020,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         B, H, Lq, Lk, D = 1, 8, 256, 256, 64
         block_size = 128
         scale = 1.0 / math.sqrt(math.sqrt(D))
-        lk_slices = Lk // block_size  # 2
 
         queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
         keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
@@ -5024,7 +5052,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 )
             with spyre_hint(tile_size_per_dim={"B": 1}):
                 with spyre_hint(tile_size_per_dim={"H": 2}):
-                    with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
+                    with spyre_hint(tile_size_per_dim={"Lk": block_size}):
                         keys_T = keys.transpose(-1, -2).contiguous()
                         scores = torch.matmul(queries * scale, keys_T * scale)
                         scores = scores.transpose(-1, -2).contiguous()
@@ -5096,7 +5124,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         B, H, Lq, Lk, D = 1, 8, 256, 256, 64
         block_size = 128
-        lq_slices = Lq // block_size  # 2
 
         queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
         keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
@@ -5136,7 +5163,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             denominator = denominator.amax(dim=-1)  # B, H, Lq sparse
             with spyre_hint(tile_size_per_dim={"B": 1}):
                 with spyre_hint(tile_size_per_dim={"H": 2}):
-                    with spyre_hint(num_tiles_per_dim={"Lq": lq_slices}):
+                    with spyre_hint(tile_size_per_dim={"Lq": block_size}):
                         scaled_keys = keys * scale  # B, H, Lk, D
                         keys_T = scaled_keys.transpose(-1, -2)  # B, H, D, Lk
                         scores = torch.matmul(queries * scale, keys_T)  # B, H, Lq, Lk
@@ -6363,7 +6390,6 @@ def test_tiled_in_place_accumulator():
     _pnd.reset()
 
     B, H, Lq, D = 1, 8, 256, 64
-    lq_slices = Lq // 128
 
     x_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
     scale_t = torch.randn(B, H, Lq, 1, dtype=torch.float16)
@@ -6373,7 +6399,7 @@ def test_tiled_in_place_accumulator():
 
     def fn(x, scale, acc):
         with spyre_hint(tile_size_per_dim={"H": 2}):
-            with spyre_hint(num_tiles_per_dim={"Lq": lq_slices}):
+            with spyre_hint(tile_size_per_dim={"Lq": 128}):
                 block_max = torch.amax(x, dim=-1, keepdim=True)
                 acc.copy_(acc + block_max * scale)
         return acc
