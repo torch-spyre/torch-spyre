@@ -86,6 +86,7 @@ register_torch_compile_kernel(
         aten.bitwise_not,
         aten.logical_not,
         aten.bmm,
+        aten.matmul,
         aten.cat,
         aten.div,
         aten.exp,
