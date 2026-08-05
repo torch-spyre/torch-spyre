@@ -341,7 +341,6 @@ def lower_scaled_mm(
     out_dtype=None,
     use_fast_accum=False,
 ):
-
     mat1.realize()
     mat2.realize()
     mat1_loader = mat1.make_loader()
