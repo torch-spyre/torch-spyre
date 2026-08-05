@@ -220,11 +220,7 @@ def parse_benchmark_xml(xml_path: Path, workflow: str = ""):
             }
         )
 
-    # source_file is the dedup key. Every perf run emits the same basename
-    # (report.xml), so on its own it lets the FIRST run ever ingest and silently
-    # skips every later one -- including the other arches of the same night.
-    # Qualify it with the workflow (carries product/suite/arch) and the suite
-    # timestamp so each run is distinct while re-ingesting one file stays a no-op.
+    # dedup key: bare basename collides across arches and nights
     source_file = "/".join(
         p for p in (workflow, created_at.strftime("%Y%m%dT%H%M%SZ"), xml_path.name) if p
     )
@@ -659,6 +655,11 @@ def main():
     client = get_client()
     client.command("SELECT 1")
     print("Connected.\n")
+
+    # CREATE TABLE IF NOT EXISTS elsewhere won't add a column to an existing table
+    client.command(
+        "ALTER TABLE benchmark_runs ADD COLUMN IF NOT EXISTS workflow String DEFAULT ''"
+    )
 
     total_cases = 0
     total_benchmarks = 0
