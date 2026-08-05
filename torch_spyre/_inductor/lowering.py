@@ -330,7 +330,7 @@ def _ensure_synthetic_origin(result, target, args: tuple) -> None:
     buf.origins = OrderedSet([fx_node])
 
 
-@register_spyre_lowering(torch.ops.aten._scaled_mm.default)
+@register_spyre_lowering(torch.ops.aten._scaled_mm.default, type_promotion_kind=None)
 def lower_scaled_mm(
     mat1,
     mat2,
@@ -341,16 +341,6 @@ def lower_scaled_mm(
     out_dtype=None,
     use_fast_accum=False,
 ):
-    if scale_a is not None:
-        raise Unsupported("scale_a parameter in _scaled_mm is not yet supported")
-    if scale_b is not None:
-        raise Unsupported("scale_b parameter in _scaled_mm is not yet supported")
-    if bias is not None:
-        raise Unsupported("bias parameter in _scaled_mm is not yet supported")
-    if scale_result is not None:
-        raise Unsupported("scale_result parameter in _scaled_mm is not yet supported")
-    if use_fast_accum:
-        raise Unsupported("use_fast_accum parameter in _scaled_mm is not yet supported")
 
     mat1.realize()
     mat2.realize()
@@ -417,6 +407,29 @@ def lower_scaled_mm(
     )
 
     result.realize()
+
+    # Apply activation scale
+    if scale_a is not None:
+        scale_a.realize()
+        result = lowering.mul(result, scale_a)
+        result.realize()
+
+    # Apply weight scale
+    if scale_b is not None:
+        scale_b.realize()
+        result = lowering.mul(result, scale_b)
+        result.realize()
+
+    # Apply bias
+    if bias is not None:
+        bias.realize()
+        result = lowering.add(result, bias)
+        result.realize()
+
+    if scale_result is not None:
+        logger.warning("scale_result parameter in _scaled_mm is not yet supported")
+    if use_fast_accum:
+        logger.warning("use_fast_accum parameter in _scaled_mm is not yet supported")
 
     if logger.isEnabledFor(logging.DEBUG):
         result_buf = V.graph.get_buffer(result.get_name())
