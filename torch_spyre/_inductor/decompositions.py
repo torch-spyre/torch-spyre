@@ -799,7 +799,7 @@ def scaled_mm_decomp(
 ) -> torch.Tensor:
     """
     Decompose _scaled_mm into:
-    1. Raw FP8 matmul via spyre.fp8_scaled_mm (no scale/bias applied)
+    1. Raw FP8 matmul via spyre.scaled_mm (no scale/bias applied)
     2. Multiply by scale_a, if present
     3. Multiply by scale_b, if present
     4. Add bias, if present
@@ -809,7 +809,7 @@ def scaled_mm_decomp(
     separation dequantize_fp8_with_scale_decomp uses for its FP8->FP16
     conversion.
     """
-    result = torch.ops.spyre.fp8_scaled_mm(mat1, mat2, out_dtype=out_dtype)
+    result = torch.ops.spyre.scaled_mm(mat1, mat2, out_dtype=out_dtype)
 
     if scale_a is not None:
         result = result * scale_a

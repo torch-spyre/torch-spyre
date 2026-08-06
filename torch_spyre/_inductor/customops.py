@@ -716,8 +716,8 @@ def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return torch.empty(input.size(), dtype=torch.float16, device=input.device)
 
 
-@torch.library.custom_op("spyre::fp8_scaled_mm", mutates_args=(), device_types="spyre")
-def fp8_scaled_mm(
+@torch.library.custom_op("spyre::scaled_mm", mutates_args=(), device_types="spyre")
+def scaled_mm(
     mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
 ) -> torch.Tensor:  # type: ignore[empty-body]
     """
@@ -731,7 +731,7 @@ def fp8_scaled_mm(
     pass
 
 
-@fp8_scaled_mm.register_fake
+@scaled_mm.register_fake
 def _(
     mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
 ) -> torch.Tensor:

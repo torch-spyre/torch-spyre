@@ -330,8 +330,8 @@ def _ensure_synthetic_origin(result, target, args: tuple) -> None:
     buf.origins = OrderedSet([fx_node])
 
 
-@register_spyre_lowering(torch.ops.spyre.fp8_scaled_mm.default)
-def lower_fp8_scaled_mm(
+@register_spyre_lowering(torch.ops.spyre.scaled_mm.default)
+def lower_scaled_mm(
     mat1,
     mat2,
     out_dtype=None,
@@ -405,7 +405,7 @@ def lower_fp8_scaled_mm(
     if logger.isEnabledFor(logging.DEBUG):
         result_buf = V.graph.get_buffer(result.get_name())
         logger.debug(
-            f"fp8_scaled_mm: mat1{[int(s) for s in mat1_size]} @ mat2{[int(s) for s in mat2_size]} "
+            f"scaled_mm: mat1{[int(s) for s in mat1_size]} @ mat2{[int(s) for s in mat2_size]} "
             f"-> {[int(s) for s in result_buf.get_size()]}, "
             f"mat1_dtype={mat1_dtype}, mat2_dtype={mat2_dtype}, out_dtype={output_dtype}"
         )
