@@ -437,8 +437,10 @@ def _build_padding_for_tensor(conv_params):
     }
 
 
-def get_conv_params(tensor_num, dim, opfunc, conv_params, size, splits):
-    conv_padding = "nopad"
+def get_conv_params(
+    tensor_num, dim, opfunc, conv_params, size, splits, padding="nopad"
+):
+    conv_padding = padding
     total_size = size // splits
     padding_len = 0
     stride_len = 1
@@ -1185,6 +1187,7 @@ def generate_sdsc(
                 sdsc_spec.conv_params,
                 dim_size,
                 nsplits,
+                padding=_coord_padding(dim_str, is_input),
             )
             result[dim_str] = gen_coord_info_value(
                 size=size,
