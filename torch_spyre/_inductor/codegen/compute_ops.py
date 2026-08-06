@@ -1367,7 +1367,6 @@ def generate_sdsc(
                                             }
                                         }
                                         if tensor.backGap
-                                        and sdsc_spec.opfunc != DEPTHWISE_CONV2D_OP
                                         else {}
                                     ),
                                     "coordinates_": {
