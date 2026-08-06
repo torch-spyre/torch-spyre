@@ -30,7 +30,6 @@ from .constants import (
     COPY_BACK_CANDIDATE_ATTR,
     BATCH_MATMUL_FP8_OP,
     DEPTHWISE_CONV2D_OP,
-    CONV2D_DIM_LABELS,
     SHARED_WEIGHT_UNIT_BMM_CUSTOM_META_KEY,
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
@@ -638,10 +637,6 @@ def lower_convolution(x, w, stride, padding, dilation, groups):
             "total_size_j": W_in_padded,
             "kernel_h": K_h,
             "kernel_w": K_w,
-            "pad_dim_i": CONV2D_DIM_LABELS[2],
-            "pad_dim_j": CONV2D_DIM_LABELS[3],
-            "window_dim_i": CONV2D_DIM_LABELS[-2],
-            "window_dim_j": CONV2D_DIM_LABELS[-1],
             "pad_type": "padded_fullspan_wunneeded"
             if (padding[0] == 0 and padding[1] == 0)
             else "padded_nozeropad",

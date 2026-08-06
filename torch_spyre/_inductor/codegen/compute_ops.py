@@ -18,21 +18,9 @@ import dataclasses
 from sympy import Symbol
 
 from torch_spyre._C import DataFormats, encode_constant
-from torch_spyre._inductor.constants import DEPTHWISE_CONV2D_OP
+from torch_spyre._inductor.constants import CONV2D_DIM_LABELS, DEPTHWISE_CONV2D_OP
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.pass_utils import coeff_through_floor
-
-
-def _build_padding_for_tensor(conv_params):
-    """Build padding_ for tensor allocations, only when conv_params is non-empty."""
-    if not conv_params:
-        return {}
-    return {
-        "padding_": {
-            str(conv_params["pad_dim_i"]): conv_params["pad_type"],
-            str(conv_params["pad_dim_j"]): conv_params["pad_type"],
-        }
-    }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -431,6 +419,24 @@ def gen_coord_info_value(
         }
 
 
+# SDSC dim labels for the conv2d padding (output-spatial) axes.
+
+_CONV2D_PAD_DIM_I = CONV2D_DIM_LABELS[2]
+_CONV2D_PAD_DIM_J = CONV2D_DIM_LABELS[3]
+
+
+def _build_padding_for_tensor(conv_params):
+    """Build padding_ for tensor allocations, only when conv_params is non-empty."""
+    if not conv_params:
+        return {}
+    return {
+        "padding_": {
+            str(_CONV2D_PAD_DIM_I): conv_params["pad_type"],
+            str(_CONV2D_PAD_DIM_J): conv_params["pad_type"],
+        }
+    }
+
+
 def get_conv_params(tensor_num, dim, opfunc, conv_params, size, splits):
     conv_padding = "nopad"
     total_size = size // splits
@@ -438,8 +444,6 @@ def get_conv_params(tensor_num, dim, opfunc, conv_params, size, splits):
     stride_len = 1
     if tensor_num == 0 and opfunc == DEPTHWISE_CONV2D_OP:
         required_keys = [
-            "pad_dim_i",
-            "pad_dim_j",
             "stride_i",
             "stride_j",
             "kernel_h",
@@ -448,20 +452,20 @@ def get_conv_params(tensor_num, dim, opfunc, conv_params, size, splits):
         missing = [k for k in required_keys if k not in conv_params]
         if missing:
             raise ValueError(f"Missing conv_params keys: {missing}")
-        if "pad_type" in conv_params and (
-            str(dim) == str(conv_params["pad_dim_i"])
-            or str(dim) == str(conv_params["pad_dim_j"])
+        if "pad_type" in conv_params and str(dim) in (
+            str(_CONV2D_PAD_DIM_I),
+            str(_CONV2D_PAD_DIM_J),
         ):
             conv_padding = conv_params["pad_type"]
             padding_len = conv_params["pad_i"]
             stride_len = conv_params["stride_i"]
-        if "pad_dim_i" in conv_params and str(dim) == str(conv_params["pad_dim_i"]):
+        if str(dim) == str(_CONV2D_PAD_DIM_I):
             total_size = (
                 (size // splits) * conv_params["stride_i"] + conv_params["kernel_h"] - 1
             )
             padding_len = conv_params["pad_i"]
             stride_len = conv_params["stride_i"]
-        elif "pad_dim_j" in conv_params and str(dim) == str(conv_params["pad_dim_j"]):
+        elif str(dim) == str(_CONV2D_PAD_DIM_J):
             total_size = (
                 (size // splits) * conv_params["stride_j"] + conv_params["kernel_w"] - 1
             )

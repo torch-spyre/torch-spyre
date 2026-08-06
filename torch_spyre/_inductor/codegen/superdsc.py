@@ -257,10 +257,16 @@ def _calculate_device_stride(dev_dim_idx: int, device_size: list) -> int:
     return math.prod(device_size[-dev_dim_idx - 2 :])
 
 
-# SDSC dim labels for a conv2d's output-spatial (image H/W) axes. These are the
-# renamed labels from CONV2D_DIM_LABELS, so they are compared against the
-# post-symbol_mapping dim names.
-_CONV2D_SPATIAL_DIM_NAMES = ("i", "j")
+# SDSC dim labels for the conv2d padding (output-spatial) and window (kernel)
+# axes. These labels are owned by codegen -- see the note on CONV2D_DIM_LABELS in
+# constants.py -- so they are defined here rather than plumbed down from
+# ``lower_convolution`` through ``op_info``.
+_CONV2D_PAD_DIM_I = CONV2D_DIM_LABELS[2]
+_CONV2D_PAD_DIM_J = CONV2D_DIM_LABELS[3]
+_CONV2D_WINDOW_DIM_I = CONV2D_DIM_LABELS[-2]
+_CONV2D_WINDOW_DIM_J = CONV2D_DIM_LABELS[-1]
+
+_CONV2D_SPATIAL_DIM_NAMES = (_CONV2D_PAD_DIM_I, _CONV2D_PAD_DIM_J)
 
 
 def _is_conv2d_kernel_tensor(arg: TensorArg, tensor_position: int | None) -> bool:
@@ -562,15 +568,18 @@ def _conv2d_sdsc_fields(
 
     def compute_padding_for_dim(
         suffix,
-        pad_dim_key,
+        pad_dim,
         kernel_key,
         stride_key,
-        window_dim_key,
+        window_dim,
         total_size_key,
         dim_sizes=None,
     ):
-        """Compute padding fields for a single dimension (i or j)."""
-        pad_dim = conv_params[pad_dim_key]
+        """Compute padding fields for a single dimension (i or j).
+
+        ``pad_dim`` and ``window_dim`` are SDSC dim labels supplied by codegen,
+        not keys to look up in ``conv_params``.
+        """
         stride = conv_params[stride_key]
         kernel_size = conv_params[kernel_key]
         pad_amount = conv_params.get(f"pad_{suffix}", 0)
@@ -623,27 +632,27 @@ def _conv2d_sdsc_fields(
             "totalSize_": total_size,
             "stride_": stride,
             "dilation_": conv_params.get(f"dilation_{suffix}", 1),
-            "windowDim_": conv_params[window_dim_key],
+            "windowDim_": window_dim,
         }
 
     def build_padding_sizes_variant(dim_sizes=None):
         """Build paddingSizes_ for one variant (top-level or per-core)."""
         return {
-            str(conv_params["pad_dim_i"]): compute_padding_for_dim(
+            str(_CONV2D_PAD_DIM_I): compute_padding_for_dim(
                 "i",
-                "pad_dim_i",
+                _CONV2D_PAD_DIM_I,
                 "kernel_h",
                 "stride_i",
-                "window_dim_i",
+                _CONV2D_WINDOW_DIM_I,
                 "total_size_i",
                 dim_sizes,
             ),
-            str(conv_params["pad_dim_j"]): compute_padding_for_dim(
+            str(_CONV2D_PAD_DIM_J): compute_padding_for_dim(
                 "j",
-                "pad_dim_j",
+                _CONV2D_PAD_DIM_J,
                 "kernel_w",
                 "stride_j",
-                "window_dim_j",
+                _CONV2D_WINDOW_DIM_J,
                 "total_size_j",
                 dim_sizes,
             ),
