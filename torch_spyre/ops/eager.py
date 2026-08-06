@@ -59,7 +59,71 @@ def maybe_wrap_dim(dim: int, ndims: int) -> int:
     return dim
 
 
+def _materialize_offset_view(x):
+    """Return an offset-0 copy of a Spyre tensor that carries a nonzero
+    ``storage_offset``; pass everything else through unchanged.
+
+    A standalone-compiled kernel drops its input's ``storage_offset`` (upstream
+    Inductor's placeholder path reads sizes/strides only, and SpyreTensorLayout
+    has no offset field), so it binds the storage BASE pointer and reads from
+    element 0 regardless of the view's true offset — see ``_reoffset`` in
+    ``torch_spyre/_inductor/lowering.py``. Only ``spyre::copy_from_d2d``
+    re-injects the offset in-graph; every other compiled eager op would
+    silently read the wrong data.
+
+    ``clone()`` dispatches ``aten::clone`` -> ``aten::copy_`` ->
+    ``spyre::copy_from_d2d``, i.e. that same offset-honoring path, producing a
+    correct offset-0 buffer. This is a no-op for the overwhelmingly common
+    offset-0 case (fresh buffers, and slices that already forced a copy).
+    """
+    if (
+        isinstance(x, torch.Tensor)
+        and x.device.type == "spyre"
+        and x.storage_offset() != 0
+    ):
+        return x.clone()
+    return x
+
+
+def _write_arg_slots(op):
+    """Positions and names of an op's mutated (write-aliased) arguments.
+
+    Such arguments (e.g. ``out=`` of an out-variant, ``self`` of an in-place op)
+    must NOT be materialized: cloning them would detach the write from the
+    caller's tensor and silently drop the result. ``alias_info.is_write``
+    identifies them from the schema.
+    """
+    positions: set[int] = set()
+    names: set[str] = set()
+    for i, arg in enumerate(op._schema.arguments):
+        if arg.alias_info is not None and arg.alias_info.is_write:
+            positions.add(i)
+            names.add(arg.name)
+    return positions, names
+
+
+def _make_offset_safe_dispatch(op):
+    """Build a dispatch wrapper that materializes nonzero-offset Spyre inputs
+    (except mutated args) before invoking the standalone-compiled kernel."""
+    write_positions, write_names = _write_arg_slots(op)
+
+    def dispatch(*args, compiled=None, **kwargs):
+        args = tuple(
+            a if i in write_positions else _materialize_offset_view(a)
+            for i, a in enumerate(args)
+        )
+        kwargs = {
+            k: (v if k in write_names else _materialize_offset_view(v))
+            for k, v in kwargs.items()
+        }
+        return compiled(*args, **kwargs)
+
+    return dispatch
+
+
 def dispatch_to_torch_compile(*args, compiled=None, **kwargs):
+    # Back-compat shim: offset materialization now happens in the per-op
+    # wrapper built by _make_offset_safe_dispatch (registration path below).
     return compiled(*args, **kwargs)
 
 
@@ -72,7 +136,8 @@ def register_torch_compile_kernel(ops):
         if "dtype" in op.name():
             # ops that change dtype are not supported yet
             continue
-        compiled_kernel = compile_once(op, dynamic=False)(dispatch_to_torch_compile)
+        dispatch = _make_offset_safe_dispatch(op)
+        compiled_kernel = compile_once(op, dynamic=False)(dispatch)
         torch.library.register_kernel(op.name(), ["spyre"])(compiled_kernel)
 
 
