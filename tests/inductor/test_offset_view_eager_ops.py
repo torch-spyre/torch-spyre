@@ -96,8 +96,9 @@ class TestOffsetViewInPlaceWrites:
 
         ref = qkv.clone()
         ref[..., Q : Q + KV] = torch.relu(qkv[..., Q : Q + KV])
-        torch.testing.assert_close(dev.to("cpu").float(), ref.float(),
-                                   atol=ATOL, rtol=0)
+        torch.testing.assert_close(
+            dev.to("cpu").float(), ref.float(), atol=ATOL, rtol=0
+        )
 
     def test_add_accumulates_at_offset(self, T):
         """add_ into the offset k-slice: read-modify-write must read the
@@ -110,5 +111,6 @@ class TestOffsetViewInPlaceWrites:
 
         ref = qkv.clone()
         ref[..., Q : Q + KV] = qkv[..., Q : Q + KV] + addend
-        torch.testing.assert_close(dev.to("cpu").float(), ref.float(),
-                                   atol=ATOL, rtol=0)
+        torch.testing.assert_close(
+            dev.to("cpu").float(), ref.float(), atol=ATOL, rtol=0
+        )
