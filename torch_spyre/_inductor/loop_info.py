@@ -53,14 +53,20 @@ class ReductionPlan:
         accumulators (see ``_compute_fill_loop_info``). False for a flat
         (reduction-dim-only) tiling.
     full_output_ranges:
-        Full (pre-outer-division) output shape for the accumulation buffer,
-        from ``_compute_full_ranges``.
+        Full (pre-division) output shape for the accumulation buffer --
+        planning runs before ``_apply_plan`` divides ``op.data.ranges``, so
+        this is just ``op.data.ranges`` at planning time, unchanged.
     per_tile_ranges:
-        Per-outer-tile output shape (``op.data.ranges`` at planning time).
+        Per-outer-tile output shape: ``op.data.ranges`` at planning time with
+        every tiled dim divided by its ``loop_count`` (mirrors the division
+        ``_divide_ranges`` performs later, in place, during transformation).
     outer_fill_loop_info:
         ``CoarseTileInfo`` covering only the outer output-dim levels, to
         stamp on the fill op for a nested tiling (``_compute_fill_loop_info``).
         ``None`` for a flat tiling, where the fill runs once before all loops.
+        Its ``loop_group_id`` is planning-time, pre-offset numbering --
+        transformation must re-slice it from the op's own real, stamped
+        ``loop_group_id`` before use (see ``_propagate_tiled_reduction_op``).
     """
 
     reduction_type: str

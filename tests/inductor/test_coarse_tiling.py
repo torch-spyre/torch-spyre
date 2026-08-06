@@ -4435,8 +4435,12 @@ class TestPlanTilingPropagation(unittest.TestCase):
 
     def test_outside_consumer_matches_copy_out(self):
         """Tiled with an outside consumer -> copy_out, matching
-        _propagate_tiled_op's _allocate_full_buffer/_insert_copy_op path."""
-        tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        _propagate_tiled_op's _allocate_full_buffer/_insert_copy_op path.
+
+        Planning runs before _apply_plan divides op.data.ranges, so the
+        fixture's ranges are already the full (pre-division) size here --
+        full_ranges is expected to come back unchanged."""
+        tiled = _make_tiled_op("op0", [Integer(64)], (0,), [Integer(4)], [[0]])
         consumer = _make_consumer_op("out0", "op0")
         propagation = self._plan_for(tiled, group_ops=[tiled, consumer])
         self.assertEqual(propagation.kind, "copy_out")

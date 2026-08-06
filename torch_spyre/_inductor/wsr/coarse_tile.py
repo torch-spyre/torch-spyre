@@ -380,16 +380,43 @@ def _compute_full_ranges_planned(
 ) -> list[Expr]:
     """Planning-time analog of _compute_full_ranges.
 
-    Same computation, but takes op's planned CoarseTileInfo directly (op has
-    no .loop_info attribute yet at planning time) instead of reading it off
-    the op.
+    _compute_full_ranges reconstructs the pre-division ranges from op.data
+    .ranges, which by the time transformation calls it has already been
+    divided by _divide_ranges. Planning runs *before* _apply_plan/
+    _divide_ranges, so op.data.ranges is already the undivided, full shape
+    here -- return it unchanged rather than multiplying by loop_count again
+    (which would double the extent of every tiled dim).
     """
-    full_ranges = list(op.data.ranges)
+    return list(op.data.ranges)
+
+
+def _compute_per_tile_ranges_planned(
+    op: ComputedBuffer, info: CoarseTileInfo
+) -> list[Expr]:
+    """Compute op's post-division (per-tile) output ranges without mutating.
+
+    Mirrors the arithmetic _divide_ranges performs in place, but reads
+    pre-mutation op.data.ranges (planning runs before _apply_plan) and
+    returns a fresh list instead of writing through op.data/op.layout. A dim
+    tiled at more than one level is divided by every such level's count, matching
+    _divide_ranges being called once per level in the transformation loop.
+    """
+    ranges = list(op.data.ranges)
     for count, dims in zip(info.loop_count, info.loop_tiled_dims):
         for d in dims:
-            if 0 <= d < len(full_ranges):
-                full_ranges[d] = sympy.simplify(full_ranges[d] * count)
-    return full_ranges
+            if 0 <= d < len(ranges):
+                r = ranges[d]
+                if isinstance(r, (int, sympy.Integer)) and isinstance(
+                    count, (int, sympy.Integer)
+                ):
+                    assert int(r) % int(count) == 0, (
+                        f"coarse_tile: op {op.get_name()!r} loop var d{d} range "
+                        f"{r} is not divisible by loop_count {count}."
+                    )
+                    ranges[d] = sympy.Integer(int(r) // int(count))
+                else:
+                    ranges[d] = sympy.simplify(sympy.sympify(r) / sympy.sympify(count))
+    return ranges
 
 
 def _compute_fill_loop_info_planned(
@@ -479,7 +506,7 @@ def _plan_tiling_propagation(
             if isinstance(op.data, Reduction) and has_tiled_reduction:
                 reduction_type = op.data.reduction_type
                 identity = _reduction_identity_value(reduction_type, op.get_dtype())
-                per_tile_ranges = list(op.data.ranges)
+                per_tile_ranges = _compute_per_tile_ranges_planned(op, info)
                 full_output_ranges = _compute_full_ranges_planned(op, info)
                 outer_fill_loop_info = _compute_fill_loop_info_planned(info)
                 reduction_plan = ReductionPlan(
@@ -1401,10 +1428,17 @@ def coarse_tile(
         retiled_infos_by_group.append((stamped_group_id, group_ops, retiled_infos))
 
     # Pass 1: read copy-ins, using each op's now-stamped
-    # loop_info.propagation.full_read_deps. Must complete before
-    # insert_tiling_propagation's Reduction/copy-out dispatch runs, which
-    # reads each op's *current* reads/loader.
+    # loop_info.propagation.full_read_deps. Must complete before Pass 2 and
+    # insert_tiling_propagation's copy-out dispatch run, both of which read
+    # each op's *current* reads/loader.
     _insert_all_read_copy_ops(operations)
+
+    # Pass 2: reduction machinery (accumulator/fill/combine), using each
+    # op's now-stamped loop_info.propagation.reduction. Must run after Pass
+    # 1 (a tiled-reduction op may itself have needed a read copy-in) and
+    # before insert_tiling_propagation, which no longer dispatches reduction
+    # ops at all -- Pass 2 is their sole handler.
+    _insert_all_reduction_ops(operations)
 
     insert_tiling_propagation(operations, groups)
 
@@ -1444,6 +1478,23 @@ def insert_tiling_propagation(
             if not isinstance(op, ComputedBuffer):
                 continue
             if not isinstance(op.data, (Pointwise, Reduction)):
+                continue
+            # Reduction ops tiled over a reduction dim were already fully
+            # handled by Pass 2 (_insert_all_reduction_ops), which runs
+            # before this loop -- its own consumer-patching already redirects
+            # every outside reader/graph-output away from op's name, so a
+            # second dispatch here would be redundant at best. Detect via
+            # loop_info.propagation.kind rather than re-deriving
+            # has_tiled_reduction, since group_ops may be stale (see the
+            # resolve-by-name step below) -- checking the *current* object's
+            # already-computed plan is simpler and always correct.
+            current_propagation = getattr(
+                getattr(op, "loop_info", None), "propagation", None
+            )
+            if (
+                current_propagation is not None
+                and current_propagation.kind == "reduction"
+            ):
                 continue
             # _insert_all_read_copy_ops (Pass 1) may already have spliced a
             # replacement for op into `operations` under the same name, if
@@ -1599,18 +1650,13 @@ def _propagate_tiled_op(
     # loop ever calls this function. By the time op reaches here, its reads
     # already target the inserted copy buffers, so op.loop_info is already
     # the final, post-copy-in one -- no re-fetch needed.
+    #
+    # Reduction ops tiled over a reduction dim are handled entirely by Pass 2
+    # (_insert_all_reduction_ops), which also runs before
+    # insert_tiling_propagation's loop calls this function -- op.data is
+    # never a Reduction with a tiled reduction dim by the time control
+    # reaches here.
     loop_info = getattr(op, "loop_info", None)
-
-    if isinstance(op.data, Reduction):
-        # Unsupported reduction-tiling shapes are already rejected during
-        # planning (_validate_planned_reduction_tiling, called from
-        # plan_coarse_tile_groups) -- no need to re-check here.
-        has_tiled_reduction = loop_info is not None and any(
-            dims for dims in getattr(loop_info, "loop_tiled_reduction_dims", [])
-        )
-        if has_tiled_reduction:
-            _propagate_tiled_reduction_op(op, operations)
-            return
 
     if loop_info is None:
         return
@@ -2514,10 +2560,20 @@ def _insert_read_copy_ops(
             if copy_writes
             else []
         )
+        # copy_buf is its own op, not tiled_op under another name -- it must
+        # not inherit tiled_op_info.propagation. That plan was computed for
+        # tiled_op's own boundary-crossing decision (kind may be "reduction"
+        # or "copy_out"); copy_buf is purely scratch, reused in place and
+        # never read outside this loop group, so its own kind is always
+        # "loop_internal". Leaving propagation unreplaced here previously let
+        # a "reduction"-kind plan leak onto this Pointwise passthrough buffer,
+        # causing Pass 2 (_insert_all_reduction_ops) to misdispatch it into
+        # _propagate_tiled_reduction_op.
         copy_buf.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
             tiled_op_info,
             tiled_dims_per_read=tiled_dims_per_read,
             output_tiled_dims=output_tiled_dims,
+            propagation=PropagationPlan(kind="loop_internal"),
         )
 
         V.graph.name_to_buffer[copy_name] = copy_buf
@@ -2835,6 +2891,31 @@ def _compute_fill_loop_info(op: ComputedBuffer) -> "CoarseTileInfo | None":
     )
 
 
+def _insert_all_reduction_ops(operations: list[Operation]) -> None:
+    """Pass 2: build reduction machinery for every planned reduction op.
+
+    Transformation's Pass 2 (see the plan/execute split design). Every op
+    was already stamped by _apply_plan with a loop_info carrying
+    .propagation, computed by _plan_tiling_propagation -- this pass only
+    consumes that decision (kind == "reduction" and its accompanying
+    ReductionPlan shape/identity/nesting data), it makes no new ones.
+
+    Must run after Pass 1 (_insert_all_read_copy_ops) -- a tiled-reduction
+    op may itself have needed a read copy-in, and this pass's accumulator/
+    fill/combine construction reads op's *current* reads/loader -- and
+    before insert_tiling_propagation, which no longer dispatches reduction
+    ops at all now that this pass is their sole handler.
+    """
+    for op in list(operations):
+        if not isinstance(op, ComputedBuffer):
+            continue
+        loop_info = getattr(op, "loop_info", None)
+        propagation = getattr(loop_info, "propagation", None)
+        if propagation is None or propagation.kind != "reduction":
+            continue
+        _propagate_tiled_reduction_op(op, operations)
+
+
 def _propagate_tiled_reduction_op(
     op: ComputedBuffer,
     operations: list[Operation],
@@ -2843,10 +2924,10 @@ def _propagate_tiled_reduction_op(
 
     Strategy: fill-initialize + per-tile combine.
       1. Allocate a HBM accumulation buffer sized to the full
-         (pre-outer-division) output shape (_compute_full_ranges), so that
-         address advancement across outer tiles writes each tile into the
-         correct slice.  For flat (reduction-only) tiling this equals
-         op.data.ranges.
+         (pre-outer-division) output shape (planned as
+         reduction.full_output_ranges), so that address advancement across
+         outer tiles writes each tile into the correct slice.  For flat
+         (reduction-only) tiling this equals op.data.ranges.
       2. Insert a fill op that writes the reduction's identity value into the
          accumulation buffer.  For flat reduction tiling the fill has no
          loop_info and runs before all loops.  For nested tiling (outer
@@ -2863,17 +2944,17 @@ def _propagate_tiled_reduction_op(
     """
     loop_info = op.loop_info
     loop_group_id = loop_info.loop_group_id
-    reduction_type = op.data.reduction_type
-    identity = _reduction_identity_value(reduction_type, op.get_dtype())
+    reduction_plan = loop_info.propagation.reduction
+    identity = reduction_plan.identity
 
     # Per-outer-tile output shape (ranges after any outer tiling divided them).
-    per_tile_ranges = list(op.data.ranges)
+    per_tile_ranges = reduction_plan.per_tile_ranges
 
     # Accumulation buffer uses the full (pre-outer-division) output shape so
     # that address advancement across outer output-dim tiles writes each tile's
     # result into the correct slice.  For reduction-dim-only tiling there is no
     # outer division, so full == per-tile.
-    full_output_ranges = _compute_full_ranges(op)
+    full_output_ranges = reduction_plan.full_output_ranges
 
     # Insert HBM buffer before the first op in the loop group.
     outer_key = loop_group_id[0]
@@ -2885,8 +2966,22 @@ def _propagate_tiled_reduction_op(
         == outer_key
     )
 
-    fill_loop_info = _compute_fill_loop_info(op)
-    is_nested = fill_loop_info is not None
+    fill_loop_info = reduction_plan.outer_fill_loop_info
+    is_nested = reduction_plan.is_nested
+
+    if fill_loop_info is not None:
+        # outer_fill_loop_info was built at planning time, before _apply_plan
+        # stamped op's real, offset-adjusted loop_group_id -- its own
+        # loop_group_id is still the pre-offset internal numbering
+        # plan_coarse_tile_groups used only for its own bookkeeping (see
+        # coarse_tile()'s comment on group_idx_offset). Re-slice from
+        # op.loop_info's now-real loop_group_id so the fill/copy ops this
+        # function stamps with fill_loop_info end up in the same outer group
+        # as every other op here, not a stale, potentially colliding one.
+        fill_loop_info = dataclasses.replace(
+            fill_loop_info,
+            loop_group_id=loop_group_id[: len(fill_loop_info.loop_count)],
+        )
 
     if is_nested:
         # Nested case: allocate separate tile-sized and full-sized buffers.
