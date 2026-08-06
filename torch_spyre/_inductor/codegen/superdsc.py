@@ -151,6 +151,10 @@ class SDSCSpec:
         core_slice_map = ", ".join(
             f"{k}={v}" for k, v in self.core_id_to_work_slice.items()
         )
+        psizes = ", ".join(f"{k}={v}" for k, v in self.padding_sizes.items())
+        psizes_per_core = ", ".join(
+            f"{k}={v}" for k, v in self.padding_sizes_per_core.items()
+        )
         args = "\n".join("  " + line for a in self.args for line in str(a).splitlines())
         parts = [
             f"  opfunc={self.opfunc}",
@@ -160,6 +164,8 @@ class SDSCSpec:
             f"  iteration_space=[{iter_space}]",
             f"  work_slices=[{slices}]",
             f"  core_id_to_work_slice=[{core_slice_map}]",
+            f"  padding_sizes=[{psizes}]",
+            f"  padding_sizes_per_core=[{psizes_per_core}]",
             f"  layouts=[\n{layouts}\n  ]",
             f"  args=[\n{args}\n  ]",
         ]
