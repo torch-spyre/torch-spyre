@@ -30,7 +30,7 @@ Covers six areas, each in its own class group:
      (TestGenerateBundleMlir, TestFindUnimplemented,
       TestGenerateBundleMlirSnapshot, TestGenerateBundleMlirWithAffineStrides,
       TestGenerateBundleNestedTiling, TestGenerateBundleAffineLoopPath)
-  6. Buffer propagation: consumer analysis helpers for insert_tiling_propagation
+  6. Buffer propagation: consumer analysis helpers for tiling propagation
      (TestCoarseTileBufferPropagation)
 
 No Spyre device or backend compiler is required.
@@ -1607,10 +1607,10 @@ class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
 
     These tests call plan_coarse_tile_groups + _apply_plan directly rather
     than the full coarse_tile() entry point.  coarse_tile() unconditionally
-    also runs insert_tiling_propagation after stamping every group, which
-    for a Reduction op with an actually-tiled reduction dim drives
-    _propagate_tiled_reduction_op -> _allocate_full_buffer ->
-    graph_lowering.run_node() on a synthesized spyre.empty FX node -- real
+    also runs the reduction-machinery pass (_insert_all_reduction_ops) after
+    stamping every group, which for a Reduction op with an actually-tiled
+    reduction dim drives _propagate_tiled_reduction_op -> _allocate_full_buffer
+    -> graph_lowering.run_node() on a synthesized spyre.empty FX node -- real
     FX-dispatch/lowering machinery this lightweight harness does not
     provide (confirmed live: raises LoweringException /
     "'NullHandler' object does not support the context manager protocol").
@@ -4063,7 +4063,7 @@ def _make_inside_consumer_op(name, reads_buf, loop_group_id):
 
 
 class TestCoarseTileBufferPropagation(unittest.TestCase):
-    """Tests for insert_tiling_propagation — consumer analysis helpers."""
+    """Tests for tiling propagation — consumer analysis helpers."""
 
     def setUp(self):
         # Only test_case2_condition_now_produces_copy_op below needs a real
@@ -4236,10 +4236,11 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         (_allocate_full_buffer, _insert_copy_op, _patch_consumers) all touch
         real ComputedBuffer/V.graph machinery (qualify_name, run_node,
         replace_computed_buffer_body), which MagicMock-based ops used
-        elsewhere in this file cannot satisfy. insert_tiling_propagation
-        itself takes a pre-grouped ``groups`` list that plan_coarse_tile_groups
-        would normally produce; calling _propagate_tiled_op directly is the
-        cheaper, equivalent way to reach exactly the code this task changed.
+        elsewhere in this file cannot satisfy. Pass 3
+        (_insert_all_write_copy_ops) itself takes the already-stamped
+        `operations` list that _apply_plan would normally produce; calling
+        _propagate_tiled_op directly is the cheaper, equivalent way to reach
+        exactly the code this task changed.
         """
         from torch._inductor.ir import (
             ComputedBuffer,
@@ -5278,7 +5279,7 @@ def _make_tiled_reduction_op(
 
 
 class TestCoarseTileReductionPropagation(unittest.TestCase):
-    """Tests for insert_tiling_propagation Reduction support."""
+    """Tests for tiling propagation Reduction support."""
 
     def test_reduction_tiled_reduction_dim_nested_ok(self):
         from torch_spyre._inductor.wsr.coarse_tile import (

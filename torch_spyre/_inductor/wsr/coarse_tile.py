@@ -1492,8 +1492,7 @@ def coarse_tile(
 
     # Pass 1: read copy-ins, using each op's now-stamped
     # loop_info.propagation.full_read_deps. Must complete before Pass 2 and
-    # insert_tiling_propagation's copy-out dispatch run, both of which read
-    # each op's *current* reads/loader.
+    # Pass 3 run, both of which read each op's *current* reads/loader.
     _insert_all_read_copy_ops(operations)
 
     # Pass 2: reduction machinery (accumulator/fill/combine), using each
@@ -1509,10 +1508,6 @@ def coarse_tile(
     # is_graph_output. Must run after Pass 1/2 -- _allocate_full_buffer/
     # _insert_copy_op read op's *current* reads/loader/layout.
     _insert_all_write_copy_ops(operations)
-
-    # No-op: kept only as a mock/patch point for span-overflow tests. See
-    # insert_tiling_propagation's docstring.
-    insert_tiling_propagation(operations, groups)
 
     # Checkpoint 5 wants each op's *planned* kind by name -- snapshot that
     # now, before the resync loop below overwrites `group_ops` (the same
@@ -1611,23 +1606,6 @@ def _log_propagation_self_check(
 # ---------------------------------------------------------------------------
 # Buffer propagation pass
 # ---------------------------------------------------------------------------
-
-
-def insert_tiling_propagation(
-    operations: list[Operation],
-    groups: list[tuple],
-) -> None:
-    """No-op: retained only as a mock/patch point for span-overflow tests.
-
-    Pass 1 (_insert_all_read_copy_ops), Pass 2 (_insert_all_reduction_ops),
-    and Pass 3 (_insert_all_write_copy_ops) -- all run before this -- now
-    handle every tiled op's own boundary-crossing, and
-    _plan_tiling_propagation's planning-time
-    _zero_reads_of_fixed_buffers_planned already zeroes fixed-buffer
-    readers' tiled_dims_per_read entries before _apply_plan ever stamps
-    loop_info, so no transformation-time equivalent is needed.
-    """
-    del operations, groups
 
 
 def _validate_planned_reduction_tiling(
@@ -2743,9 +2721,9 @@ def _insert_all_read_copy_ops(operations: list[Operation]) -> None:
     _insert_read_copy_ops.
 
     Must run after every group's _apply_plan (so op.loop_info is stamped)
-    and before insert_tiling_propagation's Reduction/copy-out dispatch,
-    which reads an op's *current* reads/loader -- copy-ins must be applied
-    before that machinery is built, not interleaved with it.
+    and before Pass 2/3's Reduction/copy-out dispatch, which reads an op's
+    *current* reads/loader -- copy-ins must be applied before that
+    machinery is built, not interleaved with it.
     """
     for op in list(operations):
         if not isinstance(op, ComputedBuffer):
@@ -2970,8 +2948,8 @@ def _insert_all_reduction_ops(operations: list[Operation]) -> None:
     Must run after Pass 1 (_insert_all_read_copy_ops) -- a tiled-reduction
     op may itself have needed a read copy-in, and this pass's accumulator/
     fill/combine construction reads op's *current* reads/loader -- and
-    before insert_tiling_propagation, which no longer dispatches reduction
-    ops at all now that this pass is their sole handler.
+    before Pass 3, since a reduction op is never also copy_out (the plan's
+    kind routes each op to exactly one).
     """
     for op in list(operations):
         if not isinstance(op, ComputedBuffer):
@@ -3413,9 +3391,9 @@ def _patch_retiled_load_indexes(
 
     # Only ops that were already in the group when _apply_plan ran can hold a
     # stale (pre-divide) coefficient for a retiled buffer.  Ops inserted later
-    # by insert_tiling_propagation (e.g. _insert_copy_op's copy_buf) read the
-    # retiled buffer's already-updated layout directly, so rewriting them here
-    # would double-apply the stride correction (see issue found while fixing
+    # by Pass 1/2/3 (e.g. _insert_copy_op's copy_buf) read the retiled
+    # buffer's already-updated layout directly, so rewriting them here would
+    # double-apply the stride correction (see issue found while fixing
     # test_hint_restickify_stays_in_group).
     retiled_names = set(rewrites_by_name)
     for op in list(group_ops):
