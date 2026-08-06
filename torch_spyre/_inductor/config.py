@@ -112,4 +112,18 @@ layout_solver: Literal[
     "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
 ] = os.environ.get("LAYOUT_SOLVER", "greedy")  # type: ignore[assignment]
 
+# What to do when a spyre_hint(tile_size_per_dim=...) tile size does not evenly
+# divide the range it subdivides -- the declared size of the named dim for the
+# outermost hint, or the enclosing hint's tile size for a nested one. WSR needs
+# full tiles, so a non-multiple cannot be honoured either way.
+#
+# Default (False): log a WARNING and leave that dim UNTILED (loop count 1),
+# preserving today's graceful degradation for short sequences and small batches
+# -- decode has max_seqlen_q=1 and batch=1, neither of which can be a multiple
+# of a 64-element block.
+#
+# Strict (True): raise. Intended for performance CI and any model/input where
+# tiling is expected to succeed, so a silent loss of tiling is caught.
+strict_tile_size: bool = _get_env_bool("SPYRE_STRICT_TILE_SIZE", False)
+
 install_config_module(sys.modules[__name__])

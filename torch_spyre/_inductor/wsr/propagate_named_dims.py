@@ -32,6 +32,7 @@ from torch._inductor.ir import (
 from torch._inductor.dependencies import MemoryDep, is_indirect
 from torch._inductor.graph import GraphLowering
 from torch._inductor.virtualized import V
+from .. import config
 from ..errors import Unsupported
 from ..pass_utils import (
     host_coordinates,
@@ -592,7 +593,128 @@ def validate_named_dims(graph: GraphLowering) -> None:
                     )
 
 
+_TILE_SIZE_KEY = "tile_size_per_dim"
+_COUNT_KEYS = ("tiles", "slices", "num_tiles_per_dim")
+
+
+def _hint_dims(hint_dict: dict) -> dict:
+    """The {name: value} mapping a hint scope specifies, whichever key it used."""
+    for k in (*_COUNT_KEYS, _TILE_SIZE_KEY):
+        v = hint_dict.get(k)
+        if v:
+            return v
+    return {}
+
+
+def _resolve_tile_size_counts(operations: list[Operation]) -> dict[int, dict[str, int]]:
+    """Convert tile_size_per_dim hints to loop trip counts.
+
+    Hints tile NAMED DIMENSIONS, not tensors. A named dim and its extent are
+    registered by declare_tensor_dim(name, size); name_tensor_dims() then binds
+    tensor axes to those names, and propagate_named_dims works out which of an
+    operation's iteration variables correspond to which names.
+
+    THE COUNT COMES FROM THE DECLARATION, NOT FROM THE OPERATIONS
+    -------------------------------------------------------------
+    For a hint on dim D with tile size s:
+
+        no enclosing hint on D    ->  count = size(D) // s
+        enclosing hint, size s_o  ->  count = s_o // s
+
+    and nothing else enters it -- not tensor shapes, not an op's iteration
+    ranges, not whether any tensor in scope even has an axis of size(D). So
+    counts are a function of the hint tree and the declarations alone, and
+    distinct named dims never interact.
+
+    This is legitimate because the declarations are VALIDATED against the real
+    layouts: _consume_names requires the declared sizes of the names covering a
+    layout axis to multiply to that axis's extent. The declaration is therefore
+    the checked record of the shape.
+
+    Deriving the count by inspecting lowered operations instead is not merely
+    unnecessary, it is WRONG, because the name -> operation mapping is lossy:
+
+      * fusion    -- with B=1, H=8 the backend folds B in with H onto ONE loop
+                     var of extent 8, so inspection reports 8 for B where the
+                     answer is size(B) == 1.
+      * degeneracy-- a size-1 dim has no loop var of its own at all.
+      * broadcast -- an op that does not iterate over D offers nothing to read,
+                     yet the count is unchanged.
+
+    An earlier version of this function read extents from op.get_read_writes()
+    and hit all three. See PR #3491's review thread.
+
+    Full tiles only, so each size must divide what it subdivides. When one does
+    not, config.strict_tile_size selects the behaviour: warn and leave the dim
+    untiled (default), or raise (performance CI).
+    """
+    counts: dict[int, dict[str, int]] = {}
+    for op in operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        op_hints = get_op_hints(op)
+        if not any(_TILE_SIZE_KEY in h for h in op_hints.values()):
+            continue
+
+        # hint_id comes from a counter incremented when a spyre_hint scope is
+        # ENTERED during tracing, so for the scopes applying to one op ascending
+        # hint_id is outermost-first. An op's hint set IS its enclosing chain.
+        enclosing: dict[str, int] = {}
+        for hint_id, hint_dict in sorted(op_hints.items()):
+            sizes = hint_dict.get(_TILE_SIZE_KEY)
+            if not sizes:
+                continue
+            for name, raw in sizes.items():
+                tile_size = int(raw)
+                declared = _named_dims.get(name)
+                if not declared:
+                    raise Unsupported(
+                        f"spyre_hint(tile_size_per_dim={{{name!r}: {tile_size}}}): "
+                        f"dim {name!r} has no declared size. Call "
+                        f"declare_tensor_dim({name!r}, size) before compiling -- "
+                        "the loop trip count is derived from that declaration."
+                    )
+                if tile_size <= 0:
+                    raise Unsupported(
+                        f"spyre_hint(tile_size_per_dim={{{name!r}: {tile_size}}}): "
+                        "tile size must be positive"
+                    )
+
+                avail = enclosing.get(name, int(declared))
+                if avail % tile_size == 0:
+                    count, inner_range = avail // tile_size, tile_size
+                else:
+                    msg = (
+                        f"spyre_hint(tile_size_per_dim={{{name!r}: {tile_size}}}): "
+                        f"{tile_size} does not divide "
+                        + (
+                            "its declared size"
+                            if name not in enclosing
+                            else "the enclosing hint's tile size"
+                        )
+                        + f" ({avail}), so WSR cannot form full tiles. Pad "
+                        f"{name!r} to a multiple of {tile_size} (with "
+                        "op-appropriate identity values), or choose a size that "
+                        "divides."
+                    )
+                    if config.strict_tile_size:
+                        raise Unsupported(msg)
+                    logger.warning(
+                        "%s Leaving it untiled at this level; set "
+                        "SPYRE_STRICT_TILE_SIZE=1 to make this an error.",
+                        msg,
+                    )
+                    # One trip, and the inner levels see the range unchanged
+                    # rather than the size that was refused.
+                    count, inner_range = 1, avail
+
+                counts.setdefault(hint_id, {})[name] = count
+                enclosing[name] = inner_range
+    return counts
+
+
 def _assign_dim_hints_impl(operations: list[Operation]) -> None:
+    tile_size_counts = _resolve_tile_size_counts(operations)
     for op in operations:
         if not isinstance(op, ComputedBuffer):
             continue
@@ -633,15 +755,28 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
 
         dim_hints = []
         for hint_id, hint_dict in sorted(op_hints.items()):
-            # A hint scope uses exactly one of tiles/slices/num_tiles_per_dim.
-            dims: dict[str, int] = next(
-                (
-                    v
-                    for k in ("tiles", "slices", "num_tiles_per_dim")
-                    if (v := hint_dict.get(k))
-                ),
-                {},
-            )
+            # A hint scope uses exactly one of tiles/slices/num_tiles_per_dim
+            # (trip count) or tile_size_per_dim (per-tile extent, converted to a
+            # trip count by _resolve_tile_size_counts).
+            dims: dict[str, int] = _hint_dims(hint_dict)
+            if _TILE_SIZE_KEY in hint_dict and hint_dict[_TILE_SIZE_KEY]:
+                resolved = tile_size_counts.get(hint_id, {})
+                missing = [name for name in dims if name not in resolved]
+                if missing:
+                    # Never fall back to using the declared SIZE as a trip count:
+                    # that silently tiles into `tile_size` pieces instead of pieces
+                    # OF tile_size, which miscompiles rather than failing.  An
+                    # unresolved name means no op in the graph carried that dim, so
+                    # the extent was never found -- almost always a name that does
+                    # not match any declared tensor dim.
+                    raise Unsupported(
+                        f"spyre_hint(tile_size_per_dim=...) names dim(s) "
+                        f"{missing} that no operation in the tiled scope carries, "
+                        "so the extent needed to derive the loop trip count could "
+                        "not be found. Check the name matches a dim declared via "
+                        "declare_tensor_dim()/name_tensor_dims()."
+                    )
+                dims = {name: resolved[name] for name in dims}
             # TODO: support multiple dimensions per spyre_hint() call.
             # hint_id_to_ranges_pos in plan_coarse_tile_groups would need to
             # become dict[int, list[int]] and _hints_levels would need to
