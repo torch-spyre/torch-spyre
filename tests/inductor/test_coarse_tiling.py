@@ -1937,132 +1937,6 @@ class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
             plan_coarse_tile_groups(group_ops, [(group_ops, levels)])
 
 
-def _make_fixed_flag_op(
-    name,
-    tiled_dims_per_read,
-    output_tiled_dims,
-    pending_per_tile_fixed=False,
-    layout_per_tile_fixed=False,
-    read_names=(),
-):
-    """Return a ComputedBuffer mock carrying loop_info + a fixed-tile signal.
-
-    Mirrors _make_tiled_op/_make_consumer_op's MagicMock(spec=...) pattern
-    (see _make_rw_with_reads above) so isinstance(op, ComputedBuffer) and
-    isinstance(dep, MemoryDep) both hold without needing real IR.
-    """
-    from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
-
-    data = MagicMock(spec=Pointwise)
-    data.ranges = [Integer(16)]
-
-    op = MagicMock(spec=ComputedBuffer)
-    op.data = data
-    op.get_operation_name.return_value = name
-    op.get_name.return_value = name
-    op.loop_info = CoarseTileInfo(
-        loop_group_id=(0,),
-        loop_count=[Integer(4)],
-        loop_tiled_dims=[[0]],
-        tiled_dims_per_read=[list(entry) for entry in tiled_dims_per_read],
-        output_tiled_dims=list(output_tiled_dims),
-    )
-    op.get_read_writes.return_value = _make_rw_with_reads(*read_names)
-    if layout_per_tile_fixed:
-        layout = MagicMock(spec=FixedLayout)
-        layout.per_tile_fixed = True
-        op.layout = layout
-    else:
-        op.layout = MagicMock(spec=FixedLayout)
-        del op.layout.per_tile_fixed
-    if pending_per_tile_fixed:
-        op._pending_per_tile_fixed = True
-    else:
-        del op._pending_per_tile_fixed
-    op.origins = OrderedSet()
-    return op
-
-
-class TestZeroFixedTileAdvanceExprs(unittest.TestCase):
-    """Unit tests for _zero_fixed_tile_advance_exprs."""
-
-    def test_no_fixed_ops_is_noop(self):
-        from torch_spyre._inductor.wsr.coarse_tile import _zero_fixed_tile_advance_exprs
-
-        op = _make_fixed_flag_op(
-            "op0",
-            tiled_dims_per_read=[[[(0, Integer(4))]]],
-            output_tiled_dims=[[(0, Integer(4))]],
-        )
-        _zero_fixed_tile_advance_exprs([op])
-        self.assertEqual(op.loop_info.tiled_dims_per_read[0], [[(0, Integer(4))]])
-        self.assertEqual(op.loop_info.output_tiled_dims, [[(0, Integer(4))]])
-
-    def test_pending_per_tile_fixed_zeros_own_output(self):
-        from torch_spyre._inductor.wsr.coarse_tile import _zero_fixed_tile_advance_exprs
-
-        op = _make_fixed_flag_op(
-            "op0",
-            tiled_dims_per_read=[],
-            output_tiled_dims=[[(0, Integer(4))]],
-            pending_per_tile_fixed=True,
-        )
-        _zero_fixed_tile_advance_exprs([op])
-        self.assertEqual(op.loop_info.output_tiled_dims, [])
-
-    def test_committed_layout_per_tile_fixed_zeros_own_output(self):
-        from torch_spyre._inductor.wsr.coarse_tile import _zero_fixed_tile_advance_exprs
-
-        op = _make_fixed_flag_op(
-            "op0",
-            tiled_dims_per_read=[],
-            output_tiled_dims=[[(0, Integer(4))]],
-            layout_per_tile_fixed=True,
-        )
-        _zero_fixed_tile_advance_exprs([op])
-        self.assertEqual(op.loop_info.output_tiled_dims, [])
-
-    def test_reader_of_fixed_buffer_has_its_read_advance_zeroed(self):
-        from torch_spyre._inductor.wsr.coarse_tile import _zero_fixed_tile_advance_exprs
-
-        fixed_op = _make_fixed_flag_op(
-            "fixed0",
-            tiled_dims_per_read=[],
-            output_tiled_dims=[[(0, Integer(4))]],
-            pending_per_tile_fixed=True,
-        )
-        reader = _make_fixed_flag_op(
-            "reader0",
-            tiled_dims_per_read=[[[(0, Integer(4))]], [[(0, Integer(8))]]],
-            output_tiled_dims=[[(0, Integer(8))]],
-            read_names=["fixed0", "other_buf"],
-        )
-        _zero_fixed_tile_advance_exprs([fixed_op, reader])
-        # fixed0's own read entry (index 0, matching read_names[0]) is
-        # dropped to an empty per-level list; other_buf's (index 1) is
-        # untouched.
-        self.assertEqual(reader.loop_info.tiled_dims_per_read[0], [])
-        self.assertEqual(reader.loop_info.tiled_dims_per_read[1], [[(0, Integer(8))]])
-        # reader's own output is unaffected -- reader0 itself isn't fixed.
-        self.assertEqual(reader.loop_info.output_tiled_dims, [[(0, Integer(8))]])
-
-    def test_op_without_loop_info_is_skipped(self):
-        from torch_spyre._inductor.wsr.coarse_tile import _zero_fixed_tile_advance_exprs
-
-        fixed_op = _make_fixed_flag_op(
-            "fixed0",
-            tiled_dims_per_read=[],
-            output_tiled_dims=[],
-            pending_per_tile_fixed=True,
-        )
-        no_loop_info_op = _make_fixed_flag_op(
-            "other0", tiled_dims_per_read=[], output_tiled_dims=[]
-        )
-        del no_loop_info_op.loop_info
-        # Must not raise despite the second op having no loop_info at all.
-        _zero_fixed_tile_advance_exprs([fixed_op, no_loop_info_op])
-
-
 # ===========================================================================
 # 3. CountedLoopSchedulerNode and build_loop_scheduler_nodes
 # ===========================================================================
@@ -3738,7 +3612,7 @@ class TestGenerateBundleAffineLoopPath(unittest.TestCase):
 
     Key invariants:
       - ops tiled only by the inner loop var emit affine.apply with that var only
-      - ops not tiled (per_tile_fixed or fixed address) emit no affine.apply
+      - ops not tiled (fixed address, no advancing dims) emit no affine.apply
       - the copy op (outer-B tiled) emits affine.apply with the outer loop var
     """
 
@@ -3959,7 +3833,7 @@ class TestGenerateBundleAffineLoopPath(unittest.TestCase):
                     [],
                 )
             elif i == 2:
-                # combine: inside outer>inner, per_tile_fixed accum_tile, not tiled.
+                # combine: inside outer>inner, accum_tile address fixed, not tiled.
                 return _make_tiled_json(idx, sym_id), [0x3000], [[{}, {}]], []
             else:
                 # copy: inside outer loop only; accum_full tiled at outer level (level 0).
@@ -3994,7 +3868,7 @@ class TestGenerateBundleAffineLoopPath(unittest.TestCase):
         )
 
     def test_tile_accum_fill_no_affine_apply(self):
-        """fill op (per_tile_fixed output) must not get an affine.apply."""
+        """fill op (fixed, non-advancing output) must not get an affine.apply."""
         mlir = self._bundle(
             self._make_tile_accum_specs(),
             self._fake_tile_accum(self._GRP3_K_STRIDE, self._GRP3_B_STRIDE),
@@ -4487,10 +4361,11 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         # Both real inputs get their own read copy.
         self.assertEqual(len(read_copy_ops), 2)
         # The tiled op itself never becomes a MutationLayoutSHOULDREMOVE --
-        # it keeps its own tile-sized layout and is marked per_tile_fixed
-        # instead, mirroring the Case 1 path.
+        # it keeps its own tile-sized layout, and its own write no longer
+        # advances (the copy-out op above drains it every iteration
+        # instead), mirroring the Case 1 path.
         self.assertNotIsInstance(final_op.layout, MutationLayoutSHOULDREMOVE)
-        self.assertTrue(getattr(final_op, "_pending_per_tile_fixed", False))
+        self.assertEqual(final_op.loop_info.output_tiled_dims, [])
 
 
 def _make_cross_group_producer_read_fixture():
@@ -4965,6 +4840,109 @@ class TestInsertReadCopyOps(unittest.TestCase):
             ElementArrangement.STANDARD,
         )
         self.assertEqual(copy_buf.layout.device_layout, expected_device_layout)
+
+
+class TestIsReadAdvancingAnywhere(unittest.TestCase):
+    """A buffer with a fixed write can still be barred from LX by a reader.
+
+    ``_is_tiled_advancing`` only asks whether a buffer's own *producing*
+    write advances; it says nothing about whether some other op *reads*
+    that buffer via a reference that advances across the reader's own
+    coarse-tile loop (e.g. a full HBM buffer with a fixed write, copied
+    into a nested tile every outer iteration -- exactly the shape
+    ``_make_full_buffer_read_fixture`` already builds for
+    ``_insert_read_copy_ops``'s own tests). ``compute_ops.py``'s
+    ``is_tiled_lx`` check applies to every ``TensorArg`` -- reads and the
+    write -- so missing this at allocation time only defers the same
+    ``NotImplementedError`` to codegen. This class exercises
+    ``_get_buffer_user_deps`` + ``_is_read_advancing_anywhere`` together,
+    against real IR and real ``MemoryDep`` objects (via
+    ``_make_full_buffer_read_fixture``), not mocks.
+    """
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    def test_advancing_copy_in_read_detected(self):
+        from torch_spyre._inductor.scratchpad.utils import (
+            _get_buffer_user_deps,
+            _is_read_advancing_anywhere,
+        )
+
+        tiled_op, full_deps, operations = _make_full_buffer_read_fixture()
+        self.assertEqual(len(full_deps), 1)
+        full_buf = V.graph.get_buffer(full_deps[0].name)
+        # full_buf itself has no loop_info -- its write is fixed (it is
+        # never produced inside a coarse-tile loop). tiled_op reads it via
+        # an advancing copy-in: dim 0 divided across tiled_op's own outer
+        # loop (matches the fixture's loop_count=[8] over dim 0).
+        tiled_op.loop_info.tiled_dims_per_read = [[[(0, Integer(8))]]]
+
+        fake_graph = SimpleNamespace(operations=operations)
+        buf_user_deps = _get_buffer_user_deps(fake_graph)
+        self.assertTrue(_is_read_advancing_anywhere(full_buf.get_name(), buf_user_deps))
+
+    def test_fixed_copy_in_read_not_detected(self):
+        """Same shape, but the reader's copy-in is fixed (not advancing):
+        the dep has no tiled levels at all (empty outer list)."""
+        from torch_spyre._inductor.scratchpad.utils import (
+            _get_buffer_user_deps,
+            _is_read_advancing_anywhere,
+        )
+
+        tiled_op, full_deps, operations = _make_full_buffer_read_fixture()
+        full_buf = V.graph.get_buffer(full_deps[0].name)
+        tiled_op.loop_info.tiled_dims_per_read = [[]]
+
+        fake_graph = SimpleNamespace(operations=operations)
+        buf_user_deps = _get_buffer_user_deps(fake_graph)
+        self.assertFalse(
+            _is_read_advancing_anywhere(full_buf.get_name(), buf_user_deps)
+        )
+
+    def test_fixed_copy_in_read_with_empty_levels_not_detected(self):
+        """Fixed can also show up as a non-empty outer list whose every
+        per-level entry is itself empty -- e.g. tiled_op has one loop level
+        that does not divide any dim this dep's index depends on.
+        _general_tile_advance's own per-level loop (`if not
+        dim_extent_pairs: continue`) never contributes a term for such a
+        level, so this must be treated as fixed too, not merely "has some
+        levels" (regression coverage: an earlier version of this check used
+        a shallow `if tiled_dims_per_read[dep_idx]:` truthiness test, which
+        wrongly treated [[]] as advancing since the outer list is
+        non-empty)."""
+        from torch_spyre._inductor.scratchpad.utils import (
+            _get_buffer_user_deps,
+            _is_read_advancing_anywhere,
+        )
+
+        tiled_op, full_deps, operations = _make_full_buffer_read_fixture()
+        full_buf = V.graph.get_buffer(full_deps[0].name)
+        tiled_op.loop_info.tiled_dims_per_read = [[[]]]
+
+        fake_graph = SimpleNamespace(operations=operations)
+        buf_user_deps = _get_buffer_user_deps(fake_graph)
+        self.assertFalse(
+            _is_read_advancing_anywhere(full_buf.get_name(), buf_user_deps)
+        )
+
+    def test_unrelated_buffer_not_detected(self):
+        from torch_spyre._inductor.scratchpad.utils import (
+            _get_buffer_user_deps,
+            _is_read_advancing_anywhere,
+        )
+
+        tiled_op, full_deps, operations = _make_full_buffer_read_fixture()
+        tiled_op.loop_info.tiled_dims_per_read = [[[(0, Integer(8))]]]
+
+        fake_graph = SimpleNamespace(operations=operations)
+        buf_user_deps = _get_buffer_user_deps(fake_graph)
+        self.assertFalse(_is_read_advancing_anywhere("no_such_buffer", buf_user_deps))
 
 
 class TestRescaleIndex(unittest.TestCase):

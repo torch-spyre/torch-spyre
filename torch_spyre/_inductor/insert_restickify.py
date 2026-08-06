@@ -29,6 +29,7 @@ from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
     InputBuffer,
+    IRNode,
     MutationLayoutSHOULDREMOVE,
     Operation,
     ReinterpretView,
@@ -94,7 +95,16 @@ def _create_restickify_node(
     Inserts a spyre.restickify call into the FX graph, lowers it via
     graph_lowering.run_node(), and assigns the target layout.  Returns
     (old_buffer_name, new_computed_buffer).
+
+    For synthetically-created buffers that have no FX node (e.g.
+    coarse_tile_read_copy_* buffers created by coarse_tile.py), the FX env
+    lookup is skipped and lower_restickify is called directly with a TensorBox
+    wrapping the ComputedBuffer.
     """
+    from .lowering import (
+        lower_restickify,
+    )  # deferred: lowering.py imports insert_restickify at module level
+
     arg_name = restick_arg_info["arg_name"]
 
     graph_lowering = V.graph
@@ -114,12 +124,48 @@ def _create_restickify_node(
 
     # Search env by buffer name to find the FX node to pass to restickify.
     fx_arg_node = next(
-        fx_node
-        for fx_node, tb in graph_lowering.env.items()
-        if isinstance(fx_node, torch.fx.Node)
-        and isinstance(tb, TensorBox)
-        and tb.get_name() == arg_name
+        (
+            fx_node
+            for fx_node, tb in graph_lowering.env.items()
+            if isinstance(fx_node, torch.fx.Node)
+            and isinstance(tb, TensorBox)
+            and tb.get_name() == arg_name
+        ),
+        None,
     )
+
+    if fx_arg_node is None:
+        # Synthetically-created buffers (e.g. coarse_tile_read_copy_*) have no
+        # FX node. Build a TensorBox from the buffer and call lower_restickify
+        # directly; realize() inside lower_restickify registers the output in
+        # graph.buffers and graph.operations.
+        arg_buf = graph_lowering.get_buffer(arg_name)
+        assert isinstance(arg_buf, ComputedBuffer), (
+            f"_create_restickify_node: buffer {arg_name!r} not found in env and is "
+            f"{type(arg_buf).__name__}, not ComputedBuffer — cannot restickify"
+        )
+        arg_tb = TensorBox(StorageBox(arg_buf))
+        # Insert a synthetic FX node for origins — downstream code (e.g.
+        # _single_arg_op_layout in propagate_layouts.py) requires non-empty origins.
+        first_compute_node = next(n for n in fx_graph.nodes if n.op != "placeholder")
+        with fx_graph.inserting_before(first_compute_node):
+            restick_fx_node = fx_graph.create_node(
+                "call_function", torch.ops.spyre.restickify.default, ()
+            )
+        with (
+            IRNode.current_origins(OrderedSet([restick_fx_node])),
+            V.set_current_node(restick_fx_node),
+        ):
+            restick_tb = lower_restickify(arg_tb)
+        restick_buff = restick_tb.data.data  # TensorBox -> StorageBox -> ComputedBuffer
+        assert isinstance(restick_buff, ComputedBuffer), (
+            f"Expected ComputedBuffer, got {type(restick_buff).__name__}"
+        )
+        restick_buff.origins = OrderedSet([restick_fx_node])
+        graph_lowering.env[restick_fx_node] = restick_tb
+        restick_buff.layout = restick_arg_info["target_layout"]
+        return arg_name, restick_buff
+
     # Insert at a valid position in the FX graph; the operations list order is
     # authoritative pre-scheduler, not position in the FX graph.
     first_compute_node = next(n for n in fx_graph.nodes if n.op != "placeholder")
@@ -278,29 +324,16 @@ def finalize_layouts(graph: GraphLowering) -> None:
         if op_layouts and not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
             stl = committed if cost_fn else op_layouts[0]
             op.layout = _fixed_tiled(op.layout, cast(SpyreTensorLayout, stl))
-            # Mark loop-invariant tiled ops: per_tile_fixed so the unroller
-            # reuses the same base address every tile iteration.  A tiled op is
-            # loop-invariant when its CoarseTileInfo has no tiled dims at any
-            # level (all loop_tiled_dims and loop_tiled_reduction_dims entries
-            # are empty).  The loop-internal and tiled-reduction-scratch cases
-            # are handled later in _propagate_tiled_op /
-            # _propagate_tiled_reduction_op once consumer analysis is available.
+            # Tiled-reduction scratch: propagate the reduction op's device
+            # layout to accum_full so fill, combine, and copy all agree on
+            # the device coordinate system.
             loop_info = getattr(op, "loop_info", None)
             if loop_info is not None and isinstance(op.layout, FixedTiledLayout):
-                all_tiled_dims_empty = all(
-                    not dims for dims in loop_info.loop_tiled_dims
-                )
                 all_tiled_rdims_empty = all(
                     not dims
                     for dims in getattr(loop_info, "loop_tiled_reduction_dims", [])
                 )
-                if all_tiled_dims_empty and all_tiled_rdims_empty:
-                    op.layout.per_tile_fixed = True
-                # Tiled-reduction scratch: inner level tiles a reduction dim.
-                # The op's output is a per-tile accumulation buffer reused
-                # every inner-loop iteration.
-                elif not all_tiled_rdims_empty:
-                    op.layout.per_tile_fixed = True
+                if not all_tiled_rdims_empty:
                     # Propagate the reduction op's device layout to accum_full.
                     # Pre-stickify, _allocate_full_buffer assigned accum_full a
                     # generic layout; we now overwrite it with the same STL as
@@ -332,18 +365,6 @@ def finalize_layouts(graph: GraphLowering) -> None:
                                 accum_layout, op.layout.device_layout
                             )
 
-            # Loop-internal buffers: _propagate_tiled_op sets _pending_per_tile_fixed
-            # when the layout is still FixedLayout (pre-stickify).  Transfer that
-            # deferred flag now that we have the committed FixedTiledLayout.
-            if getattr(op, "_pending_per_tile_fixed", False):
-                assert isinstance(op.layout, FixedTiledLayout), (
-                    f"{op.get_name()} has _pending_per_tile_fixed but layout is "
-                    f"{type(op.layout).__name__} — expected FixedTiledLayout "
-                    "after finalize_layouts committed"
-                )
-                op.layout.per_tile_fixed = True
-                del op._pending_per_tile_fixed  # type: ignore[attr-defined]
-
         # For each input edge, schedule a restickify if the input's committed STL
         # is incompatible with what this op requires on that edge.
         if not cost_fn:
@@ -372,9 +393,6 @@ def finalize_layouts(graph: GraphLowering) -> None:
                         accum_layout.size,
                         accum_layout.stride,
                         committed,
-                    )
-                    new_layout.per_tile_fixed = getattr(
-                        accum_layout, "per_tile_fixed", False
                     )
                     mut_target_buf.layout = new_layout
             elif isinstance(mut_target_buf, SpyreEmptyFallback) and committed is None:
@@ -418,13 +436,6 @@ def finalize_layouts(graph: GraphLowering) -> None:
                     f"target_stl.stride_map={list(target_stl.stride_map)}"
                 )
             restick_target = _fixed_tiled(in_layout, restick_stl)
-            # restick_target's buffer is created fresh by _create_restickify_node
-            # and consumed only by op's own inner_fn (see
-            # insert_restickify_on_node_inputs) — it can never have outside-loop
-            # consumers, so it is always safe to inherit in_layout's per_tile_fixed:
-            # if the source address doesn't advance across iterations, this private
-            # single-consumer copy of it doesn't need to either.
-            restick_target.per_tile_fixed = getattr(in_layout, "per_tile_fixed", False)
             logger.info(
                 f"Injecting restickify on {op.get_name()} input {edge.dep.name}: "
                 f"{list(in_stl.stride_map)} -> {list(target_stl.stride_map)}"
