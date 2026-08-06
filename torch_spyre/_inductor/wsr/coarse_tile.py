@@ -1400,6 +1400,12 @@ def coarse_tile(
         )
         retiled_infos_by_group.append((stamped_group_id, group_ops, retiled_infos))
 
+    # Pass 1: read copy-ins, using each op's now-stamped
+    # loop_info.propagation.full_read_deps. Must complete before
+    # insert_tiling_propagation's Reduction/copy-out dispatch runs, which
+    # reads each op's *current* reads/loader.
+    _insert_all_read_copy_ops(operations)
+
     insert_tiling_propagation(operations, groups)
 
     for group_id, group_ops, retiled_infos in retiled_infos_by_group:
@@ -1439,6 +1445,33 @@ def insert_tiling_propagation(
                 continue
             if not isinstance(op.data, (Pointwise, Reduction)):
                 continue
+            # _insert_all_read_copy_ops (Pass 1) may already have spliced a
+            # replacement for op into `operations` under the same name, if
+            # op read a full-size cross-loop-group buffer directly.
+            # group_ops is a stale pre-Pass-1 snapshot, so resolve the
+            # current object by name before calling _propagate_tiled_op --
+            # otherwise it would operate on the discarded pre-copy-in op
+            # whose reads still point at the un-copied full buffer.
+            op = next(
+                (
+                    o
+                    for o in operations
+                    if isinstance(o, ComputedBuffer) and o.get_name() == op.get_name()
+                ),
+                op,
+            )
+            # Write the Pass-1-resolved object back into group_ops immediately
+            # -- not just after _propagate_tiled_op returns (see the resync
+            # below). group_ops is shared with retiled_infos_by_group, read
+            # later by _patch_retiled_load_indexes; _propagate_tiled_op may
+            # mutate op.loop_info *in place* (no replacement object) for
+            # e.g. the loop-internal/copy-out output_tiled_dims zeroing, in
+            # which case the after-the-fact "current is not op" check below
+            # never fires, leaving group_ops[idx] pointing at the discarded
+            # pre-Pass-1 object forever -- exactly the object
+            # _patch_retiled_load_indexes would later reconstruct from,
+            # silently discarding the zeroing.
+            group_ops[idx] = op
             _propagate_tiled_op(op, operations)
             # _propagate_tiled_op (and the copy-op insertion it may
             # delegate to) can replace op with a new ComputedBuffer object
@@ -1560,28 +1593,13 @@ def _propagate_tiled_op(
     operations: list[Operation],
 ) -> None:
     """Handle buffer propagation for a single tiled Pointwise or Reduction op."""
+    # Read copy-ins (for a tiled op reading a full-size cross-loop-group
+    # buffer directly -- see _full_buffer_read_deps) are handled up front by
+    # Pass 1 (_insert_all_read_copy_ops), before insert_tiling_propagation's
+    # loop ever calls this function. By the time op reaches here, its reads
+    # already target the inserted copy buffers, so op.loop_info is already
+    # the final, post-copy-in one -- no re-fetch needed.
     loop_info = getattr(op, "loop_info", None)
-
-    # A tiled op — Pointwise or Reduction, loop-internal or not — may read a
-    # buffer produced outside its own outer loop group directly (e.g. a
-    # SpyreEmptyFallback accumulator, or the output of an earlier, different
-    # coarse-tile group's own copy op).  That buffer's layout was fixed by a
-    # different loop group's (or no loop group's) constraints, sized to its
-    # own full extent, while this op's own candidates are sized to its tile
-    # — the two can never be stick-compatible.  Insert a tile-sized read copy
-    # for each such input before doing anything else (mirrors the write-side
-    # _insert_copy_op fix, but on the read side).  This must run before the
-    # Reduction/has_tiled_reduction branch below, since
-    # _propagate_tiled_reduction_op never touches op's own reads.
-    full_deps = _full_buffer_read_deps(op)
-    if full_deps:
-        op = _insert_read_copy_ops(op, full_deps, operations)
-        # _insert_read_copy_ops may rebuild op.loop_info via
-        # dataclasses.replace (to give it fresh tiled_dims_per_read for the
-        # swapped-in copy reads), which detaches it from the loop_info
-        # object captured above -- re-fetch so every mutation below lands
-        # on the object actually reachable from the (possibly-replaced) op.
-        loop_info = getattr(op, "loop_info", None)
 
     if isinstance(op.data, Reduction):
         # Unsupported reduction-tiling shapes are already rejected during
@@ -2577,6 +2595,45 @@ def _insert_read_copy_ops(
             new_loop_info, tiled_dims_per_read=new_tiled_dims_per_read
         )
     return new_op
+
+
+def _insert_all_read_copy_ops(operations: list[Operation]) -> None:
+    """Pass 1: insert read-copy-ins for every tiled op reading a full buffer.
+
+    Transformation's Pass 1 (see the plan/execute split design). Every op
+    was already stamped by _apply_plan with a loop_info, so
+    _full_buffer_read_deps(op) is available -- but it must be recomputed
+    fresh here, not read off loop_info.propagation.full_read_deps: that
+    planning-time value was computed from op.get_read_writes() *before*
+    _apply_plan's _divide_ranges/_divide_reduction_ranges divided op's own
+    ranges, so its MemoryDep.index/size expressions are keyed to the
+    pre-division (full-sized) iteration space. _insert_read_copy_ops sizes
+    and indexes the inserted copy directly from dep.index/dep.size (see its
+    docstring), so a stale pre-division dep would size/index the copy
+    against the wrong (full, not tile) extent -- silent wrong-code, exactly
+    the hazard CLAUDE.md's "wrap, never reconstruct" convention warns about
+    for stale symbolic index expressions. _full_buffer_read_deps(op),
+    called here on the current post-division op, is the fresh equivalent.
+    propagation.full_read_deps still has value elsewhere (e.g. as a planning-
+    time cross-check of *which* reads are full-buffer reads -- a static
+    topology fact, unaffected by division), but its dep objects themselves
+    must never be handed to a transformation-time mutation like
+    _insert_read_copy_ops.
+
+    Must run after every group's _apply_plan (so op.loop_info is stamped)
+    and before insert_tiling_propagation's Reduction/copy-out dispatch,
+    which reads an op's *current* reads/loader -- copy-ins must be applied
+    before that machinery is built, not interleaved with it.
+    """
+    for op in list(operations):
+        if not isinstance(op, ComputedBuffer):
+            continue
+        if not isinstance(op.data, (Pointwise, Reduction)):
+            continue
+        full_deps = _full_buffer_read_deps(op)
+        if not full_deps:
+            continue
+        _insert_read_copy_ops(op, full_deps, operations)
 
 
 # ---------------------------------------------------------------------------

@@ -4252,7 +4252,10 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         from torch_spyre._inductor.lowering import enable_spyre_lowerings
-        from torch_spyre._inductor.wsr.coarse_tile import _propagate_tiled_op
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _insert_all_read_copy_ops,
+            _propagate_tiled_op,
+        )
 
         # _allocate_full_buffer lowers a real spyre.empty FX node via
         # V.graph.run_node(), which needs V.fake_mode (GraphLowering.fake_mode
@@ -4317,32 +4320,47 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         # V.graph.buffers, not an independent list, for that removal to find it.
         operations = V.graph.buffers
         operations.extend([tiled_op, consumer])
+        original_op = tiled_op
 
+        # Read copy-ins are now Pass 1 (_insert_all_read_copy_ops), a
+        # standalone pass that runs before insert_tiling_propagation /
+        # _propagate_tiled_op even in production -- call it directly here
+        # rather than folding its effect into _propagate_tiled_op.
         with patch(
             "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
             return_value=set(),
         ):
+            _insert_all_read_copy_ops(operations)
+            # Pass 1 may have spliced a replacement for "op0" into
+            # operations -- re-resolve by name before calling
+            # _propagate_tiled_op, exactly as insert_tiling_propagation's
+            # own loop now does.
+            tiled_op = next(
+                o
+                for o in operations
+                if isinstance(o, ComputedBuffer) and o.get_name() == "op0"
+            )
             _propagate_tiled_op(tiled_op, operations)
 
-        # tiled_op's own two inputs are real, full-size, untiled InputBuffers
+        # original_op's two inputs are real, full-size, untiled InputBuffers
         # read at a tile-scoped index -- _full_buffer_read_deps now flags
-        # both, so _insert_read_copy_ops replaces tiled_op with a new
-        # ComputedBuffer (same name, "op0") before the write-side copy-op
-        # logic below even runs. Look the final op up by name rather than
-        # using the now-stale tiled_op reference.
+        # both, so Pass 1's _insert_all_read_copy_ops replaces original_op
+        # with a new ComputedBuffer (same name, "op0") before the write-side
+        # copy-op logic even runs. Look the final op up by name rather than
+        # using the now-stale original_op reference.
         final_op = V.graph.name_to_buffer["op0"]
         # name_to_buffer is only half the story: replace_computed_buffer_body
-        # must also have swapped the stale tiled_op out of operations (==
+        # must also have swapped the stale original_op out of operations (==
         # V.graph.buffers, see the comment above where it's assigned) for
         # later scheduling to see the new op instead of the old one. Checked
         # by identity (`is`), not `in`/`==`: ComputedBuffer is a frozen
         # dataclass, so `==` compares field values rather than object
-        # identity, and tiled_op/final_op share the same (in-place-mutated)
+        # identity, and original_op/final_op share the same (in-place-mutated)
         # `.data` and layout -- they compare equal to each other even though
         # only final_op is the live object, which makes assertIn/assertNotIn
         # pass regardless of whether the swap actually happened.
         self.assertTrue(any(op is final_op for op in operations))
-        self.assertFalse(any(op is tiled_op for op in operations))
+        self.assertFalse(any(op is original_op for op in operations))
 
         write_copy_ops = [
             op
