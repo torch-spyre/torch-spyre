@@ -257,15 +257,25 @@ def _calculate_device_stride(dev_dim_idx: int, device_size: list) -> int:
     return math.prod(device_size[-dev_dim_idx - 2 :])
 
 
+def _is_conv2d_kernel_tensor(arg: TensorArg, tensor_position: int | None) -> bool:
+    """Check if a tensor is a kernel tensor for conv2d ops.
+
+    A conv2d kernel tensor is identified by its position in op_spec.args.
+    This function centralizes the kernel identification logic.
+    Called only for tensors in op_spec.args (via enumerate), so tensor_position is never -1.
+    """
+    return tensor_position == 1
+
+
 def _get_device_dim_order(
     arg: TensorArg,
     symbol_mapping: dict,
     op_spec: OpSpec | None = None,
-    arg_index: int | None = None,
+    tensor_position: int | None = None,
 ) -> tuple[list[Symbol], Symbol | None]:
     """Return (dim_order, stick_dim) for the arg's device layout after symbol substitution.
 
-    For kernel tensors in conv ops (arg_index==1):
+    For kernel tensors in conv ops (tensor_position==1):
     - Excludes size-1 output-spatial dimensions (i, j) since kernels have no spatial-output dependence.
     - Explicitly includes kernel dimensions (ki, kj) even if they don't appear in device_coordinates
       (e.g., when kernel_size=1, they don't iterate naturally but are still structural dimensions).
@@ -299,8 +309,8 @@ def _get_device_dim_order(
             skip_sym = False
             if (
                 op_spec is not None
-                and arg_index == 1
                 and _is_conv(op_spec.op)
+                and _is_conv2d_kernel_tensor(arg, tensor_position)
                 and str(sym) in ("i", "j")
             ):
                 # sym is already mapped to "i" or "j", but iteration_space has the original c2/c3/z0/z1 names.
@@ -327,8 +337,8 @@ def _get_device_dim_order(
     # be in layoutDimOrder and coordinates_.
     if (
         op_spec is not None
-        and arg_index == 1
         and _is_conv(op_spec.op)
+        and _is_conv2d_kernel_tensor(arg, tensor_position)
         and op_spec.op_info
         and "conv_params" in op_spec.op_info
     ):
@@ -749,6 +759,17 @@ def _get_op_dim_labels(ndim: int, is_matmul: bool, is_conv2d: bool) -> list[str]
         return INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
 
 
+def _get_tensor_layout_labels(use_op_dims: bool, op_name: str) -> list[str]:
+    layout_labels = (
+        LAYOUT_LABELS
+        if use_op_dims
+        else MATMUL_LAYOUT_LABELS
+        if _is_matmul(op_name)
+        else CONV2D_LAYOUT_LABELS
+    )
+    return layout_labels
+
+
 def _get_data_format(op, device_dtype):
     """
     NOTE: This is NOT a data conversion.
@@ -834,7 +855,7 @@ def _create_sdsc_tensors(
             dim_order, stick_dim = index_tensor_layouts[i]
         else:
             dim_order, stick_dim = _get_device_dim_order(
-                arg, symbol_mapping, op_spec, arg_index=i
+                arg, symbol_mapping, op_spec, tensor_position=i
             )
 
         # Case 2 (MutationLayoutSHOULDREMOVE) ops carry an authoritative
@@ -977,13 +998,8 @@ def _create_sdsc_tensors(
             max_dim_sizes[mb_sym] = -1
 
         effective_stick = op_stick_dim if stick_dim is None else stick_dim
-        layout_labels = (
-            LAYOUT_LABELS
-            if use_op_dims
-            else MATMUL_LAYOUT_LABELS
-            if _is_matmul(op_spec.op)
-            else CONV2D_LAYOUT_LABELS
-        )
+
+        layout_labels = _get_tensor_layout_labels(use_op_dims, op_spec.op)
 
         if has_indirect_access:
             label = get_indirect_layout_label(
@@ -1457,21 +1473,22 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         num_cores = math.prod(dim_splits.values())
 
     if is_conv2d and disable_conv2d_spatial_split:
-        # Disable splitting on spatial image dimensions (i, j) for conv2d when stride > 1.
-        # For stride > 1: splitting causes DSM/strided access complexity that degrades correctness.
-        # For stride = 1: splitting is safe but disabling it improves memory locality anyway.
-        # Controlled by SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT env var (default: 1).
-        stride_i = conv_params.get("stride_i", 1)
-        stride_j = conv_params.get("stride_j", 1)
-        has_stride = stride_i > 1 or stride_j > 1
-
-        if has_stride:
-            # For strided conv2d, always disable i/j splits (necessary for correctness).
+        # Splitting the spatial image dims (i, j) of a strided conv2d across
+        # cores produces incorrect DSM/strided addressing. The split is
+        # suppressed upstream by ``conv_spatial_blocked_vars`` in
+        # work_division.py, so those cores go to dims that can absorb them
+        # instead of being dropped here. Span reduction outranks the flag: if
+        # the hardware span limit forces a spatial split, work division logs a
+        # warning and keeps it, so this only checks the dims it did block.
+        if conv_params.get("stride_i", 1) > 1 or conv_params.get("stride_j", 1) > 1:
             for _spatial_sym in (Symbol("i"), Symbol("j")):
-                if _spatial_sym in dim_splits:
-                    dim_splits[_spatial_sym] = 1
-                    work_slices[_spatial_sym] = 1
-            num_cores = math.prod(dim_splits.values())
+                if dim_splits.get(_spatial_sym, 1) > 1:
+                    logger.warning(
+                        f"strided conv2d {op_spec.op}: spatial dim "
+                        f"{_spatial_sym} is split {dim_splits[_spatial_sym]} "
+                        f"ways; expected work division to block it unless the "
+                        f"memory-span limit required the split."
+                    )
 
     # Pool-specific SDSC field values.  Computed here (where the op is already
     # identified) as plain data threaded onto SDSCSpec; generate_sdsc consumes
