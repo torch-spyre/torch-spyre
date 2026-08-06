@@ -4252,6 +4252,7 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         from torch_spyre._inductor.lowering import enable_spyre_lowerings
+        from torch_spyre._inductor.loop_info import PropagationPlan
         from torch_spyre._inductor.wsr.coarse_tile import (
             _insert_all_read_copy_ops,
             _propagate_tiled_op,
@@ -4323,9 +4324,9 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         original_op = tiled_op
 
         # Read copy-ins are now Pass 1 (_insert_all_read_copy_ops), a
-        # standalone pass that runs before insert_tiling_propagation /
-        # _propagate_tiled_op even in production -- call it directly here
-        # rather than folding its effect into _propagate_tiled_op.
+        # standalone pass that runs before Pass 3 / _propagate_tiled_op even
+        # in production -- call it directly here rather than folding its
+        # effect into _propagate_tiled_op.
         with patch(
             "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
             return_value=set(),
@@ -4333,14 +4334,25 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
             _insert_all_read_copy_ops(operations)
             # Pass 1 may have spliced a replacement for "op0" into
             # operations -- re-resolve by name before calling
-            # _propagate_tiled_op, exactly as insert_tiling_propagation's
+            # _propagate_tiled_op, exactly as _insert_all_write_copy_ops'
             # own loop now does.
             tiled_op = next(
                 o
                 for o in operations
                 if isinstance(o, ComputedBuffer) and o.get_name() == "op0"
             )
-            _propagate_tiled_op(tiled_op, operations)
+            # _propagate_tiled_op (Pass 3) now consumes a precomputed
+            # PropagationPlan instead of deriving it itself -- full_ranges
+            # is the pre-division full shape (8 * loop_count 8 == 64),
+            # matching what the old in-function _compute_full_ranges call
+            # used to compute from the tile-sized op.data.ranges.
+            propagation = PropagationPlan(
+                kind="copy_out",
+                full_ranges=[Integer(64)],
+                outside_consumer_names=("out0",),
+                is_graph_output=False,
+            )
+            _propagate_tiled_op(tiled_op, propagation, operations)
 
         # original_op's two inputs are real, full-size, untiled InputBuffers
         # read at a tile-scoped index -- _full_buffer_read_deps now flags

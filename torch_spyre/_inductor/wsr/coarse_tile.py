@@ -1408,10 +1408,8 @@ def coarse_tile(
     plan = plan_coarse_tile_groups(operations, groups)
 
     # Planning continued: decide every op's propagation kind (loop-internal
-    # / copy-out / reduction) with zero mutation. Transformation doesn't
-    # consume this yet (still uses its own equivalent, interleaved logic) --
-    # this is purely additive until the cross-check test below is joined by
-    # the Stage 3 migration.
+    # / copy-out / reduction) with zero mutation, consumed by Pass 1/2/3
+    # below.
     _plan_tiling_propagation(operations, groups, plan)
 
     # Transformation: apply the plan. Only reached if planning didn't raise.
@@ -1436,13 +1434,38 @@ def coarse_tile(
     # Pass 2: reduction machinery (accumulator/fill/combine), using each
     # op's now-stamped loop_info.propagation.reduction. Must run after Pass
     # 1 (a tiled-reduction op may itself have needed a read copy-in) and
-    # before insert_tiling_propagation, which no longer dispatches reduction
-    # ops at all -- Pass 2 is their sole handler.
+    # before Pass 3 -- a reduction op is never also copy_out (the plan's
+    # kind routes each op to exactly one).
     _insert_all_reduction_ops(operations)
+
+    # Pass 3: write copy-outs (full buffer + copy op + outside-consumer/
+    # graph-output patching), using each op's now-stamped
+    # loop_info.propagation.full_ranges/outside_consumer_names/
+    # is_graph_output. Must run after Pass 1/2 -- _allocate_full_buffer/
+    # _insert_copy_op read op's *current* reads/loader/layout.
+    _insert_all_write_copy_ops(operations)
 
     insert_tiling_propagation(operations, groups)
 
+    # Pass 1/2/3 (all above) may have spliced a replacement ComputedBuffer
+    # into `operations` under the same name for any op in a group's
+    # `group_ops` snapshot (taken before those passes ran, back when
+    # retiled_infos_by_group was built) -- e.g. a read copy-in redirect
+    # (Pass 1) or a copy-out's output_tiled_dims zeroing that happens to
+    # accompany a body rewrite. _patch_retiled_load_indexes must see each
+    # op's *current* inner_fn/loop_info to decide whether it still needs
+    # patching, so re-resolve every entry by name from `operations` (the
+    # authoritative post-replacement list) before calling it -- the same
+    # by-name resync idiom used throughout this module (see PropagationPlan's
+    # docstring on name stability).
+    name_to_op = {
+        op.get_name(): op for op in operations if isinstance(op, ComputedBuffer)
+    }
     for group_id, group_ops, retiled_infos in retiled_infos_by_group:
+        for idx, op in enumerate(group_ops):
+            if not isinstance(op, ComputedBuffer):
+                continue
+            group_ops[idx] = name_to_op.get(op.get_name(), op)
         _patch_retiled_load_indexes(group_id, group_ops, retiled_infos, operations)
 
 
@@ -1455,98 +1478,18 @@ def insert_tiling_propagation(
     operations: list[Operation],
     groups: list[tuple],
 ) -> None:
-    """Insert full-sized buffers and copy/mutation ops for tiled ops.
+    """Zero fixed-buffer readers' tiled_dims_per_read entries.
 
-    Handles Pointwise and Reduction ComputedBuffers.  For Reductions, tiled
-    dims that fall in the reduction_ranges index range raise RuntimeError.
-
-    For each eligible ComputedBuffer in a tiling group, if its result is
-    consumed by any operation outside the loop (different loop_group_id or
-    absent) or is a graph output, this pass ensures the outside consumer sees
-    the complete result: allocate a full-sized buffer, then insert a copy op
-    (same loop_group_id, same loop_tiled_dims) that writes each tile into the
-    correct slice of the full buffer.  Patch outside consumers to read the
-    full buffer.  This applies uniformly regardless of whether the tiled
-    op's output is also consumed inside the loop.
-
-    The existing tiled_symbols / affine.apply machinery in SpyreKernel and
-    bundle.py handles the per-iteration address offset for both the tiled
-    op and the inserted copy op.
+    Pass 2 (_insert_all_reduction_ops) and Pass 3 (_insert_all_write_copy_ops)
+    -- both run before this -- already handle every tiled op's own
+    boundary-crossing (reduction machinery, or full-buffer allocation +
+    copy-out + outside-consumer/graph-output patching). All that remains
+    here is _zero_reads_of_fixed_buffers, kept as its own pass because "is
+    buf1 fixed" depends on Pass 3 having already zeroed buf1's own
+    output_tiled_dims, which a sibling reader of buf1 cannot know until
+    then regardless of visitation order.
     """
-    for group_ops, _ in groups:
-        for idx, op in enumerate(group_ops):
-            if not isinstance(op, ComputedBuffer):
-                continue
-            if not isinstance(op.data, (Pointwise, Reduction)):
-                continue
-            # Reduction ops tiled over a reduction dim were already fully
-            # handled by Pass 2 (_insert_all_reduction_ops), which runs
-            # before this loop -- its own consumer-patching already redirects
-            # every outside reader/graph-output away from op's name, so a
-            # second dispatch here would be redundant at best. Detect via
-            # loop_info.propagation.kind rather than re-deriving
-            # has_tiled_reduction, since group_ops may be stale (see the
-            # resolve-by-name step below) -- checking the *current* object's
-            # already-computed plan is simpler and always correct.
-            current_propagation = getattr(
-                getattr(op, "loop_info", None), "propagation", None
-            )
-            if (
-                current_propagation is not None
-                and current_propagation.kind == "reduction"
-            ):
-                continue
-            # _insert_all_read_copy_ops (Pass 1) may already have spliced a
-            # replacement for op into `operations` under the same name, if
-            # op read a full-size cross-loop-group buffer directly.
-            # group_ops is a stale pre-Pass-1 snapshot, so resolve the
-            # current object by name before calling _propagate_tiled_op --
-            # otherwise it would operate on the discarded pre-copy-in op
-            # whose reads still point at the un-copied full buffer.
-            op = next(
-                (
-                    o
-                    for o in operations
-                    if isinstance(o, ComputedBuffer) and o.get_name() == op.get_name()
-                ),
-                op,
-            )
-            # Write the Pass-1-resolved object back into group_ops immediately
-            # -- not just after _propagate_tiled_op returns (see the resync
-            # below). group_ops is shared with retiled_infos_by_group, read
-            # later by _patch_retiled_load_indexes; _propagate_tiled_op may
-            # mutate op.loop_info *in place* (no replacement object) for
-            # e.g. the loop-internal/copy-out output_tiled_dims zeroing, in
-            # which case the after-the-fact "current is not op" check below
-            # never fires, leaving group_ops[idx] pointing at the discarded
-            # pre-Pass-1 object forever -- exactly the object
-            # _patch_retiled_load_indexes would later reconstruct from,
-            # silently discarding the zeroing.
-            group_ops[idx] = op
-            _propagate_tiled_op(op, operations)
-            # _propagate_tiled_op (and the copy-op insertion it may
-            # delegate to) can replace op with a new ComputedBuffer object
-            # spliced into `operations` under the same name (see
-            # replace_computed_buffer_body).  group_ops is a separate list
-            # snapshotted before this loop runs, so it must be kept in sync
-            # here — otherwise a later pass reading group_ops (e.g.
-            # _patch_retiled_load_indexes) sees the stale pre-rewrite object
-            # and clobbers the rewrite when it reconstructs from it.  Look
-            # up the current object in `operations` itself (already the
-            # authoritative post-replacement list) rather than V.graph --
-            # this pass runs from CustomPreSchedulingPasses, and unit tests
-            # that call coarse_tile() directly never install a real V.graph.
-            current = next(
-                (
-                    o
-                    for o in operations
-                    if isinstance(o, ComputedBuffer) and o.get_name() == op.get_name()
-                ),
-                None,
-            )
-            if current is not None and current is not op:
-                group_ops[idx] = current
-
+    del groups  # unused now that Pass 3 covers every group's own ops
     _zero_reads_of_fixed_buffers(operations)
 
 
@@ -1639,46 +1582,58 @@ def _validate_planned_reduction_tiling(
             )
 
 
+def _insert_all_write_copy_ops(operations: list[Operation]) -> None:
+    """Pass 3: build full buffer + copy-out for every planned copy-out op.
+
+    Transformation's Pass 3 (see the plan/execute split design). Every op
+    was already stamped by _apply_plan with a loop_info carrying
+    .propagation, computed by _plan_tiling_propagation -- this pass only
+    consumes that decision (kind == "copy_out" and its accompanying
+    full_ranges/outside_consumer_names/is_graph_output data), it makes no
+    new ones. A "loop_internal" op needs nothing here: planning already
+    determined it has no outside consumers, so its output_tiled_dims is
+    left as _apply_plan stamped it (a loop-internal op's write is never
+    tiled -- see _plan_tiling_propagation).
+
+    Must run after Pass 1 (_insert_all_read_copy_ops) and Pass 2
+    (_insert_all_reduction_ops) -- a copy-out op may itself have needed a
+    read copy-in, and _allocate_full_buffer/_insert_copy_op read op's
+    *current* reads/loader/layout.
+    """
+    for op in list(operations):
+        if not isinstance(op, ComputedBuffer):
+            continue
+        loop_info = getattr(op, "loop_info", None)
+        propagation = getattr(loop_info, "propagation", None)
+        if propagation is None or propagation.kind != "copy_out":
+            continue
+        _propagate_tiled_op(op, propagation, operations)
+
+
 def _propagate_tiled_op(
     op: ComputedBuffer,
+    propagation: PropagationPlan,
     operations: list[Operation],
 ) -> None:
-    """Handle buffer propagation for a single tiled Pointwise or Reduction op."""
-    # Read copy-ins (for a tiled op reading a full-size cross-loop-group
-    # buffer directly -- see _full_buffer_read_deps) are handled up front by
-    # Pass 1 (_insert_all_read_copy_ops), before insert_tiling_propagation's
-    # loop ever calls this function. By the time op reaches here, its reads
-    # already target the inserted copy buffers, so op.loop_info is already
-    # the final, post-copy-in one -- no re-fetch needed.
-    #
-    # Reduction ops tiled over a reduction dim are handled entirely by Pass 2
-    # (_insert_all_reduction_ops), which also runs before
-    # insert_tiling_propagation's loop calls this function -- op.data is
-    # never a Reduction with a tiled reduction dim by the time control
-    # reaches here.
-    loop_info = getattr(op, "loop_info", None)
-
-    if loop_info is None:
-        return
+    """Allocate a full buffer + copy-out for a single planned copy-out op."""
+    loop_info = op.loop_info
     loop_group_id = loop_info.loop_group_id
-
     buf_name = op.get_name()
-    outside_consumers, is_graph_output = _find_outside_consumers(
-        buf_name, loop_group_id, operations
-    )
 
-    # If no dims were tiled (loop_tiled_dims all empty), the op is loop-invariant.
-    if all(not dims for dims in loop_info.loop_tiled_dims):
-        return
+    # Resolve planning-time consumer names to their current objects --
+    # Pass 1/2 may have spliced replacements into `operations` under the
+    # same names since planning ran (see PropagationPlan's docstring on
+    # name stability).
+    outside_consumers = [
+        o
+        for o in operations
+        if isinstance(o, ComputedBuffer)
+        and o.get_name() in propagation.outside_consumer_names
+    ]
+    is_graph_output = propagation.is_graph_output
 
-    if not outside_consumers and not is_graph_output:
-        # Loop-internal: the buffer is a per-tile scratch region reused every
-        # iteration.  Its own write must not advance at any level.
-        loop_info.output_tiled_dims = []
-        return
-
-    # Reconstruct the original (pre-division) ranges.
-    full_ranges = _compute_full_ranges(op)
+    full_ranges = propagation.full_ranges
+    assert full_ranges is not None, "full_ranges must be planned for copy_out ops"
 
     # Insert the full buffer before the first op in the same outermost
     # loop group so it doesn't split the group's contiguous run in the
