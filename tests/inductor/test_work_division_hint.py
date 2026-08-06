@@ -399,7 +399,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         _name_tensor_dims(x, ["M", "N"])
 
         def fn(x):
-            with spyre_hint(tiles={"M": 4}):
+            with spyre_hint(tile_size_per_dim={"M": 32}):
                 return torch.abs(x)
 
         with (
@@ -427,7 +427,7 @@ class TestNamedWorkDivisionHint(InductorTestCase):
         _name_tensor_dims(x, ["M", "N"])
 
         def fn(x):
-            with spyre_hint(tiles={"M": 4}, work_div={"N": 2}):
+            with spyre_hint(tile_size_per_dim={"M": 32}, work_div={"N": 2}):
                 return torch.abs(x)
 
         with (

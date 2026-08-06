@@ -205,7 +205,7 @@ def test_abs_256x256_A4():
     inputs = [tensor("x", shape=(256, 256), dims=["A", "B"])]
 
     def fn(x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 64}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return torch.abs(x)
 
@@ -217,7 +217,7 @@ def test_abs_256x256_B4():
     inputs = [tensor("x", shape=(256, 256), dims=["A", "B"])]
 
     def fn(x):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return torch.abs(x)
 
@@ -229,8 +229,8 @@ def test_abs_256x256_A4_B4():
     inputs = [tensor("x", shape=(256, 256), dims=["A", "B"])]
 
     def fn(x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 64}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     return torch.abs(x)
 
@@ -248,7 +248,7 @@ def test_add_256x256_A4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 64}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return x + y
 
@@ -263,7 +263,7 @@ def test_add_256x256_B4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return x + y
 
@@ -278,8 +278,8 @@ def test_add_256x256_A4_B4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 64}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     return x + y
 
@@ -297,7 +297,7 @@ def test_add_512x256_A4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return x + y
 
@@ -312,7 +312,7 @@ def test_add_512x256_B4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return x + y
 
@@ -327,8 +327,8 @@ def test_add_512x256_A4_B4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     return x + y
 
@@ -346,7 +346,7 @@ def test_add_256x512_A4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 64}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return x + y
 
@@ -361,7 +361,7 @@ def test_add_256x512_B4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 128}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return x + y
 
@@ -376,8 +376,8 @@ def test_add_256x512_A4_B4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 64}):
+            with spyre_hint(tile_size_per_dim={"B": 128}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     return x + y
 
@@ -395,7 +395,7 @@ def test_add_512x512_A4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return x + y
 
@@ -410,7 +410,7 @@ def test_add_512x512_B4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 128}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return x + y
 
@@ -425,8 +425,8 @@ def test_add_512x512_A4_B4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 128}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     return x + y
 
@@ -444,8 +444,8 @@ def test_add_512x256_A4_B2():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 2}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 128}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     return x + y
 
@@ -466,7 +466,7 @@ def test_add_3d_512x256x256_A4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["A", "B", "C"]):
                 return x + y
 
@@ -481,7 +481,7 @@ def test_add_3d_512x256x256_B2():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"B": 2}):
+        with spyre_hint(tile_size_per_dim={"B": 128}):
             with spyre_hint(expected_named_dims=["A", "B", "C"]):
                 return x + y
 
@@ -496,7 +496,7 @@ def test_add_3d_512x256x256_C4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"C": 4}):
+        with spyre_hint(tile_size_per_dim={"C": 64}):
             with spyre_hint(expected_named_dims=["A", "B", "C"]):
                 return x + y
 
@@ -511,8 +511,8 @@ def test_add_3d_512x256x256_A4_B2():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 2}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 128}):
                 with spyre_hint(expected_named_dims=["A", "B", "C"]):
                     return x + y
 
@@ -527,8 +527,8 @@ def test_add_3d_512x256x256_A4_C4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"C": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"C": 64}):
                 with spyre_hint(expected_named_dims=["A", "B", "C"]):
                     return x + y
 
@@ -543,8 +543,8 @@ def test_add_3d_512x256x256_B2_C4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"B": 2}):
-            with spyre_hint(num_tiles_per_dim={"C": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 128}):
+            with spyre_hint(tile_size_per_dim={"C": 64}):
                 with spyre_hint(expected_named_dims=["A", "B", "C"]):
                     return x + y
 
@@ -559,9 +559,9 @@ def test_add_3d_512x256x256_A4_B2_C4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 2}):
-                with spyre_hint(num_tiles_per_dim={"C": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 128}):
+                with spyre_hint(tile_size_per_dim={"C": 64}):
                     with spyre_hint(expected_named_dims=["A", "B", "C"]):
                         return x + y
 
@@ -583,7 +583,7 @@ def test_abs_add_mul_512x256_A4():
     ]
 
     def fn(a, b, c):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return torch.abs(a + b) * c
 
@@ -599,7 +599,7 @@ def test_abs_add_mul_512x256_B4():
     ]
 
     def fn(a, b, c):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return torch.abs(a + b) * c
 
@@ -615,8 +615,8 @@ def test_abs_add_mul_512x256_A4_B4():
     ]
 
     def fn(a, b, c):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     return torch.abs(a + b) * c
 
@@ -632,7 +632,7 @@ def test_exp_abs_add_mul_512x256_A4():
     ]
 
     def fn(a, b, c):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return torch.exp(torch.abs((a + b) * c))
 
@@ -648,7 +648,7 @@ def test_exp_abs_add_mul_512x256_B4():
     ]
 
     def fn(a, b, c):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return torch.exp(torch.abs((a + b) * c))
 
@@ -664,8 +664,8 @@ def test_exp_abs_add_mul_512x256_A4_B4():
     ]
 
     def fn(a, b, c):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     return torch.exp(torch.abs((a + b) * c))
 
@@ -684,7 +684,7 @@ def test_min_2d_512x256_reduce_dim0_A4():
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
                 return x.amin(dim=0)
 
@@ -696,7 +696,7 @@ def test_min_2d_512x256_reduce_dim0_B4():
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
                 return x.amin(dim=0)
 
@@ -708,8 +708,8 @@ def test_min_2d_512x256_reduce_dim0_A4_B4():
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(
                     expected_named_dims=["B"], expected_reduction_dims=["A"]
                 ):
@@ -725,7 +725,7 @@ def test_min_2d_512x256_reduce_dim1_A4():
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["A"], expected_reduction_dims=["B"]):
                 return x.amin(dim=1)
 
@@ -737,7 +737,7 @@ def test_min_2d_512x256_reduce_dim1_B4():
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["A"], expected_reduction_dims=["B"]):
                 return x.amin(dim=1)
 
@@ -749,8 +749,8 @@ def test_min_2d_512x256_reduce_dim1_A4_B4():
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(
                     expected_named_dims=["A"], expected_reduction_dims=["B"]
                 ):
@@ -767,9 +767,9 @@ def test_min_3d_512x256x256_reduce_dim0_A4_B2_C4():
     inputs = [tensor("x", shape=(512, 256, 256), dims=["A", "B", "C"])]
 
     def fn(x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 2}):
-                with spyre_hint(num_tiles_per_dim={"C": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 128}):
+                with spyre_hint(tile_size_per_dim={"C": 64}):
                     with spyre_hint(
                         expected_named_dims=["B", "C"], expected_reduction_dims=["A"]
                     ):
@@ -786,9 +786,9 @@ def test_min_3d_512x256x256_reduce_dim1_A4_B2_C4():
     inputs = [tensor("x", shape=(512, 256, 256), dims=["A", "B", "C"])]
 
     def fn(x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 2}):
-                with spyre_hint(num_tiles_per_dim={"C": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 128}):
+                with spyre_hint(tile_size_per_dim={"C": 64}):
                     with spyre_hint(
                         expected_named_dims=["A", "C"], expected_reduction_dims=["B"]
                     ):
@@ -804,9 +804,9 @@ def test_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
     inputs = [tensor("x", shape=(512, 256, 256), dims=["A", "B", "C"])]
 
     def fn(x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 2}):
-                with spyre_hint(num_tiles_per_dim={"C": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 128}):
+                with spyre_hint(tile_size_per_dim={"C": 64}):
                     with spyre_hint(
                         expected_named_dims=["A", "B"], expected_reduction_dims=["C"]
                     ):
@@ -834,7 +834,7 @@ def test_add_min_2d_512x256_reduce_dim0_A4():
     ]
 
     def fn(a, b):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
                 r = b.amin(dim=0)
             with spyre_hint(expected_named_dims=["B"]):
@@ -853,7 +853,7 @@ def test_add_min_2d_512x256_reduce_dim0_B4():
     ]
 
     def fn(a, b):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
                 r = b.amin(dim=0)
             with spyre_hint(expected_named_dims=["B"]):
@@ -872,8 +872,8 @@ def test_add_min_2d_512x256_reduce_dim0_A4_B4():
     ]
 
     def fn(a, b):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(
                     expected_named_dims=["B"], expected_reduction_dims=["A"]
                 ):
@@ -894,7 +894,7 @@ def test_add_min_2d_512x256_reduce_dim1_A4():
     ]
 
     def fn(a, b):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["A"], expected_reduction_dims=["B"]):
                 r = b.amin(dim=1, keepdim=True)
             with spyre_hint(expected_named_dims=["A"]):
@@ -913,7 +913,7 @@ def test_add_min_2d_512x256_reduce_dim1_B4():
     ]
 
     def fn(a, b):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["A"], expected_reduction_dims=["B"]):
                 r = b.amin(dim=1, keepdim=True)
             with spyre_hint(expected_named_dims=["A"]):
@@ -932,8 +932,8 @@ def test_add_min_2d_512x256_reduce_dim1_A4_B4():
     ]
 
     def fn(a, b):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(
                     expected_named_dims=["A"], expected_reduction_dims=["B"]
                 ):
@@ -955,9 +955,9 @@ def test_add_min_3d_512x256x256_reduce_dim0_A4_B2_C4():
     ]
 
     def fn(a, b):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 2}):
-                with spyre_hint(num_tiles_per_dim={"C": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 128}):
+                with spyre_hint(tile_size_per_dim={"C": 64}):
                     with spyre_hint(
                         expected_named_dims=["B", "C"], expected_reduction_dims=["A"]
                     ):
@@ -981,9 +981,9 @@ def test_add_min_3d_512x256x256_reduce_dim1_A4_B2_C4():
     ]
 
     def fn(a, b):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 2}):
-                with spyre_hint(num_tiles_per_dim={"C": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 128}):
+                with spyre_hint(tile_size_per_dim={"C": 64}):
                     with spyre_hint(
                         expected_named_dims=["A", "C"], expected_reduction_dims=["B"]
                     ):
@@ -1007,9 +1007,9 @@ def test_add_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
     ]
 
     def fn(a, b):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 2}):
-                with spyre_hint(num_tiles_per_dim={"C": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 128}):
+                with spyre_hint(tile_size_per_dim={"C": 64}):
                     with spyre_hint(
                         expected_named_dims=["A", "B"], expected_reduction_dims=["C"]
                     ):
@@ -1036,7 +1036,7 @@ def test_reduce_both_dense_add_2d_512x256_A4():
     ]
 
     def fn(a, b):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["B"]):
                 return a.amin(dim=0) + b.amin(dim=0)
 
@@ -1051,7 +1051,7 @@ def test_reduce_both_dense_add_2d_512x256_B4():
     ]
 
     def fn(a, b):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["B"]):
                 return a.amin(dim=0) + b.amin(dim=0)
 
@@ -1066,8 +1066,8 @@ def test_reduce_both_dense_add_2d_512x256_A4_B4():
     ]
 
     def fn(a, b):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(expected_named_dims=["B"]):
                     return a.amin(dim=0) + b.amin(dim=0)
 
@@ -1082,7 +1082,7 @@ def test_reduce_both_sparse_add_2d_512x256_A4():
     ]
 
     def fn(a, b):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["A"]):
                 return a.amin(dim=1) + b.amin(dim=1)
 
@@ -1097,7 +1097,7 @@ def test_reduce_both_sparse_add_2d_512x256_B4():
     ]
 
     def fn(a, b):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["A"]):
                 return a.amin(dim=1) + b.amin(dim=1)
 
@@ -1112,8 +1112,8 @@ def test_reduce_both_sparse_add_2d_512x256_A4_B4():
     ]
 
     def fn(a, b):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(expected_named_dims=["A"]):
                     return a.amin(dim=1) + b.amin(dim=1)
 
@@ -1129,7 +1129,7 @@ def test_softmax_2d_512x256_dim1_A4():
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             return torch.softmax(x, dim=1)
 
     run_coarse_tile_test(fn, inputs)
@@ -1140,7 +1140,7 @@ def test_softmax_2d_512x256_dim1_B4():
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             return torch.softmax(x, dim=1)
 
     run_coarse_tile_test(fn, inputs)
@@ -1151,8 +1151,8 @@ def test_softmax_2d_512x256_dim1_A4_B4():
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 return torch.softmax(x, dim=1)
 
     run_coarse_tile_test(fn, inputs)
@@ -1163,7 +1163,7 @@ def test_softmax_2d_512x256_dim0_A4():
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             return torch.softmax(x, dim=0)
 
     run_coarse_tile_test(fn, inputs)
@@ -1174,7 +1174,7 @@ def test_softmax_2d_512x256_dim0_B4():
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             return torch.softmax(x, dim=0)
 
     run_coarse_tile_test(fn, inputs)
@@ -1185,8 +1185,8 @@ def test_softmax_2d_512x256_dim0_A4_B4():
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 return torch.softmax(x, dim=0)
 
     run_coarse_tile_test(fn, inputs)
@@ -1209,7 +1209,7 @@ def test_restickify_add_256x128_A2():
     ]
 
     def fn(a, x):
-        with spyre_hint(num_tiles_per_dim={"A": 2}):
+        with spyre_hint(tile_size_per_dim={"A": 64}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return a.t() + x
 
@@ -1224,7 +1224,7 @@ def test_restickify_add_256x128_B4():
     ]
 
     def fn(a, x):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return a.t() + x
 
@@ -1239,8 +1239,8 @@ def test_restickify_add_256x128_A2_B4():
     ]
 
     def fn(a, x):
-        with spyre_hint(num_tiles_per_dim={"A": 2}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 64}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     return a.t() + x
 
@@ -1262,7 +1262,7 @@ def test_restickify_2t_add_256x128_A2():
     ]
 
     def fn(a, b, x):
-        with spyre_hint(num_tiles_per_dim={"A": 2}):
+        with spyre_hint(tile_size_per_dim={"A": 64}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return a.t() + b.t() + x
 
@@ -1279,7 +1279,7 @@ def test_restickify_2t_add_256x128_B4():
     ]
 
     def fn(a, b, x):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return a.t() + b.t() + x
 
@@ -1296,8 +1296,8 @@ def test_restickify_2t_add_256x128_A2_B4():
     ]
 
     def fn(a, b, x):
-        with spyre_hint(num_tiles_per_dim={"A": 2}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 64}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     return a.t() + b.t() + x
 
@@ -1317,7 +1317,7 @@ def test_restickify_3d_transpose12_256x512x256_A4():
     ]
 
     def fn(a, x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 64}):
             with spyre_hint(expected_named_dims=["A", "B", "C"]):
                 return a.transpose(1, 2) + x
 
@@ -1332,7 +1332,7 @@ def test_restickify_3d_transpose12_256x512x256_B4():
     ]
 
     def fn(a, x):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["A", "B", "C"]):
                 return a.transpose(1, 2) + x
 
@@ -1347,7 +1347,7 @@ def test_restickify_3d_transpose12_256x512x256_C4():
     ]
 
     def fn(a, x):
-        with spyre_hint(num_tiles_per_dim={"C": 4}):
+        with spyre_hint(tile_size_per_dim={"C": 128}):
             with spyre_hint(expected_named_dims=["A", "B", "C"]):
                 return a.transpose(1, 2) + x
 
@@ -1362,8 +1362,8 @@ def test_restickify_3d_transpose12_256x512x256_A4_B4():
     ]
 
     def fn(a, x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 64}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(expected_named_dims=["A", "B", "C"]):
                     return a.transpose(1, 2) + x
 
@@ -1378,8 +1378,8 @@ def test_restickify_3d_transpose12_256x512x256_A4_C4():
     ]
 
     def fn(a, x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"C": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 64}):
+            with spyre_hint(tile_size_per_dim={"C": 128}):
                 with spyre_hint(expected_named_dims=["A", "B", "C"]):
                     return a.transpose(1, 2) + x
 
@@ -1394,8 +1394,8 @@ def test_restickify_3d_transpose12_256x512x256_B4_C4():
     ]
 
     def fn(a, x):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
-            with spyre_hint(num_tiles_per_dim={"C": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
+            with spyre_hint(tile_size_per_dim={"C": 128}):
                 with spyre_hint(expected_named_dims=["A", "B", "C"]):
                     return a.transpose(1, 2) + x
 
@@ -1410,9 +1410,9 @@ def test_restickify_3d_transpose12_256x512x256_A4_B4_C4():
     ]
 
     def fn(a, x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
-                with spyre_hint(num_tiles_per_dim={"C": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 64}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
+                with spyre_hint(tile_size_per_dim={"C": 128}):
                     with spyre_hint(expected_named_dims=["A", "B", "C"]):
                         return a.transpose(1, 2) + x
 
@@ -1434,7 +1434,7 @@ def test_restickify_matmul_xt_y_256x128_M4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"M": 4}):
+        with spyre_hint(tile_size_per_dim={"M": 64}):
             with spyre_hint(expected_named_dims=["M", "N"]):
                 return torch.matmul(x.t(), y)
 
@@ -1449,7 +1449,7 @@ def test_restickify_matmul_xt_y_256x128_N4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"N": 4}):
+        with spyre_hint(tile_size_per_dim={"N": 64}):
             with spyre_hint(expected_named_dims=["M", "N"]):
                 return torch.matmul(x.t(), y)
 
@@ -1464,8 +1464,8 @@ def test_restickify_matmul_xt_y_256x128_M4_N4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"M": 4}):
-            with spyre_hint(num_tiles_per_dim={"N": 4}):
+        with spyre_hint(tile_size_per_dim={"M": 64}):
+            with spyre_hint(tile_size_per_dim={"N": 64}):
                 with spyre_hint(expected_named_dims=["M", "N"]):
                     return torch.matmul(x.t(), y)
 
@@ -1480,7 +1480,7 @@ def test_restickify_matmul_x_yt_128x256_M2():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"M": 2}):
+        with spyre_hint(tile_size_per_dim={"M": 64}):
             with spyre_hint(expected_named_dims=["M", "N"]):
                 return torch.matmul(x, y.t())
 
@@ -1495,7 +1495,7 @@ def test_restickify_matmul_x_yt_128x256_N2():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"N": 2}):
+        with spyre_hint(tile_size_per_dim={"N": 64}):
             with spyre_hint(expected_named_dims=["M", "N"]):
                 return torch.matmul(x, y.t())
 
@@ -1510,8 +1510,8 @@ def test_restickify_matmul_x_yt_128x256_M2_N2():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"M": 2}):
-            with spyre_hint(num_tiles_per_dim={"N": 2}):
+        with spyre_hint(tile_size_per_dim={"M": 64}):
+            with spyre_hint(tile_size_per_dim={"N": 64}):
                 with spyre_hint(expected_named_dims=["M", "N"]):
                     return torch.matmul(x, y.t())
 
@@ -1537,7 +1537,7 @@ def test_copy_into_preallocated_512x256_A4():
 
     def fn(a, b):
         c = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 c.copy_(a + b)
         return c
@@ -1554,7 +1554,7 @@ def test_copy_into_preallocated_512x256_B4():
 
     def fn(a, b):
         c = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 c.copy_(a + b)
         return c
@@ -1571,8 +1571,8 @@ def test_copy_into_preallocated_512x256_A4_B4():
 
     def fn(a, b):
         c = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     c.copy_(a + b)
         return c
@@ -1591,7 +1591,7 @@ def test_copy_inplace_accum_512x256_A4():
     ]
 
     def fn(acc, x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 acc.copy_(acc + x)
         return acc
@@ -1607,7 +1607,7 @@ def test_copy_inplace_accum_512x256_B4():
     ]
 
     def fn(acc, x):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 acc.copy_(acc + x)
         return acc
@@ -1623,8 +1623,8 @@ def test_copy_inplace_accum_512x256_A4_B4():
     ]
 
     def fn(acc, x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     acc.copy_(acc + x)
         return acc
@@ -1645,7 +1645,7 @@ def test_copy_rmw_correction_512x256_A4():
     ]
 
     def fn(acc, scale, y):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 acc.copy_(acc * scale + y)
         return acc
@@ -1662,7 +1662,7 @@ def test_copy_rmw_correction_512x256_B4():
     ]
 
     def fn(acc, scale, y):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 acc.copy_(acc * scale + y)
         return acc
@@ -1679,8 +1679,8 @@ def test_copy_rmw_correction_512x256_A4_B4():
     ]
 
     def fn(acc, scale, y):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     acc.copy_(acc * scale + y)
         return acc
@@ -1698,7 +1698,7 @@ def test_copy_after_reduction_512x256_A4():
 
     def fn(x):
         out = torch.zeros(256, device=x.device, dtype=x.dtype)
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
                 out.copy_(x.amin(dim=0))
         return out
@@ -1712,7 +1712,7 @@ def test_copy_after_reduction_512x256_B4():
 
     def fn(x):
         out = torch.zeros(256, device=x.device, dtype=x.dtype)
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
                 out.copy_(x.amin(dim=0))
         return out
@@ -1726,8 +1726,8 @@ def test_copy_after_reduction_512x256_A4_B4():
 
     def fn(x):
         out = torch.zeros(256, device=x.device, dtype=x.dtype)
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(
                     expected_named_dims=["B"], expected_reduction_dims=["A"]
                 ):
@@ -1753,8 +1753,8 @@ def test_copy_running_max_4d_H4_Lq4():
         real_max = torch.full(
             (B, H, Lq), float("-inf"), device=scores.device, dtype=scores.dtype
         )
-        with spyre_hint(num_tiles_per_dim={"H": H // h_block_size}):
-            with spyre_hint(num_tiles_per_dim={"Lq": Lq // lq_block_size}):
+        with spyre_hint(tile_size_per_dim={"H": h_block_size}):
+            with spyre_hint(tile_size_per_dim={"Lq": lq_block_size}):
                 with spyre_hint(
                     expected_named_dims=["B", "H", "Lq"], expected_reduction_dims=["Lk"]
                 ):
@@ -1780,7 +1780,7 @@ def test_copy_restickify_512x256_A4():
 
     def fn(a, b):
         c = torch.zeros(b.shape, device=b.device, dtype=b.dtype)
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 64}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 c.copy_(a.t() + b)
         return c
@@ -1797,7 +1797,7 @@ def test_copy_restickify_512x256_B4():
 
     def fn(a, b):
         c = torch.zeros(b.shape, device=b.device, dtype=b.dtype)
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 128}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 c.copy_(a.t() + b)
         return c
@@ -1814,8 +1814,8 @@ def test_copy_restickify_512x256_A4_B4():
 
     def fn(a, b):
         c = torch.zeros(b.shape, device=b.device, dtype=b.dtype)
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 64}):
+            with spyre_hint(tile_size_per_dim={"B": 128}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     c.copy_(a.t() + b)
         return c
@@ -1836,7 +1836,7 @@ def test_copy_accum_with_reduction_512x256_A4():
     ]
 
     def fn(acc, scale, x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["A"], expected_reduction_dims=["B"]):
                 r = x.amin(dim=1, keepdim=True)
             with spyre_hint(expected_named_dims=["A", "B"]):
@@ -1858,7 +1858,7 @@ def test_copy_accum_with_reduction_512x256_B4():
     ]
 
     def fn(acc, scale, x):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["A"], expected_reduction_dims=["B"]):
                 r = x.amin(dim=1, keepdim=True)
             with spyre_hint(expected_named_dims=["A", "B"]):
@@ -1880,8 +1880,8 @@ def test_copy_accum_with_reduction_512x256_A4_B4():
     ]
 
     def fn(acc, scale, x):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(
                     expected_named_dims=["A"], expected_reduction_dims=["B"]
                 ):
@@ -1906,7 +1906,7 @@ def test_copy_two_copies_same_scope_512x256_A4():
     def fn(a, b):
         c1 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
         c2 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 c1.copy_(a + b)
             with spyre_hint(expected_named_dims=["A", "B"]):
@@ -1926,7 +1926,7 @@ def test_copy_two_copies_same_scope_512x256_B4():
     def fn(a, b):
         c1 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
         c2 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 c1.copy_(a + b)
             with spyre_hint(expected_named_dims=["A", "B"]):
@@ -1946,8 +1946,8 @@ def test_copy_two_copies_same_scope_512x256_A4_B4():
     def fn(a, b):
         c1 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
         c2 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     c1.copy_(a + b)
                 with spyre_hint(expected_named_dims=["A", "B"]):
@@ -1977,7 +1977,7 @@ def test_outside_consumer_pointwise_512x256_A4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 z = x + y
         return z * 2.0
@@ -1993,7 +1993,7 @@ def test_outside_consumer_pointwise_512x256_B4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 z = x + y
         return z * 2.0
@@ -2009,8 +2009,8 @@ def test_outside_consumer_pointwise_512x256_A4_B4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     z = x + y
         return z * 2.0
@@ -2032,7 +2032,7 @@ def test_outside_consumer_copy_then_read_512x256_A4():
 
     def fn(x, y, norm):
         out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 out.copy_(x + y)
         return out / (torch.abs(norm) + 1.0)
@@ -2050,7 +2050,7 @@ def test_outside_consumer_copy_then_read_512x256_B4():
 
     def fn(x, y, norm):
         out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 out.copy_(x + y)
         return out / (torch.abs(norm) + 1.0)
@@ -2068,8 +2068,8 @@ def test_outside_consumer_copy_then_read_512x256_A4_B4():
 
     def fn(x, y, norm):
         out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     out.copy_(x + y)
         return out / (torch.abs(norm) + 1.0)
@@ -2095,7 +2095,7 @@ def test_outside_consumer_two_accum_512x256_A4():
     def fn(x, scale):
         out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
         denom = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 out.copy_(out * scale + x)
             with spyre_hint(expected_named_dims=["A"]):
@@ -2115,7 +2115,7 @@ def test_outside_consumer_two_accum_512x256_B4():
     def fn(x, scale):
         out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
         denom = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 out.copy_(out * scale + x)
             with spyre_hint(expected_named_dims=["A"]):
@@ -2138,8 +2138,8 @@ def test_outside_consumer_two_accum_512x256_A4_B4():
     def fn(x, scale):
         out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
         denom = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     out.copy_(out * scale + x)
                 with spyre_hint(expected_named_dims=["A"]):
@@ -2162,7 +2162,7 @@ def test_outside_consumer_reduction_512x256_A4():
     ]
 
     def fn(x, bias):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
             with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
                 s = x.amin(dim=0)
         return s + bias
@@ -2178,7 +2178,7 @@ def test_outside_consumer_reduction_512x256_B4():
     ]
 
     def fn(x, bias):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
                 s = x.amin(dim=0)
         return s + bias
@@ -2194,8 +2194,8 @@ def test_outside_consumer_reduction_512x256_A4_B4():
     ]
 
     def fn(x, bias):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 128}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(
                     expected_named_dims=["B"], expected_reduction_dims=["A"]
                 ):
@@ -2225,8 +2225,10 @@ def test_view_1d_subdim_Lq2_D2():
     def fn(a, b):
         a = a.view(Lq, D)
         b = b.view(Lq, D)
-        with spyre_hint(num_tiles_per_dim={"Lq": 2}):
-            with spyre_hint(num_tiles_per_dim={"D": 2}):
+        # Per-dim tile sizes: each count comes from the dim's own declared size
+        # (256/128 -> 2, 128/64 -> 2), independent of the op's iteration space.
+        with spyre_hint(tile_size_per_dim={"Lq": Lq // 2}):
+            with spyre_hint(tile_size_per_dim={"D": D // 2}):
                 with spyre_hint(expected_named_dims=["Lq", "D"]):
                     return a * b
 
@@ -2261,7 +2263,7 @@ def test_view_named_input_view_transpose_H2():
     def fn(q, k):
         q = q.view(B, S, H, D).transpose(1, 2)
         k = k.view(B, S, H, D).transpose(1, 2)
-        with spyre_hint(num_tiles_per_dim={"H": 2}):
+        with spyre_hint(tile_size_per_dim={"H": 4}):
             with spyre_hint(expected_named_dims=["B", "H", "S", "D"]):
                 return q * k
 
@@ -2290,7 +2292,7 @@ def test_view_named_input_view_transpose_S4():
     def fn(q, k):
         q = q.view(B, S, H, D).transpose(1, 2)
         k = k.view(B, S, H, D).transpose(1, 2)
-        with spyre_hint(num_tiles_per_dim={"S": 4}):
+        with spyre_hint(tile_size_per_dim={"S": 64}):
             with spyre_hint(expected_named_dims=["B", "H", "S", "D"]):
                 return q * k
 
@@ -2319,8 +2321,8 @@ def test_view_named_input_view_transpose_H2_S4():
     def fn(q, k):
         q = q.view(B, S, H, D).transpose(1, 2)
         k = k.view(B, S, H, D).transpose(1, 2)
-        with spyre_hint(num_tiles_per_dim={"H": 2}):
-            with spyre_hint(num_tiles_per_dim={"S": 4}):
+        with spyre_hint(tile_size_per_dim={"H": 4}):
+            with spyre_hint(tile_size_per_dim={"S": 64}):
                 with spyre_hint(expected_named_dims=["B", "H", "S", "D"]):
                     return q * k
 
@@ -2352,7 +2354,7 @@ def test_view_4d_transpose_H2():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"H": 2}):
+        with spyre_hint(tile_size_per_dim={"H": 2}):
             with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
                 return x.view(B, S, H, D).transpose(1, 2) * y
 
@@ -2379,7 +2381,7 @@ def test_view_4d_transpose_S4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"Lq": 4}):
+        with spyre_hint(tile_size_per_dim={"Lq": 64}):
             with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
                 return x.view(B, S, H, D).transpose(1, 2) * y
 
@@ -2406,8 +2408,8 @@ def test_view_4d_transpose_H2_S4():
     ]
 
     def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"H": 2}):
-            with spyre_hint(num_tiles_per_dim={"Lq": 4}):
+        with spyre_hint(tile_size_per_dim={"H": 2}):
+            with spyre_hint(tile_size_per_dim={"Lq": 64}):
                 with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
                     return x.view(B, S, H, D).transpose(1, 2) * y
 
@@ -2425,7 +2427,7 @@ def test_view_unsqueeze_broadcast_A4():
     ]
 
     def fn(a, b):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 64}):
             with spyre_hint(expected_named_dims=["N", "A", "B"]):
                 return a.unsqueeze(0) * b
 
@@ -2440,7 +2442,7 @@ def test_view_unsqueeze_broadcast_B4():
     ]
 
     def fn(a, b):
-        with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"B": 64}):
             with spyre_hint(expected_named_dims=["N", "A", "B"]):
                 return a.unsqueeze(0) * b
 
@@ -2455,8 +2457,8 @@ def test_view_unsqueeze_broadcast_A4_B4():
     ]
 
     def fn(a, b):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+        with spyre_hint(tile_size_per_dim={"A": 64}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(expected_named_dims=["N", "A", "B"]):
                     return a.unsqueeze(0) * b
 
@@ -2506,10 +2508,10 @@ def _flash_v1_fn(
         denominator = torch.zeros(
             (B, H, Lq), device=queries.device, dtype=torch.float16
         )
-    with spyre_hint(num_tiles_per_dim={"B": b_tiles}):
-        with spyre_hint(num_tiles_per_dim={"H": h_tiles}):
-            with spyre_hint(num_tiles_per_dim={"Lq": lq_tiles}):
-                with spyre_hint(num_tiles_per_dim={"Lk": lk_tiles}):
+    with spyre_hint(tile_size_per_dim={"B": B // b_tiles}):
+        with spyre_hint(tile_size_per_dim={"H": H // h_tiles}):
+            with spyre_hint(tile_size_per_dim={"Lq": Lq // lq_tiles}):
+                with spyre_hint(tile_size_per_dim={"Lk": Lk // lk_tiles}):
                     with spyre_hint(expected_named_dims=["B", "H", "D", "Lk"]):
                         keys_T = keys.transpose(-1, -2).contiguous()
                     with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
@@ -2728,10 +2730,10 @@ def _flash_v2_fn(
         device=queries.device,
         dtype=torch.float16,
     ).amax(dim=-1)
-    with spyre_hint(num_tiles_per_dim={"B": b_tiles}):
-        with spyre_hint(num_tiles_per_dim={"H": h_tiles}):
-            with spyre_hint(num_tiles_per_dim={"Lq": lq_tiles}):
-                with spyre_hint(num_tiles_per_dim={"Lk": lk_tiles}):
+    with spyre_hint(tile_size_per_dim={"B": B // b_tiles}):
+        with spyre_hint(tile_size_per_dim={"H": H // h_tiles}):
+            with spyre_hint(tile_size_per_dim={"Lq": Lq // lq_tiles}):
+                with spyre_hint(tile_size_per_dim={"Lk": Lk // lk_tiles}):
                     with spyre_hint(expected_named_dims=["B", "H", "Lk", "D"]):
                         scaled_keys = keys * scale
                     with spyre_hint(expected_named_dims=["B", "H", "D", "Lk"]):
@@ -2921,8 +2923,8 @@ def test_flash_v2_tile_all():
 
 
 # ---------------------------------------------------------------------------
-# Flash v3: causal mask, copy_ accumulators, scores transposed, tiles= API
-# Uses num_tiles_per_dim= (normalized from tiles=) for consistency
+# Flash v3: causal mask, copy_ accumulators, scores transposed
+# Declares tile_size_per_dim= (per-tile extent), like every other site here
 # ---------------------------------------------------------------------------
 
 
@@ -2968,10 +2970,10 @@ def _flash_v3_fn(
         (B, H, Lq), float("-inf"), device=queries.device, dtype=torch.float16
     )
     denominator = torch.zeros((B, H, Lq), device=queries.device, dtype=torch.float16)
-    with spyre_hint(num_tiles_per_dim={"B": b_tiles}):
-        with spyre_hint(num_tiles_per_dim={"H": h_tiles}):
-            with spyre_hint(num_tiles_per_dim={"Lq": lq_tiles}):
-                with spyre_hint(num_tiles_per_dim={"Lk": lk_tiles}):
+    with spyre_hint(tile_size_per_dim={"B": B // b_tiles}):
+        with spyre_hint(tile_size_per_dim={"H": H // h_tiles}):
+            with spyre_hint(tile_size_per_dim={"Lq": Lq // lq_tiles}):
+                with spyre_hint(tile_size_per_dim={"Lk": Lk // lk_tiles}):
                     with spyre_hint(expected_named_dims=["B", "H", "Lk", "D"]):
                         scaled_keys = keys * scale
                     with spyre_hint(expected_named_dims=["B", "H", "D", "Lk"]):
@@ -3179,10 +3181,10 @@ def _flash_v4_fn(q, k, v, *, B, S, H, D, b_tiles=1, h_tiles=1, lq_tiles=1, lk_ti
     output = torch.zeros_like(q)
     real_max = torch.full((B, H, S), float("-inf"), device=q.device, dtype=q.dtype)
     denominator = torch.zeros((B, H, S), device=q.device, dtype=q.dtype)
-    with spyre_hint(num_tiles_per_dim={"B": b_tiles}):
-        with spyre_hint(num_tiles_per_dim={"H": h_tiles}):
-            with spyre_hint(num_tiles_per_dim={"Lq": lq_tiles}):
-                with spyre_hint(num_tiles_per_dim={"Lk": lk_tiles}):
+    with spyre_hint(tile_size_per_dim={"B": B // b_tiles}):
+        with spyre_hint(tile_size_per_dim={"H": H // h_tiles}):
+            with spyre_hint(tile_size_per_dim={"Lq": S // lq_tiles}):
+                with spyre_hint(tile_size_per_dim={"Lk": S // lk_tiles}):
                     with spyre_hint(expected_named_dims=["B", "H", "Lk", "D"]):
                         scaled_keys = k * scale
                     with spyre_hint(expected_named_dims=["B", "H", "D", "Lk"]):
@@ -3352,7 +3354,7 @@ def test_validate_reduction_dims_raises_on_mismatch():
 #
 # spyre_hint-driven coarse tiling
 # These tests verify that coarse tiling is driven automatically by
-# spyre_hint(num_tiles_per_dim=...) annotations.  Named tensor dimensions
+# spyre_hint(tile_size_per_dim=...) annotations.  Named tensor dimensions
 # must be declared and annotated on device tensors for the hint resolver to
 # map dimension names to loop variables.
 # ===========================================================================
@@ -3363,7 +3365,7 @@ _name_tensor_dims = _pnd.name_tensor_dims
 
 
 class TestCoarseTileSpyreHints(InductorTestCase):
-    """Coarse tiling driven by spyre_hint(num_tiles_per_dim=...) annotations."""
+    """Coarse tiling driven by spyre_hint(tile_size_per_dim=...) annotations."""
 
     def setUp(self):
         super().setUp()
@@ -3403,7 +3405,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         }
     )
     def test_hint_single_group_pointwise(self):
-        """spyre_hint(num_tiles_per_dim={"A": 4}) tiles a pointwise abs into 4 iterations."""
+        """spyre_hint(tile_size_per_dim={"A": 64}) tiles a pointwise abs into 4 iterations."""
         from torch_spyre._inductor import spyre_hint
 
         # 256 rows × 128 cols.  Tiling the outermost dim by 4 → 64 rows/iter.
@@ -3411,7 +3413,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         x = torch.randn(A, B, dtype=torch.float16)
 
         def fn(x):
-            with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(tile_size_per_dim={"A": 64}):
                 return torch.abs(x)
 
         x_dev = x.to("spyre")
@@ -3464,7 +3466,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         x = torch.randn(B, D, dtype=torch.float16)
 
         def softmax_fn(x):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 with spyre_hint(
                     expected_named_dims=["B"], expected_reduction_dims=["D"]
                 ):
@@ -3519,7 +3521,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     def test_hint_nested_loop_with_scratchpad(self):
         """Design-doc small example: y=a+b; z=y*c with nested K=2×M=4 hints.
 
-        This is the canonical spyre_hint(num_tiles_per_dim=...) version of the
+        This is the canonical spyre_hint(tile_size_per_dim=...) version of the
         small example from docs/source/compiler/coarse_tiling_loops.md.
 
         Shape [1024, 4096], outer hint tiles A-dim by 2 (512 rows/iter),
@@ -3544,8 +3546,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         c = torch.randn(A, B, dtype=torch.float16)
 
         def fn(a, b, c):
-            with spyre_hint(num_tiles_per_dim={"A": 2}):
-                with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(tile_size_per_dim={"A": 512}):
+                with spyre_hint(tile_size_per_dim={"B": 1024}):
                     y = a + b
                     z = y * c
                     return z
@@ -3607,13 +3609,18 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         Uses sub-dimension naming to map a [B, D] tensor's physical dims to
         named sub-dims, then tiles each op independently:
 
-        op_a = abs(x): hint num_tiles_per_dim={"B": 4} tiles dim 0 only.
+        op_a = abs(x): hint tile_size_per_dim={"B": 64} tiles dim 0 only.
           B=256 → 4 tiles of 64 rows each.  Iteration space per tile: [64, D].
 
         op_b = neg(y): tensor named ["B0","B1","D0","D1"] with B0×B1=B and
-          D0×D1=D.  Outer hint num_tiles_per_dim={"B0": 4} tiles dim 0 (c0,
-          range 256) into 4.  Inner hint num_tiles_per_dim={"D0": 4} tiles
-          dim 1 (c1, range 128) into 4.  Iteration space per tile: [64, 32].
+          D0×D1=D.  Outer hint tiles dim 0 (c0, range 256) into 4, inner hint
+          tiles dim 1 (c1, range 128) into 4.  Iteration space per tile:
+          [64, 32].
+
+          B0 and D0 are declared with size 4 each, so a tile size of 1 gives 4
+          tiles of each -- the count is size(B0) // 1.  That B0/B1 share one loop
+          var of extent 256 does not enter the count: named dims are tiled
+          independently of the operation.
 
         Both ops form separate groups → ≥2 LoopSpec entries, each with
         count=sympify('4').
@@ -3644,10 +3651,13 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(y_dev, ["B0", "B1", "D0", "D1"])
 
         def fn(x, y):
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(tile_size_per_dim={"B": 64}):
                 out_x = torch.abs(x)
-            with spyre_hint(num_tiles_per_dim={"B0": 4}):
-                with spyre_hint(num_tiles_per_dim={"D0": 4}):
+            # B0 and D0 are each declared with size 4, so a tile size of 1 is
+            # 4 tiles apiece (count = 4 // 1).  Their landing on one loop var of
+            # extent 256 alongside B1/D1 does not enter the count.
+            with spyre_hint(tile_size_per_dim={"B0": 1}):
+                with spyre_hint(tile_size_per_dim={"D0": 1}):
                     out_y = torch.neg(y)
             return out_x, out_y
 
@@ -3693,9 +3703,9 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         def fn(x, y):
             # Two independent pointwise ops: each becomes its own group.
-            with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(tile_size_per_dim={"A": 64}):
                 out_x = torch.abs(x)
-            with spyre_hint(num_tiles_per_dim={"A": 8}):
+            with spyre_hint(tile_size_per_dim={"A": 32}):
                 out_y = torch.neg(y)
             return out_x, out_y
 
@@ -3747,7 +3757,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         x = torch.randn(M, K, dtype=torch.float16)
 
         def fn(x):
-            with spyre_hint(num_tiles_per_dim={"M": 4}):
+            with spyre_hint(tile_size_per_dim={"M": 64}):
                 # torch.full produces a scalar-fill with no M/K loop dim mapping.
                 bias = torch.full(x.shape, 0.5, dtype=x.dtype, device=x.device)
                 return x + bias
@@ -3814,7 +3824,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(x_dev, ["M", "K"])
 
         def fn(x):
-            with spyre_hint(num_tiles_per_dim={"M": 4}):
+            with spyre_hint(tile_size_per_dim={"M": 64}):
                 # torch.full produces a scalar-fill ComputedBuffer with no M-dim
                 # loop var — its loop_tiled_dims are all empty (loop-invariant).
                 bias = torch.full(x.shape, 0.5, dtype=x.dtype, device=x.device)
@@ -3880,7 +3890,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         y = torch.randn(K, N, dtype=torch.float16) * 0.01
 
         def fn(x, y):
-            with spyre_hint(num_tiles_per_dim={"M": 4}):
+            with spyre_hint(tile_size_per_dim={"M": 32}):
                 return torch.matmul(x, y)
 
         x_dev = x.to("spyre")
@@ -3935,7 +3945,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         scale = torch.randn(M, dtype=torch.float16)
 
         def fn(x, scale):
-            with spyre_hint(num_tiles_per_dim={"M": 4}):
+            with spyre_hint(tile_size_per_dim={"M": 64}):
                 # transpose + contiguous forces a restickify on x before the mul
                 x_t = x.transpose(0, 1).contiguous().transpose(0, 1)
                 return x_t * scale.unsqueeze(-1)
@@ -3974,7 +3984,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         }
     )
     def test_hint_softmax_row_tiling(self):
-        """spyre_hint(num_tiles_per_dim={"NROW": 4}) tiles softmax over the row dimension.
+        """spyre_hint(tile_size_per_dim={"NROW": 4096}) tiles softmax over the row dim.
 
         NCOL=4096 gives 64 sticks/row.  Row-tiling this shape exercises the
         multi-stick device_size[1] invariant: a per-tile device_size bug that
@@ -3992,7 +4002,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         def fn(x, dim=-1):
             _name_tensor_dims(x, ["NROW", "NCOL"])
-            with spyre_hint(num_tiles_per_dim={"NROW": 4}):
+            with spyre_hint(tile_size_per_dim={"NROW": 4096}):
                 return torch.softmax(x, dim)
 
         compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=0.02, rtol=0.1)
@@ -4002,7 +4012,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # ------------------------------------------------------------------
 
     def test_hint_matmul_row_tiling(self):
-        """spyre_hint(num_tiles_per_dim={"M": 4}) tiles matmul over the row (M) dimension."""
+        """spyre_hint(tile_size_per_dim={"M": 64}) tiles matmul over the row (M) dim."""
         from torch_spyre._inductor import spyre_hint
 
         M, K, N = 256, 128, 64
@@ -4016,7 +4026,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         def fn(x, y):
             _name_tensor_dims(x, ["M", "K"])
             _name_tensor_dims(y, ["K", "N"])
-            with spyre_hint(num_tiles_per_dim={"M": 4}):
+            with spyre_hint(tile_size_per_dim={"M": 64}):
                 return x @ y
 
         compare_with_cpu(
@@ -4032,7 +4042,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         # The Lk hint was previously a no-op (dropped by _hints_levels bug fixed
         # on this branch).  Now that Lk tiling is correctly applied, the result
         # is numerically wrong (~90% element mismatch).  Investigate and fix
-        # before re-adding spyre_hint(num_tiles_per_dim={"Lk": lk_slices}).
+        # before re-adding spyre_hint(tile_size_per_dim={"Lk": <per-tile Lk extent>}).
 
         Decision xfail: failing in CI (Actions run 30385154736, job
         90362755639) on PR #3293. We've decided to xfail the coarse tiling
@@ -4044,14 +4054,12 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         from torch_spyre._inductor import spyre_hint
 
         B, H, Lq, Lk, D = 1, 8, 256, 256, 64
-        block_size = 128
 
         queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
         keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
         values_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
 
         scale = 1.0 / math.sqrt(math.sqrt(D))
-        lk_slices = Lk // block_size  # noqa: F841 — used in commented-out Lk hint
 
         def flash(queries, keys, values):
             with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
@@ -4068,11 +4076,11 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                     (B, H, Lq), device=queries.device, dtype=torch.float16
                 )
             with spyre_hint(
-                num_tiles_per_dim={"B": 1}
+                tile_size_per_dim={"B": 1}
             ):  # 3 nested scopes exercises multi-hint logic
-                with spyre_hint(num_tiles_per_dim={"H": 4}):
+                with spyre_hint(tile_size_per_dim={"H": 2}):
                     # TODO: re-enable once numerical error with Lk tiling is fixed
-                    # with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
+                    # with spyre_hint(tile_size_per_dim={"Lk": <per-tile Lk extent>}):
                     keys_T = keys.transpose(-1, -2).contiguous()
                     scores = torch.matmul(queries * scale, keys_T * scale)
                     scores = scores.transpose(-1, -2).contiguous()
@@ -4153,7 +4161,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         causal = torch.tril(torch.ones(Lq, Lk, dtype=torch.bool))
         mask_t = torch.zeros(1, 1, Lq, Lk, dtype=torch.float16)
         mask_t.masked_fill_(~causal, float("-inf"))
-        lq_slices = Lq // block_size
 
         def flash(queries, keys, values, mask):
             scale = 1.0 / math.sqrt(math.sqrt(D))
@@ -4173,10 +4180,10 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             )
             denominator = denominator.amax(dim=-1)  # B, H, Lq sparse
             with spyre_hint(
-                num_tiles_per_dim={"B": 1}
+                tile_size_per_dim={"B": 1}
             ):  # 3 nested scopes exercises multi-hint logic
-                with spyre_hint(num_tiles_per_dim={"H": 4}):
-                    with spyre_hint(num_tiles_per_dim={"Lq": lq_slices}):
+                with spyre_hint(tile_size_per_dim={"H": 2}):
+                    with spyre_hint(tile_size_per_dim={"Lq": block_size}):
                         scaled_keys = keys * scale  # B, H, Lk, D
                         keys_T = scaled_keys.transpose(-1, -2)  # B, H, D, Lk
                         scores = torch.matmul(queries * scale, keys_T)  # B, H, Lq, Lk
@@ -4262,7 +4269,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         causal = torch.tril(torch.ones(Lq, Lk, dtype=torch.bool))
         mask_t = torch.zeros(1, 1, Lq, Lk, dtype=torch.float16)
         mask_t.masked_fill_(~causal, float("-inf"))
-        lq_slices = Lq // block_size
 
         def flash(queries, keys, values, mask):
             scale = 1.0 / math.sqrt(math.sqrt(D))
@@ -4278,8 +4284,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 device=queries.device,
                 dtype=torch.float16,
             ).amax(dim=-1)
-            with spyre_hint(num_tiles_per_dim={"H": 4}):
-                with spyre_hint(num_tiles_per_dim={"Lq": lq_slices}):
+            with spyre_hint(tile_size_per_dim={"H": 2}):
+                with spyre_hint(tile_size_per_dim={"Lq": block_size}):
                     scaled_keys = keys * scale
                     keys_T = scaled_keys.transpose(-1, -2)
                     scores = torch.matmul(queries * scale, keys_T)
@@ -4384,10 +4390,10 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 (B, H, Lq), device=queries.device, dtype=torch.float16
             )
 
-            with spyre_hint(tiles={"B": B // b_block_size}):
-                with spyre_hint(tiles={"H": H // h_block_size}):
-                    with spyre_hint(tiles={"Lq": Lq // q_block_size}):
-                        with spyre_hint(tiles={"Lk": Lk // kv_block_size}):
+            with spyre_hint(tile_size_per_dim={"B": b_block_size}):
+                with spyre_hint(tile_size_per_dim={"H": h_block_size}):
+                    with spyre_hint(tile_size_per_dim={"Lq": q_block_size}):
+                        with spyre_hint(tile_size_per_dim={"Lk": kv_block_size}):
                             # with spyre_hint(work_div={"H": 4, "Lq": 8, "Lk": 8}):
                             scaled_keys = keys * scale  # B, H, Lk, D
                             keys_T = scaled_keys.transpose(-1, -2)  # B, H, D, Lk
@@ -4488,10 +4494,10 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 (B, H, Lq), device=queries.device, dtype=torch.float16
             )
 
-            with spyre_hint(tiles={"B": B // b_block_size}):
-                with spyre_hint(tiles={"H": H // h_block_size}):
-                    with spyre_hint(tiles={"Lq": Lq // q_block_size}):
-                        with spyre_hint(tiles={"Lk": Lk // kv_block_size}):
+            with spyre_hint(tile_size_per_dim={"B": b_block_size}):
+                with spyre_hint(tile_size_per_dim={"H": h_block_size}):
+                    with spyre_hint(tile_size_per_dim={"Lq": q_block_size}):
+                        with spyre_hint(tile_size_per_dim={"Lk": kv_block_size}):
                             scaled_keys = keys * scale  # B, H, Lk, D
                             keys_T = scaled_keys.transpose(-1, -2)  # B, H, D, Lk
                             scores = torch.matmul(
@@ -4578,8 +4584,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             real_max = torch.full(
                 (B, H, Lq), float("-inf"), device=scores.device, dtype=scores.dtype
             )
-            with spyre_hint(tiles={"H": H // h_block_size}):
-                with spyre_hint(tiles={"Lq": Lq // lq_block_size}):
+            with spyre_hint(tile_size_per_dim={"H": h_block_size}):
+                with spyre_hint(tile_size_per_dim={"Lq": lq_block_size}):
                     with spyre_hint(
                         expected_named_dims=["B", "H", "Lq"],
                         expected_reduction_dims=["Lk"],
@@ -4650,11 +4656,11 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             )
             denominator = torch.zeros((B, H, S), device=q.device, dtype=q.dtype)
 
-            with spyre_hint(tiles={"batch_size": max(1, B // 2)}):
-                with spyre_hint(tiles={"num_heads": max(1, H // 4)}):
-                    with spyre_hint(tiles={"max_seqlen_q": max(1, S // q_block_size)}):
+            with spyre_hint(tile_size_per_dim={"batch_size": 2}):
+                with spyre_hint(tile_size_per_dim={"num_heads": 4}):
+                    with spyre_hint(tile_size_per_dim={"max_seqlen_q": q_block_size}):
                         with spyre_hint(
-                            tiles={"max_seqlen_kv": max(1, S // kv_block_size)}
+                            tile_size_per_dim={"max_seqlen_kv": kv_block_size}
                         ):
                             scaled_keys = k * scale
                             keys_T = scaled_keys.transpose(-1, -2).contiguous()
@@ -4735,8 +4741,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(y_dev, ["A", "B", "D"])
 
         def fn(x, y):
-            with spyre_hint(num_tiles_per_dim={"A": 2}):
-                with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(tile_size_per_dim={"A": 64}):
+                with spyre_hint(tile_size_per_dim={"B": 2}):
                     # abs_x has shape [A, D], unsqueeze to [A, 1, D] for broadcast
                     abs_x = torch.abs(x).unsqueeze(1)
                     return abs_x + y
@@ -4789,7 +4795,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         B, H, Lq, Lk, D = 1, 8, 256, 256, 64
         block_size = 128
         scale = 1.0 / math.sqrt(math.sqrt(D))
-        lk_slices = Lk // block_size  # 2
 
         queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
         keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
@@ -4822,9 +4827,9 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                     device=queries.device,
                     dtype=torch.float16,
                 )
-            with spyre_hint(num_tiles_per_dim={"B": 1}):
-                with spyre_hint(num_tiles_per_dim={"H": 4}):
-                    with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
+            with spyre_hint(tile_size_per_dim={"B": 1}):
+                with spyre_hint(tile_size_per_dim={"H": 2}):
+                    with spyre_hint(tile_size_per_dim={"Lk": block_size}):
                         keys_T = keys.transpose(-1, -2).contiguous()
                         scores = torch.matmul(queries * scale, keys_T * scale)
                         scores = scores.transpose(-1, -2).contiguous()
@@ -4885,7 +4890,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(x_dev, ["H", "Lq", "Lk"])
 
         def fn(x):
-            with spyre_hint(num_tiles_per_dim={"Lk": 2}):
+            with spyre_hint(tile_size_per_dim={"Lk": 64}):
                 # Op1: pointwise — Lk is an output dim
                 y = x * 2.0
                 # Op2: reduction over Lk — Lk is a reduction dim
@@ -4950,7 +4955,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         B, H, Lq, Lk, D = 1, 8, 256, 256, 64
         block_size = 128
         scale = 1.0 / math.sqrt(math.sqrt(D))
-        lk_slices = Lk // block_size  # 2
 
         queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
         keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
@@ -4981,9 +4985,9 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 denominator = torch.zeros(
                     (B, H, Lq), device=queries.device, dtype=torch.float16
                 )
-            with spyre_hint(num_tiles_per_dim={"B": 1}):
-                with spyre_hint(num_tiles_per_dim={"H": 4}):
-                    with spyre_hint(num_tiles_per_dim={"Lk": lk_slices}):
+            with spyre_hint(tile_size_per_dim={"B": 1}):
+                with spyre_hint(tile_size_per_dim={"H": 2}):
+                    with spyre_hint(tile_size_per_dim={"Lk": block_size}):
                         keys_T = keys.transpose(-1, -2).contiguous()
                         scores = torch.matmul(queries * scale, keys_T * scale)
                         scores = scores.transpose(-1, -2).contiguous()
@@ -5055,7 +5059,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         B, H, Lq, Lk, D = 1, 8, 256, 256, 64
         block_size = 128
-        lq_slices = Lq // block_size  # 2
 
         queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
         keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
@@ -5093,9 +5096,9 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 dtype=torch.float16,
             )
             denominator = denominator.amax(dim=-1)  # B, H, Lq sparse
-            with spyre_hint(num_tiles_per_dim={"B": 1}):
-                with spyre_hint(num_tiles_per_dim={"H": 4}):
-                    with spyre_hint(num_tiles_per_dim={"Lq": lq_slices}):
+            with spyre_hint(tile_size_per_dim={"B": 1}):
+                with spyre_hint(tile_size_per_dim={"H": 2}):
+                    with spyre_hint(tile_size_per_dim={"Lq": block_size}):
                         scaled_keys = keys * scale  # B, H, Lk, D
                         keys_T = scaled_keys.transpose(-1, -2)  # B, H, D, Lk
                         scores = torch.matmul(queries * scale, keys_T)  # B, H, Lq, Lk
@@ -5149,7 +5152,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         )
 
     def test_hint_h_tiling_elementwise(self):
-        """spyre_hint(num_tiles_per_dim={"H": 2}) tiles elementwise multiply over the H dimension.
+        """spyre_hint(tile_size_per_dim={"H": 4}) tiles elementwise multiply over H.
 
         Regression test for a bug in per-tile byte-stride computation where
         per-tile HBM base addresses advanced by the wrong amount when the tiled
@@ -5164,7 +5167,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         V = torch.randn(B, H, Lk, D, dtype=torch.float16)
 
         def fn(q, v):
-            with spyre_hint(num_tiles_per_dim={"H": 2}):
+            with spyre_hint(tile_size_per_dim={"H": 4}):
                 return q * v
 
         ref = fn(Q, V)
@@ -5215,7 +5218,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(V_dev, ["B", "H", "Lq", "D"])
 
         def fn(q, v):
-            with spyre_hint(num_tiles_per_dim={"H": 2}):
+            with spyre_hint(tile_size_per_dim={"H": 4}):
                 return q * v
 
         cfn = torch.compile(fn)
@@ -5333,7 +5336,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     def test_hint_row_tiling_multi_stick_pointwise_correct(self):
         """Row-tiling a multi-stick pointwise chain produces correct output.
 
-        y = a + b; z = y * c on [1024, 4096] fp16 with num_tiles_per_dim={"A": 2}.
+        y = a + b; z = y * c on [1024, 4096] fp16 with tile_size_per_dim={"A": 512}.
         This is the minimal reproducer for the _tile_device_size bug: with 64
         sticks/row, shrinking device_size[1] from 1024 to 512 corrupts the
         inter-stick-group stride, producing wrong values in the second tile.
@@ -5356,7 +5359,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             _name_tensor_dims(a, ["A", "B"])
             _name_tensor_dims(b, ["A", "B"])
             _name_tensor_dims(c, ["A", "B"])
-            with spyre_hint(num_tiles_per_dim={"A": 2}):
+            with spyre_hint(tile_size_per_dim={"A": 512}):
                 y = a + b
                 z = y * c
                 return z
@@ -5394,7 +5397,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         def fn(x, y):
             _name_tensor_dims(x, ["A", "B"])
             _name_tensor_dims(y, ["A", "B"])
-            with spyre_hint(num_tiles_per_dim={"A": 2}):
+            with spyre_hint(tile_size_per_dim={"A": 64}):
                 z = x + y  # tiled op
             return z * 2.0  # outside consumer -- forces _allocate_full_buffer
 
@@ -5415,8 +5418,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             _name_tensor_dims(a, ["Lq", "D"])
             _name_tensor_dims(b, ["Lq", "D"])
             c = torch.full((Lq, D), 0, device=a.device, dtype=torch.float16)
-            with spyre_hint(num_tiles_per_dim={"Lq": 2}):
-                with spyre_hint(num_tiles_per_dim={"D": 2}):
+            with spyre_hint(tile_size_per_dim={"Lq": 128}):
+                with spyre_hint(tile_size_per_dim={"D": 64}):
                     c.copy_(a + b)
             return c
 
@@ -5445,7 +5448,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         divergent-stick-dim case being a separate, pre-existing,
         out-of-scope gap -- confirmed by direct repro, not exercised here;
         tracked as https://github.com/torch-spyre/torch-spyre/issues/3332).
-        Nesting num_tiles_per_dim={"Lq": 2} outer / {"B": 2} inner tiles two
+        Nesting tile_size_per_dim={"Lq": 128} outer / {"B": 2} inner tiles two
         non-stick dims, each with a distinct per-arg device_coordinates walk.
         """
         from torch_spyre._C import SpyreTensorLayout
@@ -5468,8 +5471,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             _name_tensor_dims(a, ["B", "Lq", "D"])
             _name_tensor_dims(b, ["B", "Lq", "D"])
             c = torch.full((B, Lq, D), 0, device=a.device, dtype=torch.float16)
-            with spyre_hint(num_tiles_per_dim={"Lq": 2}):
-                with spyre_hint(num_tiles_per_dim={"B": 2}):
+            with spyre_hint(tile_size_per_dim={"Lq": 128}):
+                with spyre_hint(tile_size_per_dim={"B": 2}):
                     c.copy_(a + b)
             return c
 
@@ -5500,8 +5503,11 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             _name_tensor_dims(a, ["Lq", "D"])
             _name_tensor_dims(b, ["Lq", "D"])
             c = torch.full([Lq * D], 0, device=a.device, dtype=torch.float16)
-            with spyre_hint(num_tiles_per_dim={"Lq": 2}):
-                with spyre_hint(num_tiles_per_dim={"D": 2}):
+            # Lq and D are independent named dims: each count comes from that
+            # dim's own declared size (256/128 -> 2, 128/64 -> 2), regardless of
+            # the backend landing both on one loop var.
+            with spyre_hint(tile_size_per_dim={"Lq": Lq // 2}):
+                with spyre_hint(tile_size_per_dim={"D": D // 2}):
                     c.copy_(a + b)
             return c
 
@@ -5623,7 +5629,7 @@ class TestNamedDimsHint(InductorTestCase):
         M, K = 256, 64
 
         def fn(x):
-            with spyre_hint(slices={"M": 4}, named_dims=["M", "K"]):
+            with spyre_hint(tile_size_per_dim={"M": 64}, named_dims=["M", "K"]):
                 bias = torch.full(x.shape, 0.5, dtype=x.dtype, device=x.device)
             return x + bias
 
@@ -5658,7 +5664,7 @@ class TestNamedDimsHint(InductorTestCase):
         M, K = 128, 64
 
         def fn(x):
-            with spyre_hint(slices={"M": 2}, named_dims=["M", "K"]):
+            with spyre_hint(tile_size_per_dim={"M": 64}, named_dims=["M", "K"]):
                 buf = torch.full_like(x, 2.0)
             return x + buf
 
@@ -5701,7 +5707,7 @@ class TestNamedDimsHint(InductorTestCase):
         M, K = 256, 64
 
         def fn(x):
-            with spyre_hint(slices={"M": 4}, named_dims=["M", "K"]):
+            with spyre_hint(tile_size_per_dim={"M": 64}, named_dims=["M", "K"]):
                 bias = torch.full(x.shape, 0.5, dtype=x.dtype, device=x.device)
             return x + bias
 
@@ -5747,7 +5753,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         _name_tensor_dims(x_dev, ["B", "D"])
 
         def fn(x):
-            with spyre_hint(num_tiles_per_dim={"D": 4}):
+            with spyre_hint(tile_size_per_dim={"D": 128}):
                 return x.sum(dim=-1)
 
         cfn = torch.compile(fn)
@@ -5773,7 +5779,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
 
         def fn(x):
             _name_tensor_dims(x, ["B", "D"])
-            with spyre_hint(num_tiles_per_dim={"D": 4}):
+            with spyre_hint(tile_size_per_dim={"D": 128}):
                 return x.sum(dim=-1)
 
         # atol=0.05: fp16 sum over 512 elements scaled by 0.1 accumulates ~0.05 error.
@@ -5795,7 +5801,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         _name_tensor_dims(b_dev, ["K", "N"])
 
         def fn(a, b):
-            with spyre_hint(num_tiles_per_dim={"K": 4}):
+            with spyre_hint(tile_size_per_dim={"K": 128}):
                 return a @ b
 
         cfn = torch.compile(fn)
@@ -5824,7 +5830,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         def fn(a, b):
             _name_tensor_dims(a, ["M", "K"])
             _name_tensor_dims(b, ["K", "N"])
-            with spyre_hint(num_tiles_per_dim={"K": 4}):
+            with spyre_hint(tile_size_per_dim={"K": 128}):
                 return a @ b
 
         compare_with_cpu(
@@ -5843,7 +5849,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         _name_tensor_dims(x_dev, ["B", "D"])
 
         def fn(x):
-            with spyre_hint(num_tiles_per_dim={"D": 4}):
+            with spyre_hint(tile_size_per_dim={"D": 128}):
                 return x.amax(dim=-1)
 
         cfn = torch.compile(fn)
@@ -5869,7 +5875,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
 
         def fn(x):
             _name_tensor_dims(x, ["B", "D"])
-            with spyre_hint(num_tiles_per_dim={"D": 4}):
+            with spyre_hint(tile_size_per_dim={"D": 128}):
                 return x.amax(dim=-1)
 
         compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=1e-3, rtol=1e-3)
@@ -5886,7 +5892,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
         _name_tensor_dims(x_dev, ["B", "D"])
 
         def fn(x):
-            with spyre_hint(num_tiles_per_dim={"D": 4}):
+            with spyre_hint(tile_size_per_dim={"D": 128}):
                 return x.amin(dim=-1)
 
         cfn = torch.compile(fn)
@@ -5912,7 +5918,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
 
         def fn(x):
             _name_tensor_dims(x, ["B", "D"])
-            with spyre_hint(num_tiles_per_dim={"D": 4}):
+            with spyre_hint(tile_size_per_dim={"D": 128}):
                 return x.amin(dim=-1)
 
         compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=1e-3, rtol=1e-3)
@@ -5943,7 +5949,7 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
 
         def fn(x):
             _name_tensor_dims(x, ["B", "D"])
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(tile_size_per_dim={"B": 128}):
                 return x.sum(dim=0)
 
         compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=0.05, rtol=0.05)
@@ -5960,7 +5966,7 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
 
         def fn(x):
             _name_tensor_dims(x, ["B", "D"])
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(tile_size_per_dim={"B": 128}):
                 return x.amax(dim=0)
 
         compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=1e-3, rtol=1e-3)
@@ -5977,7 +5983,7 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
 
         def fn(x):
             _name_tensor_dims(x, ["B", "D"])
-            with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(tile_size_per_dim={"B": 128}):
                 return x.amin(dim=0)
 
         compare_with_cpu(fn, x, run_compile=True, run_eager=False, atol=1e-3, rtol=1e-3)
@@ -6010,7 +6016,7 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
         def fn(a, b):
             _name_tensor_dims(a, ["M", "K"])
             _name_tensor_dims(b, ["K", "N"])
-            with spyre_hint(num_tiles_per_dim={"K": 4}):
+            with spyre_hint(tile_size_per_dim={"K": 128}):
                 return torch.mm(a, b)
 
         compare_with_cpu(
@@ -6032,7 +6038,7 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
         def fn(a, b):
             _name_tensor_dims(a, ["B", "M", "K"])
             _name_tensor_dims(b, ["B", "K", "N"])
-            with spyre_hint(num_tiles_per_dim={"K": 4}):
+            with spyre_hint(tile_size_per_dim={"K": 128}):
                 return torch.bmm(a, b)
 
         compare_with_cpu(
@@ -6054,7 +6060,7 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
         def fn(a, b):
             _name_tensor_dims(a, ["B", "M", "K"])
             _name_tensor_dims(b, ["K", "N"])
-            with spyre_hint(num_tiles_per_dim={"K": 4}):
+            with spyre_hint(tile_size_per_dim={"K": 128}):
                 return torch.matmul(a, b)
 
         compare_with_cpu(
@@ -6077,7 +6083,7 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
         _name_tensor_dims(b_dev, ["K", "N"])
 
         def fn(a, b):
-            with spyre_hint(num_tiles_per_dim={"K": 4}):
+            with spyre_hint(tile_size_per_dim={"K": 128}):
                 return torch.mm(a, b)
 
         cfn = torch.compile(fn)
@@ -6138,8 +6144,8 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         def fn(a, b):
             _name_tensor_dims(a, ["B", "M", "K"])
             _name_tensor_dims(b, ["B", "K", "N"])
-            with spyre_hint(num_tiles_per_dim={"B": 2}):
-                with spyre_hint(num_tiles_per_dim={"K": 4}):
+            with spyre_hint(tile_size_per_dim={"B": 2}):
+                with spyre_hint(tile_size_per_dim={"K": 128}):
                     return torch.bmm(a, b)
 
         compare_with_cpu(
@@ -6163,8 +6169,8 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         def fn(a, b):
             _name_tensor_dims(a, ["M", "K"])
             _name_tensor_dims(b, ["K", "N"])
-            with spyre_hint(num_tiles_per_dim={"M": 2}):
-                with spyre_hint(num_tiles_per_dim={"K": 4}):
+            with spyre_hint(tile_size_per_dim={"M": 64}):
+                with spyre_hint(tile_size_per_dim={"K": 128}):
                     return torch.mm(a, b)
 
         compare_with_cpu(
@@ -6187,8 +6193,8 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         _name_tensor_dims(b_dev, ["K", "N"])
 
         def fn(a, b):
-            with spyre_hint(num_tiles_per_dim={"M": 2}):
-                with spyre_hint(num_tiles_per_dim={"K": 4}):
+            with spyre_hint(tile_size_per_dim={"M": 64}):
+                with spyre_hint(tile_size_per_dim={"K": 128}):
                     return torch.mm(a, b)
 
         cfn = torch.compile(fn)
@@ -6221,8 +6227,8 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         _name_tensor_dims(b_dev, ["K", "N"])
 
         def fn(a, b):
-            with spyre_hint(num_tiles_per_dim={"M": 2}):
-                with spyre_hint(num_tiles_per_dim={"K": 4}):
+            with spyre_hint(tile_size_per_dim={"M": 64}):
+                with spyre_hint(tile_size_per_dim={"K": 128}):
                     return torch.mm(a, b)
 
         cfn = torch.compile(fn)
@@ -6262,8 +6268,8 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         _name_tensor_dims(b_dev, ["K", "N"])
 
         def fn(a, b):
-            with spyre_hint(num_tiles_per_dim={"M": 2}):
-                with spyre_hint(num_tiles_per_dim={"K": 4}):
+            with spyre_hint(tile_size_per_dim={"M": 64}):
+                with spyre_hint(tile_size_per_dim={"K": 128}):
                     return torch.mm(a, b)
 
         cfn = torch.compile(fn)
@@ -6307,8 +6313,8 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         _name_tensor_dims(b_dev, ["K", "N"])
 
         def fn(a, b):
-            with spyre_hint(num_tiles_per_dim={"M": 2}):
-                with spyre_hint(num_tiles_per_dim={"K": 4}):
+            with spyre_hint(tile_size_per_dim={"M": 64}):
+                with spyre_hint(tile_size_per_dim={"K": 128}):
                     return torch.mm(a, b)
 
         cfn = torch.compile(fn)
@@ -6363,7 +6369,6 @@ def test_tiled_in_place_accumulator():
     _pnd.reset()
 
     B, H, Lq, D = 1, 8, 256, 64
-    lq_slices = Lq // 128
 
     x_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
     scale_t = torch.randn(B, H, Lq, 1, dtype=torch.float16)
@@ -6372,8 +6377,8 @@ def test_tiled_in_place_accumulator():
     acc_t = torch.zeros(B, H, Lq, D, dtype=torch.float16)
 
     def fn(x, scale, acc):
-        with spyre_hint(num_tiles_per_dim={"H": 4}):
-            with spyre_hint(num_tiles_per_dim={"Lq": lq_slices}):
+        with spyre_hint(tile_size_per_dim={"H": 2}):
+            with spyre_hint(tile_size_per_dim={"Lq": 128}):
                 block_max = torch.amax(x, dim=-1, keepdim=True)
                 acc.copy_(acc + block_max * scale)
         return acc
@@ -6407,7 +6412,7 @@ def test_sum_reduce_with_explicit_zero_accumulator():
 
     def f(a):
         z = torch.zeros(B, device=a.device, dtype=torch.float16)
-        with spyre_hint(num_tiles_per_dim={"A": 2}):
+        with spyre_hint(tile_size_per_dim={"A": 512}):
             y = torch.sum(a, dim=0)
             z += y
         return z
@@ -6434,7 +6439,7 @@ def test_sum_reduce_implicit_accumulator():
     a_t = torch.randn(A, B, dtype=torch.float16) * 0.01
 
     def f_implicit(a):
-        with spyre_hint(num_tiles_per_dim={"A": 2}):
+        with spyre_hint(tile_size_per_dim={"A": 512}):
             z = torch.sum(a, dim=0)
         return z
 
@@ -6471,7 +6476,7 @@ def test_zeros_named_dims_hint_correctness():
     def f(x, cval):
         with spyre_hint(named_dims=["B", "H", "Lq"]):
             denom_named = torch.zeros((B, H, Lq), device=x.device, dtype=torch.float16)
-        with spyre_hint(num_tiles_per_dim={"H": 4}):
+        with spyre_hint(tile_size_per_dim={"H": 2}):
             corr = torch.exp(cval)
             denom_likecval = torch.zeros_like(cval)
             s_simple = x.sum(dim=-2)

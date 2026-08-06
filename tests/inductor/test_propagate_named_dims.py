@@ -163,6 +163,9 @@ def test_2d_add():
     y = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
 
     def fn(a, b):
+        # Deliberately kept on the count form: num_tiles_per_dim remains a
+        # supported hint, and this is its only direct pointwise coverage.
+        # Do not migrate to tile_size_per_dim.
         with _spyre_hint(num_tiles_per_dim={"M": 2}):
             return a + b
 
@@ -189,7 +192,7 @@ def test_2d_add_transposed():
     y = torch.randn(_N, _M, dtype=torch.float16, device=DEVICE)
 
     def fn(a, b):
-        with _spyre_hint(num_tiles_per_dim={"M": 2}):
+        with _spyre_hint(tile_size_per_dim={"M": _M // 2}):
             return a + b.t()
 
     _run_and_capture(
@@ -214,6 +217,9 @@ def test_2d_reduce_on_M():
     x = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
 
     def fn(a):
+        # Deliberately kept on the count form: num_tiles_per_dim remains a
+        # supported hint, and this is its only direct reduction coverage.
+        # Do not migrate to tile_size_per_dim.
         with _spyre_hint(num_tiles_per_dim={"N": 2}):
             return a.sum(dim=0)
 
@@ -239,7 +245,7 @@ def test_2d_reduce_on_N():
     x = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
 
     def fn(a):
-        with _spyre_hint(num_tiles_per_dim={"M": 2}):
+        with _spyre_hint(tile_size_per_dim={"M": _M // 2}):
             return a.sum(dim=1)
 
     _run_and_capture(
@@ -264,7 +270,7 @@ def test_2d_reduce_on_M_contiguous_before():
     x = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
 
     def fn(a):
-        with _spyre_hint(num_tiles_per_dim={"N": 2}):
+        with _spyre_hint(tile_size_per_dim={"N": _N // 2}):
             return a.contiguous().sum(dim=0)
 
     _run_and_capture(
@@ -289,7 +295,7 @@ def test_2d_reduce_on_M_contiguous_after():
     x = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
 
     def fn(a):
-        with _spyre_hint(num_tiles_per_dim={"N": 2}):
+        with _spyre_hint(tile_size_per_dim={"N": _N // 2}):
             return a.sum(dim=0).contiguous()
 
     _run_and_capture(
@@ -314,7 +320,7 @@ def test_2d_reduce_on_N_contiguous_before():
     x = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
 
     def fn(a):
-        with _spyre_hint(num_tiles_per_dim={"M": 2}):
+        with _spyre_hint(tile_size_per_dim={"M": _M // 2}):
             return a.contiguous().sum(dim=1)
 
     _run_and_capture(
@@ -339,7 +345,7 @@ def test_2d_reduce_on_N_contiguous_after():
     x = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
 
     def fn(a):
-        with _spyre_hint(num_tiles_per_dim={"M": 2}):
+        with _spyre_hint(tile_size_per_dim={"M": _M // 2}):
             return a.sum(dim=1).contiguous()
 
     _run_and_capture(
@@ -364,7 +370,7 @@ def test_2d_transposed_reduce_on_M():
     x = torch.randn(_N, _M, dtype=torch.float16, device=DEVICE)
 
     def fn(a):
-        with _spyre_hint(num_tiles_per_dim={"N": 2}):
+        with _spyre_hint(tile_size_per_dim={"N": _N // 2}):
             return a.t().sum(dim=0)
 
     _run_and_capture(
@@ -389,7 +395,7 @@ def test_2d_transposed_reduce_on_N():
     x = torch.randn(_N, _M, dtype=torch.float16, device=DEVICE)
 
     def fn(a):
-        with _spyre_hint(num_tiles_per_dim={"M": 2}):
+        with _spyre_hint(tile_size_per_dim={"M": _M // 2}):
             return a.t().sum(dim=1)
 
     _run_and_capture(
@@ -418,7 +424,7 @@ def test_no_permute():
     scale = 1.0 / math.sqrt(D)
 
     def fn(q):
-        with _spyre_hint(num_tiles_per_dim={"Lq": 2}):
+        with _spyre_hint(tile_size_per_dim={"Lq": Lq // 2}):
             return (q * scale).contiguous()
 
     _run_and_capture(
@@ -444,7 +450,7 @@ def test_permute_then_contiguous():
     scale = 1.0 / math.sqrt(D)
 
     def fn(q):
-        with _spyre_hint(num_tiles_per_dim={"Lq": 2}):
+        with _spyre_hint(tile_size_per_dim={"Lq": Lq // 2}):
             return (q.permute(0, 2, 1, 3) * scale).contiguous()
 
     _run_and_capture(
@@ -470,7 +476,7 @@ def test_permute_no_contiguous():
     scale = 1.0 / math.sqrt(D)
 
     def fn(q, s):
-        with _spyre_hint(num_tiles_per_dim={"Lq": 2}):
+        with _spyre_hint(tile_size_per_dim={"Lq": Lq // 2}):
             return q.permute(0, 2, 1, 3) * s
 
     _run_and_capture(
@@ -496,7 +502,7 @@ def test_contiguous_then_mul():
     scale = 1.0 / math.sqrt(D)
 
     def fn(q):
-        with _spyre_hint(num_tiles_per_dim={"Lq": 2}):
+        with _spyre_hint(tile_size_per_dim={"Lq": Lq // 2}):
             return q.permute(0, 2, 1, 3).contiguous() * scale
 
     _run_and_capture(
@@ -528,7 +534,7 @@ def test_permute_matmul():
     scale = 1.0 / math.sqrt(D)
 
     def fn(q, k):
-        with _spyre_hint(num_tiles_per_dim={"L": 2}):
+        with _spyre_hint(tile_size_per_dim={"L": Lq // 2}):
             q_perm = q.permute(0, 2, 1, 3) * scale
             k_perm = k.permute(0, 2, 3, 1) * scale
             return torch.matmul(q_perm, k_perm)
@@ -636,7 +642,7 @@ def test_permute_exp():
     queries = torch.randn(B, Lq, H, D, dtype=torch.float16, device=DEVICE)
 
     def fn(q):
-        with _spyre_hint(num_tiles_per_dim={"Lq": 2}):
+        with _spyre_hint(tile_size_per_dim={"Lq": Lq // 2}):
             return q.permute(0, 2, 1, 3).exp()
 
     _run_and_capture(
@@ -724,7 +730,7 @@ def test_broadcast_unsqueeze_mul():
 
     def fn(a, c_full):
         c_reduced = c_full.amax(dim=-1)  # [B,H,Lk,D] -> [B,H,Lk]
-        with _spyre_hint(num_tiles_per_dim={"Lk": 2}):
+        with _spyre_hint(tile_size_per_dim={"Lk": Lk // 2}):
             return c_reduced.unsqueeze(-1) * a
 
     _run_and_capture(
@@ -758,7 +764,7 @@ def test_permute_matmul_equal_lqlk_distinct_names():
     def fn(q, k):
         q_perm = q.permute(0, 2, 1, 3) * scale
         k_perm = k.permute(0, 2, 3, 1) * scale
-        with _spyre_hint(num_tiles_per_dim={"Lq": 2}):
+        with _spyre_hint(tile_size_per_dim={"Lq": Lq // 2}):
             return torch.matmul(q_perm, k_perm)
 
     _run_and_capture(
@@ -794,7 +800,7 @@ def test_permuted_intermediate_then_reduce():
     scale = 1.0 / math.sqrt(D)
 
     def fn(q):
-        with _spyre_hint(num_tiles_per_dim={"Lq": 2}):
+        with _spyre_hint(tile_size_per_dim={"Lq": Lq // 2}):
             return (q * scale).permute(0, 2, 1, 3).sum(dim=-1)
 
     _run_and_capture(
@@ -831,7 +837,7 @@ def test_permuted_intermediate_then_pointwise():
     scale = 1.0 / math.sqrt(D)
 
     def fn(q, bias):
-        with _spyre_hint(num_tiles_per_dim={"Lq": 2}):
+        with _spyre_hint(tile_size_per_dim={"Lq": Lq // 2}):
             inter = (q * scale).permute(0, 2, 1, 3).exp()
             return inter * bias
 
@@ -1014,7 +1020,7 @@ def test_broadcast_expand_leading_dim():
     y = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
 
     def fn(a, b):
-        with _spyre_hint(num_tiles_per_dim={"M": 2}):
+        with _spyre_hint(tile_size_per_dim={"M": _M // 2}):
             return a.expand(_M, _N) + b
 
     _run_and_capture(
@@ -1046,7 +1052,7 @@ def test_broadcast_expand_trailing_dims():
     y = torch.randn(_M, _N, dtype=torch.float16, device=DEVICE)
 
     def fn(a, b):
-        with _spyre_hint(num_tiles_per_dim={"M": 2}):
+        with _spyre_hint(tile_size_per_dim={"M": _M // 2}):
             return a.expand(_M, _N) + b
 
     _run_and_capture(

@@ -2381,7 +2381,8 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
             return x + y
 
         def manual_hint_fn(x, y):
-            with spyre_hint(num_tiles_per_dim={"SO_H": 5}):
+            # SO_H = shape[1] = 20 -> 5 tiles of 4
+            with spyre_hint(tile_size_per_dim={"SO_H": 4}):
                 return x + y
 
         _pnd.declare_tensor_dim("SO_B", shape[0])

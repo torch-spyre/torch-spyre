@@ -25,6 +25,11 @@ d = torch.rand(64, 256, dtype=torch.float16)  # M N
 
 
 def f(a, b, c, d):
+    # NOTE: kept on the count spelling. A tile_size_per_dim hint derives its loop
+    # count from the DECLARED size of the named dim, and this example declares
+    # none (no declare_tensor_dim / name_tensor_dims), so it has nothing to
+    # divide. Converting it needs the example extended to declare its dims --
+    # tracked with the prose pages that still describe num_tiles_per_dim.
     with spyre_hint(tiles={"K": 2}):
         with spyre_hint(tiles={"M": 4}):
             x = a + b

@@ -81,13 +81,13 @@ def main() -> None:
         "--outer-tiles",
         type=int,
         default=2,
-        help="num_tiles_per_dim for the outer spyre_hint (dim A). Default: 2.",
+        help="Number of tiles for the outer spyre_hint (dim A). Default: 2.",
     )
     parser.add_argument(
         "--inner-tiles",
         type=int,
         default=4,
-        help="num_tiles_per_dim for the inner spyre_hint (dim B). Default: 4.",
+        help="Number of tiles for the inner spyre_hint (dim B). Default: 4.",
     )
     parser.add_argument(
         "--size-a", type=int, default=1024, help="Size of dim A. Default: 1024."
@@ -114,11 +114,14 @@ def main() -> None:
     for t in (a_dev, b_dev, c_dev):
         _name_tensor_dims(t, ["A", "B"])
 
-    outer_tiles, inner_tiles = args.outer_tiles, args.inner_tiles
+    # The CLI takes tile COUNTS, but spyre_hint declares the per-tile EXTENT,
+    # so convert here at the hint boundary.
+    outer_size = args.size_a // args.outer_tiles
+    inner_size = args.size_b // args.inner_tiles
 
     def fn(a, b, c):
-        with spyre_hint(num_tiles_per_dim={"A": outer_tiles}):
-            with spyre_hint(num_tiles_per_dim={"B": inner_tiles}):
+        with spyre_hint(tile_size_per_dim={"A": outer_size}):
+            with spyre_hint(tile_size_per_dim={"B": inner_size}):
                 y = a + b
                 z = y * c
                 return z
