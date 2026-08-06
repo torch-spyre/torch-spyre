@@ -661,7 +661,6 @@ def lower_convolution(x, w, stride, padding, dilation, groups):
         inner_fn=inner_fn,
         ranges=[N, C_out, H_out, W_out],
         reduction_ranges=red_ranges,
-        # reduction_ranges=[K_h, K_w, G],
         op_info=op_info,
     )
 

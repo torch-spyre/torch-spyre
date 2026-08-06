@@ -640,7 +640,6 @@ def generate_sdsc(
     use_symbols: bool = False,
 ):
     """Generate SDSC JSON for one OpSpec.
-    print(f"DEBUG: generate_sdsc: sdsc_spec: {sdsc_spec}")
 
     Returns a 4-tuple ``(sdsc_json, base_symbol_values, affine_strides, symbol_kinds)``:
     - ``sdsc_json``: the JSON dict to write to ``sdsc_N.json``
@@ -1240,8 +1239,6 @@ def generate_sdsc(
         return {
             "isPadded": 1 if is_input else 0,
             "isZeroPadded": 0,
-            # "dsOffset": 0,
-            # "allocateNode_": alloc_node,
         }
 
     return (
