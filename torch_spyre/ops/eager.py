@@ -89,9 +89,10 @@ def _write_arg_slots(op):
     """Positions and names of an op's mutated (write-aliased) arguments.
 
     Such arguments (e.g. ``out=`` of an out-variant, ``self`` of an in-place op)
-    must NOT be materialized: cloning them would detach the write from the
-    caller's tensor and silently drop the result. ``alias_info.is_write``
-    identifies them from the schema.
+    need read-modify-write handling rather than a plain read-side clone: the
+    standalone-compiled kernel would write to the storage base (element 0)
+    instead of the view's ``storage_offset``. ``alias_info.is_write`` identifies
+    them from the schema.
     """
     positions: set[int] = set()
     names: set[str] = set()
@@ -102,21 +103,72 @@ def _write_arg_slots(op):
     return positions, names
 
 
+def _remap_result(result, lookup):
+    """Swap substituted clones back to the caller's originals in a return value.
+
+    ``lookup`` maps ``id(clone) -> original``. The compiled kernel echoes the
+    write-arg object it was handed (verified: ``relu_``/``add.out`` return the
+    same object), so an in-place/out op returns the clone we substituted;
+    restore the caller's tensor identity so aliasing is preserved.
+    """
+    if isinstance(result, torch.Tensor):
+        return lookup.get(id(result), result)
+    if isinstance(result, tuple):
+        mapped = [_remap_result(r, lookup) for r in result]
+        if hasattr(type(result), "_make"):  # namedtuple / structseq
+            return type(result)._make(mapped)
+        return tuple(mapped)
+    if isinstance(result, list):
+        return [_remap_result(r, lookup) for r in result]
+    return result
+
+
 def _make_offset_safe_dispatch(op):
-    """Build a dispatch wrapper that materializes nonzero-offset Spyre inputs
-    (except mutated args) before invoking the standalone-compiled kernel."""
+    """Build a dispatch wrapper that keeps nonzero-offset Spyre tensors correct
+    across the standalone-compiled kernel.
+
+    - Read (non-write) args: materialize a nonzero-offset view to a fresh
+      offset-0 buffer (``_materialize_offset_view``) before the call.
+    - Write (mutated) args: read-modify-write. Clone the offset view to an
+      offset-0 buffer, run the kernel against the clone, then ``copy_`` the
+      result back into the caller's view.
+
+    Everything is a no-op for the common offset-0 case.
+    """
     write_positions, write_names = _write_arg_slots(op)
 
     def dispatch(*args, compiled=None, **kwargs):
+        write_back = []  # (clone, original) for each substituted write view
+
+        def prep_write(x):
+            if (
+                isinstance(x, torch.Tensor)
+                and x.device.type == "spyre"
+                and x.storage_offset() != 0
+            ):
+                local = x.clone()
+                write_back.append((local, x))
+                return local
+            return x
+
         args = tuple(
-            a if i in write_positions else _materialize_offset_view(a)
+            prep_write(a) if i in write_positions else _materialize_offset_view(a)
             for i, a in enumerate(args)
         )
         kwargs = {
-            k: (v if k in write_names else _materialize_offset_view(v))
+            k: (prep_write(v) if k in write_names else _materialize_offset_view(v))
             for k, v in kwargs.items()
         }
-        return compiled(*args, **kwargs)
+
+        result = compiled(*args, **kwargs)
+
+        if write_back:
+            for local, original in write_back:
+                original.copy_(local)
+            result = _remap_result(
+                result, {id(local): original for local, original in write_back}
+            )
+        return result
 
     return dispatch
 
