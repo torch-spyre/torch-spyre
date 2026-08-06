@@ -17,7 +17,7 @@ import pytest
 import unittest
 import torch
 import torch.nn.functional as F
-from torch.profiler import profile, ProfilerActivity
+from torch.profiler import profile, ProfilerActivity, _memory_profiler
 from torch.testing._internal.common_utils import (
     skipIfTorchDynamo,
     TemporaryFileName,
@@ -81,13 +81,12 @@ class TestSpyreProfiler(TestCase):
 
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
-            with_stack=True,
-        ):  # as prof
+            with_stack=False,
+        ) as prof:
             x *= 2
-        self.assertTrue(True)
-        # TODO(#114): restore once libaiupti + kineto-spyre are rebuilt in lockstep.
-        # names = [e.name for e in prof.events()]
-        # self.assertTrue("aten::mul_" in names)
+            # TODO(#114): check with_stack=True once libaiupti + kineto-spyre are rebuilt in lockstep.
+        names = [e.name for e in prof.events()]
+        self.assertTrue("aten::mul_" in names)
 
     @unittest.skipUnless(Test_spyre, "require spyre device")
     def test_event_list(self):
@@ -192,8 +191,8 @@ def test_synchronize_callable():
     assert hasattr(torch, "spyre"), "torch.spyre namespace is missing"
     assert hasattr(torch.spyre, "synchronize"), "torch.spyre.synchronize() is missing"
 
-    x = torch.randn(64, 64, device="spyre")
-    y = torch.randn(64, 64, device="spyre")
+    x = torch.randn((64, 64), dtype=torch.float16, device="spyre")
+    y = torch.randn((64, 64), dtype=torch.float16, device="spyre")
 
     z = torch.matmul(x, y)
 
@@ -262,3 +261,108 @@ def test_kineto_memcpy_and_memset_events_captured():
 
     memset_events = [e for e in events if e.get("cat") == "gpu_memset"]
     assert memset_events, "Expected at least one memset event in the kineto-spyre trace"
+
+
+class TestMemoryProfilerTimeline(TestCase):
+    @unittest.skipIf(not Test_spyre, "spyre device required")
+    def test_memory_timeline_no_id_spyre(self) -> None:
+        # On CPU the default behavior is to simply forward to malloc. That
+        # means that when we free `x` the allocator doesn't actually know how
+        # many bytes are in the allocation, and thus there's no point to
+        # calling `c10::reportMemoryUsageToProfiler`. So in order to test that
+        # memory profiler processes this case correctly we need to use device
+        # where we do always keep a record.
+        x = torch.ones((1024,), device="spyre")
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) as prof:
+            # We never see `x` used so we don't know the storage is for a
+            # Tensor, but we do still see the free event.
+            del x
+
+            # For empty we see the allocation and free, but not any use.
+            # So this also cannot be identified as a Tensor.
+            y = torch.empty((64,))
+            del y
+
+            z = torch.empty((256,))
+            z.view_as(z)  # Show `z` to the profiler
+            del z
+
+        memory_profile = prof._memory_profile()
+
+        expected = [
+            # x
+            (_memory_profiler.Action.PREEXISTING, 4096),
+            (_memory_profiler.Action.DESTROY, 4096),
+            #
+            # y
+            (_memory_profiler.Action.CREATE, 256),
+            (_memory_profiler.Action.DESTROY, 256),
+            #
+            # z
+            (_memory_profiler.Action.CREATE, 1024),
+            (_memory_profiler.Action.DESTROY, 1024),
+        ]
+
+        actual = [(action, size) for _, action, _, size in memory_profile.timeline]
+
+        self.assertGreaterEqual(len(actual), len(expected))
+
+        for (act_action, act_size), (exp_action, exp_size) in zip(actual, expected):
+            self.assertEqual(act_action, exp_action)
+            self.assertGreaterEqual(
+                act_size, exp_size, f"Expected at least {exp_size}, got {act_size}"
+            )
+            # Allow generous allocator padding/alignment overhead. 4x is chosen as a
+            # middle ground: 2x risks false failures from allocator rounding, while
+            # 8x would allow large over-reporting bugs to pass unnoticed.
+            self.assertLessEqual(
+                act_size,
+                exp_size * 4,
+                f"Expected at most {exp_size * 4}, got {act_size}",
+            )
+
+    def test_memory_timeline_no_id_cpu(self) -> None:
+        x = torch.ones((1024,), device="cpu")
+
+        with profile(
+            activities=[ProfilerActivity.CPU],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) as prof:
+            # We never see `x` used so we don't know the storage is for a
+            # Tensor, but we do still see the free event.
+            del x
+
+            # For empty we see the allocation and free, but not any use.
+            # So this also cannot be identified as a Tensor.
+            y = torch.empty((64,))
+            del y
+
+            z = torch.empty((256,))
+            z.view_as(z)  # Show `z` to the profiler
+            del z
+
+        memory_profile = prof._memory_profile()
+
+        expected = [
+            #
+            # y
+            (_memory_profiler.Action.CREATE, 256),
+            (_memory_profiler.Action.DESTROY, 256),
+            #
+            # z
+            (_memory_profiler.Action.CREATE, 1024),
+            (_memory_profiler.Action.DESTROY, 1024),
+        ]
+
+        actual = [(action, size) for _, action, _, size in memory_profile.timeline]
+
+        for event in expected:
+            self.assertTrue(event in actual, f"event: {event} was not found in actual.")

@@ -757,6 +757,16 @@ class _OOTOpMarkerPatcher:
                             test_wrapper
                         )
 
+                    # ModelOpInfo (tests/models/test_model_ops_v2.py) carries the
+                    # per-sample `edits.ops.include[].tags` from the YAML config
+                    # (e.g. "torch.nn.functional.embedding.1_spyre"). Apply each
+                    # as its own mark so a single sample can be selected with
+                    # `-m <tag>`, the same way op__/dtype__ select by op/dtype.
+                    # Plain upstream OpInfo objects have no `op_tags` attribute,
+                    # so this is a no-op for every other @ops-based test suite.
+                    for op_tag in getattr(op, "op_tags", None) or []:
+                        test_wrapper = pytest.mark.__getattr__(op_tag)(test_wrapper)
+
                 if dtype is not None:
                     dtype_safe = re.sub(
                         r"[^a-zA-Z0-9_]", "_", str(dtype).replace("torch.", "")

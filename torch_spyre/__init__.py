@@ -326,6 +326,28 @@ def _autoload():
     except ImportError:
         pass
 
+    # Register Spyre Profiler
+    try:
+        import torch.profiler
+
+        _orig_init = torch.profiler.profile.__init__
+
+        def _init_with_spyre_profiler(self, *args, **kwargs):
+            # For first call, need to ensure torch_spyre._C is loaded so that SpyreProfiler is registered
+            if not torch.spyre.is_initialized():
+                torch.spyre._impl._lazy_init()
+            try:
+                # This will automatically register the profiler
+                import torch_spyre._C  # noqa: F401
+            except ImportError:
+                pass
+            torch.profiler.profile.__init__ = _orig_init
+            return _orig_init(self, *args, **kwargs)
+
+        torch.profiler.profile.__init__ = _init_with_spyre_profiler
+    except ImportError:
+        pass
+
     # Set correct state for dynamo to support eager ops
     import torch._dynamo.config
 

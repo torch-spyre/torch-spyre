@@ -9,6 +9,7 @@ test_suite_config:
             #         or test_matmul or test_large_matmul or test_linear
             #
             - TestOps::test_(addmm|mm|bmm|einsum|matmul|linear).*
+            - TestOps::test_fp8_scaled_mm.*
           mode: mandatory_success
           tags:
             - ops__inductor-matmul
