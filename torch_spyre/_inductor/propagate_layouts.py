@@ -55,6 +55,7 @@ from .dtype_ops import bool_equivalent_dtype
 from .errors import Unsupported
 from .constants import (
     BATCH_MATMUL_OP,
+    BATCH_MATMUL_FP8_OP,
     COPY_BACK_CANDIDATE_ATTR,
     DEVICE_NAME,
     ELIDED_COPY_BACK_ATTR,
@@ -364,6 +365,41 @@ def _rescale_stl_for_dtype(
     )
 
 
+def _qfp8wt_stl(
+    output: FixedLayout,
+    in_layout: FixedLayout,
+) -> SpyreTensorLayout:
+    """Propagate special FP8 tensor with 2D stick [2, 64]
+
+    The QFP8WT weight (KERNEL) tensor requires stick dimensions of [2, 64].  This
+    function propagates the output layout for both aligned and unaligned input tensors.
+
+    Outer dimensions and strides are preserved from output layout, with the innermost
+    stride always set to 1. For unaligned inputs where input stick size is not a
+    multiple of input stick size, the last dimension is padded to the stick size.  For
+    aligned inputs, it retains the concrete output size.
+
+    Args:
+        output: Inductor ``FixedLayout`` for the op's output tensor.
+        in_layout: Inductor ``FixedLayout`` for the op's input tensor.
+    """
+    in_eps = get_elem_in_stick(in_layout.dtype)
+    stick_dim_size = in_layout.size[-1]
+    unaligned = stick_dim_size % in_eps
+    outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
+    outer_strides = [concretize_expr(s) for s in output.stride[:-1]]
+    last_dim = in_eps if unaligned > 0 else concretize_expr(output.size[-1])
+    c_size = outer_sizes + [last_dim]
+    c_stride = outer_strides + [1]
+    return SpyreTensorLayout(
+        c_size,
+        c_stride,
+        output.dtype,
+        list(range(len(c_size))),
+        ElementArrangement.QFP8WT,
+    )
+
+
 def _single_arg_op_layout(
     op: Operation,
     output: FixedLayout,
@@ -535,6 +571,10 @@ def _single_arg_op_layout(
             return [
                 _rescale_stl_for_dtype(stl, output.dtype, ElementArrangement.QFP8CH)
             ]
+
+        case spyreop.qfp8wt.default:
+            # fp16 -> fp8 weight quantization with 2D-stick layout [2, 64].
+            return [_qfp8wt_stl(output, in_layout)]
 
     # For a bool output this op is dtype-preserving data movement or a
     # same-width reinterpret (reshape/transpose/etc); reuse the input STL's
@@ -1195,7 +1235,10 @@ def compute_layouts(
     if len(args) > 1 and isinstance(data, Pointwise):
         return _multi_arg_pointwise_layouts(op, output, output_dep, args)
 
-    if isinstance(data, Reduction) and data.reduction_type == BATCH_MATMUL_OP:
+    if isinstance(data, Reduction) and data.reduction_type in [
+        BATCH_MATMUL_OP,
+        BATCH_MATMUL_FP8_OP,
+    ]:
         return _matmul_layouts(op, output, output_dep, args)
 
     if isinstance(data, Reduction) and data.reduction_type == "exx2":

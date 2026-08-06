@@ -1808,8 +1808,6 @@ def format_operations(operations: list[Operation]) -> str:
                 buf.write(f"\n  dim_hints={dim_hints}")
             if loop_info := getattr(op, "loop_info", None):
                 buf.write(f"\n  loop_info={loop_info}")
-            if pending_per_tile_fixed := getattr(op, "_pending_per_tile_fixed", None):
-                buf.write(f"\n  _pending_per_tile_fixed={pending_per_tile_fixed}")
             buf.write(f"\n  {op.data}")
         buf.write("\n\n")
     return buf.getvalue()
