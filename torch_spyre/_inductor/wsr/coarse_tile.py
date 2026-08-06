@@ -1514,6 +1514,21 @@ def coarse_tile(
     # insert_tiling_propagation's docstring.
     insert_tiling_propagation(operations, groups)
 
+    # Checkpoint 5 wants each op's *planned* kind by name -- snapshot that
+    # now, before the resync loop below overwrites `group_ops` (the same
+    # list objects `groups` holds references to) with post-transformation
+    # replacement objects, which would make the id(op)-keyed `plan` lookup
+    # miss every replaced op.
+    predicted_kind_by_name: dict[str, str] = {
+        op.get_name(): info.propagation.kind
+        for group_ops, _levels in groups
+        for op in group_ops
+        if isinstance(op, ComputedBuffer)
+        and (info := plan.get(id(op))) is not None
+        and info.propagation is not None
+        and info.propagation.kind in ("copy_out", "reduction")
+    }
+
     # Pass 1/2/3 (all above) may have spliced a replacement ComputedBuffer
     # into `operations` under the same name for any op in a group's
     # `group_ops` snapshot (taken before those passes ran, back when
@@ -1535,61 +1550,61 @@ def coarse_tile(
             group_ops[idx] = name_to_op.get(op.get_name(), op)
         _patch_retiled_load_indexes(group_id, group_ops, retiled_infos, operations)
 
-    _log_propagation_self_check(operations, plan)
+    _log_propagation_self_check(operations, predicted_kind_by_name)
 
 
 def _log_propagation_self_check(
     operations: list[Operation],
-    plan: dict[int, CoarseTileInfo],
+    predicted_kind_by_name: dict[str, str],
 ) -> None:
-    """Checkpoint 5: cross-check actual new-op counts against the plan.
+    """Checkpoint 5: per-op cross-check of actual new buffers against the plan.
 
-    Tally new op names by the prefix each pass's worker uses
-    (coarse_tile_copy_*/coarse_tile_read_copy_*/coarse_tile_combine_*/
-    coarse_tile_fill_*) and compare against checkpoint 1's predicted
-    copy_out/reduction counts -- a cheap correctness assertion that the
-    fixed pass sequence actually did what planning decided it would.
+    For every op the plan routed to "copy_out" or "reduction", check by name
+    that the buffers its kind requires actually exist in `operations`:
+    copy_out needs a "coarse_tile_copy_{name}"; reduction needs both a
+    "coarse_tile_fill_{name}" and a "coarse_tile_combine_{name}" (nested
+    reduction additionally needs a "coarse_tile_reduce_copy_{name}", but that
+    is not checked here since a missing outer-level copy would already
+    surface as wrong numerics, not a silently-dropped buffer). This is a
+    per-op existence check rather than a plan-vs-actual aggregate tally,
+    because a coarse count comparison (e.g. counting fill buffers alone as a
+    proxy for "reduction machinery is complete") cannot distinguish "combine
+    op silently dropped" from "no bug" -- the count of fill buffers alone is
+    unaffected by a missing combine op.
     """
     if not logger.isEnabledFor(logging.DEBUG):
         return
-    predicted_copy_out = 0
-    predicted_reduction = 0
-    for info in plan.values():
-        if info.propagation is None:
-            continue
-        if info.propagation.kind == "copy_out":
-            predicted_copy_out += 1
-        elif info.propagation.kind == "reduction":
-            predicted_reduction += 1
+    existing_names = {
+        op.get_name() for op in operations if isinstance(op, ComputedBuffer)
+    }
+    mismatches = []
+    for name, kind in predicted_kind_by_name.items():
+        if kind == "copy_out":
+            required = [f"coarse_tile_copy_{name}"]
+        else:
+            required = [f"coarse_tile_fill_{name}", f"coarse_tile_combine_{name}"]
+        missing = [r for r in required if r not in existing_names]
+        if missing:
+            mismatches.append((name, kind, missing))
 
-    actual_copy_out = 0
-    actual_reduction = 0
-    for op in operations:
-        if not isinstance(op, ComputedBuffer):
-            continue
-        name = op.get_name()
-        if name.startswith("coarse_tile_copy_"):
-            actual_copy_out += 1
-        elif name.startswith("coarse_tile_fill_"):
-            actual_reduction += 1
-
+    predicted_copy_out = sum(
+        1 for k in predicted_kind_by_name.values() if k == "copy_out"
+    )
+    predicted_reduction = sum(
+        1 for k in predicted_kind_by_name.values() if k == "reduction"
+    )
     logger.debug(
-        "coarse_tile: self-check predicted copy_out=%d reduction=%d, "
-        "actual copy_out=%d reduction=%d",
+        "coarse_tile: self-check predicted copy_out=%d reduction=%d, %d mismatches",
         predicted_copy_out,
         predicted_reduction,
-        actual_copy_out,
-        actual_reduction,
+        len(mismatches),
     )
-    if actual_copy_out != predicted_copy_out or actual_reduction != predicted_reduction:
+    if mismatches:
         logger.warning(
-            "coarse_tile: propagation self-check mismatch -- planned "
-            "copy_out=%d reduction=%d but transformation produced "
-            "copy_out=%d reduction=%d",
-            predicted_copy_out,
-            predicted_reduction,
-            actual_copy_out,
-            actual_reduction,
+            "coarse_tile: propagation self-check mismatch -- %d op(s) "
+            "missing their planned buffers: %s",
+            len(mismatches),
+            mismatches,
         )
 
 
