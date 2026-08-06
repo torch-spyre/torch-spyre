@@ -4434,7 +4434,6 @@ class TestPlanTilingPropagation(unittest.TestCase):
         op = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[]])
         propagation = self._plan_for(op)
         self.assertEqual(propagation.kind, "loop_internal")
-        self.assertEqual(propagation.full_read_deps, ())
 
     def test_no_outside_consumers_matches_loop_internal(self):
         """Tiled with no outside consumers/graph output -> loop_internal,

@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Literal
 import sympy
 
 if TYPE_CHECKING:
-    from torch._inductor.dependencies import MemoryDep
     from torch._inductor.ir import ComputedBuffer
 
 
@@ -106,10 +105,6 @@ class PropagationPlan:
         this op's own outermost loop group that read this op's result.
     is_graph_output:
         True if this op's buffer name appears in the graph's output names.
-    full_read_deps:
-        This op's own ``MemoryDep`` reads whose producer lies outside this
-        op's own loop group (``_full_buffer_read_deps``) -- independent of
-        ``kind``, since an op of any kind may need read-side copy-ins.
     """
 
     kind: Literal["loop_internal", "copy_out", "reduction"]
@@ -117,7 +112,6 @@ class PropagationPlan:
     reduction: ReductionPlan | None = None
     outside_consumer_names: tuple[str, ...] = ()
     is_graph_output: bool = False
-    full_read_deps: tuple["MemoryDep", ...] = ()
 
 
 @dataclass

@@ -346,39 +346,6 @@ def _find_outside_consumers_planned(
     return consumer_names, is_graph_output
 
 
-def _full_buffer_read_deps_planned(
-    op: ComputedBuffer,
-    info: CoarseTileInfo,
-    name_to_group_outer_key: dict[str, int],
-) -> list[MemoryDep]:
-    """Planning-time analog of _full_buffer_read_deps.
-
-    Same decision, but takes op's planned CoarseTileInfo directly (op has no
-    .loop_info attribute yet at planning time) and looks up each read
-    dependency's producer outer loop-group key from name_to_group_outer_key
-    instead of a not-yet-stamped op.loop_info attribute.
-    """
-    from ..ir import SpyreEmptyFallback  # deferred: avoids circular import
-
-    outer_key = info.loop_group_id[0]
-    reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
-    result = []
-    for d in reads:
-        buf = V.graph.get_buffer(d.name)
-        unwrapped = buf
-        if isinstance(unwrapped, TensorBox):
-            unwrapped = unwrapped.data
-        if isinstance(unwrapped, StorageBox):
-            unwrapped = unwrapped.data
-        if isinstance(unwrapped, (SpyreEmptyFallback, InputBuffer)):
-            result.append(d)
-        elif isinstance(unwrapped, ComputedBuffer):
-            producer_outer_key = name_to_group_outer_key.get(unwrapped.get_name())
-            if producer_outer_key is None or producer_outer_key != outer_key:
-                result.append(d)
-    return result
-
-
 def _compute_full_ranges_planned(
     op: ComputedBuffer, info: CoarseTileInfo
 ) -> list[Expr]:
@@ -474,9 +441,9 @@ def _plan_tiling_propagation(
     Untiled/skipped ops (no entry in `plan`) are left untouched.
     """
     # Every candidate consumer/producer's outer loop-group key, built once
-    # up front so _find_outside_consumers_planned / _full_buffer_read_deps_planned
-    # don't each re-derive it per candidate. Keyed by name (not id(op)) to
-    # match _reads_buffer/_graph_output_names' own name-based buffer lookup.
+    # up front so _find_outside_consumers_planned doesn't re-derive it per
+    # candidate. Keyed by name (not id(op)) to match _reads_buffer/
+    # _graph_output_names' own name-based buffer lookup.
     # Prefer this call's own plan (the freshest data, for ops this call is
     # about to stamp); fall back to a real, already-stamped loop_info
     # attribute for ops outside this plan (e.g. from an earlier coarse_tile()
@@ -502,10 +469,6 @@ def _plan_tiling_propagation(
             if info is None:
                 continue
 
-            full_read_deps = tuple(
-                _full_buffer_read_deps_planned(op, info, name_to_group_outer_key)
-            )
-
             has_tiled_reduction = any(info.loop_tiled_reduction_dims)
             if isinstance(op.data, Reduction) and has_tiled_reduction:
                 reduction_type = op.data.reduction_type
@@ -530,15 +493,11 @@ def _plan_tiling_propagation(
                     reduction=reduction_plan,
                     outside_consumer_names=tuple(consumer_names),
                     is_graph_output=is_graph_output,
-                    full_read_deps=full_read_deps,
                 )
                 continue
 
             if all(not dims for dims in info.loop_tiled_dims):
-                info.propagation = PropagationPlan(
-                    kind="loop_internal",
-                    full_read_deps=full_read_deps,
-                )
+                info.propagation = PropagationPlan(kind="loop_internal")
                 continue
 
             buf_name = op.get_name()
@@ -546,10 +505,7 @@ def _plan_tiling_propagation(
                 buf_name, info.loop_group_id, operations, name_to_group_outer_key
             )
             if not consumer_names and not is_graph_output:
-                info.propagation = PropagationPlan(
-                    kind="loop_internal",
-                    full_read_deps=full_read_deps,
-                )
+                info.propagation = PropagationPlan(kind="loop_internal")
                 continue
 
             full_ranges = _compute_full_ranges_planned(op, info)
@@ -558,7 +514,6 @@ def _plan_tiling_propagation(
                 full_ranges=full_ranges,
                 outside_consumer_names=tuple(consumer_names),
                 is_graph_output=is_graph_output,
-                full_read_deps=full_read_deps,
             )
 
     _zero_reads_of_fixed_buffers_planned(operations, plan)
@@ -1490,9 +1445,9 @@ def coarse_tile(
         )
         retiled_infos_by_group.append((stamped_group_id, group_ops, retiled_infos))
 
-    # Pass 1: read copy-ins, using each op's now-stamped
-    # loop_info.propagation.full_read_deps. Must complete before Pass 2 and
-    # Pass 3 run, both of which read each op's *current* reads/loader.
+    # Pass 1: read copy-ins, recomputing each op's full-buffer read deps
+    # fresh (post-division). Must complete before Pass 2 and Pass 3 run,
+    # both of which read each op's *current* reads/loader.
     _insert_all_read_copy_ops(operations)
 
     # Pass 2: reduction machinery (accumulator/fill/combine), using each
@@ -2702,23 +2657,17 @@ def _insert_all_read_copy_ops(operations: list[Operation]) -> None:
 
     Transformation's Pass 1 (see the plan/execute split design). Every op
     was already stamped by _apply_plan with a loop_info, so
-    _full_buffer_read_deps(op) is available -- but it must be recomputed
-    fresh here, not read off loop_info.propagation.full_read_deps: that
-    planning-time value was computed from op.get_read_writes() *before*
-    _apply_plan's _divide_ranges/_divide_reduction_ranges divided op's own
-    ranges, so its MemoryDep.index/size expressions are keyed to the
-    pre-division (full-sized) iteration space. _insert_read_copy_ops sizes
-    and indexes the inserted copy directly from dep.index/dep.size (see its
-    docstring), so a stale pre-division dep would size/index the copy
-    against the wrong (full, not tile) extent -- silent wrong-code, exactly
-    the hazard CLAUDE.md's "wrap, never reconstruct" convention warns about
-    for stale symbolic index expressions. _full_buffer_read_deps(op),
-    called here on the current post-division op, is the fresh equivalent.
-    propagation.full_read_deps still has value elsewhere (e.g. as a planning-
-    time cross-check of *which* reads are full-buffer reads -- a static
-    topology fact, unaffected by division), but its dep objects themselves
-    must never be handed to a transformation-time mutation like
-    _insert_read_copy_ops.
+    _full_buffer_read_deps(op) is available -- and it must be computed here,
+    not at planning time: op.get_read_writes() before _apply_plan's
+    _divide_ranges/_divide_reduction_ranges divided op's own ranges would
+    key each MemoryDep's index/size expressions to the pre-division
+    (full-sized) iteration space. _insert_read_copy_ops sizes and indexes
+    the inserted copy directly from dep.index/dep.size (see its docstring),
+    so a pre-division dep would size/index the copy against the wrong
+    (full, not tile) extent -- silent wrong-code, exactly the hazard
+    CLAUDE.md's "wrap, never reconstruct" convention warns about for stale
+    symbolic index expressions. _full_buffer_read_deps(op), called here on
+    the current post-division op, avoids that hazard entirely.
 
     Must run after every group's _apply_plan (so op.loop_info is stamped)
     and before Pass 2/3's Reduction/copy-out dispatch, which reads an op's
