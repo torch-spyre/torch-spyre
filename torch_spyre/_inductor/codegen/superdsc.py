@@ -1582,7 +1582,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     if is_conv2d and disable_conv2d_spatial_split:
         # Splitting the spatial image dims (i, j) of a strided conv2d across
-        # cores produces incorrect DSM/strided addressing. The split is
+        # cores produces incorrect numerical results in some cases. The split is
         # suppressed upstream by ``conv_spatial_blocked_vars`` in
         # work_division.py, so those cores go to dims that can absorb them
         # instead of being dropped here. Span reduction outranks the flag: if
