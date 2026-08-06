@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import torch
+
+from torch._inductor.ir import ComputedBuffer
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
     FusedSchedulerNode,
@@ -38,10 +41,37 @@ def _is_spyre_node(node: BaseSchedulerNode) -> bool:
     return device is not None and device.type == DEVICE_NAME
 
 
+def _is_restickify_node(node: BaseSchedulerNode) -> bool:
+    """True if the node is a restickify op inserted by insert_restickify.
+
+    Restickify nodes must not be fused with surrounding ops.  When fused into a
+    tiled attention SDSC the outer tile-loop variables inflate the SDSC iteration
+    space, making the ReStickifyOpHBM initial chunk too large to fit in LX.
+
+    A restickify node is a ComputedBuffer whose origins contain exactly one FX
+    node targeting ``torch.ops.spyre.restickify.default``.
+    """
+    if not isinstance(node, SchedulerNode):
+        return False
+    op = node.node
+    if not isinstance(op, ComputedBuffer):
+        return False
+    return any(
+        getattr(fx_node, "target", None) is torch.ops.spyre.restickify.default
+        for fx_node in op.origins
+    )
+
+
 def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     """
     Fuse nodes together to form kernels without changing their order.
     Each kernel will be compiled into a single SuperDSC Bundle.
+
+    Restickify nodes are never fused with other ops: they are emitted as
+    standalone bundles so their SDSC iteration space contains only the
+    restickify's own dimensions (not any outer tile-loop variables from a
+    surrounding fused kernel), keeping the ReStickifyOpHBM initial chunk
+    within the LX capacity limit.
     """
     if len(nodes) == 0:
         return nodes
@@ -55,7 +85,14 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     cur_nodes: list[SchedulerNode | CountedLoopSchedulerNode] = []
 
     for n in nodes:
-        if isinstance(n, (SchedulerNode, CountedLoopSchedulerNode)) and _is_spyre_node(
+        if _is_restickify_node(n):
+            # Flush the current group, emit the restickify as its own bundle,
+            # then start a fresh group for whatever follows.
+            if fused := _make_fused(cur_nodes):
+                fused_nodes.append(fused)
+            cur_nodes = []
+            fused_nodes.append(n)
+        elif isinstance(n, (SchedulerNode, CountedLoopSchedulerNode)) and _is_spyre_node(
             n
         ):
             cur_nodes.append(n)

@@ -16,7 +16,7 @@ import dataclasses
 import math
 from typing import Any
 from collections import Counter
-from sympy import Integer, Symbol, Expr
+from sympy import Integer, Mul, Symbol, Expr
 
 from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats, ElementArrangement
@@ -256,7 +256,35 @@ def _get_device_dim_order(
     """Return (dim_order, stick_dim) for the arg's device layout after symbol substitution."""
     last_coord = arg.device_coordinates[-1].subs(symbol_mapping)
     free = sorted(last_coord.free_symbols, key=str)
-    stick_dim = free[0] if free else None
+    if len(free) == 0:
+        stick_dim = None
+    elif len(free) == 1:
+        stick_dim = free[0]
+    else:
+        # Multi-stick-per-row: inner + elems_per_stick * Mod(outer, n).
+        # Use the cross-stick (outer) variable as stick_dim so that, after
+        # parse_op_spec merges the inner dimension into the outer, the SDSC
+        # sees a single wide stick variable spanning n_sticks*elems_per_stick
+        # elements — identical to how a normal single-variable wide-stick
+        # tensor is handled (e.g. D=256 → one variable ranging 0..255).
+        # Detect inline to avoid circular import (pass_utils → superdsc).
+        elems_per_stick = arg.device_dtype.elems_per_stick()
+        stick_dim = free[0]  # default: first symbol alphabetically
+        free_args = [a for a in last_coord.args if a.free_symbols]
+        if len(free_args) == 2:
+            bare = [a for a in free_args if a.is_symbol]
+            if len(bare) == 1:
+                other = next(a for a in free_args if not a.is_symbol)
+                if isinstance(other, Mul):
+                    coeff, mod_part = other.as_coeff_Mul()
+                    if (
+                        coeff == elems_per_stick
+                        and isinstance(mod_part, Mod)
+                        and len(mod_part.args[0].free_symbols) == 1
+                        and mod_part.args[1] > 0
+                    ):
+                        # outer variable: appears in Mod(outer, n)
+                        stick_dim = next(iter(mod_part.args[0].free_symbols))
 
     dim_order: list[Symbol] = []
     for i in range(len(arg.device_coordinates) - 2, -1, -1):
@@ -1004,6 +1032,68 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         symbol_mapping[sym]: wk_slice if not has_indirect_access else 1
         for sym, (_, wk_slice) in op_spec.iteration_space.items()
     }
+
+    # Multi-stick-per-row (MSR) normalisation.
+    #
+    # When a tensor's last host dimension spans multiple sticks, PyTorch's IR
+    # decomposes it into two loop variables:
+    #   outer (range = n_sticks_per_row)  — selects the stick within a row
+    #   inner (range = elems_per_stick)   — within-stick position
+    # giving a stick expression  inner + elems_per_stick * Mod(outer, n_sticks).
+    #
+    # SDSC/DeepTools expects a SINGLE loop variable per stick dimension spanning
+    # total_elements = n_sticks * elems_per_stick.  Two separate loop variables
+    # inflate the SDSC chunk size, causing an LX-fit failure at compile time.
+    #
+    # Fix: merge inner into outer at the SDSC level so outer spans the full
+    # n_sticks * elems_per_stick elements — identical to a normal single-variable
+    # wide-stick dimension.  _get_device_dim_order already returns outer as
+    # stick_dim for MSR tensors.
+    _msr_inner_labels: set[Symbol] = set()
+    for _arg in op_spec.args:
+        if is_index_tensor(_arg, op_spec):
+            continue
+        _stick_expr = _arg.device_coordinates[-1].subs(symbol_mapping)
+        _eps = _arg.device_dtype.elems_per_stick()
+        _se_free = [a for a in _stick_expr.args if a.free_symbols]
+        if len(_se_free) != 2:
+            continue
+        _bare = [a for a in _se_free if a.is_symbol]
+        if len(_bare) != 1:
+            continue
+        _other_term = next(a for a in _se_free if not a.is_symbol)
+        if not isinstance(_other_term, Mul):
+            continue
+        _coeff, _mod_expr = _other_term.as_coeff_Mul()
+        if not (
+            _coeff == _eps
+            and isinstance(_mod_expr, Mod)
+            and len(_mod_expr.args[0].free_symbols) == 1
+            and _mod_expr.args[1] > 0
+        ):
+            continue
+        # Confirmed MSR: inner_sym = bare variable, outer_sym = var in Mod.
+        _inner_sym: Symbol = _bare[0]
+        _outer_sym: Symbol = next(iter(_mod_expr.args[0].free_symbols))
+        if (
+            _inner_sym not in sdsc_iteration_space
+            or _outer_sym not in sdsc_iteration_space
+        ):
+            continue
+        # Merge: outer absorbs inner's element range so outer spans all
+        # n_sticks * elems_per_stick elements (e.g. 4 * 64 = 256).
+        sdsc_iteration_space[_outer_sym] = (
+            sdsc_iteration_space[_outer_sym] * sdsc_iteration_space[_inner_sym]
+        )
+        _msr_inner_labels.add(_inner_sym)
+
+    # Remove merged inner labels from all SDSC dicts.
+    for _lbl in _msr_inner_labels:
+        sdsc_iteration_space.pop(_lbl, None)
+        dim_splits.pop(_lbl, None)
+        work_slices.pop(_lbl, None)
+    if _msr_inner_labels:
+        num_cores = math.prod(dim_splits.values())
 
     ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)

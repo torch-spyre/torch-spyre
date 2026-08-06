@@ -215,6 +215,26 @@ def buffer_not_read_in_full(graph: GraphLowering, buf_name: str) -> bool:
     return False
 
 
+def _has_indirect_read(op: Operation) -> bool:
+    """True if any of op's input MemoryDeps is an indirect (data-dependent) read.
+
+    Ops with indirect reads are gather-style ops (``index_select``, ``gather``,
+    etc.) whose value-tensor output must live in HBM.  The Spyre engine does not
+    support indirect addressing through LX scratchpad (the address offset of an
+    LX tensor is a compile-time constant; it cannot be indexed at runtime via a
+    data-dependent pointer).  Index tensors themselves are already forced to HBM
+    by the ``memOrg_`` field in ``compute_ops.py``; this guard covers the output
+    buffer of the gather/index_select op so it also stays in HBM.
+    """
+    if not isinstance(op, ComputedBuffer):
+        return False
+    return any(
+        dep.is_indirect()
+        for dep in op_read_writes(op).reads
+        if isinstance(dep, MemoryDep)
+    )
+
+
 def _is_tiled_advancing(op: Operation) -> bool:
     """True if ``op``'s output advances its address across a coarse-tile loop.
 

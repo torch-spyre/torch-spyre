@@ -54,6 +54,7 @@ from .pass_utils import (
     splits_by_index_coeff,
     apply_splits_from_index_coeff,
     op_read_writes,
+    _is_multi_stick_row_expr,
 )
 from .propagate_hints import get_op_hints
 from collections.abc import Iterable
@@ -405,9 +406,18 @@ def adjust_it_space_for_sticks(
             continue
 
         stick_expr = td.device_coords[-1]
-        if len(stick_expr.free_symbols) != 1:
+        elems_per_stick = td.layout.device_layout.elems_per_stick()
+        if len(stick_expr.free_symbols) == 1:
+            stick_var = next(iter(stick_expr.free_symbols))
+        elif _is_multi_stick_row_expr(stick_expr, elems_per_stick):
+            # Multi-stick-per-row: inner + elems_per_stick * Mod(outer, n).
+            # The bare inner symbol is the within-stick variable to adjust
+            # (range == elems_per_stick, so it collapses to 1 stick).
+            stick_var = next(
+                a for a in stick_expr.args if a.free_symbols and a.is_symbol
+            )
+        else:
             continue
-        stick_var = next(iter(stick_expr.free_symbols))
         if stick_var not in adjusted_space:
             continue
         if stick_var in symbol_meta:
@@ -420,7 +430,6 @@ def adjust_it_space_for_sticks(
                 f"(tensor {td.dep.name}); symbolic dims must be non-stick "
                 f"(e.g. the leading batch dim)."
             )
-        elems_per_stick = td.layout.device_layout.elems_per_stick()
         if stick_var not in max_elems or elems_per_stick > max_elems[stick_var]:
             max_elems[stick_var] = elems_per_stick
 
