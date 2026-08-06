@@ -21,8 +21,8 @@
 #include <pybind11/native_enum.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
-#include <util/sen_data_convert.h>
-#include <util/sendefs.h>
+#include <spyrecode-host-functions/sendataconvert/sen_data_convert.h>
+#include <util/sendefs/sendefs.h>
 
 #include <cstdlib>     // std::getenv
 #include <filesystem>  // NOLINT(build/c++17)
@@ -46,6 +46,7 @@
 #include "prepare_kernel.h"
 #include "spyre_allocator.h"
 #include "spyre_device_enum.h"
+#include "spyre_error.h"
 #include "spyre_generator_impl.h"
 #include "spyre_guard.h"
 #include "spyre_kernel.h"
@@ -207,8 +208,9 @@ PYBIND11_MODULE(_C, m) {
       .value("STANDARD", spyre::ElementArrangement::STANDARD)
       .value("DL16_TO_FP32", spyre::ElementArrangement::DL16_TO_FP32)
       .value("QFP8CH", spyre::ElementArrangement::QFP8CH)
+      .value("EXX2", spyre::ElementArrangement::EXX2)
       .value("FP32_TO_DL16", spyre::ElementArrangement::FP32_TO_DL16)
-      .value("EXX2", spyre::ElementArrangement::EXX2);
+      .value("QFP8WT", spyre::ElementArrangement::QFP8WT);
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
@@ -518,12 +520,36 @@ PYBIND11_MODULE(_C, m) {
       },
       py::arg("device"), "Reset peak allocator statistics");
 
-  // Returns true if any stream in the runtime has been shut down
-  // (unrecoverable). When true, no further work can be submitted on the
-  // affected streams.
-  m.def("has_stream_error", []() -> bool {
-    auto runtime = spyre::GlobalRuntime::get();
-    if (!runtime) return false;
-    return runtime->hasStreamError();
-  });
+  // ── Typed stream error API ───────────────────────────────────────────────
+
+  py::enum_<spyre::SpyreStreamError>(m, "SpyreStreamError")
+      .value("Success", spyre::SpyreStreamError::Success)
+      .value("Shutdown", spyre::SpyreStreamError::Shutdown);
+
+  py::enum_<spyre::SpyreDeviceState>(m, "SpyreDeviceState")
+      .value("Ok", spyre::SpyreDeviceState::Ok)
+      .value("NotInitialized", spyre::SpyreDeviceState::NotInitialized)
+      .value("StreamError", spyre::SpyreDeviceState::StreamError);
+
+  m.def(
+      "stream_get_error",
+      [](const spyre::SpyreStream& stream) {
+        return spyre::SpyreStreamGetError(stream);
+      },
+      py::arg("stream"),
+      "Return the SpyreStreamError state of a single stream.");
+
+  m.def(
+      "stream_get_error_string",
+      [](spyre::SpyreStreamError err) -> std::string {
+        return spyre::SpyreStreamGetErrorString(err);
+      },
+      py::arg("error"),
+      "Return a human-readable string for a SpyreStreamError value.");
+
+  m.def(
+      "get_device_state", []() { return spyre::SpyreGetDeviceState(); },
+      "Return the SpyreDeviceState aggregate for the process. "
+      "Returns NotInitialized when the runtime has not been created yet; "
+      "callers should treat this as 'proceed / no error'.");
 }

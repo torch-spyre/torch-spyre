@@ -99,7 +99,6 @@ class FixedTiledLayout(FixedLayout):
         super().__init__(device, dtype, size, stride, offset)
         self.device_layout: SpyreTensorLayout = device_layout
         self.allocation: dict[str, Any] = {}
-        self.per_tile_fixed: bool = False
 
     def __str__(self) -> str:
         device_index_str = "" if self.device.index is None else f":{self.device.index}"

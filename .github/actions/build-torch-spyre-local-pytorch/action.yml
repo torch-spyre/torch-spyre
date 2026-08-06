@@ -1,0 +1,77 @@
+name: Build torch-spyre against a local PyTorch checkout
+description: |
+  Builds torch-spyre against a local PyTorch source tree following 
+  the torch-spyre-docs. 
+
+inputs:
+  torch_spyre_dir:
+    description: Path to the checked-out torch-spyre directory
+    required: false
+    type: string
+    default: torch-spyre
+
+runs:
+  using: composite
+  steps:
+    - name: Build and install torch-spyre against local PyTorch
+      shell: bash
+      env:
+        TORCH_SPYRE_DIR: ${{ inputs.torch_spyre_dir }}
+      run: |
+        source "$HOME/.bashrc"
+        source /etc/profile.d/ibm-aiu-setup.sh
+
+        [[ "$TORCH_SPYRE_DIR" != /* ]] && TORCH_SPYRE_DIR="${PWD}/${TORCH_SPYRE_DIR}"
+        echo "TORCH_SPYRE_DIR $TORCH_SPYRE_DIR"
+
+        source "${TORCH_SPYRE_DIR}/.venv/bin/activate"
+
+        echo "========================================"
+        echo "========== Torch Spyre (local PyTorch)"
+        echo "========================================"
+
+        cd "$TORCH_SPYRE_DIR"
+
+        # Point torch-spyre's pyproject.toml at the local pytorch checkout
+        # instead of the pinned pytorch-cpu wheel index (non-editable -- see
+        # the description above for why). Reverted unconditionally on exit —
+        # the runner is ephemeral, but this keeps the checkout in the state a
+        # human would expect if it were ever inspected mid-job.
+        cp uv.lock uv.lock.bak
+        sed -i 's|^    "torch~=2.13.0",|#    "torch~=2.13.0",|' pyproject.toml
+        sed -i 's|^#    "torch>=2.13.0",|    "torch>=2.13.0",|' pyproject.toml
+        sed -i 's|^#  { path = "\.\./pytorch", editable = true },|  { path = "../pytorch", editable = false },|' pyproject.toml
+        sed -i '/^  { path = "\.\.\/pytorch", editable = false },/{n;s|^  { index = "pytorch-cpu" },|#  { index = "pytorch-cpu" },|}' pyproject.toml
+        trap 'sed -i "s|^#    \"torch~=2.13.0\",|    \"torch~=2.13.0\",|" pyproject.toml; \
+              sed -i "s|^    \"torch>=2.13.0\",|#    \"torch>=2.13.0\",|" pyproject.toml; \
+              sed -i "/^  { path = \"\.\.\/pytorch\", editable = false },/{n;s|^#  { index = \"pytorch-cpu\" },|  { index = \"pytorch-cpu\" },|}" pyproject.toml; \
+              sed -i "s|^  { path = \"\.\./pytorch\", editable = false },|#  { path = \"../pytorch\", editable = true },|" pyproject.toml; \
+              mv uv.lock.bak uv.lock' EXIT
+
+        # Install build dependencies without installing the project, required
+        # for --no-build-isolation to work properly.
+        uv sync --active --inexact --no-install-project --extra build
+
+        # uv's build cache for torch-spyre (a --no-build-isolation local
+        # package) is keyed on its own source tree, not on which torch is
+        # currently installed. If torch-spyre's C++ sources haven't changed
+        # since a previous build against a *different* torch (e.g. the
+        # pinned wheel), --reinstall-package alone can reinstall a stale
+        # cached wheel instead of recompiling — producing a torch_spyre._C.so
+        # linked against the wrong ATen ABI. Force an actual rebuild.
+        rm -rf build dist ./*.egg-info
+        uv cache clean torch-spyre || true
+
+        # uv treats the local pytorch path dependency as stale whenever its
+        # source-tree mtimes change (i.e. on every fresh checkout) and
+        # rebuilds it here regardless of what build-pytorch-from-source
+        # already installed. Pass the same env that build needs (gcc12
+        # warning-as-error workaround, CMAKE_PREFIX_PATH) so that rebuild
+        # succeeds too.
+        export CXX="$(command -v c++)"
+        CMAKE_PREFIX_PATH="${TORCH_SPYRE_DIR}/.venv" \
+        USE_CUDA=0 \
+        CFLAGS=" -Wno-error=maybe-uninitialized -Wno-error=uninitialized -Wno-error=restrict" \
+        CXXFLAGS=" -Wno-error=maybe-uninitialized -Wno-error=uninitialized -Wno-error=restrict" \
+        uv sync --all-extras --active --inexact --no-build-isolation --reinstall-package torch-spyre -v
+        unset CXX

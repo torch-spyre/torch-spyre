@@ -34,6 +34,11 @@ class GreedyLayoutSolver(MemoryPlanSolver):
         # `usage` tracks live placements during planning. It is specific to the
         # greedy time-stepping algorithm; the gap-based solvers don't use it.
         self.usage: list[LifetimeBoundBuffer] = []
+        # Names of parents whose slot has already been handed to an in-place
+        # child. A slot is handed off once: from the handoff on it belongs to
+        # that child, so a second child declaring the same parent must be placed
+        # on its own slot instead of landing on top of the first.
+        self.reused_parents: set[str] = set()
 
     def _get_lowest_addr_in_use(self):
         return min(
@@ -46,6 +51,27 @@ class GreedyLayoutSolver(MemoryPlanSolver):
             (rec.address + rec.size for rec in self.usage if rec.address is not None),
             default=0,
         )
+
+    def _occupied_spans(self) -> list[tuple[int, int]]:
+        """Merged ``[start, end)`` address spans currently in use.
+
+        An in-place handoff keeps both the dying parent and its child in
+        ``usage`` at the same address for the tick their lifetimes share, so
+        entries can nest. Merging the spans first means the gap scan cannot read
+        a shared slot as two abutting ones and hand out an address that is still
+        inside the parent.
+        """
+        merged: list[list[int]] = []
+        for lo, hi in sorted(
+            (rec.address, rec.address + rec.size)
+            for rec in self.usage
+            if rec.address is not None
+        ):
+            if merged and lo <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], hi)
+            else:
+                merged.append([lo, hi])
+        return [(lo, hi) for lo, hi in merged]
 
     def _find_free_block(self, size_needed: int) -> Optional[int]:
         assert all(x.address is not None for x in self.usage)
@@ -62,15 +88,10 @@ class GreedyLayoutSolver(MemoryPlanSolver):
             return address
 
         # Search for a gap between existing allocations
-        self.usage.sort(key=lambda x: (x.address is None, x.address))
-        for i in range(len(self.usage) - 1):
-            assert (current_address := self.usage[i].address) is not None
-            assert (next_address := self.usage[i + 1].address) is not None
-            frag_st = (
-                math.ceil((current_address + self.usage[i].size) / self.alignment)
-                * self.alignment
-            )
-            if next_address - frag_st >= size_needed:
+        occupied = self._occupied_spans()
+        for (_, span_end), (next_start, _) in zip(occupied, occupied[1:]):
+            frag_st = math.ceil(span_end / self.alignment) * self.alignment
+            if next_start - frag_st >= size_needed:
                 return frag_st
 
         return None
@@ -78,11 +99,18 @@ class GreedyLayoutSolver(MemoryPlanSolver):
     def _try_allocate(self, buffer: LifetimeBoundBuffer):
         # Check if the current buffer can be in-placed
         for in_place_opt in buffer.in_place_parents:
+            if in_place_opt in self.reused_parents:
+                continue
             matched_obj = next((u for u in self.usage if u.name == in_place_opt), None)
             if matched_obj is not None and buffer.size <= matched_obj.size:
                 buffer.address = matched_obj.address
                 self.usage.append(buffer)
-                self.usage.remove(matched_obj)
+                # The parent stays in `usage` until its own end_time. It is still
+                # live for the handoff tick, and the child covers only the low
+                # `buffer.size` bytes of its slot, so the footprint above that is
+                # still holding the parent's data and is not free for anyone
+                # else. `_try_deallocate` drops the parent at the right tick.
+                self.reused_parents.add(in_place_opt)
                 return None
 
         # Decide where to allocate the block from
@@ -147,6 +175,7 @@ class GreedyLayoutSolver(MemoryPlanSolver):
             return list(buffers)
 
         self.usage = []
+        self.reused_parents = set()
 
         # Walk through all transition points in chronological order.
         # Include end_time + 1 so deallocation fires even when no other

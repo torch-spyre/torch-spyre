@@ -509,24 +509,13 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
 
 
 def _graph_has_named_dims_hint(graph: GraphLowering) -> bool:
-    """True if any op carries a spyre_hint(named_dims=[...]) annotation.
-
-    This lets a decomposition name its own intermediate dims entirely in-graph
-    (e.g. the flash SDPA decomposition), without a driver-side name_tensor_dims()
-    call.  Such a hint is the only in-graph way to name a matmul output, whose
-    loop vars carry no names from inputs.
-
-    This scans graph.operations, which _propagate_named_dims_impl then scans
-    again; the extra pass is a cheap gate on a per-compilation path.  If it ever
-    shows up as a hotspot, fold the check into _propagate_named_dims_impl (run
-    unconditionally, short-circuit inside) so operations is walked once.
-    """
-    for op in graph.operations:
-        if isinstance(op, ComputedBuffer):
-            for hint_dict in get_op_hints(op).values():
-                if "named_dims" in hint_dict:
-                    return True
-    return False
+    """True if any op carries a spyre_hint(named_dims=[...]) annotation."""
+    return any(
+        "named_dims" in hint_dict
+        for op in graph.operations
+        if isinstance(op, ComputedBuffer)
+        for hint_dict in get_op_hints(op).values()
+    )
 
 
 def propagate_named_dims(
@@ -555,6 +544,52 @@ def propagate_named_dims(
     finally:
         _named_tensor_dims.clear()
         _enabled = False
+
+
+def validate_named_dims(graph: GraphLowering) -> None:
+    """Assert expected_named_dims / expected_reduction_dims hints match propagation.
+
+    Reads hint keys set by spyre_hint() and compares them against the
+    _dim_prop_info written by propagate_named_dims().  Raises AssertionError
+    immediately on the first mismatch.  Ops without assertion hints are skipped.
+    Ops where _dim_prop_info is absent (propagation was skipped or the op is a
+    no-op) are also silently skipped.
+    """
+    for op in graph.operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        dp = getattr(op, "_dim_prop_info", None)
+        if dp is None:
+            continue
+        for hint_dict in get_op_hints(op).values():
+            if (
+                "expected_named_dims" not in hint_dict
+                and "expected_reduction_dims" not in hint_dict
+            ):
+                continue
+            origins: set = getattr(op.data, "origins", set())
+            aten_ops = [str(n.target) for n in origins if hasattr(n, "target")]
+            logger.info(
+                f"validate_named_dims: checking {op.get_name()} named_dims={dp.named_dims}"
+            )
+            if "expected_named_dims" in hint_dict:
+                expected = hint_dict["expected_named_dims"]
+                actual = dp.named_dims
+                if actual != expected:
+                    raise AssertionError(
+                        f"validate_named_dims: {op.get_name()} {aten_ops}\n"
+                        f"  expected_named_dims: {expected}\n"
+                        f"  actual   named_dims: {actual}"
+                    )
+            if "expected_reduction_dims" in hint_dict:
+                expected = hint_dict["expected_reduction_dims"]
+                actual = dp.reduction_named_dims
+                if actual != expected:
+                    raise AssertionError(
+                        f"validate_named_dims: {op.get_name()} {aten_ops}\n"
+                        f"  expected_reduction_dims: {expected}\n"
+                        f"  actual   reduction_dims: {actual}"
+                    )
 
 
 def _assign_dim_hints_impl(operations: list[Operation]) -> None:

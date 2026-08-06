@@ -626,13 +626,16 @@ Environment Variables
    * - ``BUNDLE_SYMBOLIC_ARGS``
      - Emit LPDDR5 tensor addresses as runtime symbols rather than baked
        integers (default ``1``)
-   * - ``LX_BOUNDARY_CLONES``
-     - Insert boundary clones at LX scratchpad planning edges (default
-       ``0``)
    * - ``LAYOUT_SOLVER``
      - LX scratchpad layout solver strategy: ``greedy`` (default),
-       ``bestfit``, ``firstfit``, ``cpsat``.
+       ``bestfit``, ``firstfit``, ``cpsat``, ``simulated_annealing``.
        See :doc:`/compiler/scratchpad_planning`
+   * - ``SPYRE_INDUCTOR_ENABLE_REDUCTION_TILING``
+     - Enable reduction tiling in the pre-scheduling pipeline (default
+       ``1``)
+   * - ``SPYRE_LOG_PASSES``
+     - Comma-separated list of pass names after which to log the
+       op-spec IR at pipeline stage boundaries (default empty)
    * - ``MAX_BUCKETS``
      - Maximum number of work division buckets (default ``32``)
    * - ``MIN_DEFAULT_GRANULARITY``

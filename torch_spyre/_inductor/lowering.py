@@ -330,7 +330,6 @@ def _ensure_synthetic_origin(result, target, args: tuple) -> None:
     buf.origins = OrderedSet([fx_node])
 
 
-# TODO:This is just place holder now; Real implementation will follow
 @register_spyre_lowering(torch.ops.aten._scaled_mm.default)
 def lower_scaled_mm(
     mat1,
@@ -1182,6 +1181,18 @@ def _peel(node):
     return node
 
 
+def _peel_through_views(node):
+    """Like _peel, but also unwraps views (reshape/expand/slice/etc.).
+
+    A view (e.g. ir.ReinterpretView) is not a MutableBox/StorageBox, so plain
+    _peel stops at the view instead of reaching the Buffer underneath it.
+    """
+    node = _peel(node)
+    while isinstance(node, ir.BaseView):
+        node = _peel(node.data)
+    return node
+
+
 def _copy_back_candidate(dst, src) -> bool:
     """Whether ``copy_(dst, src)`` is worth checking after layout propagation.
 
@@ -1362,10 +1373,24 @@ def to_dtype(x, dst_dtype, use_compute_types=True):
         return lowering.clone(x)
 
     # Check if conversion is supported by backend
-    if DtypeOpTable.get_operator(src_dtype, dst_dtype) is None:
+    if not DtypeOpTable.is_supported(src_dtype, dst_dtype):
         # Unsupported conversion - fall back to CPU
         op = torch.ops.spyre.to_dtype_cpu.default
         return eager_fallback(op, x, dst_dtype)
+
+    # DMA-copied bool InputBuffers have a different HBM element ordering than
+    # computation-kernel outputs, so a stick-reordering typecast (e.g.
+    # DL16TOFP32 for bool → float32) reads them back shuffled (28/64 elements).
+    # Fall back to CPU for host bools whose conversion reorders sticks; an
+    # IDENTITY byte-copy (e.g. bool → float16) is safe. On-device computed bools
+    # use the native path. Peel through views (reshape/expand) too, since a
+    # viewed host bool is still backed by the same DMA-copied InputBuffer.
+    if src_dtype == torch.bool and DtypeOpTable.bool_host_conversion_reorders_sticks(
+        dst_dtype
+    ):
+        if isinstance(_peel_through_views(x), ir.InputBuffer):
+            op = torch.ops.spyre.to_dtype_cpu.default
+            return eager_fallback(op, x, dst_dtype)
 
     return lowering.to_dtype(
         x, dst_dtype, copy=True, use_compute_types=use_compute_types
@@ -1413,6 +1438,7 @@ def with_int64_fallback(fn, *args, convert_output=True):
 @register_spyre_lowering(
     torch.ops.aten.add.Tensor,
     type_promotion_kind=None,
+    broadcast=True,
 )
 def lower_add(x, y, *, alpha=1):
     if alpha != 1:
@@ -1431,6 +1457,7 @@ def lower_add(x, y, *, alpha=1):
 @register_spyre_lowering(
     torch.ops.aten.mul.Tensor,
     type_promotion_kind=None,
+    broadcast=True,
 )
 def lower_mul(x, y):
     return with_int64_fallback(lowering.mul, x, y)
@@ -1439,6 +1466,7 @@ def lower_mul(x, y):
 @register_spyre_lowering(
     torch.ops.aten.sub.Tensor,
     type_promotion_kind=None,
+    broadcast=True,
 )
 def lower_sub(x, y, *, alpha=1):
     if alpha != 1:
@@ -1457,6 +1485,7 @@ def lower_sub(x, y, *, alpha=1):
 @register_spyre_lowering(
     torch.ops.aten.minimum.default,
     type_promotion_kind=None,
+    broadcast=True,
 )
 def lower_minimum(x, y):
     return with_int64_fallback(lowering.minimum, x, y)
@@ -1465,6 +1494,7 @@ def lower_minimum(x, y):
 @register_spyre_lowering(
     torch.ops.aten.maximum.default,
     type_promotion_kind=None,
+    broadcast=True,
 )
 def lower_maximum(x, y):
     return with_int64_fallback(lowering.maximum, x, y)
@@ -1479,6 +1509,32 @@ def lower_qfp8ch(x):
     """
 
     fn = lowering.ops_wrapper(torch.ops.spyre.qfp8ch.__name__)
+    x_loader = x.make_loader()
+
+    def inner_fn(index):
+        return fn(x_loader(index))
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=torch.float8_e4m3fn,
+        inner_fn=inner_fn,
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw
+
+
+@register_spyre_lowering(torch.ops.spyre.qfp8wt)
+def lower_qfp8wt(x):
+    """
+    Lower qfp8wt operation - weight FP8 format conversion.
+
+    Pointwise format conversion only (no scaling).
+    """
+
+    fn = lowering.ops_wrapper(torch.ops.spyre.qfp8wt.__name__)
     x_loader = x.make_loader()
 
     def inner_fn(index):
