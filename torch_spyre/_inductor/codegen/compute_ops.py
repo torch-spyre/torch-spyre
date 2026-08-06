@@ -1172,20 +1172,15 @@ def generate_sdsc(
             is_tiled = scale == 1
             nsplits = sdsc_spec.work_slices[dim] if is_tiled else 1
             dim_size = _coord_size(dim_str, sdsc_spec.iteration_space[dim], is_input)
-            size = (
-                dim_size 
-                // nsplits
-                if is_tiled
-                else 1
-            )
+            size = dim_size // nsplits if is_tiled else 1
             is_fp8, _, st_idx = _compute_fp8_coord_params(tensor, dim, sdsc_spec)
             conv_params = get_conv_params(
-			    tensor_idx,
-			    dim,
-			    sdsc_spec.opfunc,
-			    sdsc_spec.conv_params,
-			    dim_size,
-			    nsplits,
+                tensor_idx,
+                dim,
+                sdsc_spec.opfunc,
+                sdsc_spec.conv_params,
+                dim_size,
+                nsplits,
             )
             result[dim_str] = gen_coord_info_value(
                 size=size,
@@ -1198,7 +1193,7 @@ def generate_sdsc(
                 tensor_idx=tensor_idx,
                 opfunc=sdsc_spec.opfunc,
                 padding=_coord_padding(dim_str, is_input),
-                conv_params = conv_params
+                conv_params=conv_params,
             )
         return result
 

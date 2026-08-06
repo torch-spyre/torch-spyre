@@ -23,7 +23,7 @@ from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.config import disable_conv2d_spatial_split
-from torch_spyre._C import DataFormats, ElementArrangement
+from torch_spyre._C import ElementArrangement
 from torch_spyre._inductor.constants import (
     CONV2D_DIM_LABELS,
     CONV2D_LAYOUT_LABELS,
@@ -1018,12 +1018,12 @@ def _create_sdsc_tensors(
             if not isinstance(dim_coord, IndirectAccess) and dev_dim_size > it_dim_size:
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 offsets[dim] = dim_offset * dim_device_stride
-                # conv2d addresses the difference between device and iteration space sizes 
+                # conv2d addresses the difference between device and iteration space sizes
                 # in its spatial dims (i, j) through the
                 # window/padding machinery in _conv2d_sdsc_fields, which already
                 # accounts for the gap between the device extent and the
                 # iteration extent. Emitting a backGap for them double-counts
-                # that gap and corrupts the generated addressing. 
+                # that gap and corrupts the generated addressing.
                 #
                 if (
                     not _is_conv(op_spec.op)
@@ -1048,11 +1048,8 @@ def _create_sdsc_tensors(
             else:
                 max_dim_sizes[mb_sym] = -1
 
-
         effective_stick = [op_stick_dim if stick_dim is None else stick_dim]
-        #effective_stick = op_stick_dim if stick_dim is None else stick_dim
         layout_labels = _get_tensor_layout_labels(use_op_dims, op_spec.op)
-        #layout_labels = MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS
 
         # Special handling for FP8 matmul KERNEL tensor
         dtype_stick_size = arg.device_dtype.elems_per_stick()
