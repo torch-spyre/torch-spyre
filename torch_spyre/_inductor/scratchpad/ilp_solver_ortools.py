@@ -207,13 +207,18 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
     # ------------------------------ residency ------------------------------
     def spill_cost(self) -> int:
         """Differential HBM traffic a spill adds over residency: the reads
-        residency would have served from LX (``read_count``, computed by the
-        allocator) plus the producer's write, which residency turns into a free
-        LX write. A graph input has no producer write to save; a graph output's
-        write-out is unavoidable either way, so it too cancels. Both cases are
-        exactly ``boundary != Intermediate`` -- for a plain
-        :class:`LifetimeBoundBuffer`, whose boundary is not tracked,
-        ``first_use_is_read`` marks the same distinction for inputs."""
+        residency would have served from LX plus the producer's write, which
+        residency turns into a free LX write. A graph input has no producer write
+        to save; a graph output's write-out is unavoidable either way, so it too
+        cancels. Both cases are exactly ``boundary != Intermediate`` -- for a
+        plain :class:`LifetimeBoundBuffer`, whose boundary is not tracked,
+        ``first_use_is_read`` marks the same distinction for inputs.
+
+        An input's first read is the clone-in that pinning cannot avoid, so it is
+        not one of the reads residency serves and is discounted from
+        ``read_count`` (which counts the buffer's reads, not the savings). For a
+        computed buffer the first use is the write and ``read_count`` already
+        excludes it, hence the discount is keyed on ``first_use_is_read``."""
         b = self.buffer
         boundary = getattr(b, "boundary", None)
         is_intermediate = (
@@ -221,7 +226,8 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
             if boundary is not None
             else not b.first_use_is_read
         )
-        return (b.read_count + (1 if is_intermediate else 0)) * b.size
+        reads_served = b.read_count - (1 if b.first_use_is_read else 0)
+        return (reads_served + (1 if is_intermediate else 0)) * b.size
 
     def constrain_residency(self, model, kids, bufs) -> None:
         """Placement-only: any buffer may reside, so there is no slicing gate."""

@@ -58,10 +58,11 @@ class LifetimeBoundBuffer:
 
     Both properties of ``uses`` are asserted in ``__post_init__``.  Strictness
     is what makes ``read_count`` trustworthy: one entry per accessing op means
-    ``read_count == 0`` is exactly "written, never read", which the in-place
-    invariants rely on (see :func:`assert_in_place_parent_is_read`).  A repeated
-    index would describe a buffer written and read by the same op, i.e. with a
-    single live tick, and would let such a buffer pass as an in-place parent.
+    that for a computed buffer ``read_count == 0`` is exactly "written, never
+    read", which the in-place invariants rely on (see
+    :func:`assert_in_place_parent_is_read`).  A repeated index would describe a
+    buffer written and read by the same op, i.e. with a single live tick, and
+    would let such a buffer pass as an in-place parent.
 
     ``start_time`` and ``end_time`` are convenience properties derived from
     ``uses``: ``uses[0]`` and ``uses[-1] + 1`` respectively.
@@ -94,10 +95,18 @@ class LifetimeBoundBuffer:
 
     @property
     def read_count(self) -> int:
-        """Number of reads: every use but the first, which is the producing
-        write for a computed buffer.  Exact because ``uses`` holds one distinct
-        index per accessing op."""
-        return max(0, len(self.uses) - 1)
+        """Number of reads.  For a computed buffer the first use is the producing
+        write, so every use but that one is a read; when ``first_use_is_read``
+        (a graph input) every use is a read.  Exact because ``uses`` holds one
+        distinct index per accessing op.
+
+        This counts the buffer's reads, not the reads residency would save: an
+        input's first read is the clone-in that pinning cannot avoid, so a cost
+        model has to discount it separately (see
+        :meth:`_LifetimeBufferWithCpVars.spill_cost`).  The ``max`` only guards
+        the transient empty-``uses`` state described in :meth:`__post_init__`.
+        """
+        return max(0, len(self.uses) - (0 if self.first_use_is_read else 1))
 
     @property
     def start_time(self) -> int:

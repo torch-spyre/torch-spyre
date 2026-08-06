@@ -646,6 +646,24 @@ class BaseLayoutSolverTests:
         # known and filled in afterwards.
         LifetimeBoundBuffer("P", 20, [])
 
+    def test_read_count_counts_every_use_of_a_read_first_buffer(self):
+        # A computed buffer's first use is its producing write, so only the later
+        # uses are reads. A graph input (first_use_is_read) is read at every use,
+        # including the first -- that read is the clone-in, which is still a read
+        # of the buffer even though pinning cannot save it (the cost models
+        # discount it themselves; see CpSat's ``spill_cost``).
+        self.assertEqual(LifetimeBoundBuffer("C", 20, [3, 5, 8]).read_count, 2)
+        self.assertEqual(LifetimeBoundBuffer("C", 20, [3]).read_count, 0)
+        inp = LifetimeBoundBuffer("I", 20, [3, 5, 8], first_use_is_read=True)
+        self.assertEqual(inp.read_count, 3)
+        single = LifetimeBoundBuffer("I", 20, [3], first_use_is_read=True)
+        self.assertEqual(single.read_count, 1)
+        # Empty uses is a transient registration state, not a negative count.
+        self.assertEqual(LifetimeBoundBuffer("E", 20, []).read_count, 0)
+        self.assertEqual(
+            LifetimeBoundBuffer("E", 20, [], first_use_is_read=True).read_count, 0
+        )
+
     def test_repeated_index_cannot_pass_as_a_read(self):
         # The in-place rule tests for a use strictly after the first rather than
         # relying on read_count, so a buffer whose uses were mutated into a

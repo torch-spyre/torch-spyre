@@ -96,7 +96,7 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
     it) and it inflates ``read_count``, so it is dropped.  This is what lets
     :class:`~torch_spyre._inductor.scratchpad.plan_solver.LifetimeBoundBuffer`
     require strictly increasing ``uses``, and makes ``read_count == 0`` mean
-    exactly "written but never read".
+    exactly "written but never read" for a computed buffer.
 
     Note: previously, unused graph inputs did not appear in the returned dict at
     all.  Now they appear with an empty list, and ``_build_bound_buffers`` skips

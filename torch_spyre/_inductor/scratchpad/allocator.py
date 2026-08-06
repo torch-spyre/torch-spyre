@@ -229,8 +229,11 @@ class ScratchpadAllocator:
     def _read_count(uses: list[int]) -> int:
         """Reads residency would serve from LX. The first use is never one of
         them: it is either the producer's write (an intermediate) or the clone-in
-        read a graph input cannot avoid. Mirrors
-        ``LifetimeBoundBuffer.read_count``."""
+        read a graph input cannot avoid.
+
+        Deliberately not ``LifetimeBoundBuffer.read_count``, which counts the
+        buffer's reads and so includes an input's clone-in; this is the savings,
+        which discounts it in both cases (as ``spill_cost`` does)."""
         return max(0, len(uses) - 1)
 
     @staticmethod
@@ -1844,7 +1847,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     output_name,
                     size,
                     uses,
-                    first_use_is_read=True,
+                    # An op output is a computed buffer: ``uses[0]`` is the
+                    # producing write, as on the placement path above. (Only the
+                    # input-clone loop above sets this True.)
+                    first_use_is_read=False,
                     in_place_parents=parents,
                     core_divisions=buf_divisions,
                     parents=parent_proj,
