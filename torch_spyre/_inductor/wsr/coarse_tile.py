@@ -58,6 +58,7 @@ from __future__ import annotations
 
 
 import dataclasses
+import logging
 from collections import Counter
 from typing import NamedTuple
 
@@ -612,6 +613,62 @@ def _zero_reads_of_fixed_buffers_planned(
         for i, dep in enumerate(reads):
             if dep.name in fixed_names and info.tiled_dims_per_read[i]:
                 info.tiled_dims_per_read[i] = []
+
+
+def _log_propagation_plan(
+    groups: list[tuple],
+    plan: dict[int, CoarseTileInfo],
+) -> None:
+    """Checkpoint 1: log the complete plan before any transformation runs.
+
+    Most valuable of the five checkpoints (see the plan/execute split
+    design's "Logging checkpoints" section) because it is inspectable even
+    if transformation later crashes -- every op's kind is already decided
+    here, with zero mutation.
+    """
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    for group_idx, (group_ops, _levels) in enumerate(groups):
+        tally: dict[str, int] = {"loop_internal": 0, "copy_out": 0, "reduction": 0}
+        for op in group_ops:
+            if not isinstance(op, ComputedBuffer):
+                continue
+            info = plan.get(id(op))
+            propagation = info.propagation if info is not None else None
+            if propagation is None:
+                continue
+            tally[propagation.kind] += 1
+            if propagation.kind == "copy_out":
+                logger.debug(
+                    "coarse_tile: plan group=%d %s kind=copy_out "
+                    "full_ranges=%s consumers=%s graph_output=%s",
+                    group_idx,
+                    op.get_name(),
+                    propagation.full_ranges,
+                    propagation.outside_consumer_names,
+                    propagation.is_graph_output,
+                )
+            elif propagation.kind == "reduction":
+                reduction = propagation.reduction
+                logger.debug(
+                    "coarse_tile: plan group=%d %s kind=reduction "
+                    "reduction_type=%s is_nested=%s consumers=%s "
+                    "graph_output=%s",
+                    group_idx,
+                    op.get_name(),
+                    reduction.reduction_type if reduction else None,
+                    reduction.is_nested if reduction else None,
+                    propagation.outside_consumer_names,
+                    propagation.is_graph_output,
+                )
+        logger.debug(
+            "coarse_tile: plan group=%d tally loop_internal=%d copy_out=%d "
+            "reduction=%d",
+            group_idx,
+            tally["loop_internal"],
+            tally["copy_out"],
+            tally["reduction"],
+        )
 
 
 def _planned_tile_extents_per_level(
@@ -1418,6 +1475,7 @@ def coarse_tile(
     # / copy-out / reduction) with zero mutation, consumed by Pass 1/2/3
     # below.
     _plan_tiling_propagation(operations, groups, plan)
+    _log_propagation_plan(groups, plan)
 
     # Transformation: apply the plan. Only reached if planning didn't raise.
     retiled_infos_by_group: list[
@@ -1476,6 +1534,63 @@ def coarse_tile(
                 continue
             group_ops[idx] = name_to_op.get(op.get_name(), op)
         _patch_retiled_load_indexes(group_id, group_ops, retiled_infos, operations)
+
+    _log_propagation_self_check(operations, plan)
+
+
+def _log_propagation_self_check(
+    operations: list[Operation],
+    plan: dict[int, CoarseTileInfo],
+) -> None:
+    """Checkpoint 5: cross-check actual new-op counts against the plan.
+
+    Tally new op names by the prefix each pass's worker uses
+    (coarse_tile_copy_*/coarse_tile_read_copy_*/coarse_tile_combine_*/
+    coarse_tile_fill_*) and compare against checkpoint 1's predicted
+    copy_out/reduction counts -- a cheap correctness assertion that the
+    fixed pass sequence actually did what planning decided it would.
+    """
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    predicted_copy_out = 0
+    predicted_reduction = 0
+    for info in plan.values():
+        if info.propagation is None:
+            continue
+        if info.propagation.kind == "copy_out":
+            predicted_copy_out += 1
+        elif info.propagation.kind == "reduction":
+            predicted_reduction += 1
+
+    actual_copy_out = 0
+    actual_reduction = 0
+    for op in operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        name = op.get_name()
+        if name.startswith("coarse_tile_copy_"):
+            actual_copy_out += 1
+        elif name.startswith("coarse_tile_fill_"):
+            actual_reduction += 1
+
+    logger.debug(
+        "coarse_tile: self-check predicted copy_out=%d reduction=%d, "
+        "actual copy_out=%d reduction=%d",
+        predicted_copy_out,
+        predicted_reduction,
+        actual_copy_out,
+        actual_reduction,
+    )
+    if actual_copy_out != predicted_copy_out or actual_reduction != predicted_reduction:
+        logger.warning(
+            "coarse_tile: propagation self-check mismatch -- planned "
+            "copy_out=%d reduction=%d but transformation produced "
+            "copy_out=%d reduction=%d",
+            predicted_copy_out,
+            predicted_reduction,
+            actual_copy_out,
+            actual_reduction,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1639,7 +1754,16 @@ def _propagate_tiled_op(
     if is_graph_output:
         _patch_graph_outputs(buf_name, full_buf)
 
-    logger.debug("coarse_tile: propagated %s → %s (copy)", buf_name, full_name)
+    logger.debug(
+        "coarse_tile: write copy-out %s -> %s old_stride=%s new_stride=%s "
+        "consumers=%s graph_output=%s",
+        buf_name,
+        full_name,
+        old_stride,
+        tuple(full_buf.layout.stride),
+        [c.get_name() for c in outside_consumers],
+        is_graph_output,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2508,6 +2632,13 @@ def _insert_read_copy_ops(
         # tile_strides, so _NameSwapHandler rescales the index's coefficients
         # from full_strides to tile_strides at call time (_rescale_index).
         name_map[dep.name] = (copy_name, full_strides, tile_strides)
+        logger.debug(
+            "coarse_tile: read copy-in %s -> %s (full_strides=%s tile_strides=%s)",
+            dep.name,
+            copy_name,
+            full_strides,
+            tile_strides,
+        )
 
     # Patch tiled_op's inner_fn once with the full name_map (wrap, not
     # reconstruct — see _NameSwapHandler docstring).  Rebuild via
@@ -2621,7 +2752,7 @@ def _insert_combine_op(
     tiled_op: ComputedBuffer,
     accum_buf: ComputedBuffer,
     operations: list[Operation],
-) -> None:
+) -> str:
     """Insert a pointwise combine op that accumulates tiled_op into accum_buf.
 
     The combine op reads both the partial result (tiled_op) and the current
@@ -2712,6 +2843,7 @@ def _insert_combine_op(
 
     tiled_idx = operations.index(tiled_op)
     operations.insert(tiled_idx + 1, combine_buf)
+    return combine_name
 
 
 def _insert_reduction_copy_op(
@@ -2980,7 +3112,7 @@ def _propagate_tiled_reduction_op(
     operations.insert(fill_target_idx + 2, fill_buf)
 
     # Insert combine op after the tiled reduction op (inside the loop).
-    _insert_combine_op(op, combine_target, operations)
+    combine_name = _insert_combine_op(op, combine_target, operations)
 
     # For nested case, insert a copy op at the outer loop level that writes
     # accum_tile → accum_full, advancing accum_full across outer output tiles.
@@ -3017,11 +3149,12 @@ def _propagate_tiled_reduction_op(
         _patch_graph_outputs(buf_name, accum_full)
 
     logger.debug(
-        "coarse_tile: tiled reduction %s → accum_full %s (fill=%s, identity=%s, "
-        "nested=%s)",
+        "coarse_tile: tiled reduction %s -> accum_full %s (fill=%s, combine=%s, "
+        "identity=%s, nested=%s)",
         buf_name,
         accum_name,
         fill_name,
+        combine_name,
         identity,
         is_nested,
     )
