@@ -39,9 +39,12 @@ tiled dimension from its ``loop_var`` in ``dim_hints``.
 
 Each ``ops`` list must be a contiguous sub-sequence of ``operations``.
 
-After stamping, ``coarse_tile`` calls ``insert_tiling_propagation`` to allocate
-full-sized output buffers and insert copy/mutation ops for Pointwise operations
-whose results are consumed outside the loop.
+After stamping, ``coarse_tile`` runs a fixed sequence of passes --
+``_insert_all_read_copy_ops``, ``_insert_all_reduction_ops``,
+``_insert_all_write_copy_ops`` -- that allocate full-sized output buffers and
+insert copy/mutation/reduction ops for tiled operations whose results are
+consumed outside the loop, all driven by the ``PropagationPlan`` each op's
+``loop_info`` already carries from planning.
 
 Before touching any ``inner_fn``/``layout``/``MutationLayoutSHOULDREMOVE``
 rewiring in this file, read "Appendix: How IR rewiring works, and why it's
@@ -566,13 +569,18 @@ def _zero_reads_of_fixed_buffers_planned(
 ) -> None:
     """Planning-time analog of _zero_reads_of_fixed_buffers.
 
-    A buffer is "fixed" once _plan_tiling_propagation (just above, in the
-    same call) has decided kind == "loop_internal" for a tiled op (loop
-    _propagate_tiled_op's own equivalent zeroing at loop_info.output_tiled_dims
-    = [] for the same case, plus _propagate_tiled_reduction_op's own
-    unconditional zeroing for any tiled-reduction op -- reduction accumulator
-    buffers are never read by name in the tiled_dims_per_read sense, so they
-    need no separate reader-side zeroing here). Unlike the deleted
+    A buffer is "fixed" -- its own tiled write never advances, because
+    something else drains/replaces it every iteration -- once
+    _plan_tiling_propagation (just above, in the same call) has decided any
+    kind at all for a tiled op: "loop_internal" (nothing advances it),
+    "copy_out" (the Pass 3 copy op drains it), or "reduction" (the Pass 2
+    combine op drains it, and _propagate_tiled_reduction_op zeroes it
+    unconditionally). The reduction case matters here even though the
+    accumulator buffer itself is never read by name: a tiled-reduction op's
+    *own* buffer (e.g. an amax result feeding a same-loop subtraction, as in
+    softmax) IS commonly read by name by a sibling op in the same group, and
+    that sibling's tiled_dims_per_read entry for it must be zeroed exactly
+    like the loop_internal/copy_out cases. Unlike the deleted
     transformation-time pass, every op's kind is already known for the
     whole plan at this point (computed above, before any mutation), so
     there is no reader-before-producer ordering hazard to work around --
@@ -585,7 +593,6 @@ def _zero_reads_of_fixed_buffers_planned(
         if isinstance(op, ComputedBuffer)
         and (info := plan.get(id(op))) is not None
         and info.propagation is not None
-        and info.propagation.kind == "loop_internal"
         and any(dims for dims in info.loop_tiled_dims)
     }
     if not fixed_names:
@@ -1445,6 +1452,8 @@ def coarse_tile(
     # _insert_copy_op read op's *current* reads/loader/layout.
     _insert_all_write_copy_ops(operations)
 
+    # No-op: kept only as a mock/patch point for span-overflow tests. See
+    # insert_tiling_propagation's docstring.
     insert_tiling_propagation(operations, groups)
 
     # Pass 1/2/3 (all above) may have spliced a replacement ComputedBuffer
@@ -1478,61 +1487,17 @@ def insert_tiling_propagation(
     operations: list[Operation],
     groups: list[tuple],
 ) -> None:
-    """Zero fixed-buffer readers' tiled_dims_per_read entries.
+    """No-op: retained only as a mock/patch point for span-overflow tests.
 
-    Pass 2 (_insert_all_reduction_ops) and Pass 3 (_insert_all_write_copy_ops)
-    -- both run before this -- already handle every tiled op's own
-    boundary-crossing (reduction machinery, or full-buffer allocation +
-    copy-out + outside-consumer/graph-output patching). All that remains
-    here is _zero_reads_of_fixed_buffers, kept as its own pass because "is
-    buf1 fixed" depends on Pass 3 having already zeroed buf1's own
-    output_tiled_dims, which a sibling reader of buf1 cannot know until
-    then regardless of visitation order.
+    Pass 1 (_insert_all_read_copy_ops), Pass 2 (_insert_all_reduction_ops),
+    and Pass 3 (_insert_all_write_copy_ops) -- all run before this -- now
+    handle every tiled op's own boundary-crossing, and
+    _plan_tiling_propagation's planning-time
+    _zero_reads_of_fixed_buffers_planned already zeroes fixed-buffer
+    readers' tiled_dims_per_read entries before _apply_plan ever stamps
+    loop_info, so no transformation-time equivalent is needed.
     """
-    del groups  # unused now that Pass 3 covers every group's own ops
-    _zero_reads_of_fixed_buffers(operations)
-
-
-def _zero_reads_of_fixed_buffers(operations: list[Operation]) -> None:
-    """Zero tiled_dims_per_read entries for reads of now-fixed buffers.
-
-    The per-op loop above (_propagate_tiled_op /
-    _propagate_tiled_reduction_op) zeroes a buffer's own
-    output_tiled_dims once that buffer is known to be loop-internal
-    scratch reused in place every iteration (no outside consumers, not a
-    graph output). But a sibling op *reading* that buffer inside the same
-    loop was planned before this was known, so its tiled_dims_per_read
-    entry for that read may still carry the stale, non-empty extent from
-    plan_coarse_tile_groups. SpyreKernel._general_tile_advance matches
-    tiled_dims_per_read to get_read_writes().reads purely positionally, so
-    a fixed buffer's readers must have that entry zeroed too, exactly
-    mirroring the now-fixed buffer's own write. This is a genuine second
-    pass over `operations` (not folded into the per-op loop above) because
-    a reader can be visited before its dependency is determined to be
-    fixed -- group_ops is processed in source order, and "is buf1 fixed"
-    is only known once buf1 itself has been propagated.
-    """
-    fixed_names = {
-        op.get_name()
-        for op in operations
-        if isinstance(op, ComputedBuffer)
-        and (loop_info := getattr(op, "loop_info", None)) is not None
-        and any(dims for dims in loop_info.loop_tiled_dims)
-        and not any(dims for dims in loop_info.output_tiled_dims)
-    }
-    if not fixed_names:
-        return
-
-    for op in operations:
-        if not isinstance(op, ComputedBuffer):
-            continue
-        loop_info = getattr(op, "loop_info", None)
-        if loop_info is None or not loop_info.tiled_dims_per_read:
-            continue
-        reads = [d for d in op.get_read_writes().reads if isinstance(d, MemoryDep)]
-        for i, dep in enumerate(reads):
-            if dep.name in fixed_names and loop_info.tiled_dims_per_read[i]:
-                loop_info.tiled_dims_per_read[i] = []
+    del operations, groups
 
 
 def _validate_planned_reduction_tiling(
