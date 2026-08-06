@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest import TestCase
 
 from torch_spyre._inductor import config
@@ -130,6 +131,74 @@ def _addr_overlap(a, b) -> bool:
     return a.address < b.address + b.size and b.address < a.address + a.size
 
 
+def _in_place_descendants(buffers) -> dict[str, set[str]]:
+    """name -> every name reachable by following in-place edges downward.
+
+    A slot can be handed down a chain (``a -> b -> c``), and every solver
+    supports that, so legality has to be judged transitively: ``a`` and ``c``
+    sharing one base is the chain working as intended, not an overlap. Siblings
+    are deliberately *not* related here -- two children of one parent are in the
+    same component but neither inherits from the other, so they may not share.
+    """
+    children: dict[str, list[str]] = {}
+    for b in buffers:
+        for parent in b.in_place_parents:
+            children.setdefault(parent, []).append(b.name)
+
+    descendants: dict[str, set[str]] = {}
+
+    def walk(name: str) -> set[str]:
+        if name in descendants:
+            return descendants[name]
+        descendants[name] = set()  # placeholder, so a malformed cycle terminates
+        reached: set[str] = set()
+        for child in children.get(name, ()):
+            reached.add(child)
+            reached |= walk(child)
+        descendants[name] = reached
+        return reached
+
+    for b in buffers:
+        walk(b.name)
+    return descendants
+
+
+def _assert_legal_layout(test, result, size, alignment):
+    """Assert the layout is *physically* legal, whatever the solver's policy.
+
+    Every placed buffer is aligned and inside capacity, and no two buffers live
+    at a common tick may share an address. An in-place chain is exempt only at
+    *equal* addresses -- that one shared base is the whole point of the handoff
+    tick. A child that failed exact reuse and landed part-way into its parent, a
+    second child taking a slot already handed off, or a third buffer given the
+    parent's footprint above the child's, is corrupted data rather than a
+    heuristic choice, so each is checked like any other pair.
+
+    Which buffers reside is a policy question each solver answers differently;
+    this is the part none of them may get wrong, so it is asserted on every
+    layout every suite produces rather than per test.
+    """
+    placed = [b for b in result if b.address is not None]
+    for b in placed:
+        test.assertEqual(b.address % alignment, 0, f"{b.name} misaligned")
+        test.assertLessEqual(b.address + b.size, size, f"{b.name} exceeds capacity")
+    descendants = _in_place_descendants(result)
+    for i, a in enumerate(placed):
+        for c in placed[i + 1 :]:
+            if not _lifetimes_overlap(a, c):
+                continue
+            inherits = c.name in descendants[a.name] or a.name in descendants[c.name]
+            if inherits and a.address == c.address:
+                continue  # sanctioned handoff: same base, down one chain
+            test.assertFalse(
+                _addr_overlap(a, c),
+                f"{a.name}[{a.address},{a.address + a.size}) and "
+                f"{c.name}[{c.address},{c.address + c.size}) overlap in memory "
+                f"while both live at tick {max(a.start_time, c.start_time)}"
+                + (" (in-place chain, differing bases)" if inherits else ""),
+            )
+
+
 class BaseLayoutSolverTests:
     solver_class: type[MemoryPlanSolver] = None  # type: ignore[assignment]
 
@@ -146,7 +215,11 @@ class BaseLayoutSolverTests:
 
     def solve(self, buffers, size=LARGE_SIZE, alignment=1):
         self.last_solver = self.solver_class(size, alignment)
-        return self.last_solver.plan_layout(buffers)
+        result = self.last_solver.plan_layout(buffers)
+        # Checked here, not in check_result: several tests call solve() directly
+        # and assert addresses themselves, and legality holds for those too.
+        _assert_legal_layout(self, result, size, alignment)
+        return result
 
     def check_result(self, result, expected_addresses, size, alignment):
         """Assert the solved layout matches the heuristic-solver expectation.
@@ -210,6 +283,85 @@ class BaseLayoutSolverTests:
 
         self.assertIsNone(result["parent"].address)
         self.assertIsNotNone(result["child"].address)
+
+    # -- the in-place handoff contract, run against every solver -------------
+    #
+    # A child may take over its parent's slot, but only at the parent's exact
+    # base, and only the low `child.size` bytes of it. The parent is still live
+    # for the handoff tick and the bytes above the child still hold parent data
+    # read on that tick, so that remainder belongs to nobody else until the
+    # parent's lifetime ends.
+
+    def test_live_parent_footprint_not_reused_at_handoff(self):
+        # `child` takes over the low 5 bytes of a 40-byte parent. `stranger`
+        # enters at the handoff tick, so it may not be handed any of the
+        # remaining 35 -- and `child` itself may not sit part-way into the
+        # parent. `_assert_legal_layout` in solve() is the real assertion; the
+        # checks below name the specific pair for a readable failure.
+        parent = self.make_buffer("parent", 40, [0])
+        child = self.make_buffer("child", 5, [0, 2], in_place_parents=["parent"])
+        stranger = self.make_buffer("stranger", 20, [0, 1])
+        result = {b.name: b for b in self.solve([parent, child, stranger], size=120)}
+
+        p = result["parent"]
+        if p.address is None:
+            self.skipTest("parent spilled; nothing to protect")
+        for name in ("child", "stranger"):
+            b = result[name]
+            if b.address is None or not _lifetimes_overlap(p, b):
+                continue
+            if name == "child" and b.address == p.address:
+                continue  # sanctioned exact reuse
+            self.assertFalse(
+                _addr_overlap(p, b),
+                f"{name}[{b.address},{b.address + b.size}) lands inside live "
+                f"parent[{p.address},{p.address + p.size}) at the handoff tick",
+            )
+
+    def test_second_child_does_not_take_a_handed_off_slot(self):
+        # Two children declare the same parent. A slot is handed off once, so at
+        # most one of them may inherit the parent's base -- whichever the solver's
+        # ordering prefers. The other has to be placed on its own: those bytes now
+        # belong to the first child, and the rest still belongs to the parent for
+        # the handoff tick.
+        parent = self.make_buffer("parent", 40, [0])
+        first = self.make_buffer("first", 20, [0, 2], in_place_parents=["parent"])
+        second = self.make_buffer("second", 5, [0], in_place_parents=["parent"])
+        result = {b.name: b for b in self.solve([parent, first, second], size=120)}
+
+        placed = [b for b in result.values() if b.address is not None]
+        self.assertEqual(len(placed), 3, "all three fit in 120 bytes")
+        inheritors = [
+            name
+            for name in ("first", "second")
+            if result[name].address == result["parent"].address
+        ]
+        self.assertLessEqual(
+            len(inheritors),
+            1,
+            f"{inheritors} all sit at the parent's base; the slot is handed off once",
+        )
+
+    def test_in_place_merge_stays_within_capacity(self):
+        # Tight capacity (three alignment units) around a single in-place pair.
+        # The pair legally shares one base, but everything stacked around it must
+        # still end below capacity: a solver -- or a post-pass that slides merged
+        # units down -- has to spill rather than hand out an address that runs
+        # past the limit.
+        buffers = [
+            self.make_buffer("stacked", 20, [0, 2]),
+            self.make_buffer("late", 5, [6]),
+            self.make_buffer("parent", 20, [0]),
+            self.make_buffer("child", 5, [0, 2, 5, 6], in_place_parents=["parent"]),
+        ]
+        for b in self.solve(buffers, size=30, alignment=10):
+            if b.address is not None:
+                self.assertLessEqual(
+                    b.address + b.size,
+                    30,
+                    f"{b.name}[{b.address},{b.address + b.size}) runs past the "
+                    f"30-byte scratchpad",
+                )
 
     def test_simple_layout(self):
         # Three non-overlapping buffers fill memory sequentially.
@@ -446,6 +598,9 @@ print("RESULT " + json.dumps({{x.name: x.address for x in bufs}}))
 """
 
 
+_DETERMINISM_HASHSEEDS = range(5)
+
+
 def _run_determinism_snippet(hashseed, solver_class_name, solver_module):
     env = dict(
         os.environ,
@@ -461,11 +616,32 @@ def _run_determinism_snippet(hashseed, solver_class_name, solver_module):
         text=True,
         env=env,
         cwd=_REPO_ROOT,
-        timeout=60,
+        timeout=120,
     )
     assert p.returncode == 0, p.stderr
     line = next(ln for ln in p.stdout.splitlines() if ln.startswith("RESULT "))
     return json.loads(line[len("RESULT ") :])
+
+
+def _run_determinism_snippets(solver_class_name, solver_module):
+    """Run the snippet once per hash seed, all subprocesses concurrently.
+
+    Each subprocess pays ~6s importing torch and the Inductor stack (the
+    snippet imports ``torch_spyre._inductor``, whose ``__init__`` pulls in
+    ``torch._inductor.graph``), so running them sequentially costs that import
+    once per seed. The work is entirely inside ``subprocess.run``, so threads
+    release the GIL and wall time collapses to roughly a single import.
+    Returns the results in seed order.
+    """
+    with ThreadPoolExecutor(max_workers=len(_DETERMINISM_HASHSEEDS)) as pool:
+        return list(
+            pool.map(
+                lambda seed: _run_determinism_snippet(
+                    seed, solver_class_name, solver_module
+                ),
+                _DETERMINISM_HASHSEEDS,
+            )
+        )
 
 
 class ScoreOrderingTests:
@@ -513,6 +689,18 @@ class ScoreOrderingTests:
         self.assertEqual(by_name["child"], 0)  # child reuses parent's slot
         self.assertIsNone(by_name["plain"])
 
+    def test_failed_inplace_reuse_does_not_overlap_live_parent(self):
+        parent = LifetimeBoundBuffer("parent", 20, [0, 4])
+        blocker = LifetimeBoundBuffer("blocker", 5, [5, 8])
+        child = LifetimeBoundBuffer("child", 10, [4, 8], in_place_parents=["parent"])
+
+        result = self.solve([parent, blocker, child], size=30)
+        by_name = {buffer.name: buffer.address for buffer in result}
+
+        self.assertEqual(by_name["parent"], 0)
+        self.assertEqual(by_name["blocker"], 0)
+        self.assertEqual(by_name["child"], 20)
+
     def test_write_first_buffer_placed_before_read_only(self):
         # Identical span (5) and use count (2). `writer`'s first use is a write
         # (first_use_is_read=False), so pinning it also saves the more expensive
@@ -530,15 +718,12 @@ class ScoreOrderingTests:
 
     def test_inplace_parent_choice_is_hashseed_independent(self):
         """Placement must not depend on PYTHONHASHSEED (set-iteration order)."""
-        solver_class_name = self.solver_class.__name__
-        solver_module = self.solver_class.__module__
-        base = _run_determinism_snippet(0, solver_class_name, solver_module)
-        for hashseed in range(1, 10):
-            self.assertEqual(
-                _run_determinism_snippet(hashseed, solver_class_name, solver_module),
-                base,
-                f"PYTHONHASHSEED={hashseed}",
-            )
+        results = _run_determinism_snippets(
+            self.solver_class.__name__, self.solver_class.__module__
+        )
+        base = results[0]
+        for hashseed, result in zip(_DETERMINISM_HASHSEEDS, results):
+            self.assertEqual(result, base, f"PYTHONHASHSEED={hashseed}")
 
 
 class TestFirstFitLayoutSolver(ScoreOrderingTests, BaseLayoutSolverTests, TestCase):
@@ -571,24 +756,10 @@ def _assert_legal_packing(test, result, expected_addresses, size, alignment):
     solver minimises HBM traffic.
     """
     placed = [b for b in result if b.address is not None]
-    # A legal packing: every placed buffer is aligned and within capacity.
-    for b in placed:
-        test.assertEqual(b.address % alignment, 0, f"{b.name} misaligned")
-        test.assertLessEqual(b.address + b.size, size, f"{b.name} exceeds capacity")
-    # No two lifetime-overlapping buffers may share addresses, except in-place
-    # pairs, which intentionally share storage for the single tick their
-    # lifetimes touch.
-    for a in placed:
-        for c in placed:
-            if a.name == c.name:
-                continue
-            if not _lifetimes_overlap(a, c):
-                continue
-            if a.name in c.in_place_parents or c.name in a.in_place_parents:
-                continue
-            test.assertFalse(
-                _addr_overlap(a, c), f"{a.name} and {c.name} overlap in memory"
-            )
+    # Aligned, within capacity, and no address shared between buffers live at a
+    # common tick -- in-place pairs included, which are legal only at the single
+    # shared base they were merged at.
+    _assert_legal_layout(test, result, size, alignment)
     # Below one alignment unit of capacity the solver's unit model rounds to
     # zero and can't represent any placement, so the count comparison does not
     # apply.
@@ -665,7 +836,9 @@ class JointDivisionSolverTests(BaseLayoutSolverTests):
         )
         self.last_solver = self.solver_class(size, alignment)
         result = self.last_solver.plan_layout_and_core_divisions(buffers + [sink])
-        return [b for b in result if b.name != "__sink__"]
+        result = [b for b in result if b.name != "__sink__"]
+        _assert_legal_layout(self, result, size, alignment)
+        return result
 
     def check_result(self, result, expected_addresses, size, alignment):
         _assert_legal_packing(self, result, expected_addresses, size, alignment)
@@ -969,7 +1142,9 @@ class TestCpSatPlacementOnly(BaseLayoutSolverTests, TestCase):
             # and the solver cannot represent any placement.
             return buffers
         self.last_solver = self.solver_class(size, alignment)
-        return self.last_solver.plan_layout(buffers)
+        result = self.last_solver.plan_layout(buffers)
+        _assert_legal_layout(self, result, size, alignment)
+        return result
 
     def check_result(self, result, expected_addresses, size, alignment):
         _assert_legal_packing(self, result, expected_addresses, size, alignment)

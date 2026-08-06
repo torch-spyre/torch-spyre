@@ -19,7 +19,7 @@ Canonical examples are `reciprocal` and `sigmoid`.
 ## Spyre-specific decompositions
 
 We define Spyre-specific decompositions in [decompositions.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/decompositions.py)
-using the `@register_spyre_decomposition` decorator.  Decompositions are graph transformations
+using the `@register_spyre_decompositions` decorator.  Decompositions are graph transformations
 that are performed before the graph is lowered to loop level IR.
 
 ## Spyre-specific lowerings

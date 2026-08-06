@@ -6,22 +6,25 @@ Pydantic models for the OOT PyTorch test framework YAML config.
 Used by oot_test_parsing.py to validate and parse the YAML config.
 """
 
+import logging
+import math
+import os
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Union
 
 import torch
-from pydantic import BaseModel, field_validator, model_validator  # type: ignore
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator  # type: ignore
 
 from .oot_test_constants import (
+    REL_PATH_TOKENS,
+    DTYPE_STR_MAP,
+    MODE_MANDATORY_SUCCESS,
+    MODE_XFAIL,
     _VALID_DTYPE_STRINGS,
     _VALID_INIT_STRATEGIES,
     _VALID_TEST_MODES,
     _VALID_UNLISTED_MODES,
-    DTYPE_STR_MAP,
-    MODE_MANDATORY_SUCCESS,
-    MODE_XFAIL,
-    REL_PATH_TOKENS,
 )
 from .oot_test_matching import parse_dtype
 from .oot_test_utilities import (
@@ -29,6 +32,24 @@ from .oot_test_utilities import (
     _resolve_dtype_str,
     _resolve_tensor_path,
 )
+
+# Logger setup
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG if os.environ.get("TORCH_SPYRE_DEBUG") else logging.INFO)
+
+
+def _resolve_device_dtype(device_dtype_str: str):
+    """Resolve a yaml device_dtype string (a torch dtype alias) to a DataFormats member."""
+    from torch_spyre._C import DataFormats, get_device_dtype
+
+    torch_dtype = _resolve_dtype_str(device_dtype_str)
+    device_dtype = get_device_dtype(torch_dtype)
+    if device_dtype == DataFormats.INVALID:
+        raise ValueError(
+            f"dtype {torch_dtype} (from device_dtype {device_dtype_str!r}) has "
+            f"no Spyre device representation."
+        )
+    return device_dtype
 
 
 # ---------------------------
@@ -46,8 +67,34 @@ class InputInitArgs(BaseModel):
     key: Optional[str] = None  # file: key within file (dict/.safetensors)
 
 
+class SpyreTensorLayoutSpec(BaseModel):
+    """Specifies a SpyreTensorLayout to use when transferring a tensor to Spyre.
+
+    Uses explicit device layout specification:
+    - device_size: explicit device size specification (required)
+    - stride_map: explicit stride map specification (required)
+    - device_dtype: device data format (e.g., DataFormats.IEEE_FP32) (optional)
+    """
+
+    device_size: List[int]
+    stride_map: List[int]
+    device_dtype: str
+
+    @model_validator(mode="after")
+    def validate_layout_format(self) -> "SpyreTensorLayoutSpec":
+        """Validate device_size and stride_map have matching lengths."""
+        if len(self.device_size) != len(self.stride_map):
+            raise ValueError(
+                f"device_size length ({len(self.device_size)}) must match "
+                f"stride_map length ({len(self.stride_map)})"
+            )
+        return self
+
+
 class InputTensorSpec(BaseModel):
     """Specification for constructing a single input tensor."""
+
+    model_config = ConfigDict(extra="forbid")
 
     shape: List[int]
     dtype: str
@@ -56,6 +103,7 @@ class InputTensorSpec(BaseModel):
     init_args: InputInitArgs = InputInitArgs()
     stride: Optional[List[int]] = None
     storage_offset: int = 0
+    device_layout: Optional["SpyreTensorLayoutSpec"] = None
 
     @field_validator("dtype")
     @classmethod
@@ -134,6 +182,99 @@ class InputTensorSpec(BaseModel):
         if dtype_override is not None and resolved.is_floating_point:
             return dtype_override
         return resolved
+
+    def to_spyre(self, cpu_tensor: torch.Tensor) -> torch.Tensor:
+        """Transfer a CPU tensor to Spyre with explicit SpyreTensorLayout.
+
+        Uses explicit device_size and stride_map to create the layout.
+        Automatically validates the created layout matches the specification.
+        """
+        from torch_spyre._C import SpyreTensorLayout, get_spyre_tensor_layout
+
+        layout_spec = self.device_layout
+        assert layout_spec is not None, (
+            "to_spyre() should only be called when device_layout is set"
+        )
+
+        shape = list(cpu_tensor.shape)
+        stride = list(cpu_tensor.stride())
+        dtype = cpu_tensor.dtype
+
+        device_size = layout_spec.device_size
+        stride_map = layout_spec.stride_map
+        device_dtype = _resolve_device_dtype(layout_spec.device_dtype)
+
+        logger.debug(
+            "Transferring tensor shape=%s stride=%s dtype=%s to Spyre with "
+            "device_size=%s stride_map=%s device_dtype=%s",
+            shape,
+            stride,
+            dtype,
+            device_size,
+            stride_map,
+            layout_spec.device_dtype,
+        )
+
+        # Build the SpyreTensorLayout from explicit device_size + stride_map
+        stl = SpyreTensorLayout(
+            device_size=device_size,
+            stride_map=stride_map,
+            device_dtype=device_dtype,
+        )
+        logger.debug("Layout created: %s", stl)
+
+        # Step 1: move to device; Step 2: apply custom layout
+        spyre_tensor = cpu_tensor.to("spyre", device_layout=stl)
+
+        # Validate the applied layout
+        actual_layout = get_spyre_tensor_layout(spyre_tensor)
+        logger.debug(
+            "Applied layout: device_size=%s stride_map=%s device_dtype=%s "
+            "(spec: device_size=%s stride_map=%s device_dtype=%s)",
+            list(actual_layout.device_size),
+            list(actual_layout.stride_map),
+            actual_layout.device_dtype,
+            device_size,
+            stride_map,
+            device_dtype,
+        )
+        # The size/stride checks below don't cover dtype,
+        # so a wrong device_dtype from the YAML spec would previously slip
+        # through unnoticed.
+        assert actual_layout.device_dtype == device_dtype, (
+            f"device_dtype mismatch for tensor shape={shape}:\n"
+            f"  expected: {device_dtype}\n"
+            f"  actual:   {actual_layout.device_dtype}"
+        )
+
+        # H2D and D2H use the same stored layout, making the round-trip
+        # self-inverting. Validate layout invariants instead.
+        n_logical = math.prod(shape) if shape else 1
+        n_device = math.prod(device_size) if device_size else 1
+        assert n_device >= n_logical, (
+            f"device_size {device_size} holds {n_device} elements < the "
+            f"tensor's {n_logical} (shape={shape}); a valid device layout "
+            f"only ever pads up, never loses elements."
+        )
+
+        from torch_spyre._C import get_device_dtype
+
+        expected_dd = get_device_dtype(dtype)
+        assert device_dtype == expected_dd, (
+            f"device_dtype {device_dtype} is not the natural device dtype "
+            f"{expected_dd} for tensor dtype {dtype}."
+        )
+
+        roundtrip = spyre_tensor.cpu()
+        assert torch.equal(roundtrip, cpu_tensor), (
+            f"Data mismatch after applying device_layout for tensor shape={shape}:\n"
+            f"  device_size: {device_size}\n"
+            f"  stride_map:  {stride_map}\n"
+            f"This usually means device_size/stride_map is not a valid device "
+            f"layout for this tensor."
+        )
+
+        return spyre_tensor
 
     def build(
         self, *, seed: Optional[int], dtype: Optional[torch.dtype] = None
@@ -667,6 +808,11 @@ class InputsEdits(BaseModel):
         4. pass through as-is
 
         None, bool, and numeric values pass through unchanged.
+
+        A bare ``device_layout`` dict with no ``tensor`` wrapper isn't a shape
+        _parse_input_arg understands (device_layout only exists nested inside
+        an InputTensorSpec), so it's rejected loudly rather than silently
+        passed through as an unbuilt raw dict.
         """
         import ast as _ast
 
@@ -699,6 +845,14 @@ class InputsEdits(BaseModel):
                 elif isinstance(arg, InputArgPy):
                     out[k] = _eval_py_literal(arg.py)
                 continue
+
+            if isinstance(v, dict) and "device_layout" in v:
+                raise NotImplementedError(
+                    f"kwarg {k!r} looks like a device_layout spec ({v!r}) with no "
+                    f"'tensor' wrapper. device_layout only exists inside an "
+                    f"InputTensorSpec — wrap this as "
+                    f"{{'tensor': {{..., 'device_layout': {v!r}}}}} instead."
+                )
 
             if isinstance(v, str):
                 # 1. dtype resolution

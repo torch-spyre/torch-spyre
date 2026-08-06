@@ -1,0 +1,210 @@
+name: build-test-pytorch-source
+
+# ---------------------------------------------------------------------------
+# Reusable workflow — not triggered directly. Called by the
+# `gate_and_build`/`build_and_test` jobs in
+# push-pytorch-dispatch-to-clickhouse.yaml once a repository_dispatch from
+# pytorch/pytorch has been gated and a commit SHA extracted.
+#
+# Builds that exact PyTorch commit from source, builds torch-spyre against
+# it (editable, --local-pytorch style), and runs the upstream test suite.
+# Reports its lifecycle (torch_build -> torch_spyre_build -> running_tests
+# -> completed) and final test-result counts back into the same ClickHouse
+# row the caller's `ingest` job created, keyed on
+# github.event.client_payload.delivery_id (shared across the whole
+# workflow_call, since the github context always reflects the caller).
+# ---------------------------------------------------------------------------
+on:
+  workflow_call:
+    inputs:
+      pytorch_sha:
+        description: Exact pytorch/pytorch commit SHA to build
+        required: true
+        type: string
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build_and_test:
+    name: Build PyTorch@${{ inputs.pytorch_sha }} + torch-spyre, run upstream tests
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - linux
+      - image_spyre_backend
+    timeout-minutes: 180
+    env:
+      # GitHub Actions sets CI=true which causes pytest inductor tests to fail.
+      CI: ''
+      # Consumed by the "Report stage: ..." steps below, which write dispatch
+      # lifecycle updates into the same ClickHouse row that
+      # push-pytorch-dispatch-to-clickhouse.yaml's `ingest` job created.
+      # Available because the caller invokes this reusable workflow with
+      # `secrets: inherit`.
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
+      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER_DEV }}
+      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS_DEV }}
+      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB_DEV }}
+    steps:
+      - name: Checkout composite actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - name: Checkout torch-spyre
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: torch-spyre
+
+      - name: Checkout pytorch@${{ inputs.pytorch_sha }}
+        uses: ./.github/actions/checkout-pytorch
+        with:
+          sha: ${{ inputs.pytorch_sha }}
+
+      - uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+      - name: Write dispatch payload to file
+        env:
+          PAYLOAD_JSON: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          printf '%s' "$PAYLOAD_JSON" > payload.json
+
+
+      - name: 'Report stage: torch_build'
+        run: |
+          echo "T_TORCH_BUILD_START=$(date +%s)" >> "$GITHUB_ENV"
+          uv run --with clickhouse-connect --with regex \
+            torch-spyre/.github/scripts/ingest_pytorch_dispatch.py \
+            --payload-file payload.json \
+            --event-type "${{ github.event.action }}" \
+            --run-id   "${{ github.run_id }}" \
+            --run-link "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --job-name build_and_test \
+            --stage torch_build \
+            --progress in_progress \
+            --pytorch-sha "${{ inputs.pytorch_sha }}" \
+            --torch-spyre-sha "${{ github.sha }}"
+
+      - name: Build PyTorch from source
+        uses: ./.github/actions/build-pytorch-from-source
+
+      - name: 'Report stage: torch_spyre_build'
+        run: |
+          echo "T_TORCH_SPYRE_BUILD_START=$(date +%s)" >> "$GITHUB_ENV"
+          uv run --with clickhouse-connect --with regex \
+            torch-spyre/.github/scripts/ingest_pytorch_dispatch.py \
+            --payload-file payload.json \
+            --event-type "${{ github.event.action }}" \
+            --run-id   "${{ github.run_id }}" \
+            --run-link "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --job-name build_and_test \
+            --stage torch_spyre_build \
+            --progress in_progress \
+            --pytorch-sha "${{ inputs.pytorch_sha }}" \
+            --torch-spyre-sha "${{ github.sha }}"
+
+      - name: Build torch-spyre against local PyTorch
+        uses: ./.github/actions/build-torch-spyre-local-pytorch
+
+      # - name: Report CI started to pytorch/pytorch
+      #   continue-on-error: true
+      #   uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
+      #   with:
+      #     status: in_progress
+
+      - name: 'Report stage: running_tests'
+        run: |
+          echo "T_RUNNING_TESTS_START=$(date +%s)" >> "$GITHUB_ENV"
+          uv run --with clickhouse-connect --with regex \
+            torch-spyre/.github/scripts/ingest_pytorch_dispatch.py \
+            --payload-file payload.json \
+            --event-type "${{ github.event.action }}" \
+            --run-id   "${{ github.run_id }}" \
+            --run-link "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --job-name build_and_test \
+            --stage running_tests \
+            --progress in_progress \
+            --pytorch-sha "${{ inputs.pytorch_sha }}" \
+            --torch-spyre-sha "${{ github.sha }}"
+
+      - name: Derive report paths (Upstream Beta)
+        run: |
+          REPORT_NAME="test_upstream_beta_config.xml"
+          echo "REPORT_NAME_UPSTREAM_BETA=${REPORT_NAME}" >> "$GITHUB_ENV"
+          echo "REPORT_PATH_UPSTREAM_BETA=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+
+      - name: Run Upstream Beta tests
+        uses: ./.github/actions/run-test-suite
+        with:
+          suite_name: Upstream Beta
+          config: tests/configs/upstream_tests_beta
+          extra_test_flags: -v
+          junit_xml_path: ${{ env.REPORT_PATH_UPSTREAM_BETA }}
+          report_name: ${{ env.REPORT_NAME_UPSTREAM_BETA }}
+
+      - name: Record stage timings
+        if: always()
+        run: |
+          echo "T_RUNNING_TESTS_END=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Parse test results (counts)
+        id: test_results
+        if: always()
+        run: |
+          python3 torch-spyre/.github/scripts/parse_junit_xml_counts.py \
+            --junit-xml "${REPORT_PATH_UPSTREAM_BETA}" \
+            --summary-title "Upstream Beta test results"
+
+      - name: 'Report stage: completed'
+        if: always()
+        env:
+          TEST_RESULTS_JSON: ${{ steps.test_results.outputs.test_results_json }}
+          CONCLUSION: ${{ job.status == 'success' && 'success' || 'failure' }}
+        run: |
+          python3 torch-spyre/.github/scripts/build_stage_result_payload.py \
+            --test-results-json "${TEST_RESULTS_JSON}" \
+            --conclusion "${CONCLUSION}" \
+            --duration pytorch_build_seconds=T_TORCH_BUILD_START:T_TORCH_SPYRE_BUILD_START \
+            --duration torch_spyre_build_seconds=T_TORCH_SPYRE_BUILD_START:T_RUNNING_TESTS_START \
+            --duration tests_seconds=T_RUNNING_TESTS_START:T_RUNNING_TESTS_END \
+            --output-file result_payload.json
+          uv run --with clickhouse-connect --with regex \
+            torch-spyre/.github/scripts/ingest_pytorch_dispatch.py \
+            --payload-file payload.json \
+            --event-type "${{ github.event.action }}" \
+            --run-id   "${{ github.run_id }}" \
+            --run-link "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --job-name build_and_test \
+            --stage completed \
+            --progress completed \
+            --pytorch-sha "${{ inputs.pytorch_sha }}" \
+            --torch-spyre-sha "${{ github.sha }}" \
+            --result-payload-file result_payload.json
+
+      # - name: Report CI completed to pytorch/pytorch
+      #   if: always()
+      #   continue-on-error: true
+      #   uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
+      #   with:
+      #     status: completed
+      #     conclusion: ${{ job.status == 'success' && 'success' || 'failure' }}
+      #     test-results: ${{ steps.test_results.outputs.test_results_json }}
+
+      - name: Upload JUnit XML reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: upstream-beta-reports-${{ inputs.pytorch_sha }}
+          path: |
+            ${{ env.REPORT_PATH_UPSTREAM_BETA }}
+          if-no-files-found: warn
+          retention-days: 30

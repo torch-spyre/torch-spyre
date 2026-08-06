@@ -30,11 +30,13 @@ from torch._inductor.ir import (
     Reduction,
     ReinterpretView,
 )
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 
 from torch_spyre._inductor.pass_utils import (
     apply_splits_from_index_coeff,
     concretize_expr,
+    indirect_info_from_op,
     iteration_space_from_op,
     splits_by_index_coeff,
     op_read_writes,
@@ -74,6 +76,8 @@ from torch_spyre._inductor.scratchpad.utils import (
     buffer_not_read_in_full,
     get_ncores_for_buffers,
     _is_tiled_advancing,
+    _is_read_advancing_anywhere,
+    _get_buffer_user_deps,
     _would_produce_lx_back_gap,
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
 )
@@ -229,6 +233,40 @@ class ScratchpadAllocator:
         ``LifetimeBoundBuffer.read_count``."""
         return max(0, len(uses) - 1)
 
+    @staticmethod
+    def _is_index_or_indirectly_accessed(
+        graph: GraphLowering,
+        name: str,
+        uses: list[int],
+        op: Optional[Operation],
+    ) -> bool:
+        """True if ``name`` is an index tensor, or is itself accessed
+        indirectly (a gather/scatter value tensor), on either side of its
+        lifetime: as ``op``'s own indirect write (a Scatter target), or as a
+        read/index operand of any consumer in ``uses``.
+
+        Both the index tensor and the tensor it indexes into must stay off
+        the scratchpad and resolve from HBM instead.
+        """
+        if isinstance(op, ComputedBuffer):
+            writes = op_read_writes(op).writes
+            if any(isinstance(dep, MemoryDep) and dep.is_indirect() for dep in writes):
+                return True
+        for u in uses:
+            consumer = graph.operations[u]
+            if not isinstance(consumer, ComputedBuffer):
+                continue
+            index_names, _, _ = indirect_info_from_op(consumer)
+            if name in index_names:
+                return True
+            reads = op_read_writes(consumer).reads
+            if any(
+                dep.name == name and isinstance(dep, MemoryDep) and dep.is_indirect()
+                for dep in reads
+            ):
+                return True
+        return False
+
     def _buffer_residency_reason(
         self,
         graph: GraphLowering,
@@ -242,6 +280,7 @@ class ScratchpadAllocator:
         ncores: dict[str, int],
         ncores_reasons: dict[str, str],
         division_is_fixed: bool,
+        buf_user_deps: dict[str, list[tuple[Operation, MemoryDep]]],
     ) -> Optional[str]:
         """The first check ``name`` fails, or ``None`` if it clears them all.
 
@@ -262,6 +301,8 @@ class ScratchpadAllocator:
                 division was committed upstream and a mismatch between a buffer's
                 users is fatal. False on the joint path, where the solver chooses
                 the division and its slicing gate decides instead.
+            buf_user_deps: every buffer's ``(op, dep)`` users, from
+                :func:`_get_buffer_user_deps`, for the read-side advancing check.
         """
         if op is None or not self._op_output_good_for_lx_reuse(op):
             return "op not allowed"
@@ -272,17 +313,24 @@ class ScratchpadAllocator:
             return "unsized (no device layout)"
         if name in mutated_buffers:
             return "mutation target"
-        if _is_tiled_advancing(op):
+        if _is_tiled_advancing(op) or _is_read_advancing_anywhere(name, buf_user_deps):
             # LX addresses cannot be expressed as affine.apply symbols today (see
             # compute_ops.py's is_tiled_lx check), so a buffer whose address
             # advances per coarse-tile iteration must stay in HBM, where that is
-            # supported.
-            return "tiled (advancing), not per_tile_fixed"
+            # supported -- whether the advance is on this buffer's own write
+            # (_is_tiled_advancing) or on some other op's read of it
+            # (_is_read_advancing_anywhere, e.g. a fixed-write full buffer
+            # copied into a nested tile every outer iteration).
+            return "tiled (advancing)"
         restickify = self._restickify_barrier(graph, name, uses)
         if restickify is not None:
             return restickify
         if any(isinstance(graph.operations[u], ExternKernel) for u in uses):
             return "extern kernel user"
+        if self._is_index_or_indirectly_accessed(graph, name, uses, op):
+            # Index tensors and the value tensors they index into are read via
+            # data-dependent (indirect) addressing, must stay in hbm.
+            return "index tensor or indirectly accessed"
         if name in graph_output_names:
             # A graph output normally can't reside (the value must land back in
             # HBM), but with boundary cloning on it is pinned via an output clone
@@ -334,6 +382,8 @@ class ScratchpadAllocator:
             return "graph input (no clone)"
         if self._read_count(uses) == 0:
             return "no consumer reads it from LX"
+        if self._is_index_or_indirectly_accessed(graph, name, uses, None):
+            return "index tensor or indirectly accessed"
         if not GraphEditor.all_uses_are_rewritable(graph, uses):
             return "use is not rewritable to the clone"
         if buffer_not_read_in_full(graph, name):
@@ -387,6 +437,7 @@ class ScratchpadAllocator:
             ncores, ncores_reasons = get_ncores_for_buffers(graph)
         ncores = ncores or {}
         ncores_reasons = ncores_reasons or {}
+        buf_user_deps = _get_buffer_user_deps(graph)
         return {
             name: self._buffer_residency_reason(
                 graph,
@@ -399,6 +450,7 @@ class ScratchpadAllocator:
                 ncores=ncores,
                 ncores_reasons=ncores_reasons,
                 division_is_fixed=division_is_fixed,
+                buf_user_deps=buf_user_deps,
             )
             for name in names
         }
