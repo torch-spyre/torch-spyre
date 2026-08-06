@@ -17,6 +17,9 @@ test_suite_config:
         - names:
             # shape ops
             - TestOps::test_flatten.*
+            # flip: non-stick dims reverse via index_select; the stick-dim
+            # cases are strict xfails inside the test itself
+            - TestOps::test_flip.*
             - TestOps::test_permute.*
             - TestOps::test_unbind.*
             - TestOps::test_size_one.*

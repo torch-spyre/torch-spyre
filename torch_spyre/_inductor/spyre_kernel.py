@@ -762,7 +762,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             tensor.layout.device_layout.device_size,
             device_coords,
             tensor.layout.allocation,
-            per_tile_fixed=getattr(tensor.layout, "per_tile_fixed", False),
             element_arrangement=tensor.layout.device_layout.element_arrangement,
             name=opspec_name,
             device_tile_advance_expr=device_tile_advance_expr,
@@ -1428,8 +1427,6 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 + "],"
                             )
                             buf.writeline(f"allocation={arg.allocation!r},")
-                            if arg.per_tile_fixed:
-                                buf.writeline("per_tile_fixed=True,")
                             if arg.name is not None:
                                 buf.writeline(f"name={arg.name!r},")
                             if arg.device_tile_advance_expr is not None:

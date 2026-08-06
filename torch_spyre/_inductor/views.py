@@ -151,6 +151,10 @@ def compute_coordinates(
     may contain symbolic expressions (e.g. a dynamic batch dimension); the
     algorithm concretizes range values only for comparison logic, while the
     output coordinate expressions remain symbolic.
+
+    Raises ``Unsupported`` if ``index`` walks a dimension backwards (a loop
+    variable with a negative coefficient, as produced by ``prims.rev``): a
+    device coordinate can only ascend.
     """
     assert all(isinstance(s, (int, sympy.Integer)) for s in stride), (
         f"compute_coordinates requires concrete strides, got {stride}"
@@ -185,6 +189,26 @@ def compute_coordinates(
         # TODO(issue#1373): replace with sympy predicates to avoid concretization.
         concrete_step = _concretize_for_cmp(step)
         concrete_limit = _concretize_for_cmp(limit)
+
+        # ``limit`` below ``step`` means the access walks the dimension
+        # backwards (the index carries a term like ``N - 1 - var``, as
+        # ``prims.rev`` / ``Tensor.flip`` produces).  Every dim test below
+        # compares a non-negative ``stride[dim]`` against ``concrete_step``, so
+        # a descending term can match no dim and would be dropped from
+        # ``coordinates`` entirely -- silently yielding the coordinate for
+        # ``var == 0`` at every iteration.  Device coordinates can only ascend,
+        # so reject it loudly instead (see issue #3558).
+        #
+        # Testing ``limit - step`` rather than ``step``'s sign isolates the
+        # direction from any additive constant folded into both: for a term
+        # ``a*var + b`` over range ``R``, ``limit - step == a*(R - 1)``, so the
+        # comparison sees ``a``'s sign alone.
+        if concrete_limit < concrete_step:
+            raise Unsupported(
+                f"index term for {var} runs backwards (step {step}, limit "
+                f"{limit}): reversed traversal of a tensor dimension cannot "
+                f"be expressed as a device coordinate"
+            )
 
         # find primary dim with largest stride less than or equal to step
         primary_stride = 0
