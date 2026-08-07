@@ -21,7 +21,3 @@ test_suite_config:
             - TestMemoryProfilerTimeline::test_memory_timeline_no_id_spyre
             - TestMemoryProfilerTimeline::test_memory_timeline_no_id_cpu
           mode: mandatory_success
-        - names:
-            - TestMemoryProfilerTimeline::test_memory_timeline_no_id_spyre
-            - TestMemoryProfilerTimeline::test_memory_timeline_no_id_cpu
-          mode: mandatory_success

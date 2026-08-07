@@ -154,9 +154,17 @@ class TestSpyreProfiler(TestCase):
         B, H, L, D = 1, 4, 16, 32
         block_size = 8
 
-        Q = torch.randn(B, H, L, D, dtype=torch.float16).to(device)
-        K = torch.randn(B, H, L, D, dtype=torch.float16).to(device)
-        V = torch.randn(B, H, L, D, dtype=torch.float16).to(device)
+        # Keep source tensors on CPU so the profiled region can include explicit
+        # HtoD transfers that must appear in the Chrome trace.
+        q_cpu = torch.randn(B, H, L, D, dtype=torch.float16)
+        k_cpu = torch.randn(B, H, L, D, dtype=torch.float16)
+        v_cpu = torch.randn(B, H, L, D, dtype=torch.float16)
+
+        # Separate warmup inputs are moved to Spyre before profiling so the
+        # first profiled call measures runtime activity rather than compilation.
+        Q = q_cpu.to(device)
+        K = k_cpu.to(device)
+        V = v_cpu.to(device)
 
         def flash(Q, K, V, block_size):
             output = torch.zeros_like(Q)
@@ -193,14 +201,26 @@ class TestSpyreProfiler(TestCase):
             return output / denominator.unsqueeze(-1)
 
         compiled_fn = torch.compile(flash, backend="inductor")
-        # Warm up: trigger compilation outside the profiled region.
+        # Warm up outside the profiled region to avoid compile-time activity in
+        # the trace we validate below.
         compiled_fn(Q, K, V, block_size)
 
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
             acc_events=True,
         ) as prof:
-            compiled_fn(Q, K, V, block_size)
+            # Move inputs during profiling so HtoD memcpy events are required in
+            # the exported trace.
+            Q = q_cpu.to(device)
+            K = k_cpu.to(device)
+            V = v_cpu.to(device)
+            output = compiled_fn(Q, K, V, block_size)
+            # Move the result back to CPU during profiling so DtoH memcpy events
+            # are also required in the exported trace.
+            output.cpu()
+            # Flush device work before the profile closes so async events land in
+            # the trace before export.
+            torch.spyre.synchronize()
 
         fd, trace_path = tempfile.mkstemp(suffix=".json")
         os.close(fd)
@@ -214,26 +234,22 @@ class TestSpyreProfiler(TestCase):
             complete_events = [e for e in data["traceEvents"] if e.get("ph") == "X"]
             self.assertTrue(complete_events, "No complete ('X') events in trace")
 
-            # No zero timestamps across all complete events
-            zero_ts = [e for e in complete_events if e.get("ts", 1) == 0]
+            # No zero or missing timestamps across all complete events
+            zero_ts = [e for e in complete_events if e.get("ts") in (0, None)]
             self.assertFalse(
                 zero_ts,
                 f"{len(zero_ts)} event(s) have ts == 0: "
                 + ", ".join(e.get("name", "<unnamed>") for e in zero_ts),
             )
 
-            # No zero-duration gpu_memcpy (HtoD / DtoH) events
+            # Require HtoD and DtoH memcpy events and validate their durations
             memcpy_events = [e for e in complete_events if e.get("cat") == "gpu_memcpy"]
-            htod_zero = [
-                e
-                for e in memcpy_events
-                if "HtoD" in e.get("name", "") and e.get("dur", 1) == 0
-            ]
-            dtoh_zero = [
-                e
-                for e in memcpy_events
-                if "DtoH" in e.get("name", "") and e.get("dur", 1) == 0
-            ]
+            htod_events = [e for e in memcpy_events if "HtoD" in e.get("name", "")]
+            dtoh_events = [e for e in memcpy_events if "DtoH" in e.get("name", "")]
+            self.assertTrue(htod_events, "Expected at least one HtoD memcpy event")
+            self.assertTrue(dtoh_events, "Expected at least one DtoH memcpy event")
+            htod_zero = [e for e in htod_events if e.get("dur") in (0, None)]
+            dtoh_zero = [e for e in dtoh_events if e.get("dur") in (0, None)]
             self.assertFalse(
                 htod_zero,
                 f"{len(htod_zero)} HtoD memcpy event(s) have dur == 0: "
@@ -245,12 +261,10 @@ class TestSpyreProfiler(TestCase):
                 + ", ".join(e.get("name", "<unnamed>") for e in dtoh_zero),
             )
 
-            # No zero-duration kernel events
-            kernel_zero_dur = [
-                e
-                for e in complete_events
-                if e.get("cat") == "kernel" and e.get("dur", 1) == 0
-            ]
+            # Require kernel events and validate their durations
+            kernel_events = [e for e in complete_events if e.get("cat") == "kernel"]
+            self.assertTrue(kernel_events, "Expected at least one kernel event")
+            kernel_zero_dur = [e for e in kernel_events if e.get("dur") in (0, None)]
             self.assertFalse(
                 kernel_zero_dur,
                 f"{len(kernel_zero_dur)} kernel event(s) have dur == 0: "
