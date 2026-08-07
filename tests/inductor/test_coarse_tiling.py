@@ -30,7 +30,7 @@ Covers six areas, each in its own class group:
      (TestGenerateBundleMlir, TestFindUnimplemented,
       TestGenerateBundleMlirSnapshot, TestGenerateBundleMlirWithAffineStrides,
       TestGenerateBundleNestedTiling, TestGenerateBundleAffineLoopPath)
-  6. Buffer propagation: consumer analysis helpers for insert_tiling_propagation
+  6. Buffer propagation: consumer analysis helpers for tiling propagation
      (TestCoarseTileBufferPropagation)
 
 No Spyre device or backend compiler is required.
@@ -1607,10 +1607,10 @@ class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
 
     These tests call plan_coarse_tile_groups + _apply_plan directly rather
     than the full coarse_tile() entry point.  coarse_tile() unconditionally
-    also runs insert_tiling_propagation after stamping every group, which
-    for a Reduction op with an actually-tiled reduction dim drives
-    _propagate_tiled_reduction_op -> _allocate_full_buffer ->
-    graph_lowering.run_node() on a synthesized spyre.empty FX node -- real
+    also runs the reduction-machinery pass (_insert_all_reduction_ops) after
+    stamping every group, which for a Reduction op with an actually-tiled
+    reduction dim drives _propagate_tiled_reduction_op -> _allocate_full_buffer
+    -> graph_lowering.run_node() on a synthesized spyre.empty FX node -- real
     FX-dispatch/lowering machinery this lightweight harness does not
     provide (confirmed live: raises LoweringException /
     "'NullHandler' object does not support the context manager protocol").
@@ -4063,7 +4063,7 @@ def _make_inside_consumer_op(name, reads_buf, loop_group_id):
 
 
 class TestCoarseTileBufferPropagation(unittest.TestCase):
-    """Tests for insert_tiling_propagation — consumer analysis helpers."""
+    """Tests for tiling propagation — consumer analysis helpers."""
 
     def setUp(self):
         # Only test_case2_condition_now_produces_copy_op below needs a real
@@ -4236,10 +4236,11 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         (_allocate_full_buffer, _insert_copy_op, _patch_consumers) all touch
         real ComputedBuffer/V.graph machinery (qualify_name, run_node,
         replace_computed_buffer_body), which MagicMock-based ops used
-        elsewhere in this file cannot satisfy. insert_tiling_propagation
-        itself takes a pre-grouped ``groups`` list that plan_coarse_tile_groups
-        would normally produce; calling _propagate_tiled_op directly is the
-        cheaper, equivalent way to reach exactly the code this task changed.
+        elsewhere in this file cannot satisfy. Pass 3
+        (_insert_all_write_copy_ops) itself takes the already-stamped
+        `operations` list that _apply_plan would normally produce; calling
+        _propagate_tiled_op directly is the cheaper, equivalent way to reach
+        exactly the code this task changed.
         """
         from torch._inductor.ir import (
             ComputedBuffer,
@@ -4252,7 +4253,11 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         from torch_spyre._inductor.lowering import enable_spyre_lowerings
-        from torch_spyre._inductor.wsr.coarse_tile import _propagate_tiled_op
+        from torch_spyre._inductor.loop_info import PropagationPlan
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _insert_all_read_copy_ops,
+            _propagate_tiled_op,
+        )
 
         # _allocate_full_buffer lowers a real spyre.empty FX node via
         # V.graph.run_node(), which needs V.fake_mode (GraphLowering.fake_mode
@@ -4317,32 +4322,58 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         # V.graph.buffers, not an independent list, for that removal to find it.
         operations = V.graph.buffers
         operations.extend([tiled_op, consumer])
+        original_op = tiled_op
 
+        # Read copy-ins are now Pass 1 (_insert_all_read_copy_ops), a
+        # standalone pass that runs before Pass 3 / _propagate_tiled_op even
+        # in production -- call it directly here rather than folding its
+        # effect into _propagate_tiled_op.
         with patch(
             "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
             return_value=set(),
         ):
-            _propagate_tiled_op(tiled_op, operations)
+            _insert_all_read_copy_ops(operations)
+            # Pass 1 may have spliced a replacement for "op0" into
+            # operations -- re-resolve by name before calling
+            # _propagate_tiled_op, exactly as _insert_all_write_copy_ops'
+            # own loop now does.
+            tiled_op = next(
+                o
+                for o in operations
+                if isinstance(o, ComputedBuffer) and o.get_name() == "op0"
+            )
+            # _propagate_tiled_op (Pass 3) now consumes a precomputed
+            # PropagationPlan instead of deriving it itself -- full_ranges
+            # is the pre-division full shape (8 * loop_count 8 == 64),
+            # matching what the old in-function _compute_full_ranges call
+            # used to compute from the tile-sized op.data.ranges.
+            propagation = PropagationPlan(
+                kind="copy_out",
+                full_ranges=[Integer(64)],
+                outside_consumer_names=("out0",),
+                is_graph_output=False,
+            )
+            _propagate_tiled_op(tiled_op, propagation, operations)
 
-        # tiled_op's own two inputs are real, full-size, untiled InputBuffers
+        # original_op's two inputs are real, full-size, untiled InputBuffers
         # read at a tile-scoped index -- _full_buffer_read_deps now flags
-        # both, so _insert_read_copy_ops replaces tiled_op with a new
-        # ComputedBuffer (same name, "op0") before the write-side copy-op
-        # logic below even runs. Look the final op up by name rather than
-        # using the now-stale tiled_op reference.
+        # both, so Pass 1's _insert_all_read_copy_ops replaces original_op
+        # with a new ComputedBuffer (same name, "op0") before the write-side
+        # copy-op logic even runs. Look the final op up by name rather than
+        # using the now-stale original_op reference.
         final_op = V.graph.name_to_buffer["op0"]
         # name_to_buffer is only half the story: replace_computed_buffer_body
-        # must also have swapped the stale tiled_op out of operations (==
+        # must also have swapped the stale original_op out of operations (==
         # V.graph.buffers, see the comment above where it's assigned) for
         # later scheduling to see the new op instead of the old one. Checked
         # by identity (`is`), not `in`/`==`: ComputedBuffer is a frozen
         # dataclass, so `==` compares field values rather than object
-        # identity, and tiled_op/final_op share the same (in-place-mutated)
+        # identity, and original_op/final_op share the same (in-place-mutated)
         # `.data` and layout -- they compare equal to each other even though
         # only final_op is the live object, which makes assertIn/assertNotIn
         # pass regardless of whether the swap actually happened.
         self.assertTrue(any(op is final_op for op in operations))
-        self.assertFalse(any(op is tiled_op for op in operations))
+        self.assertFalse(any(op is original_op for op in operations))
 
         write_copy_ops = [
             op
@@ -4366,6 +4397,188 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         # instead), mirroring the Case 1 path.
         self.assertNotIsInstance(final_op.layout, MutationLayoutSHOULDREMOVE)
         self.assertEqual(final_op.loop_info.output_tiled_dims, [])
+
+
+class TestPlanTilingPropagation(unittest.TestCase):
+    """Cross-check: _plan_tiling_propagation's kind decision must match what
+    _propagate_tiled_op / _propagate_tiled_reduction_op actually do today.
+
+    This is the load-bearing regression net for Stage 2: it validates the
+    front-loaded planning decision against current (still transformation-
+    driving) behavior, before Stage 3 ever makes transformation consume the
+    new field. Built with the same mock-based fixtures
+    (_make_tiled_op/_make_consumer_op/_make_inside_consumer_op/
+    _make_tiled_reduction_op) TestCoarseTileBufferPropagation already uses
+    for its plain _find_outside_consumers/_full_buffer_read_deps checks --
+    _plan_tiling_propagation's own helpers are direct planning-time analogs
+    of those same functions.
+    """
+
+    def _plan_for(self, op, group_ops=None):
+        from torch_spyre._inductor.wsr.coarse_tile import _plan_tiling_propagation
+
+        group_ops = group_ops if group_ops is not None else [op]
+        info = op.loop_info
+        plan = {id(op): info}
+        levels = [(0, c) for c in info.loop_count]
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
+            return_value=set(),
+        ):
+            _plan_tiling_propagation(group_ops, [(group_ops, levels)], plan)
+        return info.propagation
+
+    def test_loop_invariant_matches_no_tiled_dims(self):
+        """All loop_tiled_dims empty -> loop_internal, matching
+        _propagate_tiled_op's `all(not dims ...)` fast-path return."""
+        op = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[]])
+        propagation = self._plan_for(op)
+        self.assertEqual(propagation.kind, "loop_internal")
+
+    def test_no_outside_consumers_matches_loop_internal(self):
+        """Tiled with no outside consumers/graph output -> loop_internal,
+        matching _propagate_tiled_op zeroing output_tiled_dims and
+        returning without a copy op."""
+        op = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        propagation = self._plan_for(op)
+        self.assertEqual(propagation.kind, "loop_internal")
+        self.assertEqual(propagation.outside_consumer_names, ())
+        self.assertFalse(propagation.is_graph_output)
+
+    def test_outside_consumer_matches_copy_out(self):
+        """Tiled with an outside consumer -> copy_out, matching
+        _propagate_tiled_op's _allocate_full_buffer/_insert_copy_op path.
+
+        Planning runs before _apply_plan divides op.data.ranges, so the
+        fixture's ranges are already the full (pre-division) size here --
+        full_ranges is expected to come back unchanged."""
+        tiled = _make_tiled_op("op0", [Integer(64)], (0,), [Integer(4)], [[0]])
+        consumer = _make_consumer_op("out0", "op0")
+        propagation = self._plan_for(tiled, group_ops=[tiled, consumer])
+        self.assertEqual(propagation.kind, "copy_out")
+        self.assertEqual(propagation.outside_consumer_names, ("out0",))
+        self.assertEqual(propagation.full_ranges, [Integer(64)])
+
+    def test_inside_consumer_only_matches_loop_internal(self):
+        """An inside-loop-group consumer alone doesn't force copy_out --
+        matches _propagate_tiled_op's outside_consumers check, which
+        _find_outside_consumers already excludes same-outer-group readers
+        from."""
+        tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        inside = _make_inside_consumer_op("op1", "op0", (0,))
+        propagation = self._plan_for(tiled, group_ops=[tiled, inside])
+        self.assertEqual(propagation.kind, "loop_internal")
+
+    def test_graph_output_matches_copy_out(self):
+        """A graph-output buffer -> copy_out even with no other consumers,
+        matching _propagate_tiled_op's is_graph_output branch."""
+        from torch_spyre._inductor.wsr.coarse_tile import _plan_tiling_propagation
+
+        op = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        info = op.loop_info
+        plan = {id(op): info}
+        levels = [(0, Integer(4))]
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
+            return_value={"op0"},
+        ):
+            _plan_tiling_propagation([op], [([op], levels)], plan)
+        propagation = info.propagation
+        self.assertEqual(propagation.kind, "copy_out")
+        self.assertTrue(propagation.is_graph_output)
+
+    def test_tiled_reduction_matches_reduction_kind(self):
+        """A Reduction op tiling a reduction dim -> kind="reduction", with
+        the same identity/nesting decisions _propagate_tiled_reduction_op
+        computes."""
+        op = _make_tiled_reduction_op(
+            "red0",
+            ranges=[Integer(128)],
+            reduction_ranges=[Integer(256)],
+            reduction_type="sum",
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[]],
+        )
+        op.loop_info.loop_tiled_reduction_dims = [[0]]
+        propagation = self._plan_for(op)
+        self.assertEqual(propagation.kind, "reduction")
+        self.assertIsNotNone(propagation.reduction)
+        self.assertEqual(propagation.reduction.reduction_type, "sum")
+        self.assertEqual(propagation.reduction.identity, 0)
+        self.assertFalse(propagation.reduction.is_nested)
+        self.assertIsNone(propagation.reduction.outer_fill_loop_info)
+
+    def test_nested_tiled_reduction_matches_is_nested(self):
+        """Nested output+reduction tiling -> reduction plan with
+        is_nested=True and a trimmed outer_fill_loop_info, matching
+        _compute_fill_loop_info's non-None nested case."""
+        op = _make_tiled_reduction_op(
+            "red0",
+            ranges=[Integer(64)],
+            reduction_ranges=[Integer(256)],
+            reduction_type="max",
+            loop_group_id=(0, 0),
+            loop_count=[Integer(2), Integer(4)],
+            loop_tiled_dims=[[0], []],
+        )
+        op.loop_info.loop_tiled_reduction_dims = [[], [0]]
+        propagation = self._plan_for(op)
+        self.assertEqual(propagation.kind, "reduction")
+        self.assertTrue(propagation.reduction.is_nested)
+        self.assertEqual(propagation.reduction.identity, float("-inf"))
+        outer_info = propagation.reduction.outer_fill_loop_info
+        self.assertIsNotNone(outer_info)
+        self.assertEqual(outer_info.loop_group_id, (0,))
+        self.assertEqual(outer_info.loop_count, [Integer(2)])
+        self.assertEqual(outer_info.loop_tiled_dims, [[0]])
+
+    def test_reader_before_producer_still_zeroes_fixed_read(self):
+        """Reader-before-producer ordering in group_ops must not matter.
+
+        producer (op0) is tiled with no outside consumers -> loop_internal,
+        i.e. "fixed": its own write never advances. reader (op1) is inside
+        the same loop group and reads op0; op1's tiled_dims_per_read entry
+        for op0 is planted here exactly as plan_coarse_tile_groups would
+        have left it *before* op0's fixed status was known (non-empty,
+        mirroring the stale entry _zero_reads_of_fixed_buffers used to
+        correct after the fact at transformation time). op1 is placed
+        BEFORE op0 in group_ops -- the ordering
+        _zero_reads_of_fixed_buffers existed to work around, since
+        source-order visitation would see op1 before op0 is known to be
+        fixed. _plan_tiling_propagation must still zero op1's entry for
+        op0, because it computes every op's kind up front before its own
+        fixed-buffer zeroing pass runs -- there is no visitation-order
+        hazard left to trigger.
+        """
+        from torch_spyre._inductor.wsr.coarse_tile import _plan_tiling_propagation
+
+        producer = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        reader = _make_inside_consumer_op("op1", "op0", (0,))
+        # Simulate plan_coarse_tile_groups's pre-zeroing output: op1 read op0
+        # while op0's own tiled dims were still extent-4-tiled at level 0.
+        reader.loop_info.tiled_dims_per_read = [[[(0, Integer(4))]]]
+        group_ops = [reader, producer]
+        plan = {id(reader): reader.loop_info, id(producer): producer.loop_info}
+        levels = [(0, Integer(4))]
+        # reader is in `plan`, so _plan_tiling_propagation's main loop
+        # processes it too, which resolves its "op0" read via
+        # V.graph.get_buffer -- give it a minimal graph mock rather than a
+        # real GraphLowering, since these are MagicMock IR objects, not
+        # objects a real graph handler has ever registered.
+        mock_graph = MagicMock()
+        mock_graph.get_buffer.return_value = producer
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
+                return_value=set(),
+            ),
+            V.set_graph_handler(mock_graph),
+        ):
+            _plan_tiling_propagation(group_ops, [(group_ops, levels)], plan)
+
+        self.assertEqual(producer.loop_info.propagation.kind, "loop_internal")
+        self.assertEqual(reader.loop_info.tiled_dims_per_read, [[]])
 
 
 def _make_cross_group_producer_read_fixture():
@@ -5065,10 +5278,12 @@ def _make_tiled_reduction_op(
 
 
 class TestCoarseTileReductionPropagation(unittest.TestCase):
-    """Tests for insert_tiling_propagation Reduction support."""
+    """Tests for tiling propagation Reduction support."""
 
     def test_reduction_tiled_reduction_dim_nested_ok(self):
-        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _validate_planned_reduction_tiling,
+        )
 
         # Nested: outer tiles output dim, inner tiles reduction dim — now supported
         op = _make_tiled_reduction_op(
@@ -5081,10 +5296,14 @@ class TestCoarseTileReductionPropagation(unittest.TestCase):
             loop_tiled_dims=[[0], []],
         )
         op.loop_info.loop_tiled_reduction_dims = [[], [0]]
-        _validate_reduction_tiling(op)  # must not raise
+        _validate_planned_reduction_tiling(
+            op, op.loop_info.loop_tiled_dims, op.loop_info.loop_tiled_reduction_dims
+        )  # must not raise
 
     def test_reduction_output_dim_tiled_ok(self):
-        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _validate_planned_reduction_tiling,
+        )
 
         # ranges=[M], reduction_ranges=[K]; tiled_dim=0 is an output dim → no error
         op = _make_tiled_reduction_op(
@@ -5097,7 +5316,9 @@ class TestCoarseTileReductionPropagation(unittest.TestCase):
             loop_tiled_dims=[[0]],
         )
         # output-dim-only tiling should not raise
-        _validate_reduction_tiling(op)
+        _validate_planned_reduction_tiling(
+            op, op.loop_info.loop_tiled_dims, op.loop_info.loop_tiled_reduction_dims
+        )
 
     def test_nested_fill_gets_outer_loop_info(self):
         """Fill op gets outer-level loop_info for nested output+reduction tiling."""
@@ -5179,9 +5400,11 @@ class TestComputeFillLoopInfo(unittest.TestCase):
         self.assertEqual(result.loop_tiled_reduction_dims, [[]])
 
 
-class TestValidateReductionTiling(unittest.TestCase):
-    """Tests for _validate_reduction_tiling: raising on unsupported cases,
-    passing on supported ones."""
+class TestValidatePlannedReductionTiling(unittest.TestCase):
+    """Tests for _validate_planned_reduction_tiling: raising on unsupported
+    cases, passing on supported ones. Called from plan_coarse_tile_groups
+    (planning time) with the op's own per-level tiled-dims lists, before any
+    loop_info is stamped."""
 
     def _make_op(self, loop_tiled_dims, loop_tiled_reduction_dims):
         from torch._inductor.ir import ComputedBuffer, Reduction
@@ -5203,43 +5426,52 @@ class TestValidateReductionTiling(unittest.TestCase):
 
     def test_pure_reduction_tile_ok(self):
         """Single level, only reduction dim tiled — Stage 1 supported case."""
-        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _validate_planned_reduction_tiling,
+        )
 
         op = self._make_op(loop_tiled_dims=[[]], loop_tiled_reduction_dims=[[0]])
-        _validate_reduction_tiling(op)  # must not raise
+        _validate_planned_reduction_tiling(op, [[]], [[0]])  # must not raise
 
     def test_pure_output_tile_ok(self):
         """Single level, only output dim tiled — existing supported case."""
-        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _validate_planned_reduction_tiling,
+        )
 
         op = self._make_op(loop_tiled_dims=[[0]], loop_tiled_reduction_dims=[[]])
-        _validate_reduction_tiling(op)  # must not raise
+        _validate_planned_reduction_tiling(op, [[0]], [[]])  # must not raise
 
-    def test_no_loop_info_ok(self):
-        """Op with no loop_info is not tiled — no error."""
+    def test_no_tiled_dims_ok(self):
+        """No dims tiled at all — no error."""
         from torch._inductor.ir import ComputedBuffer, Reduction
-        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _validate_planned_reduction_tiling,
+        )
 
         data = MagicMock(spec=Reduction)
         data.ranges = [Integer(128)]
         data.reduction_ranges = [Integer(256)]
         op = MagicMock(spec=ComputedBuffer)
         op.data = data
-        op.loop_info = None
-        _validate_reduction_tiling(op)  # must not raise
+        _validate_planned_reduction_tiling(op, [[]], [[]])  # must not raise
 
     def test_mixed_same_level_raises(self):
         """Both output and reduction dim tiled at the same level — Stage 2, raises."""
-        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _validate_planned_reduction_tiling,
+        )
 
         op = self._make_op(loop_tiled_dims=[[0]], loop_tiled_reduction_dims=[[0]])
         with self.assertRaises(Unsupported, msg="mixed same-level should raise"):
-            _validate_reduction_tiling(op)
+            _validate_planned_reduction_tiling(op, [[0]], [[0]])
 
     def test_mixed_different_levels_allowed(self):
         """Outer output-dim tiling + inner reduction-dim tiling — now supported."""
         from torch._inductor.ir import ComputedBuffer, Reduction
-        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _validate_planned_reduction_tiling,
+        )
 
         data = MagicMock(spec=Reduction)
         data.ranges = [Integer(128)]
@@ -5248,19 +5480,17 @@ class TestValidateReductionTiling(unittest.TestCase):
         op = MagicMock(spec=ComputedBuffer)
         op.data = data
         op.get_name.return_value = "test_op"
-        op.loop_info = CoarseTileInfo(
-            loop_group_id=(0, 0),
-            loop_count=[Integer(2), Integer(4)],
-            loop_tiled_dims=[[0], []],
-            loop_tiled_reduction_dims=[[], [0]],
-        )
+        tiled_dims = [[0], []]
+        tiled_rdims = [[], [0]]
         # Must not raise: outer output-dim + inner reduction-dim is now supported.
-        _validate_reduction_tiling(op)
+        _validate_planned_reduction_tiling(op, tiled_dims, tiled_rdims)
 
     def test_multiple_reduction_dims_same_level_raises(self):
         """Multiple reduction dims tiled at one level — Stage 2, raises."""
         from torch._inductor.ir import ComputedBuffer, Reduction
-        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _validate_planned_reduction_tiling,
+        )
 
         data = MagicMock(spec=Reduction)
         data.ranges = [Integer(128)]
@@ -5268,19 +5498,15 @@ class TestValidateReductionTiling(unittest.TestCase):
         op = MagicMock(spec=ComputedBuffer)
         op.data = data
         op.get_name.return_value = "test_op"
-        op.loop_info = CoarseTileInfo(
-            loop_group_id=(0,),
-            loop_count=[Integer(4)],
-            loop_tiled_dims=[[]],
-            loop_tiled_reduction_dims=[[0, 1]],
-        )
         with self.assertRaises(Unsupported, msg="multiple reduction dims should raise"):
-            _validate_reduction_tiling(op)
+            _validate_planned_reduction_tiling(op, [[]], [[0, 1]])
 
     def test_stick_dim_reduction_tiling_allowed(self):
         """Tiling a reduction over the stick dimension is now supported."""
         from torch._inductor.ir import ComputedBuffer, Reduction
-        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _validate_planned_reduction_tiling,
+        )
 
         data = MagicMock(spec=Reduction)
         data.ranges = [Integer(64)]  # [B] output
@@ -5289,14 +5515,8 @@ class TestValidateReductionTiling(unittest.TestCase):
         op = MagicMock(spec=ComputedBuffer)
         op.data = data
         op.get_name.return_value = "test_sum"
-        op.loop_info = CoarseTileInfo(
-            loop_group_id=(0,),
-            loop_count=[Integer(4)],
-            loop_tiled_dims=[[]],
-            loop_tiled_reduction_dims=[[0]],
-        )
         # Must not raise: stick-dim reduction tiling is now supported.
-        _validate_reduction_tiling(op)
+        _validate_planned_reduction_tiling(op, [[]], [[0]])
 
 
 class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
