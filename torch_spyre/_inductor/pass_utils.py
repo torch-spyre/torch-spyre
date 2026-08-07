@@ -705,6 +705,33 @@ def is_stick_expr_offset_free(stick_expr: sympy.Expr, elems_per_stick: int) -> b
     return is_supported_mod or is_bare_var or is_zero
 
 
+def _is_scaled_mod_stick_expr(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
+    """Return True for a stride-scaled Mod stick expression.
+
+    Recognises ``coeff * Mod(var, n)`` where ``coeff * n == elems_per_stick``
+    and ``coeff > 1``.  This arises from tensors whose innermost host dimension
+    has a stride greater than 1 — for example stride-2 interleaved access on an
+    EXX2 tensor where each stick holds 32 pairs, giving
+    ``2 * Mod(d1, 32)`` with ``elems_per_stick = 64``.
+
+    Unlike the MSR pattern (``inner + elems_per_stick * Mod(outer, n)``), this
+    expression has exactly **one** free symbol and is handled by the standard
+    single-variable SDSC path.  No special normalisation is required in codegen;
+    the coefficient is encoded in the device layout's stride_map.
+    """
+    if not isinstance(stick_expr, sympy.Mul):
+        return False
+    coeff, mod_part = stick_expr.as_coeff_Mul()
+    return (
+        isinstance(coeff, sympy.Integer)
+        and int(coeff) > 1
+        and isinstance(mod_part, sympy.Mod)
+        and len(mod_part.args[0].free_symbols) == 1
+        and isinstance(mod_part.args[1], sympy.Integer)
+        and int(coeff) * int(mod_part.args[1]) == elems_per_stick
+    )
+
+
 def _is_stick_expr_with_offset(stick_expr: sympy.Expr, elems_per_stick: int) -> bool:
     """Return True if stick_expr is an offset variant: Mod(var, N) + c or var + c."""
     if not isinstance(stick_expr, sympy.Add):
@@ -774,12 +801,38 @@ def _check_stick_expr_supported(stick_expr: sympy.Expr, elems_per_stick: int) ->
     offset_free = is_stick_expr_offset_free(stick_expr, elems_per_stick)
     has_offset = _is_stick_expr_with_offset(stick_expr, elems_per_stick)
     is_multi_stick_row = _is_multi_stick_row_expr(stick_expr, elems_per_stick)
-    if not (offset_free or has_offset or is_multi_stick_row):
+    is_scaled_mod = _is_scaled_mod_stick_expr(stick_expr, elems_per_stick)
+    if not (offset_free or has_offset or is_multi_stick_row or is_scaled_mod):
         raise Unsupported(
             f"Unexpected stick expression {stick_expr!r}: expected "
             f"Mod(var, {elems_per_stick}), a bare variable, 0, any of those "
-            f"with a constant offset, or inner + {elems_per_stick}*Mod(outer, n)"
+            f"with a constant offset, inner + {elems_per_stick}*Mod(outer, n), "
+            f"or coeff*Mod(var, n) where coeff*n == {elems_per_stick}"
         )
+
+
+def device_coordinates_unchecked(
+    stl: SpyreTensorLayout,
+    dep: MemoryDep,
+    indirect_sizes: "dict[sympy.Symbol, int] | None",
+) -> list[sympy.Expr]:
+    """Like ``device_coordinates`` but skips the stick-expression support check.
+
+    Use this only when the caller needs the raw stick expression to decide
+    what to do next (e.g. matching it back to a host dimension to search for
+    an alternative stick dimension) rather than needing a validated,
+    backend-representable coordinate list.
+    """
+    # device_size and stride_map come from the C++ SpyreTensorLayout and are
+    # already concrete, so no concretization is needed here.
+    index = concretize_index(dep.index, set(dep.ranges.keys()))
+    return compute_coordinates(
+        stl.device_size,
+        stl.stride_map,
+        dep.ranges,
+        index,
+        indirect_sizes,
+    )
 
 
 def device_coordinates(
@@ -800,16 +853,7 @@ def device_coordinates(
         One coordinate expression per device dimension; the last element is
         the stick expression.
     """
-    # device_size and stride_map come from the C++ SpyreTensorLayout and are
-    # already concrete, so no concretization is needed here.
-    index = concretize_index(dep.index, set(dep.ranges.keys()))
-    coords = compute_coordinates(
-        stl.device_size,
-        stl.stride_map,
-        dep.ranges,
-        index,
-        indirect_sizes,
-    )
+    coords = device_coordinates_unchecked(stl, dep, indirect_sizes)
     _check_stick_expr_supported(coords[-1], stl.elems_per_stick())
     return coords
 
@@ -1211,8 +1255,11 @@ def compute_restickify_needed(
     # MSR layouts are layout-compatible with each other (no restickify needed)
     # when both input and output use the same outer stick-selecting variable.
     in_is_msr = _is_multi_stick_row_expr(idc[-1], elems_per_stick)
+    # Scaled-Mod (coeff*Mod(var, n), coeff*n == elems_per_stick) is a fixed
+    # stride-interleaved stick pattern: no restickify needed when compatible.
+    in_is_scaled_mod = _is_scaled_mod_stick_expr(idc[-1], elems_per_stick)
     compatible = stick_compatible([idc, out_idc], elems_per_stick)
-    if (in_stick_offset_free or in_is_msr) and compatible:
+    if (in_stick_offset_free or in_is_msr or in_is_scaled_mod) and compatible:
         return False, None
     logger.debug(
         "compute_restickify_needed: restickify may be needed "

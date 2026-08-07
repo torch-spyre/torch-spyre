@@ -78,10 +78,12 @@ from .pass_utils import (
     identify_matmul_inputs,
     host_coordinates,
     device_coordinates,
+    device_coordinates_unchecked,
     try_device_coordinates,
     indirect_info_from_op,
     is_stick_expr_offset_free,
     _is_multi_stick_row_expr,
+    _is_scaled_mod_stick_expr,
     _msr_outer_var,
     iter_var_id,
 )
@@ -245,6 +247,18 @@ def _output_stl_from_stick_expr(
             return _make_output_stl(
                 output, output_dep, c_size, c_stride, out_stick_dim, allow_msr=True
             )
+    if _is_scaled_mod_stick_expr(stick_expr, stick_size):
+        # For scaled-Mod (coeff*Mod(var, n)), extract the inner variable and use
+        # it to locate the host dimension that the stick maps to.
+        _, mod_part = stick_expr.as_coeff_Mul()
+        inner_var = next(iter(mod_part.args[0].free_symbols))
+        out_stick_dim = _pick_stick_dim(sympy.Mod(inner_var, stick_size), out_coords)
+        if out_stick_dim == -1:
+            for d, c in enumerate(out_coords):
+                if inner_var in c.free_symbols:
+                    out_stick_dim = d
+                    break
+        return _make_output_stl(output, output_dep, c_size, c_stride, out_stick_dim, dtype)
     return None
 
 
@@ -268,6 +282,8 @@ def _make_output_stl(
     if is_stick_expr_offset_free(stick_expr, stick_size):
         return stl
     if allow_msr and _is_multi_stick_row_expr(stick_expr, stick_size):
+        return stl
+    if _is_scaled_mod_stick_expr(stick_expr, stick_size):
         return stl
     return None
 
@@ -323,7 +339,10 @@ def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
                 continue
             representable += 1
             stick_expr = coords[-1]
-            if not is_stick_expr_offset_free(stick_expr, stl.elems_per_stick()):
+            if not (
+                is_stick_expr_offset_free(stick_expr, stl.elems_per_stick())
+                or _is_scaled_mod_stick_expr(stick_expr, stl.elems_per_stick())
+            ):
                 raise Unsupported(
                     f"{op_label}: input arg{i} has stick expression with offset "
                     f"{stick_expr!r} (likely from slicing the stick dimension); "
@@ -520,7 +539,10 @@ def _single_arg_op_layout(
                 # Staggered-EA candidate whose physical stick depth differs from
                 # elems_per_stick — not a valid input for this conversion path.
                 return []
-            if not is_stick_expr_offset_free(in_stick_expr, stl.elems_per_stick()):
+            if not (
+                is_stick_expr_offset_free(in_stick_expr, stl.elems_per_stick())
+                or _is_scaled_mod_stick_expr(in_stick_expr, stl.elems_per_stick())
+            ):
                 return []
 
             input_ea = stl.element_arrangement
@@ -695,8 +717,10 @@ def _clone_layout(
         c_size, c_stride, dtype_for_layout, list(range(len(output.size)))
     )
 
-    if is_stick_expr_offset_free(stick_expr, stick_size) or _is_multi_stick_row_expr(
-        stick_expr, stick_size
+    if (
+        is_stick_expr_offset_free(stick_expr, stick_size)
+        or _is_multi_stick_row_expr(stick_expr, stick_size)
+        or _is_scaled_mod_stick_expr(stick_expr, stick_size)
     ):
         # Case 1: No restickify insertion needed.
         # Covers both offset-free sticks and multi-stick-row (MSR) patterns.
@@ -1053,9 +1077,10 @@ def _multi_arg_pointwise_layouts(
                 output_ea,
             )
             coord = try_device_coordinates(in_stl, arg.dep, ind_sizes)
-            if coord is None or not (
+            if not (
                 is_stick_expr_offset_free(coord[-1], stick_size)
                 or _is_multi_stick_row_expr(coord[-1], stick_size)
+                or _is_scaled_mod_stick_expr(coord[-1], stick_size)
             ):
                 return False
             # For indirect-access value tensors, the stick dimension cannot
@@ -1186,10 +1211,13 @@ def _multi_arg_pointwise_layouts(
             not in natural_footprints
         ):
             continue
-        # Stick must be offset-free; per-input feasibility is left to
-        # AllSameNode (INF-costs incompatible).
+        # Stick must be offset-free or a recognised non-offset pattern;
+        # per-input feasibility is left to AllSameNode (INF-costs incompatible).
         out_coord = device_coordinates(candidate, output_dep, ind_sizes)
-        if not is_stick_expr_offset_free(out_coord[-1], stick_size):
+        if not (
+            is_stick_expr_offset_free(out_coord[-1], stick_size)
+            or _is_scaled_mod_stick_expr(out_coord[-1], stick_size)
+        ):
             continue
         # Move to front (or insert if new): the in-place layout must win on
         # cost ties so the allocator's positional in-place check can fire.
@@ -1426,7 +1454,11 @@ def _find_alt_target_stl(
     or raises Unsupported if no valid alternative exists.
     """
     stick_size = get_elem_in_stick(target_layout.dtype)
-    write_stick = device_coordinates(target_stl, output_dep, None)[-1]
+    # Unchecked: the current stick dim may produce a stick expression the
+    # backend can't represent at all (not just an offset, e.g. a strided
+    # write target). That's exactly the case this function searches for an
+    # alternative stick dim to fix, so it must not raise here.
+    write_stick = device_coordinates_unchecked(target_stl, output_dep, None)[-1]
     if is_stick_expr_offset_free(write_stick, stick_size):
         return None
 

@@ -548,14 +548,14 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
         original_layout = mutation_op.layout
         assert isinstance(original_layout, MutationLayoutSHOULDREMOVE)
         slice_layout = original_layout.target.get_layout()
-        # We only reach this pass because the write stick had a non-zero offset,
-        # so the slice layout must carry it.
-        assert slice_layout.offset != 0, (
-            f"slice offset lost while retargeting mutation {mutation_name} "
-            f"(target={type(original_layout.target).__name__}, "
-            f"layout offset={slice_layout.offset!r}); the original slice offset "
-            f"is not carried by the mutation target layout"
-        )
+        # We reach this pass because the write stick under the original STL was
+        # unsupported -- either a constant offset (e.g. from slicing the stick
+        # dimension) or another pattern the backend can't represent at all
+        # (e.g. a strided/dilated write target with offset 0). Either way,
+        # alt_stl was chosen by _find_alt_target_stl() specifically so the
+        # write stick is representable, so wrapping buf_tmp in slice_layout
+        # (which carries the full size/stride/offset of the mutation target)
+        # is correct regardless of whether the offset itself is zero.
         slice_view_of_buf_tmp = ReinterpretView(
             data=StorageBox(buf_tmp), layout=slice_layout
         )

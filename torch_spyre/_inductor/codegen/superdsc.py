@@ -16,7 +16,7 @@ import dataclasses
 import math
 from typing import Any
 from collections import Counter
-from sympy import Integer, Mul, Symbol, Expr
+from sympy import Integer, Mul, Symbol, Expr, Mod, floor
 
 from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats, ElementArrangement

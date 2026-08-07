@@ -24,6 +24,7 @@ from torch_spyre._inductor.pass_utils import (
     try_device_coordinates,
     _check_stick_expr_supported,
     _is_multi_stick_row_expr,
+    _is_scaled_mod_stick_expr,
     is_stick_expr_offset_free,
 )
 from torch_spyre._inductor.propagate_layouts import (
@@ -414,9 +415,65 @@ class TestMultiStickRowExpr(TestCase):
             _check_stick_expr_supported(d1 + d2, self.EPS)
 
     def test_check_rejects_wrong_coeff(self):
-        # coefficient 32 != elems_per_stick 64
+        # d2 + 32*Mod(d1, 4): MSR with coefficient 32 != elems_per_stick 64
         with self.assertRaises(Unsupported):
             _check_stick_expr_supported(d2 + 32 * sympy.Mod(d1, 4), self.EPS)
+
+
+class TestScaledModStickExpr(TestCase):
+    """Tests for the scaled-Mod stick expression pattern coeff*Mod(var, n).
+
+    The expression ``2*Mod(d1, 32)`` arises from tensors with a stride-2
+    innermost host dimension (e.g. EXX2 interleaved layouts), where
+    ``coeff * n == elems_per_stick`` (here 2*32 == 64).
+    """
+
+    EPS = 64  # elems_per_stick for fp16
+
+    # --- _is_scaled_mod_stick_expr ---
+
+    def test_recognises_stride2_fp16(self):
+        # 2*Mod(d1, 32): stride 2, 32 positions, coeff*n = 64
+        expr = 2 * sympy.Mod(d1, 32)
+        self.assertTrue(_is_scaled_mod_stick_expr(expr, self.EPS))
+
+    def test_recognises_stride4_fp16(self):
+        # 4*Mod(d1, 16): stride 4, 16 positions, coeff*n = 64
+        expr = 4 * sympy.Mod(d1, 16)
+        self.assertTrue(_is_scaled_mod_stick_expr(expr, self.EPS))
+
+    def test_rejects_coeff1(self):
+        # 1*Mod(d1, 64) is just Mod(d1, 64) — offset-free, not scaled-mod
+        expr = sympy.Mod(d1, self.EPS)
+        self.assertFalse(_is_scaled_mod_stick_expr(expr, self.EPS))
+
+    def test_rejects_coeff_product_mismatch(self):
+        # 2*Mod(d1, 4): coeff*n = 8 != 64
+        expr = 2 * sympy.Mod(d1, 4)
+        self.assertFalse(_is_scaled_mod_stick_expr(expr, self.EPS))
+
+    def test_rejects_bare_var(self):
+        self.assertFalse(_is_scaled_mod_stick_expr(d1, self.EPS))
+
+    def test_rejects_msr_add(self):
+        # MSR (Add), not Mul
+        expr = d2 + self.EPS * sympy.Mod(d1, 4)
+        self.assertFalse(_is_scaled_mod_stick_expr(expr, self.EPS))
+
+    # --- _check_stick_expr_supported ---
+
+    def test_check_accepts_stride2(self):
+        expr = 2 * sympy.Mod(d1, 32)
+        _check_stick_expr_supported(expr, self.EPS)  # must not raise
+
+    def test_check_rejects_coeff_product_mismatch(self):
+        # 2*Mod(d1, 4): coeff*n = 8 != elems_per_stick 64 — not a valid stick
+        with self.assertRaises(Unsupported):
+            _check_stick_expr_supported(2 * sympy.Mod(d1, 4), self.EPS)
+
+    def test_check_accepts_stride4(self):
+        expr = 4 * sympy.Mod(d1, 16)
+        _check_stick_expr_supported(expr, self.EPS)  # must not raise
 
 
 if __name__ == "__main__":
