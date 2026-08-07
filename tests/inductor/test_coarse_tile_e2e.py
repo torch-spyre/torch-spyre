@@ -1518,6 +1518,29 @@ def test_restickify_matmul_x_yt_128x256_M2_N2():
     run_coarse_tile_test(fn, inputs)
 
 
+def test_restickify_pointwise_unsqueeze_mul_Lq2():
+    """pointwise result unsqueezed and multiplied with 4D tensor, tiled Lq÷2.
+
+    Minimal reproducer for ReinterpretView staleness: a 3D pointwise result
+    [H,Lq] goes through unsqueeze(-1) creating a ReinterpretView [H,Lq,1]
+    whose FixedLayout captures pre-divide Lq strides. The multiply consumer
+    reads it with a stale stride coefficient after _divide_ranges tiles Lq.
+    """
+    H, Lq, D = 8, 128, 64
+    inputs = [
+        tensor("x", shape=(H, Lq), dims=["H", "Lq"]),
+        tensor("y", shape=(H, Lq), dims=["H", "Lq"]),
+        tensor("z", shape=(H, Lq, D), dims=["H", "Lq", "D"]),
+    ]
+
+    def fn(x, y, z):
+        with spyre_hint(num_tiles_per_dim={"Lq": 2}):
+            c = torch.exp(x - y)  # [H, Lq] pointwise
+            return z * c.unsqueeze(-1)  # [H, Lq, D]
+
+    run_coarse_tile_test(fn, inputs)
+
+
 # ---------------------------------------------------------------------------
 # Group 7: copies
 # Patterns: copy into pre-allocated buffer, in-place accumulation,
