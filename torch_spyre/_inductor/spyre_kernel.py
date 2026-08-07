@@ -19,7 +19,7 @@ from abc import ABC
 import torch
 import sympy
 
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 
 from torch._inductor.codegen.common import (
     CSEVariable,
@@ -328,6 +328,10 @@ class SpyreOpFuncs:
     @staticmethod
     def qfp8ch(x):
         return PointwiseOp("qfp8ch", [x])
+
+    @staticmethod
+    def qfp8wt(x):
+        return PointwiseOp("qfp8wt", [x])
 
     @staticmethod
     def relu(x):
@@ -758,7 +762,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             tensor.layout.device_layout.device_size,
             device_coords,
             tensor.layout.allocation,
-            per_tile_fixed=getattr(tensor.layout, "per_tile_fixed", False),
+            element_arrangement=tensor.layout.device_layout.element_arrangement,
             name=opspec_name,
             device_tile_advance_expr=device_tile_advance_expr,
         )
@@ -1423,14 +1427,16 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 + "],"
                             )
                             buf.writeline(f"allocation={arg.allocation!r},")
-                            if arg.per_tile_fixed:
-                                buf.writeline("per_tile_fixed=True,")
                             if arg.name is not None:
                                 buf.writeline(f"name={arg.name!r},")
                             if arg.device_tile_advance_expr is not None:
                                 buf.writeline(
                                     "device_tile_advance_expr="
                                     f"{sympy_str(arg.device_tile_advance_expr)},"
+                                )
+                            if arg.element_arrangement != ElementArrangement.STANDARD:
+                                buf.writeline(
+                                    f"element_arrangement={arg.element_arrangement},"
                                 )
                         buf.writeline("),")
                 buf.writeline("]")

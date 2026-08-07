@@ -32,7 +32,7 @@ from typing import Any, Callable, Optional, Sequence, Union
 import torch
 import torch._decomp as decomp
 
-from .constants import DEVICE_NAME, FP8_E4M3_MAX
+from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from .errors import Unsupported
 
 from . import customops  # noqa: F401
@@ -823,8 +823,64 @@ def spyre_quantize_fp8_with_scale(
 ) -> torch.Tensor:
     inv_scale = torch.reciprocal(scale)
     x_scaled = input * inv_scale
-    x_clamped = torch.ops.spyre.clamp(x_scaled, -FP8_E4M3_MAX, FP8_E4M3_MAX)
+    x_clamped = torch.ops.spyre.clamp(x_scaled, FP8_E4M3FN_MIN, FP8_E4M3FN_MAX)
     return torch.ops.spyre.qfp8ch(x_clamped)
+
+
+@register_spyre_decompositions([torch.ops.spyre.quantize_weight_fp8_with_scale])
+def spyre_quantize_weight_fp8_with_scale(
+    input: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    inv_scale = torch.reciprocal(scale)
+    x_scaled = input * inv_scale
+    x_clamped = torch.ops.spyre.clamp(x_scaled, FP8_E4M3FN_MIN, FP8_E4M3FN_MAX)
+    return torch.ops.spyre.qfp8wt(x_clamped)
+
+
+@register_spyre_decompositions([torch.ops.aten.flip.default])
+def spyre_flip(input: torch.Tensor, dims: Sequence[int]) -> torch.Tensor:
+    """Reverse ``input`` along each dim in ``dims`` using gathers.
+
+    Inductor's default decomposition of ``aten.flip`` is ``prims.rev``, whose
+    index expression walks the reversed dim backwards (``N - 1 - i``). Device
+    coordinates can only ascend, so that form is not lowerable on Spyre —
+    ``compute_coordinates`` rejects it. The same reversal expressed as an
+    ``index_select`` with a descending index tensor is an ordinary gather,
+    which the backend does support: the descending order lives in the index
+    *values* rather than in the access pattern.
+
+    Registering the aten op also installs the PrivateUse1 kernel, so this is
+    what eager ``Tensor.flip`` dispatches to as well (there is no
+    ``aten::flip`` kernel for Spyre otherwise).
+    """
+    # Replacing the op means aten.flip's own argument validation no longer
+    # runs, so repeat it here rather than silently accepting a program aten
+    # rejects. Out-of-range dims still raise from ``size()`` below.
+    seen: set[int] = set()
+    for dim in dims:
+        normalized = dim + input.dim() if dim < 0 else dim
+        if normalized in seen:
+            raise RuntimeError(
+                f"dim {normalized} appears multiple times in the list of dims"
+            )
+        seen.add(normalized)
+
+    out = input
+    reversed_any = False
+    for dim in dims:
+        # A 0-d tensor accepts flip(0) and is its own reversal; ``size(0)``
+        # would raise on it, so skip before asking.
+        size = 1 if input.dim() == 0 else out.size(dim)
+        if size <= 1:
+            # A dim of size 0 or 1 is its own reversal; index_select would
+            # still work, but skipping avoids an empty/degenerate gather.
+            continue
+        index = torch.arange(size - 1, -1, -1, device=out.device, dtype=torch.int32)
+        out = torch.index_select(out, dim, index)
+        reversed_any = True
+    # aten.flip always returns a fresh tensor; clone so the no-op case does
+    # not alias its input.
+    return out if reversed_any else out.clone()
 
 
 @register_spyre_decompositions([torch.ops.aten.prod.dim_int])
