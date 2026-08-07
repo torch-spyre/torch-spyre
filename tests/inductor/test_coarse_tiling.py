@@ -4799,6 +4799,37 @@ def _make_full_buffer_read_fixture():
     return tiled_op, full_deps, operations
 
 
+class TestReadCopyPlanDataclasses(unittest.TestCase):
+    """ReadCopyEntry/ReadCopyPlan are plain frozen dataclasses (Task 1)."""
+
+    def test_read_copy_entry_and_plan_construct_and_are_frozen(self):
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._inductor.loop_info import ReadCopyEntry, ReadCopyPlan
+
+        dep = MemoryDep(
+            name="a",
+            index=sympy.Integer(0),
+            var_names=(),
+            size=(),
+        )
+        entry = ReadCopyEntry(
+            copy_name="coarse_tile_read_copy_group0_a_0",
+            dep=dep,
+            insert_before_op_name="op0",
+            sizing_op_name="op0",
+            consumer_op_names=("op0", "op1"),
+        )
+        self.assertEqual(entry.copy_name, "coarse_tile_read_copy_group0_a_0")
+        self.assertEqual(entry.consumer_op_names, ("op0", "op1"))
+        with self.assertRaises(Exception):
+            entry.copy_name = "other"  # frozen -> raises FrozenInstanceError
+
+        plan = ReadCopyPlan(entries=(entry,))
+        self.assertEqual(plan.entries, (entry,))
+        with self.assertRaises(Exception):
+            plan.entries = ()
+
+
 class TestInsertReadCopyOps(unittest.TestCase):
     """_insert_read_copy_ops always materializes a real copy, never a view.
 
