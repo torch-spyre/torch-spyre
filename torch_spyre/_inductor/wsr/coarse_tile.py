@@ -2265,6 +2265,7 @@ def _insert_one_read_copy(
     dep: MemoryDep,
     copy_name: str,
     operations: list[Operation],
+    insert_before_op: Operation,
 ) -> str:
     """Build and insert one tile-sized copy op for a single full-buffer read.
 
@@ -2294,10 +2295,17 @@ def _insert_one_read_copy(
     Otherwise (pre-stickify call site) the copy gets a plain FixedLayout, and
     stickification (which runs later) fills device_layout in normally.
 
+    insert_before_op is the plan's own insertion-point decision (see
+    ReadCopyEntry.insert_before_op_name) -- it names the first
+    (operations order) consuming op in the group and is authoritative
+    for where the copy is spliced into `operations`, independent of
+    sizing_op (which only supplies loop_info/ranges/origins here and may
+    coincide with insert_before_op but is not guaranteed to by contract).
+
     Returns the inserted copy buffer's name (copy_buf.get_name()) -- callers
     patch consumers separately via _patch_consumer_to_read_copy.
     """
-    sizing_idx = operations.index(sizing_op)
+    insert_idx = operations.index(insert_before_op)
     full_buf = V.graph.get_buffer(dep.name)
     # Graph inputs come back TensorBox(StorageBox(InputBuffer))-wrapped
     # (see graph_inputs); get_dtype() resolves to self.dtype via IRNode
@@ -2538,7 +2546,7 @@ def _insert_one_read_copy(
     )
 
     V.graph.name_to_buffer[copy_name] = copy_buf
-    operations.insert(sizing_idx, copy_buf)
+    operations.insert(insert_idx, copy_buf)
 
     logger.debug(
         "coarse_tile: read copy-in %s -> %s",
@@ -2670,6 +2678,8 @@ def _plan_read_copies(
         for op in group_ops:
             if not isinstance(op, ComputedBuffer):
                 continue
+            if not isinstance(op.data, (Pointwise, Reduction)):
+                continue
             for dep in _full_buffer_read_deps(op):
                 key = (
                     dep.name,
@@ -2689,19 +2699,35 @@ def _plan_read_copies(
             sizing_info = sizing_op.loop_info  # type: ignore[attr-defined]
             for other_op, _dep in op_deps[1:]:
                 other_info = other_op.loop_info  # type: ignore[attr-defined]
-                assert (
-                    other_info.loop_count == sizing_info.loop_count
-                    and other_info.loop_tiled_dims == sizing_info.loop_tiled_dims
-                ), (
+                # Only loop_count (the per-level trip counts) is a genuine
+                # per-*group* invariant that every op in the group shares by
+                # construction -- and it is the only one of the two fields
+                # _insert_one_read_copy actually consumes from sizing_op_info
+                # to size the shared copy's read_level_extents (see its
+                # body). loop_tiled_dims is *not* comparable across op kinds:
+                # its dim keys are positions into each op's own data.ranges
+                # (output-shaped), while a Reduction's own tiling of a
+                # reduction dim shows up in loop_tiled_reduction_dims
+                # instead, in a completely different numbering space. A
+                # Reduction (e.g. softmax's max) and a sibling Pointwise
+                # (e.g. softmax's x - max) can legitimately tile the very
+                # same logical tensor dim through these two different
+                # fields and still correctly share one copy -- see
+                # docs/superpowers/specs/2026-08-07-read-copy-sharing-and-
+                # disable-design.md for why the plan doesn't need
+                # loop_tiled_dims to build the copy either way.
+                assert other_info.loop_count == sizing_info.loop_count, (
                     "_plan_read_copies: ops in the same coarse-tile group "
-                    f"disagree on loop_count/loop_tiled_dims ({other_op.get_name()!r} "
-                    f"vs {sizing_op.get_name()!r} sizing this shared copy of "
-                    f"{key[0]!r}) -- ops in one group must share tiling shape "
+                    f"disagree on loop_count ({other_op.get_name()!r} vs "
+                    f"{sizing_op.get_name()!r} sizing this shared copy of "
+                    f"{key[0]!r}) -- ops in one group must share trip counts "
                     "by construction."
                 )
+            group_tag = "_".join(str(i) for i in stamped_group_id)
             copy_name = V.graph.qualify_name(
-                f"coarse_tile_read_copy_{stamped_group_id}_{key[0]}_{n}"
+                f"coarse_tile_read_copy_{group_tag}_{key[0]}_{n}"
             )
+            assert copy_name.isidentifier(), f"invalid copy buffer name: {copy_name!r}"
             entries.append(
                 ReadCopyEntry(
                     copy_name=copy_name,
@@ -2741,8 +2767,13 @@ def _insert_all_read_copy_ops(
                 if isinstance(op, ComputedBuffer)
             }
             sizing_op = name_to_op[entry.sizing_op_name]
+            insert_before_op = name_to_op[entry.insert_before_op_name]
             new_copy_name = _insert_one_read_copy(
-                sizing_op, entry.dep, entry.copy_name, operations
+                sizing_op,
+                entry.dep,
+                entry.copy_name,
+                operations,
+                insert_before_op=insert_before_op,
             )
             for consumer_name in entry.consumer_op_names:
                 consumer = name_to_op[consumer_name]
@@ -2777,7 +2808,9 @@ def _insert_read_copy_ops(
         copy_name = V.graph.qualify_name(
             f"coarse_tile_read_copy_{tiled_op.get_name()}_{dep.name}"
         )
-        new_copy_name = _insert_one_read_copy(tiled_op, dep, copy_name, operations)
+        new_copy_name = _insert_one_read_copy(
+            tiled_op, dep, copy_name, operations, insert_before_op=tiled_op
+        )
         _patch_consumer_to_read_copy(tiled_op, dep, new_copy_name, operations)
         tiled_op = next(
             o
