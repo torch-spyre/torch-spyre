@@ -103,6 +103,14 @@ class SpyreStream {
   static uint64_t edge4SlotSkips();
   static void resetEdge4SlotStats();
 
+  // Test-only: clear all edge-4 rolling slots (the region_id -> back-event
+  // map). The mock device address used by unit tests yields a DETERMINISTIC
+  // region_id, so a slot published by a prior test would otherwise be observed
+  // by the next; a test calls this (plus resetEdge4SlotStats) to isolate its
+  // hit/skip sequence. Locks the dedicated edge4_mutex. Does NOT reset the
+  // counters (call resetEdge4SlotStats for that).
+  static void clearEdge4Slots();
+
  private:
   flex::RuntimeStream* resolveRuntimeHandle() const;
   void copyAsyncImpl(void* cpu_ptr,

@@ -222,6 +222,11 @@ uint64_t SpyreAllocator::compositeAddressToDmva(
   return getFlexAllocator()->compositeAddressToDmva(addr);
 }
 
+size_t SpyreAllocator::getNumProgramRegions() {
+  auto flex_alloc = getFlexAllocator();
+  return flex_alloc ? flex_alloc->getNumProgramRegions() : 0;
+}
+
 void SpyreAllocator::memoryPressureCallback(
     std::unique_lock<std::mutex>& lock) {
   // This callback is invoked by FlexAllocator while holding allocator_mutex

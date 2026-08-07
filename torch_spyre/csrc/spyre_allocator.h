@@ -82,6 +82,15 @@ struct SpyreAllocator final : public c10::DeviceAllocator {
   void copy_data(void* dest, const void* src, std::size_t count) const final;
 
   uint64_t compositeAddressToDmva(const flex::CompositeAddress& addr) const;
+
+  // Number of Program regions the backing FlexAllocator was configured with,
+  // or 0 if no FlexAllocator is available yet. Exposed for the edge-4
+  // rolling-slot WAR key guard in prepare_kernel: the scalar region_id key
+  // collapses correctly only while there is a single Program region
+  // (DEFAULT_1P0_NUM_PROGRAM_REGIONS==1). Delegates to the private
+  // getFlexAllocator(), mirroring compositeAddressToDmva() above, so callers
+  // never touch the raw flex allocator handle.
+  static size_t getNumProgramRegions();
 };
 
 }  // namespace spyre
