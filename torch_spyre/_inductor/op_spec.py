@@ -16,10 +16,13 @@
 from __future__ import annotations
 
 import dataclasses
+import threading
+from collections import OrderedDict
 from typing import Any, Literal, Sequence
 
 from sympy import Symbol, Expr, Function
-from torch_spyre._C import DataFormats, ElementArrangement
+from torch_spyre._C import DataFormats, ElementArrangement, fill_tensor
+from torch_spyre._inductor.constants import DEVICE_NAME
 import torch
 
 
@@ -269,8 +272,69 @@ class LoopSpec:
     body: list[Any]
 
 
+# Module-level cache of device-side constant tensors, keyed by
+# (value, (device_type, device_index), dtype).  It is a MODULE global on
+# purpose: spyre_constant_tensor is emitted as source into the generated
+# runtime wrapper, so it runs at model *execution* time, after compile_fx has
+# torn down its graph handler.  A V.graph-scoped cache would land on a
+# throwaway handler on every call and never persist (see
+# repro_3392_v_graph_cache.py); the module global persists across compilation
+# and runtime so repeated identical const-scalar fills reuse one device tensor.
+_CONSTANT_TENSOR_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
+_CACHE_LOCK = threading.Lock()
+_CACHE_MAX_SIZE = 1000  # ~128KB of cached scalar tensors
+
+
+def clear_constant_tensor_cache() -> None:
+    """Empty the module-level constant-tensor cache (thread-safe)."""
+    with _CACHE_LOCK:
+        _CONSTANT_TENSOR_CACHE.clear()
+
+
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):
-    return torch.tensor(const_val, dtype=dtype).to(device)
+    """Create or retrieve a cached constant tensor on the device.
+
+    On Spyre the constant is materialized with a device-side fill
+    (``torch.empty`` + ``fill_tensor``), avoiding the host-side
+    ``torch.tensor(...).to(device)`` H2D copy, and memoized in a module-level
+    LRU cache so repeated identical fills reuse one device tensor.  Non-Spyre
+    devices keep the unchanged host path and are not cached.
+
+    Args:
+        const_val: The scalar constant value.
+        device: Target device (str or ``torch.device``, e.g. "spyre").
+        dtype: Tensor dtype (default: ``torch.float16``).
+
+    Returns:
+        A 0-d tensor on ``device`` holding the constant value.  On the Spyre
+        path it is shared across callers requesting the same (value, device,
+        dtype) key and therefore MUST NOT BE MUTATED.
+
+    Note:
+        ``float(const_val)`` makes NaN always miss the cache because
+        ``float("nan") != float("nan")``.  This is intentional: each NaN
+        request gets a fresh tensor rather than an accidental cache match.
+    """
+    device = torch.device(device)
+
+    # Non-Spyre devices (e.g. CPU): keep the plain host path, uncached.
+    if device.type != DEVICE_NAME:
+        return torch.tensor(const_val, dtype=dtype).to(device)
+
+    cache_key = (float(const_val), (device.type, device.index), dtype)
+    with _CACHE_LOCK:
+        if cache_key in _CONSTANT_TENSOR_CACHE:
+            _CONSTANT_TENSOR_CACHE.move_to_end(cache_key)
+            return _CONSTANT_TENSOR_CACHE[cache_key]
+
+        # Device-side fill: allocate uninitialized, then fill via DMA.
+        t = torch.empty((), dtype=dtype, device=device)
+        fill_tensor(t, float(const_val))
+
+        _CONSTANT_TENSOR_CACHE[cache_key] = t
+        while len(_CONSTANT_TENSOR_CACHE) > _CACHE_MAX_SIZE:
+            _CONSTANT_TENSOR_CACHE.popitem(last=False)
+        return t
 
 
 def find_unimplemented(specs: list) -> UnimplementedOp | None:
