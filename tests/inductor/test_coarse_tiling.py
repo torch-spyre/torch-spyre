@@ -4799,6 +4799,94 @@ def _make_full_buffer_read_fixture():
     return tiled_op, full_deps, operations
 
 
+def _make_two_op_shared_read_fixture():
+    """Two tiled ops in the same group both read full_buf at the SAME index
+    expression (mirrors "a+b*a": two reads of "a" with identical indexing,
+    just from two different consuming ops instead of one op's two reads).
+
+    Returns (op_a, op_b, full_buf, operations) with loop_info already
+    stamped on both ops, ready to pass into _plan_read_copies via a single
+    retiled_infos_by_group-style entry:
+    [((0,), [op_a, op_b], {})].
+    """
+    from torch._inductor.ir import (
+        ComputedBuffer,
+        FixedLayout,
+        Pointwise,
+        StorageBox,
+        TensorBox,
+    )
+
+    from torch_spyre._inductor.ir import SpyreEmptyFallback
+
+    device = torch.device("cpu")
+    dtype = torch.float32
+
+    full_buf = SpyreEmptyFallback(
+        torch.ops.spyre.empty.default, [64, 128], device, dtype
+    )
+    full_buf.layout = FixedLayout(device, dtype, [64, 128], [128, 1])
+    full_box = TensorBox(StorageBox(full_buf))
+
+    def _make_reader(name):
+        def inner_fn(index):
+            return full_box.make_loader()(index)
+
+        pw = Pointwise.create(
+            device=device,
+            dtype=dtype,
+            inner_fn=inner_fn,
+            ranges=[Integer(8), Integer(128)],
+        )
+        pw_data = pw.data.data
+        op = ComputedBuffer(
+            name=name,
+            layout=FixedLayout(device, dtype, [Integer(8), Integer(128)], None),
+            data=pw_data,
+        )
+        op.operation_name = name
+        op.origins = OrderedSet()
+        op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,), loop_count=[Integer(8)], loop_tiled_dims=[[0]]
+        )
+        V.graph.name_to_buffer[name] = op
+        return op
+
+    op_a = _make_reader("op_a")
+    op_b = _make_reader("op_b")
+    operations = [full_buf, op_a, op_b]
+    return op_a, op_b, full_buf, operations
+
+
+class TestPlanReadCopies(unittest.TestCase):
+    """_plan_read_copies groups equivalent cross-group reads within a group."""
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    def test_two_ops_same_index_share_one_entry(self):
+        from torch_spyre._inductor.wsr.coarse_tile import _plan_read_copies
+
+        op_a, op_b, full_buf, operations = _make_two_op_shared_read_fixture()
+        retiled_infos_by_group = [((0,), [op_a, op_b], {})]
+
+        plans = _plan_read_copies(operations, retiled_infos_by_group)
+
+        self.assertIn((0,), plans)
+        plan = plans[(0,)]
+        self.assertEqual(len(plan.entries), 1)
+        entry = plan.entries[0]
+        self.assertEqual(entry.dep.name, full_buf.get_name())
+        self.assertEqual(entry.insert_before_op_name, "op_a")
+        self.assertEqual(entry.sizing_op_name, "op_a")
+        self.assertEqual(set(entry.consumer_op_names), {"op_a", "op_b"})
+
+
 class TestReadCopyPlanDataclasses(unittest.TestCase):
     """ReadCopyEntry/ReadCopyPlan are plain frozen dataclasses (Task 1)."""
 

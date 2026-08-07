@@ -94,7 +94,14 @@ from .. import config
 from ..constants import BATCH_MATMUL_OP
 from ..errors import Unsupported
 from ..logging_utils import get_inductor_logger
-from ..loop_info import CoarseTileInfo, PropagationPlan, ReductionPlan, copy_op_metadata
+from ..loop_info import (
+    CoarseTileInfo,
+    PropagationPlan,
+    ReadCopyEntry,
+    ReadCopyPlan,
+    ReductionPlan,
+    copy_op_metadata,
+)
 from ..pass_utils import op_out_coords, host_coordinates, indirect_sizes_from_op
 from ..ir import FixedTiledLayout, SpyreConstantFallback, _resize_device_layout
 
@@ -2650,6 +2657,86 @@ def _insert_read_copy_ops(
             new_loop_info, tiled_dims_per_read=new_tiled_dims_per_read
         )
     return new_op
+
+
+def _plan_read_copies(
+    operations: list[Operation],
+    retiled_infos_by_group: list[
+        tuple[tuple[int, ...], list[Operation], dict[str, "_RetiledBufferInfo"]]
+    ],
+) -> dict[tuple[int, ...], ReadCopyPlan]:
+    """Plan Pass 1's read-copy sharing, with zero mutation.
+
+    For each group, collects every ComputedBuffer op's
+    _full_buffer_read_deps and groups equivalent reads (same buffer name,
+    same per-var index coefficients, same size -- see the canonical key
+    below) into one ReadCopyEntry each, regardless of whether the
+    equivalent reads came from the same op or from different ops in the
+    group. The first op (operations order) with an equivalent read supplies
+    both insert_before_op_name and sizing_op_name; every op in the group
+    with an equivalent read is recorded in consumer_op_names.
+
+    Must run after every group's _apply_plan (see coarse_tile()'s body):
+    _full_buffer_read_deps requires op.loop_info to be stamped and
+    op.get_read_writes() to reflect post-division ranges, neither of which
+    holds before _apply_plan runs for that op's group.
+    """
+    op_position = {op.get_operation_name(): i for i, op in enumerate(operations)}
+    plans: dict[tuple[int, ...], ReadCopyPlan] = {}
+
+    for stamped_group_id, group_ops, _retiled_infos in retiled_infos_by_group:
+        # canonical key -> list of (op, dep) in operations order.
+        keyed: dict[tuple, list[tuple[Operation, MemoryDep]]] = {}
+        for op in group_ops:
+            if not isinstance(op, ComputedBuffer):
+                continue
+            for dep in _full_buffer_read_deps(op):
+                key = (
+                    dep.name,
+                    tuple(dep.index.coeff(v) for v in dep.var_names),
+                    tuple(dep.size),
+                )
+                keyed.setdefault(key, []).append((op, dep))
+
+        entries: list[ReadCopyEntry] = []
+        for n, (key, op_deps) in enumerate(keyed.items()):
+            # Order this key's (op, dep) pairs by their position in
+            # `operations`, not by group_ops's own order, so
+            # insert_before_op_name/sizing_op_name pick the op that is
+            # actually first in the real operations list.
+            op_deps.sort(key=lambda pair: op_position[pair[0].get_operation_name()])
+            sizing_op, sizing_dep = op_deps[0]
+            sizing_info = sizing_op.loop_info  # type: ignore[attr-defined]
+            for other_op, _dep in op_deps[1:]:
+                other_info = other_op.loop_info  # type: ignore[attr-defined]
+                assert (
+                    other_info.loop_count == sizing_info.loop_count
+                    and other_info.loop_tiled_dims == sizing_info.loop_tiled_dims
+                ), (
+                    "_plan_read_copies: ops in the same coarse-tile group "
+                    f"disagree on loop_count/loop_tiled_dims ({other_op.get_name()!r} "
+                    f"vs {sizing_op.get_name()!r} sizing this shared copy of "
+                    f"{key[0]!r}) -- ops in one group must share tiling shape "
+                    "by construction."
+                )
+            copy_name = V.graph.qualify_name(
+                f"coarse_tile_read_copy_{stamped_group_id}_{key[0]}_{n}"
+            )
+            entries.append(
+                ReadCopyEntry(
+                    copy_name=copy_name,
+                    dep=sizing_dep,
+                    insert_before_op_name=sizing_op.get_operation_name(),
+                    sizing_op_name=sizing_op.get_operation_name(),
+                    consumer_op_names=tuple(
+                        op.get_operation_name() for op, _dep in op_deps
+                    ),
+                )
+            )
+        if entries:
+            plans[stamped_group_id] = ReadCopyPlan(entries=tuple(entries))
+
+    return plans
 
 
 def _insert_all_read_copy_ops(operations: list[Operation]) -> None:
