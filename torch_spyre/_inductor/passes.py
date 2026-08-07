@@ -351,6 +351,11 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     Requires FixedTiledLayout (device_layout) on all ops.
     hint-driven groups (hints_to_coarse_tile_groups) are intentionally
     absent: they have already run pre-stickification.
+
+    Passes insert_read_copies=False: layout propagation has already
+    committed every op's device layout by this point, so a read-copy here
+    would only produce an HBM-to-HBM copy with no layout-reconciliation
+    benefit.
     """
     if config.ignore_span_overflow_hints:
         return
@@ -376,7 +381,12 @@ def _maybe_coarse_tile_span_overflow(graph: GraphLowering) -> None:
     op_order = {id(op): idx for idx, op in enumerate(graph.operations)}
     groups.sort(key=lambda group: op_order.get(id(group[0][0]), len(op_order)))
     validate_coarse_tile_groups(groups)
-    coarse_tile(graph, groups=groups, group_idx_offset=group_idx_offset)
+    coarse_tile(
+        graph,
+        groups=groups,
+        group_idx_offset=group_idx_offset,
+        insert_read_copies=False,
+    )
 
 
 @_runs(cost_model_matmul_division, work_distribution)
