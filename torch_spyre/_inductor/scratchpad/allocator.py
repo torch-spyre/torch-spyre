@@ -30,8 +30,8 @@ from torch._inductor.ir import (
     Reduction,
     ReinterpretView,
 )
-from torch._inductor.graph import GraphLowering
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.graph import GraphLowering
 
 from torch_spyre._inductor.pass_utils import (
     apply_splits_from_index_coeff,
@@ -76,6 +76,8 @@ from torch_spyre._inductor.scratchpad.utils import (
     buffer_not_read_in_full,
     get_ncores_for_buffers,
     _is_tiled_advancing,
+    _is_read_advancing_anywhere,
+    _get_buffer_user_deps,
     _would_produce_lx_back_gap,
     OP_OUTPUT_GOOD_FOR_LX_REUSE,
 )
@@ -278,6 +280,7 @@ class ScratchpadAllocator:
         ncores: dict[str, int],
         ncores_reasons: dict[str, str],
         division_is_fixed: bool,
+        buf_user_deps: dict[str, list[tuple[Operation, MemoryDep]]],
     ) -> Optional[str]:
         """The first check ``name`` fails, or ``None`` if it clears them all.
 
@@ -298,6 +301,8 @@ class ScratchpadAllocator:
                 division was committed upstream and a mismatch between a buffer's
                 users is fatal. False on the joint path, where the solver chooses
                 the division and its slicing gate decides instead.
+            buf_user_deps: every buffer's ``(op, dep)`` users, from
+                :func:`_get_buffer_user_deps`, for the read-side advancing check.
         """
         if op is None or not self._op_output_good_for_lx_reuse(op):
             return "op not allowed"
@@ -308,12 +313,15 @@ class ScratchpadAllocator:
             return "unsized (no device layout)"
         if name in mutated_buffers:
             return "mutation target"
-        if _is_tiled_advancing(op):
+        if _is_tiled_advancing(op) or _is_read_advancing_anywhere(name, buf_user_deps):
             # LX addresses cannot be expressed as affine.apply symbols today (see
             # compute_ops.py's is_tiled_lx check), so a buffer whose address
             # advances per coarse-tile iteration must stay in HBM, where that is
-            # supported.
-            return "tiled (advancing), not per_tile_fixed"
+            # supported -- whether the advance is on this buffer's own write
+            # (_is_tiled_advancing) or on some other op's read of it
+            # (_is_read_advancing_anywhere, e.g. a fixed-write full buffer
+            # copied into a nested tile every outer iteration).
+            return "tiled (advancing)"
         restickify = self._restickify_barrier(graph, name, uses)
         if restickify is not None:
             return restickify
@@ -429,6 +437,7 @@ class ScratchpadAllocator:
             ncores, ncores_reasons = get_ncores_for_buffers(graph)
         ncores = ncores or {}
         ncores_reasons = ncores_reasons or {}
+        buf_user_deps = _get_buffer_user_deps(graph)
         return {
             name: self._buffer_residency_reason(
                 graph,
@@ -441,6 +450,7 @@ class ScratchpadAllocator:
                 ncores=ncores,
                 ncores_reasons=ncores_reasons,
                 division_is_fixed=division_is_fixed,
+                buf_user_deps=buf_user_deps,
             )
             for name in names
         }

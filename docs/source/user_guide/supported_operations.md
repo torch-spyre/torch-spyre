@@ -91,6 +91,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.repeat` | | Y | Spyre | Compiled only. `repeat.out` is available as a CPU fallback |
 | `torch.unbind` | Y | Y | Spyre | |
 | `torch.Tensor.unfold` | Y | Y | Spyre | View op |
+| `torch.flip` | Y | Y | Spyre | Custom decomposition to `index_select` gathers; reversing the last (stick) dimension is unsupported and raises |
 | `torch.split` | | Y | Spyre | Compiled only (lowers via `aten.slice`) |
 | `torch.expand` | | Y | Spyre | Compiled only; supported when followed by a materializing op (e.g. `clone`, `contiguous`). Used internally by `ones`, `pad`, and SDPA decompositions |
 | `torch.narrow` / `torch.select` | | Y | Spyre | Compiled only; basic slicing works (see `test_slice` / `test_split`); broader `narrow`/`select` coverage in development |

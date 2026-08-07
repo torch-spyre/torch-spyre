@@ -173,7 +173,6 @@ class TensorArg:
     device_size: list[int]
     device_coordinates: list[Expr]
     allocation: Any
-    per_tile_fixed: bool = False
     name: str | None = None
     device_tile_advance_expr: Expr | None = None
     element_arrangement: ElementArrangement = dataclasses.field(

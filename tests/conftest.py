@@ -398,6 +398,11 @@ def pytest_configure(config):
             for test_entry in file_entry.get("tests", []):
                 for tag in test_entry.get("tags", []):
                     tags.add(tag)
+                edits = test_entry.get("edits") or {}
+                ops = edits.get("ops") or {}
+                for op_item in ops.get("include") or []:
+                    for tag in op_item.get("tags", []):
+                        tags.add(tag)
         for tag in sorted(tags):
             config.addinivalue_line(
                 "markers",
