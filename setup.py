@@ -257,7 +257,7 @@ if __name__ == "__main__":
         if use_spyre_ccl:
             base_define_macros.append(("USE_SPYRE_CCL", None))
         if use_new_system:
-            base_define_macros.append(("USE_FLEX_NAMESPACE", None))
+            base_define_macros.append(("DISABLE_LEGACY_GRAPH_RUNTIME", None))
         if COMPILE_AIUPTI:
             base_define_macros.append(("HAS_AIUPTI", None))
             base_define_macros.append(("USE_KINETO", None))
