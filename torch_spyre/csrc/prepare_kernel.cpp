@@ -637,21 +637,54 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
   // Any other plan shape is left untouched -> runs single-stream (the launch
   // router's has_event_step gate keeps it byte-identical to the pre-overlap
   // path). This also fails safe if a triple's region_id cannot be resolved.
-  if (steps.size() == 3 &&
+  // #1(a) INSTRUMENTATION OPT-OUT: SPYRE_DISABLE_HC_DMA_OVERLAP=1 emits the
+  // un-split 3-step [HostCompute, H2D, Compute] plan -- the pre-change,
+  // single-stream baseline -- so the R8 byte-identical numeric gate can run the
+  // SAME granite decode with overlap ON (default, env unset) vs OFF and
+  // torch.equal the FULL output token-id tensor. Only the exact value "1"
+  // disables; anything else (or unset) keeps overlap ON. This is the ONLY
+  // production behavior toggle added; the instrumented path is otherwise
+  // unchanged.
+  const char* disable_overlap_env = std::getenv("SPYRE_DISABLE_HC_DMA_OVERLAP");
+  const bool overlap_enabled = (disable_overlap_env == nullptr ||
+                                std::string(disable_overlap_env) != "1");
+  if (overlap_enabled && steps.size() == 3 &&
       dynamic_cast<JobPlanStepHostCompute*>(steps[0].get()) != nullptr &&
       dynamic_cast<JobPlanStepH2D*>(steps[1].get()) != nullptr &&
       dynamic_cast<JobPlanStepCompute*>(steps[2].get()) != nullptr) {
     auto* h2d = static_cast<JobPlanStepH2D*>(steps[1].get());
 
+    // #3 EDGE-4 KEY PREMISE (design §3; DEFAULT_1P0_NUM_PROGRAM_REGIONS==1):
+    // the rolling-slot WAR key is a SCALAR region_id, sound ONLY while there is
+    // a single Program region -- then every cached kernel's correction H2D
+    // collapses to the same region_id and consecutive launches serialize
+    // through one slot. If the allocator is ever configured with >1 program
+    // region, distinct kernels' corrections could resolve to DIFFERENT regions
+    // and a scalar key would mis-serialize (or drop) the cross-kernel WAR ->
+    // silent wrong numerics. Fail building the instrumented plan rather than
+    // corrupt, so a future multi-program-region change trips here first.
+    const size_t num_program_regions = SpyreAllocator::getNumProgramRegions();
+    TORCH_CHECK(
+        num_program_regions <= 1,
+        "Two-stream overlap: the edge-4 scalar region_id key assumes a single "
+        "Program region (DEFAULT_1P0_NUM_PROGRAM_REGIONS==1), but the "
+        "allocator reports ",
+        num_program_regions,
+        " program regions. A scalar key would mis-serialize the cross-kernel "
+        "WAR; update the edge-4 key design (per-region keying) before "
+        "enabling >1 program region.");
+
     // region_id is RUNTIME-resolved from the bound CompositeAddress, NOT
     // present in the SpyreCode JSON. Resolve it through the H2D device address,
     // never a raw runtime pointer (design "Hard invariants").
     const auto& dev_addr = h2d->deviceAddress();
-    // BUILD-TIME ASSERT: a single, well-defined correction region. The single
-    // triple has exactly one H2D -> one region_id, so a scalar hash key is
-    // sound. If a plan could target two distinct regions with partial byte
-    // overlap, a scalar key would mis-serialize the WAR (design §3, architect
-    // Q4) -> STOP and report.
+    // chunks().size()==1 asserts only that THIS correction's device address is
+    // a SINGLE contiguous chunk, so chunks()[0] spans the whole correction
+    // range and its region_id is the well-defined key for THIS plan. It does
+    // NOT, by itself, prove a single shared correction region across kernels --
+    // that is the num_program_regions premise guarded above. A multi-chunk
+    // correction address would make chunks()[0].region_id an incomplete key ->
+    // STOP.
     TORCH_CHECK(dev_addr.chunks().size() == 1,
                 "Two-stream overlap: H2D correction address must resolve to a "
                 "single chunk (region_id key), got ",

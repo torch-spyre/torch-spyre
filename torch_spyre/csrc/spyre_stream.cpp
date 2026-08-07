@@ -326,6 +326,15 @@ void SpyreStream::resetEdge4SlotStats() {
   pool.edge4_slot_skips.store(0, std::memory_order_relaxed);
 }
 
+// Test-only: drop all published back-events so a fresh test does not inherit a
+// slot keyed by the deterministic mock region_id. Locks the DEDICATED
+// edge4_mutex (never pool.mutex), matching the other edge-4 accessors.
+void SpyreStream::clearEdge4Slots() {
+  auto& pool = getStreamPool();
+  std::lock_guard<std::mutex> lock(pool.edge4_mutex);
+  pool.edge4_back_events.clear();
+}
+
 void SpyreStream::fillAsync(const flex::CompositeAddress* dst, double value,
                             DataFormats dtype, bool use_dmai) const {
   resolveRuntimeHandle()->fillAsync(dst, value, dtype, use_dmai);

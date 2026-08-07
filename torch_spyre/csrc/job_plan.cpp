@@ -525,6 +525,16 @@ std::string checkJobPlanStepOrdering(const std::vector<StepKind>& kinds,
            " SignalForward vs " + std::to_string(n_wait_fwd) +
            " WaitForward (intra-plan forward events must be matched)";
   }
+  // #6 FORWARD-GUARD: a two-stream plan (any event step present) MUST carry a
+  // forward Ef pair to serialize the cross-stream H2D->Compute RAW (edge-3).
+  // has_event with zero forward signals means only back events were wired --
+  // the device Compute would then race the H2D that feeds it. (The count-match
+  // above already caught the asymmetric case; this catches zero-forward.)
+  if (has_event && n_sig_fwd == 0) {
+    return "forward event pairing violation: a two-stream plan (event steps "
+           "present) must carry a matched forward Ef pair to serialize the "
+           "cross-stream H2D->Compute RAW; found none";
+  }
 
   // Back events (WaitBack/SignalBack) are CROSS-LAUNCH: intentionally NOT
   // count-matched here. An unmatched WaitBack no-ops on an empty rolling slot
