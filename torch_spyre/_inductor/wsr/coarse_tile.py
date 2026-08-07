@@ -2712,10 +2712,8 @@ def _plan_read_copies(
                 # Reduction (e.g. softmax's max) and a sibling Pointwise
                 # (e.g. softmax's x - max) can legitimately tile the very
                 # same logical tensor dim through these two different
-                # fields and still correctly share one copy -- see
-                # docs/superpowers/specs/2026-08-07-read-copy-sharing-and-
-                # disable-design.md for why the plan doesn't need
-                # loop_tiled_dims to build the copy either way.
+                # fields and still correctly share one copy -- the plan
+                # doesn't need loop_tiled_dims to build the copy either way.
                 assert other_info.loop_count == sizing_info.loop_count, (
                     "_plan_read_copies: ops in the same coarse-tile group "
                     f"disagree on loop_count ({other_op.get_name()!r} vs "

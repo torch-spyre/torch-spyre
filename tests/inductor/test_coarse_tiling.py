@@ -5322,6 +5322,119 @@ class TestInsertAllReadCopyOps(unittest.TestCase):
 
         self.assertEqual(operations, before)
 
+    def test_one_consumer_patched_across_two_entries(self):
+        """op_a reads buf_x (shared with op_b) and buf_y (shared with op_c):
+        op_a appears in TWO different ReadCopyEntry.consumer_op_names within
+        the same plan. Each entry's consumer loop rebuilds op_a in place via
+        replace_computed_buffer_body, so the second entry to patch op_a must
+        resolve it by name through a freshly-rebuilt name_to_op, not through
+        a stale object reference captured before the first entry's patch --
+        exactly the object-identity hazard _NameSwapHandler/
+        replace_computed_buffer_body exist to guard against. Confirms both
+        patches land on the final op_a object (it loads both copies, never
+        the original full buffers)."""
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            Pointwise,
+            StorageBox,
+            TensorBox,
+        )
+
+        from torch_spyre._inductor.ir import SpyreEmptyFallback
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _insert_all_read_copy_ops,
+            _plan_read_copies,
+        )
+
+        device = torch.device("cpu")
+        dtype = torch.float32
+
+        def _make_full(name):
+            buf = SpyreEmptyFallback(
+                torch.ops.spyre.empty.default, [8, 8], device, dtype
+            )
+            buf.layout = FixedLayout(device, dtype, [8, 8], [8, 1])
+            buf.name = name
+            V.graph.name_to_buffer[name] = buf
+            return buf
+
+        buf_x = _make_full("buf_x")
+        buf_y = _make_full("buf_y")
+        box_x = TensorBox(StorageBox(buf_x))
+        box_y = TensorBox(StorageBox(buf_y))
+
+        def _make_op(name, boxes):
+            def inner_fn(index):
+                total = boxes[0].make_loader()(index)
+                for box in boxes[1:]:
+                    total = total + box.make_loader()(index)
+                return total
+
+            pw = Pointwise.create(
+                device=device,
+                dtype=dtype,
+                inner_fn=inner_fn,
+                ranges=[Integer(8), Integer(8)],
+            )
+            pw_data = pw.data.data
+            op = ComputedBuffer(
+                name=name,
+                layout=FixedLayout(device, dtype, [Integer(8), Integer(8)], None),
+                data=pw_data,
+            )
+            op.operation_name = name
+            op.origins = OrderedSet()
+            op.loop_info = CoarseTileInfo(
+                loop_group_id=(0,), loop_count=[Integer(1)], loop_tiled_dims=[[]]
+            )
+            V.graph.name_to_buffer[name] = op
+            return op
+
+        # op_a reads both buf_x and buf_y; op_b only buf_x; op_c only buf_y.
+        op_a = _make_op("op_a", [box_x, box_y])
+        op_b = _make_op("op_b", [box_x])
+        op_c = _make_op("op_c", [box_y])
+        operations = [buf_x, buf_y, op_a, op_b, op_c]
+        retiled_infos_by_group = [((0,), [op_a, op_b, op_c], {})]
+
+        plans = _plan_read_copies(operations, retiled_infos_by_group)
+        entries_by_name = {e.dep.name: e for e in plans[(0,)].entries}
+        self.assertEqual(set(entries_by_name), {"buf_x", "buf_y"})
+        self.assertIn("op_a", entries_by_name["buf_x"].consumer_op_names)
+        self.assertIn("op_a", entries_by_name["buf_y"].consumer_op_names)
+
+        _insert_all_read_copy_ops(operations, plans)
+
+        final_op_a = next(
+            o
+            for o in operations
+            if isinstance(o, ComputedBuffer) and o.get_name() == "op_a"
+        )
+
+        class _Recorder(list):
+            def load(self, name, index):
+                self.append(name)
+                return 0.0
+
+            def add(self, a, b):
+                return 0.0
+
+        loaded = _Recorder()
+        with V.set_ops_handler(loaded):
+            final_op_a.data.inner_fn([sympy.Integer(0) for _ in final_op_a.data.ranges])
+
+        copy_names = {
+            op.get_name()
+            for op in operations
+            if isinstance(op, ComputedBuffer)
+            and op.get_name().startswith("coarse_tile_read_copy_")
+        }
+        self.assertEqual(len(copy_names), 2)
+        self.assertEqual(set(loaded), copy_names)
+        self.assertNotIn("buf_x", loaded)
+        self.assertNotIn("buf_y", loaded)
+
 
 class TestInsertReadCopyOps(unittest.TestCase):
     """_insert_read_copy_ops always materializes a real copy, never a view.
