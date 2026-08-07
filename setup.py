@@ -170,13 +170,24 @@ if COMPILE_AIUPTI:  # Include kineto and libaiupti headers
     KINETO_INCLUDE_DIR = Path(torch.__path__[0]) / "include" / "kineto"
     INCLUDE_DIRS += [KINETO_INCLUDE_DIR]
 
-    # On default system install, aiupti is installed in runtime folders
+    # On default system install, aiupti headers are in runtime folders
     if os.environ.get("LIBAIUPTI_INSTALL_DIR", "") != "":
         LIBAIUPTI_DIR = Path(os.environ["LIBAIUPTI_INSTALL_DIR"])
-        LIBRARY_DIRS += [LIBAIUPTI_DIR / "lib"]
         INCLUDE_DIRS += [LIBAIUPTI_DIR / "include"]
 
-    LIBRARIES.insert(-1, "aiupti")  # Build dependency on flex
+    # NB: libaiupti is intentionally NOT linked as a DT_NEEDED dependency of
+    # _C. Loading it arms the flex runtime's per-op telemetry, adding a fixed
+    # per-dispatch cost to every aten op (a large regression under eager
+    # execution). Instead it is linked only by the standalone _aiupti_shim
+    # extension (built below), which _C dlopen's lazily on the first profiler
+    # session (see AiuptiLibrary). libaiupti therefore stays unloaded — and
+    # telemetry dormant — until a trace is requested. `dl` provides
+    # dlopen/dlsym for that lazy load.
+    LIBRARIES.append("dl")
+
+    LIBAIUPTI_LIBRARY_DIRS = list(LIBRARY_DIRS)
+    if os.environ.get("LIBAIUPTI_INSTALL_DIR", "") != "":
+        LIBAIUPTI_LIBRARY_DIRS = [LIBAIUPTI_DIR / "lib"] + LIBAIUPTI_LIBRARY_DIRS
 
 if use_spyre_ccl:
     LIBRARIES.append("spyre_comms")
@@ -232,8 +243,13 @@ if __name__ == "__main__":
         from torch.utils.cpp_extension import BuildExtension, CppExtension
 
         sources = list(CSRC_DIR.glob("*.cpp"))
+        # The shim is built as its own extension (see below); it must not be
+        # compiled into _C, or _C would link libaiupti as a DT_NEEDED dep.
+        shim_source = PROFILER_SRC_DIR / "AiuptiShim.cpp"
         profiler_sources = (
-            list(PROFILER_SRC_DIR.glob("*.cpp")) if COMPILE_AIUPTI else []
+            [p for p in PROFILER_SRC_DIR.glob("*.cpp") if p != shim_source]
+            if COMPILE_AIUPTI
+            else []
         )
         distributed_sources = (
             list(DISTRIBUTED_SRC_DIR.glob("*.cpp")) if use_spyre_ccl else []
@@ -277,6 +293,25 @@ if __name__ == "__main__":
                 ],
             ),
         ]
+
+        if COMPILE_AIUPTI:
+            # Standalone shim that links libaiupti. _C dlopen's this on the
+            # first profiler session so libaiupti is not loaded at import time
+            # (see the DT_NEEDED note above and AiuptiLibrary).
+            ext_modules.append(
+                CppExtension(
+                    name=f"{PACKAGE_NAME}._aiupti_shim",
+                    sources=[shim_source.relative_to(ROOT_DIR).as_posix()],
+                    include_dirs=[str(p) for p in INCLUDE_DIRS],
+                    library_dirs=[str(p) for p in LIBAIUPTI_LIBRARY_DIRS],
+                    libraries=["aiupti"],
+                    extra_compile_args={"cxx": EXTRA_CXX_FLAGS},
+                    define_macros=base_define_macros
+                    + [
+                        ("MODULE_NAME", f'"{PACKAGE_NAME}._aiupti_shim"'),
+                    ],
+                )
+            )
 
         BUILD_DIR = ROOT_DIR / "build"
 

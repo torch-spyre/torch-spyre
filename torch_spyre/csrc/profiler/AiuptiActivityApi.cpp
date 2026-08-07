@@ -20,6 +20,8 @@
 
 #include <c10/util/Logging.h>
 
+#include "AiuptiLibrary.h"
+
 #include <cassert>
 #include <chrono>
 #include <cstdlib>
@@ -75,7 +77,8 @@ static bool nextActivityRecord(uint8_t* buffer, size_t valid_size,
                                Pti_Activity*& record) {
 #ifdef HAS_AIUPTI
   AIUpti_ResultTypes status =
-      aiuptiActivityGetNextRecord(buffer, valid_size, &record);
+      AiuptiLibrary::singleton().activityGetNextRecord(buffer, valid_size,
+                                                       &record);
   if (status != AIUpti_ResultTypes::AIUPTI_SUCCESS) {
     record = nullptr;
   }
@@ -129,7 +132,7 @@ AiuptiActivityApi::activityBuffers() {
 
 #ifdef HAS_AIUPTI
   std::chrono::time_point<std::chrono::system_clock> t1;
-  AIUPTI_CALL(aiuptiFlushAllActivities());
+  AIUPTI_CALL(AiuptiLibrary::singleton().flushAllActivities());
 #endif
 
   std::lock_guard<std::mutex> guard(mutex_);
@@ -178,7 +181,7 @@ void AiuptiActivityApi::clearActivities() {
   //   }
   // }
 #ifdef HAS_AIUPTI
-  AIUPTI_CALL(aiuptiFlushAllActivities());
+  AIUPTI_CALL(AiuptiLibrary::singleton().flushAllActivities());
 #endif
   // TODO(mamaral): verify
   // std::lock_guard<std::mutex> guard(mutex_);
@@ -214,7 +217,8 @@ void AiuptiActivityApi::bufferCompleted(uint8_t* buffer, size_t size,
   // often)
   if (VLOG_IS_ON(1)) {
     size_t dropped = 0;
-    AIUPTI_CALL(aiuptiActivityGetNumDroppedRecords(&dropped));
+    AIUPTI_CALL(
+        AiuptiLibrary::singleton().activityGetNumDroppedRecords(&dropped));
     if (dropped != 0)
       LOG(WARNING) << "Dropped " << dropped << " activity records";
   }
@@ -224,33 +228,33 @@ void AiuptiActivityApi::bufferCompleted(uint8_t* buffer, size_t size,
 void AiuptiActivityApi::enableAiuptiActivities(
     const std::set<libkineto::ActivityType>& selected_activities) {
 #ifdef HAS_AIUPTI
-  AIUPTI_CALL(aiuptiActivityRegisterCallbacks(bufferRequestedTrampoline,
-                                              bufferCompletedTrampoline));
+  AIUPTI_CALL(AiuptiLibrary::singleton().activityRegisterCallbacks(
+      bufferRequestedTrampoline, bufferCompletedTrampoline));
   bool activityEnabled = false;
   externalCorrelationEnabled_ = false;
   for (const auto& activity : selected_activities) {
     if (activity == libkineto::ActivityType::GPU_MEMCPY) {
-      AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_MEMCPY));
-      AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_MEMCPY2));
-      AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_SYNCHRONIZATION));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_MEMCPY));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_MEMCPY2));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_SYNCHRONIZATION));
       activityEnabled = true;
     }
     if (activity == libkineto::ActivityType::GPU_MEMSET) {
       // memset requires memory be also enabled
-      AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_MEMORY));
-      AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_MEMSET));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_MEMORY));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_MEMSET));
       activityEnabled = true;
     }
     if (activity == libkineto::ActivityType::CONCURRENT_KERNEL) {
-      AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_CMPT));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_CMPT));
       activityEnabled = true;
     }
     if (activity == libkineto::ActivityType::PRIVATEUSE1_RUNTIME) {
-      AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_RUNTIME));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_RUNTIME));
       activityEnabled = true;
     }
     if (activity == libkineto::ActivityType::PRIVATEUSE1_DRIVER) {
-      AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_DRIVER));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_DRIVER));
       activityEnabled = true;
     }
   }
@@ -261,14 +265,14 @@ void AiuptiActivityApi::enableAiuptiActivities(
   if (activityEnabled == false) {
     const char* env_value = std::getenv("ProfilerActivity");
     if (env_value != nullptr && std::string(env_value) == "PrivateUse1") {
-      AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_MEMCPY));
-      AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_MEMCPY2));
-      AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_SYNCHRONIZATION));
-      AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_MEMORY));
-      AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_MEMSET));
-      AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_CMPT));
-      AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_RUNTIME));
-      AIUPTI_CALL(aiuptiActivityEnable(AIUPTI_ACTIVITY_KIND_DRIVER));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_MEMCPY));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_MEMCPY2));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_SYNCHRONIZATION));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_MEMORY));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_MEMSET));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_CMPT));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_RUNTIME));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_DRIVER));
     }
   }
 
@@ -284,26 +288,26 @@ void AiuptiActivityApi::disablePtiActivities(
   bool activityDisabled = false;
   for (const auto& activity : selected_activities) {
     if (activity == libkineto::ActivityType::GPU_MEMCPY) {
-      AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_MEMCPY));
-      AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_MEMCPY2));
-      AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_SYNCHRONIZATION));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_MEMCPY));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_MEMCPY2));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_SYNCHRONIZATION));
       activityDisabled = true;
     }
     if (activity == libkineto::ActivityType::GPU_MEMSET) {
-      AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_MEMORY));
-      AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_MEMSET));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_MEMORY));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_MEMSET));
       activityDisabled = true;
     }
     if (activity == libkineto::ActivityType::CONCURRENT_KERNEL) {
-      AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_CMPT));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_CMPT));
       activityDisabled = true;
     }
     if (activity == libkineto::ActivityType::PRIVATEUSE1_RUNTIME) {
-      AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_RUNTIME));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_RUNTIME));
       activityDisabled = true;
     }
     if (activity == libkineto::ActivityType::PRIVATEUSE1_DRIVER) {
-      AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_DRIVER));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_DRIVER));
       activityDisabled = true;
     }
   }
@@ -311,14 +315,14 @@ void AiuptiActivityApi::disablePtiActivities(
   if (activityDisabled == false) {
     const char* env_value = std::getenv("ProfilerActivity");
     if (env_value != nullptr && std::string(env_value) == "PrivateUse1") {
-      AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_MEMCPY));
-      AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_MEMCPY2));
-      AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_SYNCHRONIZATION));
-      AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_MEMORY));
-      AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_MEMSET));
-      AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_CMPT));
-      AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_RUNTIME));
-      AIUPTI_CALL(aiuptiActivityDisable(AIUPTI_ACTIVITY_KIND_DRIVER));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_MEMCPY));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_MEMCPY2));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_SYNCHRONIZATION));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_MEMORY));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_MEMSET));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_CMPT));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_RUNTIME));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_DRIVER));
     }
   }
   externalCorrelationEnabled_ = false;
