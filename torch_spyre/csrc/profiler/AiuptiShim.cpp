@@ -29,9 +29,9 @@
 // correctly-mangled references, so we never hardcode C++ mangled names in
 // dlsym calls.
 
-#include <cstring>
-
 #include <libaiupti/aiupti_activity.h>
+
+#include <cstring>
 
 extern "C" void* ts_aiupti_resolve(const char* name) {
   if (std::strcmp(name, "aiuptiActivityRegisterCallbacks") == 0)

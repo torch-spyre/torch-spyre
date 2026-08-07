@@ -20,8 +20,6 @@
 
 #include <c10/util/Logging.h>
 
-#include "AiuptiLibrary.h"
-
 #include <cassert>
 #include <chrono>
 #include <cstdlib>
@@ -31,6 +29,8 @@
 #include <string>
 #include <thread>
 #include <utility>
+
+#include "AiuptiLibrary.h"
 
 namespace KINETO_NAMESPACE {
 
@@ -76,9 +76,8 @@ void AiuptiActivityApi::popCorrelationID(CorrelationFlowType type) {
 static bool nextActivityRecord(uint8_t* buffer, size_t valid_size,
                                Pti_Activity*& record) {
 #ifdef HAS_AIUPTI
-  AIUpti_ResultTypes status =
-      AiuptiLibrary::singleton().activityGetNextRecord(buffer, valid_size,
-                                                       &record);
+  AIUpti_ResultTypes status = AiuptiLibrary::singleton().activityGetNextRecord(
+      buffer, valid_size, &record);
   if (status != AIUpti_ResultTypes::AIUPTI_SUCCESS) {
     record = nullptr;
   }
@@ -234,27 +233,35 @@ void AiuptiActivityApi::enableAiuptiActivities(
   externalCorrelationEnabled_ = false;
   for (const auto& activity : selected_activities) {
     if (activity == libkineto::ActivityType::GPU_MEMCPY) {
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_MEMCPY));
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_MEMCPY2));
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_SYNCHRONIZATION));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(
+          AIUPTI_ACTIVITY_KIND_MEMCPY));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(
+          AIUPTI_ACTIVITY_KIND_MEMCPY2));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(
+          AIUPTI_ACTIVITY_KIND_SYNCHRONIZATION));
       activityEnabled = true;
     }
     if (activity == libkineto::ActivityType::GPU_MEMSET) {
       // memset requires memory be also enabled
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_MEMORY));
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_MEMSET));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(
+          AIUPTI_ACTIVITY_KIND_MEMORY));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(
+          AIUPTI_ACTIVITY_KIND_MEMSET));
       activityEnabled = true;
     }
     if (activity == libkineto::ActivityType::CONCURRENT_KERNEL) {
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_CMPT));
+      AIUPTI_CALL(
+          AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_CMPT));
       activityEnabled = true;
     }
     if (activity == libkineto::ActivityType::PRIVATEUSE1_RUNTIME) {
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_RUNTIME));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(
+          AIUPTI_ACTIVITY_KIND_RUNTIME));
       activityEnabled = true;
     }
     if (activity == libkineto::ActivityType::PRIVATEUSE1_DRIVER) {
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_DRIVER));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(
+          AIUPTI_ACTIVITY_KIND_DRIVER));
       activityEnabled = true;
     }
   }
@@ -265,14 +272,22 @@ void AiuptiActivityApi::enableAiuptiActivities(
   if (activityEnabled == false) {
     const char* env_value = std::getenv("ProfilerActivity");
     if (env_value != nullptr && std::string(env_value) == "PrivateUse1") {
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_MEMCPY));
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_MEMCPY2));
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_SYNCHRONIZATION));
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_MEMORY));
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_MEMSET));
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_CMPT));
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_RUNTIME));
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_DRIVER));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(
+          AIUPTI_ACTIVITY_KIND_MEMCPY));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(
+          AIUPTI_ACTIVITY_KIND_MEMCPY2));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(
+          AIUPTI_ACTIVITY_KIND_SYNCHRONIZATION));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(
+          AIUPTI_ACTIVITY_KIND_MEMORY));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(
+          AIUPTI_ACTIVITY_KIND_MEMSET));
+      AIUPTI_CALL(
+          AiuptiLibrary::singleton().activityEnable(AIUPTI_ACTIVITY_KIND_CMPT));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(
+          AIUPTI_ACTIVITY_KIND_RUNTIME));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityEnable(
+          AIUPTI_ACTIVITY_KIND_DRIVER));
     }
   }
 
@@ -288,26 +303,34 @@ void AiuptiActivityApi::disablePtiActivities(
   bool activityDisabled = false;
   for (const auto& activity : selected_activities) {
     if (activity == libkineto::ActivityType::GPU_MEMCPY) {
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_MEMCPY));
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_MEMCPY2));
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_SYNCHRONIZATION));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(
+          AIUPTI_ACTIVITY_KIND_MEMCPY));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(
+          AIUPTI_ACTIVITY_KIND_MEMCPY2));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(
+          AIUPTI_ACTIVITY_KIND_SYNCHRONIZATION));
       activityDisabled = true;
     }
     if (activity == libkineto::ActivityType::GPU_MEMSET) {
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_MEMORY));
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_MEMSET));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(
+          AIUPTI_ACTIVITY_KIND_MEMORY));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(
+          AIUPTI_ACTIVITY_KIND_MEMSET));
       activityDisabled = true;
     }
     if (activity == libkineto::ActivityType::CONCURRENT_KERNEL) {
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_CMPT));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(
+          AIUPTI_ACTIVITY_KIND_CMPT));
       activityDisabled = true;
     }
     if (activity == libkineto::ActivityType::PRIVATEUSE1_RUNTIME) {
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_RUNTIME));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(
+          AIUPTI_ACTIVITY_KIND_RUNTIME));
       activityDisabled = true;
     }
     if (activity == libkineto::ActivityType::PRIVATEUSE1_DRIVER) {
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_DRIVER));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(
+          AIUPTI_ACTIVITY_KIND_DRIVER));
       activityDisabled = true;
     }
   }
@@ -315,14 +338,22 @@ void AiuptiActivityApi::disablePtiActivities(
   if (activityDisabled == false) {
     const char* env_value = std::getenv("ProfilerActivity");
     if (env_value != nullptr && std::string(env_value) == "PrivateUse1") {
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_MEMCPY));
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_MEMCPY2));
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_SYNCHRONIZATION));
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_MEMORY));
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_MEMSET));
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_CMPT));
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_RUNTIME));
-      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(AIUPTI_ACTIVITY_KIND_DRIVER));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(
+          AIUPTI_ACTIVITY_KIND_MEMCPY));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(
+          AIUPTI_ACTIVITY_KIND_MEMCPY2));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(
+          AIUPTI_ACTIVITY_KIND_SYNCHRONIZATION));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(
+          AIUPTI_ACTIVITY_KIND_MEMORY));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(
+          AIUPTI_ACTIVITY_KIND_MEMSET));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(
+          AIUPTI_ACTIVITY_KIND_CMPT));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(
+          AIUPTI_ACTIVITY_KIND_RUNTIME));
+      AIUPTI_CALL(AiuptiLibrary::singleton().activityDisable(
+          AIUPTI_ACTIVITY_KIND_DRIVER));
     }
   }
   externalCorrelationEnabled_ = false;

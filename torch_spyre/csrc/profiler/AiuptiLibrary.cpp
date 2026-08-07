@@ -68,9 +68,8 @@ const AiuptiLibrary& AiuptiLibrary::singleton() {
     // deferred until a profiler session actually starts.
     void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
     if (handle == nullptr) {
-      throw std::runtime_error(
-          std::string("Failed to load ") + path +
-          " for AIU profiling: " + dlerror());
+      throw std::runtime_error(std::string("Failed to load ") + path +
+                               " for AIU profiling: " + dlerror());
     }
     auto resolveFn =
         reinterpret_cast<ResolveFn>(dlsym(handle, "ts_aiupti_resolve"));
@@ -92,9 +91,8 @@ const AiuptiLibrary& AiuptiLibrary::singleton() {
     lib.activityGetNumDroppedRecords =
         reinterpret_cast<decltype(lib.activityGetNumDroppedRecords)>(
             resolve(resolveFn, "aiuptiActivityGetNumDroppedRecords"));
-    lib.flushAllActivities =
-        reinterpret_cast<decltype(lib.flushAllActivities)>(
-            resolve(resolveFn, "aiuptiFlushAllActivities"));
+    lib.flushAllActivities = reinterpret_cast<decltype(lib.flushAllActivities)>(
+        resolve(resolveFn, "aiuptiFlushAllActivities"));
   });
   return lib;
 }
