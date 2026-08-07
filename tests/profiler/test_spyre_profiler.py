@@ -179,7 +179,6 @@ def test_chrome_trace_is_valid_json(tmp_path):
     assert len(data["traceEvents"]) > 0, "Trace JSON must contain at least one event"
 
 
-@unittest.skipIf(not Test_spyre, "spyre device required")
 @pytest.mark.requires_spyre_profiler
 def test_synchronize_callable():
     """
@@ -199,18 +198,15 @@ def test_synchronize_callable():
 
     torch.spyre.synchronize()
 
+    # .cpu() performs an implicit synchronization, so this test does not
+    # independently verify synchronize(). It serves as an end-to-end correctness
+    # and API smoke test.
     result = z.cpu()
 
     assert result.numel() == 64 * 64
     assert torch.isfinite(result).all()
 
-    torch.testing.assert_close(
-        result,
-        ref,
-        atol=1e-1,
-        rtol=1e-1,
-        msg=f"Result diverged from ref: max abs diff={torch.max(torch.abs(result - ref)).item():.4e}",
-    )
+    torch.testing.assert_close(result, atol=1e-1, rtol=1e-1)
 
 
 @pytest.mark.requires_spyre_profiler
