@@ -4925,6 +4925,62 @@ class TestPlanReadCopies(unittest.TestCase):
         self.assertEqual(entry.sizing_op_name, "op_a")
         self.assertEqual(set(entry.consumer_op_names), {"op_a", "op_b"})
 
+    def test_same_op_two_reads_same_index_collapse_to_one_entry(self):
+        """a+b*a: one op reading buffer 'a' twice at the identical index
+        must plan exactly one ReadCopyEntry, consumed once by that op."""
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            Pointwise,
+            StorageBox,
+            TensorBox,
+        )
+
+        from torch_spyre._inductor.ir import SpyreEmptyFallback
+        from torch_spyre._inductor.wsr.coarse_tile import _plan_read_copies
+
+        device = torch.device("cpu")
+        dtype = torch.float32
+
+        full_buf = SpyreEmptyFallback(
+            torch.ops.spyre.empty.default, [8, 8], device, dtype
+        )
+        full_buf.layout = FixedLayout(device, dtype, [8, 8], [8, 1])
+        full_box = TensorBox(StorageBox(full_buf))
+
+        def inner_fn(index):
+            a1 = full_box.make_loader()(index)
+            a2 = full_box.make_loader()(index)
+            return a1 + a2
+
+        pw = Pointwise.create(
+            device=device,
+            dtype=dtype,
+            inner_fn=inner_fn,
+            ranges=[Integer(8), Integer(8)],
+        )
+        pw_data = pw.data.data
+        tiled_op = ComputedBuffer(
+            name="tiled_op0",
+            layout=FixedLayout(device, dtype, [Integer(8), Integer(8)], None),
+            data=pw_data,
+        )
+        tiled_op.operation_name = "tiled_op0"
+        tiled_op.origins = OrderedSet()
+        tiled_op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,), loop_count=[Integer(1)], loop_tiled_dims=[[]]
+        )
+        V.graph.name_to_buffer["tiled_op0"] = tiled_op
+
+        operations = [full_buf, tiled_op]
+        retiled_infos_by_group = [((0,), [tiled_op], {})]
+
+        plans = _plan_read_copies(operations, retiled_infos_by_group)
+
+        self.assertEqual(len(plans[(0,)].entries), 1)
+        entry = plans[(0,)].entries[0]
+        self.assertEqual(entry.consumer_op_names, ("tiled_op0",))
+
 
 class TestReadCopyPlanDataclasses(unittest.TestCase):
     """ReadCopyEntry/ReadCopyPlan are plain frozen dataclasses (Task 1)."""
