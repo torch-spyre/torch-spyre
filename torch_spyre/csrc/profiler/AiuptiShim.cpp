@@ -18,12 +18,13 @@
 //
 // This translation unit is compiled into a standalone shared library
 // (torch_spyre/_aiupti_shim.so) that links libaiupti as a DT_NEEDED
-// dependency. torch_spyre._C deliberately does NOT link libaiupti: merely
-// loading it into the process arms the flex runtime's per-op telemetry, which
-// adds a fixed per-dispatch cost to every aten op and dominates the forward
-// pass under eager execution. The profiler dlopen's this shim on the first
-// trace request (pulling libaiupti in at that point) and resolves the aiupti
-// entry points through the single `extern "C"` function below.
+// dependency. torch_spyre._C deliberately does NOT link libaiupti: loaded at
+// process startup it arms the flex runtime's per-op telemetry, which adds a
+// fixed per-dispatch cost to every aten op and dominates the forward pass
+// under eager execution. The profiler dlopen's this shim on the first trace
+// request — after flex is initialized, which is late enough not to arm that
+// path — and resolves the aiupti entry points through the single `extern "C"`
+// function below.
 //
 // Taking the address of each aiupti function here forces the compiler to emit
 // correctly-mangled references, so we never hardcode C++ mangled names in

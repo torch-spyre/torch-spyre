@@ -63,9 +63,11 @@ const AiuptiLibrary& AiuptiLibrary::singleton() {
   static std::once_flag once;
   std::call_once(once, [&]() {
     std::string path = shimPath();
-    // Loading the shim pulls libaiupti in as its DT_NEEDED dependency; this is
-    // the point at which flex per-op telemetry is armed, which is why it is
-    // deferred until a profiler session actually starts.
+    // Loading the shim pulls libaiupti in as its DT_NEEDED dependency. Doing
+    // this lazily (on the first profiler session, after flex is initialized)
+    // rather than linking it into _C keeps libaiupti from being mapped at
+    // startup, which is what would arm flex's per-op telemetry. See
+    // AiuptiLibrary.h.
     void* handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
     if (handle == nullptr) {
       throw std::runtime_error(std::string("Failed to load ") + path +

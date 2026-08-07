@@ -176,13 +176,15 @@ if COMPILE_AIUPTI:  # Include kineto and libaiupti headers
         INCLUDE_DIRS += [LIBAIUPTI_DIR / "include"]
 
     # NB: libaiupti is intentionally NOT linked as a DT_NEEDED dependency of
-    # _C. Loading it arms the flex runtime's per-op telemetry, adding a fixed
-    # per-dispatch cost to every aten op (a large regression under eager
-    # execution). Instead it is linked only by the standalone _aiupti_shim
-    # extension (built below), which _C dlopen's lazily on the first profiler
-    # session (see AiuptiLibrary). libaiupti therefore stays unloaded — and
-    # telemetry dormant — until a trace is requested. `dl` provides
-    # dlopen/dlsym for that lazy load.
+    # _C. Loaded at process startup (as a DT_NEEDED) it arms the flex runtime's
+    # per-op telemetry, adding a fixed per-dispatch cost to every aten op (a
+    # large regression under eager execution); loading it later via dlopen,
+    # after flex is initialized, does not. Instead it is linked only by the
+    # standalone _aiupti_shim extension (built below), which _C dlopen's lazily
+    # on the first profiler session (see AiuptiLibrary). libaiupti therefore
+    # stays unloaded — and telemetry dormant — until a trace is requested, and
+    # a run that never profiles never loads it. `dl` provides dlopen/dlsym for
+    # that lazy load.
     LIBRARIES.append("dl")
 
     LIBAIUPTI_LIBRARY_DIRS = list(LIBRARY_DIRS)

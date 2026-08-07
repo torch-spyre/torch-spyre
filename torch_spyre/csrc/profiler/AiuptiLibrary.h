@@ -24,13 +24,15 @@ namespace KINETO_NAMESPACE {
 // Lazily-resolved entry points into libaiupti.so.
 //
 // libaiupti is deliberately NOT linked as a DT_NEEDED dependency of
-// torch_spyre._C. Merely loading it into the process arms the flex runtime's
-// per-op telemetry path, which adds a fixed per-dispatch cost to every aten
-// op. Under eager execution (CompilationMode.NONE) each op is its own tiny
-// graph, so that cost is paid ~once per op per token and dominates the forward
-// pass. By resolving these symbols via dlopen/dlsym on the first profiler
-// session rather than at import, libaiupti stays unloaded — and telemetry
-// dormant — until a trace is actually requested.
+// torch_spyre._C. Loaded at process startup (as a DT_NEEDED, or via
+// LD_PRELOAD) it arms the flex runtime's per-op telemetry path, which adds a
+// fixed per-dispatch cost to every aten op. Under eager execution
+// (CompilationMode.NONE) each op is its own tiny graph, so that cost is paid
+// ~once per op per token and dominates the forward pass. Loading it later —
+// via dlopen after flex is already initialized — does not arm that path. By
+// dlopen'ing on the first profiler session instead of linking at startup,
+// libaiupti is never mapped early in a normal run: telemetry stays dormant
+// until a trace is requested, and a run that never profiles never loads it.
 struct AiuptiLibrary {
   decltype(&aiuptiActivityRegisterCallbacks) activityRegisterCallbacks =
       nullptr;
