@@ -1472,6 +1472,43 @@ class TestCoarseTile(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             coarse_tile(_graph([op_known]), [([op_unknown], [(0, Integer(2))])])
 
+    def test_insert_read_copies_false_skips_pass_1(self):
+        """insert_read_copies=False must skip both planning and execution
+        of Pass 1 -- a full-buffer boundary read stays a direct read of the
+        full buffer, not redirected to a copy."""
+        from torch._inductor.ir import ComputedBuffer
+
+        gm = fx.symbolic_trace(lambda: None)
+        graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        graph_ctx.__enter__()
+        try:
+            tiled_op, full_deps, operations = _make_full_buffer_read_fixture()
+            self.assertEqual(len(full_deps), 1)
+            full_buf_name = full_deps[0].name
+
+            groups = [([tiled_op], [(0, Integer(8))])]
+            self._run(operations, groups, insert_read_copies=False)
+
+            # No new copy op was inserted: still exactly the original two ops.
+            self.assertEqual(len(operations), 2)
+            loaded_names = []
+
+            class _Recorder:
+                def load(self, name, index):
+                    loaded_names.append(name)
+                    return 0.0
+
+            final_op = next(
+                o
+                for o in operations
+                if isinstance(o, ComputedBuffer) and o.get_name() == "tiled_op0"
+            )
+            with V.set_ops_handler(_Recorder()):
+                final_op.data.inner_fn([sympy.Integer(0) for _ in final_op.data.ranges])
+            self.assertIn(full_buf_name, loaded_names)
+        finally:
+            graph_ctx.__exit__(None, None, None)
+
 
 class TestCoarseTileNested(unittest.TestCase):
     """Verify that the nested group format [(hint_id, K1), ...] works."""
@@ -4256,6 +4293,7 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         from torch_spyre._inductor.loop_info import PropagationPlan
         from torch_spyre._inductor.wsr.coarse_tile import (
             _insert_all_read_copy_ops,
+            _plan_read_copies,
             _propagate_tiled_op,
         )
 
@@ -4332,7 +4370,8 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
             "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
             return_value=set(),
         ):
-            _insert_all_read_copy_ops(operations)
+            read_copy_plans = _plan_read_copies(operations, [((0,), [tiled_op], {})])
+            _insert_all_read_copy_ops(operations, read_copy_plans)
             # Pass 1 may have spliced a replacement for "op0" into
             # operations -- re-resolve by name before calling
             # _propagate_tiled_op, exactly as _insert_all_write_copy_ops'
@@ -4916,6 +4955,153 @@ class TestReadCopyPlanDataclasses(unittest.TestCase):
         self.assertEqual(plan.entries, (entry,))
         with self.assertRaises(Exception):
             plan.entries = ()
+
+
+class TestInsertAllReadCopyOps(unittest.TestCase):
+    """_insert_all_read_copy_ops executes a precomputed ReadCopyPlan."""
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    def test_shared_read_produces_one_copy_for_two_consumers(self):
+        from torch._inductor.ir import ComputedBuffer
+
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _insert_all_read_copy_ops,
+            _plan_read_copies,
+        )
+
+        op_a, op_b, full_buf, operations = _make_two_op_shared_read_fixture()
+        retiled_infos_by_group = [((0,), [op_a, op_b], {})]
+        plans = _plan_read_copies(operations, retiled_infos_by_group)
+
+        _insert_all_read_copy_ops(operations, plans)
+
+        # Exactly one new copy op was inserted: full_buf, copy, op_a, op_b.
+        self.assertEqual(len(operations), 4)
+        copy_buf = operations[1]
+        self.assertIsInstance(copy_buf, ComputedBuffer)
+        self.assertIs(operations[0], full_buf)
+
+        # Both consumers were repointed at the SAME copy buffer name, not
+        # two independent copies.
+        new_op_a = next(
+            o
+            for o in operations
+            if isinstance(o, ComputedBuffer) and o.get_name() == "op_a"
+        )
+        new_op_b = next(
+            o
+            for o in operations
+            if isinstance(o, ComputedBuffer) and o.get_name() == "op_b"
+        )
+
+        class _Recorder(list):
+            def load(self, name, index):
+                self.append(name)
+                return 0.0
+
+        # _Recorder(loaded_by_a) would build a *new* list initialized from
+        # loaded_by_a's (empty) contents, not an alias of it -- appends
+        # inside .load() would then land on the _Recorder instance, not on
+        # loaded_by_a, leaving loaded_by_a permanently empty regardless of
+        # what inner_fn loads. Use each _Recorder instance itself as both
+        # the installed handler and the assertion target.
+        loaded_by_a = _Recorder()
+        loaded_by_b = _Recorder()
+
+        with V.set_ops_handler(loaded_by_a):
+            new_op_a.data.inner_fn([sympy.Integer(0) for _ in new_op_a.data.ranges])
+        with V.set_ops_handler(loaded_by_b):
+            new_op_b.data.inner_fn([sympy.Integer(0) for _ in new_op_b.data.ranges])
+
+        self.assertEqual(loaded_by_a, [copy_buf.get_name()])
+        self.assertEqual(loaded_by_b, [copy_buf.get_name()])
+        self.assertNotIn(full_buf.get_name(), loaded_by_a)
+        self.assertNotIn(full_buf.get_name(), loaded_by_b)
+
+    def test_transposed_read_gets_its_own_copy(self):
+        """a+b+a.t()-style: two reads of the same buffer with different
+        index expressions must NOT share a copy."""
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            Pointwise,
+            StorageBox,
+            TensorBox,
+        )
+
+        from torch_spyre._inductor.ir import SpyreEmptyFallback
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _insert_all_read_copy_ops,
+            _plan_read_copies,
+        )
+
+        device = torch.device("cpu")
+        dtype = torch.float32
+
+        full_buf = SpyreEmptyFallback(
+            torch.ops.spyre.empty.default, [8, 8], device, dtype
+        )
+        full_buf.layout = FixedLayout(device, dtype, [8, 8], [8, 1])
+        full_box = TensorBox(StorageBox(full_buf))
+
+        def inner_fn(index):
+            i, j = index
+            plain = full_box.make_loader()([i, j])
+            transposed = full_box.make_loader()([j, i])
+            return plain + transposed
+
+        pw = Pointwise.create(
+            device=device,
+            dtype=dtype,
+            inner_fn=inner_fn,
+            ranges=[Integer(8), Integer(8)],
+        )
+        pw_data = pw.data.data
+        tiled_op = ComputedBuffer(
+            name="tiled_op0",
+            layout=FixedLayout(device, dtype, [Integer(8), Integer(8)], None),
+            data=pw_data,
+        )
+        tiled_op.operation_name = "tiled_op0"
+        tiled_op.origins = OrderedSet()
+        tiled_op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,), loop_count=[Integer(1)], loop_tiled_dims=[[]]
+        )
+        V.graph.name_to_buffer["tiled_op0"] = tiled_op
+
+        operations = [full_buf, tiled_op]
+        retiled_infos_by_group = [((0,), [tiled_op], {})]
+        plans = _plan_read_copies(operations, retiled_infos_by_group)
+
+        self.assertEqual(len(plans[(0,)].entries), 2)
+
+        _insert_all_read_copy_ops(operations, plans)
+
+        copy_bufs = [
+            op
+            for op in operations
+            if isinstance(op, ComputedBuffer) and op.get_name() != "tiled_op0"
+        ]
+        self.assertEqual(len(copy_bufs), 2)
+
+    def test_disable_flag_skips_everything(self):
+        """An empty read_copy_plans dict (the insert_read_copies=False case)
+        leaves operations untouched."""
+        from torch_spyre._inductor.wsr.coarse_tile import _insert_all_read_copy_ops
+
+        op_a, op_b, full_buf, operations = _make_two_op_shared_read_fixture()
+        before = list(operations)
+
+        _insert_all_read_copy_ops(operations, {})
+
+        self.assertEqual(operations, before)
 
 
 class TestInsertReadCopyOps(unittest.TestCase):
