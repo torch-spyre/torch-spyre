@@ -534,9 +534,39 @@ class InputArgConfig(BaseModel):
         return self
 
 
+class InputArgCache(BaseModel):
+    """A pre-populated KV cache argument (e.g. a decode-step ``past_key_values``).
+
+    A DecoderLayer's decode path runs
+    ``if past_key_values is not None: past_key_values.update(...)`` to append the
+    new token's K/V to the cached past, then attends over the whole span. To
+    reproduce that under a module test we must hand the layer a real ``Cache``
+    already primed with ``past_len`` tokens — a bare tensor list won't do, since
+    the layer calls ``.update()`` on it.
+
+    Built at runtime (see ``InputsEdits.resolved_kwargs``): construct
+    ``cache_path`` from ``config_path``/``config_kwargs`` + ``max_cache_len``,
+    then prime layer ``layer_idx`` with the ``key``/``value`` tensors via
+    ``update()`` so ``get_seq_length()`` reflects the past.
+    """
+
+    cache_path: str  # e.g. "transformers.cache_utils.StaticCache"
+    layer_idx: int
+    key: InputTensorSpec
+    value: InputTensorSpec
+    max_cache_len: Optional[int] = None
+    config_path: Optional[str] = None
+    config_kwargs: Dict[str, Any] = {}
+
+
 # Union type for a single element of edits.inputs.args
 InputArg = Union[
-    InputArgTensor, InputArgTensorList, InputArgConfig, InputArgValue, InputArgPy
+    InputArgTensor,
+    InputArgTensorList,
+    InputArgConfig,
+    InputArgCache,
+    InputArgValue,
+    InputArgPy,
 ]
 
 
@@ -550,7 +580,14 @@ def _parse_input_arg(raw: Any) -> InputArg:
     # Handle already-parsed InputArg objects (from YAML anchors/aliases)
     if isinstance(
         raw,
-        (InputArgTensor, InputArgTensorList, InputArgConfig, InputArgValue, InputArgPy),
+        (
+            InputArgTensor,
+            InputArgTensorList,
+            InputArgConfig,
+            InputArgCache,
+            InputArgValue,
+            InputArgPy,
+        ),
     ):
         return raw
 
@@ -562,6 +599,17 @@ def _parse_input_arg(raw: Any) -> InputArg:
     if "tensor_list" in keys:
         return InputArgTensorList(
             tensor_list=[InputTensorSpec(**t) for t in raw["tensor_list"]]
+        )
+    if "cache" in keys:
+        c = raw["cache"]
+        return InputArgCache(
+            cache_path=c["cache_path"],
+            layer_idx=c["layer_idx"],
+            key=InputTensorSpec(**c["key"]),
+            value=InputTensorSpec(**c["value"]),
+            max_cache_len=c.get("max_cache_len"),
+            config_path=c.get("config_path"),
+            config_kwargs=c.get("config_kwargs", {}) or {},
         )
     # A config arg is identified by either key: "model_id" (load full config via
     # AutoConfig.from_pretrained — no config_path required) or "config_path"
@@ -675,6 +723,74 @@ def _move_to_test_device(obj: Any, test_device: Optional[torch.device]) -> Any:
     if isinstance(obj, list):
         return [_move_to_test_device(item, test_device) for item in obj]
     return obj
+
+
+def _build_cache(
+    arg: "InputArgCache",
+    *,
+    seed: Optional[int],
+    test_device: Optional[torch.device] = None,
+) -> Any:
+    """Reconstruct a KV cache primed with past tokens from an ``InputArgCache``.
+
+    Builds the concrete cache class named by ``cache_path`` (e.g. StaticCache)
+    from ``config_path``/``config_kwargs`` + ``max_cache_len``, then primes layer
+    ``layer_idx`` by a single ``update()`` of the captured past K/V. After this
+    the cache reports ``get_seq_length() == past_len``, so a DecoderLayer's
+    decode forward runs the real ``past_key_values.update(...)`` branch and
+    attends over past + new token — the behaviour a bare tensor list can't
+    reproduce (the layer calls ``.update()`` on the cache object).
+
+    The captured ``key``/``value`` specs hold the populated slice
+    ``[B, num_kv_heads, past_len, head_dim]`` (not the full fixed allocation).
+
+    ``test_device`` places the cache's backing buffers on the target device.
+    A lazily-initialized layer cache (e.g. ``StaticLayer``) pins its ``device``
+    from the FIRST ``update()`` call's ``key_states``, so the priming K/V below
+    are moved to ``test_device`` BEFORE ``update()``. Without this the whole
+    cache stays on CPU, and the module-under-test's own (on-device) decode
+    ``update(key_states, ...)`` mixes an on-device tensor with a CPU cache
+    buffer -> a device-mismatch error inside the compiled region. ``None``
+    (CPU-target runs) leaves the priming tensors on CPU.
+    """
+    import importlib
+
+    # Resolve the cache class (e.g. transformers.cache_utils.StaticCache).
+    cache_module, _, cache_cls_name = arg.cache_path.rpartition(".")
+    if not cache_module:
+        raise ValueError(
+            f"Invalid cache_path {arg.cache_path!r}: expected "
+            f"'package.module.ClassName'"
+        )
+    cache_cls = getattr(importlib.import_module(cache_module), cache_cls_name)
+
+    # Build the model config the cache needs (StaticCache.__init__ requires one).
+    if not arg.config_path:
+        raise ValueError(
+            f"cache spec for {arg.cache_path!r} is missing config_path; "
+            f"regenerate the module config with a config-emitting generator."
+        )
+    cfg_module, _, cfg_cls_name = arg.config_path.rpartition(".")
+    config_cls = getattr(importlib.import_module(cfg_module), cfg_cls_name)
+    config = config_cls(**arg.config_kwargs)
+
+    # Build the past K/V tensors (populated slice) on CPU, then relocate to the
+    # test device so the cache pins its backing buffers there (see docstring).
+    key = _move_to_test_device(arg.key.build(seed=seed), test_device)
+    value = _move_to_test_device(
+        arg.value.build(seed=(None if seed is None else seed + 1)), test_device
+    )
+
+    # max_cache_len must cover the past; fall back to the captured past length.
+    past_len = key.shape[-2]
+    max_cache_len = arg.max_cache_len or past_len
+
+    cache = cache_cls(config=config, max_cache_len=max_cache_len)
+    # Prime the target layer's slot; update() appends and returns the full span.
+    # The device-placed key/value make a lazily-initialized layer pin its
+    # buffers on test_device, matching the on-device decode update() later.
+    cache.update(key, value, arg.layer_idx)
+    return cache
 
 
 class InputsEdits(BaseModel):
@@ -800,6 +916,15 @@ class InputsEdits(BaseModel):
         as attention/rotary layers receive ``hidden_states`` / ``position_ids`` /
         ``position_embeddings`` as kwargs, so without this they would arrive as
         raw dicts (``'dict' object has no attribute 'shape'``).
+        ``tensor`` / ``tensor_list`` / ``config_path`` / ``model_id`` / ``cache``
+        / ``py`` — just like a positional arg. Those are built into real
+        tensors/objects here via the same ``_parse_input_arg`` path used for
+        positional args. Modules such as attention/rotary layers receive
+        ``hidden_states`` / ``position_ids`` / ``position_embeddings`` as kwargs,
+        so without this they would arrive as raw dicts (``'dict' object has no
+        attribute 'shape'``). A DecoderLayer additionally receives
+        ``past_key_values`` as a primed ``Cache`` (the ``cache`` spec) so its
+        decode path runs ``past_key_values.update(...)`` over real past tokens.
 
         For plain (non-spec) string values the resolution order is:
         1. dtype alias ("float16" / "torch.float16") -> torch.dtype via DTYPE_STR_MAP
@@ -818,13 +943,13 @@ class InputsEdits(BaseModel):
 
         # Tensor-spec dicts carry exactly one of these keys; anything else is a
         # plain scalar/dtype/device value handled by the string branch below.
-        _SPEC_KEYS = {"tensor", "tensor_list", "config_path", "model_id", "py"}
+        _SPEC_KEYS = {"tensor", "tensor_list", "config_path", "model_id", "cache", "py"}
 
         out: Dict[str, Any] = {}
         for i, (k, v) in enumerate(self.kwargs.items()):
-            # Build tensor/tensor_list/config/py specs into real objects, mirroring
-            # build_cpu_args() for positional args. Use a per-key seed offset so
-            # distinct kwargs don't share identical random data.
+            # Build tensor/tensor_list/config/cache/py specs into real objects,
+            # mirroring build_cpu_args() for positional args. Use a per-key seed
+            # offset so distinct kwargs don't share identical random data.
             if isinstance(v, dict) and (set(v.keys()) & _SPEC_KEYS):
                 arg = _parse_input_arg(v)
                 inp_seed = None if seed is None else seed + 500000 + i * 131
@@ -842,6 +967,8 @@ class InputsEdits(BaseModel):
                     out[k] = _move_to_test_device(lst, test_device)
                 elif isinstance(arg, InputArgConfig):
                     out[k] = _build_hf_config(arg)
+                elif isinstance(arg, InputArgCache):
+                    out[k] = _build_cache(arg, seed=inp_seed, test_device=test_device)
                 elif isinstance(arg, InputArgPy):
                     out[k] = _eval_py_literal(arg.py)
                 continue
