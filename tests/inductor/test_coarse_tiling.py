@@ -4981,6 +4981,80 @@ class TestPlanReadCopies(unittest.TestCase):
         entry = plans[(0,)].entries[0]
         self.assertEqual(entry.consumer_op_names, ("tiled_op0",))
 
+    def test_partial_sharing_two_entries_different_consumers(self):
+        """op_a reads shared_buf + only_a; op_b reads shared_buf + only_b.
+        Expect two ReadCopyEntry objects: one shared (consumers = op_a,
+        op_b), one each for only_a/only_b (consumers = just that op)."""
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            Pointwise,
+            StorageBox,
+            TensorBox,
+        )
+
+        from torch_spyre._inductor.ir import SpyreEmptyFallback
+        from torch_spyre._inductor.wsr.coarse_tile import _plan_read_copies
+
+        device = torch.device("cpu")
+        dtype = torch.float32
+
+        def _make_full(name, size):
+            buf = SpyreEmptyFallback(torch.ops.spyre.empty.default, size, device, dtype)
+            buf.layout = FixedLayout(device, dtype, size, [size[1], 1])
+            buf.name = name
+            V.graph.name_to_buffer[name] = buf
+            return buf
+
+        shared_buf = _make_full("shared_buf", [8, 8])
+        only_a_buf = _make_full("only_a_buf", [8, 8])
+        only_b_buf = _make_full("only_b_buf", [8, 8])
+
+        shared_box = TensorBox(StorageBox(shared_buf))
+        only_a_box = TensorBox(StorageBox(only_a_buf))
+        only_b_box = TensorBox(StorageBox(only_b_buf))
+
+        def _make_reader(name, extra_box):
+            def inner_fn(index):
+                return shared_box.make_loader()(index) + extra_box.make_loader()(index)
+
+            pw = Pointwise.create(
+                device=device,
+                dtype=dtype,
+                inner_fn=inner_fn,
+                ranges=[Integer(8), Integer(8)],
+            )
+            pw_data = pw.data.data
+            op = ComputedBuffer(
+                name=name,
+                layout=FixedLayout(device, dtype, [Integer(8), Integer(8)], None),
+                data=pw_data,
+            )
+            op.operation_name = name
+            op.origins = OrderedSet()
+            op.loop_info = CoarseTileInfo(
+                loop_group_id=(0,), loop_count=[Integer(1)], loop_tiled_dims=[[]]
+            )
+            V.graph.name_to_buffer[name] = op
+            return op
+
+        op_a = _make_reader("op_a", only_a_box)
+        op_b = _make_reader("op_b", only_b_box)
+        operations = [shared_buf, only_a_buf, only_b_buf, op_a, op_b]
+        retiled_infos_by_group = [((0,), [op_a, op_b], {})]
+
+        plans = _plan_read_copies(operations, retiled_infos_by_group)
+
+        entries_by_name = {e.dep.name: e for e in plans[(0,)].entries}
+        self.assertEqual(
+            set(entries_by_name), {"shared_buf", "only_a_buf", "only_b_buf"}
+        )
+        self.assertEqual(
+            set(entries_by_name["shared_buf"].consumer_op_names), {"op_a", "op_b"}
+        )
+        self.assertEqual(entries_by_name["only_a_buf"].consumer_op_names, ("op_a",))
+        self.assertEqual(entries_by_name["only_b_buf"].consumer_op_names, ("op_b",))
+
 
 class TestReadCopyPlanDataclasses(unittest.TestCase):
     """ReadCopyEntry/ReadCopyPlan are plain frozen dataclasses (Task 1)."""
