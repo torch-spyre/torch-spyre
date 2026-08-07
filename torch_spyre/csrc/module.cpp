@@ -24,6 +24,7 @@
 #include <spyrecode-host-functions/sendataconvert/sen_data_convert.h>
 #include <util/sendefs/sendefs.h>
 
+#include <cstdint>
 #include <cstdlib>     // std::getenv
 #include <filesystem>  // NOLINT(build/c++17)
 #include <flex/flex.hpp>
@@ -429,20 +430,11 @@ PYBIND11_MODULE(_C, m) {
           "get_step_type",
           [](const spyre::JobPlan& plan, size_t idx) {
             TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");
-            const auto& step = plan.steps[idx];
-            if (dynamic_cast<const spyre::JobPlanStepH2D*>(step.get())) {
-              return "H2D";
-            } else if (dynamic_cast<const spyre::JobPlanStepD2H*>(step.get())) {
-              return "D2H";
-            } else if (dynamic_cast<const spyre::JobPlanStepCompute*>(
-                           step.get())) {
-              return "Compute";
-            } else if (dynamic_cast<const spyre::JobPlanStepHostCompute*>(
-                           step.get())) {
-              return "HostCompute";
-            } else {
-              return "Unknown";
-            }
+            // Single source of truth for step-type identification (also used by
+            // the P2-14 ordering validator). Recognizes the two-stream event
+            // steps (SignalForward/WaitForward/SignalBack/WaitBack) that the
+            // old dynamic_cast chain reported as "Unknown".
+            return spyre::stepKindName(spyre::classifyStep(*plan.steps[idx]));
           },
           py::arg("idx"), "Get the type of step at the given index")
       .def(
@@ -453,6 +445,36 @@ PYBIND11_MODULE(_C, m) {
           },
           py::arg("idx"),
           "Get the pipeline_barrier flag for the step at the given index")
+      .def(
+          "get_step_stream_role",
+          [](const spyre::JobPlan& plan, size_t idx) {
+            TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");
+            return plan.steps[idx]->role() == spyre::StreamRole::Prep ? "Prep"
+                                                                      : "Dev";
+          },
+          py::arg("idx"),
+          "Get the stream role (Prep/Dev) for the step at the given index")
+      .def(
+          "get_step_region_id",
+          [](const spyre::JobPlan& plan, size_t idx) -> uint64_t {
+            TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");
+            const auto* step = plan.steps[idx].get();
+            if (const auto* sb =
+                    dynamic_cast<const spyre::JobPlanStepEventSignalBack*>(
+                        step)) {
+              return sb->regionId();
+            }
+            if (const auto* wb =
+                    dynamic_cast<const spyre::JobPlanStepEventWaitBack*>(
+                        step)) {
+              return wb->regionId();
+            }
+            TORCH_CHECK(false, "Step at index ", idx,
+                        " is not a back-event step (SignalBack/WaitBack); has "
+                        "no region_id");
+          },
+          py::arg("idx"),
+          "Get the edge-4 region_id key for a SignalBack/WaitBack step")
       .def("__repr__", [](const spyre::JobPlan& plan) {
         return "<JobPlan steps=" + std::to_string(plan.steps.size()) +
                " job_allocation_size=" +
@@ -482,6 +504,48 @@ PYBIND11_MODULE(_C, m) {
         "Args:\n"
         "    job_plan: The JobPlan to execute\n"
         "    args: Sequence of input/output tensors");
+
+  // ── Two-stream overlap: step-ordering validator + edge-4 instrumentation ──
+
+  // Direct binding of the pure P2-14 ordering checker so the
+  // Placement-Invariant rejection can be tested without constructing real steps
+  // (a real HostCompute needs a deeptools::Hcm + pinned buffers). Takes
+  // parallel lists of StepKind names ("HostCompute"/"H2D"/... per stepKindName)
+  // and StreamRole names
+  // ("Prep"/"Dev"), returns "" when valid or a human-readable error otherwise.
+  m.def(
+      "check_job_plan_step_ordering",
+      [](const std::vector<std::string>& kind_names,
+         const std::vector<std::string>& role_names) {
+        TORCH_CHECK(kind_names.size() == role_names.size(),
+                    "kind_names/role_names length mismatch: ",
+                    kind_names.size(), " vs ", role_names.size());
+        std::vector<spyre::StepKind> kinds;
+        std::vector<spyre::StreamRole> roles;
+        kinds.reserve(kind_names.size());
+        roles.reserve(role_names.size());
+        for (const auto& n : kind_names) {
+          kinds.push_back(spyre::stepKindFromName(n));
+        }
+        for (const auto& n : role_names) {
+          roles.push_back(spyre::streamRoleFromName(n));
+        }
+        return spyre::checkJobPlanStepOrdering(kinds, roles);
+      },
+      py::arg("kind_names"), py::arg("role_names"),
+      "Validate a projected two-stream step ordering; '' if valid else the "
+      "error message.");
+
+  m.def(
+      "edge4_slot_hits", []() { return spyre::SpyreStream::edge4SlotHits(); },
+      "Number of WaitBack rolling-slot HITS (found a published back-event).");
+  m.def(
+      "edge4_slot_skips", []() { return spyre::SpyreStream::edge4SlotSkips(); },
+      "Number of WaitBack rolling-slot SKIPS (empty slot, no-op'd).");
+  m.def(
+      "reset_edge4_slot_stats",
+      []() { spyre::SpyreStream::resetEdge4SlotStats(); },
+      "Reset the edge-4 rolling-slot hit/skip counters to zero.");
 
   // Allocator statistics functions
   m.def(

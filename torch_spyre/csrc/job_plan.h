@@ -178,6 +178,39 @@ class HostBuffer {
 // function is defined as deeptools::processComputeOnHostCommand
 
 /**
+ * @brief Which stream a JobPlanStep runs on in the two-stream overlap topology.
+ *
+ * Prep = the persistent host-compute/prep stream (S_prep, id 65): HostCompute
+ *        and H2D. Dev = the default/current stream (S_dev, id 0): device
+ * Compute and (by default) D2H. Device compute overlaps HC/H2D precisely
+ * because it runs on a DIFFERENT stream, while every op keeps
+ * pipeline_barrier=true (strict per-stream FIFO). See phase1-design.md §1.
+ */
+enum class StreamRole { Prep, Dev };
+
+/**
+ * @brief Coarse classification of a JobPlanStep for structural validation.
+ *
+ * Used by the P2-14 step-ordering validator (checkJobPlanStepOrdering) and the
+ * get_step_type binding. Kept separate from the concrete step classes so the
+ * ordering logic is a PURE function over a projected (StepKind, StreamRole)
+ * sequence and can be unit-tested (e.g. the Placement-Invariant negative test)
+ * without constructing heavyweight steps (a real HostCompute needs a
+ * deeptools::Hcm plus pinned HostBuffers).
+ */
+enum class StepKind {
+  HostCompute,
+  H2D,
+  D2H,
+  Compute,
+  SignalForward,
+  WaitForward,
+  SignalBack,
+  WaitBack,
+  Unknown,
+};
+
+/**
  * @brief Context passed to JobPlanStep::construct() at launch time
  *
  * Carries runtime data available at LaunchKernel time that was not available
@@ -189,6 +222,18 @@ struct LaunchContext {
    *
    */
   const std::vector<at::Tensor>& inputs_outputs;
+
+  /**
+   * @brief Forward (edge-3, intra-launch) cross-stream events.
+   *
+   * Populated FRESH per launch (sized at prepare time to the number of forward
+   * Sig/Wait pairs). A JobPlanStepEventSignalForward writes the event at its
+   * slot; the paired JobPlanStepEventWaitForward reads it. Edge-4
+   * (cross-launch) back-events are NOT here — they live in the StreamPool
+   * rolling map because they must persist across launches. Empty for plans with
+   * no forward events.
+   */
+  std::vector<std::shared_ptr<flex::Event>> events;
 };
 
 /**
@@ -254,11 +299,38 @@ class JobPlanStep {
     return pipeline_barrier_;
   }
 
+  /**
+   * @brief Which stream this step runs on (Prep or Dev).
+   *
+   * Resolved at PrepareKernel time and read by SpyreStream::launch() to route
+   * the step to S_prep or S_dev. Defaults to Dev; subclasses that belong on the
+   * prep stream (HostCompute, H2D) set Prep in their ctor.
+   */
+  StreamRole role() const {
+    return role_;
+  }
+
+  /**
+   * @brief Set the stream role for this step.
+   *
+   * Used by PrepareKernel to override the subclass default when assembling the
+   * two-stream plan (e.g. to force a D2H onto Prep if profiling ever requires
+   * it). Event steps set their role at construction.
+   */
+  void setRole(StreamRole role) {
+    role_ = role;
+  }
+
  protected:
   // true by default: every step is a potential consumer that should wait for
-  // prior ops. Steps that are genuinely overlap-eligible (HostCompute) opt out
-  // explicitly.
+  // prior ops. With the two-stream topology EVERY step keeps this true (strict
+  // per-stream FIFO); overlap comes from the stream split, never from relaxing
+  // a barrier.
   bool pipeline_barrier_ = true;
+
+  // Which stream this step runs on. Defaults to Dev (device compute / D2H);
+  // HostCompute and H2D override to Prep in their ctors.
+  StreamRole role_ = StreamRole::Dev;
 };
 
 /**
@@ -295,7 +367,21 @@ class JobPlanStepH2D final : public JobPlanStep {
    */
   JobPlanStepH2D(void* host_address, flex::CompositeAddress device_address)
       : host_address_(host_address),
-        device_address_(std::move(device_address)) {}
+        device_address_(std::move(device_address)) {
+    role_ = StreamRole::Prep;  // H2D runs on the prep stream (S_prep)
+  }
+
+  /**
+   * @brief Expose the device CompositeAddress so PrepareKernel can resolve the
+   * correction region_id (edge-4 rolling-slot key) from the BOUND address.
+   *
+   * region_id is runtime-resolved from device_address_, not present in the
+   * SpyreCode JSON, so the back-event key must be extracted here rather than
+   * from a raw pointer.
+   */
+  const flex::CompositeAddress& deviceAddress() const {
+    return device_address_;
+  }
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
@@ -434,7 +520,12 @@ class JobPlanStepHostCompute final : public JobPlanStep {
         output_buffer_(output_buffer),
         input_buffer_(input_buffer),
         ishape_(ishape) {
-    pipeline_barrier_ = false;  // host callbacks are overlap-eligible
+    // Inherits pipeline_barrier_ = true from the base. HostCompute keeps strict
+    // per-stream FIFO like every other op; overlap with device compute comes
+    // from placing HostCompute on the prep stream (S_prep), NOT from relaxing
+    // its barrier. The inline synchronize() it triggers only drains S_prep, so
+    // it never blocks device compute on S_dev.
+    role_ = StreamRole::Prep;
   }
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
@@ -446,6 +537,115 @@ class JobPlanStepHostCompute final : public JobPlanStep {
   void* output_buffer_;       // Non-owning pointer (JobPlan owns the buffer)
   const void* input_buffer_;  // Non-owning pointer (JobPlan owns the buffer)
   std::vector<int64_t> ishape_;
+};
+
+/**
+ * @brief Forward (edge-3, intra-launch) event SIGNAL step.
+ *
+ * The producer side of an intra-launch cross-stream edge (H2D on S_prep →
+ * device Compute on S_dev, a RAW on the device buffer). At construct() time it
+ * allocates a FRESH flex::Event, stores it in ctx.events[slot] for the paired
+ * wait to read, and enqueues an EventSignal on this step's stream. Fresh per
+ * launch: the event is single-shot and never reused across launches.
+ */
+class JobPlanStepEventSignalForward final : public JobPlanStep {
+ public:
+  JobPlanStepEventSignalForward(StreamRole role, size_t slot) : slot_(slot) {
+    role_ = role;
+  }
+
+  void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
+  void write(std::ostream& os) const override;
+
+  size_t slot() const {
+    return slot_;
+  }
+
+ private:
+  size_t slot_;  // index into LaunchContext.events
+};
+
+/**
+ * @brief Forward (edge-3, intra-launch) event WAIT step.
+ *
+ * The consumer side: reads the FRESH event from ctx.events[slot] (populated by
+ * the paired signal earlier in the same launch) and enqueues an EventWait on
+ * this step's stream so it blocks until the signal fires.
+ */
+class JobPlanStepEventWaitForward final : public JobPlanStep {
+ public:
+  JobPlanStepEventWaitForward(StreamRole role, size_t slot) : slot_(slot) {
+    role_ = role;
+  }
+
+  void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
+  void write(std::ostream& os) const override;
+
+  size_t slot() const {
+    return slot_;
+  }
+
+ private:
+  size_t slot_;  // index into LaunchContext.events
+};
+
+/**
+ * @brief Back (edge-4, cross-launch + cross-kernel) event SIGNAL step.
+ *
+ * The producer side of the cross-launch WAR edge (device Compute_i on S_dev →
+ * next launch's H2D_{i+1} on S_prep, both touching the shared correction
+ * region). At construct() it allocates a FRESH Event, enqueues an EventSignal
+ * on S_dev, then publishes the event into the StreamPool rolling slot keyed by
+ * region_id (overwriting the previous launch's slot). The event is
+ * runtime-scoped, NOT stored in LaunchContext — it must outlive the launch so
+ * the NEXT launch's WaitBack can read it. Keyed by the scalar region_id (not
+ * the CompositeAddress) so overlapping-but-unequal device pointers into the
+ * same physical region serialize correctly.
+ */
+class JobPlanStepEventSignalBack final : public JobPlanStep {
+ public:
+  JobPlanStepEventSignalBack(StreamRole role, uint64_t region_id)
+      : region_id_(region_id) {
+    role_ = role;
+  }
+
+  void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
+  void write(std::ostream& os) const override;
+
+  uint64_t regionId() const {
+    return region_id_;
+  }
+
+ private:
+  uint64_t region_id_;  // rolling-slot key (correction region)
+};
+
+/**
+ * @brief Back (edge-4, cross-launch + cross-kernel) event WAIT step.
+ *
+ * The consumer side: reads the StreamPool rolling slot for region_id. If a
+ * PRIOR launch published an event there, enqueues an EventWait on S_prep so the
+ * next H2D waits for the prior DC to finish reading the shared region. On the
+ * FIRST launch the slot is empty → this is a NO-OP (nothing to wait on yet), so
+ * an unmatched WaitBack is safe, never a hang. Placement Invariant: this must
+ * be enqueued AFTER HostCompute and BEFORE H2D on S_prep.
+ */
+class JobPlanStepEventWaitBack final : public JobPlanStep {
+ public:
+  JobPlanStepEventWaitBack(StreamRole role, uint64_t region_id)
+      : region_id_(region_id) {
+    role_ = role;
+  }
+
+  void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
+  void write(std::ostream& os) const override;
+
+  uint64_t regionId() const {
+    return region_id_;
+  }
+
+ private:
+  uint64_t region_id_;  // rolling-slot key (correction region)
 };
 
 /**
@@ -541,5 +741,54 @@ struct JobPlan {
  * @return Reference to the output stream
  */
 std::ostream& operator<<(std::ostream& os, const JobPlan& plan);
+
+/**
+ * @brief Classify a JobPlanStep into a StepKind (dynamic_cast dispatch).
+ *
+ * Single source of truth for step-type identification, shared by the
+ * get_step_type binding and the P2-14 ordering validator.
+ */
+StepKind classifyStep(const JobPlanStep& step);
+
+/// Human-readable name for a StepKind (used by get_step_type and validator
+/// error messages). Never returns nullptr.
+const char* stepKindName(StepKind kind);
+
+/// Parse a StepKind from its stepKindName() spelling. Throws on an unknown
+/// name. Used by the check_job_plan_step_ordering Python binding.
+StepKind stepKindFromName(const std::string& name);
+
+/// Parse a StreamRole from "Prep"/"Dev". Throws on an unknown name. Used by the
+/// check_job_plan_step_ordering Python binding.
+StreamRole streamRoleFromName(const std::string& name);
+
+/**
+ * @brief Validate the two-stream step ordering over a PROJECTED sequence.
+ *
+ * Pure function over parallel (kinds, roles) vectors — one entry per step, in
+ * plan order. Returns an empty string when the ordering is valid, otherwise a
+ * human-readable error message. This is the core of the P2-14 validator:
+ * JobPlanBuilder::validate() classifies the real plan and calls this, and the
+ * check_job_plan_step_ordering binding calls it directly so the
+ * Placement-Invariant rejection can be tested without building real steps.
+ *
+ * Rules (phase1-design.md §4/§7, single-triple + cross-launch):
+ *  - Applied only when the plan has a HostCompute or any event step; a plan
+ * with neither (pure ComputeOnDevice, standalone D2H, tensor .to moves) is
+ * legacy single-stream and stays valid unconditionally (backward-compat).
+ *  - S_prep (role Prep) must match  HostCompute -> [WaitBack]? -> H2D ->
+ *    [SignalForward]?  (NO Compute on Prep). The optional-WaitBack slot BETWEEN
+ *    HostCompute and H2D is the Placement Invariant: a WaitBack before the
+ *    HostCompute (or after the H2D) is rejected.
+ *  - S_dev (role Dev) must match  [WaitForward]? -> Compute -> [SignalBack]?
+ *    (NO HostCompute/H2D on Dev), preserving the leading-producer guarantee.
+ *  - Forward events are intra-plan: #SignalForward must equal #WaitForward.
+ *  - Back events are CROSS-LAUNCH; a single plan is NOT count-matched
+ *    (WaitBack<->SignalBack), because the paired step lives in a different
+ *    launch. An unmatched WaitBack is safe — the runtime no-ops on an empty
+ *    rolling slot on the first launch.
+ */
+std::string checkJobPlanStepOrdering(const std::vector<StepKind>& kinds,
+                                     const std::vector<StreamRole>& roles);
 
 }  // namespace spyre

@@ -18,6 +18,7 @@
 
 #include <iostream>
 #include <memory>
+#include <string>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -199,6 +200,107 @@ void JobPlanStepHostCompute::write(std::ostream& os) const {
      << "\n";
 }
 
+namespace {
+
+// Scope-exit guard mirroring JobPlanStepHostCompute's Guard: destroy the flex
+// EventSignalParams even if launchEventSignal throws.
+struct SignalParamsGuard {
+  flex::EventSignalParams* p;
+  ~SignalParamsGuard() {
+    flex::destroyEventSignalParams(p);
+  }
+};
+
+struct WaitParamsGuard {
+  flex::EventWaitParams* p;
+  ~WaitParamsGuard() {
+    flex::destroyEventWaitParams(p);
+  }
+};
+
+}  // namespace
+
+void JobPlanStepEventSignalForward::construct(LaunchContext& ctx,
+                                              const SpyreStream& stream) const {
+  TORCH_CHECK(slot_ < ctx.events.size(), "EventSignalForward slot ", slot_,
+              " out of range (events.size()=", ctx.events.size(), ")");
+  // Allocate a FRESH event for this launch and publish it so the paired wait in
+  // the same launch reads the same object. Single-shot; never reused.
+  auto event = flex::createEvent();
+  ctx.events[slot_] = event;
+  auto* params = flex::createEventSignalParams(event);
+  SignalParamsGuard guard{params};
+  stream.launchEventSignal(params);
+}
+
+void JobPlanStepEventSignalForward::write(std::ostream& os) const {
+  os << "  Event Signal (forward, edge-3)\n";
+  os << "    Slot: " << slot_ << "\n";
+  os << "    Stream role: " << (role_ == StreamRole::Prep ? "Prep" : "Dev")
+     << "\n";
+}
+
+void JobPlanStepEventWaitForward::construct(LaunchContext& ctx,
+                                            const SpyreStream& stream) const {
+  TORCH_CHECK(slot_ < ctx.events.size(), "EventWaitForward slot ", slot_,
+              " out of range (events.size()=", ctx.events.size(), ")");
+  auto event = ctx.events[slot_];
+  TORCH_CHECK(event != nullptr, "EventWaitForward slot ", slot_,
+              " has no event; the paired forward signal must run first");
+  auto* params = flex::createEventWaitParams(event);
+  WaitParamsGuard guard{params};
+  stream.launchEventWait(params);
+}
+
+void JobPlanStepEventWaitForward::write(std::ostream& os) const {
+  os << "  Event Wait (forward, edge-3)\n";
+  os << "    Slot: " << slot_ << "\n";
+  os << "    Stream role: " << (role_ == StreamRole::Prep ? "Prep" : "Dev")
+     << "\n";
+}
+
+void JobPlanStepEventSignalBack::construct(LaunchContext& /*ctx*/,
+                                           const SpyreStream& stream) const {
+  // Allocate a FRESH event, enqueue the signal on S_dev, then publish it into
+  // the runtime-scoped rolling slot so the NEXT launch's WaitBack (keyed by the
+  // same region_id) can read it. Publishing AFTER launchEventSignal keeps the
+  // slot pointing at an event that is already enqueued to be signaled.
+  auto event = flex::createEvent();
+  auto* params = flex::createEventSignalParams(event);
+  SignalParamsGuard guard{params};
+  stream.launchEventSignal(params);
+  SpyreStream::setEdge4Slot(region_id_, event);
+}
+
+void JobPlanStepEventSignalBack::write(std::ostream& os) const {
+  os << "  Event Signal (back, edge-4)\n";
+  os << "    Region id: " << region_id_ << "\n";
+  os << "    Stream role: " << (role_ == StreamRole::Prep ? "Prep" : "Dev")
+     << "\n";
+}
+
+void JobPlanStepEventWaitBack::construct(LaunchContext& /*ctx*/,
+                                         const SpyreStream& stream) const {
+  // Read the rolling slot for this region. On the first launch the slot is
+  // empty → NO-OP (nothing to wait on). On later launches it holds the prior
+  // launch's SigBack event, so the next H2D waits for the prior DC to stop
+  // reading the shared correction region (edge-4 WAR).
+  auto event = SpyreStream::getEdge4Slot(region_id_);
+  if (event == nullptr) {
+    return;  // first launch: no prior producer to wait on
+  }
+  auto* params = flex::createEventWaitParams(event);
+  WaitParamsGuard guard{params};
+  stream.launchEventWait(params);
+}
+
+void JobPlanStepEventWaitBack::write(std::ostream& os) const {
+  os << "  Event Wait (back, edge-4)\n";
+  os << "    Region id: " << region_id_ << "\n";
+  os << "    Stream role: " << (role_ == StreamRole::Prep ? "Prep" : "Dev")
+     << "\n";
+}
+
 std::ostream& operator<<(std::ostream& os, const JobPlan& plan) {
   os << "============ JobPlan =============\n";
   os << "Total steps: " << plan.steps.size() << "\n";
@@ -245,6 +347,191 @@ std::ostream& operator<<(std::ostream& os, const JobPlan& plan) {
 
   os << "==================================\n";
   return os;
+}
+
+StepKind classifyStep(const JobPlanStep& step) {
+  if (dynamic_cast<const JobPlanStepHostCompute*>(&step)) {
+    return StepKind::HostCompute;
+  }
+  if (dynamic_cast<const JobPlanStepH2D*>(&step)) {
+    return StepKind::H2D;
+  }
+  if (dynamic_cast<const JobPlanStepD2H*>(&step)) {
+    return StepKind::D2H;
+  }
+  if (dynamic_cast<const JobPlanStepCompute*>(&step)) {
+    return StepKind::Compute;
+  }
+  if (dynamic_cast<const JobPlanStepEventSignalForward*>(&step)) {
+    return StepKind::SignalForward;
+  }
+  if (dynamic_cast<const JobPlanStepEventWaitForward*>(&step)) {
+    return StepKind::WaitForward;
+  }
+  if (dynamic_cast<const JobPlanStepEventSignalBack*>(&step)) {
+    return StepKind::SignalBack;
+  }
+  if (dynamic_cast<const JobPlanStepEventWaitBack*>(&step)) {
+    return StepKind::WaitBack;
+  }
+  return StepKind::Unknown;
+}
+
+const char* stepKindName(StepKind kind) {
+  switch (kind) {
+    case StepKind::HostCompute:
+      return "HostCompute";
+    case StepKind::H2D:
+      return "H2D";
+    case StepKind::D2H:
+      return "D2H";
+    case StepKind::Compute:
+      return "Compute";
+    case StepKind::SignalForward:
+      return "SignalForward";
+    case StepKind::WaitForward:
+      return "WaitForward";
+    case StepKind::SignalBack:
+      return "SignalBack";
+    case StepKind::WaitBack:
+      return "WaitBack";
+    case StepKind::Unknown:
+    default:
+      return "Unknown";
+  }
+}
+
+StepKind stepKindFromName(const std::string& name) {
+  if (name == "HostCompute") return StepKind::HostCompute;
+  if (name == "H2D") return StepKind::H2D;
+  if (name == "D2H") return StepKind::D2H;
+  if (name == "Compute") return StepKind::Compute;
+  if (name == "SignalForward") return StepKind::SignalForward;
+  if (name == "WaitForward") return StepKind::WaitForward;
+  if (name == "SignalBack") return StepKind::SignalBack;
+  if (name == "WaitBack") return StepKind::WaitBack;
+  if (name == "Unknown") return StepKind::Unknown;
+  TORCH_CHECK(false, "Unknown StepKind name: ", name);
+}
+
+StreamRole streamRoleFromName(const std::string& name) {
+  if (name == "Prep") return StreamRole::Prep;
+  if (name == "Dev") return StreamRole::Dev;
+  TORCH_CHECK(false, "Unknown StreamRole name: ", name, " (expected Prep/Dev)");
+}
+
+std::string checkJobPlanStepOrdering(const std::vector<StepKind>& kinds,
+                                     const std::vector<StreamRole>& roles) {
+  if (kinds.size() != roles.size()) {
+    return "kinds/roles length mismatch";
+  }
+
+  // Gate: only validate plans built as HostCompute-led and/or two-stream (any
+  // event step). A plan with neither is legacy single-stream and stays valid
+  // (backward-compat with the pre-overlap path: pure ComputeOnDevice,
+  // standalone D2H, tensor .to() moves).
+  bool has_host_compute = false;
+  bool has_event = false;
+  for (StepKind k : kinds) {
+    if (k == StepKind::HostCompute) {
+      has_host_compute = true;
+    }
+    if (k == StepKind::SignalForward || k == StepKind::WaitForward ||
+        k == StepKind::SignalBack || k == StepKind::WaitBack) {
+      has_event = true;
+    }
+  }
+  if (!has_host_compute && !has_event) {
+    return "";
+  }
+
+  // Project into the two per-stream subsequences, preserving plan order.
+  std::vector<StepKind> prep;
+  std::vector<StepKind> dev;
+  for (size_t i = 0; i < kinds.size(); ++i) {
+    if (roles[i] == StreamRole::Prep) {
+      prep.push_back(kinds[i]);
+    } else {
+      dev.push_back(kinds[i]);
+    }
+  }
+
+  auto name_at = [](const std::vector<StepKind>& seq, size_t i) {
+    return std::string(i < seq.size() ? stepKindName(seq[i]) : "<end>");
+  };
+
+  // S_prep: HostCompute -> [WaitBack]? -> H2D -> [SignalForward]?
+  {
+    size_t i = 0;
+    if (i >= prep.size() || prep[i] != StepKind::HostCompute) {
+      return "S_prep ordering violation: prep stream must begin with "
+             "HostCompute, got " +
+             name_at(prep, i);
+    }
+    ++i;
+    if (i < prep.size() && prep[i] == StepKind::WaitBack) {
+      ++i;  // optional edge-4 WaitBack, correctly placed after HostCompute
+    }
+    if (i >= prep.size() || prep[i] != StepKind::H2D) {
+      return "S_prep ordering violation: expected H2D after HostCompute (with "
+             "an optional WaitBack between them per the Placement Invariant), "
+             "got " +
+             name_at(prep, i);
+    }
+    ++i;
+    if (i < prep.size() && prep[i] == StepKind::SignalForward) {
+      ++i;  // optional forward signal
+    }
+    if (i != prep.size()) {
+      return "S_prep ordering violation: unexpected step " + name_at(prep, i) +
+             " (prep allows only HostCompute -> [WaitBack]? -> H2D -> "
+             "[SignalForward]?; a misplaced WaitBack or any Compute on the "
+             "prep "
+             "stream lands here)";
+    }
+  }
+
+  // S_dev: [WaitForward]? -> Compute -> [SignalBack]?
+  {
+    size_t i = 0;
+    if (i < dev.size() && dev[i] == StepKind::WaitForward) {
+      ++i;  // optional forward wait
+    }
+    if (i >= dev.size() || dev[i] != StepKind::Compute) {
+      return "S_dev ordering violation: expected Compute (optionally preceded "
+             "by WaitForward), got " +
+             name_at(dev, i) +
+             " (no HostCompute/H2D permitted on the device stream)";
+    }
+    ++i;
+    if (i < dev.size() && dev[i] == StepKind::SignalBack) {
+      ++i;  // optional back signal
+    }
+    if (i != dev.size()) {
+      return "S_dev ordering violation: unexpected step " + name_at(dev, i) +
+             " (dev allows only [WaitForward]? -> Compute -> [SignalBack]?)";
+    }
+  }
+
+  // Forward events are intra-plan: signals must match waits.
+  size_t n_sig_fwd = 0;
+  size_t n_wait_fwd = 0;
+  for (StepKind k : kinds) {
+    if (k == StepKind::SignalForward) ++n_sig_fwd;
+    if (k == StepKind::WaitForward) ++n_wait_fwd;
+  }
+  if (n_sig_fwd != n_wait_fwd) {
+    return "forward event pairing violation: " + std::to_string(n_sig_fwd) +
+           " SignalForward vs " + std::to_string(n_wait_fwd) +
+           " WaitForward (intra-plan forward events must be matched)";
+  }
+
+  // Back events (WaitBack/SignalBack) are CROSS-LAUNCH: intentionally NOT
+  // count-matched here. An unmatched WaitBack no-ops on an empty rolling slot
+  // (first launch); an unmatched SignalBack simply publishes for a future
+  // launch. Their placement is already enforced by the per-stream walks above.
+
+  return "";
 }
 
 }  // namespace spyre
