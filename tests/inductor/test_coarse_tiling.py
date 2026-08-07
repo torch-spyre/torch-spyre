@@ -1509,6 +1509,95 @@ class TestCoarseTile(unittest.TestCase):
         finally:
             graph_ctx.__exit__(None, None, None)
 
+    def test_end_to_end_shares_one_copy_across_group(self):
+        """Full coarse_tile() entry point: two hint-driven ops in one group
+        both reading the same full InputBuffer at the same index must end
+        up sharing exactly one inserted read-copy op.
+
+        This closes the loop that Tasks 2/3/6/7's direct
+        _plan_read_copies/_insert_all_read_copy_ops tests don't cover: it
+        is the only test that also runs coarse_tile()'s later by-name
+        resync loop (_patch_retiled_load_indexes, near the end of
+        coarse_tile()'s body), which could in principle silently break
+        Pass 1's sharing if it replaced an op object Pass 1 already
+        consumed by name.
+        """
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            InputBuffer,
+            Pointwise,
+            StorageBox,
+            TensorBox,
+        )
+        from torch_spyre._inductor.propagate_hints import DimHint
+
+        gm = fx.symbolic_trace(lambda: None)
+        graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        graph_ctx.__enter__()
+        try:
+            device = torch.device("cpu")
+            dtype = torch.float32
+
+            # One real, full-size InputBuffer shared by both ops below --
+            # unlike _make_real_pointwise_op (which allocates a fresh
+            # InputBuffer per op), both readers here load the exact same
+            # buffer object at the exact same index, so _plan_read_copies
+            # should key them into a single ReadCopyEntry.
+            shared_input = InputBuffer(
+                name="shared_in", layout=FixedLayout(device, dtype, [64], [1])
+            )
+            V.graph.name_to_buffer["shared_in"] = shared_input
+            shared_box = TensorBox(StorageBox(shared_input))
+
+            def _make_reader(name):
+                def inner_fn(index):
+                    return shared_box.make_loader()(index)
+
+                pw = Pointwise.create(
+                    device=device,
+                    dtype=dtype,
+                    inner_fn=inner_fn,
+                    ranges=[Integer(64)],
+                )
+                pw_data = pw.data.data  # TensorBox -> StorageBox -> Pointwise
+                op = ComputedBuffer(
+                    name=name,
+                    layout=FixedLayout(device, dtype, [Integer(64)], None),
+                    data=pw_data,
+                )
+                op.operation_name = name
+                op.origins = OrderedSet()
+                V.graph.name_to_buffer[name] = op
+                op._test_out_coords = [sympy.Symbol("c0")]
+                op.dim_hints = [
+                    DimHint(
+                        dim_names=["dim0"],
+                        split_count=1,
+                        loop_var=sympy.Symbol("c0"),
+                        is_reduction=False,
+                        hint_id=0,
+                    )
+                ]
+                return op
+
+            op_a = _make_reader("op_a")
+            op_b = _make_reader("op_b")
+            operations = [op_a, op_b]
+            groups = [([op_a, op_b], [(0, Integer(8))])]
+
+            self._run(operations, groups)
+
+            copy_ops = [
+                op
+                for op in operations
+                if isinstance(op, ComputedBuffer)
+                and op.get_name().startswith("coarse_tile_read_copy_")
+            ]
+            self.assertEqual(len(copy_ops), 1)
+        finally:
+            graph_ctx.__exit__(None, None, None)
+
 
 class TestCoarseTileNested(unittest.TestCase):
     """Verify that the nested group format [(hint_id, K1), ...] works."""
