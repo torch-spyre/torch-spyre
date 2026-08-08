@@ -176,4 +176,3 @@ inline std::pair<size_t, size_t> elementSize(const c10::ScalarType& dtype) {
   return {val, val};
 }
 }  // namespace spyre
-
