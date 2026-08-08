@@ -1423,12 +1423,6 @@ class TestCoarseTile(unittest.TestCase):
     def tearDown(self):
         self._patch.stop()
 
-    def _run(self, all_ops, groups, **kwargs):
-        if kwargs.pop("insert_read_copies", True):
-            coarse_tile_pre_stickify(_graph(all_ops), groups, **kwargs)
-        else:
-            coarse_tile_post_stickify(_graph(all_ops), groups, **kwargs)
-
     def test_empty_groups_list_is_noop(self):
         data = _make_pointwise([Integer(32)])
         op = _make_op(data, "op0")
@@ -1480,8 +1474,8 @@ class TestCoarseTile(unittest.TestCase):
                 _graph([op_known]), [([op_unknown], [(0, Integer(2))])]
             )
 
-    def test_insert_read_copies_false_skips_pass_1(self):
-        """insert_read_copies=False must skip both planning and execution
+    def test_post_stickify_skips_pass_1(self):
+        """coarse_tile_post_stickify must skip both planning and execution
         of Pass 1 -- a full-buffer boundary read stays a direct read of the
         full buffer, not redirected to a copy."""
         from torch._inductor.ir import ComputedBuffer
@@ -1495,7 +1489,7 @@ class TestCoarseTile(unittest.TestCase):
             full_buf_name = full_deps[0].name
 
             groups = [([tiled_op], [(0, Integer(8))])]
-            self._run(operations, groups, insert_read_copies=False)
+            coarse_tile_post_stickify(_graph(operations), groups)
 
             # No new copy op was inserted: still exactly the original two ops.
             self.assertEqual(len(operations), 2)
@@ -1594,7 +1588,7 @@ class TestCoarseTile(unittest.TestCase):
             operations = [op_a, op_b]
             groups = [([op_a, op_b], [(0, Integer(8))])]
 
-            self._run(operations, groups)
+            coarse_tile_pre_stickify(_graph(operations), groups)
 
             copy_ops = [
                 op
