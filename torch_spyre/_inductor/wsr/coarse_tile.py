@@ -2771,13 +2771,14 @@ def _plan_read_copies(
                 # same logical tensor dim through these two different
                 # fields and still correctly share one copy -- the plan
                 # doesn't need loop_tiled_dims to build the copy either way.
-                assert other_info.loop_count == sizing_info.loop_count, (
-                    "_plan_read_copies: ops in the same coarse-tile group "
-                    f"disagree on loop_count ({other_op.get_name()!r} vs "
-                    f"{sizing_op.get_name()!r} sizing this shared copy of "
-                    f"{key[0]!r}) -- ops in one group must share trip counts "
-                    "by construction."
-                )
+                if other_info.loop_count != sizing_info.loop_count:
+                    raise Unsupported(
+                        "_plan_read_copies: ops in the same coarse-tile "
+                        f"group disagree on loop_count ({other_op.get_name()!r} "
+                        f"vs {sizing_op.get_name()!r} sizing this shared copy "
+                        f"of {key[0]!r}) -- ops in one group must share trip "
+                        "counts by construction."
+                    )
             group_tag = "_".join(str(i) for i in stamped_group_id)
             copy_name = V.graph.qualify_name(
                 f"coarse_tile_read_copy_{group_tag}_{key[0]}_{n}"
