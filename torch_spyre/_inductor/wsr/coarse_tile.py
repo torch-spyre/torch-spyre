@@ -2450,7 +2450,7 @@ def _insert_one_read_copy(
             # back to a default row-major allocation, preserving
             # element_arrangement -- same fallback _allocate_full_buffer
             # uses for its own grow-direction resize failures.
-            logger.debug(
+            logger.warning(
                 "_insert_one_read_copy: _resize_device_layout could not "
                 "classify %r (full_size=%s tile_size=%s); using "
                 "row-major fallback",
