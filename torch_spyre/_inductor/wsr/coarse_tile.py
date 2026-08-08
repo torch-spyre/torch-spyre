@@ -1396,19 +1396,18 @@ def _is_constant_fill(op: ComputedBuffer) -> bool:
     )
 
 
-def coarse_tile(
+def coarse_tile_pre_stickify(
     graph: GraphLowering,
     groups: list[tuple],
     group_idx_offset: int = 0,
-    insert_read_copies: bool = True,
 ) -> None:
-    """Plan then transform: stamp loop_group_id / loop_count and scale ranges.
+    """Hint-driven coarse tiling.  Runs PRE-stickification.
 
     Parameters
     ----------
-    operations:
-        The full ordered list of IR operations (as seen by
-        CustomPreSchedulingPasses).  Modified in-place when the
+    graph:
+        Provides ``operations``, the full ordered list of IR operations (as
+        seen by CustomPreSchedulingPasses).  Modified in-place when the
         transformation phase inserts new buffer/copy ops.
     groups:
         Sequence of ``(ops, levels)`` tuples produced by
@@ -1416,16 +1415,60 @@ def coarse_tile(
         ``(hint_id, count)`` pairs, outermost first.
     group_idx_offset:
         Starting index for group IDs assigned to the first group.  Use this
-        when making a second ``coarse_tile`` call on the same graph so that
-        the new group IDs do not collide with IDs already stamped by an
-        earlier call (e.g. hint-driven groups stamped pre-stickification).
-    insert_read_copies:
-        When False, skip both planning and insertion of Pass 1's read
-        copy-ins entirely. Set False by _maybe_coarse_tile_span_overflow
-        (passes.py): at that post-stickify call site, every op's device
-        layout is already committed by layout propagation, so a read-copy
-        buys no layout reconciliation and would only produce an HBM-to-HBM
-        copy with no benefit.
+        when making a second call on the same graph so that the new group
+        IDs do not collide with IDs already stamped by an earlier call.
+
+    Plans and inserts read copy-ins (Pass 1), reduction machinery (Pass 2),
+    and write copy-outs (Pass 3). See coarse_tile_post_stickify for the
+    post-stickification counterpart, which never needs Pass 1.
+    """
+    _coarse_tile_common(graph, groups, group_idx_offset, run_read_copies=True)
+
+
+def coarse_tile_post_stickify(
+    graph: GraphLowering,
+    groups: list[tuple],
+    group_idx_offset: int = 0,
+) -> None:
+    """Span-overflow coarse tiling.  Runs POST-stickification.
+
+    Parameters
+    ----------
+    graph:
+        Provides ``operations``, the full ordered list of IR operations (as
+        seen by CustomPreSchedulingPasses).  Modified in-place when the
+        transformation phase inserts new buffer/copy ops.
+    groups:
+        Sequence of ``(ops, levels)`` tuples produced by
+        ``span_overflow_groups``.  ``levels`` is a list of
+        ``(hint_id, count)`` pairs, outermost first.
+    group_idx_offset:
+        Starting index for group IDs assigned to the first group.  Use this
+        so span-overflow group IDs do not collide with any hint-driven
+        groups already stamped by an earlier coarse_tile_pre_stickify call.
+
+    Every op's device layout is already committed by layout propagation by
+    the time this runs, so Pass 1 (read copy-ins) is skipped
+    unconditionally: a read-copy here would only produce an HBM-to-HBM copy
+    with no layout-reconciliation benefit. See coarse_tile_pre_stickify for
+    the pre-stickification counterpart.
+    """
+    _coarse_tile_common(graph, groups, group_idx_offset, run_read_copies=False)
+
+
+def _coarse_tile_common(
+    graph: GraphLowering,
+    groups: list[tuple],
+    group_idx_offset: int,
+    run_read_copies: bool,
+) -> None:
+    """Plan then transform: stamp loop_group_id / loop_count and scale ranges.
+
+    Shared plan-then-transform body for both stickify entry points --
+    run_read_copies is an internal-only switch (never exposed publicly) so
+    the two ~10-step orchestration bodies aren't duplicated. See
+    coarse_tile_pre_stickify/coarse_tile_post_stickify for the two public
+    entry points that call this.
     """
     operations = graph.operations
 
@@ -1464,9 +1507,9 @@ def coarse_tile(
     # group's _apply_plan above, not alongside _plan_tiling_propagation)
     # because it needs op.loop_info stamped and ranges already divided --
     # see _plan_read_copies's own docstring. Skipped entirely when
-    # insert_read_copies is False (e.g. the post-stickify call site, where
-    # layout propagation already ran and a read-copy buys nothing).
-    if insert_read_copies:
+    # run_read_copies is False (the post-stickify call site, where layout
+    # propagation already ran and a read-copy buys nothing).
+    if run_read_copies:
         read_copy_plans = _plan_read_copies(operations, retiled_infos_by_group)
         _insert_all_read_copy_ops(operations, read_copy_plans)
 
