@@ -39,11 +39,13 @@ tiled dimension from its ``loop_var`` in ``dim_hints``.
 
 Each ``ops`` list must be a contiguous sub-sequence of ``operations``.
 
-After stamping, ``coarse_tile`` runs a fixed sequence of passes --
-``_insert_all_read_copy_ops``, ``_insert_all_reduction_ops``,
-``_insert_all_write_copy_ops`` -- that allocate full-sized output buffers and
-insert copy/mutation/reduction ops for tiled operations whose results are
-consumed outside the loop, all driven by the ``PropagationPlan`` each op's
+After stamping, each entry point runs its own sequence of passes.
+``coarse_tile_pre_stickify`` runs ``_insert_all_read_copy_ops``,
+``_insert_all_reduction_ops``, then ``_insert_all_write_copy_ops``;
+``coarse_tile_post_stickify`` skips ``_insert_all_read_copy_ops`` and runs
+only the latter two. All three passes allocate full-sized output buffers
+and insert copy/mutation/reduction ops for tiled operations whose results
+are consumed outside the loop, driven by the ``PropagationPlan`` each op's
 ``loop_info`` already carries from planning.
 
 Before touching any ``inner_fn``/``layout``/``MutationLayoutSHOULDREMOVE``
@@ -453,9 +455,10 @@ def _plan_tiling_propagation(
     # _graph_output_names' own name-based buffer lookup.
     # Prefer this call's own plan (the freshest data, for ops this call is
     # about to stamp); fall back to a real, already-stamped loop_info
-    # attribute for ops outside this plan (e.g. from an earlier coarse_tile()
-    # call on the same graph, or already-processed groups within a chained
-    # call) -- exactly the candidates _find_outside_consumers/
+    # attribute for ops outside this plan (e.g. from an earlier
+    # coarse_tile_pre_stickify()/coarse_tile_post_stickify() call on the
+    # same graph, or already-processed groups within a chained call) --
+    # exactly the candidates _find_outside_consumers/
     # _full_buffer_read_deps consult via getattr(op, "loop_info", None) at
     # transformation time.
     name_to_group_outer_key: dict[str, int] = {}
@@ -2707,7 +2710,7 @@ def _plan_read_copies(
     both insert_before_op_name and sizing_op_name; every op in the group
     with an equivalent read is recorded in consumer_op_names.
 
-    Must run after every group's _apply_plan (see coarse_tile()'s body):
+    Must run after every group's _apply_plan (see _coarse_tile_common's body):
     _full_buffer_read_deps requires op.loop_info to be stamped and
     op.get_read_writes() to reflect post-division ranges, neither of which
     holds before _apply_plan runs for that op's group.
@@ -3144,7 +3147,8 @@ def _propagate_tiled_reduction_op(
         # stamped op's real, offset-adjusted loop_group_id -- its own
         # loop_group_id is still the pre-offset internal numbering
         # plan_coarse_tile_groups used only for its own bookkeeping (see
-        # coarse_tile()'s comment on group_idx_offset). Re-slice from
+        # coarse_tile_pre_stickify's/coarse_tile_post_stickify's comment on
+        # group_idx_offset). Re-slice from
         # op.loop_info's now-real loop_group_id so the fill/copy ops this
         # function stamps with fill_loop_info end up in the same outer group
         # as every other op here, not a stale, potentially colliding one.
