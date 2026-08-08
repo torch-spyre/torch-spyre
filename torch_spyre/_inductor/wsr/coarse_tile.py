@@ -31,7 +31,7 @@ to innermost.  For a single-level group this is a 1-element list ``[K]``.
 Entry point::
 
     groups = hints_to_coarse_tile_groups(graph)
-    coarse_tile(graph, groups)
+    coarse_tile_pre_stickify(graph, groups)
 
 ``groups`` is a list of ``(ops, levels)`` tuples where ``levels`` is a list of
 ``(hint_id, count)`` pairs, outermost first.  Each op resolves its own
