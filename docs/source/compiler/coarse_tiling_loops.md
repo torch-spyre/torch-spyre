@@ -31,7 +31,7 @@ what constraints forced each choice — see the companion RFC
 
 - [Design Overview](#design-overview)
 - [Small Example](#small-example)
-- [Layer 1 — IR pass & `coarse_tile_pre_stickify()`/`coarse_tile_post_stickify()` API](#layer-1--pre-scheduling-ir-pass)
+- [Layer 1 — IR pass & `coarse_tile()` API](#layer-1--pre-scheduling-ir-pass)
   - [`reorder_unhinted_interlopers`](#reorder_unhinted_interlopers-pre-grouping-pass)
   - [Groups derivation and placement](#groups-derivation-and-placement-in-custompreschedulingpasses)
 - [Layer 2 — `CountedLoopSchedulerNode`](#layer-2--countedloopschedulernode)
@@ -128,12 +128,10 @@ hand-editing; see `docs/tools/README.md` for usage.
 
 ### What the coarse-tiling pass stamps
 
-The coarse-tile entry points (`coarse_tile_pre_stickify`/
-`coarse_tile_post_stickify`) see this as a nested group spec and stamp a
-single `loop_info: CoarseTileInfo` attribute on **both** `ir.Operation`
-objects. This is the real, captured value of `buf0`'s (`y = a + b`'s)
-`loop_info` immediately after the call runs, before any later pass touches
-it:
+`coarse_tile()` sees this as a nested group spec and stamps a single
+`loop_info: CoarseTileInfo` attribute on **both** `ir.Operation` objects. This
+is the real, captured value of `buf0`'s (`y = a + b`'s) `loop_info`
+immediately after `coarse_tile()` runs, before any later pass touches it:
 
 ```python
 from torch_spyre._inductor.loop_info import CoarseTileInfo
@@ -342,8 +340,7 @@ Key points:
   for how that layout redirects without changing the loop's per-tile
   `Pointwise.ranges`.
 - **`tiled_dims_per_read` and `output_tiled_dims` are already visible here**,
-  not just at the moment the coarse-tile entry point first stamps them (see
-  [What the
+  not just at the moment `coarse_tile()` first stamps them (see [What the
   coarse-tiling pass stamps](#what-the-coarse-tiling-pass-stamps) above) —
   they survive `span_reduction`, `work_distribution`, and
   `scratchpad_planning` unchanged, since none of those passes touch
@@ -926,60 +923,39 @@ bypass this:
 object.__setattr__(data, "ranges", ranges)
 ```
 
-### Public API: `coarse_tile_pre_stickify()` / `coarse_tile_post_stickify()`
+### Public API: `coarse_tile()`
 
 ```python
-def coarse_tile_pre_stickify(
-    graph: GraphLowering,
-    groups: list[tuple],
-    group_idx_offset: int = 0,
-) -> None:
-
-def coarse_tile_post_stickify(
+def coarse_tile(
     graph: GraphLowering,
     groups: list[tuple],
     group_idx_offset: int = 0,
 ) -> None:
 ```
 
-There are two public entry points with identical signatures.
-`coarse_tile_pre_stickify` is used for hint-driven groups, stamped before
-stickification; `coarse_tile_post_stickify` is used for span-overflow
-groups, stamped after stickification (once every op's device layout is
-already committed, a read-copy would only produce an HBM-to-HBM copy with
-no layout-reconciliation benefit). Both delegate to a shared private
-driver, `_coarse_tile_common(graph, groups, group_idx_offset,
-run_read_copies)`, passing `run_read_copies=True`/`False` respectively —
-the only difference between the two entry points is whether Pass 1 (read
-copy-ins, `_insert_all_read_copy_ops`) runs; Pass 2
-(`_insert_all_reduction_ops`) and Pass 3 (`_insert_all_write_copy_ops`) run
-either way.
-
 `groups` is a pre-computed list of group tuples produced by
-`hints_to_coarse_tile_groups` (for `coarse_tile_pre_stickify`) or
-`span_overflow_groups` (for `coarse_tile_post_stickify`).  Each `ops` list
-must be a contiguous sub-sequence of `graph.operations`; a gap indicates a
-data-flow dependency crossing the group boundary and raises `RuntimeError`.
-The full `GraphLowering` is required (not just the operations list) because
+`hints_to_coarse_tile_groups`.  Each `ops` list must be a contiguous
+sub-sequence of `graph.operations`; a gap indicates a data-flow dependency
+crossing the group boundary and raises `RuntimeError`.  The full
+`GraphLowering` is required (not just the operations list) because
 `insert_tiling_propagation` calls `V.graph` APIs to allocate new buffers.
-`group_idx_offset` lets a caller make a second `coarse_tile_pre_stickify`/
-`coarse_tile_post_stickify` call on the same graph (e.g. hint-driven groups
-stamped pre-stickification, followed by a later span-overflow-driven call)
-without the new call's group IDs colliding with IDs already stamped by the
-earlier one.
+`group_idx_offset` lets a caller make a second `coarse_tile()` call on the
+same graph (e.g. hint-driven groups stamped pre-stickification, followed by
+a later span-overflow-driven call) without the new call's group IDs
+colliding with IDs already stamped by the earlier one.
 
-`_coarse_tile_common` itself is a thin plan-then-transform driver: it calls
+`coarse_tile()` itself is a thin plan-then-transform driver: it calls
 `plan_coarse_tile_groups(operations, groups)` exactly once, up front, for
 every group in the list.  Planning does zero IR mutation — it only decides
 each op's tiling attributes and raises `Unsupported` if any op in any group
 can't be tiled (see "Sequential recurrences are rejected at planning time"
-below).  Only if that single planning call succeeds does
-`_coarse_tile_common` move on to transformation: it loops over `groups`
-again and calls `_apply_plan` once per group to perform the actual IR
-mutation, followed by `insert_tiling_propagation`,
-`_zero_fixed_tile_advance_exprs`, and `_patch_retiled_load_indexes`.  There
-is no per-group interleaving of planning and mutation — every group is
-planned before any group is transformed.
+below).  Only if that single planning call succeeds does `coarse_tile()`
+move on to transformation: it loops over `groups` again and calls
+`_apply_plan` once per group to perform the actual IR mutation, followed by
+`insert_tiling_propagation`, `_zero_fixed_tile_advance_exprs`, and
+`_patch_retiled_load_indexes`.  There is no per-group interleaving of
+planning and mutation — every group is planned before any group is
+transformed.
 
 Each group tuple has the form:
 
@@ -1007,9 +983,9 @@ they are derived per-op inside `plan_coarse_tile_groups` by consulting each
 op's `DimHint.loop_var`.
 
 `plan_coarse_tile_groups` always receives this canonical list-of-pairs
-representation; for hint-driven groups it is built by `_hints_levels()`
-inside `hints_to_coarse_tile_groups` in `coarse_tile.py` before
-`coarse_tile_pre_stickify` plans and then transforms each group.
+representation; it is built by `_hints_levels()` inside
+`hints_to_coarse_tile_groups` in `coarse_tile.py` before `coarse_tile()`
+plans and then transforms each group.
 
 ### `reorder_unhinted_interlopers`: pre-grouping pass
 
@@ -1183,7 +1159,7 @@ for buffer lifetime analysis.
 
 ### Buffer propagation: `insert_tiling_propagation`
 
-`_coarse_tile_common` calls `insert_tiling_propagation(operations, groups)`
+`coarse_tile()` calls `insert_tiling_propagation(operations, groups)`
 immediately after stamping all loop attributes.  Its job is to ensure that
 any op whose result is consumed **outside** the loop (or is a graph output)
 exposes a complete, fully-sized buffer to its consumers.  Ops whose outputs
@@ -1646,13 +1622,13 @@ is rejected outright, before any IR mutation happens.
 
 **Detection, not propagation.** `plan_coarse_tile_groups` (the planning
 phase — see
-[Public API: `coarse_tile_pre_stickify()`/`coarse_tile_post_stickify()`](#public-api-coarse_tile_pre_stickify-coarse_tile_post_stickify))
-calls `_seed_buffer_for_carry` on every op that is loop-invariant at the
-group's reduction-tiled level(s) (`_plan_is_loop_invariant_at_reduction_levels`
+[Public API: `coarse_tile()`](#public-api-coarse_tile)) calls
+`_seed_buffer_for_carry` on every op that is loop-invariant at the group's
+reduction-tiled level(s) (`_plan_is_loop_invariant_at_reduction_levels`
 gates this call). If `_seed_buffer_for_carry` identifies `op` as the
 carry-producing step of such a recurrence, planning raises `Unsupported`
-immediately — `_coarse_tile_common` never reaches the transformation phase
-for that group, and no buffers are allocated or rewired for the recurrence.
+immediately — `coarse_tile()` never reaches the transformation phase for
+that group, and no buffers are allocated or rewired for the recurrence.
 `_seed_buffer_for_carry` exists purely to answer "does this op need a
 pattern we don't support," not to drive any propagation; there is no
 `accum_tile`/`carry_prev` machinery, no copy-in/copy-out placement, and no
@@ -2064,8 +2040,7 @@ LoopSpec(
 
 `OpSpec.tiled_symbols` is populated by `SpyreKernel.create_op_spec`: it
 reads `loop_info.loop_tiled_dims` (a `list[list[int]]`) from the
-`ir.Operation` (stamped by `coarse_tile_pre_stickify`/
-`coarse_tile_post_stickify`), and for each loop level
+`ir.Operation` (stamped by `coarse_tile()`), and for each loop level
 selects the symbols at those indices from the scheduler-level
 `iteration_space` dict.  The result is stored innermost-first.
 `MemoryDep.ranges` preserves the `data.ranges` ordering, so this positional
@@ -2164,7 +2139,7 @@ landed.
 |---|---|
 | `torch_spyre/_inductor/loop_info.py` | Layer 1: `CoarseTileInfo` dataclass; `copy_op_metadata` |
 | `torch_spyre/_inductor/wsr/coarse_tile_hints.py` | `reorder_unhinted_interlopers()` reorders interlopers before grouping |
-| `torch_spyre/_inductor/wsr/coarse_tile.py` | Layer 1: `coarse_tile_pre_stickify()`/`coarse_tile_post_stickify()` stamp `loop_info` and rewrite ranges; `insert_tiling_propagation` handles the data perimeter |
+| `torch_spyre/_inductor/wsr/coarse_tile.py` | Layer 1: `coarse_tile()` stamps `loop_info` and rewrites ranges; `insert_tiling_propagation` handles the data perimeter |
 | `torch_spyre/_inductor/insert_restickify.py` | Commits deferred `_pending_per_tile_fixed` flags in `finalize_layouts`; derives a restickify buffer's own `per_tile_fixed` from the *consuming* op's `loop_info` rather than inheriting the source layout's flag, needed when the restickify buffer takes over an advancing accumulator's role (the nested output-dim + reduction-dim tiling copy-out into `accum_tile`, `_insert_reduction_copy_op`) |
 | `torch_spyre/_inductor/scheduler.py` | Layer 2: `CountedLoopSchedulerNode`, `build_loop_scheduler_nodes`, `_codegen_counted_loop`, `_regroup_by_outer_loop_key` |
 | `torch_spyre/_inductor/op_spec.py` | Layer 3: `LoopSpec` and `OpSpec` dataclasses |
@@ -2173,8 +2148,8 @@ landed.
 | `torch_spyre/_inductor/passes.py` | Wires all passes into `CustomPreSchedulingPasses` and `CustomPreFusionPasses` |
 | `torch_spyre/_inductor/propagate_hints.py` | `spyre_hint()` context manager; `DimHint`; hint collection/recovery across AOT re-tracing |
 | `torch_spyre/_inductor/wsr/propagate_named_dims.py` | `propagate_named_dims()` and `assign_dim_hints()`: attach `dim_hints` to `ir.Operation` objects |
-| `torch_spyre/_inductor/wsr/coarse_tile_hints.py` | `hints_to_coarse_tile_groups()`: converts `dim_hints` into `coarse_tile_pre_stickify()` group tuples |
-| `torch_spyre/_inductor/wsr/coarse_tile.py` | `coarse_tile_pre_stickify()`/`coarse_tile_post_stickify()` entry points |
+| `torch_spyre/_inductor/wsr/coarse_tile_hints.py` | `hints_to_coarse_tile_groups()`: converts `dim_hints` into `coarse_tile()` group tuples |
+| `torch_spyre/_inductor/wsr/coarse_tile.py` | `coarse_tile()` entry point |
 | `tests/inductor/test_coarse_tiling.py` | Unit tests: IR pass, propagation, scheduler node, bundle MLIR output |
 | `tests/inductor/test_coarse_tile_e2e.py` | End-to-end compilation tests |
 
@@ -2425,8 +2400,8 @@ and they are staged deliberately rather than combined:
 2. **`_patch_retiled_load_indexes`** fixes a different problem: *other* ops
    whose captured load index still carries the pre-tiling stride
    coefficient for a buffer that has since been re-tiled. This is driven
-   exactly once, at the very end of `_coarse_tile_common`, after every group
-   in the call has been processed — not per-group. `_stride_rewrite_map`
+   exactly once, at the very end of `coarse_tile()`, after every group in
+   the call has been processed — not per-group. `_stride_rewrite_map`
    (in `coarse_tile.py`) builds the substitution from old to new
    stride coefficients; `_retile_load_index_from_strides`
    (in `coarse_tile.py`) checks that the load index is affine and
