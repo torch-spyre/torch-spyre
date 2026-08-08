@@ -19,7 +19,7 @@ from collections import Counter
 from sympy import Integer, Symbol, Expr
 
 from torch._inductor.virtualized import V
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.constants import (
     IDENTITY_OP,
     INPUT_DIM_LABELS,
@@ -74,7 +74,6 @@ class SDSCArgs:
     arg_index: int = -1
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
-    per_tile_fixed: bool = False
     device_tile_advance_expr: Expr | None = None
 
     def __str__(self) -> str:
@@ -286,8 +285,8 @@ def _get_device_dim_order(
 def _get_layout_label(
     layouts: dict,
     dim_order: list,
-    stick_dim_order: Symbol | None,
-    stick_size: int,
+    stick_dim_order: list,
+    stick_size: list,
     layout_labels: list[str],
 ) -> str:
     for label, layout in layouts.items():
@@ -322,14 +321,18 @@ def _get_padded_iteration_space(
     padding: dict = {}
     for sdsc_arg, op_spec_arg, dim_order in zip(sdsc_args, op_spec_args, dim_order):
         layout = layouts[sdsc_arg.layout]
-        stick_dim = layout["stick_dim_order"]
+        stick_dim_order = layout["stick_dim_order"]
+        stick_size = layout["stick_size"]
         dev_size = op_spec_arg.device_size[-2::-1]
         for idx, dim in enumerate(dim_order):
-            if idx >= len(dev_size) or dim != stick_dim:
+            if idx >= len(dev_size) or dim not in stick_dim_order:
                 continue
-            unaligned = sdsc_iteration_space[dim] % layout["stick_size"]
+            effective_stick_size = (
+                stick_size[0] if len(stick_size) == 1 else stick_size[0] * stick_size[1]
+            )
+            unaligned = sdsc_iteration_space[dim] % effective_stick_size
             if unaligned > 0:
-                padding[dim] = layout["stick_size"] - unaligned
+                padding[dim] = effective_stick_size - unaligned
                 sdsc_iteration_space[dim] += padding[dim]
     return padding
 
@@ -567,6 +570,8 @@ def _create_sdsc_tensors(
     sdsc_args: list[SDSCArgs] = []
 
     for i, arg in enumerate(op_spec.args):
+        is_fp8_mm_kernel_arg = arg.element_arrangement == ElementArrangement.QFP8WT
+
         # Step 1: Determine dimension order and stick dimension.
         # Index tensors use their pre-computed layout (their coords have no IndirectAccess).
         if has_indirect_access and i in index_tensor_layouts:
@@ -722,8 +727,17 @@ def _create_sdsc_tensors(
             else:
                 max_dim_sizes[mb_sym] = -1
 
-        effective_stick = op_stick_dim if stick_dim is None else stick_dim
+        effective_stick = [op_stick_dim if stick_dim is None else stick_dim]
         layout_labels = MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS
+
+        # Special handling for FP8 matmul KERNEL tensor
+        dtype_stick_size = arg.device_dtype.elems_per_stick()
+        layout_stick_size = [dtype_stick_size]
+        if is_fp8_mm_kernel_arg:
+            # FP8 KERNEL needs 2D stick: [2, stick_size/2]
+            layout_stick_size = [2, dtype_stick_size // 2]
+            # Use the last two dimensions from dim_order for 2D stick
+            effective_stick = dim_order[-2:]
 
         if has_indirect_access:
             label = get_indirect_layout_label(
@@ -732,7 +746,7 @@ def _create_sdsc_tensors(
                 layouts,
                 dim_order,
                 effective_stick,
-                arg.device_dtype.elems_per_stick(),
+                layout_stick_size,
                 layout_labels,
                 _get_layout_label,
                 logger,
@@ -742,7 +756,7 @@ def _create_sdsc_tensors(
                 layouts,
                 dim_order,
                 effective_stick,
-                arg.device_dtype.elems_per_stick(),
+                layout_stick_size,
                 layout_labels,
             )
 
@@ -785,7 +799,6 @@ def _create_sdsc_tensors(
                 arg_index=arg.arg_index,
                 is_index_tensor=is_idx_tensor,
                 related_value_tensor_idx=related_val_idx,
-                per_tile_fixed=arg.per_tile_fixed,
                 device_tile_advance_expr=arg.device_tile_advance_expr,
             )
         )
@@ -1133,7 +1146,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                     ),
                     None,
                 )
-                if dim_sym is None or dim_sym == stick_dim:
+                if dim_sym is None or dim_sym in stick_dim:
                     continue
                 padded_it_size = sdsc_iteration_space[dim_sym]
                 dev_dim_size = op_spec_arg.device_size[coord_idx]

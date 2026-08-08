@@ -1,5 +1,5 @@
 test_suite_config:
-  labels: [core, full, device_critical]
+  labels: [core]
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/profiler/test_spyre_profiler.py
       unlisted_test_mode: mandatory_success
@@ -15,4 +15,8 @@ test_suite_config:
         - names:
             - TestSpyreProfiler::test_event_list
             - TestSpyreProfiler::test_profiler_timestamp_consistency
+          mode: mandatory_success
+        - names:
+            - TestMemoryProfilerTimeline::test_memory_timeline_no_id_spyre
+            - TestMemoryProfilerTimeline::test_memory_timeline_no_id_cpu
           mode: mandatory_success
