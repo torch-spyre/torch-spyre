@@ -84,7 +84,8 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _retile_load_index_from_strides,
     _should_patch_retiled_load_indexes,
     _stride_rewrite_map,
-    coarse_tile,
+    coarse_tile_post_stickify,
+    coarse_tile_pre_stickify,
     plan_coarse_tile_groups,
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
@@ -1423,13 +1424,16 @@ class TestCoarseTile(unittest.TestCase):
         self._patch.stop()
 
     def _run(self, all_ops, groups, **kwargs):
-        coarse_tile(_graph(all_ops), groups, **kwargs)
+        if kwargs.pop("insert_read_copies", True):
+            coarse_tile_pre_stickify(_graph(all_ops), groups, **kwargs)
+        else:
+            coarse_tile_post_stickify(_graph(all_ops), groups, **kwargs)
 
     def test_empty_groups_list_is_noop(self):
         data = _make_pointwise([Integer(32)])
         op = _make_op(data, "op0")
         original = list(data.ranges)
-        coarse_tile(_graph([op]), [])
+        coarse_tile_pre_stickify(_graph([op]), [])
         self.assertFalse(hasattr(op, "loop_info") and op.loop_info != MagicMock())
         self.assertEqual(data.ranges, original)
 
@@ -1437,7 +1441,7 @@ class TestCoarseTile(unittest.TestCase):
         op_extern = _make_non_computed_op("extern0")
         data = _make_pointwise([Integer(16)])
         op_computed = _make_hinted_op(data, "op0", hints=((0, 0),))
-        coarse_tile(
+        coarse_tile_pre_stickify(
             _graph([op_extern, op_computed]),
             [([op_extern, op_computed], [(0, Integer(2))])],
         )
@@ -1449,7 +1453,7 @@ class TestCoarseTile(unittest.TestCase):
         n = Symbol("N", positive=True)
         data = _make_pointwise([n])
         op = _make_hinted_op(data, "op0", hints=((0, 0),))
-        coarse_tile(_graph([op]), [([op], [(0, k)])])
+        coarse_tile_pre_stickify(_graph([op]), [([op], [(0, k)])])
         self.assertEqual(op.loop_info.loop_count, [k])
         self.assertEqual(simplify(data.ranges[0] - n / k), 0)
 
@@ -1461,7 +1465,9 @@ class TestCoarseTile(unittest.TestCase):
         op1 = _make_hinted_op(d1, "op1", hints=((0, 0),))
         op2 = _make_hinted_op(d2, "op2", hints=((0, 0),))
         with self.assertRaises(RuntimeError):
-            coarse_tile(_graph([op0, op1, op2]), [([op0, op2], [(0, Integer(4))])])
+            coarse_tile_pre_stickify(
+                _graph([op0, op1, op2]), [([op0, op2], [(0, Integer(4))])]
+            )
 
     def test_op_not_in_operations_raises(self):
         data = _make_pointwise([Integer(32)])
@@ -1470,7 +1476,9 @@ class TestCoarseTile(unittest.TestCase):
             _make_pointwise([Integer(8)]), "unknown", hints=((0, 0),)
         )
         with self.assertRaises(RuntimeError):
-            coarse_tile(_graph([op_known]), [([op_unknown], [(0, Integer(2))])])
+            coarse_tile_pre_stickify(
+                _graph([op_known]), [([op_unknown], [(0, Integer(2))])]
+            )
 
     def test_insert_read_copies_false_skips_pass_1(self):
         """insert_read_copies=False must skip both planning and execution
@@ -1615,7 +1623,9 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_spec_stamps_list_attributes(self):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
+        coarse_tile_pre_stickify(
+            _graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])]
+        )
         self.assertEqual(op.loop_info.loop_group_id, (0, 0))
         self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [1]])
@@ -1623,14 +1633,18 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_spec_divides_ranges_both_levels(self):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
+        coarse_tile_pre_stickify(
+            _graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])]
+        )
         self.assertEqual(data.ranges[0], Integer(64))
         self.assertEqual(data.ranges[1], Integer(64))
 
     def test_nested_spec_outer_only_divides_outer_dim(self):
         data = _make_pointwise([Integer(32), Integer(64), Integer(16)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(8))])])
+        coarse_tile_pre_stickify(
+            _graph([op]), [([op], [(1, Integer(4)), (2, Integer(8))])]
+        )
         self.assertEqual(data.ranges[0], Integer(8))
         self.assertEqual(data.ranges[1], Integer(8))
         self.assertEqual(data.ranges[2], Integer(16))
@@ -1641,7 +1655,7 @@ class TestCoarseTileNested(unittest.TestCase):
         d1 = _make_pointwise([Integer(128), Integer(64)])
         op0 = _make_hinted_op(d0, "op0", hints=((1, 0),))
         op1 = _make_hinted_op(d1, "op1", hints=((2, 0), (3, 1)))
-        coarse_tile(
+        coarse_tile_pre_stickify(
             _graph([op0, op1]),
             [
                 ([op0], [(1, Integer(4))]),
@@ -1662,7 +1676,9 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_same_dim_different_counts(self):
         data = _make_pointwise([Integer(256)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 0)))
-        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
+        coarse_tile_pre_stickify(
+            _graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])]
+        )
         self.assertEqual(data.ranges[0], Integer(32))
         self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [0]])
@@ -1708,7 +1724,7 @@ class TestCoarseTileNested(unittest.TestCase):
             ([op0], [(1, Integer(4))]),
             ([op1], [(2, Integer(4)), (3, Integer(2))]),
         ]
-        coarse_tile(_graph([op0, op1]), groups)
+        coarse_tile_pre_stickify(_graph([op0, op1]), groups)
         for group_ops, _ in groups:
             for op in group_ops:
                 if isinstance(op, ComputedBuffer):
