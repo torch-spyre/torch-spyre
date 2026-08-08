@@ -2727,9 +2727,20 @@ def _plan_read_copies(
             if not isinstance(op.data, (Pointwise, Reduction)):
                 continue
             for dep in _full_buffer_read_deps(op):
+                # dep.index.coeff(v) is a *linear* coefficient: it is blind
+                # to any constant offset in the index (e.g. 64*d0 + d1 and
+                # 64*d0 + d1 + 5 have identical coeffs). Two reads that
+                # differ only in a constant offset (e.g. a shifted/windowed
+                # read) must not collapse to the same key -- _insert_one_
+                # read_copy sizes the shared copy from only the sizing
+                # op's own dep.index, so a merged-in consumer at a
+                # different real offset would silently read wrong or
+                # out-of-bounds data. Include the offset explicitly.
+                offset = dep.index - sum(dep.index.coeff(v) * v for v in dep.var_names)
                 key = (
                     dep.name,
                     tuple(dep.index.coeff(v) for v in dep.var_names),
+                    offset,
                     tuple(dep.size),
                 )
                 keyed.setdefault(key, []).append((op, dep))

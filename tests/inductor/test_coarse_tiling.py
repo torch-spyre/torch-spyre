@@ -5320,6 +5320,77 @@ class TestInsertAllReadCopyOps(unittest.TestCase):
         ]
         self.assertEqual(len(copy_bufs), 2)
 
+    def test_offset_read_gets_its_own_copy(self):
+        """a+shift(a)-style: two reads of the same buffer with identical
+        per-var index coefficients but a different constant offset must
+        NOT share a copy -- dep.index.coeff(v) is blind to the constant
+        term, so a naive key would wrongly merge these (see coarse_tile.py
+        issue where a merged-in consumer's real offset differs from the
+        sizing op's, producing wrong/out-of-bounds data)."""
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            Pointwise,
+            StorageBox,
+            TensorBox,
+        )
+
+        from torch_spyre._inductor.ir import SpyreEmptyFallback
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _insert_all_read_copy_ops,
+            _plan_read_copies,
+        )
+
+        device = torch.device("cpu")
+        dtype = torch.float32
+
+        # 8x9 so a +1 column offset stays in bounds for all j in [0, 8).
+        full_buf = SpyreEmptyFallback(
+            torch.ops.spyre.empty.default, [8, 9], device, dtype
+        )
+        full_buf.layout = FixedLayout(device, dtype, [8, 9], [9, 1])
+        full_box = TensorBox(StorageBox(full_buf))
+
+        def inner_fn(index):
+            i, j = index
+            plain = full_box.make_loader()([i, j])
+            shifted = full_box.make_loader()([i, j + 1])
+            return plain + shifted
+
+        pw = Pointwise.create(
+            device=device,
+            dtype=dtype,
+            inner_fn=inner_fn,
+            ranges=[Integer(8), Integer(8)],
+        )
+        pw_data = pw.data.data
+        tiled_op = ComputedBuffer(
+            name="tiled_op0",
+            layout=FixedLayout(device, dtype, [Integer(8), Integer(8)], None),
+            data=pw_data,
+        )
+        tiled_op.operation_name = "tiled_op0"
+        tiled_op.origins = OrderedSet()
+        tiled_op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,), loop_count=[Integer(1)], loop_tiled_dims=[[]]
+        )
+        V.graph.name_to_buffer["tiled_op0"] = tiled_op
+
+        operations = [full_buf, tiled_op]
+        retiled_infos_by_group = [((0,), [tiled_op], {})]
+        plans = _plan_read_copies(operations, retiled_infos_by_group)
+
+        self.assertEqual(len(plans[(0,)].entries), 2)
+
+        _insert_all_read_copy_ops(operations, plans)
+
+        copy_bufs = [
+            op
+            for op in operations
+            if isinstance(op, ComputedBuffer) and op.get_name() != "tiled_op0"
+        ]
+        self.assertEqual(len(copy_bufs), 2)
+
     def test_disable_flag_skips_everything(self):
         """An empty read_copy_plans dict (the insert_read_copies=False case)
         leaves operations untouched."""
