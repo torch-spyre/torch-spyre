@@ -1332,6 +1332,53 @@ this — whether an op is `copy_out` at all — is made once, up front, by
 `_plan_tiling_propagation`; Pass 3 only executes it. The single operative
 treatment corresponds to the doc's Case 2 row above.
 
+**Revisited and re-deferred (2026-08-08): skipping the copy for
+span-overflow.** The span-overflow coarse-tiling path
+(`coarse_tile_span_overflow.py`) runs post-stickify and is intentionally
+narrow in scope — at most one loop level, at most one reduction per loop —
+which raised the question of whether that narrowness makes it safe to skip
+the copy op in at least some cases, avoiding the HBM round-trip. Three
+candidates were investigated and all three were rejected or deferred
+without becoming implemented:
+
+1. **Rely on `_resize_device_layout` preserving compatibility.** The
+   full buffer's device layout is derived from the tiled op's own
+   already-input-reconciled output layout by resizing it
+   (`_resize_device_layout`/`_stick_host_dim`), so perhaps that derivation
+   preserves enough structure to stay compatible with the op's inputs.
+   Rejected: `_resize_device_layout` preserves dim order and which host dim
+   is the stick, but *recomputes* `stride_map`/`device_size` for the new
+   size, and compatibility (`stick_compatible`, reached via
+   `device_coordinates`/`compute_coordinates`) depends on a size-dependent
+   coordinate-derivation step, not just dim order. Resizing does not
+   provably preserve compatibility.
+2. **Skip only when the tiled op has zero external-to-group reads.** If
+   every one of an op's reads is satisfied by sibling ops in the same
+   coarse-tile group (no graph inputs, no other-group outputs), there is
+   structurally nothing external to reconcile the full buffer's layout
+   against, so direct-write would be safe. Confirmed this shape is
+   non-vacuous in the grouping logic (`_plan_tiling_propagation` classifies
+   `copy_out` purely by output/consumer criteria, independent of an op's own
+   reads, and `span_overflow_groups`'s multi-op pointwise-run logic does not
+   require every op in a run to read an external buffer) and is exercised by
+   mocked-IR unit tests (`test_span_overflow_hint_analysis.py`'s
+   `test_chained_compatible_pointwise_ops_produce_one_group` and
+   `test_chained_pointwise_ops_conform_to_producer_split`). But no
+   end-to-end test compiling a real torch program through genuine
+   span-overflow triggering produces this shape — every real multi-op chain
+   found (e.g. `abs(a+b)*c`) has its last op read an additional external
+   tensor, and single-op programs are the norm. Deferred as unproven against
+   real workloads, not rejected as impossible.
+3. **Explicit per-edge compatibility re-check.** Reuse the same mechanism
+   `finalize_layouts` uses (`edge.layout(in_stl, target_stl)` via
+   `EdgeCostMap`) to re-derive `device_coordinates` for the full buffer's
+   actual resized layout against each of the tiled op's input edges, after
+   `_allocate_full_buffer` runs, and skip the copy only if every edge is
+   still compatible. This is well-scoped and would live entirely on the
+   post-stickify path. Deferred, not rejected — the most promising direction
+   for a follow-up, should a real workload surface case 2's shape or
+   otherwise justify the added complexity.
+
 **Case 1** is where most of the working-set-reduction win comes from.  An
 intermediate like `y` in the small example flows from one tiled op to
 another without ever leaving scratchpad.  Planning routes such an op to
