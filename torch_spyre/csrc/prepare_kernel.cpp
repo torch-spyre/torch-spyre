@@ -29,6 +29,7 @@
 
 #include "job_plan.h"
 #include "logging.h"
+#include "module.h"
 #include "spyre_allocator.h"
 #include "spyrecode-host-functions/spyrecode.h"
 
@@ -648,7 +649,18 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
   const char* disable_overlap_env = std::getenv("SPYRE_DISABLE_HC_DMA_OVERLAP");
   const bool overlap_enabled = (disable_overlap_env == nullptr ||
                                 std::string(disable_overlap_env) != "1");
-  if (overlap_enabled && steps.size() == 3 &&
+  // SPYRE_HAZARD_TRACKER short-circuit: when the flex per-region hazard tracker
+  // is enabled we do NOT emit the static edge-3/4 event steps below (nor run
+  // the scalar-region_id TORCH_CHECK). flex inserts the cross-stream RAW/WAR
+  // events dynamically per-region at enqueue, which is exactly the intended way
+  // past the single-Program-region limit the scalar key assumed -- so that
+  // check must not run in hazard mode. The plain [HostCompute(Prep), H2D(Prep),
+  // Compute(Dev)] triple already carries the correct roles (assigned by step
+  // type in the ctors) and passes checkJobPlanStepOrdering unchanged
+  // (has_event=false skips its forward-guard); the launch router splits it
+  // across S_prep/S_dev by role(). Hazard mode thus makes overlap_enabled /
+  // SPYRE_DISABLE_HC_DMA_OVERLAP moot, which is correct.
+  if (!get_hazard_tracker_enabled() && overlap_enabled && steps.size() == 3 &&
       dynamic_cast<JobPlanStepHostCompute*>(steps[0].get()) != nullptr &&
       dynamic_cast<JobPlanStepH2D*>(steps[1].get()) != nullptr &&
       dynamic_cast<JobPlanStepCompute*>(steps[2].get()) != nullptr) {

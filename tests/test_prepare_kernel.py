@@ -240,6 +240,74 @@ class TestPrepareKernel:
             # Both back-event steps key off the SAME correction region_id.
             assert job_plan.get_step_region_id(1) == job_plan.get_step_region_id(6)
 
+    def test_hazard_tracker_emits_bare_split_triple(self):
+        """SPYRE_HAZARD_TRACKER: the correction triple is split WITHOUT events.
+
+        With the hazard tracker enabled, PrepareKernel skips the static edge-3/4
+        event-step block (and its scalar-region_id TORCH_CHECK). The plain
+        [HostCompute, H2D, Compute] triple survives, still carrying its by-type
+        roles [Prep, Prep, Dev] -- so the launch router splits it across
+        S_prep/S_dev while flex inserts the cross-stream RAW/WAR events
+        dynamically at enqueue. No event steps are emitted (3 steps, not 7).
+        """
+        prev = torch_spyre._C.get_hazard_tracker_enabled()
+        try:
+            torch_spyre._C.set_hazard_tracker_enabled(True)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                spyrecode_dir = self.create_mock_spyrecode(
+                    tmpdir, exec_command="ComputeOnHost"
+                )
+                # Must NOT raise: the getNumProgramRegions()<=1 TORCH_CHECK lives
+                # inside the skipped block, so it does not run in hazard mode.
+                job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+                # Bare split triple: 3 steps, NO event steps inserted.
+                assert job_plan.num_steps() == 3
+                assert [job_plan.get_step_type(i) for i in range(3)] == [
+                    "HostCompute",
+                    "H2D",
+                    "Compute",
+                ]
+                # Roles are assigned by step type in the ctors, so the bare
+                # triple already carries the split roles -- the split is real.
+                assert [job_plan.get_step_stream_role(i) for i in range(3)] == [
+                    "Prep",
+                    "Prep",
+                    "Dev",
+                ]
+        finally:
+            torch_spyre._C.set_hazard_tracker_enabled(prev)
+
+    def test_hazard_tracker_disabled_by_default(self):
+        """Flag OFF: the default static-edge path is byte-identical (7 steps).
+
+        Guards against an accidental default flip: with the hazard tracker
+        explicitly disabled, the SAME ComputeOnHost triple is rewritten into the
+        7-step instrumented plan with the default roles -- exactly the shipped
+        overlap path (cf. test_compute_on_host_valid).
+        """
+        prev = torch_spyre._C.get_hazard_tracker_enabled()
+        try:
+            torch_spyre._C.set_hazard_tracker_enabled(False)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                spyrecode_dir = self.create_mock_spyrecode(
+                    tmpdir, exec_command="ComputeOnHost"
+                )
+                job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+                assert job_plan.num_steps() == 7
+                assert [job_plan.get_step_stream_role(i) for i in range(7)] == [
+                    "Prep",
+                    "Prep",
+                    "Prep",
+                    "Prep",
+                    "Dev",
+                    "Dev",
+                    "Dev",
+                ]
+        finally:
+            torch_spyre._C.set_hazard_tracker_enabled(prev)
+
     def test_compute_on_host_missing_ohandle(self):
         """Test that missing ohandle field raises RuntimeError."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -922,6 +990,25 @@ class TestStepOrderingValidator:
         assert (
             torch_spyre._C.check_job_plan_step_ordering(
                 ["H2D", "Compute"], ["Dev", "Dev"]
+            )
+            == ""
+        )
+
+    def test_hazard_tracker_bare_split_ordering_valid(self):
+        """LOCK: a HostCompute-led, split, NO-events plan is valid.
+
+        Under SPYRE_HAZARD_TRACKER the correction triple is split across
+        S_prep/S_dev but carries NO event steps (flex inserts the cross-stream
+        events dynamically). The ordering validator must accept it: has_event is
+        false, so the forward-guard -- which requires a matched Ef pair for
+        two-stream plans -- is skipped. This locks that property so a future
+        validator change that would break hazard mode fails here loudly.
+        Contrast test_legacy_single_stream_plan_still_valid (no HostCompute):
+        this plan HAS a HostCompute but still no events.
+        """
+        assert (
+            torch_spyre._C.check_job_plan_step_ordering(
+                ["HostCompute", "H2D", "Compute"], ["Prep", "Prep", "Dev"]
             )
             == ""
         )
