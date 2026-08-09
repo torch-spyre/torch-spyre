@@ -75,13 +75,17 @@ def _materialize_offset_view(x):
     ``spyre::copy_from_d2d``, i.e. that same offset-honoring path, producing a
     correct offset-0 buffer. This is a no-op for the overwhelmingly common
     offset-0 case (fresh buffers, and slices that already forced a copy).
+
+    ``List[Tensor]`` args (e.g. ``aten.cat``/``aten.stack``) are recursed into
+    element-wise so an offset view nested in a list is materialized too;
+    otherwise those ops would silently read element 0 of each nested view.
     """
-    if (
-        isinstance(x, torch.Tensor)
-        and x.device.type == "spyre"
-        and x.storage_offset() != 0
-    ):
-        return x.clone()
+    if isinstance(x, torch.Tensor):
+        if x.device.type == "spyre" and x.storage_offset() != 0:
+            return x.clone()
+        return x
+    if isinstance(x, (list, tuple)):
+        return type(x)(_materialize_offset_view(e) for e in x)
     return x
 
 
@@ -141,14 +145,14 @@ def _make_offset_safe_dispatch(op):
         write_back = []  # (clone, original) for each substituted write view
 
         def prep_write(x):
-            if (
-                isinstance(x, torch.Tensor)
-                and x.device.type == "spyre"
-                and x.storage_offset() != 0
-            ):
-                local = x.clone()
-                write_back.append((local, x))
-                return local
+            if isinstance(x, torch.Tensor):
+                if x.device.type == "spyre" and x.storage_offset() != 0:
+                    local = x.clone()
+                    write_back.append((local, x))
+                    return local
+                return x
+            if isinstance(x, (list, tuple)):
+                return type(x)(prep_write(e) for e in x)
             return x
 
         args = tuple(
@@ -171,12 +175,6 @@ def _make_offset_safe_dispatch(op):
         return result
 
     return dispatch
-
-
-def dispatch_to_torch_compile(*args, compiled=None, **kwargs):
-    # Back-compat shim: offset materialization now happens in the per-op
-    # wrapper built by _make_offset_safe_dispatch (registration path below).
-    return compiled(*args, **kwargs)
 
 
 def register_torch_compile_kernel(ops):

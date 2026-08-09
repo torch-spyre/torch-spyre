@@ -114,3 +114,33 @@ class TestOffsetViewInPlaceWrites:
         torch.testing.assert_close(
             dev.to("cpu").float(), ref.float(), atol=ATOL, rtol=0
         )
+
+
+@pytest.mark.parametrize("T", [1, 2, 32])
+class TestOffsetViewListArgs:
+    """Ops that take their tensors via a ``List[Tensor]`` schema arg
+    (``aten.cat``/``aten.stack``) must materialize every offset view nested in
+    the list, not just bare-tensor args. Otherwise each nested view is read
+    from element 0 of its storage instead of its real ``storage_offset``."""
+
+    def _kv_slices(self, T):
+        """Return (device k-view, device v-view, cpu qkv). Both slices carry a
+        nonzero storage_offset (Q and Q+KV) at T=1 and stay strided at T>1."""
+        torch.manual_seed(3)
+        qkv = torch.randn(32, T, TOTAL, dtype=DTYPE)
+        dev = qkv.to(DEVICE)
+        return dev[..., Q : Q + KV], dev[..., Q + KV : TOTAL], qkv
+
+    def test_cat_reads_correct_slices(self, T):
+        """aten.cat over two offset views along the last dim."""
+        k, v, qkv = self._kv_slices(T)
+        got = torch.cat([k, v], dim=-1).to("cpu")
+        ref = torch.cat([qkv[..., Q : Q + KV], qkv[..., Q + KV : TOTAL]], dim=-1)
+        torch.testing.assert_close(got.float(), ref.float(), atol=ATOL, rtol=0)
+
+    def test_stack_reads_correct_slices(self, T):
+        """aten.stack over two offset views along a new dim."""
+        k, v, qkv = self._kv_slices(T)
+        got = torch.stack([k, v], dim=0).to("cpu")
+        ref = torch.stack([qkv[..., Q : Q + KV], qkv[..., Q + KV : TOTAL]], dim=0)
+        torch.testing.assert_close(got.float(), ref.float(), atol=ATOL, rtol=0)
