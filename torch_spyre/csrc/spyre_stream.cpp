@@ -16,6 +16,7 @@
 
 #include "spyre_stream.h"
 
+#include <ATen/record_function.h>
 #include <c10/core/Device.h>
 #include <c10/core/Stream.h>
 
@@ -146,7 +147,8 @@ bool SpyreStream::query() const {
 }
 
 void SpyreStream::synchronize() const {
-  c10::DeviceGuard guard(stream_.device());
+  RECORD_FUNCTION("host::synchronize", {});
+  c10::DeviceGuard device_guard(stream_.device());
 
   DEBUGINFO("SpyreStream::synchronize() - stream ", id(), " on device ",
             static_cast<int>(device().index()));
@@ -241,23 +243,28 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
 }
 
 void SpyreStream::launchH2D(flex::DmaParams* params) const {
+  RECORD_FUNCTION("launch::H2D", {});
   resolveRuntimeHandle()->launchOperationH2D(params);
 }
 
 void SpyreStream::launchD2H(flex::DmaParams* params) const {
+  RECORD_FUNCTION("launch::D2H", {});
   resolveRuntimeHandle()->launchOperationD2H(params);
 }
 
 void SpyreStream::launchCompute(flex::ComputeParams* params) const {
+  RECORD_FUNCTION("launch::Compute", {});
   resolveRuntimeHandle()->launchOperationCompute(params);
 }
 
 void SpyreStream::launchHostCallback(flex::HostCallbackParams* params) const {
+  RECORD_FUNCTION("launch::HostCallback", {});
   resolveRuntimeHandle()->launchOperationHostCallback(params);
 }
 
 void SpyreStream::fillAsync(const flex::CompositeAddress* dst, double value,
                             DataFormats dtype, bool use_dmai) const {
+  RECORD_FUNCTION("launch::Memset", {});
   resolveRuntimeHandle()->fillAsync(dst, value, dtype, use_dmai);
 }
 

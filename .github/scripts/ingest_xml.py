@@ -77,7 +77,7 @@ def is_benchmark_xml(root) -> bool:
     return all("benchmark" in (tc.get("classname", "")) for tc in cases)
 
 
-def parse_benchmark_xml(xml_path: Path):
+def parse_benchmark_xml(xml_path: Path, workflow: str = "", ci_run_id: str = ""):
     """
     Parse a performance-benchmark XML into (run_meta, list[benchmark_row]).
 
@@ -214,10 +214,16 @@ def parse_benchmark_xml(xml_path: Path):
             }
         )
 
+    # dedup key: bare basename collides across arches and nights. ci_run_id is
+    # stable per run, so a re-ingest of the same file is still a no-op.
+    run_key = ci_run_id or created_at.strftime("%Y%m%dT%H%M%SZ")
+    source_file = "/".join(p for p in (workflow, run_key, xml_path.name) if p)
+
     run_meta = {
-        "source_file": xml_path.name,
+        "source_file": source_file,
         "created_at": created_at,
         "version_info": version_info,
+        "workflow": workflow,
     }
     return run_meta, benchmarks
 
@@ -236,9 +242,16 @@ def insert_benchmark_run(client, run_id: int, run_meta: dict) -> None:
                 run_meta["source_file"],
                 run_meta.get("version_info"),
                 run_meta["created_at"].replace(tzinfo=None),
+                run_meta.get("workflow", ""),
             ]
         ],
-        column_names=["run_id", "source_file", "version_info", "created_at"],
+        column_names=[
+            "run_id",
+            "source_file",
+            "version_info",
+            "created_at",
+            "workflow",
+        ],
     )
 
 
@@ -637,6 +650,11 @@ def main():
     client.command("SELECT 1")
     print("Connected.\n")
 
+    # CREATE TABLE IF NOT EXISTS elsewhere won't add a column to an existing table
+    client.command(
+        "ALTER TABLE benchmark_runs ADD COLUMN IF NOT EXISTS workflow String DEFAULT ''"
+    )
+
     total_cases = 0
     total_benchmarks = 0
 
@@ -649,7 +667,9 @@ def main():
         # ── Dispatch: benchmark vs test-result ─────────────────────────────
         if is_benchmark_xml(root):
             print("  Detected: performance benchmark XML")
-            run_meta, benchmarks = parse_benchmark_xml(xml_path)
+            run_meta, benchmarks = parse_benchmark_xml(
+                xml_path, args.workflow, args.run_id
+            )
             if run_meta is None:
                 continue
 
