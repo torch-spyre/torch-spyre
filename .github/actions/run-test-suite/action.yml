@@ -120,9 +120,19 @@ runs:
         # Set by stall_watcher when it kills a hung attempt; read after `wait`
         # to make the next attempt add -n1 (pytest-xdist worker isolation).
         _STALLED_LAST_ATTEMPT=0
+        # Previous attempt's TEST_PID (also its PGID, via `set -m`); empty
+        # until the first attempt has run.
+        TEST_PID=""
         while [[ $attempt -lt $MAX_ATTEMPTS ]]; do
           attempt=$(( attempt + 1 ))
           echo "=== Attempt ${attempt}/${MAX_ATTEMPTS}: ${{ inputs.suite_name }} ==="
+
+          # Clean up the previous attempt's leader PID or its process group, whichever is still alive.
+          if [[ -n "$TEST_PID" ]] && { kill -0 -- "$TEST_PID" 2>/dev/null || kill -0 -- "-$TEST_PID" 2>/dev/null; }; then
+            echo "Previous attempt's process (PID/PGID ${TEST_PID}) still alive — cleaning up"
+            kill -STOP -- "$TEST_PID" "-$TEST_PID" 2>/dev/null || true
+            kill -KILL -- "$TEST_PID" "-$TEST_PID" 2>/dev/null || true
+          fi
 
           LOG_FILE="$(mktemp /tmp/test_output_XXXXXX.log)"
           STALL_FLAG="$(mktemp /tmp/stall_flag_XXXXXX.tmp)"

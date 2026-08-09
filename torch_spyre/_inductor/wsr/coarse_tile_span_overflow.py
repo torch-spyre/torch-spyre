@@ -356,11 +356,11 @@ def span_overflow_groups(
         plan = plan_span_overflow_tile(op, config.sencores)
         if plan is None:
             # op needs no coarse tiling of its own.  It's always safe to leave
-            # it outside any loop: insert_tiling_propagation's outside-consumer
-            # path (coarse_tile.py) already patches consumers of a tiled
-            # producer to read a full, reassembled buffer, and
-            # plan_span_overflow_tile returning None here means that op's own
-            # full-size reads/writes are already known not to overflow.
+            # it outside any loop: Pass 3's outside-consumer path
+            # (coarse_tile.py) already patches consumers of a tiled producer
+            # to read a full, reassembled buffer, and plan_span_overflow_tile
+            # returning None here means that op's own full-size reads/writes
+            # are already known not to overflow.
             logger.debug("[span-overflow groups] op=%s no auto plan", op.get_name())
             flush_current_group()
             continue
