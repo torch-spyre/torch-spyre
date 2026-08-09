@@ -278,6 +278,7 @@ def gen_coord_info_value(
     """
     if conv_params is None:
         conv_params = {"conv_padding": padding, "stride_len": 1, "total_size": size}
+    
 
     if not is_stick_dim:
         return {
@@ -1150,7 +1151,7 @@ def generate_sdsc(
                 for c in range(sdsc_spec.num_cores)
             }
 
-    def _build_coord_info(tensor, tensor_idx: int) -> dict:
+    def _build_coord_info(op, tensor, tensor_idx: int) -> dict:
         """Builds the coordinate information for all dimensions of a tensor.
 
         Computes layout, slicing, and FP8 parameter metadata required for
@@ -1178,14 +1179,19 @@ def generate_sdsc(
             dim_size = _coord_size(dim_str, sdsc_spec.iteration_space[dim], is_input)
             size = dim_size // nsplits if is_tiled else 1
             is_fp8, _, st_idx = _compute_fp8_coord_params(tensor, dim, sdsc_spec)
-            conv_params = get_conv_params(
-                tensor_idx,
-                dim,
-                sdsc_spec.opfunc,
-                sdsc_spec.conv_params,
-                dim_size,
-                nsplits,
-            )
+            conv_params = (
+                get_conv_params(
+                    tensor_idx,
+                    dim,
+                    sdsc_spec.opfunc,
+                    sdsc_spec.conv_params,
+                    dim_size,
+                    nsplits,
+                ) 
+                if op == DEPTHWISE_CONV2D_OP
+                else None
+           )
+ 
             result[dim_str] = gen_coord_info_value(
                 size=size,
                 nsplits=nsplits,
@@ -1472,7 +1478,7 @@ def generate_sdsc(
                                         else {}
                                     ),
                                     "coordinates_": {
-                                        "coordInfo": _build_coord_info(tensor, i),
+                                        "coordInfo": _build_coord_info(sdsc_spec.opfunc, tensor, i),
                                         "coreIdToWkSlice_": {},
                                     },
                                 }
