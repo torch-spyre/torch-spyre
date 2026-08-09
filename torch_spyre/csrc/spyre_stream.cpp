@@ -383,16 +383,23 @@ void SpyreStream::launch(const JobPlan& plan,
   LaunchContext ctx{
       args, std::vector<std::shared_ptr<flex::Event>>(num_forward_events)};
 
-  // GATE (correctness over overlap): only engage the S_prep/S_dev split for a
-  // plan PrepareKernel explicitly built as two-stream (has event steps).
-  // Without events there is nothing to serialize a cross-stream H2D->Compute
-  // RAW, so an un-instrumented plan MUST run entirely on S_dev — byte-identical
-  // to the pre-overlap single-stream path. This also fails safe if edit 6 could
-  // not instrument a plan (e.g. region_id unresolved): it runs correctly, just
-  // without overlap, rather than splitting an unserialized dependency.
+  // GATE (correctness over overlap): engage the S_prep/S_dev split when EITHER
+  // (a) PrepareKernel instrumented this plan with static event steps (the
+  // default overlap path, whose forward/back events serialize the cross-stream
+  // H2D->Compute RAW), OR (b) the flex per-region hazard tracker is enabled
+  // (SPYRE_HAZARD_TRACKER) -- then there are NO static event steps and flex
+  // inserts the cross-stream RAW/WAR events dynamically at enqueue. Absent
+  // both, an un-instrumented plan MUST run entirely on S_dev -- byte-identical
+  // to the pre-overlap single-stream path (also the fail-safe if PrepareKernel
+  // could not instrument, e.g. region_id unresolved). Per-step routing still
+  // keys on role(), so any all-Dev plan (pure Compute / standalone D2H) stays
+  // single-stream even with the split engaged. In hazard mode
+  // num_forward_events is 0, so the (empty) ctx forward-event vector is never
+  // indexed.
+  const bool should_split = has_event_step || get_hazard_tracker_enabled();
   for (const auto& step : plan.steps) {
     const SpyreStream& target =
-        (has_event_step && step->role() == StreamRole::Prep) ? s_prep : s_dev;
+        (should_split && step->role() == StreamRole::Prep) ? s_prep : s_dev;
     step->construct(ctx, target);
   }
 }

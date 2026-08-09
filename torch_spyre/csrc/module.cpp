@@ -73,6 +73,22 @@ void set_downcast_warn_enabled(bool enabled) {
   g_downcast_warn_enabled.store(enabled, std::memory_order_relaxed);
 }
 
+// SPYRE_HAZARD_TRACKER latch: when on, torch-spyre skips emitting the static
+// edge-3/4 event steps and instead splits the correction triple across
+// S_prep/S_dev while flex's per-region hazard tracker inserts the cross-stream
+// RAW/WAR events dynamically at enqueue. Default OFF => byte-identical to the
+// static-edge overlap path. Read once from the env in init_from_env and applied
+// to the flex RuntimeContext in _startRuntime.
+std::atomic<bool> g_hazard_tracker_enabled{false};  // default OFF
+
+bool get_hazard_tracker_enabled() {
+  return g_hazard_tracker_enabled.load(std::memory_order_relaxed);
+}
+
+void set_hazard_tracker_enabled(bool enabled) {
+  g_hazard_tracker_enabled.store(enabled, std::memory_order_relaxed);
+}
+
 // Optional: initialize from env at module init
 static void init_from_env() {
   if (const char* v = std::getenv(SPYRE_DOWNCAST_ENV)) {
@@ -81,6 +97,12 @@ static void init_from_env() {
     for (auto& c : s) c = std::tolower(c);
     bool enable = !(s == "0" || s == "false" || s == "off");
     g_downcast_warn_enabled.store(enable, std::memory_order_relaxed);
+  }
+  // SPYRE_HAZARD_TRACKER is a correctness gate: strict "1" semantics (matching
+  // SPYRE_DISABLE_HC_DMA_OVERLAP), NOT the permissive downcast parser above.
+  if (const char* v = std::getenv("SPYRE_HAZARD_TRACKER")) {
+    g_hazard_tracker_enabled.store(std::string(v) == "1",
+                                   std::memory_order_relaxed);
   }
 }
 
@@ -111,6 +133,13 @@ void _startRuntime() {
   init_from_env();
   if (runtime) {
     GlobalRuntime::set(runtime);
+    // Apply the SPYRE_HAZARD_TRACKER latch (read in init_from_env above) to the
+    // flex runtime: this enables flex's per-region hazard tracker iff the flag
+    // is on. It is the ONLY coupled enable of flex's tracker; the python
+    // set_hazard_tracker_enabled hook flips only torch-spyre's plan-shaping +
+    // routing global and does NOT re-drive flex. setHazardTrackerEnabled only
+    // stores an atomic in flex, so it cannot fail.
+    runtime->setHazardTrackerEnabled(get_hazard_tracker_enabled());
     DEBUGINFO(s);
     DEBUGINFO("runtime started with logical_device_id ", logical_device_id);
   } else {
@@ -331,6 +360,15 @@ PYBIND11_MODULE(_C, m) {
         "Return whether downcast warnings are enabled.");
   m.def("set_downcast_warning", &spyre::set_downcast_warn_enabled,
         "Enable/disable downcast warnings for this process.");
+  m.def("get_hazard_tracker_enabled", &spyre::get_hazard_tracker_enabled,
+        "Whether the flex per-region hazard tracker is enabled.");
+  m.def("set_hazard_tracker_enabled", &spyre::set_hazard_tracker_enabled,
+        py::arg("enabled"),
+        "Enable/disable the flex hazard-tracker path (TEST/tuning hook; the "
+        "production value is latched from SPYRE_HAZARD_TRACKER at runtime "
+        "start). NOTE: this flips only torch-spyre's plan-shaping + routing "
+        "global; it does NOT re-drive flex's RuntimeContext, which was set "
+        "once at _startRuntime.");
   m.def("get_elem_in_stick", &spyre::get_elem_in_stick);
   m.def("get_device_dtype", &spyre::get_device_dtype);
 
