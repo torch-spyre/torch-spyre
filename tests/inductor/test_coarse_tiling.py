@@ -1162,7 +1162,7 @@ class TestDivideRanges(unittest.TestCase):
             ReductionHint,
         )
 
-        N = sympy.Symbol("N", positive=True)
+        N = sympy.Symbol("N", positive=True, integer=True)
         red = Reduction(
             device=torch.device("cpu"),
             dtype=torch.float16,
@@ -7453,7 +7453,7 @@ class TestCoeffThroughFloor(unittest.TestCase):
         self.assertEqual(coeff_through_floor(expr, s), 64)
 
 
-class TestRetile(unittest.TestCase):
+class TestTileHelpers(unittest.TestCase):
     """Tests for tile.py."""
 
     def test_compute_tile_stride_1d(self):

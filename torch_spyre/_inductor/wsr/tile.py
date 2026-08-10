@@ -14,6 +14,8 @@
 
 import sympy
 
+from ..views import convert_modular_indexing
+
 # An irregular dimension is a dimension with size one or stride zero.
 
 
@@ -25,6 +27,7 @@ def compute_tile_stride(size, stride, tile_size):
     Cumulative tile counts must divide strides. Padding is reduced in proportion
     of tile counts. Tile strides of irregular tile dimensions are set to zero.
     """
+    print(size, tile_size)
     assert all(x % y == 0 for x, y in zip(size, tile_size))
     # exclude irregular tensor dimensions (size==1 or stride==0)
     dims = [d for d, (s, t) in enumerate(zip(size, stride)) if s != 1 and t != 0]
@@ -69,7 +72,7 @@ def compute_tile_index(index, size, stride, tile_stride):
     tile_stride = [tile_stride[d] for d in dims]
     paired_strides = list(reversed(sorted(zip(stride, tile_stride))))
     # sanitize index
-    index = index.replace(sympy.floor, lambda x: x).expand()
+    index = convert_modular_indexing(index).replace(sympy.floor, lambda x: x).expand()
     # handle constant offset
     offset = index.xreplace({var: sympy.S.Zero for var in index.free_symbols})
     tile_index = compute_tile_offset(offset, paired_strides)
