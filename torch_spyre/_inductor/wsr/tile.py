@@ -27,7 +27,6 @@ def compute_tile_stride(size, stride, tile_size):
     Cumulative tile counts must divide strides. Padding is reduced in proportion
     of tile counts. Tile strides of irregular tile dimensions are set to zero.
     """
-    print(size, tile_size)
     assert all(x % y == 0 for x, y in zip(size, tile_size))
     # exclude irregular tensor dimensions (size==1 or stride==0)
     dims = [d for d, (s, t) in enumerate(zip(size, stride)) if s != 1 and t != 0]
