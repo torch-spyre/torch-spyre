@@ -393,9 +393,14 @@ void SpyreStream::launch(const JobPlan& plan,
   // to the pre-overlap single-stream path (also the fail-safe if PrepareKernel
   // could not instrument, e.g. region_id unresolved). Per-step routing still
   // keys on role(), so any all-Dev plan (pure Compute / standalone D2H) stays
-  // single-stream even with the split engaged. In hazard mode
-  // num_forward_events is 0, so the (empty) ctx forward-event vector is never
-  // indexed.
+  // single-stream even with the split engaged. Conversely, under hazard mode
+  // ANY plan carrying a Prep-role step splits -- not only the correction
+  // triple, but e.g. a bare H2D-led plan. That is intended: flex's per-region
+  // tracker inserts the edges regardless of plan shape. Today granite decode
+  // emits only the triple, so the broader split is unexercised until a
+  // non-triple producer appears (validated then, not by the decode gate). In
+  // hazard mode num_forward_events is 0, so the (empty) ctx forward-event
+  // vector is never indexed.
   const bool should_split = has_event_step || get_hazard_tracker_enabled();
   for (const auto& step : plan.steps) {
     const SpyreStream& target =
