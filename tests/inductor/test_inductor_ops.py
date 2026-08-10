@@ -4759,6 +4759,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     [[1, 64, 1, 1, 64], [1, 3, 1, 1, 64]],
                     [[1, 1, -1, 192, 64], [1, 1, -1, 3, 3]],
                 ),
+                "1x3x64x1_ksize_1x1": (
+                    cached_randn((1, 3, 64, 1)),
+                    cached_randn((3, 1, 1, 1)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    3,
+                    [[1, 64, 1, 1, 64], [1, 1, 1, 1, 64]],
+                    [[1, 1, -1, 192, 64], [1, 1, -1, 1, 1]],
+                ),
                 "2x3x32_ksize1": (
                     cached_randn((2, 3, 32, 32)),
                     cached_randn((3, 1, 1, 1)),
