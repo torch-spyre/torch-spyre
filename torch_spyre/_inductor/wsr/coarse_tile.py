@@ -1214,10 +1214,11 @@ def _divide_ranges(
     new_size = list(layout.size)
     for i in tiled_dims:
         new_size[i] = ranges[i]
-    layout.size = new_size
 
     # Recompute strides for the smaller buffer preserving the order of dimensions
     layout.stride = compute_tile_stride(layout.size, old_stride, new_size)
+
+    layout.size = new_size
 
     # Invalidate Layout- and ComputedBuffer-level caches that read size/stride.
     _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
