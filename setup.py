@@ -157,8 +157,8 @@ else:
 
 INCLUDE_DIRS += [os.environ["SEN_COMMON_HEADERS"]]
 
-disable_legacy_graph = os.environ.get("DISABLE_LEGACY_GRAPH_RUNTIME", "0") == "1"
-if disable_legacy_graph:
+use_new_system = os.environ.get("NEW_SYSTEM_SETUP", "0") == "1"
+if use_new_system:
     LIBRARIES = ["flex"]
 else:
     LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
@@ -256,8 +256,8 @@ if __name__ == "__main__":
         ]
         if use_spyre_ccl:
             base_define_macros.append(("USE_SPYRE_CCL", None))
-        if disable_legacy_graph:
-            base_define_macros.append(("DISABLE_LEGACY_GRAPH_RUNTIME", None))
+        if use_new_system:
+            base_define_macros.append(("USE_FLEX_NAMESPACE", None))
         if COMPILE_AIUPTI:
             base_define_macros.append(("HAS_AIUPTI", None))
             base_define_macros.append(("USE_KINETO", None))
