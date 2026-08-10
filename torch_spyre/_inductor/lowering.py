@@ -1067,6 +1067,28 @@ output[indices] = input or output[indices].copy_(input). Please report any incom
     return output
 
 
+@register_spyre_lowering(torch.ops.aten.slice_scatter.default, type_promotion_kind=None)
+def lower_slice_scatter(self, src, dim=0, start=None, end=None, step=1):
+    size = self.get_size()
+    dim = dim % len(size)
+
+    if step != 1:
+        # Only a unit step maps to a single SliceView.
+        raise Unsupported(
+            f"slice_scatter with step={step} is not supported on Spyre "
+            f"(only unit step maps to a SliceView mutation)"
+        )
+
+    start = 0 if start is None else start
+    end = size[dim] if end is None else end
+
+    output = lowering.clone(self)
+    output.realize()
+    sliced_output = ir.SliceView.create(output, dim, start, end)
+    lowering.mutate_to(sliced_output, src)
+    return output
+
+
 @register_spyre_lowering(torch.ops.spyre.restickify)
 def lower_restickify(x):
     # Restickify must operate on base tensors, so we need

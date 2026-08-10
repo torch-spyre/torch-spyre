@@ -29,6 +29,7 @@ test_suite_config:
             - TestOps::test_copy_roundtrip.*
             # slice / split
             - TestOps::test_slice.*
+            - TestOps::test_slice_scatter.*
             - TestOps::test_split.*
           mode: mandatory_success
           tags:

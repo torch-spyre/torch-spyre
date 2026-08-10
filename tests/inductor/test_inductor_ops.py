@@ -3432,6 +3432,167 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "5d": (cached_randn((2, 3, 4, 5, 192), dtype=torch.float16),),
             },
         },
+        ("test_slice_scatter", "test_slice_scatter_cpu"): {
+            "ops_dict": {
+                # Functional slice_scatter into an INTERNAL base (x + 1.0).
+                "internal": lambda dim, start, end, x, src: torch.slice_scatter(
+                    x + 1.0, src, dim, start, end
+                ),
+                # Functional slice_scatter with the GRAPH INPUT as the base
+                # (the mutation is copied back into the placeholder).
+                "graph_input": lambda dim, start, end, x, src: torch.slice_scatter(
+                    x, src, dim, start, end
+                ),
+                # ``copy_`` into a slice view.
+                "view_copy": lambda dim, start, end, x, src: (
+                    base := x + 1.0,
+                    base.narrow(dim, start, end - start).copy_(src),
+                    base,
+                )[-1],
+            },
+            "param_sets": {
+                # Non-stick (non-last) dim: full sticks, no stick offset.
+                "nonstick_3d": (
+                    1,
+                    1,
+                    3,
+                    cached_randn((8, 4, 64)),
+                    cached_randn((8, 2, 64)),
+                ),
+                "nonstick_4d": (
+                    2,
+                    1,
+                    3,
+                    cached_randn((2, 8, 4, 64)),
+                    cached_randn((2, 8, 2, 64)),
+                ),
+                # Stick (last) dim aligned to a full stick (64).
+                "stick_1d": (
+                    0,
+                    0,
+                    64,
+                    cached_randn((128,)),
+                    cached_randn((64,)),
+                ),
+                "stick_2d": (
+                    1,
+                    0,
+                    64,
+                    cached_randn((8, 128)),
+                    cached_randn((8, 64)),
+                ),
+                "stick_3d": (
+                    2,
+                    0,
+                    64,
+                    cached_randn((2, 8, 128)),
+                    cached_randn((2, 8, 64)),
+                ),
+                "stick_4d": (
+                    3,
+                    0,
+                    64,
+                    cached_randn((2, 8, 4, 128)),
+                    cached_randn((2, 8, 4, 64)),
+                ),
+                # Stick (last) dim, offset by a full stick (cols 64:128).
+                "stick_off_1d": (
+                    0,
+                    64,
+                    128,
+                    cached_randn((128,)),
+                    cached_randn((64,)),
+                ),
+                "stick_off_2d": (
+                    1,
+                    64,
+                    128,
+                    cached_randn((8, 128)),
+                    cached_randn((8, 64)),
+                ),
+                "stick_off_4d": (
+                    3,
+                    64,
+                    128,
+                    cached_randn((2, 8, 4, 128)),
+                    cached_randn((2, 8, 4, 64)),
+                ),
+            },
+        },
+        # ``out=`` writes. Torch Inductor only supports a CONTIGUOUS ``out=``
+        # tensor, which for a slice means slicing the outermost dim (dim 0).
+        ("test_slice_scatter_out", "test_slice_scatter_cpu"): {
+            "ops_dict": {
+                # ``out=`` write into a slice view, e.g.
+                # torch.add(a, b, out=base[...]).
+                "out_arg": lambda dim, start, end, x, src: (
+                    base := x + 1.0,
+                    torch.add(src, src, out=base.narrow(dim, start, end - start)),
+                    base,
+                )[-1],
+            },
+            "param_sets": {
+                # dim 0 aligned (start 0), across 1d/2d/3d/4d.
+                "dim0_1d": (
+                    0,
+                    0,
+                    64,
+                    cached_randn((128,)),
+                    cached_randn((64,)),
+                ),
+                "dim0_2d": (
+                    0,
+                    0,
+                    4,
+                    cached_randn((8, 128)),
+                    cached_randn((4, 128)),
+                ),
+                "dim0_3d": (
+                    0,
+                    0,
+                    2,
+                    cached_randn((4, 8, 64)),
+                    cached_randn((2, 8, 64)),
+                ),
+                "dim0_4d": (
+                    0,
+                    0,
+                    2,
+                    cached_randn((4, 8, 2, 64)),
+                    cached_randn((2, 8, 2, 64)),
+                ),
+                # dim 0 offset (start != 0) -- contiguous, nonzero storage
+                # offset, across 1d/2d/3d/4d.
+                "dim0_off_1d": (
+                    0,
+                    64,
+                    128,
+                    cached_randn((128,)),
+                    cached_randn((64,)),
+                ),
+                "dim0_off_2d": (
+                    0,
+                    4,
+                    8,
+                    cached_randn((8, 128)),
+                    cached_randn((4, 128)),
+                ),
+                "dim0_off_3d": (
+                    0,
+                    2,
+                    4,
+                    cached_randn((4, 8, 64)),
+                    cached_randn((2, 8, 64)),
+                ),
+                "dim0_off_4d": (
+                    0,
+                    2,
+                    4,
+                    cached_randn((4, 8, 2, 64)),
+                    cached_randn((2, 8, 2, 64)),
+                ),
+            },
+        },
         ("test_rope_fms", "test_rope_cpu"): {
             "param_sets": {
                 "prefill_bs1": (
@@ -6384,6 +6545,34 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return x[:, 1:2, :, :, :] + x[:, :, 2:3, :, :]
 
         self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
+
+    def test_slice_scatter_cpu(self, op, dim, start, end, x, src):
+        """Slice writes lowered by ``lower_slice_scatter``."""
+
+        self.compare_with_cpu(
+            lambda x, src: op(dim, start, end, x, src),
+            x,
+            src,
+            clone_inputs=True,
+            run_eager=False,
+            atol=0.005,
+            rtol=0.005,
+        )
+
+    def test_slice_scatter_step_raises(self):
+        """A strided (non-unit-step) slice_scatter raises Unsupported."""
+
+        def fn(x, src):
+            base = x + 1.0
+            return torch.slice_scatter(base, src, dim=0, start=0, end=128, step=2)
+
+        x = torch.randn(128, 128, dtype=torch.float16, device="spyre")
+        src = torch.randn(64, 128, dtype=torch.float16, device="spyre")
+
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True, dynamic=False)
+        with pytest.raises(Exception) as exc_info:
+            compiled(x, src)
+        assert "step" in str(exc_info.value)
 
     def test_rope_cpu(self, q, freqs):
         def fn(q, freqs):
