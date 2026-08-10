@@ -4665,7 +4665,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_dwise_conv2d", "test_dwise_conv2d_cpu"): {
             "param_sets": {
-                "1x64_ksize3_depthwise": (
+                "1x64_ksize3": (
                     cached_randn((1, 64, 32, 32)),
                     cached_randn((64, 1, 3, 3)),
                     None,
@@ -4675,7 +4675,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     [[32, 32, 1, 1, 64], [3, 3, 1, 1, 64]],
                     [[1, 32, -1, 65536, 1024], [1, 3, -1, 9, 9]],
                 ),
-                "8x64_ksize3_depthwise": (
+                "8x64_ksize3": (
                     cached_randn((8, 64, 128, 128)),
                     cached_randn((64, 1, 3, 3)),
                     None,
@@ -4685,7 +4685,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     [[128, 128, 1, 8, 64], [3, 3, 1, 1, 64]],
                     [[1, 128, -1, 1048576, 16384], [1, 3, -1, 9, 9]],
                 ),
-                "1x3x64_ksize3_depthwise": (
+                "1x3x64_ksize3": (
                     cached_randn((1, 3, 64, 64)),
                     cached_randn((3, 1, 3, 3)),
                     None,
@@ -4695,7 +4695,37 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     [[64, 64, 1, 1, 64], [3, 3, 1, 1, 64]],
                     [[1, 64, -1, 12288, 4096], [1, 3, -1, 9, 9]],
                 ),
-                "2x3x32_ksize1_depthwise": (
+                "1x3x64_ksize_1x3": (
+                    cached_randn((1, 3, 64, 64)),
+                    cached_randn((3, 1, 1, 3)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    3,
+                    [[64, 64, 1, 1, 64], [3, 1, 1, 1, 64]],
+                    [[1, 64, -1, 12288, 4096], [1, 3, -1, 3, 3]],
+                ),
+                "1x3x64_ksize_3x1": (
+                    cached_randn((1, 3, 64, 64)),
+                    cached_randn((3, 1, 3, 1)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    3,
+                    [[64, 64, 1, 1, 64], [1, 3, 1, 1, 64]],
+                    [[1, 64, -1, 12288, 4096], [1, 1, -1, 3, 3]],
+                ),
+                "1x3x64x1_ksize_3x1": (
+                    cached_randn((1, 3, 64, 1)),
+                    cached_randn((3, 1, 3, 1)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    3,
+                    [[1, 64, 1, 1, 64], [1, 3, 1, 1, 64]],
+                    [[1, 1, -1, 192, 64], [1, 1, -1, 3, 3]],
+                ),
+                "2x3x32_ksize1": (
                     cached_randn((2, 3, 32, 32)),
                     cached_randn((3, 1, 1, 1)),
                     None,
@@ -4705,7 +4735,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     [[32, 32, 1, 2, 64], [1, 1, 1, 1, 64]],
                     [[1, 32, -1, 3072, 1024], [1, 1, -1, 1, 1]],
                 ),
-                "1x16x64_ksize3_depthwise": (
+                "1x16x64_ksize3": (
                     cached_randn((1, 16, 64, 64)),
                     cached_randn((16, 1, 3, 3)),
                     None,
@@ -4715,7 +4745,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     [[64, 64, 1, 1, 64], [3, 3, 1, 1, 64]],
                     [[1, 64, -1, 65536, 4096], [1, 3, -1, 9, 9]],
                 ),
-                "2x32_ksize1_stride2_depthwise": (
+                "2x32_ksize1_stride2": (
                     cached_randn((2, 32, 64, 64)),
                     cached_randn((32, 1, 1, 1)),
                     None,
@@ -4725,7 +4755,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     [[64, 64, 1, 2, 64], [1, 1, 1, 1, 64]],
                     [[1, 64, -1, 131072, 4096], [1, 1, -1, 1, 1]],
                 ),
-                "1x3x128_ksize5_depthwise": (
+                "1x3x128_ksize5": (
                     cached_randn((1, 3, 128, 128)),
                     cached_randn((3, 1, 5, 5)),
                     None,
