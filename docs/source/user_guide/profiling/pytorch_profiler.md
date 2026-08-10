@@ -60,9 +60,32 @@ print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10).replace(
 print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10).replace("CUDA", "AIU"))
 ```
 
-The `.replace("CUDA", "AIU")` is a cosmetic workaround — the profiler's
+The `.replace("CUDA", "AIU")` is a cosmetic workaround. The profiler's
 internal column category is still named after CUDA; native renaming is
 on the roadmap.
+
+The table groups time by operator. `Self CPU` is host-side time spent
+in the operator itself. `AIU total` (the renamed device column) is the
+device-side time attributed to it. The layout looks like this:
+
+```text
+---------------------------  ------------  ------------  ------------  ------------
+                       Name     Self CPU     CPU total     AIU total    # of Calls
+---------------------------  ------------  ------------  ------------  ------------
+             aten::mm          1.20ms         4.80ms        9.30ms            96
+      aten::scaled_dot_...     0.40ms         2.10ms        3.70ms            48
+             aten::add         0.30ms         0.90ms        0.80ms           192
+    TorchDynamo Cache Lookup   0.05ms         0.05ms        0.00ms             1
+---------------------------  ------------  ------------  ------------  ------------
+Self CPU time total: 6.40ms
+Self AIU time total: 14.10ms
+```
+
+The values above are illustrative. Absolute numbers depend on the model,
+the batch and sequence configuration, and the build. Read the shape, not
+the magnitudes: a large `AIU total` next to a small `Self CPU` marks a
+device-bound operator (`aten::mm` here), which is the expected profile
+for compute-heavy matmul layers.
 
 ### Export a trace for viewers
 
