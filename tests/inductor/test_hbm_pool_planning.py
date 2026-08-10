@@ -1,0 +1,219 @@
+# Copyright 2026 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import unittest
+from unittest.mock import MagicMock
+
+import torch
+from sympy import Integer
+from torch import fx
+from torch._inductor.dependencies import MemoryDep
+from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise
+from torch._inductor.scheduler import FusedSchedulerNode, SchedulerNode
+from torch._inductor.virtualized import V
+from torch.utils._ordered_set import OrderedSet
+
+from torch_spyre._C import ElementArrangement, SpyreTensorLayout
+from torch_spyre._inductor.hbm_pool_planning import hbm_pool_planning
+from torch_spyre._inductor.ir import FixedTiledLayout
+
+
+def _make_ftl_buffer(name, host_size=(64,), dim_order=(0,)):
+    """Real ComputedBuffer with a FixedTiledLayout, for pool-eligibility tests.
+
+    Mirrors _make_ftl_op in test_coarse_tiling.py:1187, trimmed to what
+    hbm_pool_planning needs (device_layout.device_size must be set for
+    _compute_size_bytes to work).
+    """
+    strides = [int(s) for s in FlexibleLayout.contiguous_strides(list(host_size))]
+    device_layout = SpyreTensorLayout(
+        list(host_size),
+        strides,
+        torch.float16,
+        list(dim_order),
+        ElementArrangement.STANDARD,
+    )
+    layout = FixedTiledLayout(
+        torch.device("cpu"),
+        torch.float16,
+        [Integer(s) for s in host_size],
+        [Integer(s) for s in strides],
+        device_layout,
+    )
+    pw = Pointwise(
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+        inner_fn=lambda index: Integer(1),
+        ranges=[Integer(s) for s in host_size],
+    )
+    buf = ComputedBuffer(name=name, layout=layout, data=pw)
+    V.graph.name_to_buffer[name] = buf
+    return buf
+
+
+def _make_snode_with_rw(name, writes, reads):
+    """MagicMock SchedulerNode with real MemoryDep read_writes for the
+    given buffer names, and get_nodes()/get_name() wired for
+    _iter_all_nodes / bundle-name lookup.
+
+    FusedSchedulerNode.__init__ -> init_group_node/refresh_group_node_
+    dependencies walks several BaseSchedulerNode bookkeeping attributes
+    (ancestors, unmet_dependencies, min/max_order, min/max_input_distance,
+    outputs) that a bare ``MagicMock(spec=SchedulerNode)`` leaves
+    unconfigured and which then raise AttributeError. These are normally
+    populated by the real Scheduler during node construction; since these
+    tests build bundles directly (bypassing the Scheduler), fill them in
+    with the same empty/zero defaults BaseSchedulerNode.__init__ uses.
+    """
+    snode = MagicMock(spec=SchedulerNode)
+    snode.get_name.return_value = name
+    snode.get_nodes.return_value = [snode]
+    snode.ancestors = OrderedSet()
+    snode.unmet_dependencies = OrderedSet()
+    snode.min_order = 0
+    snode.max_order = 0
+    snode.min_input_distance = 0
+    snode.max_input_distance = 0
+    snode.outputs = []
+    snode.is_reduction.return_value = False
+    snode.group = (torch.device("cpu"), ())
+    snode.read_writes = MagicMock()
+    snode.read_writes.writes = {MemoryDep(w, Integer(0), (), ()) for w in writes}
+    snode.read_writes.reads = {MemoryDep(r, Integer(0), (), ()) for r in reads}
+    return snode
+
+
+class TestHbmPoolPlanningPerBundle(unittest.TestCase):
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+        # A bare GraphLowering() never runs lowering, so graph_outputs is
+        # never set by __init__ (only assigned later, mid-lowering). Set it
+        # explicitly so get_output_names()/get_output_names-based filters
+        # below don't raise AttributeError.
+        V.graph.graph_outputs = []
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    def test_buffer_local_to_one_bundle_is_pool_eligible(self):
+        """A buffer written and read within the same bundle gets an
+        hbm_pool allocation."""
+        _make_ftl_buffer("buf0")
+        writer = _make_snode_with_rw("writer", writes=["buf0"], reads=[])
+        reader = _make_snode_with_rw("reader", writes=[], reads=["buf0"])
+        bundle = FusedSchedulerNode(MagicMock(), [writer, reader])
+
+        hbm_pool_planning([bundle])
+
+        buf = V.graph.get_buffer("buf0")
+        self.assertIn("hbm_pool", buf.get_layout().allocation)
+        self.assertIn(bundle.get_name(), V.graph.hbm_pool_sizes)
+
+    def test_buffer_crossing_bundles_is_not_pool_eligible(self):
+        """A buffer written in bundle A and read in bundle B falls back
+        to standalone HBM (no hbm_pool allocation)."""
+        _make_ftl_buffer("buf0")
+        writer = _make_snode_with_rw("writer", writes=["buf0"], reads=[])
+        reader = _make_snode_with_rw("reader", writes=[], reads=["buf0"])
+        bundle_a = FusedSchedulerNode(MagicMock(), [writer])
+        bundle_b = FusedSchedulerNode(MagicMock(), [reader])
+
+        hbm_pool_planning([bundle_a, bundle_b])
+
+        buf = V.graph.get_buffer("buf0")
+        self.assertNotIn("hbm_pool", buf.get_layout().allocation)
+
+    def test_multi_bundle_graph_produces_multiple_pool_size_entries(self):
+        """Two independent bundles, each with their own local-only
+        intermediate, each get their own hbm_pool_sizes entry."""
+        _make_ftl_buffer("buf0")
+        _make_ftl_buffer("buf1")
+        w0 = _make_snode_with_rw("w0", writes=["buf0"], reads=[])
+        r0 = _make_snode_with_rw("r0", writes=[], reads=["buf0"])
+        w1 = _make_snode_with_rw("w1", writes=["buf1"], reads=[])
+        r1 = _make_snode_with_rw("r1", writes=[], reads=["buf1"])
+        bundle_a = FusedSchedulerNode(MagicMock(), [w0, r0])
+        bundle_b = FusedSchedulerNode(MagicMock(), [w1, r1])
+
+        hbm_pool_planning([bundle_a, bundle_b])
+
+        self.assertEqual(len(V.graph.hbm_pool_sizes), 2)
+        self.assertIn(bundle_a.get_name(), V.graph.hbm_pool_sizes)
+        self.assertIn(bundle_b.get_name(), V.graph.hbm_pool_sizes)
+
+    def test_disabled_config_sets_empty_dict(self):
+        from torch_spyre._inductor import config as cfg
+
+        old = cfg.hbm_pool_planning
+        cfg.hbm_pool_planning = False
+        try:
+            result = hbm_pool_planning([])
+        finally:
+            cfg.hbm_pool_planning = old
+        self.assertEqual(V.graph.hbm_pool_sizes, {})
+        self.assertEqual(result, [])
+
+    def test_single_bundle_graph_offsets_match_pre_reorder_behavior(self):
+        """A graph that fuses into exactly one bundle must get the same
+        per-buffer hbm_pool offsets and total size that the old
+        graph-global scheme would have produced for the same buffers --
+        the per-bundle rewrite must not change single-bundle behavior.
+
+        This pins down parity by computing the expected offsets directly
+        from the same Allocator/_compute_size_bytes primitives the
+        implementation itself uses, rather than hardcoding byte constants
+        that would silently drift if _compute_size_bytes's stick-alignment
+        changes for unrelated reasons.
+        """
+        from torch_spyre._inductor.constants import SEGMENT_SIZE
+        from torch_spyre._inductor.hbm_pool_planning import (
+            Allocator,
+            _compute_size_bytes,
+        )
+
+        _make_ftl_buffer("buf0", host_size=(64,))
+        _make_ftl_buffer("buf1", host_size=(128,))
+        w0 = _make_snode_with_rw("w0", writes=["buf0"], reads=[])
+        mid = _make_snode_with_rw("mid", writes=["buf1"], reads=["buf0"])
+        r1 = _make_snode_with_rw("r1", writes=[], reads=["buf1"])
+        bundle = FusedSchedulerNode(MagicMock(), [w0, mid, r1])
+
+        hbm_pool_planning([bundle])
+
+        expected_alloc = Allocator(SEGMENT_SIZE)
+        # buf0's live range ends at "mid" (step 1), buf1's starts there --
+        # sorted by (start, end, name) as in the real implementation,
+        # buf0 allocates first.
+        buf0_size = _compute_size_bytes("buf0")
+        expected_offsets = {"buf0": expected_alloc.allocate(buf0_size)}
+        expected_alloc.free(expected_offsets["buf0"], buf0_size)
+        expected_offsets["buf1"] = expected_alloc.allocate(_compute_size_bytes("buf1"))
+        expected_pool_size = expected_alloc.get_pool_end()
+
+        buf0 = V.graph.get_buffer("buf0")
+        buf1 = V.graph.get_buffer("buf1")
+        self.assertEqual(
+            buf0.get_layout().allocation["hbm_pool"], expected_offsets["buf0"]
+        )
+        self.assertEqual(
+            buf1.get_layout().allocation["hbm_pool"], expected_offsets["buf1"]
+        )
+        self.assertEqual(V.graph.hbm_pool_sizes[bundle.get_name()], expected_pool_size)
+
+
+if __name__ == "__main__":
+    unittest.main()
