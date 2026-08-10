@@ -37,6 +37,7 @@ from torch_spyre._inductor.constants import (
     POOL_DIM_LABELS,
     POOL_OPS,
     RESTICKIFY_OP,
+    DEPTHWISE_CONV2D_OP,
     TOPK_OPS,
 )
 from torch_spyre._inductor.core_mapping import core_to_slice_mapping
@@ -432,7 +433,7 @@ def _is_matmul(op: str) -> bool:
 
 
 def _is_conv(op: str) -> bool:
-    return op in ("depthwiseconv2dnative")
+    return op in [DEPTHWISE_CONV2D_OP]
 
 
 def _is_topk(op: str) -> bool:
