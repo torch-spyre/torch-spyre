@@ -15,8 +15,9 @@
 """Span-overflow-driven coarse-tile group construction.
 
 Builds coarse-tile groups automatically when an op's per-core working set
-would overflow available span, for consumption by ``coarse_tile()`` in
-``coarse_tile.py``. Runs POST-stickification (see ``passes.py``'s
+would overflow available span, for consumption by
+``coarse_tile_post_stickify()`` in ``coarse_tile.py``. Runs
+POST-stickification (see ``passes.py``'s
 ``_maybe_coarse_tile_span_overflow``) — requires ``FixedTiledLayout``
 (``device_layout``) on all ops.
 """
@@ -209,7 +210,8 @@ def _dims_to_hints(
 def span_overflow_groups(
     graph: GraphLowering,
 ) -> tuple[list[tuple], list[tuple[Operation, list[DimHint]]]]:
-    """Build coarse_tile() groups from automatic span-overflow plans.
+    """Build coarse_tile_post_stickify() groups from automatic span-overflow
+    plans.
 
     This adapter converts SpanOverflowTilePlans into the same group shape as
     user spyre_hint annotations: ``[(ops, [(hint_id, count)])]``.  Ops that
@@ -221,7 +223,7 @@ def span_overflow_groups(
     Returns a ``(groups, dim_hint_assignments)`` pair.  ``dim_hint_assignments``
     is a list of ``(op, dim_hints)`` pairs this function decided on but did
     NOT apply — applying them (setting ``op.dim_hints``) is the caller's
-    responsibility, and must happen before ``coarse_tile()``/
+    responsibility, and must happen before ``coarse_tile_post_stickify()``/
     ``validate_coarse_tile_groups`` run, since ``dim_hints`` is an input those
     consume, not something they produce.  Keeping the assignment out of this
     function's own decision logic keeps ``span_overflow_groups`` a pure
@@ -356,11 +358,11 @@ def span_overflow_groups(
         plan = plan_span_overflow_tile(op, config.sencores)
         if plan is None:
             # op needs no coarse tiling of its own.  It's always safe to leave
-            # it outside any loop: insert_tiling_propagation's outside-consumer
-            # path (coarse_tile.py) already patches consumers of a tiled
-            # producer to read a full, reassembled buffer, and
-            # plan_span_overflow_tile returning None here means that op's own
-            # full-size reads/writes are already known not to overflow.
+            # it outside any loop: Pass 3's outside-consumer path
+            # (coarse_tile.py) already patches consumers of a tiled producer
+            # to read a full, reassembled buffer, and plan_span_overflow_tile
+            # returning None here means that op's own full-size reads/writes
+            # are already known not to overflow.
             logger.debug("[span-overflow groups] op=%s no auto plan", op.get_name())
             flush_current_group()
             continue

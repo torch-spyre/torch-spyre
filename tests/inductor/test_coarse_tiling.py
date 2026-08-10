@@ -30,7 +30,7 @@ Covers six areas, each in its own class group:
      (TestGenerateBundleMlir, TestFindUnimplemented,
       TestGenerateBundleMlirSnapshot, TestGenerateBundleMlirWithAffineStrides,
       TestGenerateBundleNestedTiling, TestGenerateBundleAffineLoopPath)
-  6. Buffer propagation: consumer analysis helpers for insert_tiling_propagation
+  6. Buffer propagation: consumer analysis helpers for tiling propagation
      (TestCoarseTileBufferPropagation)
 
 No Spyre device or backend compiler is required.
@@ -84,7 +84,8 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _retile_load_index_from_strides,
     _should_patch_retiled_load_indexes,
     _stride_rewrite_map,
-    coarse_tile,
+    coarse_tile_post_stickify,
+    coarse_tile_pre_stickify,
     plan_coarse_tile_groups,
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
@@ -1422,14 +1423,11 @@ class TestCoarseTile(unittest.TestCase):
     def tearDown(self):
         self._patch.stop()
 
-    def _run(self, all_ops, groups, **kwargs):
-        coarse_tile(_graph(all_ops), groups, **kwargs)
-
     def test_empty_groups_list_is_noop(self):
         data = _make_pointwise([Integer(32)])
         op = _make_op(data, "op0")
         original = list(data.ranges)
-        coarse_tile(_graph([op]), [])
+        coarse_tile_pre_stickify(_graph([op]), [])
         self.assertFalse(hasattr(op, "loop_info") and op.loop_info != MagicMock())
         self.assertEqual(data.ranges, original)
 
@@ -1437,7 +1435,7 @@ class TestCoarseTile(unittest.TestCase):
         op_extern = _make_non_computed_op("extern0")
         data = _make_pointwise([Integer(16)])
         op_computed = _make_hinted_op(data, "op0", hints=((0, 0),))
-        coarse_tile(
+        coarse_tile_pre_stickify(
             _graph([op_extern, op_computed]),
             [([op_extern, op_computed], [(0, Integer(2))])],
         )
@@ -1449,7 +1447,7 @@ class TestCoarseTile(unittest.TestCase):
         n = Symbol("N", positive=True)
         data = _make_pointwise([n])
         op = _make_hinted_op(data, "op0", hints=((0, 0),))
-        coarse_tile(_graph([op]), [([op], [(0, k)])])
+        coarse_tile_pre_stickify(_graph([op]), [([op], [(0, k)])])
         self.assertEqual(op.loop_info.loop_count, [k])
         self.assertEqual(simplify(data.ranges[0] - n / k), 0)
 
@@ -1461,7 +1459,9 @@ class TestCoarseTile(unittest.TestCase):
         op1 = _make_hinted_op(d1, "op1", hints=((0, 0),))
         op2 = _make_hinted_op(d2, "op2", hints=((0, 0),))
         with self.assertRaises(RuntimeError):
-            coarse_tile(_graph([op0, op1, op2]), [([op0, op2], [(0, Integer(4))])])
+            coarse_tile_pre_stickify(
+                _graph([op0, op1, op2]), [([op0, op2], [(0, Integer(4))])]
+            )
 
     def test_op_not_in_operations_raises(self):
         data = _make_pointwise([Integer(32)])
@@ -1470,7 +1470,135 @@ class TestCoarseTile(unittest.TestCase):
             _make_pointwise([Integer(8)]), "unknown", hints=((0, 0),)
         )
         with self.assertRaises(RuntimeError):
-            coarse_tile(_graph([op_known]), [([op_unknown], [(0, Integer(2))])])
+            coarse_tile_pre_stickify(
+                _graph([op_known]), [([op_unknown], [(0, Integer(2))])]
+            )
+
+    def test_post_stickify_skips_pass_1(self):
+        """coarse_tile_post_stickify must skip both planning and execution
+        of Pass 1 -- a full-buffer boundary read stays a direct read of the
+        full buffer, not redirected to a copy."""
+        from torch._inductor.ir import ComputedBuffer
+
+        gm = fx.symbolic_trace(lambda: None)
+        graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        graph_ctx.__enter__()
+        try:
+            tiled_op, full_deps, operations = _make_full_buffer_read_fixture()
+            self.assertEqual(len(full_deps), 1)
+            full_buf_name = full_deps[0].name
+
+            groups = [([tiled_op], [(0, Integer(8))])]
+            coarse_tile_post_stickify(_graph(operations), groups)
+
+            # No new copy op was inserted: still exactly the original two ops.
+            self.assertEqual(len(operations), 2)
+            loaded_names = []
+
+            class _Recorder:
+                def load(self, name, index):
+                    loaded_names.append(name)
+                    return 0.0
+
+            final_op = next(
+                o
+                for o in operations
+                if isinstance(o, ComputedBuffer) and o.get_name() == "tiled_op0"
+            )
+            with V.set_ops_handler(_Recorder()):
+                final_op.data.inner_fn([sympy.Integer(0) for _ in final_op.data.ranges])
+            self.assertIn(full_buf_name, loaded_names)
+        finally:
+            graph_ctx.__exit__(None, None, None)
+
+    def test_end_to_end_shares_one_copy_across_group(self):
+        """Full coarse_tile() entry point: two hint-driven ops in one group
+        both reading the same full InputBuffer at the same index must end
+        up sharing exactly one inserted read-copy op.
+
+        This closes the loop that Tasks 2/3/6/7's direct
+        _plan_read_copies/_insert_all_read_copy_ops tests don't cover: it
+        is the only test that also runs coarse_tile()'s later by-name
+        resync loop (_patch_retiled_load_indexes, near the end of
+        coarse_tile()'s body), which could in principle silently break
+        Pass 1's sharing if it replaced an op object Pass 1 already
+        consumed by name.
+        """
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            InputBuffer,
+            Pointwise,
+            StorageBox,
+            TensorBox,
+        )
+        from torch_spyre._inductor.propagate_hints import DimHint
+
+        gm = fx.symbolic_trace(lambda: None)
+        graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        graph_ctx.__enter__()
+        try:
+            device = torch.device("cpu")
+            dtype = torch.float32
+
+            # One real, full-size InputBuffer shared by both ops below --
+            # unlike _make_real_pointwise_op (which allocates a fresh
+            # InputBuffer per op), both readers here load the exact same
+            # buffer object at the exact same index, so _plan_read_copies
+            # should key them into a single ReadCopyEntry.
+            shared_input = InputBuffer(
+                name="shared_in", layout=FixedLayout(device, dtype, [64], [1])
+            )
+            V.graph.name_to_buffer["shared_in"] = shared_input
+            shared_box = TensorBox(StorageBox(shared_input))
+
+            def _make_reader(name):
+                def inner_fn(index):
+                    return shared_box.make_loader()(index)
+
+                pw = Pointwise.create(
+                    device=device,
+                    dtype=dtype,
+                    inner_fn=inner_fn,
+                    ranges=[Integer(64)],
+                )
+                pw_data = pw.data.data  # TensorBox -> StorageBox -> Pointwise
+                op = ComputedBuffer(
+                    name=name,
+                    layout=FixedLayout(device, dtype, [Integer(64)], None),
+                    data=pw_data,
+                )
+                op.operation_name = name
+                op.origins = OrderedSet()
+                V.graph.name_to_buffer[name] = op
+                op._test_out_coords = [sympy.Symbol("c0")]
+                op.dim_hints = [
+                    DimHint(
+                        dim_names=["dim0"],
+                        split_count=1,
+                        loop_var=sympy.Symbol("c0"),
+                        is_reduction=False,
+                        hint_id=0,
+                    )
+                ]
+                return op
+
+            op_a = _make_reader("op_a")
+            op_b = _make_reader("op_b")
+            operations = [op_a, op_b]
+            groups = [([op_a, op_b], [(0, Integer(8))])]
+
+            coarse_tile_pre_stickify(_graph(operations), groups)
+
+            copy_ops = [
+                op
+                for op in operations
+                if isinstance(op, ComputedBuffer)
+                and op.get_name().startswith("coarse_tile_read_copy_")
+            ]
+            self.assertEqual(len(copy_ops), 1)
+        finally:
+            graph_ctx.__exit__(None, None, None)
 
 
 class TestCoarseTileNested(unittest.TestCase):
@@ -1489,7 +1617,9 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_spec_stamps_list_attributes(self):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
+        coarse_tile_pre_stickify(
+            _graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])]
+        )
         self.assertEqual(op.loop_info.loop_group_id, (0, 0))
         self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [1]])
@@ -1497,14 +1627,18 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_spec_divides_ranges_both_levels(self):
         data = _make_pointwise([Integer(256), Integer(128)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
+        coarse_tile_pre_stickify(
+            _graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])]
+        )
         self.assertEqual(data.ranges[0], Integer(64))
         self.assertEqual(data.ranges[1], Integer(64))
 
     def test_nested_spec_outer_only_divides_outer_dim(self):
         data = _make_pointwise([Integer(32), Integer(64), Integer(16)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 1)))
-        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(8))])])
+        coarse_tile_pre_stickify(
+            _graph([op]), [([op], [(1, Integer(4)), (2, Integer(8))])]
+        )
         self.assertEqual(data.ranges[0], Integer(8))
         self.assertEqual(data.ranges[1], Integer(8))
         self.assertEqual(data.ranges[2], Integer(16))
@@ -1515,7 +1649,7 @@ class TestCoarseTileNested(unittest.TestCase):
         d1 = _make_pointwise([Integer(128), Integer(64)])
         op0 = _make_hinted_op(d0, "op0", hints=((1, 0),))
         op1 = _make_hinted_op(d1, "op1", hints=((2, 0), (3, 1)))
-        coarse_tile(
+        coarse_tile_pre_stickify(
             _graph([op0, op1]),
             [
                 ([op0], [(1, Integer(4))]),
@@ -1536,7 +1670,9 @@ class TestCoarseTileNested(unittest.TestCase):
     def test_nested_same_dim_different_counts(self):
         data = _make_pointwise([Integer(256)])
         op = _make_hinted_op(data, "op0", hints=((1, 0), (2, 0)))
-        coarse_tile(_graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])])
+        coarse_tile_pre_stickify(
+            _graph([op]), [([op], [(1, Integer(4)), (2, Integer(2))])]
+        )
         self.assertEqual(data.ranges[0], Integer(32))
         self.assertEqual(op.loop_info.loop_count, [Integer(4), Integer(2)])
         self.assertEqual(op.loop_info.loop_tiled_dims, [[0], [0]])
@@ -1582,7 +1718,7 @@ class TestCoarseTileNested(unittest.TestCase):
             ([op0], [(1, Integer(4))]),
             ([op1], [(2, Integer(4)), (3, Integer(2))]),
         ]
-        coarse_tile(_graph([op0, op1]), groups)
+        coarse_tile_pre_stickify(_graph([op0, op1]), groups)
         for group_ops, _ in groups:
             for op in group_ops:
                 if isinstance(op, ComputedBuffer):
@@ -1607,10 +1743,10 @@ class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
 
     These tests call plan_coarse_tile_groups + _apply_plan directly rather
     than the full coarse_tile() entry point.  coarse_tile() unconditionally
-    also runs insert_tiling_propagation after stamping every group, which
-    for a Reduction op with an actually-tiled reduction dim drives
-    _propagate_tiled_reduction_op -> _allocate_full_buffer ->
-    graph_lowering.run_node() on a synthesized spyre.empty FX node -- real
+    also runs the reduction-machinery pass (_insert_all_reduction_ops) after
+    stamping every group, which for a Reduction op with an actually-tiled
+    reduction dim drives _propagate_tiled_reduction_op -> _allocate_full_buffer
+    -> graph_lowering.run_node() on a synthesized spyre.empty FX node -- real
     FX-dispatch/lowering machinery this lightweight harness does not
     provide (confirmed live: raises LoweringException /
     "'NullHandler' object does not support the context manager protocol").
@@ -4063,7 +4199,7 @@ def _make_inside_consumer_op(name, reads_buf, loop_group_id):
 
 
 class TestCoarseTileBufferPropagation(unittest.TestCase):
-    """Tests for insert_tiling_propagation — consumer analysis helpers."""
+    """Tests for tiling propagation — consumer analysis helpers."""
 
     def setUp(self):
         # Only test_case2_condition_now_produces_copy_op below needs a real
@@ -4236,10 +4372,11 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         (_allocate_full_buffer, _insert_copy_op, _patch_consumers) all touch
         real ComputedBuffer/V.graph machinery (qualify_name, run_node,
         replace_computed_buffer_body), which MagicMock-based ops used
-        elsewhere in this file cannot satisfy. insert_tiling_propagation
-        itself takes a pre-grouped ``groups`` list that plan_coarse_tile_groups
-        would normally produce; calling _propagate_tiled_op directly is the
-        cheaper, equivalent way to reach exactly the code this task changed.
+        elsewhere in this file cannot satisfy. Pass 3
+        (_insert_all_write_copy_ops) itself takes the already-stamped
+        `operations` list that _apply_plan would normally produce; calling
+        _propagate_tiled_op directly is the cheaper, equivalent way to reach
+        exactly the code this task changed.
         """
         from torch._inductor.ir import (
             ComputedBuffer,
@@ -4252,7 +4389,12 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         from torch_spyre._inductor.lowering import enable_spyre_lowerings
-        from torch_spyre._inductor.wsr.coarse_tile import _propagate_tiled_op
+        from torch_spyre._inductor.loop_info import PropagationPlan
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _insert_all_read_copy_ops,
+            _plan_read_copies,
+            _propagate_tiled_op,
+        )
 
         # _allocate_full_buffer lowers a real spyre.empty FX node via
         # V.graph.run_node(), which needs V.fake_mode (GraphLowering.fake_mode
@@ -4317,32 +4459,59 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         # V.graph.buffers, not an independent list, for that removal to find it.
         operations = V.graph.buffers
         operations.extend([tiled_op, consumer])
+        original_op = tiled_op
 
+        # Read copy-ins are now Pass 1 (_insert_all_read_copy_ops), a
+        # standalone pass that runs before Pass 3 / _propagate_tiled_op even
+        # in production -- call it directly here rather than folding its
+        # effect into _propagate_tiled_op.
         with patch(
             "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
             return_value=set(),
         ):
-            _propagate_tiled_op(tiled_op, operations)
+            read_copy_plans = _plan_read_copies(operations, [((0,), [tiled_op], {})])
+            _insert_all_read_copy_ops(operations, read_copy_plans)
+            # Pass 1 may have spliced a replacement for "op0" into
+            # operations -- re-resolve by name before calling
+            # _propagate_tiled_op, exactly as _insert_all_write_copy_ops'
+            # own loop now does.
+            tiled_op = next(
+                o
+                for o in operations
+                if isinstance(o, ComputedBuffer) and o.get_name() == "op0"
+            )
+            # _propagate_tiled_op (Pass 3) now consumes a precomputed
+            # PropagationPlan instead of deriving it itself -- full_ranges
+            # is the pre-division full shape (8 * loop_count 8 == 64),
+            # matching what the old in-function _compute_full_ranges call
+            # used to compute from the tile-sized op.data.ranges.
+            propagation = PropagationPlan(
+                kind="copy_out",
+                full_ranges=[Integer(64)],
+                outside_consumer_names=("out0",),
+                is_graph_output=False,
+            )
+            _propagate_tiled_op(tiled_op, propagation, operations)
 
-        # tiled_op's own two inputs are real, full-size, untiled InputBuffers
+        # original_op's two inputs are real, full-size, untiled InputBuffers
         # read at a tile-scoped index -- _full_buffer_read_deps now flags
-        # both, so _insert_read_copy_ops replaces tiled_op with a new
-        # ComputedBuffer (same name, "op0") before the write-side copy-op
-        # logic below even runs. Look the final op up by name rather than
-        # using the now-stale tiled_op reference.
+        # both, so Pass 1's _insert_all_read_copy_ops replaces original_op
+        # with a new ComputedBuffer (same name, "op0") before the write-side
+        # copy-op logic even runs. Look the final op up by name rather than
+        # using the now-stale original_op reference.
         final_op = V.graph.name_to_buffer["op0"]
         # name_to_buffer is only half the story: replace_computed_buffer_body
-        # must also have swapped the stale tiled_op out of operations (==
+        # must also have swapped the stale original_op out of operations (==
         # V.graph.buffers, see the comment above where it's assigned) for
         # later scheduling to see the new op instead of the old one. Checked
         # by identity (`is`), not `in`/`==`: ComputedBuffer is a frozen
         # dataclass, so `==` compares field values rather than object
-        # identity, and tiled_op/final_op share the same (in-place-mutated)
+        # identity, and original_op/final_op share the same (in-place-mutated)
         # `.data` and layout -- they compare equal to each other even though
         # only final_op is the live object, which makes assertIn/assertNotIn
         # pass regardless of whether the swap actually happened.
         self.assertTrue(any(op is final_op for op in operations))
-        self.assertFalse(any(op is tiled_op for op in operations))
+        self.assertFalse(any(op is original_op for op in operations))
 
         write_copy_ops = [
             op
@@ -4366,6 +4535,188 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         # instead), mirroring the Case 1 path.
         self.assertNotIsInstance(final_op.layout, MutationLayoutSHOULDREMOVE)
         self.assertEqual(final_op.loop_info.output_tiled_dims, [])
+
+
+class TestPlanTilingPropagation(unittest.TestCase):
+    """Cross-check: _plan_tiling_propagation's kind decision must match what
+    _propagate_tiled_op / _propagate_tiled_reduction_op actually do today.
+
+    This is the load-bearing regression net for Stage 2: it validates the
+    front-loaded planning decision against current (still transformation-
+    driving) behavior, before Stage 3 ever makes transformation consume the
+    new field. Built with the same mock-based fixtures
+    (_make_tiled_op/_make_consumer_op/_make_inside_consumer_op/
+    _make_tiled_reduction_op) TestCoarseTileBufferPropagation already uses
+    for its plain _find_outside_consumers/_full_buffer_read_deps checks --
+    _plan_tiling_propagation's own helpers are direct planning-time analogs
+    of those same functions.
+    """
+
+    def _plan_for(self, op, group_ops=None):
+        from torch_spyre._inductor.wsr.coarse_tile import _plan_tiling_propagation
+
+        group_ops = group_ops if group_ops is not None else [op]
+        info = op.loop_info
+        plan = {id(op): info}
+        levels = [(0, c) for c in info.loop_count]
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
+            return_value=set(),
+        ):
+            _plan_tiling_propagation(group_ops, [(group_ops, levels)], plan)
+        return info.propagation
+
+    def test_loop_invariant_matches_no_tiled_dims(self):
+        """All loop_tiled_dims empty -> loop_internal, matching
+        _propagate_tiled_op's `all(not dims ...)` fast-path return."""
+        op = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[]])
+        propagation = self._plan_for(op)
+        self.assertEqual(propagation.kind, "loop_internal")
+
+    def test_no_outside_consumers_matches_loop_internal(self):
+        """Tiled with no outside consumers/graph output -> loop_internal,
+        matching _propagate_tiled_op zeroing output_tiled_dims and
+        returning without a copy op."""
+        op = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        propagation = self._plan_for(op)
+        self.assertEqual(propagation.kind, "loop_internal")
+        self.assertEqual(propagation.outside_consumer_names, ())
+        self.assertFalse(propagation.is_graph_output)
+
+    def test_outside_consumer_matches_copy_out(self):
+        """Tiled with an outside consumer -> copy_out, matching
+        _propagate_tiled_op's _allocate_full_buffer/_insert_copy_op path.
+
+        Planning runs before _apply_plan divides op.data.ranges, so the
+        fixture's ranges are already the full (pre-division) size here --
+        full_ranges is expected to come back unchanged."""
+        tiled = _make_tiled_op("op0", [Integer(64)], (0,), [Integer(4)], [[0]])
+        consumer = _make_consumer_op("out0", "op0")
+        propagation = self._plan_for(tiled, group_ops=[tiled, consumer])
+        self.assertEqual(propagation.kind, "copy_out")
+        self.assertEqual(propagation.outside_consumer_names, ("out0",))
+        self.assertEqual(propagation.full_ranges, [Integer(64)])
+
+    def test_inside_consumer_only_matches_loop_internal(self):
+        """An inside-loop-group consumer alone doesn't force copy_out --
+        matches _propagate_tiled_op's outside_consumers check, which
+        _find_outside_consumers already excludes same-outer-group readers
+        from."""
+        tiled = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        inside = _make_inside_consumer_op("op1", "op0", (0,))
+        propagation = self._plan_for(tiled, group_ops=[tiled, inside])
+        self.assertEqual(propagation.kind, "loop_internal")
+
+    def test_graph_output_matches_copy_out(self):
+        """A graph-output buffer -> copy_out even with no other consumers,
+        matching _propagate_tiled_op's is_graph_output branch."""
+        from torch_spyre._inductor.wsr.coarse_tile import _plan_tiling_propagation
+
+        op = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        info = op.loop_info
+        plan = {id(op): info}
+        levels = [(0, Integer(4))]
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
+            return_value={"op0"},
+        ):
+            _plan_tiling_propagation([op], [([op], levels)], plan)
+        propagation = info.propagation
+        self.assertEqual(propagation.kind, "copy_out")
+        self.assertTrue(propagation.is_graph_output)
+
+    def test_tiled_reduction_matches_reduction_kind(self):
+        """A Reduction op tiling a reduction dim -> kind="reduction", with
+        the same identity/nesting decisions _propagate_tiled_reduction_op
+        computes."""
+        op = _make_tiled_reduction_op(
+            "red0",
+            ranges=[Integer(128)],
+            reduction_ranges=[Integer(256)],
+            reduction_type="sum",
+            loop_group_id=(0,),
+            loop_count=[Integer(4)],
+            loop_tiled_dims=[[]],
+        )
+        op.loop_info.loop_tiled_reduction_dims = [[0]]
+        propagation = self._plan_for(op)
+        self.assertEqual(propagation.kind, "reduction")
+        self.assertIsNotNone(propagation.reduction)
+        self.assertEqual(propagation.reduction.reduction_type, "sum")
+        self.assertEqual(propagation.reduction.identity, 0)
+        self.assertFalse(propagation.reduction.is_nested)
+        self.assertIsNone(propagation.reduction.outer_fill_loop_info)
+
+    def test_nested_tiled_reduction_matches_is_nested(self):
+        """Nested output+reduction tiling -> reduction plan with
+        is_nested=True and a trimmed outer_fill_loop_info, matching
+        _compute_fill_loop_info's non-None nested case."""
+        op = _make_tiled_reduction_op(
+            "red0",
+            ranges=[Integer(64)],
+            reduction_ranges=[Integer(256)],
+            reduction_type="max",
+            loop_group_id=(0, 0),
+            loop_count=[Integer(2), Integer(4)],
+            loop_tiled_dims=[[0], []],
+        )
+        op.loop_info.loop_tiled_reduction_dims = [[], [0]]
+        propagation = self._plan_for(op)
+        self.assertEqual(propagation.kind, "reduction")
+        self.assertTrue(propagation.reduction.is_nested)
+        self.assertEqual(propagation.reduction.identity, float("-inf"))
+        outer_info = propagation.reduction.outer_fill_loop_info
+        self.assertIsNotNone(outer_info)
+        self.assertEqual(outer_info.loop_group_id, (0,))
+        self.assertEqual(outer_info.loop_count, [Integer(2)])
+        self.assertEqual(outer_info.loop_tiled_dims, [[0]])
+
+    def test_reader_before_producer_still_zeroes_fixed_read(self):
+        """Reader-before-producer ordering in group_ops must not matter.
+
+        producer (op0) is tiled with no outside consumers -> loop_internal,
+        i.e. "fixed": its own write never advances. reader (op1) is inside
+        the same loop group and reads op0; op1's tiled_dims_per_read entry
+        for op0 is planted here exactly as plan_coarse_tile_groups would
+        have left it *before* op0's fixed status was known (non-empty,
+        mirroring the stale entry _zero_reads_of_fixed_buffers used to
+        correct after the fact at transformation time). op1 is placed
+        BEFORE op0 in group_ops -- the ordering
+        _zero_reads_of_fixed_buffers existed to work around, since
+        source-order visitation would see op1 before op0 is known to be
+        fixed. _plan_tiling_propagation must still zero op1's entry for
+        op0, because it computes every op's kind up front before its own
+        fixed-buffer zeroing pass runs -- there is no visitation-order
+        hazard left to trigger.
+        """
+        from torch_spyre._inductor.wsr.coarse_tile import _plan_tiling_propagation
+
+        producer = _make_tiled_op("op0", [Integer(16)], (0,), [Integer(4)], [[0]])
+        reader = _make_inside_consumer_op("op1", "op0", (0,))
+        # Simulate plan_coarse_tile_groups's pre-zeroing output: op1 read op0
+        # while op0's own tiled dims were still extent-4-tiled at level 0.
+        reader.loop_info.tiled_dims_per_read = [[[(0, Integer(4))]]]
+        group_ops = [reader, producer]
+        plan = {id(reader): reader.loop_info, id(producer): producer.loop_info}
+        levels = [(0, Integer(4))]
+        # reader is in `plan`, so _plan_tiling_propagation's main loop
+        # processes it too, which resolves its "op0" read via
+        # V.graph.get_buffer -- give it a minimal graph mock rather than a
+        # real GraphLowering, since these are MagicMock IR objects, not
+        # objects a real graph handler has ever registered.
+        mock_graph = MagicMock()
+        mock_graph.get_buffer.return_value = producer
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile._graph_output_names",
+                return_value=set(),
+            ),
+            V.set_graph_handler(mock_graph),
+        ):
+            _plan_tiling_propagation(group_ops, [(group_ops, levels)], plan)
+
+        self.assertEqual(producer.loop_info.propagation.kind, "loop_internal")
+        self.assertEqual(reader.loop_info.tiled_dims_per_read, [[]])
 
 
 def _make_cross_group_producer_read_fixture():
@@ -4584,6 +4935,586 @@ def _make_full_buffer_read_fixture():
     operations = [full_buf, tiled_op]
     full_deps = _full_buffer_read_deps(tiled_op)
     return tiled_op, full_deps, operations
+
+
+def _make_two_op_shared_read_fixture():
+    """Two tiled ops in the same group both read full_buf at the SAME index
+    expression (mirrors "a+b*a": two reads of "a" with identical indexing,
+    just from two different consuming ops instead of one op's two reads).
+
+    Returns (op_a, op_b, full_buf, operations) with loop_info already
+    stamped on both ops, ready to pass into _plan_read_copies via a single
+    retiled_infos_by_group-style entry:
+    [((0,), [op_a, op_b], {})].
+    """
+    from torch._inductor.ir import (
+        ComputedBuffer,
+        FixedLayout,
+        Pointwise,
+        StorageBox,
+        TensorBox,
+    )
+
+    from torch_spyre._inductor.ir import SpyreEmptyFallback
+
+    device = torch.device("cpu")
+    dtype = torch.float32
+
+    full_buf = SpyreEmptyFallback(
+        torch.ops.spyre.empty.default, [64, 128], device, dtype
+    )
+    full_buf.layout = FixedLayout(device, dtype, [64, 128], [128, 1])
+    full_box = TensorBox(StorageBox(full_buf))
+
+    def _make_reader(name):
+        def inner_fn(index):
+            return full_box.make_loader()(index)
+
+        pw = Pointwise.create(
+            device=device,
+            dtype=dtype,
+            inner_fn=inner_fn,
+            ranges=[Integer(8), Integer(128)],
+        )
+        pw_data = pw.data.data
+        op = ComputedBuffer(
+            name=name,
+            layout=FixedLayout(device, dtype, [Integer(8), Integer(128)], None),
+            data=pw_data,
+        )
+        op.operation_name = name
+        op.origins = OrderedSet()
+        op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,), loop_count=[Integer(8)], loop_tiled_dims=[[0]]
+        )
+        V.graph.name_to_buffer[name] = op
+        return op
+
+    op_a = _make_reader("op_a")
+    op_b = _make_reader("op_b")
+    operations = [full_buf, op_a, op_b]
+    return op_a, op_b, full_buf, operations
+
+
+class TestPlanReadCopies(unittest.TestCase):
+    """_plan_read_copies groups equivalent cross-group reads within a group."""
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    def test_two_ops_same_index_share_one_entry(self):
+        from torch_spyre._inductor.wsr.coarse_tile import _plan_read_copies
+
+        op_a, op_b, full_buf, operations = _make_two_op_shared_read_fixture()
+        retiled_infos_by_group = [((0,), [op_a, op_b], {})]
+
+        plans = _plan_read_copies(operations, retiled_infos_by_group)
+
+        self.assertIn((0,), plans)
+        plan = plans[(0,)]
+        self.assertEqual(len(plan.entries), 1)
+        entry = plan.entries[0]
+        self.assertEqual(entry.dep.name, full_buf.get_name())
+        self.assertEqual(entry.insert_before_op_name, "op_a")
+        self.assertEqual(entry.sizing_op_name, "op_a")
+        self.assertEqual(set(entry.consumer_op_names), {"op_a", "op_b"})
+
+    def test_same_op_two_reads_same_index_collapse_to_one_entry(self):
+        """a+b*a: one op reading buffer 'a' twice at the identical index
+        must plan exactly one ReadCopyEntry, consumed once by that op."""
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            Pointwise,
+            StorageBox,
+            TensorBox,
+        )
+
+        from torch_spyre._inductor.ir import SpyreEmptyFallback
+        from torch_spyre._inductor.wsr.coarse_tile import _plan_read_copies
+
+        device = torch.device("cpu")
+        dtype = torch.float32
+
+        full_buf = SpyreEmptyFallback(
+            torch.ops.spyre.empty.default, [8, 8], device, dtype
+        )
+        full_buf.layout = FixedLayout(device, dtype, [8, 8], [8, 1])
+        full_box = TensorBox(StorageBox(full_buf))
+
+        def inner_fn(index):
+            a1 = full_box.make_loader()(index)
+            a2 = full_box.make_loader()(index)
+            return a1 + a2
+
+        pw = Pointwise.create(
+            device=device,
+            dtype=dtype,
+            inner_fn=inner_fn,
+            ranges=[Integer(8), Integer(8)],
+        )
+        pw_data = pw.data.data
+        tiled_op = ComputedBuffer(
+            name="tiled_op0",
+            layout=FixedLayout(device, dtype, [Integer(8), Integer(8)], None),
+            data=pw_data,
+        )
+        tiled_op.operation_name = "tiled_op0"
+        tiled_op.origins = OrderedSet()
+        tiled_op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,), loop_count=[Integer(1)], loop_tiled_dims=[[]]
+        )
+        V.graph.name_to_buffer["tiled_op0"] = tiled_op
+
+        operations = [full_buf, tiled_op]
+        retiled_infos_by_group = [((0,), [tiled_op], {})]
+
+        plans = _plan_read_copies(operations, retiled_infos_by_group)
+
+        self.assertEqual(len(plans[(0,)].entries), 1)
+        entry = plans[(0,)].entries[0]
+        self.assertEqual(entry.consumer_op_names, ("tiled_op0",))
+
+    def test_partial_sharing_two_entries_different_consumers(self):
+        """op_a reads shared_buf + only_a; op_b reads shared_buf + only_b.
+        Expect two ReadCopyEntry objects: one shared (consumers = op_a,
+        op_b), one each for only_a/only_b (consumers = just that op)."""
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            Pointwise,
+            StorageBox,
+            TensorBox,
+        )
+
+        from torch_spyre._inductor.ir import SpyreEmptyFallback
+        from torch_spyre._inductor.wsr.coarse_tile import _plan_read_copies
+
+        device = torch.device("cpu")
+        dtype = torch.float32
+
+        def _make_full(name, size):
+            buf = SpyreEmptyFallback(torch.ops.spyre.empty.default, size, device, dtype)
+            buf.layout = FixedLayout(device, dtype, size, [size[1], 1])
+            buf.name = name
+            V.graph.name_to_buffer[name] = buf
+            return buf
+
+        shared_buf = _make_full("shared_buf", [8, 8])
+        only_a_buf = _make_full("only_a_buf", [8, 8])
+        only_b_buf = _make_full("only_b_buf", [8, 8])
+
+        shared_box = TensorBox(StorageBox(shared_buf))
+        only_a_box = TensorBox(StorageBox(only_a_buf))
+        only_b_box = TensorBox(StorageBox(only_b_buf))
+
+        def _make_reader(name, extra_box):
+            def inner_fn(index):
+                return shared_box.make_loader()(index) + extra_box.make_loader()(index)
+
+            pw = Pointwise.create(
+                device=device,
+                dtype=dtype,
+                inner_fn=inner_fn,
+                ranges=[Integer(8), Integer(8)],
+            )
+            pw_data = pw.data.data
+            op = ComputedBuffer(
+                name=name,
+                layout=FixedLayout(device, dtype, [Integer(8), Integer(8)], None),
+                data=pw_data,
+            )
+            op.operation_name = name
+            op.origins = OrderedSet()
+            op.loop_info = CoarseTileInfo(
+                loop_group_id=(0,), loop_count=[Integer(1)], loop_tiled_dims=[[]]
+            )
+            V.graph.name_to_buffer[name] = op
+            return op
+
+        op_a = _make_reader("op_a", only_a_box)
+        op_b = _make_reader("op_b", only_b_box)
+        operations = [shared_buf, only_a_buf, only_b_buf, op_a, op_b]
+        retiled_infos_by_group = [((0,), [op_a, op_b], {})]
+
+        plans = _plan_read_copies(operations, retiled_infos_by_group)
+
+        entries_by_name = {e.dep.name: e for e in plans[(0,)].entries}
+        self.assertEqual(
+            set(entries_by_name), {"shared_buf", "only_a_buf", "only_b_buf"}
+        )
+        self.assertEqual(
+            set(entries_by_name["shared_buf"].consumer_op_names), {"op_a", "op_b"}
+        )
+        self.assertEqual(entries_by_name["only_a_buf"].consumer_op_names, ("op_a",))
+        self.assertEqual(entries_by_name["only_b_buf"].consumer_op_names, ("op_b",))
+
+
+class TestReadCopyPlanDataclasses(unittest.TestCase):
+    """ReadCopyEntry/ReadCopyPlan are plain frozen dataclasses (Task 1)."""
+
+    def test_read_copy_entry_and_plan_construct_and_are_frozen(self):
+        from torch._inductor.dependencies import MemoryDep
+        from torch_spyre._inductor.loop_info import ReadCopyEntry, ReadCopyPlan
+
+        dep = MemoryDep(
+            name="a",
+            index=sympy.Integer(0),
+            var_names=(),
+            size=(),
+        )
+        entry = ReadCopyEntry(
+            copy_name="coarse_tile_read_copy_group0_a_0",
+            dep=dep,
+            insert_before_op_name="op0",
+            sizing_op_name="op0",
+            consumer_op_names=("op0", "op1"),
+        )
+        self.assertEqual(entry.copy_name, "coarse_tile_read_copy_group0_a_0")
+        self.assertEqual(entry.consumer_op_names, ("op0", "op1"))
+        with self.assertRaises(Exception):
+            entry.copy_name = "other"  # frozen -> raises FrozenInstanceError
+
+        plan = ReadCopyPlan(entries=(entry,))
+        self.assertEqual(plan.entries, (entry,))
+        with self.assertRaises(Exception):
+            plan.entries = ()
+
+
+class TestInsertAllReadCopyOps(unittest.TestCase):
+    """_insert_all_read_copy_ops executes a precomputed ReadCopyPlan."""
+
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    def test_shared_read_produces_one_copy_for_two_consumers(self):
+        from torch._inductor.ir import ComputedBuffer
+
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _insert_all_read_copy_ops,
+            _plan_read_copies,
+        )
+
+        op_a, op_b, full_buf, operations = _make_two_op_shared_read_fixture()
+        retiled_infos_by_group = [((0,), [op_a, op_b], {})]
+        plans = _plan_read_copies(operations, retiled_infos_by_group)
+
+        _insert_all_read_copy_ops(operations, plans)
+
+        # Exactly one new copy op was inserted: full_buf, copy, op_a, op_b.
+        self.assertEqual(len(operations), 4)
+        copy_buf = operations[1]
+        self.assertIsInstance(copy_buf, ComputedBuffer)
+        self.assertIs(operations[0], full_buf)
+
+        # Both consumers were repointed at the SAME copy buffer name, not
+        # two independent copies.
+        new_op_a = next(
+            o
+            for o in operations
+            if isinstance(o, ComputedBuffer) and o.get_name() == "op_a"
+        )
+        new_op_b = next(
+            o
+            for o in operations
+            if isinstance(o, ComputedBuffer) and o.get_name() == "op_b"
+        )
+
+        class _Recorder(list):
+            def load(self, name, index):
+                self.append(name)
+                return 0.0
+
+        # _Recorder(loaded_by_a) would build a *new* list initialized from
+        # loaded_by_a's (empty) contents, not an alias of it -- appends
+        # inside .load() would then land on the _Recorder instance, not on
+        # loaded_by_a, leaving loaded_by_a permanently empty regardless of
+        # what inner_fn loads. Use each _Recorder instance itself as both
+        # the installed handler and the assertion target.
+        loaded_by_a = _Recorder()
+        loaded_by_b = _Recorder()
+
+        with V.set_ops_handler(loaded_by_a):
+            new_op_a.data.inner_fn([sympy.Integer(0) for _ in new_op_a.data.ranges])
+        with V.set_ops_handler(loaded_by_b):
+            new_op_b.data.inner_fn([sympy.Integer(0) for _ in new_op_b.data.ranges])
+
+        self.assertEqual(loaded_by_a, [copy_buf.get_name()])
+        self.assertEqual(loaded_by_b, [copy_buf.get_name()])
+        self.assertNotIn(full_buf.get_name(), loaded_by_a)
+        self.assertNotIn(full_buf.get_name(), loaded_by_b)
+
+    def test_transposed_read_gets_its_own_copy(self):
+        """a+b+a.t()-style: two reads of the same buffer with different
+        index expressions must NOT share a copy."""
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            Pointwise,
+            StorageBox,
+            TensorBox,
+        )
+
+        from torch_spyre._inductor.ir import SpyreEmptyFallback
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _insert_all_read_copy_ops,
+            _plan_read_copies,
+        )
+
+        device = torch.device("cpu")
+        dtype = torch.float32
+
+        full_buf = SpyreEmptyFallback(
+            torch.ops.spyre.empty.default, [8, 8], device, dtype
+        )
+        full_buf.layout = FixedLayout(device, dtype, [8, 8], [8, 1])
+        full_box = TensorBox(StorageBox(full_buf))
+
+        def inner_fn(index):
+            i, j = index
+            plain = full_box.make_loader()([i, j])
+            transposed = full_box.make_loader()([j, i])
+            return plain + transposed
+
+        pw = Pointwise.create(
+            device=device,
+            dtype=dtype,
+            inner_fn=inner_fn,
+            ranges=[Integer(8), Integer(8)],
+        )
+        pw_data = pw.data.data
+        tiled_op = ComputedBuffer(
+            name="tiled_op0",
+            layout=FixedLayout(device, dtype, [Integer(8), Integer(8)], None),
+            data=pw_data,
+        )
+        tiled_op.operation_name = "tiled_op0"
+        tiled_op.origins = OrderedSet()
+        tiled_op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,), loop_count=[Integer(1)], loop_tiled_dims=[[]]
+        )
+        V.graph.name_to_buffer["tiled_op0"] = tiled_op
+
+        operations = [full_buf, tiled_op]
+        retiled_infos_by_group = [((0,), [tiled_op], {})]
+        plans = _plan_read_copies(operations, retiled_infos_by_group)
+
+        self.assertEqual(len(plans[(0,)].entries), 2)
+
+        _insert_all_read_copy_ops(operations, plans)
+
+        copy_bufs = [
+            op
+            for op in operations
+            if isinstance(op, ComputedBuffer) and op.get_name() != "tiled_op0"
+        ]
+        self.assertEqual(len(copy_bufs), 2)
+
+    def test_offset_read_gets_its_own_copy(self):
+        """a+shift(a)-style: two reads of the same buffer with identical
+        per-var index coefficients but a different constant offset must
+        NOT share a copy -- dep.index.coeff(v) is blind to the constant
+        term, so a naive key would wrongly merge these (see coarse_tile.py
+        issue where a merged-in consumer's real offset differs from the
+        sizing op's, producing wrong/out-of-bounds data)."""
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            Pointwise,
+            StorageBox,
+            TensorBox,
+        )
+
+        from torch_spyre._inductor.ir import SpyreEmptyFallback
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _insert_all_read_copy_ops,
+            _plan_read_copies,
+        )
+
+        device = torch.device("cpu")
+        dtype = torch.float32
+
+        # 8x9 so a +1 column offset stays in bounds for all j in [0, 8).
+        full_buf = SpyreEmptyFallback(
+            torch.ops.spyre.empty.default, [8, 9], device, dtype
+        )
+        full_buf.layout = FixedLayout(device, dtype, [8, 9], [9, 1])
+        full_box = TensorBox(StorageBox(full_buf))
+
+        def inner_fn(index):
+            i, j = index
+            plain = full_box.make_loader()([i, j])
+            shifted = full_box.make_loader()([i, j + 1])
+            return plain + shifted
+
+        pw = Pointwise.create(
+            device=device,
+            dtype=dtype,
+            inner_fn=inner_fn,
+            ranges=[Integer(8), Integer(8)],
+        )
+        pw_data = pw.data.data
+        tiled_op = ComputedBuffer(
+            name="tiled_op0",
+            layout=FixedLayout(device, dtype, [Integer(8), Integer(8)], None),
+            data=pw_data,
+        )
+        tiled_op.operation_name = "tiled_op0"
+        tiled_op.origins = OrderedSet()
+        tiled_op.loop_info = CoarseTileInfo(
+            loop_group_id=(0,), loop_count=[Integer(1)], loop_tiled_dims=[[]]
+        )
+        V.graph.name_to_buffer["tiled_op0"] = tiled_op
+
+        operations = [full_buf, tiled_op]
+        retiled_infos_by_group = [((0,), [tiled_op], {})]
+        plans = _plan_read_copies(operations, retiled_infos_by_group)
+
+        self.assertEqual(len(plans[(0,)].entries), 2)
+
+        _insert_all_read_copy_ops(operations, plans)
+
+        copy_bufs = [
+            op
+            for op in operations
+            if isinstance(op, ComputedBuffer) and op.get_name() != "tiled_op0"
+        ]
+        self.assertEqual(len(copy_bufs), 2)
+
+    def test_disable_flag_skips_everything(self):
+        """An empty read_copy_plans dict (the insert_read_copies=False case)
+        leaves operations untouched."""
+        from torch_spyre._inductor.wsr.coarse_tile import _insert_all_read_copy_ops
+
+        op_a, op_b, full_buf, operations = _make_two_op_shared_read_fixture()
+        before = list(operations)
+
+        _insert_all_read_copy_ops(operations, {})
+
+        self.assertEqual(operations, before)
+
+    def test_one_consumer_patched_across_two_entries(self):
+        """op_a reads buf_x (shared with op_b) and buf_y (shared with op_c):
+        op_a appears in TWO different ReadCopyEntry.consumer_op_names within
+        the same plan. Each entry's consumer loop rebuilds op_a in place via
+        replace_computed_buffer_body, so the second entry to patch op_a must
+        resolve it by name through a freshly-rebuilt name_to_op, not through
+        a stale object reference captured before the first entry's patch --
+        exactly the object-identity hazard _NameSwapHandler/
+        replace_computed_buffer_body exist to guard against. Confirms both
+        patches land on the final op_a object (it loads both copies, never
+        the original full buffers)."""
+        from torch._inductor.ir import (
+            ComputedBuffer,
+            FixedLayout,
+            Pointwise,
+            StorageBox,
+            TensorBox,
+        )
+
+        from torch_spyre._inductor.ir import SpyreEmptyFallback
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _insert_all_read_copy_ops,
+            _plan_read_copies,
+        )
+
+        device = torch.device("cpu")
+        dtype = torch.float32
+
+        def _make_full(name):
+            buf = SpyreEmptyFallback(
+                torch.ops.spyre.empty.default, [8, 8], device, dtype
+            )
+            buf.layout = FixedLayout(device, dtype, [8, 8], [8, 1])
+            buf.name = name
+            V.graph.name_to_buffer[name] = buf
+            return buf
+
+        buf_x = _make_full("buf_x")
+        buf_y = _make_full("buf_y")
+        box_x = TensorBox(StorageBox(buf_x))
+        box_y = TensorBox(StorageBox(buf_y))
+
+        def _make_op(name, boxes):
+            def inner_fn(index):
+                total = boxes[0].make_loader()(index)
+                for box in boxes[1:]:
+                    total = total + box.make_loader()(index)
+                return total
+
+            pw = Pointwise.create(
+                device=device,
+                dtype=dtype,
+                inner_fn=inner_fn,
+                ranges=[Integer(8), Integer(8)],
+            )
+            pw_data = pw.data.data
+            op = ComputedBuffer(
+                name=name,
+                layout=FixedLayout(device, dtype, [Integer(8), Integer(8)], None),
+                data=pw_data,
+            )
+            op.operation_name = name
+            op.origins = OrderedSet()
+            op.loop_info = CoarseTileInfo(
+                loop_group_id=(0,), loop_count=[Integer(1)], loop_tiled_dims=[[]]
+            )
+            V.graph.name_to_buffer[name] = op
+            return op
+
+        # op_a reads both buf_x and buf_y; op_b only buf_x; op_c only buf_y.
+        op_a = _make_op("op_a", [box_x, box_y])
+        op_b = _make_op("op_b", [box_x])
+        op_c = _make_op("op_c", [box_y])
+        operations = [buf_x, buf_y, op_a, op_b, op_c]
+        retiled_infos_by_group = [((0,), [op_a, op_b, op_c], {})]
+
+        plans = _plan_read_copies(operations, retiled_infos_by_group)
+        entries_by_name = {e.dep.name: e for e in plans[(0,)].entries}
+        self.assertEqual(set(entries_by_name), {"buf_x", "buf_y"})
+        self.assertIn("op_a", entries_by_name["buf_x"].consumer_op_names)
+        self.assertIn("op_a", entries_by_name["buf_y"].consumer_op_names)
+
+        _insert_all_read_copy_ops(operations, plans)
+
+        final_op_a = next(
+            o
+            for o in operations
+            if isinstance(o, ComputedBuffer) and o.get_name() == "op_a"
+        )
+
+        class _Recorder(list):
+            def load(self, name, index):
+                self.append(name)
+                return 0.0
+
+            def add(self, a, b):
+                return 0.0
+
+        loaded = _Recorder()
+        with V.set_ops_handler(loaded):
+            final_op_a.data.inner_fn([sympy.Integer(0) for _ in final_op_a.data.ranges])
+
+        copy_names = {
+            op.get_name()
+            for op in operations
+            if isinstance(op, ComputedBuffer)
+            and op.get_name().startswith("coarse_tile_read_copy_")
+        }
+        self.assertEqual(len(copy_names), 2)
+        self.assertEqual(set(loaded), copy_names)
+        self.assertNotIn("buf_x", loaded)
+        self.assertNotIn("buf_y", loaded)
 
 
 class TestInsertReadCopyOps(unittest.TestCase):
@@ -5065,10 +5996,12 @@ def _make_tiled_reduction_op(
 
 
 class TestCoarseTileReductionPropagation(unittest.TestCase):
-    """Tests for insert_tiling_propagation Reduction support."""
+    """Tests for tiling propagation Reduction support."""
 
     def test_reduction_tiled_reduction_dim_nested_ok(self):
-        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _validate_planned_reduction_tiling,
+        )
 
         # Nested: outer tiles output dim, inner tiles reduction dim — now supported
         op = _make_tiled_reduction_op(
@@ -5081,10 +6014,14 @@ class TestCoarseTileReductionPropagation(unittest.TestCase):
             loop_tiled_dims=[[0], []],
         )
         op.loop_info.loop_tiled_reduction_dims = [[], [0]]
-        _validate_reduction_tiling(op)  # must not raise
+        _validate_planned_reduction_tiling(
+            op, op.loop_info.loop_tiled_dims, op.loop_info.loop_tiled_reduction_dims
+        )  # must not raise
 
     def test_reduction_output_dim_tiled_ok(self):
-        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _validate_planned_reduction_tiling,
+        )
 
         # ranges=[M], reduction_ranges=[K]; tiled_dim=0 is an output dim → no error
         op = _make_tiled_reduction_op(
@@ -5097,7 +6034,9 @@ class TestCoarseTileReductionPropagation(unittest.TestCase):
             loop_tiled_dims=[[0]],
         )
         # output-dim-only tiling should not raise
-        _validate_reduction_tiling(op)
+        _validate_planned_reduction_tiling(
+            op, op.loop_info.loop_tiled_dims, op.loop_info.loop_tiled_reduction_dims
+        )
 
     def test_nested_fill_gets_outer_loop_info(self):
         """Fill op gets outer-level loop_info for nested output+reduction tiling."""
@@ -5179,9 +6118,11 @@ class TestComputeFillLoopInfo(unittest.TestCase):
         self.assertEqual(result.loop_tiled_reduction_dims, [[]])
 
 
-class TestValidateReductionTiling(unittest.TestCase):
-    """Tests for _validate_reduction_tiling: raising on unsupported cases,
-    passing on supported ones."""
+class TestValidatePlannedReductionTiling(unittest.TestCase):
+    """Tests for _validate_planned_reduction_tiling: raising on unsupported
+    cases, passing on supported ones. Called from plan_coarse_tile_groups
+    (planning time) with the op's own per-level tiled-dims lists, before any
+    loop_info is stamped."""
 
     def _make_op(self, loop_tiled_dims, loop_tiled_reduction_dims):
         from torch._inductor.ir import ComputedBuffer, Reduction
@@ -5203,43 +6144,52 @@ class TestValidateReductionTiling(unittest.TestCase):
 
     def test_pure_reduction_tile_ok(self):
         """Single level, only reduction dim tiled — Stage 1 supported case."""
-        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _validate_planned_reduction_tiling,
+        )
 
         op = self._make_op(loop_tiled_dims=[[]], loop_tiled_reduction_dims=[[0]])
-        _validate_reduction_tiling(op)  # must not raise
+        _validate_planned_reduction_tiling(op, [[]], [[0]])  # must not raise
 
     def test_pure_output_tile_ok(self):
         """Single level, only output dim tiled — existing supported case."""
-        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _validate_planned_reduction_tiling,
+        )
 
         op = self._make_op(loop_tiled_dims=[[0]], loop_tiled_reduction_dims=[[]])
-        _validate_reduction_tiling(op)  # must not raise
+        _validate_planned_reduction_tiling(op, [[0]], [[]])  # must not raise
 
-    def test_no_loop_info_ok(self):
-        """Op with no loop_info is not tiled — no error."""
+    def test_no_tiled_dims_ok(self):
+        """No dims tiled at all — no error."""
         from torch._inductor.ir import ComputedBuffer, Reduction
-        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _validate_planned_reduction_tiling,
+        )
 
         data = MagicMock(spec=Reduction)
         data.ranges = [Integer(128)]
         data.reduction_ranges = [Integer(256)]
         op = MagicMock(spec=ComputedBuffer)
         op.data = data
-        op.loop_info = None
-        _validate_reduction_tiling(op)  # must not raise
+        _validate_planned_reduction_tiling(op, [[]], [[]])  # must not raise
 
     def test_mixed_same_level_raises(self):
         """Both output and reduction dim tiled at the same level — Stage 2, raises."""
-        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _validate_planned_reduction_tiling,
+        )
 
         op = self._make_op(loop_tiled_dims=[[0]], loop_tiled_reduction_dims=[[0]])
         with self.assertRaises(Unsupported, msg="mixed same-level should raise"):
-            _validate_reduction_tiling(op)
+            _validate_planned_reduction_tiling(op, [[0]], [[0]])
 
     def test_mixed_different_levels_allowed(self):
         """Outer output-dim tiling + inner reduction-dim tiling — now supported."""
         from torch._inductor.ir import ComputedBuffer, Reduction
-        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _validate_planned_reduction_tiling,
+        )
 
         data = MagicMock(spec=Reduction)
         data.ranges = [Integer(128)]
@@ -5248,19 +6198,17 @@ class TestValidateReductionTiling(unittest.TestCase):
         op = MagicMock(spec=ComputedBuffer)
         op.data = data
         op.get_name.return_value = "test_op"
-        op.loop_info = CoarseTileInfo(
-            loop_group_id=(0, 0),
-            loop_count=[Integer(2), Integer(4)],
-            loop_tiled_dims=[[0], []],
-            loop_tiled_reduction_dims=[[], [0]],
-        )
+        tiled_dims = [[0], []]
+        tiled_rdims = [[], [0]]
         # Must not raise: outer output-dim + inner reduction-dim is now supported.
-        _validate_reduction_tiling(op)
+        _validate_planned_reduction_tiling(op, tiled_dims, tiled_rdims)
 
     def test_multiple_reduction_dims_same_level_raises(self):
         """Multiple reduction dims tiled at one level — Stage 2, raises."""
         from torch._inductor.ir import ComputedBuffer, Reduction
-        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _validate_planned_reduction_tiling,
+        )
 
         data = MagicMock(spec=Reduction)
         data.ranges = [Integer(128)]
@@ -5268,19 +6216,15 @@ class TestValidateReductionTiling(unittest.TestCase):
         op = MagicMock(spec=ComputedBuffer)
         op.data = data
         op.get_name.return_value = "test_op"
-        op.loop_info = CoarseTileInfo(
-            loop_group_id=(0,),
-            loop_count=[Integer(4)],
-            loop_tiled_dims=[[]],
-            loop_tiled_reduction_dims=[[0, 1]],
-        )
         with self.assertRaises(Unsupported, msg="multiple reduction dims should raise"):
-            _validate_reduction_tiling(op)
+            _validate_planned_reduction_tiling(op, [[]], [[0, 1]])
 
     def test_stick_dim_reduction_tiling_allowed(self):
         """Tiling a reduction over the stick dimension is now supported."""
         from torch._inductor.ir import ComputedBuffer, Reduction
-        from torch_spyre._inductor.wsr.coarse_tile import _validate_reduction_tiling
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _validate_planned_reduction_tiling,
+        )
 
         data = MagicMock(spec=Reduction)
         data.ranges = [Integer(64)]  # [B] output
@@ -5289,14 +6233,8 @@ class TestValidateReductionTiling(unittest.TestCase):
         op = MagicMock(spec=ComputedBuffer)
         op.data = data
         op.get_name.return_value = "test_sum"
-        op.loop_info = CoarseTileInfo(
-            loop_group_id=(0,),
-            loop_count=[Integer(4)],
-            loop_tiled_dims=[[]],
-            loop_tiled_reduction_dims=[[0]],
-        )
         # Must not raise: stick-dim reduction tiling is now supported.
-        _validate_reduction_tiling(op)
+        _validate_planned_reduction_tiling(op, [[]], [[0]])
 
 
 class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
