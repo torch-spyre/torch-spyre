@@ -7153,5 +7153,21 @@ class TestTileHelpers(unittest.TestCase):
         )
 
 
+class TestCustomPostFusionPassesOrder(unittest.TestCase):
+    def test_hbm_pool_planning_runs_after_fusion(self):
+        """hbm_pool_planning must see post-fusion bundles, not pre-fusion nodes."""
+        from torch_spyre._inductor.passes import CustomPostFusionPasses
+        from torch_spyre._inductor.fusion import spyre_fuse_nodes
+        from torch_spyre._inductor.hbm_pool_planning import hbm_pool_planning
+
+        pipeline = CustomPostFusionPasses()
+        names = [p.__name__ for p in pipeline.passes]
+        self.assertLess(
+            names.index(spyre_fuse_nodes.__name__),
+            names.index(hbm_pool_planning.__name__),
+            "spyre_fuse_nodes must run before hbm_pool_planning",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
