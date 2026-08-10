@@ -147,8 +147,6 @@ class TestSpyreProfiler(TestCase):
     @unittest.skipUnless(Test_spyre, "requires spyre device")
     def test_no_zero_timestamp_or_duration(self) -> None:
         """Verify no Chrome trace event has ts == 0 or dur == 0 after flash attention."""
-        import os
-        import tempfile
 
         device = torch.device("spyre")
         B, H, L, D = 1, 4, 16, 32
@@ -204,10 +202,12 @@ class TestSpyreProfiler(TestCase):
         # Warm up outside the profiled region to avoid compile-time activity in
         # the trace we validate below.
         compiled_fn(Q, K, V, block_size)
+        # Spyre execution is asynchronous, so drain warmup work before the
+        # profiled region starts.
+        torch.spyre.synchronize()
 
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
-            acc_events=True,
         ) as prof:
             # Move inputs during profiling so HtoD memcpy events are required in
             # the exported trace.
@@ -222,9 +222,7 @@ class TestSpyreProfiler(TestCase):
             # the trace before export.
             torch.spyre.synchronize()
 
-        fd, trace_path = tempfile.mkstemp(suffix=".json")
-        os.close(fd)
-        try:
+        with TemporaryFileName(mode="w+") as trace_path:
             prof.export_chrome_trace(trace_path)
 
             with open(trace_path) as f:
@@ -270,8 +268,6 @@ class TestSpyreProfiler(TestCase):
                 f"{len(kernel_zero_dur)} kernel event(s) have dur == 0: "
                 + ", ".join(e.get("name", "<unnamed>") for e in kernel_zero_dur),
             )
-        finally:
-            os.remove(trace_path)
 
 
 def test_package_importable():
