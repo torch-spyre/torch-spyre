@@ -599,7 +599,7 @@ def spyre_conv2d(
     stride: Sequence[int],
     padding: Sequence[int],
     dilation: Sequence[int],
-    groups: int = 1,
+    groups: int,
 ) -> torch.Tensor:  # type: ignore[empty-body]
     pass
 
@@ -611,7 +611,7 @@ def _(
     stride: Sequence[int],
     padding: Sequence[int],
     dilation: Sequence[int],
-    groups: int = 1,
+    groups: int,
 ) -> torch.Tensor:
     # Compute output shape: (N, C_out, H_out, W_out)
     N, C_in, H_in, W_in = input.shape
@@ -634,7 +634,7 @@ def spyre_conv2d_with_bias(
     stride: Sequence[int],
     padding: Sequence[int],
     dilation: Sequence[int],
-    groups: int = 1,
+    groups: int,
 ) -> torch.Tensor:  # type: ignore[empty-body]
     pass
 
@@ -647,7 +647,7 @@ def _(
     stride: Sequence[int],
     padding: Sequence[int],
     dilation: Sequence[int],
-    groups: int = 1,
+    groups: int,
 ) -> torch.Tensor:
     # Compute output shape: (N, C_out, H_out, W_out)
     N, C_in, H_in, W_in = input.shape
