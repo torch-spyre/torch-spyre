@@ -28,7 +28,7 @@ Debug-oriented variables (`TORCH_SPYRE_DEBUG`, `TORCH_COMPILE_DEBUG`,
 
 | Variable | Effect |
 |---|---|
-| `USE_SPYRE_PROFILER=1` | Opt in to automatic FFDC JSON reports on Spyre compile / runtime / unimplemented failures. Retrieve with `torch.spyre.get_diagnostic_report()`. (Same name as the CMake profiler build flag; at runtime this env var alone gates capture.) |
+| `USE_SPYRE_PROFILER=1` | Opt in to automatic FFDC JSON reports on Spyre compile / runtime / unimplemented failures. Retrieve with `torch.spyre.get_diagnostic_report()`. (Same name as the `setup.py` profiler build flag; at runtime this env var alone gates capture.) |
 
 ## Device enumeration
 

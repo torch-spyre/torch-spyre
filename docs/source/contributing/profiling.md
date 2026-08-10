@@ -20,7 +20,7 @@ several:
 |---|---|---|
 | Python API | `torch_spyre/profiler/` | `profile_spyre()` wrapper, `torch.spyre.memory_*` |
 | C++ registration | `torch_spyre/csrc/profiler/` | PrivateUse1 observer, kineto wiring |
-| Build | `CMakeLists.txt`, `torch_spyre/csrc/profiler/CMakeLists.txt` | Guarded by `USE_SPYRE_PROFILER` |
+| Build | `setup.py` | Guarded by the `USE_SPYRE_PROFILER` env var |
 | Tests | `tests/profiler/` | Skip-marked when `USE_SPYRE_PROFILER` is off |
 | External | [`kineto-spyre`][kineto-spyre], [`aiu-trace-analyzer`][ata] | Versioned separately |
 | Docs | `docs/source/user_guide/profiling/` | User-visible additions |
@@ -34,7 +34,7 @@ tells the reviewer what each branch is about without opening the PR:
 
 | Prefix | Use for |
 |---|---|
-| `profiler/build-…` | Build system, CMake, linking, `USE_SPYRE_PROFILER` |
+| `profiler/build-…` | Build system, `setup.py`, linking, `USE_SPYRE_PROFILER` |
 | `profiler/reg-…` | C++ registration, PrivateUse1 plugin loading |
 | `profiler/api-…` | Python APIs in `torch_spyre/profiler/` |
 | `profiler/trace-…` | Trace enrichment, post-processing, Perfetto grouping |
@@ -89,23 +89,24 @@ for.
 
 ## Building with the profiler enabled
 
-The profiler is gated by a CMake flag so torch-spyre still imports
-cleanly without it. Local development usually wants it on:
+The C++ profiler and aiupti path builds by default. Set
+`USE_SPYRE_PROFILER=0` to build without it, which lets torch-spyre still
+import cleanly on a toolchain that lacks the profiler dependencies:
 
 ```bash
-USE_SPYRE_PROFILER=1 pip install -e . --no-build-isolation
+USE_SPYRE_PROFILER=0 pip install -e . --no-build-isolation
 ```
 
-When the flag is **off**, every profiler import path must still succeed
-(the import test below covers this). When it is **on**, install the
-kineto-spyre wheel:
+When the profiler is **off**, every profiler import path must still
+succeed (the import test below covers this). When it is **on** (the
+default), install the kineto-spyre wheel:
 
 ```bash
 pip install kineto-spyre
 ```
 
-If you change build wiring, verify both the on and off paths build and
-import.
+If you change build wiring, verify both the default (on) and the
+`USE_SPYRE_PROFILER=0` (off) paths build and import.
 
 ## Testing profiler changes
 
