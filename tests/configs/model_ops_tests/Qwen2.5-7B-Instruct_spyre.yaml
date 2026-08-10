@@ -107,7 +107,7 @@ test_suite_config:
                       - value: 2.0
                       - value: false
                       - value: false
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L367 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L367 in forward,
                     code: inputs_embeds = self.embed_tokens(input_ids)'
                   tags:
                     - constant
@@ -123,7 +123,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - py: (None, slice(None, None, None), None)
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L103 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L103 in forward,
                     code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
                   tags:
                     - constant
@@ -138,7 +138,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L103 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L103 in forward,
                     code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
                   tags:
                     - torch.float.1_spyre
@@ -155,7 +155,7 @@ test_suite_config:
                       - value: 1
                       - value: -1
                       - value: 1
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L103 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L103 in forward,
                     code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
                   tags:
                     - constant
@@ -171,7 +171,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: cuda:0
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L103 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L103 in forward,
                     code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
                   tags:
                     - constant
@@ -189,7 +189,7 @@ test_suite_config:
                           init_args:
                             high: 1000
                       - py: (slice(None, None, None), None, slice(None, None, None))
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L104 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L104 in forward,
                     code: position_ids_expanded = position_ids[:, None, :].float()'
                   tags:
                     - constant
@@ -206,7 +206,7 @@ test_suite_config:
                           init: randint
                           init_args:
                             high: 1000
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L104 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L104 in forward,
                     code: position_ids_expanded = position_ids[:, None, :].float()'
                   tags:
                     - torch.float.2
@@ -220,7 +220,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L108 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L108 in forward,
                     code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
                   tags:
                     - torch.float.3_spyre
@@ -241,7 +241,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: xavier
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L108 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L108 in forward,
                     code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
                   tags:
                     - torch.matmul.1_spyre
@@ -257,7 +257,7 @@ test_suite_config:
                           init: rand
                       - value: 1
                       - value: 2
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L108 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L108 in forward,
                     code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
                   tags:
                     - constant
@@ -278,13 +278,13 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
-                    kwargs:
-                      dim: -1
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L109 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L109 in forward,
                     code: emb = torch.cat((freqs, freqs), dim=-1)'
                   tags:
                     - constant
                     - torch.cat.1_spyre
+                  kwargs:
+                    dim: -1
                 - name: torch.cos
                   sample_inputs_func:
                     args:
@@ -295,7 +295,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L110 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L110 in forward,
                     code: cos = emb.cos() * self.attention_scaling'
                   tags:
                     - torch.cos.1_spyre
@@ -310,7 +310,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: 1.0
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L110 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L110 in forward,
                     code: cos = emb.cos() * self.attention_scaling'
                   tags:
                     - constant
@@ -325,7 +325,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L111 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L111 in forward,
                     code: sin = emb.sin() * self.attention_scaling'
                   tags:
                     - torch.sin.1_spyre
@@ -339,17 +339,17 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                    kwargs:
-                      dtype: torch.float16
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L113 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L113 in forward,
                     code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
                   tags:
                     - torch.to.2_spyre
+                  kwargs:
+                    dtype: torch.float16
                 - name: torch._C._log_api_usage_once
                   sample_inputs_func:
                     args:
                       - value: python.nn_module
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L398 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L398 in forward,
                     code: for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):'
                   tags:
                     - constant
@@ -365,7 +365,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: torch.float32
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L260 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L260 in forward,
                     code: hidden_states = hidden_states.to(torch.float32)'
                   tags:
                     - constant
@@ -381,7 +381,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: 2
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L261 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L261 in forward,
                     code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
                   tags:
                     - constant
@@ -397,13 +397,13 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: -1
-                    kwargs:
-                      keepdim: true
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L261 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L261 in forward,
                     code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
                   tags:
                     - constant
                     - torch.mean.1_spyre
+                  kwargs:
+                    keepdim: true
                 - name: torch.add
                   sample_inputs_func:
                     args:
@@ -415,7 +415,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: 1.0e-06
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L262 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L262 in forward,
                     code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
                   tags:
                     - constant
@@ -430,7 +430,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L262 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L262 in forward,
                     code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
                   tags:
                     - torch.rsqrt.1_spyre
@@ -451,7 +451,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L262 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L262 in forward,
                     code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
                   tags:
                     - torch.mul.2_spyre
@@ -466,7 +466,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: torch.bfloat16
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L263 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L263 in forward,
                     code: return self.weight * hidden_states.to(input_dtype)'
                   tags:
                     - constant
@@ -488,7 +488,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L263 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L263 in forward,
                     code: return self.weight * hidden_states.to(input_dtype)'
                   tags:
                     - torch.mul.3_spyre
@@ -516,7 +516,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L217 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L217 in forward,
                     code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
                   tags:
                     - torch.nn.functional.linear.1_spyre
@@ -531,7 +531,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: (1, 39, -1, 128)
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L217 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L217 in forward,
                     code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
                   tags:
                     - constant
@@ -548,7 +548,7 @@ test_suite_config:
                           init: rand
                       - value: 1
                       - value: 2
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L217 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L217 in forward,
                     code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
                   tags:
                     - constant
@@ -577,7 +577,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L218 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L218 in forward,
                     code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
                   tags:
                     - torch.nn.functional.linear.2_spyre
@@ -592,7 +592,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: (1, 39, -1, 128)
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L218 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L218 in forward,
                     code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
                   tags:
                     - constant
@@ -609,7 +609,7 @@ test_suite_config:
                           init: rand
                       - value: 1
                       - value: 2
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L218 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L218 in forward,
                     code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
                   tags:
                     - constant
@@ -625,7 +625,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: 1
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L142 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L142 in apply_rotary_pos_emb,
                     code: cos = cos.unsqueeze(unsqueeze_dim)'
                   tags:
                     - constant
@@ -647,7 +647,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L144 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L144 in apply_rotary_pos_emb,
                     code: q_embed = (q * cos) + (rotate_half(q) * sin)'
                   tags:
                     - torch.mul.4_spyre
@@ -662,7 +662,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - py: (Ellipsis, slice(None, 64, None))
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L118 in rotate_half,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L118 in rotate_half,
                     code: x1 = x[..., : x.shape[-1] // 2]'
                   tags:
                     - constant
@@ -677,7 +677,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L120 in rotate_half,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L120 in rotate_half,
                     code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - torch.neg.1_spyre
@@ -697,13 +697,13 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
-                    kwargs:
-                      dim: -1
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L120 in rotate_half,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L120 in rotate_half,
                     code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - constant
                     - torch.cat.2_spyre
+                  kwargs:
+                    dim: -1
                 - name: torch.mul
                   sample_inputs_func:
                     args:
@@ -721,7 +721,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L144 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L144 in apply_rotary_pos_emb,
                     code: q_embed = (q * cos) + (rotate_half(q) * sin)'
                   tags:
                     - torch.mul.5_spyre
@@ -742,7 +742,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L144 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L144 in apply_rotary_pos_emb,
                     code: q_embed = (q * cos) + (rotate_half(q) * sin)'
                   tags:
                     - torch.add.2_spyre
@@ -763,7 +763,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L145 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L145 in apply_rotary_pos_emb,
                     code: k_embed = (k * cos) + (rotate_half(k) * sin)'
                   tags:
                     - torch.mul.6_spyre
@@ -778,7 +778,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - py: (Ellipsis, slice(None, 64, None))
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L118 in rotate_half,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L118 in rotate_half,
                     code: x1 = x[..., : x.shape[-1] // 2]'
                   tags:
                     - constant
@@ -793,7 +793,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L120 in rotate_half,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L120 in rotate_half,
                     code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - torch.neg.2_spyre
@@ -813,13 +813,13 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
-                    kwargs:
-                      dim: -1
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L120 in rotate_half,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L120 in rotate_half,
                     code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - constant
                     - torch.cat.3_spyre
+                  kwargs:
+                    dim: -1
                 - name: torch.mul
                   sample_inputs_func:
                     args:
@@ -837,7 +837,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L145 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L145 in apply_rotary_pos_emb,
                     code: k_embed = (k * cos) + (rotate_half(k) * sin)'
                   tags:
                     - torch.mul.7_spyre
@@ -858,7 +858,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L145 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L145 in apply_rotary_pos_emb,
                     code: k_embed = (k * cos) + (rotate_half(k) * sin)'
                   tags:
                     - torch.add.3_spyre
@@ -866,20 +866,20 @@ test_suite_config:
                   sample_inputs_func:
                     args:
                       - value: (1, 4, 2048, 128)
-                    kwargs:
-                      dtype: torch.float16
-                      device: cuda:0
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/cache_utils.py#L401 in lazy_initialization, code:
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L378 in lazy_initialization, code:
                     self.keys = torch.zeros('
                   tags:
                     - constant
                     - torch.zeros.1_spyre
+                  kwargs:
+                    dtype: torch.float16
+                    device: cuda:0
                 - name: torch.to
                   sample_inputs_func:
                     args:
                       - tensor:
-                          shape: [1]
-                          stride: [1]
+                          shape: []
+                          stride: []
                           storage_offset: 0
                           dtype: torch.int64
                           device: cpu
@@ -887,7 +887,7 @@ test_suite_config:
                           init_args:
                             high: 1000
                       - value: cuda:0
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/cache_utils.py#L411 in lazy_initialization, code:
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L388 in lazy_initialization, code:
                     self.cumulative_length = self.cumulative_length.to(self.device)'
                   tags:
                     - constant
@@ -897,13 +897,13 @@ test_suite_config:
                   sample_inputs_func:
                     args:
                       - value: 39
-                    kwargs:
-                      device: cuda:0
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/cache_utils.py#L443 in update, code: cache_position
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L420 in update, code: cache_position
                     = torch.arange(kv_length, device=self.device) + self.cumulative_length'
                   tags:
                     - constant
                     - torch.arange.1_spyre
+                  kwargs:
+                    device: cuda:0
                 - name: torch.add
                   sample_inputs_func:
                     args:
@@ -917,15 +917,15 @@ test_suite_config:
                           init_args:
                             high: 1000
                       - tensor:
-                          shape: [1]
-                          stride: [1]
+                          shape: []
+                          stride: []
                           storage_offset: 0
                           dtype: torch.int64
                           device: cuda:0
                           init: randint
                           init_args:
                             high: 1000
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/cache_utils.py#L443 in update, code: cache_position
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L420 in update, code: cache_position
                     = torch.arange(kv_length, device=self.device) + self.cumulative_length'
                   tags:
                     - torch.add.4
@@ -933,8 +933,8 @@ test_suite_config:
                   sample_inputs_func:
                     args:
                       - tensor:
-                          shape: [1]
-                          stride: [1]
+                          shape: []
+                          stride: []
                           storage_offset: 0
                           dtype: torch.int64
                           device: cuda:0
@@ -942,7 +942,7 @@ test_suite_config:
                           init_args:
                             high: 1000
                       - value: 39
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/cache_utils.py#L445 in update, code: self.cumulative_length.add_(kv_length)'
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L422 in update, code: self.cumulative_length.add_(kv_length)'
                   tags:
                     - constant
                     - torch.add_.1_spyre
@@ -973,7 +973,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/cache_utils.py#L449 in update, code: self.keys.index_copy_(2,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L426 in update, code: self.keys.index_copy_(2,
                     cache_position, key_states)'
                   tags:
                     - constant
@@ -988,48 +988,12 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                      - py: (slice(None, None, None), slice(None, None, None), None, slice(None, None, None), slice(None, None, None))
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/integrations/sdpa_attention.py#L24 in repeat_kv,
-                    code: hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)'
+                      - py: (slice(None, None, None), slice(None, None, None), slice(None, 39, None), slice(None, None, None))
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L142 in sdpa_attention_forward,
+                    code: key = key[:, :, :q_length, :]'
                   tags:
                     - constant
                     - torch.getitem.5_spyre
-                - name: torch.Tensor.expand
-                  sample_inputs_func:
-                    args:
-                      - tensor:
-                          shape: [1, 4, 1, 2048, 128]
-                          stride: [1048576, 262144, 262144, 128, 1]
-                          storage_offset: 0
-                          dtype: torch.float16
-                          device: cuda:0
-                          init: rand
-                      - value: 1
-                      - value: 4
-                      - value: 7
-                      - value: 2048
-                      - value: 128
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/integrations/sdpa_attention.py#L24 in repeat_kv,
-                    code: hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)'
-                  tags:
-                    - constant
-                    - torch.Tensor.expand.2_spyre
-                - name: torch.reshape
-                  sample_inputs_func:
-                    args:
-                      - tensor:
-                          shape: [1, 4, 7, 2048, 128]
-                          stride: [1048576, 262144, 0, 128, 1]
-                          storage_offset: 0
-                          dtype: torch.float16
-                          device: cuda:0
-                          init: rand
-                      - value: (1, 28, 2048, 128)
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/integrations/sdpa_attention.py#L25 in repeat_kv,
-                    code: return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)'
-                  tags:
-                    - constant
-                    - torch.reshape.1_spyre
                 - name: torch.nn.functional.scaled_dot_product_attention
                   sample_inputs_func:
                     args:
@@ -1041,27 +1005,28 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - tensor:
-                          shape: [1, 28, 2048, 128]
-                          stride: [7340032, 262144, 128, 1]
+                          shape: [1, 4, 39, 128]
+                          stride: [1048576, 262144, 128, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
                       - tensor:
-                          shape: [1, 28, 2048, 128]
-                          stride: [7340032, 262144, 128, 1]
+                          shape: [1, 4, 39, 128]
+                          stride: [1048576, 262144, 128, 1]
                           storage_offset: 0
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                    kwargs:
-                      dropout_p: 0.0
-                      scale: 0.08838834764831845
-                      is_causal: false
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/integrations/sdpa_attention.py#L92 in sdpa_attention_forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
                     code: attn_output = torch.nn.functional.scaled_dot_product_attention('
                   tags:
                     - torch.nn.functional.scaled_dot_product_attention.1_spyre
+                  kwargs:
+                    dropout_p: 0.0
+                    scale: 0.08838834764831845
+                    is_causal: true
+                    enable_gqa: true
                 - name: torch.transpose
                   sample_inputs_func:
                     args:
@@ -1074,7 +1039,7 @@ test_suite_config:
                           init: rand
                       - value: 1
                       - value: 2
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/integrations/sdpa_attention.py#L102 in sdpa_attention_forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L164 in sdpa_attention_forward,
                     code: attn_output = attn_output.transpose(1, 2).contiguous()'
                   tags:
                     - constant
@@ -1089,7 +1054,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/integrations/sdpa_attention.py#L102 in sdpa_attention_forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L164 in sdpa_attention_forward,
                     code: attn_output = attn_output.transpose(1, 2).contiguous()'
                   tags:
                     - torch.Tensor.contiguous.1_spyre
@@ -1104,11 +1069,11 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: (1, 39, -1)
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L243 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L243 in forward,
                     code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
                   tags:
                     - constant
-                    - torch.reshape.2_spyre
+                    - torch.reshape.1_spyre
                 - name: torch.Tensor.contiguous
                   sample_inputs_func:
                     args:
@@ -1119,7 +1084,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L243 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L243 in forward,
                     code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
                   tags:
                     - torch.Tensor.contiguous.2_spyre
@@ -1141,7 +1106,7 @@ test_suite_config:
                           device: cuda:0
                           init: xavier
                       - value: null
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L244 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L244 in forward,
                     code: attn_output = self.o_proj(attn_output)'
                   tags:
                     - constant
@@ -1163,7 +1128,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L302 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L302 in forward,
                     code: hidden_states = residual + hidden_states'
                   tags:
                     - torch.add.5_spyre
@@ -1185,7 +1150,7 @@ test_suite_config:
                           device: cuda:0
                           init: xavier
                       - value: null
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L47 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L47 in forward,
                     code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
                   tags:
                     - constant
@@ -1200,7 +1165,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/activations.py#L103 in forward, code: return nn.functional.silu(input)'
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/activations.py#L103 in forward, code: return nn.functional.silu(input)'
                   tags:
                     - torch.nn.functional.silu.1_spyre
                 - name: torch.mul
@@ -1220,7 +1185,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L47 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L47 in forward,
                     code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
                   tags:
                     - torch.mul.8_spyre
@@ -1242,7 +1207,7 @@ test_suite_config:
                           device: cuda:0
                           init: xavier
                       - value: null
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L47 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L47 in forward,
                     code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
                   tags:
                     - constant
@@ -1258,7 +1223,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L475 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L475 in forward,
                     code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
                   tags:
                     - constant
@@ -1281,7 +1246,7 @@ test_suite_config:
                           device: cuda:0
                           init: xavier
                       - value: null
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L475 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L475 in forward,
                     code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
                   tags:
                     - constant
@@ -1310,7 +1275,7 @@ test_suite_config:
                       - value: 2.0
                       - value: false
                       - value: false
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L367 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L367 in forward,
                     code: inputs_embeds = self.embed_tokens(input_ids)'
                   tags:
                     - constant
@@ -1328,7 +1293,7 @@ test_suite_config:
                           init_args:
                             high: 1000
                       - py: (slice(None, None, None), None, slice(None, None, None))
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L104 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L104 in forward,
                     code: position_ids_expanded = position_ids[:, None, :].float()'
                   tags:
                     - constant
@@ -1345,7 +1310,7 @@ test_suite_config:
                           init: randint
                           init_args:
                             high: 1000
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L104 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L104 in forward,
                     code: position_ids_expanded = position_ids[:, None, :].float()'
                   tags:
                     - torch.float.4
@@ -1359,7 +1324,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L108 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L108 in forward,
                     code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
                   tags:
                     - torch.float.5_spyre
@@ -1380,7 +1345,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: xavier
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L108 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L108 in forward,
                     code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
                   tags:
                     - torch.matmul.2_spyre
@@ -1396,7 +1361,7 @@ test_suite_config:
                           init: rand
                       - value: 1
                       - value: 2
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L108 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L108 in forward,
                     code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
                   tags:
                     - constant
@@ -1417,13 +1382,13 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
-                    kwargs:
-                      dim: -1
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L109 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L109 in forward,
                     code: emb = torch.cat((freqs, freqs), dim=-1)'
                   tags:
                     - constant
                     - torch.cat.4_spyre
+                  kwargs:
+                    dim: -1
                 - name: torch.cos
                   sample_inputs_func:
                     args:
@@ -1434,7 +1399,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L110 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L110 in forward,
                     code: cos = emb.cos() * self.attention_scaling'
                   tags:
                     - torch.cos.2_spyre
@@ -1449,7 +1414,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: 1.0
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L110 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L110 in forward,
                     code: cos = emb.cos() * self.attention_scaling'
                   tags:
                     - constant
@@ -1464,7 +1429,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L111 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L111 in forward,
                     code: sin = emb.sin() * self.attention_scaling'
                   tags:
                     - torch.sin.2_spyre
@@ -1478,12 +1443,12 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                    kwargs:
-                      dtype: torch.float16
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L113 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L113 in forward,
                     code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
                   tags:
                     - torch.to.6_spyre
+                  kwargs:
+                    dtype: torch.float16
                 - name: torch.to
                   sample_inputs_func:
                     args:
@@ -1495,7 +1460,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: torch.float32
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L260 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L260 in forward,
                     code: hidden_states = hidden_states.to(torch.float32)'
                   tags:
                     - constant
@@ -1511,7 +1476,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: 2
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L261 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L261 in forward,
                     code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
                   tags:
                     - constant
@@ -1527,13 +1492,13 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: -1
-                    kwargs:
-                      keepdim: true
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L261 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L261 in forward,
                     code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
                   tags:
                     - constant
                     - torch.mean.2_spyre
+                  kwargs:
+                    keepdim: true
                 - name: torch.add
                   sample_inputs_func:
                     args:
@@ -1545,7 +1510,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: 1.0e-06
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L262 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L262 in forward,
                     code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
                   tags:
                     - constant
@@ -1560,7 +1525,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L262 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L262 in forward,
                     code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
                   tags:
                     - torch.rsqrt.2_spyre
@@ -1581,7 +1546,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L262 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L262 in forward,
                     code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
                   tags:
                     - torch.mul.10_spyre
@@ -1596,7 +1561,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: torch.bfloat16
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L263 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L263 in forward,
                     code: return self.weight * hidden_states.to(input_dtype)'
                   tags:
                     - constant
@@ -1618,7 +1583,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L263 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L263 in forward,
                     code: return self.weight * hidden_states.to(input_dtype)'
                   tags:
                     - torch.mul.11_spyre
@@ -1646,7 +1611,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L217 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L217 in forward,
                     code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
                   tags:
                     - torch.nn.functional.linear.7_spyre
@@ -1661,7 +1626,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: (1, 1, -1, 128)
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L217 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L217 in forward,
                     code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
                   tags:
                     - constant
@@ -1678,7 +1643,7 @@ test_suite_config:
                           init: rand
                       - value: 1
                       - value: 2
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L217 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L217 in forward,
                     code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
                   tags:
                     - constant
@@ -1707,7 +1672,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L218 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L218 in forward,
                     code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
                   tags:
                     - torch.nn.functional.linear.8_spyre
@@ -1722,7 +1687,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: (1, 1, -1, 128)
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L218 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L218 in forward,
                     code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
                   tags:
                     - constant
@@ -1739,7 +1704,7 @@ test_suite_config:
                           init: rand
                       - value: 1
                       - value: 2
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L218 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L218 in forward,
                     code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
                   tags:
                     - constant
@@ -1755,7 +1720,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: 1
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L142 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L142 in apply_rotary_pos_emb,
                     code: cos = cos.unsqueeze(unsqueeze_dim)'
                   tags:
                     - constant
@@ -1777,7 +1742,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L144 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L144 in apply_rotary_pos_emb,
                     code: q_embed = (q * cos) + (rotate_half(q) * sin)'
                   tags:
                     - torch.mul.12_spyre
@@ -1792,7 +1757,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - py: (Ellipsis, slice(None, 64, None))
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L118 in rotate_half,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L118 in rotate_half,
                     code: x1 = x[..., : x.shape[-1] // 2]'
                   tags:
                     - constant
@@ -1807,7 +1772,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L120 in rotate_half,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L120 in rotate_half,
                     code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - torch.neg.3_spyre
@@ -1827,13 +1792,13 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
-                    kwargs:
-                      dim: -1
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L120 in rotate_half,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L120 in rotate_half,
                     code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - constant
                     - torch.cat.5_spyre
+                  kwargs:
+                    dim: -1
                 - name: torch.mul
                   sample_inputs_func:
                     args:
@@ -1851,7 +1816,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L144 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L144 in apply_rotary_pos_emb,
                     code: q_embed = (q * cos) + (rotate_half(q) * sin)'
                   tags:
                     - torch.mul.13_spyre
@@ -1872,7 +1837,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L144 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L144 in apply_rotary_pos_emb,
                     code: q_embed = (q * cos) + (rotate_half(q) * sin)'
                   tags:
                     - torch.add.7_spyre
@@ -1893,7 +1858,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L145 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L145 in apply_rotary_pos_emb,
                     code: k_embed = (k * cos) + (rotate_half(k) * sin)'
                   tags:
                     - torch.mul.14_spyre
@@ -1908,7 +1873,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - py: (Ellipsis, slice(None, 64, None))
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L118 in rotate_half,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L118 in rotate_half,
                     code: x1 = x[..., : x.shape[-1] // 2]'
                   tags:
                     - constant
@@ -1923,7 +1888,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L120 in rotate_half,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L120 in rotate_half,
                     code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - torch.neg.4_spyre
@@ -1943,13 +1908,13 @@ test_suite_config:
                             dtype: torch.float16
                             device: cuda:0
                             init: rand
-                    kwargs:
-                      dim: -1
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L120 in rotate_half,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L120 in rotate_half,
                     code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - constant
                     - torch.cat.6_spyre
+                  kwargs:
+                    dim: -1
                 - name: torch.mul
                   sample_inputs_func:
                     args:
@@ -1967,7 +1932,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L145 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L145 in apply_rotary_pos_emb,
                     code: k_embed = (k * cos) + (rotate_half(k) * sin)'
                   tags:
                     - torch.mul.15_spyre
@@ -1988,7 +1953,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L145 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L145 in apply_rotary_pos_emb,
                     code: k_embed = (k * cos) + (rotate_half(k) * sin)'
                   tags:
                     - torch.add.8_spyre
@@ -2005,15 +1970,15 @@ test_suite_config:
                           init_args:
                             high: 1000
                       - tensor:
-                          shape: [1]
-                          stride: [1]
+                          shape: []
+                          stride: []
                           storage_offset: 0
                           dtype: torch.int64
                           device: cuda:0
                           init: randint
                           init_args:
                             high: 1000
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/cache_utils.py#L443 in update, code: cache_position
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L420 in update, code: cache_position
                     = torch.arange(kv_length, device=self.device) + self.cumulative_length'
                   tags:
                     - torch.add.9
@@ -2044,7 +2009,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/cache_utils.py#L449 in update, code: self.keys.index_copy_(2,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L426 in update, code: self.keys.index_copy_(2,
                     cache_position, key_states)'
                   tags:
                     - constant
@@ -2076,11 +2041,47 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/cache_utils.py#L450 in update, code: self.values.index_copy_(2,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L427 in update, code: self.values.index_copy_(2,
                     cache_position, value_states)'
                   tags:
                     - constant
                     - torch.index_copy_.3_spyre
+                - name: torch.Tensor.expand
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 4, 1, 2048, 128]
+                          stride: [1048576, 262144, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 4
+                      - value: 7
+                      - value: 2048
+                      - value: 128
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L24 in repeat_kv,
+                    code: hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)'
+                  tags:
+                    - constant
+                    - torch.Tensor.expand.2_spyre
+                - name: torch.reshape
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 4, 7, 2048, 128]
+                          stride: [1048576, 262144, 0, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 28, 2048, 128)
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L25 in repeat_kv,
+                    code: return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)'
+                  tags:
+                    - constant
+                    - torch.reshape.2_spyre
                 - name: torch.nn.functional.scaled_dot_product_attention
                   sample_inputs_func:
                     args:
@@ -2105,14 +2106,14 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                    kwargs:
-                      dropout_p: 0.0
-                      scale: 0.08838834764831845
-                      is_causal: false
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/integrations/sdpa_attention.py#L92 in sdpa_attention_forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
                     code: attn_output = torch.nn.functional.scaled_dot_product_attention('
                   tags:
                     - torch.nn.functional.scaled_dot_product_attention.2_spyre
+                  kwargs:
+                    dropout_p: 0.0
+                    scale: 0.08838834764831845
+                    is_causal: false
                 - name: torch.transpose
                   sample_inputs_func:
                     args:
@@ -2125,7 +2126,7 @@ test_suite_config:
                           init: rand
                       - value: 1
                       - value: 2
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/integrations/sdpa_attention.py#L102 in sdpa_attention_forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L164 in sdpa_attention_forward,
                     code: attn_output = attn_output.transpose(1, 2).contiguous()'
                   tags:
                     - constant
@@ -2140,7 +2141,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/integrations/sdpa_attention.py#L102 in sdpa_attention_forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L164 in sdpa_attention_forward,
                     code: attn_output = attn_output.transpose(1, 2).contiguous()'
                   tags:
                     - torch.Tensor.contiguous.3_spyre
@@ -2155,7 +2156,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: (1, 1, -1)
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L243 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L243 in forward,
                     code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
                   tags:
                     - constant
@@ -2170,7 +2171,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L243 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L243 in forward,
                     code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
                   tags:
                     - torch.Tensor.contiguous.4_spyre
@@ -2192,7 +2193,7 @@ test_suite_config:
                           device: cuda:0
                           init: xavier
                       - value: null
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L244 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L244 in forward,
                     code: attn_output = self.o_proj(attn_output)'
                   tags:
                     - constant
@@ -2214,7 +2215,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L302 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L302 in forward,
                     code: hidden_states = residual + hidden_states'
                   tags:
                     - torch.add.10_spyre
@@ -2236,7 +2237,7 @@ test_suite_config:
                           device: cuda:0
                           init: xavier
                       - value: null
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L47 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L47 in forward,
                     code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
                   tags:
                     - constant
@@ -2251,7 +2252,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/activations.py#L103 in forward, code: return nn.functional.silu(input)'
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/activations.py#L103 in forward, code: return nn.functional.silu(input)'
                   tags:
                     - torch.nn.functional.silu.2_spyre
                 - name: torch.mul
@@ -2271,7 +2272,7 @@ test_suite_config:
                           dtype: torch.float16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L47 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L47 in forward,
                     code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
                   tags:
                     - torch.mul.16_spyre
@@ -2293,7 +2294,7 @@ test_suite_config:
                           device: cuda:0
                           init: xavier
                       - value: null
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L47 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L47 in forward,
                     code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
                   tags:
                     - constant
@@ -2309,7 +2310,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L475 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L475 in forward,
                     code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
                   tags:
                     - constant
@@ -2332,7 +2333,7 @@ test_suite_config:
                           device: cuda:0
                           init: xavier
                       - value: null
-                  description: 'https://github.com/huggingface/transformers/blob/v5.12.0/src/transformers/models/qwen2/modeling_qwen2.py#L475 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/qwen2/modeling_qwen2.py#L475 in forward,
                     code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
                   tags:
                     - constant
