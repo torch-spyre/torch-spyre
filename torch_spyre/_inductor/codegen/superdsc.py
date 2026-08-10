@@ -432,7 +432,7 @@ def _is_matmul(op: str) -> bool:
 
 
 def _is_conv(op: str) -> bool:
-    return op in ("depthwiseconv2dnative", "conv2d")
+    return op in ("depthwiseconv2dnative")
 
 
 def _is_topk(op: str) -> bool:
