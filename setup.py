@@ -157,7 +157,7 @@ else:
 
 INCLUDE_DIRS += [os.environ["SEN_COMMON_HEADERS"]]
 
-use_new_system = os.environ.get("NEW_SYSTEM_SETUP", "0") == "1"
+use_new_system = os.environ.get("DISABLE_LEGACY_GRAPH_RUNTIME", "0") == "1"
 if use_new_system:
     LIBRARIES = ["flex"]
 else:
