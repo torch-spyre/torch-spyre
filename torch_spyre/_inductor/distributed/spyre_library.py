@@ -31,6 +31,15 @@ if torch._C._dispatch_has_kernel("spyre::broadcast_async"):
         x: torch.Tensor, reduce_op: str = "sum", group_name: str = "default"
     ) -> torch.Tensor:
         """In-place op — returns the same tensor (mutated on device)."""
+
+    @torch.library.register_fake("spyre::reduce_async")
+    def _(
+        x: torch.Tensor,
+        dst_rank: int = 0,
+        reduce_op: str = "sum",
+        group_name: str = "default",
+    ) -> torch.Tensor:
+        """In-place reduce to dst_rank — returns the same tensor."""
         return x
 
     @torch.library.register_fake("spyre::wait_work")

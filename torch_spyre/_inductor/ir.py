@@ -563,6 +563,71 @@ class AllReduceAsyncFallback(ir.ExternKernel):
         V.graph.register_operation(self)
 
 
+class ReduceAsyncFallback(ir.ExternKernel):
+    """IR node for spyre.reduce_async — emits a runtime call to async reduce.
+
+    Reduces the tensor across all ranks to dst_rank. Operates in-place on the
+    input buffer (the result is only meaningful on dst_rank, but all ranks
+    participate in the collective).
+    """
+
+    def codegen(self, wrapper: PythonWrapperCodegen) -> None:
+        input_tensor = self.inputs[0]
+        input_name = input_tensor.codegen_reference()
+
+        dst_rank, reduce_op, group_name = self.constant_args
+
+        output_name = self.get_name()
+        generated_code = (
+            f"{output_name} = torch.ops.spyre.reduce_async("
+            f"{input_name}, {dst_rank}, '{reduce_op}', '{group_name}')"
+        )
+
+        logger.debug(
+            "Codegen reduce_async: %s -> %s (dst=%s, op='%s', group='%s')",
+            input_name,
+            output_name,
+            dst_rank,
+            reduce_op,
+            group_name,
+        )
+
+        wrapper.writeline(generated_code)
+
+    def should_allocate(self) -> bool:
+        return False
+
+    def get_mutation_names(self) -> Sequence[str]:
+        return [self.inputs[0].get_name()]
+
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
+
+    def __init__(
+        self,
+        op_overload: torch._ops.OpOverload,
+        x: IRNode,
+        dst_rank: int,
+        reduce_op: str,
+        group_name: str,
+    ) -> None:
+        x_device = x.get_device()
+        x_dtype = x.get_dtype()
+        x_size = x.get_size()
+        x_stride = x.get_stride()
+        layout = FixedLayout(x_device, x_dtype, x_size, x_stride)
+        super().__init__(
+            None,
+            layout,
+            [x],
+            (dst_rank, reduce_op, group_name),
+            python_kernel_name="torch.ops.spyre.reduce_async",
+            op_overload=op_overload,
+        )
+        self.name = V.graph.register_buffer(self)
+        V.graph.register_operation(self)
+
+
 class WaitWorkFallback(ir.ExternKernel):
     """IR node for spyre.wait_work — emits a runtime call to synchronize async operation.
 

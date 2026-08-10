@@ -83,6 +83,7 @@ from .scratchpad.allocator import (
     scratchpad_planning,
 )
 from .fusion import spyre_fuse_nodes
+from .hoist_collectives import hoist_collective_ops
 from .scheduler import (
     align_lx_producer_loop_order,
     build_loop_scheduler_nodes,
@@ -260,11 +261,16 @@ class CustomPreFusionPasses(_SpyreNodePassPipeline):
     # are visible to SuperDSCScheduling.can_fuse_vertical/horizontal (which return
     # False), so loop groups survive Inductor fusion intact.
     def __init__(self):
+        # hoist_collective_ops runs first: it moves async collective nodes
+        # (broadcast_async, all_reduce_async, all_gather_async) as early as
+        # their dependencies allow, maximizing communication-compute overlap.
+        #
         # align_lx_producer_loop_order runs before build_loop_scheduler_nodes so
         # it still sees plain SchedulerNodes (the only kind that can reorder
         # their loops) rather than CountedLoopSchedulerNode wrappers.
         super().__init__(
             [
+                hoist_collective_ops,
                 propagate_mutation_layouts,
                 align_lx_producer_loop_order,
                 build_loop_scheduler_nodes,
