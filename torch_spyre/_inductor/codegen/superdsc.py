@@ -1036,7 +1036,16 @@ def _create_sdsc_tensors(
         if op_stick_dim is None:
             if not (has_indirect_access and i in index_tensor_indices):
                 stick_dim = next(d for d in dims if d not in op_dim_order)
-                dim_order = dim_order + [stick_dim]
+                # The chosen dim is absent from the *op*'s dim_order, but an
+                # individual arg may already carry it: a conv2d kernel tensor
+                # gets ki/kj added explicitly by _get_device_dim_order (they are
+                # structural for the weight even when they do not appear in its
+                # device_coordinates). Appending unconditionally would repeat the
+                # dim -- e.g. a single-channel depthwise weight [1, 1, 3, 3] has
+                # dim_order [kj, ki] and became [kj, ki, ki], which the scheduler
+                # rejects with "external allocations with repeated dimensions".
+                if stick_dim not in dim_order:
+                    dim_order = dim_order + [stick_dim]
 
         if op_spec.op == "layernormscale" and len(sdsc_args) == 0:
             reduced_dims = [stick_dim]
@@ -1551,19 +1560,39 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                 break
 
     if op_stick_dim is None:
-        if is_pool:
-            # Pool op where C fits in one stick (e.g. C=1): the "out" (channel)
-            # dimension was dropped from the iteration space because its size is 1,
-            # but the SDSC still needs it.  Take the channel count from the node's
-            # live NCHW output ranges (position 1) rather than the physical device
-            # layout, which rounds channel up to a full stick and so cannot recover
-            # C when C < elems_per_stick.  (Using INPUT_DIM_LABELS[ndim] would
-            # collide with the pool dim labels "i", "j", "ki", "kj".)
+        if is_pool or is_conv2d:
+            # Pool/conv op where C fits in one stick (e.g. C=1): the "out"
+            # (channel) dimension was dropped from the iteration space because
+            # its size is 1, but the SDSC still needs it.  Take the channel count
+            # from the node's live NCHW output ranges (position 1) rather than the
+            # physical device layout, which rounds channel up to a full stick and
+            # so cannot recover C when C < elems_per_stick.  (Using
+            # INPUT_DIM_LABELS[ndim] would collide with the dim labels "i", "j",
+            # "ki", "kj".)
             stick_sym = Symbol("out")
-            # _align_pool_dim_labels already rejected a None here for pools;
-            # restate the invariant so the index is well-typed.
+            # _align_pool_dim_labels / _align_conv2d_dim_labels already rejected a
+            # None here; restate the invariant so the index is well-typed.
             assert op_spec.node_output_ranges is not None
-            sdsc_iteration_space[stick_sym] = int(op_spec.node_output_ranges[1])
+            if is_conv2d:
+                # Front-insert for conv2d, append for pool.  ``_create_sdsc_tensors``
+                # step 3 takes the stick as the FIRST iteration-space dim missing
+                # from ``op_dim_order``.  Both ops have ki/kj in the iteration
+                # space, but they differ in the reference arg (args[0], the input):
+                #   pool  op_dim_order = [kj, j, ki, i]  -- window dims present
+                #   conv  op_dim_order = [j, i]          -- window dims absent
+                # So pool skips ki/kj and reaches "out" wherever it sits, while for
+                # conv an appended "out" loses to ki -- whose cardinality is the
+                # kernel extent (e.g. 3), and the scheduler then aborts with
+                # "[distributeElemArrToTemporalLoops] Not enough elements to
+                # distribute ... requires 64 elements".  Front-inserting makes the
+                # channel dim the first candidate, so the input and the weight both
+                # get a full-width channel stick.
+                sdsc_iteration_space = {
+                    stick_sym: int(op_spec.node_output_ranges[1]),
+                    **sdsc_iteration_space,
+                }
+            else:
+                sdsc_iteration_space[stick_sym] = int(op_spec.node_output_ranges[1])
         else:
             stick_sym = Symbol(INPUT_DIM_LABELS[ndim])
             sdsc_iteration_space[stick_sym] = op_spec.args[
