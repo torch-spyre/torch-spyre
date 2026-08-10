@@ -13,23 +13,26 @@
 # limitations under the License.
 
 import unittest
+from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 import sympy
 import torch
 from sympy import Symbol
-
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
 
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.work_division import (
     TensorDep,
     multi_dim_iteration_space_split,
 )
 from torch_spyre._inductor.work_division_constraints import (
+    ConstraintResult,
     WorkDivConstraintContext,
+    collect_work_division_constraints,
     coordinate_mask_blocked_vars,
     indirect_access_pinned_vars,
     qfp8wt_matmul_k_pinned,
@@ -272,6 +275,73 @@ class TestQfp8wtConstraints(unittest.TestCase):
         )
         result = qfp8wt_matmul_k_pinned(ctx)
         self.assertEqual(result.pinned, {})
+
+
+class TestCollectWorkDivisionConstraints(unittest.TestCase):
+    _PATCH_TARGET = "torch_spyre._inductor.work_division_constraints"
+    _PLACEHOLDER_OP = _computed_buffer((128,), name="constraint_placeholder_buf")
+    _PLACEHOLDER_TD = _tensor_dep(
+        "constraint_placeholder_buf", (128,), (_isym("_placeholder"),)
+    )
+
+    def _collect(self, results, **context_kwargs):
+        rules = (
+            "coordinate_mask_blocked_vars",
+            "qfp8wt_pinned_vars",
+            "qfp8wt_matmul_k_pinned",
+            "indirect_access_pinned_vars",
+        )
+        with ExitStack() as stack:
+            for rule, result in zip(rules, results):
+                stack.enter_context(
+                    patch(
+                        f"{self._PATCH_TARGET}.{rule}",
+                        lambda _ctx, result=result: result,
+                    )
+                )
+            return collect_work_division_constraints(
+                _make_context(
+                    self._PLACEHOLDER_OP, self._PLACEHOLDER_TD, **context_kwargs
+                )
+            )
+
+    def test_drops_blocked_var_with_committed_split(self):
+        r0 = _isym("r0")
+        result = self._collect(
+            (
+                ConstraintResult(blocked={r0}),
+                ConstraintResult(),
+                ConstraintResult(),
+                ConstraintResult(),
+            ),
+            committed_splits={r0: 2},
+        )
+        self.assertEqual(result.blocked, set())
+
+    def test_conflicting_pins_raise_unsupported(self):
+        r0 = _isym("r0")
+        with self.assertRaisesRegex(Unsupported, "conflicting pinned split"):
+            self._collect(
+                (
+                    ConstraintResult(pinned={r0: 2}),
+                    ConstraintResult(pinned={r0: 1}),
+                    ConstraintResult(),
+                    ConstraintResult(),
+                )
+            )
+
+    def test_combines_non_conflicting_rules(self):
+        r0, r1, r2, r3 = (_isym(f"r{i}") for i in range(4))
+        result = self._collect(
+            (
+                ConstraintResult(blocked={r0}, pinned={r2: 1}),
+                ConstraintResult(blocked={r1}, pinned={r3: 2}),
+                ConstraintResult(pinned={r2: 1}),
+                ConstraintResult(),
+            )
+        )
+        self.assertEqual(result.blocked, {r0, r1})
+        self.assertEqual(result.pinned, {r2: 1, r3: 2})
 
 
 class TestIndirectAccessPinnedVars(unittest.TestCase):
