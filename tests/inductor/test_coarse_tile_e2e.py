@@ -5835,6 +5835,52 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             f"{seen_pool_sizes}",
         )
 
+    @config.patch({"lx_planning": False})
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_pool_alloc_scoped_per_bundle_across_fallback_boundary(self):
+        """A CPU-fallback op (torch.sin) splits the graph into multiple
+        bundles. Each bundle's pool tensor (if any) is allocated right
+        before its own .run() call and freed right after -- there is no
+        single graph-global "_pool" shared across bundles, and the
+        intermediate crossing the fallback boundary is not pool-allocated."""
+
+        def fn(t):
+            a = torch.exp(t) * 2  # compiled bundle 1; `a` crosses the
+            b = torch.sin(a)  # fallback op -- forces a bundle boundary
+            c = torch.exp(b) * 2  # compiled bundle 2
+            return c
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+            pytest.warns(UserWarning),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), x)
+        src = source_codes[0]
+
+        # No single graph-global "_pool = " assignment (the old scheme).
+        self.assertNotIn("_pool = spyre_empty_with_layout", src)
+        # Any pool tensor that does appear is kernel-scoped
+        # ("_pool_<kernel_name> = ..."), never the bare literal "_pool".
+        pool_alloc_lines = [
+            line
+            for line in src.splitlines()
+            if "spyre_empty_with_layout" in line and "uint8" in line
+        ]
+        for line in pool_alloc_lines:
+            self.assertRegex(line.strip(), r"^_pool_\S+\s*=")
+        # Each pool alloc line's variable is del'd, and each .run( call that
+        # uses a pool passes that same per-kernel variable, not a shared name.
+        pool_var_names = [
+            line.strip().split("=", 1)[0].strip() for line in pool_alloc_lines
+        ]
+        self.assertEqual(len(pool_var_names), len(set(pool_var_names)))
+        for var_name in pool_var_names:
+            self.assertIn(f"del {var_name}", src)
+
 
 class TestNamedDimsHint(InductorTestCase):
     """Tests for propagate_named_dims handling of ops with a named_dims hint.

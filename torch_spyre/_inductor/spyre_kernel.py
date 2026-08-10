@@ -1239,8 +1239,7 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices
         actuals = self.args.python_argdefs()[1]
-        hbm_pool_size = getattr(V.graph, "hbm_pool_size", 0)
-        has_pool_allocations = hbm_pool_size > 0
+        has_pool_allocations = self.pool_size > 0
 
         for name, tensor_arg in self.spyre_kernel_args:
             tensor_arg.arg_index = actuals.index(name)
@@ -1277,12 +1276,21 @@ class SpyreKernel(Kernel[CSEVariable]):
         )
 
     def call_kernel(self, name: str, node=None):
-        """Codegen a call to this kernel"""
+        """Codegen a call to this kernel, allocating/freeing this kernel's
+        own pool tensor (if any) scoped tightly around the .run() call."""
         wrapper = V.graph.wrapper_code
         call_args = []
 
-        if self._kernel_uses_hbm_pool():
-            call_args.append("_pool")
+        uses_pool = self._kernel_uses_hbm_pool()
+        pool_var_name = f"_pool_{name}"
+        if uses_pool:
+            wrapper.writeline(
+                f"{pool_var_name} = spyre_empty_with_layout("
+                f"({self.pool_size},), (1,), torch.uint8, "
+                f"SpyreTensorLayout(device_size=[{self.pool_size}], "
+                f"stride_map=[1], device_dtype=DataFormats.SENINT8))"
+            )
+            call_args.append(pool_var_name)
 
         # Add remaining kernel arguments, deduplicating tensors that appear as
         # both input and output (e.g. in-place ops like x *= 2).  With symbolic
@@ -1297,6 +1305,8 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
+        if uses_pool:
+            wrapper.writeline(f"del {pool_var_name}")
 
     def emit_layout_restores(self, restores) -> None:
         """Emit set_spyre_tensor_layout wrapper calls after this kernel's run.
