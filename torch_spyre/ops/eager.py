@@ -13,7 +13,13 @@
 # limitations under the License.
 
 import torch
-from torch_spyre._C import fill_tensor, copy_tensor
+from torch_spyre._C import (
+    fill_tensor,
+    copy_tensor,
+    get_device_state,
+    get_elem_in_stick,
+    SpyreDeviceState,
+)
 import torch_spyre.ops.fallbacks  # noqa: F401
 from .fallbacks import _get_op_overloads
 import warnings
@@ -224,6 +230,22 @@ def spyre__local_scalar_dense(self):
     return self.cpu().item()
 
 
+def _check_spyre_stream_health():
+    """Raise RuntimeError with a clear message if the Spyre stream is in error state.
+
+    A hardware fault (e.g. RAS compute CB error) puts the stream into
+    StreamError and every subsequent Spyre operation fails with
+    ``StreamInErrorState``.  Surfacing this early — before the operation is
+    attempted — produces a direct error message instead of a misleading
+    ``BackendCompilerFailed`` wrapping a buried ``StreamInErrorState``.
+    """
+    if get_device_state() == SpyreDeviceState.StreamError:
+        raise RuntimeError(
+            "Spyre stream is in error state (likely a hardware fault on a prior "
+            "operation) — a process restart is required to recover."
+        )
+
+
 @torch.library.register_kernel("aten::_copy_from", ["spyre"])
 def spyre__copy_from(self, dst, non_blocking=False):
     if self.numel() == 0:
@@ -241,9 +263,36 @@ def spyre__copy_from(self, dst, non_blocking=False):
     ):
         return dst
 
+    # Both H2D/D2H and D2D paths require a live stream. Check once here so
+    # that a poisoned stream raises a plain RuntimeError before any Dynamo
+    # tracing can wrap it as BackendCompilerFailed.
+    if self.device.type == "spyre" or dst.device.type == "spyre":
+        _check_spyre_stream_health()
+
     if (self.device.type == "cpu" and dst.device.type == "spyre") or (
         self.device.type == "spyre" and dst.device.type == "cpu"
     ):
+        # copy_tensor (spyre_copy_from) H2D always DMAs into offset 0 of the
+        # Spyre allocation — it ignores dst.storage_offset(). When
+        # dst.storage_offset() > 0 we must do a read-modify-write (RMW):
+        # DMA the full base allocation to CPU, patch the logical slice on the
+        # CPU side, then DMA the full base allocation back to Spyre.
+        if dst.device.type == "spyre":
+            dst_off = dst.storage_offset()
+            if dst_off != 0:
+                # Build a flat view of the entire Spyre storage at offset 0.
+                # storage.nbytes() may include stick-padding beyond numel().
+                n = dst.untyped_storage().nbytes() // dst.element_size()
+                base_spyre = dst.as_strided([n], [1], 0)
+                # DMA full allocation → CPU (offset-0, always legal).
+                base_cpu = base_spyre.to("cpu")
+                # Patch the logical region on the CPU side.
+                base_cpu.as_strided(
+                    dst.size(), dst.stride(), dst_off
+                ).copy_(self)
+                # DMA full allocation back → Spyre (offset-0, always legal).
+                copy_tensor(base_cpu, base_spyre, non_blocking)
+                return dst
         copy_tensor(self, dst, non_blocking)
         return dst
     elif self.device.type == "spyre" and self.device == dst.device:
@@ -256,7 +305,28 @@ def spyre__copy_from(self, dst, non_blocking=False):
         # public predicate exists — no_dispatch() excludes the Python dispatch
         # key). Revisit if upstream exposes a stable API; the alternative
         # (attempt copy_from_d2d and catch the re-entrancy failure) is worse.
-        if torch._C._dispatch_tls_is_dispatch_key_excluded("Python"):
+        #
+        # Also fall back when either tensor has a storage offset that is not a
+        # multiple of elems_per_stick: the compiled D2D kernel cannot bake a
+        # sub-stick offset into its coordinate (see _validate_reoffset_supported
+        # in lowering.py).
+        eps = get_elem_in_stick(self.dtype)
+        src_off = self.storage_offset()
+        dst_off = dst.storage_offset()
+        needs_cpu_roundtrip = (
+            torch._C._dispatch_tls_is_dispatch_key_excluded("Python")
+            or src_off % eps != 0
+            or dst_off % eps != 0
+        )
+        if needs_cpu_roundtrip:
+            if dst_off % eps != 0:
+                raise RuntimeError(
+                    f"Spyre does not support copying into a tensor whose "
+                    f"storage_offset ({dst_off}) is not a multiple of "
+                    f"elems_per_stick={eps} (dtype {dst.dtype}). "
+                    f"Re-slice on a stick-aligned boundary (a multiple of "
+                    f"{eps} elements) or use a contiguous destination."
+                )
             cpu_tmp = self.to("cpu")
             copy_tensor(cpu_tmp, dst, non_blocking)
         else:
@@ -264,9 +334,7 @@ def spyre__copy_from(self, dst, non_blocking=False):
             # is dropped by Inductor, so the lowering must re-introduce it
             # in-graph (see copy_from_d2d in customops.py and
             # lower_spyre_from_d2d).
-            torch.ops.spyre.copy_from_d2d(
-                self, dst, self.storage_offset(), dst.storage_offset()
-            )
+            torch.ops.spyre.copy_from_d2d(self, dst, src_off, dst_off)
         return dst
     else:
         if non_blocking:
