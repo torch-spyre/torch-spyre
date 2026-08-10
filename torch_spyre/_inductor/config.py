@@ -27,6 +27,15 @@ hbm_pool_planning: bool = _get_env_bool("HBM_POOL_PLANNING", True)
 
 global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == "1"
 
+# Prefer matmul layouts whose device order is [batch..., stick_outer, row].
+# Options:
+#   "":       disabled
+#   "on":     prefer this layout for matmul inputs and output
+#   "output": prefer this layout for matmul output only
+matmul_preferred_layout: Literal["", "on", "output"] = os.environ.get(
+    "SPYRE_MATMUL_PREFERRED_LAYOUT", ""
+)  # type: ignore[assignment]
+
 allow_all_ops_in_lx_planning: bool = False
 
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))

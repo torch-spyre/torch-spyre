@@ -111,6 +111,12 @@ class PropArg(NamedTuple):
     layouts: list[SpyreTensorLayout]
 
 
+class MatmulPreferredOrder(NamedTuple):
+    batch_vars: frozenset[sympy.Symbol]
+    first_matmul_var: sympy.Symbol
+    second_matmul_var: sympy.Symbol
+
+
 def _get_prop_args(reads) -> list[PropArg]:
     # Local to this pass — the FixedLayout/FixedTiledLayout ambiguity only exists
     # during propagation and should not infect downstream passes.
@@ -758,11 +764,223 @@ def _dev_coord_for_var(dev_coords, arg_host_coords, var):
     return None
 
 
+def _nonstick_device_order_vars(coords: list[sympy.Expr]) -> list[sympy.Symbol] | None:
+    result = []
+    for coord in coords[:-1]:
+        free_symbols = coord.free_symbols
+        if not free_symbols:
+            continue
+        if len(free_symbols) != 1:
+            return None
+        result.append(next(iter(free_symbols)))
+    return result
+
+
+def _matches_with_folded_stick_var(
+    coords: list[sympy.Expr],
+    nonstick_vars: list[sympy.Symbol],
+    preferred_order: MatmulPreferredOrder,
+) -> bool:
+    first = preferred_order.first_matmul_var
+    second = preferred_order.second_matmul_var
+    if first in nonstick_vars or first not in coords[-1].free_symbols:
+        return False
+    if second not in nonstick_vars:
+        return False
+
+    second_coord_pos = next(
+        i for i, coord in enumerate(coords[:-1]) if coord.free_symbols == {second}
+    )
+    if second_coord_pos == 0 or coords[second_coord_pos - 1] != sympy.S.Zero:
+        return False
+
+    before_second = _nonstick_device_order_vars(coords[:second_coord_pos])
+    after_second = _nonstick_device_order_vars(coords[second_coord_pos + 1 : -1])
+    return (
+        before_second is not None
+        and set(before_second) == set(preferred_order.batch_vars)
+        and after_second == []
+    )
+
+
+def _matches_preferred_matmul_device_order(
+    stl: SpyreTensorLayout,
+    dep: MemoryDep,
+    preferred_order: MatmulPreferredOrder | None,
+) -> bool:
+    if preferred_order is None:
+        return False
+
+    coords = try_device_coordinates(stl, dep, None)
+    if coords is None:
+        return False
+
+    actual_vars = _nonstick_device_order_vars(coords)
+    if actual_vars is None:
+        return False
+
+    if _matches_with_folded_stick_var(coords, actual_vars, preferred_order):
+        return True
+
+    if len(actual_vars) < 2:
+        return False
+
+    actual_batch_vars = actual_vars[:-2]
+    actual_matmul_vars = actual_vars[-2:]
+    return set(actual_batch_vars) == set(
+        preferred_order.batch_vars
+    ) and actual_matmul_vars == [
+        preferred_order.first_matmul_var,
+        preferred_order.second_matmul_var,
+    ]
+
+
+def _matmul_preferred_layout_mode() -> str:
+    mode = config.matmul_preferred_layout
+    if mode not in ("", "on", "output"):
+        raise Unsupported(
+            "SPYRE_MATMUL_PREFERRED_LAYOUT must be one of '', 'on', or 'output'; "
+            f"got {mode!r}"
+        )
+    return mode
+
+
+def _default_matmul_output_dim_order(out_dims: int, out_stick_dim: int) -> list[int]:
+    dim_order = list(range(out_dims - 2))
+    if out_stick_dim == out_dims - 1:
+        return dim_order + [out_dims - 2, out_dims - 1]
+    return dim_order + [out_dims - 1, out_dims - 2]
+
+
+def _preferred_matmul_output_dim_order(
+    out_dims: int, out_stick_dim: int, out_size: list | None = None
+) -> list[int]:
+    """Return host dim_order for the preferred matmul output layout.
+
+    For non-degenerate Nd outputs the desired SDSC order is
+    [row, outer-stick, batch...]. SDSC reports order from least significant to
+    most significant after size-one dimensions have folded to constant-zero
+    coordinates. Once the row dimension folds away, its relative position is
+    not a meaningful preference signal; in that case the preferred host
+    dim_order can make SDSC report outer-stick before the surviving row/batch
+    coordinate, so keep the default dim_order instead. Folded batch dimensions
+    do not affect the preference among the remaining active batch dimensions.
+    """
+    out_row_dim = out_dims - 2 if out_stick_dim == out_dims - 1 else out_dims - 1
+    out_batch_dims = [
+        dim for dim in range(out_dims) if dim not in (out_row_dim, out_stick_dim)
+    ]
+    if out_size is not None and concretize_expr(out_size[out_row_dim]) == 1:
+        return _default_matmul_output_dim_order(out_dims, out_stick_dim)
+    return [out_row_dim] + out_batch_dims + [out_stick_dim]
+
+
+def _default_matmul_input_layout(
+    arg: PropArg,
+    stick_var: sympy.Symbol,
+) -> SpyreTensorLayout | None:
+    """Build the default input layout while preserving the required stick var.
+
+    This is used when preferred input ordering cannot be derived because the
+    logical row dimension folded to a constant. Choosing the first compatible
+    explicit layout can leave SDSC reporting [outer-stick, batch] for inputs;
+    rebuilding from the host layout keeps the default batch/row placement while
+    still requiring the matmul stick dimension.
+    """
+    if arg.layout is None:
+        return None
+
+    arg_host_coords = host_coordinates(arg.layout, arg.dep, None)
+    stick_dim = None
+    for coord in arg_host_coords:
+        if stick_var not in coord.free_symbols:
+            continue
+        stick_dim = matching_dim(arg_host_coords, coord)
+        if stick_dim is not None:
+            break
+    if stick_dim is None:
+        return None
+
+    dim_order = [dim for dim in range(len(arg.layout.size)) if dim != stick_dim]
+    dim_order.append(stick_dim)
+    c_size = [concretize_expr(s) for s in arg.layout.size]
+    c_stride = [concretize_expr(s) for s in arg.layout.stride]
+    stl = SpyreTensorLayout(c_size, c_stride, arg.layout.dtype, dim_order)
+    coords = try_device_coordinates(stl, arg.dep, None)
+    if coords is not None and stick_var in coords[-1].free_symbols:
+        return stl
+    return None
+
+
+def _matmul_preferred_input_orders(
+    x_dep: MemoryDep,
+    y_dep: MemoryDep,
+    out_coords: list[sympy.Expr],
+    out_stick_dim: int,
+    reduction_var: sympy.Symbol,
+    generated_var: sympy.Symbol,
+    x_host_coords: list[sympy.Expr] | None = None,
+    y_host_coords: list[sympy.Expr] | None = None,
+) -> tuple[MatmulPreferredOrder | None, MatmulPreferredOrder]:
+    """Derive preferred device orders for the two matmul inputs.
+
+    x is [batch..., row, reduction] and must stick on reduction_var, while y is
+    [batch..., reduction, generated] and must stick on generated_var. The
+    preferred order object stores the expected non-stick device order as
+    [batch..., outer-stick, row-like-var], where the row-like var is row for x
+    and reduction for y. Folded batch dimensions, such as B=1, are ignored by
+    this match: their SDSC position is a don't-care because they no longer carry
+    a symbolic coordinate. If x's row folded to a constant, return None so the
+    caller can use the default input layout fallback.
+    """
+    x_syms = x_dep.index.free_symbols
+    y_syms = y_dep.index.free_symbols
+
+    def active_dependency_vars(
+        coords: list[sympy.Expr], syms: set[sympy.Symbol]
+    ) -> frozenset[sympy.Symbol]:
+        return frozenset(
+            sym for coord in coords for sym in sympy.sympify(coord).free_symbols & syms
+        )
+
+    out_row_dim = (
+        len(out_coords) - 2
+        if out_stick_dim == len(out_coords) - 1
+        else len(out_coords) - 1
+    )
+    out_batch_vars = frozenset(
+        sym
+        for dim, coord in enumerate(out_coords)
+        if dim not in (out_row_dim, out_stick_dim)
+        for sym in sympy.sympify(coord).free_symbols
+    )
+
+    if x_host_coords is not None and len(x_host_coords) >= 2:
+        x_batch_vars = active_dependency_vars(x_host_coords[:-2], x_syms)
+        row_vars = active_dependency_vars([x_host_coords[-2]], x_syms)
+    else:
+        x_batch_vars = out_batch_vars & x_syms
+        row_vars = sympy.sympify(out_coords[out_row_dim]).free_symbols & x_syms
+
+    x_preferred_order = None
+    if len(row_vars) == 1:
+        row_var = next(iter(row_vars))
+        x_preferred_order = MatmulPreferredOrder(x_batch_vars, reduction_var, row_var)
+
+    if y_host_coords is not None and len(y_host_coords) >= 2:
+        y_batch_vars = active_dependency_vars(y_host_coords[:-2], y_syms)
+    else:
+        y_batch_vars = out_batch_vars & y_syms
+    y_preferred_order = MatmulPreferredOrder(y_batch_vars, generated_var, reduction_var)
+    return x_preferred_order, y_preferred_order
+
+
 def find_stick_compatible_input_layout(
     arg: PropArg,
     reduction_var: sympy.Symbol,
     reduction_type: str,
     label: str,
+    preferred_order: MatmulPreferredOrder | None = None,
 ) -> SpyreTensorLayout:
     """Find the required STL for a matmul input by iterating all candidate layouts.
 
@@ -782,12 +1000,19 @@ def find_stick_compatible_input_layout(
     # Pass 1: already stick-compatible.
     # stick_compatible() checks cross-tensor compatibility; here we only need
     # to know if this input's stick coord already carries the target loop variable.
+    first_compatible = None
     for stl, dev_coords in candidates:
         if reduction_var in dev_coords[-1].free_symbols:
-            return stl
+            if first_compatible is None:
+                first_compatible = stl
+            if _matches_preferred_matmul_device_order(stl, arg.dep, preferred_order):
+                return stl
+    if first_compatible is not None:
+        return first_compatible
 
     # Pass 2: can be restickified — find the resolvable device coord for reduction_var
     # and use it as target_stick_expr for compute_restickify_target_layout.
+    first_restickified = None
     arg_host_coords = host_coordinates(arg.layout, arg.dep, None)
     for stl, dev_coords in candidates:
         target_stick_expr = _dev_coord_for_var(
@@ -799,7 +1024,13 @@ def find_stick_compatible_input_layout(
             stl, arg.layout, target_stick_expr, arg_host_coords, dev_coords
         )
         if result is not None:
-            return result
+            if first_restickified is None:
+                first_restickified = result
+            if _matches_preferred_matmul_device_order(result, arg.dep, preferred_order):
+                return result
+
+    if first_restickified is not None:
+        return first_restickified
 
     raise Unsupported(
         f"{reduction_type}: cannot restickify any input layout of {label} to carry {label}_var={reduction_var}"
@@ -839,12 +1070,38 @@ def _matmul_layouts(
     #   Output:     stick on generated_var
     reduction_var = find_reduction_var(x.dep, output_dep)
     generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep)
+    preferred_mode = _matmul_preferred_layout_mode()
 
-    x_req_stl = find_stick_compatible_input_layout(
-        x, reduction_var, data.reduction_type, "x"
-    )
+    x_preferred_order = None
+    y_preferred_order = None
+    if preferred_mode == "on":
+        out_stick_dim = next(
+            (i for i, c in enumerate(out_coords) if generated_var in c.free_symbols),
+            None,
+        )
+        if out_stick_dim is not None:
+            x_host_coords = host_coordinates(x.layout, x.dep, None)
+            y_host_coords = host_coordinates(y.layout, y.dep, None)
+            x_preferred_order, y_preferred_order = _matmul_preferred_input_orders(
+                x.dep,
+                y.dep,
+                out_coords,
+                out_stick_dim,
+                reduction_var,
+                generated_var,
+                x_host_coords,
+                y_host_coords,
+            )
+
+    x_req_stl = None
+    if preferred_mode == "on" and x_preferred_order is None:
+        x_req_stl = _default_matmul_input_layout(x, reduction_var)
+    if x_req_stl is None:
+        x_req_stl = find_stick_compatible_input_layout(
+            x, reduction_var, data.reduction_type, "x", x_preferred_order
+        )
     y_req_stl = find_stick_compatible_input_layout(
-        y, generated_var, data.reduction_type, "y"
+        y, generated_var, data.reduction_type, "y", y_preferred_order
     )
 
     out_stick_dim = next(
@@ -857,11 +1114,12 @@ def _matmul_layouts(
         )
 
     out_dims = len(output.size)
-    out_dim_order = list(range(out_dims - 2))
-    if out_stick_dim == out_dims - 1:
-        out_dim_order = out_dim_order + [out_dims - 2, out_dims - 1]
+    if preferred_mode in ("on", "output"):
+        out_dim_order = _preferred_matmul_output_dim_order(
+            out_dims, out_stick_dim, output.size
+        )
     else:
-        out_dim_order = out_dim_order + [out_dims - 1, out_dims - 2]
+        out_dim_order = _default_matmul_output_dim_order(out_dims, out_stick_dim)
     # Concretize for C++ SpyreTensorLayout constructor.
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
