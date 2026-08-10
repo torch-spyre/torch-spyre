@@ -1754,7 +1754,6 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
     blocked = coordinate_mask_blocked_vars(reduction_vars, stick_vars, it_space)
-    blocked |= conv_spatial_blocked_vars(op, it_space_adjusted, committed_splits)
     default_splits, _, _ = _default_split(
         it_space_adjusted, output_td, committed_splits, max_cores, symbol_meta, blocked
     )
