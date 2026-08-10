@@ -278,7 +278,6 @@ def gen_coord_info_value(
     """
     if conv_params is None:
         conv_params = {"conv_padding": padding, "stride_len": 1, "total_size": size}
-    
 
     if not is_stick_dim:
         return {
@@ -1187,11 +1186,11 @@ def generate_sdsc(
                     sdsc_spec.conv_params,
                     dim_size,
                     nsplits,
-                ) 
+                )
                 if op == DEPTHWISE_CONV2D_OP
                 else None
-           )
- 
+            )
+
             result[dim_str] = gen_coord_info_value(
                 size=size,
                 nsplits=nsplits,
@@ -1478,7 +1477,9 @@ def generate_sdsc(
                                         else {}
                                     ),
                                     "coordinates_": {
-                                        "coordInfo": _build_coord_info(sdsc_spec.opfunc, tensor, i),
+                                        "coordInfo": _build_coord_info(
+                                            sdsc_spec.opfunc, tensor, i
+                                        ),
                                         "coreIdToWkSlice_": {},
                                     },
                                 }

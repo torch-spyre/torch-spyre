@@ -498,6 +498,95 @@ def _align_pool_dim_labels(node_output_ranges, ndim: int) -> list[str]:
     return labels
 
 
+_CONV2D_ROLE_LABELS = list(
+    zip(
+        ["batch", "channel", "out_h", "out_w"],
+        [
+            CONV2D_DIM_LABELS[0],
+            CONV2D_DIM_LABELS[1],
+            _CONV2D_PAD_DIM_I,
+            _CONV2D_PAD_DIM_J,
+        ],
+    )
+)
+
+
+def _align_conv2d_dim_labels(
+    node_output_ranges,
+    ndim: int,
+    kernel_h,
+    kernel_w,
+) -> list[str]:
+    """Return conv2d dim labels aligned to the (possibly squeezed) iteration space.
+
+    ``node_output_ranges`` is the reduction node's full logical output ranges in
+    **NCHW** order ``[N, C, H_out, W_out]`` (live IR, incl. unit dims) -- see
+    ``OpSpec.node_output_ranges``.  Codegen owns the SDSC label for each role
+    (``_CONV2D_ROLE_LABELS``, emitted in canonical ``mb, out, i, j`` order).
+
+    A role whose live range is 1 is a *candidate* for having been squeezed out of
+    the iteration space, but the squeeze is **not unconditional**, so candidacy
+    alone cannot decide survival.  Two behaviours have to be reconciled:
+
+    - ``N == 1``  and ``kernel_size == 1`` really are
+      dropped, and the squeeze can land at the front, at the back, or in the
+      **middle** (``H_out == 1`` with ``mb`` surviving, dw-15).  No suffix slice
+      or count-from-one-end scheme can express a middle squeeze, which is why
+      survival is keyed per role rather than positionally.
+    - A **fully collapsed 1x1 output** *keeps*
+      its unit output-spatial dims: the iteration space stays rank 6 with the
+      kernel extents live and ``i``/``j`` present as size-1 dims.
+
+    So unit-range roles are dropped only in *reverse canonical order*, and only
+    as many as the iteration-space rank requires.  ``ndim`` is the ground truth;
+    the ranges only say which roles are *eligible* to be dropped.  Unlike
+    ``_align_pool_dim_labels`` this must also consider the **window** roles:
+    ``lower_avg_pool2d`` delegates to the in-tree lowering when
+    ``kH == 1 or kW == 1``, so a pool ``SpyreReduction`` always has both window
+    dims, but conv2d explicitly supports 1x1 / 1xN / Nx1 kernels.
+    """
+    if node_output_ranges is None or len(node_output_ranges) != 4:
+        raise ValueError(
+            "conv2d node_output_ranges must be NCHW [N, C, H_out, W_out]; got "
+            f"{node_output_ranges!r}"
+        )
+    # Full canonical label list with each entry's unit-ness, in iteration-space
+    # order: output roles (mb, out, i, j) then window roles (ki, kj).
+    candidates: list[tuple[str, bool]] = [
+        (label, _is_static_one(node_output_ranges[pos]))
+        for pos, (_role, label) in enumerate(_CONV2D_ROLE_LABELS)
+    ]
+    candidates.append((_CONV2D_WINDOW_DIM_I, _is_static_one(kernel_h)))
+    candidates.append((_CONV2D_WINDOW_DIM_J, _is_static_one(kernel_w)))
+
+    n_to_drop = len(candidates) - ndim
+    if n_to_drop < 0:
+        raise ValueError(
+            f"conv2d iteration-space rank {ndim} exceeds the {len(candidates)} "
+            f"canonical dim labels {[label for label, _ in candidates]}; "
+            f"node_output_ranges {node_output_ranges!r}, kernel "
+            f"{kernel_h}x{kernel_w}"
+        )
+    # Drop unit-range roles from the back: the pipeline squeezes the innermost
+    # eligible dims first, and a 1x1 output keeps i/j rather than dropping them.
+    dropped: set[int] = set()
+    for idx in range(len(candidates) - 1, -1, -1):
+        if len(dropped) == n_to_drop:
+            break
+        if candidates[idx][1]:
+            dropped.add(idx)
+    if len(dropped) != n_to_drop:
+        unit_labels = [label for label, is_unit in candidates if is_unit]
+        raise ValueError(
+            f"conv2d needs to drop {n_to_drop} dim label(s) to reach "
+            f"iteration-space rank {ndim}, but only {len(unit_labels)} "
+            f"unit-range role(s) {unit_labels} are eligible; node_output_ranges "
+            f"{node_output_ranges!r} and kernel {kernel_h}x{kernel_w} are out of "
+            "sync with the emitted iteration space"
+        )
+    return [label for idx, (label, _) in enumerate(candidates) if idx not in dropped]
+
+
 def _avgpool_sdsc_fields(iteration_space: dict, pool_params: dict) -> dict:
     """Compute the pool-specific SDSC field values for an avgpool op.
 
@@ -642,27 +731,47 @@ def _conv2d_sdsc_fields(
         }
 
     def build_padding_sizes_variant(dim_sizes=None):
-        """Build paddingSizes_ for one variant (top-level or per-core)."""
-        return {
-            str(_CONV2D_PAD_DIM_I): compute_padding_for_dim(
+        """Build paddingSizes_ for one variant (top-level or per-core).
+
+        Emits one entry per spatial axis whose output dim actually survives in
+        the iteration space, mirroring ``_avgpool_sdsc_fields``.  A collapsed
+        window (kernel extent 1) leaves its output-spatial label unassigned --
+        e.g. K=1x1 with N=1 yields no ``j`` -- and subscripting ``dim_sizes``
+        for the absent label would raise ``KeyError``.  Such an axis has no
+        pooling/conv window to describe, so it is correctly omitted rather than
+        defaulted.
+        """
+        variant = {}
+        for suffix, pad_dim, kernel_key, stride_key, window_dim, total_key in (
+            (
                 "i",
                 _CONV2D_PAD_DIM_I,
                 "kernel_h",
                 "stride_i",
                 _CONV2D_WINDOW_DIM_I,
                 "total_size_i",
-                dim_sizes,
             ),
-            str(_CONV2D_PAD_DIM_J): compute_padding_for_dim(
+            (
                 "j",
                 _CONV2D_PAD_DIM_J,
                 "kernel_w",
                 "stride_j",
                 _CONV2D_WINDOW_DIM_J,
                 "total_size_j",
-                dim_sizes,
             ),
-        }
+        ):
+            if dim_sizes is not None and Symbol(pad_dim) not in dim_sizes:
+                continue
+            variant[str(pad_dim)] = compute_padding_for_dim(
+                suffix,
+                pad_dim,
+                kernel_key,
+                stride_key,
+                window_dim,
+                total_key,
+                dim_sizes,
+            )
+        return variant
 
     return {
         "padding_sizes": build_padding_sizes_variant(dim_sizes=None),
@@ -677,102 +786,75 @@ def _build_conv2d_symbol_mapping(
     op_spec: OpSpec,
     dim_labels: list[str],
 ) -> dict[Any, Symbol]:
-    """Build symbol mapping for depthwise conv2d using size-based kernel matching.
+    """Build the symbol mapping for depthwise conv2d from live dim roles.
 
-    For depthwise conv2d, uses size-based matching to correctly identify kernel vs
-    spatial dimensions, since positional mapping fails when iteration space order
-    doesn't guarantee kernel dimensions are at expected positions.
+    Labels come from ``_align_conv2d_dim_labels``, which derives which roles
+    survived the pipeline's size-1 squeeze from the node's live NCHW output
+    ranges plus the kernel extents.  Those labels are already in
+    iteration-space order (output roles in canonical ``mb, out, i, j`` order,
+    then the surviving window dims), so symbols map onto them positionally.
 
-    Returns the symbol_mapping dict (original symbol -> SDSC label Symbol).
-    Falls back to positional mapping if kernel sizes unavailable or matching fails.
+    This deliberately does **not** identify kernel dims by matching their extent
+    against ``kernel_h``/``kernel_w``.  An extent of 1 both collapses the dim
+    away and collides with any other unit dim, so extent matching cannot
+    distinguish a kernel dim from a unit spatial dim -- and a squeeze that lands
+    in the middle of the canonical order (``H_out == 1`` dropping ``i`` while
+    ``mb`` survives) is invisible to any positional or count-based scheme.
+
+    Falls back to the caller's positional labels only when the kernel extents
+    or live ranges are unavailable, which is the pre-existing behaviour for
+    op_specs that carry no ``conv_params``.
     """
     conv_params = op_spec.op_info.get("conv_params", {})
     kernel_h = conv_params.get("kernel_h")
     kernel_w = conv_params.get("kernel_w")
-
-    if kernel_h is None or kernel_w is None:
-        # No kernel sizes available, fall back to positional mapping
-        return {
-            sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)
-        }
-
-    # Build size map from iteration space
     sym_list = list(op_spec.iteration_space.keys())
-    sym_to_size = {
-        sym: _concretize_for_sdsc(size)
-        for sym, (size, _) in op_spec.iteration_space.items()
-    }
 
-    # Find kernel dimension symbols by matching sizes
-    ki_sym = None
-    kj_sym = None
-    for sym in reversed(sym_list):
-        if sym_to_size.get(sym) == kernel_w and kj_sym is None:
-            kj_sym = sym
-        elif sym_to_size.get(sym) == kernel_h and ki_sym is None and sym != kj_sym:
-            ki_sym = sym
+    if kernel_h is None or kernel_w is None or op_spec.node_output_ranges is None:
+        # No kernel sizes or no live output ranges: keep the caller's positional
+        # mapping rather than guessing.
+        return {sym: Symbol(dim_labels[i]) for i, sym in enumerate(sym_list)}
 
-    # If both kernel symbols found, build mapping with correct labels
-    if ki_sym and kj_sym:
-        symbol_mapping = {}
-        remaining_labels = [label for label in dim_labels if label not in ("ki", "kj")]
-        remaining_idx = 0
+    labels = _align_conv2d_dim_labels(
+        op_spec.node_output_ranges, len(sym_list), kernel_h, kernel_w
+    )
 
-        for sym in sym_list:
-            if sym == ki_sym:
-                symbol_mapping[sym] = Symbol("ki")
-            elif sym == kj_sym:
-                symbol_mapping[sym] = Symbol("kj")
-            else:
-                if remaining_idx < len(remaining_labels):
-                    symbol_mapping[sym] = Symbol(remaining_labels[remaining_idx])
-                    remaining_idx += 1
-                else:
-                    symbol_mapping[sym] = Symbol(dim_labels[sym_list.index(sym)])
-        return symbol_mapping
+    # The label list is in canonical order (mb, out, i, j, ki, kj minus the
+    # squeezed roles), but the *iteration space* is not guaranteed to be.  It is
+    # built write-dep-first and then extended with read-only symbols, so when the
+    # output spatial dims collapse to 1x1 they drop out of the write dep and are
+    # re-appended AFTER the kernel dims.  
+    # Assigning canonical labels positionally would swap i/j with ki/kj.
+    #
+    # Only a fully collapsed 1x1 output can reorder this way (a surviving spatial
+    # dim stays in the write dep and keeps its slot), so handle exactly that case:
+    # the unit-extent symbols are the output spatial dims and the kernel-extent
+    # symbols are the window.
+    window_labels = (_CONV2D_WINDOW_DIM_I, _CONV2D_WINDOW_DIM_J)
+    spatial_labels = (_CONV2D_PAD_DIM_I, _CONV2D_PAD_DIM_J)
+    needs_reorder = all(lbl in labels for lbl in window_labels) and all(
+        lbl in labels for lbl in spatial_labels
+    )
+    if needs_reorder and _is_static_one(op_spec.node_output_ranges[2]):
+        sym_to_size = {
+            sym: _concretize_for_sdsc(size)
+            for sym, (size, _) in op_spec.iteration_space.items()
+        }
+        # Symbols whose extent is 1 are the collapsed spatial dims; the rest, in
+        # order, take the remaining canonical labels.
+        unit_syms = [sym for sym in sym_list if sym_to_size.get(sym) == 1]
+        if len(unit_syms) == 2:
+            non_spatial = [lbl for lbl in labels if lbl not in spatial_labels]
+            non_spatial_iter = iter(non_spatial)
+            spatial_iter = iter(spatial_labels)
+            return {
+                sym: Symbol(
+                    next(spatial_iter) if sym in unit_syms else next(non_spatial_iter)
+                )
+                for sym in sym_list
+            }
 
-    # Couldn't match both kernel dims by size: kernel dimensions are likely implicit (e.g., kernel_size=1)
-    # or one kernel size collides with another dimension size (e.g., kernel 1×2 where 1 matches other dims).
-    # When size-based matching fails, identify kernel dims by checking if they iterate to kernel_h/kernel_w.
-    # Otherwise fall back to positional mapping where last two dims are usually ki/kj.
-    symbol_mapping = {}
-
-    # Try to identify which symbols map to ki and kj by their iteration sizes
-    remaining_symbols = list(sym_list)
-    ki_sym = None
-    kj_sym = None
-
-    for sym in reversed(remaining_symbols):
-        sym_size = sym_to_size.get(sym)
-        if sym_size == kernel_w and kj_sym is None:
-            kj_sym = sym
-        elif sym_size == kernel_h and ki_sym is None and sym != kj_sym:
-            ki_sym = sym
-
-        if ki_sym and kj_sym:
-            break
-
-    # Build mapping for all symbols
-    non_kernel_labels = [
-        label for label in CONV2D_DIM_LABELS if label not in ("ki", "kj")
-    ]
-    label_idx = 0
-
-    for sym in sym_list:
-        if sym == ki_sym:
-            symbol_mapping[sym] = Symbol("ki")
-        elif sym == kj_sym:
-            symbol_mapping[sym] = Symbol("kj")
-        else:
-            if label_idx < len(non_kernel_labels):
-                symbol_mapping[sym] = Symbol(non_kernel_labels[label_idx])
-                label_idx += 1
-            else:
-                # Shouldn't happen, but guard against it
-                symbol_mapping[sym] = Symbol(f"unknown_{label_idx}")
-                label_idx += 1
-
-    return symbol_mapping
+    return {sym: Symbol(labels[i]) for i, sym in enumerate(sym_list)}
 
 
 def _get_op_dim_labels(ndim: int, is_matmul: bool, is_conv2d: bool) -> list[str]:
