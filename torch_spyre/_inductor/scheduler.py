@@ -576,7 +576,8 @@ class SuperDSCScheduling(BaseScheduling):
         if len(nodes) == 0:
             return
 
-        kernel = SpyreKernel()
+        pool_sizes = getattr(V.graph, "hbm_pool_sizes", {})
+        kernel = SpyreKernel(pool_size=pool_sizes.get(node.get_name(), 0))
         all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
             self._codegen_into_kernel(nodes, kernel, all_schedule_nodes)
@@ -611,7 +612,8 @@ class SuperDSCScheduling(BaseScheduling):
         if len(inner_nodes) == 0:
             return
 
-        kernel = SpyreKernel()
+        pool_sizes = getattr(V.graph, "hbm_pool_sizes", {})
+        kernel = SpyreKernel(pool_size=pool_sizes.get(node.get_name(), 0))
         all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
             self._codegen_into_kernel(inner_nodes, kernel, all_schedule_nodes)

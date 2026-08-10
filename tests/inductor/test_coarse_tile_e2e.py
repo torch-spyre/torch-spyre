@@ -5766,6 +5766,75 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 fn, x, y, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
             )
 
+    # ------------------------------------------------------------------
+    # Per-bundle hbm_pool_sizes threading into SpyreKernel
+    # ------------------------------------------------------------------
+
+    @config.patch({"lx_planning": False})
+    def test_bundle_pool_size_threaded_from_hbm_pool_sizes(self):
+        """codegen_node must look up this bundle's own pool_size from
+        V.graph.hbm_pool_sizes, not a stale graph-global scalar.
+
+        lx_planning is disabled here so the `a = x + y` intermediate isn't
+        claimed by LX scratchpad planning first -- with LX planning on,
+        `add`/`mul`/`sub` outputs are all LX-eligible by default (see
+        OP_OUTPUT_GOOD_FOR_LX_REUSE in scratchpad/utils.py) and may win the
+        scratchpad before hbm_pool_planning ever sees them, leaving every
+        bundle's pool_size at 0 and proving nothing about the plumbing this
+        test exists to check.
+
+        The generated wrapper's `.run(_pool, ...)` call site is only made
+        valid by Task 4's per-bundle pool codegen (not yet landed): today
+        `wrapper.py.allocate_hbm_pool()`/`generate()` still key off the old
+        graph-global `V.graph.hbm_pool_size` scalar that Task 2 replaced
+        with the `V.graph.hbm_pool_sizes` dict, so `_pool` is never emitted
+        and calling the compiled function raises `NameError: name '_pool'
+        is not defined` at runtime -- reproducible on this branch even
+        without this test's changes. That failure happens inside the
+        generated `call()` function, strictly after `codegen_node` (and
+        therefore every `SpyreKernel()` construction this test observes)
+        has already run, so it does not affect what this test checks.
+        Catch it explicitly rather than letting it fail the test or
+        loosening the assertion below.
+        """
+        from unittest.mock import patch
+
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        seen_pool_sizes = []
+        orig_init = SpyreKernel.__init__
+
+        def _recording_init(self, pool_size=0, **kwargs):
+            seen_pool_sizes.append(pool_size)
+            orig_init(self, pool_size=pool_size, **kwargs)
+
+        def fn(x, y):
+            a = x + y
+            b = a * 2
+            return b - x
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+        y = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        with (
+            patch.object(SpyreKernel, "__init__", _recording_init),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            try:
+                torch.compile(fn)(x, y)
+            except NameError as e:
+                if "_pool" not in str(e):
+                    raise
+
+        self.assertTrue(seen_pool_sizes)
+        self.assertTrue(
+            any(seen_pool_sizes),
+            f"expected at least one bundle with a nonzero pool_size, got "
+            f"{seen_pool_sizes}",
+        )
+
 
 class TestNamedDimsHint(InductorTestCase):
     """Tests for propagate_named_dims handling of ops with a named_dims hint.

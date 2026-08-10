@@ -7169,5 +7169,17 @@ class TestCustomPostFusionPassesOrder(unittest.TestCase):
         )
 
 
+class TestSpyreKernelPoolSize(unittest.TestCase):
+    def test_spyre_kernel_accepts_pool_size(self):
+        """SpyreKernel must accept a per-bundle pool_size, defaulting to 0."""
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        kernel = SpyreKernel(pool_size=2048)
+        self.assertEqual(kernel.pool_size, 2048)
+
+        default_kernel = SpyreKernel()
+        self.assertEqual(default_kernel.pool_size, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

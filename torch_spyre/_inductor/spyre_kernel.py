@@ -536,7 +536,7 @@ def _tile_advance_expr_from_dep(
 class SpyreKernel(Kernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
 
-    def __init__(self) -> None:
+    def __init__(self, pool_size: int = 0) -> None:
         super().__init__()
         self.op_specs: list[OpSpec | UnimplementedOp | LoopSpec] = []
         self.spyre_kernel_args: list[Tuple[str, TensorArg]] = []
@@ -545,6 +545,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         self._indirect_var_count: int = 0
         self._general_tile_advance_seen: dict[str, int] = {}
         self._tile_advance_symbols: dict[int, sympy.Symbol] = {}
+        self.pool_size: int = pool_size
 
     def indirect_var_names(self) -> "frozenset[str] | None":
         if not self.indirect_vars:
