@@ -105,6 +105,11 @@ from torch_spyre._inductor.temp_passes import (
     _mark_static_unit_batch_bmm,
     mark_direct_unit_bmm_pass,
 )
+from torch_spyre._inductor.wsr.tile import (
+    compute_tile_offset,
+    compute_tile_index,
+    compute_tile_stride,
+)
 
 _FP16 = DataFormats.SEN169_FP16
 
@@ -7446,6 +7451,151 @@ class TestCoeffThroughFloor(unittest.TestCase):
         s = Symbol("s")
         expr = floor(128 * s / 2)
         self.assertEqual(coeff_through_floor(expr, s), 64)
+
+
+class TestRetile(unittest.TestCase):
+    """Tests for tile.py."""
+
+    def test_compute_tile_stride_1d(self):
+        self.assertEqual(compute_tile_stride([1024], [1], [256]), [1])
+
+    def test_compute_tile_stride_2d(self):
+        self.assertEqual(
+            compute_tile_stride([1024, 4096], [4096, 1], [512, 1024]), [1024, 1]
+        )
+
+    def test_compute_tile_stride_2d_padding(self):
+        self.assertEqual(
+            compute_tile_stride([1024, 4096], [4104, 1], [512, 1024]), [1026, 1]
+        )
+
+    def test_compute_tile_stride_3d_row_major(self):
+        self.assertEqual(
+            compute_tile_stride([8, 16, 32], [512, 32, 1], [2, 4, 8]), [32, 8, 1]
+        )
+
+    def test_compute_tile_stride_3d_col_major(self):
+        self.assertEqual(
+            compute_tile_stride([8, 16, 32], [1, 8, 128], [2, 4, 8]), [1, 2, 8]
+        )
+
+    def test_compute_tile_stride_3d_min_stride_64(self):
+        self.assertEqual(
+            compute_tile_stride([4, 8, 16], [8192, 1024, 64], [2, 4, 8]),
+            [2048, 512, 64],
+        )
+
+    def test_compute_tile_stride_3d_unit_tile_middle_dim(self):
+        self.assertEqual(
+            compute_tile_stride([8, 16, 32], [512, 32, 1], [2, 1, 8]), [8, 0, 1]
+        )
+
+    def test_compute_tile_stride_3d_size1_outermost(self):
+        self.assertEqual(
+            compute_tile_stride([1, 16, 32], [512, 32, 1], [1, 4, 8]), [0, 8, 1]
+        )
+
+    def test_compute_tile_stride_3d_size1_middle(self):
+        self.assertEqual(
+            compute_tile_stride([8, 1, 32], [32, 32, 1], [2, 1, 8]), [8, 0, 1]
+        )
+
+    def test_compute_tile_stride_3d_size1_innermost(self):
+        self.assertEqual(
+            compute_tile_stride([8, 16, 1], [16, 1, 1], [2, 4, 1]), [4, 1, 0]
+        )
+
+    def test_compute_tile_stride_3d_expanded_outermost(self):
+        self.assertEqual(
+            compute_tile_stride([8, 16, 32], [0, 32, 1], [2, 4, 8]), [0, 8, 1]
+        )
+
+    def test_compute_tile_stride_3d_expanded_middle(self):
+        self.assertEqual(
+            compute_tile_stride([8, 16, 32], [32, 0, 1], [2, 4, 8]), [8, 0, 1]
+        )
+
+    def test_compute_tile_stride_3d_expanded_innermost(self):
+        self.assertEqual(
+            compute_tile_stride([8, 16, 32], [16, 1, 0], [2, 4, 8]), [4, 1, 0]
+        )
+
+    def test_compute_tile_stride_3d_padding(self):
+        self.assertEqual(
+            compute_tile_stride([8, 16, 32], [544, 32, 1], [2, 4, 8]), [34, 8, 1]
+        )
+
+    def test_compute_tile_offset_1d(self):
+        self.assertEqual(compute_tile_offset(0, [(1, 1)]), 0)
+        self.assertEqual(compute_tile_offset(1, [(1, 1)]), 1)
+        self.assertEqual(compute_tile_offset(256, [(1, 1)]), 256)
+
+    def test_compute_tile_offset_2d(self):
+        self.assertEqual(compute_tile_offset(0, [(4096, 1024), (1, 1)]), 0)
+        self.assertEqual(compute_tile_offset(1, [(4096, 1024), (1, 1)]), 1)
+        self.assertEqual(compute_tile_offset(4096, [(4096, 1024), (1, 1)]), 1024)
+        self.assertEqual(compute_tile_offset(4097, [(4096, 1024), (1, 1)]), 1025)
+        self.assertEqual(compute_tile_offset(8192, [(4096, 1024), (1, 1)]), 2048)
+        self.assertEqual(compute_tile_offset(4104, [(4104, 1026), (1, 1)]), 1026)
+
+    def test_compute_tile_offset_3d(self):
+        self.assertEqual(compute_tile_offset(512, [(512, 32), (32, 8), (1, 1)]), 32)
+        self.assertEqual(compute_tile_offset(32, [(512, 32), (32, 8), (1, 1)]), 8)
+        self.assertEqual(compute_tile_offset(545, [(512, 32), (32, 8), (1, 1)]), 41)
+
+    def test_compute_tile_offset_3d_min_stride_64(self):
+        self.assertEqual(
+            compute_tile_offset(0, [(8192, 2048), (1024, 512), (64, 64)]), 0
+        )
+        self.assertEqual(
+            compute_tile_offset(64, [(8192, 2048), (1024, 512), (64, 64)]), 64
+        )
+        self.assertEqual(
+            compute_tile_offset(1024, [(8192, 2048), (1024, 512), (64, 64)]), 512
+        )
+        self.assertEqual(
+            compute_tile_offset(8192, [(8192, 2048), (1024, 512), (64, 64)]), 2048
+        )
+        self.assertEqual(
+            compute_tile_offset(9280, [(8192, 2048), (1024, 512), (64, 64)]), 2624
+        )
+
+    def test_compute_tile_index_2d(self):
+        p0, p1 = sympy.symbols("p0 p1", integer=True)
+        self.assertEqual(
+            compute_tile_index(4096 * p0 + p1, [1024, 4096], [4096, 1], [1024, 1]),
+            1024 * p0 + p1,
+        )
+        self.assertEqual(
+            compute_tile_index(p0 + 1024 * p1, [4096, 1024], [1024, 1], [512, 1]),
+            p0 + 512 * p1,
+        )
+
+    def test_compute_tile_index_2d_diagonal(self):
+        p0 = sympy.Symbol("p0", integer=True)
+        self.assertEqual(
+            compute_tile_index(4097 * p0, [1024, 4096], [4096, 1], [1024, 1]), 1025 * p0
+        )
+
+    def test_compute_tile_index_2d_col_major(self):
+        p0, p1 = sympy.symbols("p0 p1", integer=True)
+        self.assertEqual(
+            compute_tile_index(p0 + 1024 * p1, [1024, 4096], [1, 1024], [1, 512]),
+            p0 + 512 * p1,
+        )
+
+    def test_compute_tile_index_2d_constant_offset(self):
+        p0 = sympy.Symbol("p0", integer=True)
+        self.assertEqual(
+            compute_tile_index(4096 + p0, [1024, 4096], [4096, 1], [1024, 1]), 1024 + p0
+        )
+
+    def test_compute_tile_index_2d_no_tiling(self):
+        p0 = sympy.Symbol("p0", integer=True)
+        self.assertEqual(
+            compute_tile_index(4096 * p0 + 2048, [1024, 4096], [4096, 1], [4096, 1]),
+            4096 * p0 + 2048,
+        )
 
 
 if __name__ == "__main__":

@@ -75,7 +75,6 @@ from torch._inductor.utils import sympy_subs
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
-    FlexibleLayout,
     InputBuffer,
     IRNode,
     Layout,
@@ -106,6 +105,7 @@ from ..loop_info import (
 )
 from ..pass_utils import op_out_coords, host_coordinates, indirect_sizes_from_op
 from ..ir import FixedTiledLayout, SpyreConstantFallback, _resize_device_layout
+from .tile import compute_tile_stride
 
 logger = get_inductor_logger("coarse_tile")
 
@@ -1216,8 +1216,8 @@ def _divide_ranges(
         new_size[i] = ranges[i]
     layout.size = new_size
 
-    # Recompute contiguous strides for the smaller buffer.
-    layout.stride = list(FlexibleLayout.contiguous_strides(new_size))
+    # Recompute strides for the smaller buffer preserving the order of dimensions
+    layout.stride = compute_tile_stride(layout.size, old_stride, new_size)
 
     # Invalidate Layout- and ComputedBuffer-level caches that read size/stride.
     _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
