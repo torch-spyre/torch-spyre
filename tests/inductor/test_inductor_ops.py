@@ -470,20 +470,25 @@ _SCALED_MM_SHAPES = [
 
 # scale_a, scale_b
 _SCALED_MM_PARAMS = [
-    (1.0, 1.0),
+    (1.0, 1.0, 0.0),  # unit scales, no bias — baseline
+    (2.0, 1.0, 0.0),  # non-unit scale_a
+    (1.0, 3.0, 0.0),  # non-unit scale_b
+    (2.0, 3.0, 0.0),  # both non-unit scales
+    (1.0, 1.0, 5.0),  # unit scales with bias
+    (2.0, 3.0, 0.5),  # non-unit scales with bias
 ]
 
 SCALED_MM_TESTS = {
-    f"{shapes2key([shape])}_{sa}_{sb}": (
+    f"{shapes2key([shape])}_{sa}_{sb}_{b}": (
         torch.rand((shape[0], shape[1]), dtype=torch.float16),
         torch.rand((shape[1], shape[2]), dtype=torch.float16),
         torch.tensor(sa, dtype=torch.float16),
         torch.tensor(sb, dtype=torch.float16),
+        torch.tensor(b, dtype=torch.float16),
     )
     for shape in _SCALED_MM_SHAPES
-    for sa, sb in _SCALED_MM_PARAMS
+    for sa, sb, b in _SCALED_MM_PARAMS
 }
-
 FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
 FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
 
@@ -6878,17 +6883,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             run_eager=False,
         )
 
-    def test_fp8_scaled_mm_cpu(self, a, b, scale_a, scale_b):
+    def test_fp8_scaled_mm_cpu(self, a, b, scale_a, scale_b, bias):
         """Test _scaled_mm with FP8 inputs."""
 
-        def spyre_fn(a, b, scale_a, scale_b):
+        def spyre_fn(a, b, scale_a, scale_b, bias):
             q_a = torch.ops.spyre.quantize_fp8_with_scale(a, scale_a)
             q_b = torch.ops.spyre.quantize_weight_fp8_with_scale(b, scale_b)
             return torch.ops.aten._scaled_mm(
-                q_a, q_b, scale_a=None, scale_b=None, bias=None, out_dtype=torch.float16
+                q_a,
+                q_b,
+                scale_a=scale_a,
+                scale_b=scale_b,
+                bias=bias,
+                out_dtype=torch.float16,
             )
 
-        def pytorch_fn(a, b, scale_a, scale_b):
+        def pytorch_fn(a, b, scale_a, scale_b, bias):
             q_a = (
                 (a / scale_a)
                 .clamp(-448.0, 448.0)
@@ -6901,10 +6911,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 .to(torch.float8_e4m3fn)
                 .to(torch.float16)
             )
-            return (q_a @ q_b) * (scale_a * scale_b)
+            return (q_a @ q_b) * (scale_a * scale_b) + bias
 
         compare_with_pytorch(
-            spyre_fn, pytorch_fn, a, b, scale_a, scale_b, atol=0.1, rtol=0.1
+            spyre_fn, pytorch_fn, a, b, scale_a, scale_b, bias, atol=0.1, rtol=0.1
         )
 
     def test_is_nonzero_cpu(self, *args):

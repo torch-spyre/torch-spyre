@@ -330,28 +330,12 @@ def _ensure_synthetic_origin(result, target, args: tuple) -> None:
     buf.origins = OrderedSet([fx_node])
 
 
-@register_spyre_lowering(torch.ops.aten._scaled_mm.default)
+@register_spyre_lowering(torch.ops.spyre.scaled_mm.default)
 def lower_scaled_mm(
     mat1,
     mat2,
-    scale_a=None,
-    scale_b=None,
-    bias=None,
-    scale_result=None,
     out_dtype=None,
-    use_fast_accum=False,
 ):
-    if scale_a is not None:
-        raise Unsupported("scale_a parameter in _scaled_mm is not yet supported")
-    if scale_b is not None:
-        raise Unsupported("scale_b parameter in _scaled_mm is not yet supported")
-    if bias is not None:
-        raise Unsupported("bias parameter in _scaled_mm is not yet supported")
-    if scale_result is not None:
-        raise Unsupported("scale_result parameter in _scaled_mm is not yet supported")
-    if use_fast_accum:
-        raise Unsupported("use_fast_accum parameter in _scaled_mm is not yet supported")
-
     mat1.realize()
     mat2.realize()
     mat1_loader = mat1.make_loader()
@@ -421,7 +405,7 @@ def lower_scaled_mm(
     if logger.isEnabledFor(logging.DEBUG):
         result_buf = V.graph.get_buffer(result.get_name())
         logger.debug(
-            f"_scaled_mm (FP8): mat1{[int(s) for s in mat1_size]} @ mat2{[int(s) for s in mat2_size]} "
+            f"scaled_mm: mat1{[int(s) for s in mat1_size]} @ mat2{[int(s) for s in mat2_size]} "
             f"-> {[int(s) for s in result_buf.get_size()]}, "
             f"mat1_dtype={mat1_dtype}, mat2_dtype={mat2_dtype}, out_dtype={output_dtype}"
         )

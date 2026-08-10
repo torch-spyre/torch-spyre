@@ -34,11 +34,14 @@ import torch._decomp as decomp
 
 from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from .errors import Unsupported
+from .logging_utils import get_inductor_logger
 
 from . import customops  # noqa: F401
 from . import spyre_hint
 from torch_spyre._C import DataFormats, get_device_dtype
 import torch_spyre._inductor.customops  # noqa: F401
+
+logger = get_inductor_logger("decompositions")
 
 
 # Determine the float dtype for bool at module load time (not during tracing)
@@ -781,6 +784,46 @@ def dequantize_fp8_with_scale_decomp(
     """
     x_fp16 = input.to(torch.float16)
     return x_fp16 * scale
+
+
+@register_spyre_decompositions([torch.ops.aten._scaled_mm.default])
+def scaled_mm_decomp(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    scale_a: torch.Tensor = None,
+    scale_b: torch.Tensor = None,
+    bias: torch.Tensor = None,
+    scale_result: torch.Tensor = None,
+    out_dtype: torch.dtype = None,
+    use_fast_accum: bool = False,
+) -> torch.Tensor:
+    """
+    Decompose _scaled_mm into:
+    1. Raw FP8 matmul via spyre.scaled_mm (no scale/bias applied)
+    2. Multiply by scale_a, if present
+    3. Multiply by scale_b, if present
+    4. Add bias, if present
+
+    This decomposition is executed during compilation and keeps scale/bias
+    arithmetic out of lower_scaled_mm's matmul lowering - the same
+    separation dequantize_fp8_with_scale_decomp uses for its FP8->FP16
+    conversion.
+    """
+    result = torch.ops.spyre.scaled_mm(mat1, mat2, out_dtype=out_dtype)
+
+    if scale_a is not None:
+        result = result * scale_a
+    if scale_b is not None:
+        result = result * scale_b
+    if bias is not None:
+        result = result + bias
+
+    if scale_result is not None:
+        logger.warning("scale_result parameter in _scaled_mm is not yet supported")
+    if use_fast_accum:
+        logger.warning("use_fast_accum parameter in _scaled_mm is not yet supported")
+
+    return result
 
 
 @register_spyre_decompositions([torch.ops.aten.where.ScalarOther])

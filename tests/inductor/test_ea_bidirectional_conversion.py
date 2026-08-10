@@ -183,4 +183,57 @@ def test_bidirectional_roundtrip_fp32_start(device):
     print("✓ FP32→FP16→FP32 roundtrip works")
 
 
+def _stagger_fn(x):
+    """fp32 → fp16(staggered) → stagger_to_standard_ea → standard EA fp16."""
+    return torch.ops.spyre.stagger_to_standard_ea(x.to(torch.float16))
+
+
+@pytest.mark.parametrize(
+    "x",
+    [
+        # 1-D: stick-aligned
+        torch.randn(64, dtype=torch.float32),
+        torch.randn(128, dtype=torch.float32),
+        # 1-D: non-stick-aligned (padded to 64-multiple)
+        torch.nn.functional.pad(torch.randn(44, dtype=torch.float32), (0, 20)),
+        # 2-D: stick-aligned
+        torch.randn(4, 64, dtype=torch.float32),
+        torch.randn(7, 128, dtype=torch.float32),
+        # 2-D: non-stick-aligned (padded)
+        torch.nn.functional.pad(torch.randn(7, 44, dtype=torch.float32), (0, 20)),
+        # 3-D: stick-aligned
+        torch.randn(2, 4, 64, dtype=torch.float32),
+        torch.randn(3, 5, 128, dtype=torch.float32),
+        # 3-D: non-stick-aligned (padded)
+        torch.nn.functional.pad(torch.randn(2, 4, 44, dtype=torch.float32), (0, 20)),
+        # 4-D: stick-aligned
+        torch.randn(2, 3, 4, 64, dtype=torch.float32),
+        torch.randn(2, 3, 4, 128, dtype=torch.float32),
+        # 4-D: non-stick-aligned (padded)
+        torch.nn.functional.pad(torch.randn(2, 3, 4, 44, dtype=torch.float32), (0, 20)),
+    ],
+)
+@pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+def test_stagger_to_standard_ea(x):
+    """stagger_to_standard_ea restores standard EA after fp32→fp16 (fp32todl16).
+
+    Verifies:
+      1. Output values match a plain x.to(fp16) on CPU (logical correctness).
+      2. Output EA is STANDARD (layout correctness).
+    """
+    expected = x.to(torch.float16)
+
+    compiled_fn = torch.compile(_stagger_fn, backend="inductor")
+
+    # 1. Value correctness: Spyre result matches CPU fp16 cast.
+    # fp32→fp16 rounding differs slightly (Spyre uses DF16); use fp16 tolerances.
+    result = compiled_fn(x.to("spyre")).cpu()
+    torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+
+    # 2. Layout correctness: output EA must be STANDARD.
+    spyre_result = compiled_fn(x.to("spyre"))
+    ea = get_spyre_tensor_layout(spyre_result).element_arrangement
+    assert ea == ElementArrangement.STANDARD, f"Expected STANDARD EA, got {ea}"
+
+
 # Made with Bob
