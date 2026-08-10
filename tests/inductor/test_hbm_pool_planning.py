@@ -28,6 +28,7 @@ from torch.utils._ordered_set import OrderedSet
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout
 from torch_spyre._inductor.hbm_pool_planning import hbm_pool_planning
 from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.scheduler import CountedLoopSchedulerNode
 
 
 def _make_ftl_buffer(name, host_size=(64,), dim_order=(0,)):
@@ -213,6 +214,66 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
             buf1.get_layout().allocation["hbm_pool"], expected_offsets["buf1"]
         )
         self.assertEqual(V.graph.hbm_pool_sizes[bundle.get_name()], expected_pool_size)
+
+    def test_counted_loop_accumulator_stays_live_across_the_loop(self):
+        """A buffer that is only ever read *inside* a CountedLoopScheduler
+        Node's own body (a loop-carried accumulator, e.g. a running-max/sum
+        pattern where each iteration reads the value the previous iteration
+        wrote) must be treated as live for the whole loop -- not as ending
+        right where that internal read/write happens to sit in a fully
+        flattened node list.
+
+        CountedLoopSchedulerNode represents a loop that runs loop_count
+        times at runtime as a *single* node in its containing bundle's own
+        node list (see CountedLoopSchedulerNode.unpack(), which refuses to
+        unpack itself). The IR only contains one copy of the loop body, so
+        there is no second, later textual read for a "did this survive
+        another iteration" check to find -- liveness across iterations has
+        to be inferred from the fact that this is a loop, i.e. by treating
+        it as one opaque step whose live buffers are live for that entire
+        step, not by fully flattening its body into separate timesteps.
+
+        Setup: "init" writes "acc" outside the loop. The loop's body reads
+        and writes "acc" (the accumulate step) and separately writes
+        "other" (e.g. a per-iteration scratch tile, freshly written on
+        every pass). After the loop, "final" reads only "other" -- "acc"
+        is never read again outside the loop.
+
+        With the buggy fully-flattened live-range computation, "acc"'s
+        only visible read is inside the loop body itself, so its computed
+        live range collapses to a single point (start == end) that ends
+        before "other"'s start -- the allocator frees "acc"'s block and
+        hands the identical byte offset to "other", even though the loop's
+        accumulator and the loop's own scratch tile are simultaneously
+        live at runtime throughout the loop's execution. With the fix
+        (bundle.get_nodes() -- one entry for the whole loop, not one per
+        body-op -- passed to _compute_live_ranges), "acc"'s live range
+        spans the loop's own single index, overlapping "other", and the
+        two buffers get distinct offsets.
+        """
+        _make_ftl_buffer("acc")
+        _make_ftl_buffer("other")
+
+        init = _make_snode_with_rw("init", writes=["acc"], reads=[])
+        acc_step = _make_snode_with_rw("acc_step", writes=["acc"], reads=["acc"])
+        other_step = _make_snode_with_rw("other_step", writes=["other"], reads=[])
+        loop = CountedLoopSchedulerNode(MagicMock(), [acc_step, other_step], Integer(4))
+        final = _make_snode_with_rw("final", writes=[], reads=["other"])
+        bundle = FusedSchedulerNode(MagicMock(), [init, loop, final])
+
+        hbm_pool_planning([bundle])
+
+        acc_buf = V.graph.get_buffer("acc")
+        other_buf = V.graph.get_buffer("other")
+        self.assertIn("hbm_pool", acc_buf.get_layout().allocation)
+        self.assertIn("hbm_pool", other_buf.get_layout().allocation)
+        # "acc" (live throughout the loop) and "other" (written fresh on
+        # every pass through the same loop) are simultaneously live, so
+        # they must not share the same pool offset.
+        self.assertNotEqual(
+            acc_buf.get_layout().allocation["hbm_pool"],
+            other_buf.get_layout().allocation["hbm_pool"],
+        )
 
 
 if __name__ == "__main__":

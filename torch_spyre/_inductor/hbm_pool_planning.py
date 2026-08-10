@@ -316,7 +316,17 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
         if not bundle_candidates:
             continue
 
-        live_ranges = _compute_live_ranges(bundle_flat, bundle_candidates)
+        # Use the bundle's own direct, unflattened children here (not the
+        # recursively-flattened bundle_flat used above for candidate
+        # identification): a CountedLoopSchedulerNode's body executes many
+        # times at runtime but is represented as a single node in this list,
+        # so a loop-carried buffer that is read/written on every iteration
+        # correctly stays live for the loop's entire single timestep. Fully
+        # flattening into the loop body would instead record its live range
+        # as ending at the first (and only, in the IR) occurrence of its
+        # read, causing the allocator to free and reuse its offset for a
+        # different, still-live buffer.
+        live_ranges = _compute_live_ranges(bundle.get_nodes(), bundle_candidates)
         sorted_bufs = sorted(live_ranges.items(), key=_alloc_sort_key)
 
         allocator = Allocator(SEGMENT_SIZE)
