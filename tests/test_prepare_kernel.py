@@ -275,6 +275,14 @@ class TestPrepareKernel:
                     "Prep",
                     "Dev",
                 ]
+                # pipeline_barrier stays True on EVERY step of the bare split:
+                # overlap comes only from the S_prep/S_dev split + flex's
+                # dynamic cross-stream events, never from relaxing a barrier.
+                assert [job_plan.get_step_pipeline_barrier(i) for i in range(3)] == [
+                    True,
+                    True,
+                    True,
+                ]
         finally:
             torch_spyre._C.set_hazard_tracker_enabled(prev)
 

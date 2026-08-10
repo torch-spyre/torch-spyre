@@ -87,6 +87,15 @@ bool get_hazard_tracker_enabled() {
 
 void set_hazard_tracker_enabled(bool enabled) {
   g_hazard_tracker_enabled.store(enabled, std::memory_order_relaxed);
+  // Keep flex's RuntimeContext in sync with this global. Without this, a flip
+  // AFTER _startRuntime would leave torch-spyre splitting bare (event-less)
+  // plans across S_prep/S_dev while flex's tracker stayed at its startup value
+  // -- flex would then insert NO cross-stream events, dropping the H2D->Compute
+  // RAW edge and silently corrupting numerics. No-op before _startRuntime
+  // (runtime not yet set). Storing an atomic in flex cannot fail.
+  if (const auto& runtime = GlobalRuntime::get()) {
+    runtime->setHazardTrackerEnabled(enabled);
+  }
 }
 
 // Optional: initialize from env at module init
@@ -135,10 +144,11 @@ void _startRuntime() {
     GlobalRuntime::set(runtime);
     // Apply the SPYRE_HAZARD_TRACKER latch (read in init_from_env above) to the
     // flex runtime: this enables flex's per-region hazard tracker iff the flag
-    // is on. It is the ONLY coupled enable of flex's tracker; the python
-    // set_hazard_tracker_enabled hook flips only torch-spyre's plan-shaping +
-    // routing global and does NOT re-drive flex. setHazardTrackerEnabled only
-    // stores an atomic in flex, so it cannot fail.
+    // is on. This is the production enable, latched from the env before any
+    // launch. The python set_hazard_tracker_enabled hook ALSO re-drives flex
+    // (see its definition) so a post-startup flip keeps the two atomics in
+    // sync. setHazardTrackerEnabled only stores an atomic in flex, so it
+    // cannot fail.
     runtime->setHazardTrackerEnabled(get_hazard_tracker_enabled());
     DEBUGINFO(s);
     DEBUGINFO("runtime started with logical_device_id ", logical_device_id);
@@ -366,9 +376,9 @@ PYBIND11_MODULE(_C, m) {
         py::arg("enabled"),
         "Enable/disable the flex hazard-tracker path (TEST/tuning hook; the "
         "production value is latched from SPYRE_HAZARD_TRACKER at runtime "
-        "start). NOTE: this flips only torch-spyre's plan-shaping + routing "
-        "global; it does NOT re-drive flex's RuntimeContext, which was set "
-        "once at _startRuntime.");
+        "start). Flips torch-spyre's plan-shaping + routing global AND "
+        "re-drives flex's RuntimeContext when the runtime is live, so the "
+        "two cannot diverge; a no-op on flex before _startRuntime.");
   m.def("get_elem_in_stick", &spyre::get_elem_in_stick);
   m.def("get_device_dtype", &spyre::get_device_dtype);
 
