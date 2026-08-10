@@ -378,7 +378,12 @@ PYBIND11_MODULE(_C, m) {
         "production value is latched from SPYRE_HAZARD_TRACKER at runtime "
         "start). Flips torch-spyre's plan-shaping + routing global AND "
         "re-drives flex's RuntimeContext when the runtime is live, so the "
-        "two cannot diverge; a no-op on flex before _startRuntime.");
+        "two cannot diverge; a no-op on flex before _startRuntime. "
+        "CONTRACT: call only single-threaded and NOT concurrent with an "
+        "in-flight launch -- the two-atomic update (this global + flex's) "
+        "is not atomic as a pair, so a flip racing a multi-op launch on "
+        "another thread can drop the H2D->Compute RAW edge. Flipping freely "
+        "between launches on one thread (what the tests do) is safe.");
   m.def("get_elem_in_stick", &spyre::get_elem_in_stick);
   m.def("get_device_dtype", &spyre::get_device_dtype);
 
