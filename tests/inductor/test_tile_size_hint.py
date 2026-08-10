@@ -136,6 +136,19 @@ class TestTileSizeHint(InductorTestCase):
             self._run({"tile_size_per_dim": {"A": 0}})
         self.assertIn("must be positive", str(cm.exception))
 
+    def test_tile_size_mixed_with_count_key_raises(self):
+        """One scope must not set both spellings.
+
+        spyre_hint(**kwargs) does not validate its keys, so both can be passed at
+        once.  A per-tile extent and a trip count are different quantities, and
+        picking one silently would apply a tiling the caller did not ask for.
+        """
+        with self.assertRaises(InductorError) as cm:
+            self._run({"tile_size_per_dim": {"A": 256}, "num_tiles_per_dim": {"A": 4}})
+        msg = str(cm.exception)
+        self.assertIn("exactly one", msg)
+        self.assertIn("num_tiles_per_dim", msg)
+
     def test_nested_tile_size_levels_on_distinct_dims(self):
         """Nested scopes on DISTINCT dims: each count comes from its own declaration.
 

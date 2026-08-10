@@ -760,21 +760,30 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
             # trip count by _resolve_tile_size_counts).
             dims: dict[str, int] = _hint_dims(hint_dict)
             if _TILE_SIZE_KEY in hint_dict and hint_dict[_TILE_SIZE_KEY]:
-                resolved = tile_size_counts.get(hint_id, {})
-                missing = [name for name in dims if name not in resolved]
-                if missing:
-                    # Never fall back to using the declared SIZE as a trip count:
-                    # that silently tiles into `tile_size` pieces instead of pieces
-                    # OF tile_size, which miscompiles rather than failing.  An
-                    # unresolved name means no op in the graph carried that dim, so
-                    # the extent was never found -- almost always a name that does
-                    # not match any declared tensor dim.
+                # spyre_hint(**kwargs) does not validate its keys, so a scope can
+                # carry both spellings.  They mean different things, and
+                # _hint_dims() prefers the count keys, so honouring one silently
+                # applies a tiling the caller did not ask for.
+                if conflicting := [k for k in _COUNT_KEYS if hint_dict.get(k)]:
                     raise Unsupported(
-                        f"spyre_hint(tile_size_per_dim=...) names dim(s) "
-                        f"{missing} that no operation in the tiled scope carries, "
-                        "so the extent needed to derive the loop trip count could "
-                        "not be found. Check the name matches a dim declared via "
-                        "declare_tensor_dim()/name_tensor_dims()."
+                        f"spyre_hint() argument {list(hint_dict.items())} sets "
+                        f"both {_TILE_SIZE_KEY} (a per-tile extent) and "
+                        f"{conflicting[0]} (a trip count); a hint scope must use "
+                        "exactly one of the two."
+                    )
+                resolved = tile_size_counts.get(hint_id, {})
+                # Counts come from the declarations alone, and
+                # _resolve_tile_size_counts raises for a name it cannot resolve
+                # rather than skipping it, so every name is present here.  Guard
+                # anyway, and in particular never fall back to `dims`: using the
+                # declared SIZE as a trip count tiles into `tile_size` pieces
+                # instead of pieces OF tile_size, which miscompiles rather than
+                # failing.
+                if missing := [name for name in dims if name not in resolved]:
+                    raise Unsupported(
+                        f"internal: hint {hint_id} resolved no trip count for "
+                        f"dim(s) {missing}; _resolve_tile_size_counts and "
+                        "_assign_dim_hints_impl disagree on the hint scopes."
                     )
                 dims = {name: resolved[name] for name in dims}
             # TODO: support multiple dimensions per spyre_hint() call.
