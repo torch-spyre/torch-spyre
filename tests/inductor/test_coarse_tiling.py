@@ -1137,20 +1137,20 @@ class TestDivideRanges(unittest.TestCase):
     def test_cache_invalidated_after_divide_pointwise(self):
         from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
 
-        N = sympy.Symbol("N", positive=True)
+        N = sympy.Symbol("N", positive=True, integer=True)
         pw = Pointwise(
             device=torch.device("cpu"),
             dtype=torch.float16,
             inner_fn=lambda index: sympy.Integer(1),
-            ranges=[N, Integer(32)],
+            ranges=[4 * N, Integer(32)],
         )
-        layout = FixedLayout(torch.device("cpu"), torch.float16, [N, Integer(32)])
+        layout = FixedLayout(torch.device("cpu"), torch.float16, [4 * N, Integer(32)])
         op = ComputedBuffer(name="buf0", layout=layout, data=pw)
 
         pw.get_free_symbol_uses()  # prime the cache
         self.assertTrue(hasattr(pw, _LOOPS_FREE_SYMS_KEY))
 
-        _divide_ranges(op, Integer(4), tiled_dims=[0])
+        _divide_ranges(op, N, tiled_dims=[0])
 
         self.assertFalse(hasattr(pw, _LOOPS_FREE_SYMS_KEY))
 
@@ -1167,20 +1167,20 @@ class TestDivideRanges(unittest.TestCase):
             device=torch.device("cpu"),
             dtype=torch.float16,
             inner_fn=lambda index, rindex: sympy.Integer(1),
-            ranges=[N],
+            ranges=[4 * N],
             reduction_ranges=[Integer(128)],
             reduction_type="sum",
             src_dtype=torch.float16,
             reduction_hint=ReductionHint.DEFAULT,
         )
-        layout = FixedLayout(torch.device("cpu"), torch.float16, [N])
+        layout = FixedLayout(torch.device("cpu"), torch.float16, [4 * N])
         op = ComputedBuffer(name="buf0", layout=layout, data=red)
 
         red.get_free_symbol_uses()  # prime both Loops and Reduction cache entries
         self.assertTrue(hasattr(red, _LOOPS_FREE_SYMS_KEY))
         self.assertTrue(hasattr(red, _REDUCTION_FREE_SYMS_KEY))
 
-        _divide_ranges(op, Integer(4), tiled_dims=[0])
+        _divide_ranges(op, N, tiled_dims=[0])
 
         self.assertFalse(hasattr(red, _LOOPS_FREE_SYMS_KEY))
         self.assertFalse(hasattr(red, _REDUCTION_FREE_SYMS_KEY))
