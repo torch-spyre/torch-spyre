@@ -823,7 +823,7 @@ def _build_conv2d_symbol_mapping(
     # squeezed roles), but the *iteration space* is not guaranteed to be.  It is
     # built write-dep-first and then extended with read-only symbols, so when the
     # output spatial dims collapse to 1x1 they drop out of the write dep and are
-    # re-appended AFTER the kernel dims.  
+    # re-appended AFTER the kernel dims.
     # Assigning canonical labels positionally would swap i/j with ki/kj.
     #
     # Only a fully collapsed 1x1 output can reorder this way (a surviving spatial
@@ -1088,7 +1088,15 @@ def _create_sdsc_tensors(
                 dev_dim_size = tile_size * supertile_count
                 it_dim_size = tile_size
             else:
-                dev_dim_size = arg.device_size[-stride_idx - 2]
+                # A reduced dim (e.g. a conv's ki/kj on the output arg) has no
+                # physical axis here, so stride_idx can run past device_size once
+                # enough unit dims are squeezed out; fall back to the iteration
+                # extent, which skips the padding corrections below.
+                size_idx = -stride_idx - 2
+                if -size_idx > len(arg.device_size):
+                    dev_dim_size = iteration_space[dim]
+                else:
+                    dev_dim_size = arg.device_size[size_idx]
                 it_dim_size = iteration_space[dim]
                 if dim == stick_dim:
                     stick_size = arg.device_dtype.elems_per_stick()
@@ -1111,8 +1119,20 @@ def _create_sdsc_tensors(
             else:
                 max_dim_sizes[dim] = -1
 
-            dim_coord = arg.device_coordinates[-stride_idx - 2]
-            if not isinstance(dim_coord, IndirectAccess) and dev_dim_size > it_dim_size:
+            # Same out-of-range case as the device_size lookup above: such a dim
+            # has no device coordinate either, and this subscript would raise
+            # before the size comparison below could skip it.
+            coord_idx = -stride_idx - 2
+            dim_coord = (
+                arg.device_coordinates[coord_idx]
+                if -coord_idx <= len(arg.device_coordinates)
+                else None
+            )
+            if (
+                dim_coord is not None
+                and not isinstance(dim_coord, IndirectAccess)
+                and dev_dim_size > it_dim_size
+            ):
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 offsets[dim] = dim_offset * dim_device_stride
                 # conv2d addresses the difference between device and iteration space sizes
