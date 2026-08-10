@@ -15,8 +15,8 @@
 """Hint-driven coarse-tile group construction.
 
 Builds coarse-tile groups from explicit ``dim_hints`` set by
-``propagate_hints.py``, for consumption by ``coarse_tile()`` in
-``coarse_tile.py``. Runs PRE-stickification (see ``passes.py``'s
+``propagate_hints.py``, for consumption by ``coarse_tile_pre_stickify()``
+in ``coarse_tile.py``. Runs PRE-stickification (see ``passes.py``'s
 ``_maybe_coarse_tile_hints``).
 """
 
@@ -267,10 +267,12 @@ def reorder_unhinted_interlopers(graph: GraphLowering) -> None:
 
 
 def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
-    """Build coarse_tile() groups from op.dim_hints (set by assign_dim_hints).
+    """Build coarse_tile_pre_stickify() groups from op.dim_hints (set by
+    assign_dim_hints).
 
-    coarse_tile() requires ops to be grouped: all ops in a group share the same
-    tiling spec and are tiled together inside the same loop nest.  We walk
+    coarse_tile_pre_stickify() requires ops to be grouped: all ops in a
+    group share the same tiling spec and are tiled together inside the
+    same loop nest.  We walk
     operations in topological order and collect consecutive ops that carry
     identical hints into one group, breaking whenever the hint changes or an
     op has no hint at all.

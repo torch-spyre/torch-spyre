@@ -15,12 +15,15 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import dataclasses
+import threading
 from typing import Any, Literal, Sequence
 
 from sympy import Symbol, Expr, Function
 from torch_spyre._C import DataFormats, ElementArrangement
 import torch
+from torch_spyre import _C
 
 
 class IndirectAccess(Function):
@@ -241,6 +244,34 @@ class OpSpec:
     debug_handle: DebugHandle | None = None
 
 
+# --- Module-level constant tensor cache --------------------------------------
+#
+# LRU cache for Spyre constant tensors to avoid redundant tensor creation across
+# multiple forward passes. Uses OrderedDict for least-recently-used eviction
+# with a maximum size limit to bound memory usage.
+#
+# Thread-safe for concurrent inference workloads.
+#
+_CACHE_MAX_SIZE = 1000  # Maximum number of cached constants (~128KB)
+_CONSTANT_TENSOR_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
+_CACHE_LOCK = threading.Lock()
+
+
+def clear_constant_tensor_cache():
+    """Clear the constant tensor cache.
+
+    Should be called when:
+    - Running torch.compiler.reset() to ensure test isolation
+    - Manually reclaiming device memory
+    - Starting a new inference session with different constants
+
+    Example:
+        >>> torch.compiler.reset()
+        >>> clear_constant_tensor_cache()  # Clear Spyre constants
+    """
+    _CONSTANT_TENSOR_CACHE.clear()
+
+
 @dataclasses.dataclass
 class UnimplementedOp:
     op: str
@@ -269,7 +300,73 @@ class LoopSpec:
 
 
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):
-    return torch.tensor(const_val, dtype=dtype).to(device)
+    """Create or retrieve a cached constant tensor for Spyre device.
+
+    Uses module-level LRU cache that persists across forward passes with a
+    maximum size limit (default: 1000 entries, ~128KB). Least-recently-used
+    entries are automatically evicted when the cache exceeds the limit.
+
+    For test isolation, call clear_constant_tensor_cache() after
+    torch.compiler.reset().
+
+    WARNING: Returns a shared tensor that MUST NEVER be mutated in-place.
+
+    The returned tensor is reused across multiple calls with matching
+    (value, device, dtype). In-place mutation would corrupt all callers.
+
+    Inductor enforces immutability via:
+      - SpyreConstantFallback.should_allocate() == False
+      - SpyreConstantFallback.get_mutation_names() == []
+
+    Any pass that modifies this contract MUST update this function.
+
+    Args:
+        const_val: Scalar constant value
+        device: Target device (e.g., "spyre", "cpu", or torch.device(...))
+        dtype: Data type (default: torch.float16)
+
+    Returns:
+        Immutable constant tensor (DO NOT MUTATE)
+
+    Note:
+        For non-Spyre devices (e.g., CPU), uses standard torch.tensor path
+        without caching as these tensors are cheap to create.
+
+        float(const_val) makes NaN values always miss the cache because
+        float('nan') != float('nan'). This is intentional - it falls back to
+        creating a fresh tensor for each NaN request rather than attempting
+        cache matching.
+    """
+    # Normalize device to torch.device object if string is passed
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    # For non-Spyre devices (e.g., CPU), use standard PyTorch path without caching
+    if device.type != "spyre":
+        return torch.tensor(const_val, dtype=dtype).to(device)
+
+    # Create cache key with normalized device (device.type, device.index)
+    device_key = (device.type, device.index)
+    cache_key = (float(const_val), device_key, dtype)
+
+    # Thread-safe cache lookup and insertion with LRU eviction
+    with _CACHE_LOCK:
+        if cache_key in _CONSTANT_TENSOR_CACHE:
+            # Cache hit: move to end (most recently used)
+            _CONSTANT_TENSOR_CACHE.move_to_end(cache_key)
+            return _CONSTANT_TENSOR_CACHE[cache_key]
+
+        # Cache miss: create new tensor with device-side fill
+        t = torch.empty((), dtype=dtype, device=device)
+        _C.fill_tensor(t, float(const_val))
+
+        _CONSTANT_TENSOR_CACHE[cache_key] = t
+
+        # Evict least-recently-used entries if over limit
+        while len(_CONSTANT_TENSOR_CACHE) > _CACHE_MAX_SIZE:
+            _CONSTANT_TENSOR_CACHE.popitem(last=False)  # Remove oldest (LRU)
+
+        return t
 
 
 def find_unimplemented(specs: list) -> UnimplementedOp | None:

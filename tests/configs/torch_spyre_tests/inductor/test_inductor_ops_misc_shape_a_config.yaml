@@ -27,9 +27,11 @@ test_suite_config:
             # copy / clone
             - TestOps::test_clone.*
             - TestOps::test_copy_roundtrip.*
-            # slice / split
+            # slice / split / storage_offset
             - TestOps::test_slice.*
+            - TestOps::test_slice_scatter.*
             - TestOps::test_split.*
+            - TestOps::test_storage_offset_placeholder.*
           mode: mandatory_success
           tags:
             - ops__inductor_misc_shape

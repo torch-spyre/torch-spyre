@@ -25,6 +25,7 @@ from torch._inductor.utils import ValueWithLineMap
 from torch._inductor.virtualized import V
 from torch._inductor.sizevars import SizeVarAllocator
 
+from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .constants import SEGMENT_SIZE
 
@@ -150,11 +151,30 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         if old_name not in V.graph.get_output_names() and delete_old:
             del_line = f"; {self.make_buffer_free(old)}"
 
-        if old.get_size() == new.get_size() and old.get_stride() == new.get_stride():
+        new_offset = new.get_layout().offset or 0
+        old_offset = old.get_layout().offset or 0
+        if (
+            old.get_size() == new.get_size()
+            and old.get_stride() == new.get_stride()
+            and old_offset == new_offset
+        ):
             return self.codegen_exact_buffer_reuse(old_name, new_name, del_line)
 
         new_stl = new.get_layout().device_layout
-        reinterpret_view = f"reinterpret_tensor_with_layout({old_name}, {new.get_size()}, {new.get_stride()}, 0, {new_stl!r})"
+        # reinterpret_tensor_with_layout's offset arg is added to old_name's
+        # *current* runtime storage_offset (see spyre_views.cpp), not treated
+        # as an absolute target. Passing old's offset directly double-counts
+        # it; the delta to new's offset is what actually shifts to the right
+        # place.
+        offset_increment = new_offset - old_offset
+        # Static-shape paths only: a symbolic offset would render a bare
+        # sympy expression into the generated source below.
+        if getattr(offset_increment, "free_symbols", None):
+            raise Unsupported(
+                f"symbolic storage_offset not supported in buffer-reuse codegen: "
+                f"{offset_increment!r}"
+            )
+        reinterpret_view = f"reinterpret_tensor_with_layout({old_name}, {new.get_size()}, {new.get_stride()}, {offset_increment}, {new_stl!r})"
         return f"{self.declare}{new_name} = {reinterpret_view}{del_line}  {self.comment} reuse"
 
     def allocate_hbm_pool(self):
