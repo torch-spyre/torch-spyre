@@ -949,3 +949,96 @@ def spyre_prod_dim_int(
         acc = acc.unsqueeze(dim)
 
     return acc
+
+
+def _masked_scatter_reject_reason(
+    self: torch.Tensor,
+    mask: torch.Tensor,
+    source: torch.Tensor,
+) -> Optional[str]:
+    """Why ``masked_scatter`` cannot use the row-level path here, or ``None`` if it can.
+
+    Checks are ordered from cheapest/most general to most specific:
+      1. Rank guards (no device_layout access needed).
+      2. Exact shape equality (subsumes individual last-dim checks).
+      3. Degenerate column guard (cols <= 1 is not a meaningful row).
+      4. Source column alignment.
+      5. Broadcast-stride check (the structural row-level requirement).
+    """
+    if self.dim() < 2 or source.dim() < 2 or mask.dim() != self.dim():
+        return f"rank: self={self.dim()} mask={mask.dim()} source={source.dim()}"
+    # Shape equality subsumes last-dim equality; check it first so the error
+    # message names the full shape rather than just one dimension.
+    if tuple(mask.shape) != tuple(self.shape):
+        return f"mask shape {tuple(mask.shape)} != self {tuple(self.shape)}"
+    cols = self.shape[-1]
+    # cols <= 1 is a degenerate row that offers no block-per-row equivalence.
+    if cols <= 1:
+        return f"degenerate last dim: cols={cols}"
+    if source.shape[-1] != cols:
+        return f"source last dim {source.shape[-1]} != self last dim {cols}"
+    # stride(-1) == 0 is what makes the mask per-row rather than per-element.
+    if mask.stride(-1) != 0:
+        return f"mask is not broadcast in its last dim (stride {mask.stride()})"
+    return None
+
+
+@register_spyre_decompositions([torch.ops.aten.masked_scatter.default])
+def spyre_masked_scatter(
+    self: torch.Tensor,
+    mask: torch.Tensor,
+    source: torch.Tensor,
+) -> torch.Tensor:
+    """`masked_scatter` for a mask that is broadcast along the last dim.
+
+    Such a mask (`stride(-1) == 0` -- e.g. an attention mask `[B, S]`
+    expanded to `[B, S, C]`) selects *whole rows*: row `i`, if selected,
+    consumes exactly one contiguous `C`-element block of `source`, i.e. one
+    whole row of `source.reshape(-1, C)`. The gather is then
+    `source_2d[row_idx]` -- a 1D index into the row dim of a 2D source, which
+    is a plain stick gather.
+
+    Any other mask makes this an element-level op, which Spyre cannot express:
+    the index would have to address an element inside a *packed* 1D source, and
+    a lane within a stick is not addressable. Exploding the source to one
+    element per stick does not help -- that splits every stick 64 ways, an
+    element scatter the backend cannot lower. So the generic form is rejected
+    here rather than emitting a gather that fails deeper in layout propagation.
+    """
+    reason = _masked_scatter_reject_reason(self, mask, source)
+    if reason is not None:
+        raise Unsupported(
+            f"masked_scatter needs a mask broadcast along the last dim so it "
+            f"selects whole rows ({reason}). An element-level masked_scatter "
+            f"would gather individual elements from a packed 1D source, and a "
+            f"lane within a stick is not addressable on Spyre."
+        )
+
+    cols = self.shape[-1]
+    rows = self.numel() // cols
+    # Collapse the broadcast dim: one bool per row.
+    mask_row = mask[..., 0].reshape(rows)
+    source_2d = source.reshape(-1, cols)
+    # masked_scatter requires source.numel() >= mask.sum(). For a whole-row
+    # mask, source_2d needs at least as many rows as there are selected rows.
+    torch._assert_async(
+        mask_row.sum() <= source_2d.shape[0],
+        "masked_scatter: source is too short -- it has fewer rows than the "
+        "number of selected (True) mask rows.",
+    )
+    # Row i reads source row (prefix-count of selected rows - 1). Unselected
+    # rows would get -1, so multiply by the mask to send them to row 0 instead
+    # (in bounds, and discarded by the where). Done in fp32: Spyre has no usable
+    # int `clip`, int32 sub/mul are unsupported, and fp16 loses large indices.
+    pos = mask_row.cumsum(0).to(torch.float32) - 1.0
+    row_idx = (pos * mask_row.to(torch.float32)).to(torch.int64)
+    # The gather stays 2D (its args are indirect, so the pointwise dim_order
+    # projection skips them), but the `where` must stay at `self`'s rank:
+    # that projection computes `rank_diff = len(output) - len(arg)` and only
+    # handles inputs of *lower* rank. A lower-rank output against the full-rank
+    # ND mask gives rank_diff < 0, which shifts dims the wrong way and builds a
+    # layout whose dim_order rank no longer matches host_size ("Incompatible
+    # host_size and dim_order"). Reshaping back to ND keeps every `where`
+    # input rank-aligned with the output.
+    gathered = source_2d[row_idx].reshape(self.shape)
+    return torch.where(mask, gathered, self)
