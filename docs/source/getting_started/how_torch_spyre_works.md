@@ -723,8 +723,8 @@ collectives (`scatter`, `reduce_scatter`, `alltoall`). See
 
 **Profiling.** The `SpyreActivityProfiler` Kineto bridge for `ProfilerActivity.PrivateUse1`
 device-side timing is in the tree (`torch_spyre/csrc/profiler/`) and builds by default. Device-side
-capture is not yet functional: it is disabled pending a coordinated libaiupti and kineto-spyre ABI
-rebuild. The memory APIs
+capture in the default build depends on a matching `kineto-spyre` PyTorch wheel; installing the wheel
+that pairs with the installed torch version produces device-side kernel and transfer events. The memory APIs
 (`torch.spyre.memory.memory_allocated` and friends) are available today, and
 `aiu-trace-analyzer` post-processes traces with PT-utilisation metrics. The
 [profiling RFC 0601](https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md)
@@ -816,7 +816,7 @@ would require invasive core changes. Deferring to codegen is too late.
 | `torch.spyre.memory.*` | `torch.accelerator.memory` re-export | Per-device memory queries | `memory_allocated`, `max_memory_allocated`, `reset_peak_memory_stats`, `memory_stats` — all available today. |
 | `aiu-smi` | Standalone CLI / sampler | Power, thermal, PT-utilisation, DDR / PCIe / RDMA bandwidth | Available in PF and VF mode (Z/LinuxONE rollout in progress for VF). Public release tracked in [#1335](https://github.com/torch-spyre/torch-spyre/issues/1335). |
 | `aiu-trace-analyzer` | Trace post-processor | Adds derived metrics (PT-Util %) to Chrome / Perfetto traces | Available with some known gaps. |
-| `SpyreActivityProfiler` (Kineto bridge) | `ProfilerActivity.PrivateUse1` | Device-side kernel timing into `torch.profiler` traces | Merged in [#1856](https://github.com/torch-spyre/torch-spyre/pull/1856) and built by default. Device-side capture is disabled pending a libaiupti and kineto-spyre ABI rebuild. The full design is in [profiling RFC 0601](https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md). |
+| `SpyreActivityProfiler` (Kineto bridge) | `ProfilerActivity.PrivateUse1` | Device-side kernel timing into `torch.profiler` traces | Merged in [#1856](https://github.com/torch-spyre/torch-spyre/pull/1856) and built by default. Device-side capture requires a matching `kineto-spyre` wheel. The full design is in [profiling RFC 0601](https://github.com/torch-spyre/rfcs/blob/main/0601-SpyreProfilingToolkit/0601-SpyreProfilingToolkitRFC.md). |
 
 ---
 

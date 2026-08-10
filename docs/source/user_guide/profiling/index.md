@@ -39,7 +39,7 @@ will land with RFC 0601. Day-to-day performance work still goes through
 | FFDC diagnostic reports on Spyre compile/runtime/unimplemented failures | Available (`USE_SPYRE_PROFILER=1`) | [API: `get_diagnostic_report`](../../api/torch_spyre.rst) · [Environment variables](environment_variables.md) |
 | CPU-side timing with `torch.profiler` | Available | [PyTorch Profiler](pytorch_profiler.md) |
 | Device telemetry (power, temperature, bandwidth) | Available — PF and VF mode (IBM-internal distribution; public release tracked in [#1335][issue-1335]) | [Device monitoring](device_monitoring.md) |
-| Device-side kernel timing via `ProfilerActivity.PrivateUse1` | Merged and built by default, capture disabled pending a libaiupti and kineto-spyre ABI rebuild ([#1856][pr-1856]) | [PyTorch Profiler](pytorch_profiler.md) |
+| Device-side kernel timing via `ProfilerActivity.PrivateUse1` | Merged and built by default ([#1856][pr-1856]); device-side capture requires a matching [`kineto-spyre`][kineto-spyre] wheel | [PyTorch Profiler](pytorch_profiler.md) |
 | Trace post-processing (aiu-trace-analyzer) | Available, known gaps | [Trace analysis](trace_analysis.md) |
 | `torch.spyre.memory.memory_allocated()` / `max_memory_allocated()` | Available — delegates to [`torch.accelerator.memory`][accelerator-memory] (PR [#770][pr-770]) | [Quick example](#memory-api-quick-example) |
 | Scratchpad utilization metrics | Planned | [RFC 0601][rfc-0601] |
