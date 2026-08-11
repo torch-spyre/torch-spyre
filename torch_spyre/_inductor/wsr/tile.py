@@ -105,7 +105,6 @@ def decompose_index_for_tiling(index, var_ranges):
         if term.func != sympy.Mul:
             raise Unsupported(f"index term {term} is not a linear monomial")
         prod = sympy.S.One
-        mi = []
         var_found = False
         for arg in term.args:
             if isinstance(arg, ModularIndexing):
@@ -124,7 +123,7 @@ def decompose_index_for_tiling(index, var_ranges):
             prod *= arg
         if prod <= 0:
             raise Unsupported(f"index term {term} has non-positive coefficient {prod}")
-        atoms.append((prod, var, *mi))
+        atoms.append((prod, var))
     if offset < 0:
         raise Unsupported(f"index has negative offset {offset}")
     return atoms, offset
