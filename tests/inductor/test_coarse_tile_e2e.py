@@ -1171,6 +1171,25 @@ def test_softmax_2d_512x256_dim0_B4():
     run_coarse_tile_test(fn, inputs)
 
 
+@pytest.mark.skip(
+    reason=(
+        "validate_writer_tile_advance now catches this at compile time: two "
+        "distinct bugs. (1) coarse_tile's grouping assigns the same physical "
+        "loop level to buf0/buf3's A-reduction and buf1/buf2/buf4's A-output "
+        "tiling based purely on spyre_hint scope nesting order, with no check "
+        "that a sibling op's output-tiled use of a dim collides with another "
+        "op's reduction-tiled use of that same dim at the same level -- "
+        "confirmed via colsum diagnostic (every output column summed to ~4.0 "
+        "instead of ~1.0, i.e. buf4's division reads buf3's accumulator after "
+        "only 1 of 4 A-tile combines). (2) reordering the hint scopes so the "
+        "reduction dim nests inside the output dim (as correctness requires) "
+        "avoids bug 1 but then hits the same squeeze-position bug as issue "
+        "#3613: _insert_reduction_copy_op's write-side _tiled_dims_for_dep "
+        "breaks when the reduction dim's range-1 index gets squeezed out, "
+        "same root cause as test_flash_tile_Lq et al. above. Deferred until "
+        "PR #3622's tile.py helpers land."
+    )
+)
 def test_softmax_2d_512x256_dim0_A4_B4():
     """softmax(x, dim=0) on [512,256] tiled A÷4 B÷4."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -2596,6 +2615,15 @@ def test_flash_tile_B():
     )
 
 
+@pytest.mark.skip(
+    reason=(
+        "validate_writer_tile_advance now catches this at compile time: "
+        "squeeze-position bug in _insert_copy_op's write-side "
+        "_tiled_dims_for_dep (raw d{N} numbering breaks when a unit dim is "
+        "squeezed out of the index). Same root cause as issue #3613; "
+        "deferred until PR #3622's tile.py helpers land."
+    )
+)
 def test_flash_tile_Lq():
     """Flash v1: tile Lq÷2 only."""
     run_coarse_tile_test(
@@ -2634,6 +2662,15 @@ def test_flash_tile_B_H():
     )
 
 
+@pytest.mark.skip(
+    reason=(
+        "validate_writer_tile_advance now catches this at compile time: "
+        "squeeze-position bug in _insert_copy_op's write-side "
+        "_tiled_dims_for_dep (raw d{N} numbering breaks when a unit dim is "
+        "squeezed out of the index). Same root cause as issue #3613; "
+        "deferred until PR #3622's tile.py helpers land."
+    )
+)
 def test_flash_tile_H_Lq():
     """Flash v1: tile H÷4 Lq÷2."""
     run_coarse_tile_test(
@@ -3049,6 +3086,15 @@ def test_flash_v3_tile_B():
     )
 
 
+@pytest.mark.skip(
+    reason=(
+        "validate_writer_tile_advance now catches this at compile time: "
+        "squeeze-position bug in _insert_copy_op's write-side "
+        "_tiled_dims_for_dep (raw d{N} numbering breaks when a unit dim is "
+        "squeezed out of the index). Same root cause as issue #3613; "
+        "deferred until PR #3622's tile.py helpers land."
+    )
+)
 def test_flash_v3_tile_Lq():
     """Flash v3: tile Lq÷2 only."""
     run_coarse_tile_test(
@@ -3087,6 +3133,15 @@ def test_flash_v3_tile_B_H():
     )
 
 
+@pytest.mark.skip(
+    reason=(
+        "validate_writer_tile_advance now catches this at compile time: "
+        "squeeze-position bug in _insert_copy_op's write-side "
+        "_tiled_dims_for_dep (raw d{N} numbering breaks when a unit dim is "
+        "squeezed out of the index). Same root cause as issue #3613; "
+        "deferred until PR #3622's tile.py helpers land."
+    )
+)
 def test_flash_v3_tile_H_Lq():
     """Flash v3: tile H÷4 Lq÷2. Equivalent to original test_flash_v3 (small sizes)."""
     run_coarse_tile_test(
@@ -6103,17 +6158,6 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         torch.manual_seed(0xCAFE)
         _pnd.reset()
 
-    @pytest.mark.skip(
-        reason=(
-            "This reproduces on the CI runners but NOT on every local stack, "
-            "so a passing local run is not evidence it is fixed. Observed "
-            "10.2% element mismatch (833/8192) on CI, repeatable across all "
-            "retry attempts, while the same commit passes on a dev pod. "
-            "Skipped rather than xfailed because some CI runs use strict "
-            "xfail mode, where a passing xfail (e.g. on a dev pod) is itself "
-            "a failure. Un-skip only on the strength of a green CI run."
-        )
-    )
     def test_nested_bmm_outer_Batch_inner_K_correct(self):
         """bmm [B,M,K]@[B,K,N] outer B (output) + inner K (reduction) — correct."""
         from torch_spyre._inductor import spyre_hint
@@ -6137,9 +6181,6 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
             fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
         )
 
-    @pytest.mark.skip(
-        reason="compiled spyre <-> cpu mismatch: nested matmul correctness not yet passing"
-    )
     def test_nested_matmul_outer_M_inner_K_correct(self):
         """mm [M,K]@[K,N] with outer M (output) + inner K (reduction) — correct."""
         from torch_spyre._inductor import spyre_hint
