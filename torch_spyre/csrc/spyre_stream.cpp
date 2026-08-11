@@ -19,7 +19,6 @@
 #include <c10/core/Device.h>
 #include <c10/core/Stream.h>
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -72,28 +71,6 @@ struct StreamPool {
 
   // Per-device initialization flags
   std::unordered_map<c10::DeviceIndex, std::once_flag> device_init_flags;
-
-  // Edge-4 (cross-launch, cross-kernel) rolling back-event slots, keyed by the
-  // correction region's scalar region_id. A JobPlanStepEventSignalBack
-  // publishes a fresh event here after the device Compute on S_dev; the NEXT
-  // launch's JobPlanStepEventWaitBack reads it before its H2D on S_prep so the
-  // H2D waits for the prior DC to stop reading the shared region.
-  //
-  // Guarded by a DEDICATED mutex — NEVER `mutex` (the shared_mutex above). A
-  // back-event construct resolves its RuntimeStream handle via
-  // resolveRuntimeHandle(), which takes shared_lock(mutex); reusing `mutex`
-  // here would self-deadlock. edge4_mutex_ is held ONLY around the bare
-  // find/emplace, never across a resolveRuntimeHandle() / launch call.
-  std::mutex edge4_mutex;
-  std::unordered_map<uint64_t, std::shared_ptr<flex::Event>> edge4_back_events;
-
-  // Instrumentation for tests: how many times a WaitBack found a published
-  // rolling back-event (hit) vs. an empty slot it no-op'd on (skip). A
-  // multi-launch overlap test asserts the rolling edge-4 event was actually
-  // TAKEN (hits > 0 after the first launch) rather than always skipped. Atomic
-  // so accessors can read without taking edge4_mutex; incremented under it.
-  std::atomic<uint64_t> edge4_slot_hits{0};
-  std::atomic<uint64_t> edge4_slot_skips{0};
 };
 
 StreamPool& getStreamPool() {
@@ -280,61 +257,6 @@ void SpyreStream::launchHostCallback(flex::HostCallbackParams* params) const {
   resolveRuntimeHandle()->launchOperationHostCallback(params);
 }
 
-void SpyreStream::launchEventSignal(flex::EventSignalParams* params) const {
-  resolveRuntimeHandle()->launchOperationEventSignal(params);
-}
-
-void SpyreStream::launchEventWait(flex::EventWaitParams* params) const {
-  resolveRuntimeHandle()->launchOperationEventWait(params);
-}
-
-// Edge-4 rolling-slot accessors. Lock the DEDICATED edge4_mutex ONLY around the
-// bare map find/emplace — never across resolveRuntimeHandle() (which takes
-// shared_lock(pool.mutex)), so there is no lock-ordering hazard with the pool's
-// shared_mutex.
-std::shared_ptr<flex::Event> SpyreStream::getEdge4Slot(uint64_t region_id) {
-  auto& pool = getStreamPool();
-  std::lock_guard<std::mutex> lock(pool.edge4_mutex);
-  auto it = pool.edge4_back_events.find(region_id);
-  if (it == pool.edge4_back_events.end()) {
-    pool.edge4_slot_skips.fetch_add(1, std::memory_order_relaxed);
-    return nullptr;
-  }
-  pool.edge4_slot_hits.fetch_add(1, std::memory_order_relaxed);
-  return it->second;
-}
-
-void SpyreStream::setEdge4Slot(uint64_t region_id,
-                               std::shared_ptr<flex::Event> event) {
-  auto& pool = getStreamPool();
-  std::lock_guard<std::mutex> lock(pool.edge4_mutex);
-  pool.edge4_back_events[region_id] = std::move(event);
-}
-
-// Edge-4 rolling-slot instrumentation accessors (test-only). See StreamPool.
-uint64_t SpyreStream::edge4SlotHits() {
-  return getStreamPool().edge4_slot_hits.load(std::memory_order_relaxed);
-}
-
-uint64_t SpyreStream::edge4SlotSkips() {
-  return getStreamPool().edge4_slot_skips.load(std::memory_order_relaxed);
-}
-
-void SpyreStream::resetEdge4SlotStats() {
-  auto& pool = getStreamPool();
-  pool.edge4_slot_hits.store(0, std::memory_order_relaxed);
-  pool.edge4_slot_skips.store(0, std::memory_order_relaxed);
-}
-
-// Test-only: drop all published back-events so a fresh test does not inherit a
-// slot keyed by the deterministic mock region_id. Locks the DEDICATED
-// edge4_mutex (never pool.mutex), matching the other edge-4 accessors.
-void SpyreStream::clearEdge4Slots() {
-  auto& pool = getStreamPool();
-  std::lock_guard<std::mutex> lock(pool.edge4_mutex);
-  pool.edge4_back_events.clear();
-}
-
 void SpyreStream::fillAsync(const flex::CompositeAddress* dst, double value,
                             DataFormats dtype, bool use_dmai) const {
   resolveRuntimeHandle()->fillAsync(dst, value, dtype, use_dmai);
@@ -353,55 +275,30 @@ void SpyreStream::launch(const JobPlan& plan,
   //   S_prep = the PERSISTENT host-compute stream (id 65) — HostCompute + H2D.
   // Device compute overlaps HC/H2D because it lives on a DIFFERENT stream;
   // every op keeps pipeline_barrier=true (strict per-stream FIFO). S_prep MUST
-  // be the same persistent flex handle each launch (edge-2 FIFO + the rolling
-  // edge-4 back-event depend on it): getHostComputeStreamById is a pure lookup
-  // that wraps the handle registered once in initializeStreamPoolImpl.
+  // be the same persistent flex handle each launch (edge-2 FIFO + flex's
+  // cross-launch WAR edge depend on it): getHostComputeStreamById is a pure
+  // lookup that wraps the handle registered once in initializeStreamPoolImpl.
   const SpyreStream& s_dev = *this;
   // Fixed prep-stream id 65 for the PoC (single prep stream; single device).
   const SpyreStream s_prep =
       getHostComputeStreamById(kHostComputeStreamStartPerDevice, device());
 
-  // Size the FRESH forward (edge-3, intra-launch) event vector to the number of
-  // forward signals in the plan, and detect whether this is a two-stream plan.
-  // A plan is "two-stream" iff PrepareKernel instrumented it with event steps
-  // (edit 6). Back (edge-4) events are cross-launch and live in the StreamPool
-  // rolling map, NOT in ctx.
-  size_t num_forward_events = 0;
-  bool has_event_step = false;
-  for (const auto& step : plan.steps) {
-    if (dynamic_cast<const JobPlanStepEventSignalForward*>(step.get())) {
-      ++num_forward_events;
-      has_event_step = true;
-    } else if (dynamic_cast<const JobPlanStepEventWaitForward*>(step.get()) ||
-               dynamic_cast<const JobPlanStepEventSignalBack*>(step.get()) ||
-               dynamic_cast<const JobPlanStepEventWaitBack*>(step.get())) {
-      has_event_step = true;
-    }
-  }
+  // Create launch context with tensor arguments.
+  LaunchContext ctx{args};
 
-  // Create launch context with tensor arguments and fresh forward-event slots.
-  LaunchContext ctx{
-      args, std::vector<std::shared_ptr<flex::Event>>(num_forward_events)};
-
-  // GATE (correctness over overlap): engage the S_prep/S_dev split when EITHER
-  // (a) PrepareKernel instrumented this plan with static event steps (the
-  // default overlap path, whose forward/back events serialize the cross-stream
-  // H2D->Compute RAW), OR (b) the flex per-region hazard tracker is enabled
-  // (SPYRE_HAZARD_TRACKER) -- then there are NO static event steps and flex
-  // inserts the cross-stream RAW/WAR events dynamically at enqueue. Absent
-  // both, an un-instrumented plan MUST run entirely on S_dev -- byte-identical
-  // to the pre-overlap single-stream path (also the fail-safe if PrepareKernel
-  // could not instrument, e.g. region_id unresolved). Per-step routing still
-  // keys on role(), so any all-Dev plan (pure Compute / standalone D2H) stays
-  // single-stream even with the split engaged. Conversely, under hazard mode
-  // ANY plan carrying a Prep-role step splits -- not only the correction
-  // triple, but e.g. a bare H2D-led plan. That is intended: flex's per-region
-  // tracker inserts the edges regardless of plan shape. Today granite decode
-  // emits only the triple, so the broader split is unexercised until a
-  // non-triple producer appears (validated then, not by the decode gate). In
-  // hazard mode num_forward_events is 0, so the (empty) ctx forward-event
-  // vector is never indexed.
-  const bool should_split = has_event_step || get_hazard_tracker_enabled();
+  // GATE (correctness over overlap): engage the S_prep/S_dev split only when
+  // the flex per-region hazard tracker is enabled (SPYRE_HAZARD_TRACKER,
+  // default on). torch-spyre emits NO cross-stream event steps -- flex inserts
+  // the cross-stream RAW/WAR edges dynamically at enqueue from the per-launch
+  // footprints. With the tracker OFF, every step runs on S_dev --
+  // byte-identical to the pre-overlap single-stream path (the fail-safe floor).
+  // Per-step routing still keys on role(), so any all-Dev plan (pure Compute /
+  // standalone D2H) stays single-stream even with the split engaged.
+  // Conversely, under the tracker ANY plan carrying a Prep-role step splits --
+  // not only the correction triple, but e.g. a bare H2D-led plan. That is
+  // intended: flex's per-region tracker inserts the edges regardless of plan
+  // shape.
+  const bool should_split = get_hazard_tracker_enabled();
   for (const auto& step : plan.steps) {
     const SpyreStream& target =
         (should_split && step->role() == StreamRole::Prep) ? s_prep : s_dev;

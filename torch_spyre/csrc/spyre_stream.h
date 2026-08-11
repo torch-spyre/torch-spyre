@@ -62,11 +62,6 @@ class SpyreStream {
   void launchD2H(flex::DmaParams* params) const;
   void launchCompute(flex::ComputeParams* params) const;
   void launchHostCallback(flex::HostCallbackParams* params) const;
-  // Software event ops for cross-stream ordering in the two-stream overlap
-  // topology (forward edge-3 and rolling back edge-4). Delegate to
-  // flex::RuntimeStream::launchOperationEventSignal / launchOperationEventWait.
-  void launchEventSignal(flex::EventSignalParams* params) const;
-  void launchEventWait(flex::EventWaitParams* params) const;
   // Device-side MEMORY_FILL DMA. Routes through the typed
   // flex::RuntimeStream::fillAsync overload, which performs the value->pattern
   // conversion internally (no FillParams construction here).
@@ -79,37 +74,6 @@ class SpyreStream {
   // Returns the error state of this stream without exposing the underlying
   // flex::RuntimeStream handle to callers.
   SpyreStreamError getError() const;
-
-  // Runtime-scoped rolling back-event slots for the edge-4 (cross-launch,
-  // cross-kernel) WAR on a shared correction region. Keyed by the scalar
-  // region_id resolved from the bound device CompositeAddress at prepare time.
-  // The map lives on the StreamPool singleton (device-persistent) guarded by a
-  // DEDICATED mutex, so a SigBack in launch i and a WaitBack in launch i+1 —
-  // possibly for DIFFERENT kernels sharing the region — see the same slot.
-  // getEdge4Slot returns nullptr when no producer has published yet (first
-  // launch → WaitBack no-ops). Static because the owning state is a singleton,
-  // not per-SpyreStream (SpyreStream is a value type holding only a
-  // c10::Stream).
-  static std::shared_ptr<flex::Event> getEdge4Slot(uint64_t region_id);
-  static void setEdge4Slot(uint64_t region_id,
-                           std::shared_ptr<flex::Event> event);
-
-  // Edge-4 rolling-slot instrumentation (test-only): running counts of WaitBack
-  // slot hits (found a published back-event, actually waited) vs. skips (empty
-  // slot, no-op'd). A multi-launch overlap test uses these to prove the rolling
-  // edge-4 event was TAKEN across launches rather than always skipped.
-  // resetEdge4SlotStats zeroes both (call before a measured sequence).
-  static uint64_t edge4SlotHits();
-  static uint64_t edge4SlotSkips();
-  static void resetEdge4SlotStats();
-
-  // Test-only: clear all edge-4 rolling slots (the region_id -> back-event
-  // map). The mock device address used by unit tests yields a DETERMINISTIC
-  // region_id, so a slot published by a prior test would otherwise be observed
-  // by the next; a test calls this (plus resetEdge4SlotStats) to isolate its
-  // hit/skip sequence. Locks the dedicated edge4_mutex. Does NOT reset the
-  // counters (call resetEdge4SlotStats for that).
-  static void clearEdge4Slots();
 
  private:
   flex::RuntimeStream* resolveRuntimeHandle() const;

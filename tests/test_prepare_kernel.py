@@ -184,71 +184,14 @@ class TestPrepareKernel:
             with pytest.raises(RuntimeError, match="Step index out of range"):
                 job_plan.get_step_type(999)
 
-    def test_compute_on_host_valid(self):
-        """A valid ComputeOnHost triple builds and is instrumented for overlap.
-
-        A well-formed ComputeOnHost entry (ohandle, size, ishape, ihandle, hcm)
-        translates to the single triple [HostCompute, H2D, Compute], which the
-        two-stream overlap pass (edit 6) rewrites into the 7-step instrumented
-        plan and validate() accepts:
-
-            [HostCompute, WaitBack, H2D, SignalForward, WaitForward, Compute,
-             SignalBack]
-
-        HostCompute/H2D + their events run on S_prep; Compute + its events run on
-        S_dev. The WaitBack sits AFTER HostCompute and BEFORE H2D (the Placement
-        Invariant), and the two back-event steps key off the same correction
-        region_id resolved from the bound H2D device address.
-        """
-        with tempfile.TemporaryDirectory() as tmpdir:
-            spyrecode_dir = self.create_mock_spyrecode(
-                tmpdir, exec_command="ComputeOnHost"
-            )
-
-            # Should succeed without exceptions (prepare_kernel runs validate()).
-            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
-
-            assert job_plan is not None
-            assert isinstance(job_plan, torch_spyre._C.JobPlan)
-
-            # Instrumented two-stream plan: 7 steps in the byte-identical order.
-            assert job_plan.num_steps() == 7
-            expected_types = [
-                "HostCompute",
-                "WaitBack",
-                "H2D",
-                "SignalForward",
-                "WaitForward",
-                "Compute",
-                "SignalBack",
-            ]
-            assert [job_plan.get_step_type(i) for i in range(7)] == expected_types
-
-            # Stream roles: HostCompute/WaitBack/H2D/SignalForward on S_prep;
-            # WaitForward/Compute/SignalBack on S_dev.
-            expected_roles = ["Prep", "Prep", "Prep", "Prep", "Dev", "Dev", "Dev"]
-            assert [
-                job_plan.get_step_stream_role(i) for i in range(7)
-            ] == expected_roles
-
-            # Placement Invariant: WaitBack (1) is strictly between HostCompute
-            # (0) and H2D (2).
-            assert job_plan.get_step_type(0) == "HostCompute"
-            assert job_plan.get_step_type(1) == "WaitBack"
-            assert job_plan.get_step_type(2) == "H2D"
-
-            # Both back-event steps key off the SAME correction region_id.
-            assert job_plan.get_step_region_id(1) == job_plan.get_step_region_id(6)
-
     def test_hazard_tracker_emits_bare_split_triple(self):
-        """SPYRE_HAZARD_TRACKER: the correction triple is split WITHOUT events.
+        """SPYRE_HAZARD_TRACKER on: prepare emits the bare split triple.
 
-        With the hazard tracker enabled, PrepareKernel skips the static edge-3/4
-        event-step block (and its scalar-region_id TORCH_CHECK). The plain
-        [HostCompute, H2D, Compute] triple survives, still carrying its by-type
-        roles [Prep, Prep, Dev] -- so the launch router splits it across
-        S_prep/S_dev while flex inserts the cross-stream RAW/WAR events
-        dynamically at enqueue. No event steps are emitted (3 steps, not 7).
+        PrepareKernel emits the plain [HostCompute, H2D, Compute] triple with
+        NO cross-stream event steps, carrying its by-type roles [Prep, Prep,
+        Dev] -- so the launch router splits it across S_prep/S_dev while flex
+        inserts the cross-stream RAW/WAR edges dynamically at enqueue. There is
+        no plan rewrite and no event-step emission (3 steps, never 7).
         """
         prev = torch_spyre._C.get_hazard_tracker_enabled()
         try:
@@ -257,8 +200,9 @@ class TestPrepareKernel:
                 spyrecode_dir = self.create_mock_spyrecode(
                     tmpdir, exec_command="ComputeOnHost"
                 )
-                # Must NOT raise: the getNumProgramRegions()<=1 TORCH_CHECK lives
-                # inside the skipped block, so it does not run in hazard mode.
+                # Must NOT raise: prepare emits the plain triple unconditionally
+                # (the static-edge block and its region-count TORCH_CHECK are
+                # gone), so nothing here depends on the program-region count.
                 job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
 
                 # Bare split triple: 3 steps, NO event steps inserted.
@@ -286,13 +230,14 @@ class TestPrepareKernel:
         finally:
             torch_spyre._C.set_hazard_tracker_enabled(prev)
 
-    def test_hazard_tracker_disabled_by_default(self):
-        """Flag OFF: the default static-edge path is byte-identical (7 steps).
+    def test_prepare_flag_independent_bare_triple(self):
+        """Flag OFF: prepare still emits the SAME bare triple (flag-independent).
 
-        Guards against an accidental default flip: with the hazard tracker
-        explicitly disabled, the SAME ComputeOnHost triple is rewritten into the
-        7-step instrumented plan with the default roles -- exactly the shipped
-        overlap path (cf. test_compute_on_host_valid).
+        Post-excision, PrepareKernel no longer branches on SPYRE_HAZARD_TRACKER:
+        it always emits the plain [HostCompute, H2D, Compute] triple with roles
+        [Prep, Prep, Dev]. The flag only affects launch-time routing (whether the
+        S_prep/S_dev split engages), never the prepared plan's shape. This guards
+        against reintroducing a prepare-time branch on the flag.
         """
         prev = torch_spyre._C.get_hazard_tracker_enabled()
         try:
@@ -303,14 +248,15 @@ class TestPrepareKernel:
                 )
                 job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
 
-                assert job_plan.num_steps() == 7
-                assert [job_plan.get_step_stream_role(i) for i in range(7)] == [
+                assert job_plan.num_steps() == 3
+                assert [job_plan.get_step_type(i) for i in range(3)] == [
+                    "HostCompute",
+                    "H2D",
+                    "Compute",
+                ]
+                assert [job_plan.get_step_stream_role(i) for i in range(3)] == [
                     "Prep",
                     "Prep",
-                    "Prep",
-                    "Prep",
-                    "Dev",
-                    "Dev",
                     "Dev",
                 ]
         finally:
@@ -643,15 +589,15 @@ class TestPrepareKernel:
     def test_pipeline_barrier_dma_steps_default_true(self):
         """H2D and D2H steps must carry pipeline_barrier=True by default."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            # H2D lives at index 2 of the instrumented correction plan
-            # ([HostCompute, WaitBack, H2D, ...]).
+            # H2D lives at index 1 of the correction triple
+            # ([HostCompute, H2D, Compute]).
             spyrecode_dir = self.create_mock_spyrecode(
                 tmpdir, exec_command="ComputeOnHost"
             )
             job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
 
-            assert job_plan.get_step_type(2) == "H2D"
-            assert job_plan.get_step_pipeline_barrier(2) is True, (
+            assert job_plan.get_step_type(1) == "H2D"
+            assert job_plan.get_step_pipeline_barrier(1) is True, (
                 "H2D step must carry pipeline_barrier=True by default"
             )
 
@@ -679,15 +625,14 @@ class TestPrepareKernel:
             )
 
     def test_pipeline_barrier_correction_sequence(self):
-        """Every step of the instrumented correction plan keeps barrier=True.
+        """Every step of the correction triple keeps barrier=True.
 
         The two-stream PoC preserves STRICT per-stream FIFO for ALL ops,
         including HostCompute: overlap comes from the S_prep/S_dev stream split
-        plus the cross-stream forward/back events, NOT from relaxing any op's
-        pipeline_barrier. So no step in the instrumented plan
-        ([HostCompute, WaitBack, H2D, SignalForward, WaitForward, Compute,
-        SignalBack]) may opt out of the barrier -- in particular HostCompute must
-        NOT carry the old barrier=False.
+        plus flex's dynamic cross-stream RAW/WAR edges, NOT from relaxing any
+        op's pipeline_barrier. So no step in the correction triple
+        ([HostCompute, H2D, Compute]) may opt out of the barrier -- in
+        particular HostCompute must NOT carry the old barrier=False.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = self.create_mock_spyrecode(
@@ -695,7 +640,7 @@ class TestPrepareKernel:
             )
             job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
 
-            assert job_plan.num_steps() == 7
+            assert job_plan.num_steps() == 3
 
             # Strict FIFO everywhere: barrier=True on every step, no exceptions.
             for i in range(job_plan.num_steps()):
@@ -737,128 +682,6 @@ class TestPrepareKernel:
             with pytest.raises(RuntimeError, match="Step index out of range"):
                 job_plan.get_step_pipeline_barrier(999)
 
-    def test_edge4_rolling_slot_cross_plan_hit(self):
-        """#2: the rolling edge-4 slot carries a back-event ACROSS two launches.
-
-        Two independently-prepared ComputeOnHost plans (distinct kernels: they
-        differ in ishape) whose correction H2D binds into the SAME single
-        program region must resolve to the SAME scalar region_id. That key
-        collapse is what lets launch i's SignalBack hand its back-event to launch
-        i+1's WaitBack -- the cross-kernel WAR the shipped e2e never asserts. The
-        region_id is derived from the Allocate size + the bound H2D dev_ptr (via
-        the singleton allocator's single program region); ishape is pure
-        HostCompute metadata and does NOT feed region_id, so the two plans share
-        it. We take both region_ids from REAL prepared plans, then drive the REAL
-        setEdge4Slot/getEdge4Slot map (through the test hooks that
-        SignalBack/WaitBack construct use) to prove: publish under plan A's
-        SignalBack region_id, look up under plan B's WaitBack region_id, get the
-        SAME Event (pointer identity) with edge4_slot_hits going 0 -> 1.
-        """
-        with (
-            tempfile.TemporaryDirectory() as tdir_a,
-            tempfile.TemporaryDirectory() as tdir_b,
-        ):
-            dir_a = self.create_mock_spyrecode(
-                tdir_a,
-                exec_command="ComputeOnHost",
-                exec_properties={
-                    "ohandle": "output_buffer",
-                    "size": "1024",
-                    "ishape": ["64", "16"],
-                    "ihandle": "",
-                    "hcm": {"vdci": {}, "senConstants": []},
-                },
-            )
-            dir_b = self.create_mock_spyrecode(
-                tdir_b,
-                exec_command="ComputeOnHost",
-                exec_properties={
-                    "ohandle": "output_buffer",
-                    "size": "1024",
-                    "ishape": ["16", "64"],  # distinct kernel, same region_id
-                    "ihandle": "",
-                    "hcm": {"vdci": {}, "senConstants": []},
-                },
-            )
-            plan_a = torch_spyre._C.prepare_kernel(dir_a)
-            plan_b = torch_spyre._C.prepare_kernel(dir_b)
-
-            assert plan_a.num_steps() == 7 and plan_b.num_steps() == 7
-
-            # Key collapse: plan A's SignalBack (idx 6) and plan B's WaitBack
-            # (idx 1) resolve to the SAME correction region_id even though they
-            # come from two independent prepare_kernel calls for two kernels.
-            rid_a_signal = plan_a.get_step_region_id(6)
-            rid_b_wait = plan_b.get_step_region_id(1)
-            assert rid_a_signal == rid_b_wait, (
-                "two ComputeOnHost plans whose correction H2D binds into the "
-                "single program region must share region_id; got "
-                f"{rid_a_signal} (A.SignalBack) vs {rid_b_wait} (B.WaitBack)"
-            )
-
-            # Isolate this hit/skip sequence: the mock device address yields a
-            # DETERMINISTIC region_id, so a slot published by a prior test would
-            # otherwise be observed here.
-            torch_spyre._C._test_clear_edge4_slots()
-            torch_spyre._C.reset_edge4_slot_stats()
-            assert torch_spyre._C.edge4_slot_hits() == 0
-            assert torch_spyre._C.edge4_slot_skips() == 0
-
-            # Launch i (plan A) SignalBack publishes a back-event under its
-            # region_id.
-            published = torch_spyre._C._test_edge4_signal_store(rid_a_signal)
-            assert published != 0, "SignalBack must publish a non-null back-event"
-
-            # Launch i+1 (plan B) WaitBack looks up under ITS region_id. Because
-            # the key collapsed, it finds the SAME Event -> HIT.
-            found = torch_spyre._C._test_edge4_wait_probe(rid_b_wait)
-            assert found == published, (
-                "WaitBack in launch i+1 must retrieve the SAME back-event "
-                "published by SignalBack in launch i (rolling-slot pointer "
-                "identity across the collapsed region_id key)"
-            )
-            assert torch_spyre._C.edge4_slot_hits() == 1, (
-                "the cross-launch WaitBack must HIT the published slot (0 -> 1)"
-            )
-            assert torch_spyre._C.edge4_slot_skips() == 0, (
-                "no skip when the slot is published"
-            )
-
-    def test_edge4_rolling_slot_disjoint_region_skips(self):
-        """#2 negative: a WaitBack keyed on a region_id NOT in the map MISSES.
-
-        getEdge4Slot returns nullptr (probe -> 0) and edge4_slot_skips
-        increments. The map is non-empty (a back-event is published under the
-        plan's real region_id), but a DISJOINT key still misses -- proving the
-        slot is keyed by region_id, not "whatever was last published". A first
-        launch (empty slot) takes this same no-op skip path.
-        """
-        with tempfile.TemporaryDirectory() as tmpdir:
-            spyrecode_dir = self.create_mock_spyrecode(
-                tmpdir, exec_command="ComputeOnHost"
-            )
-            plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
-            rid = plan.get_step_region_id(6)
-
-            torch_spyre._C._test_clear_edge4_slots()
-            torch_spyre._C.reset_edge4_slot_stats()
-
-            published = torch_spyre._C._test_edge4_signal_store(rid)
-            assert published != 0
-
-            disjoint_rid = rid + 0x1000000
-            assert disjoint_rid != rid
-            missed = torch_spyre._C._test_edge4_wait_probe(disjoint_rid)
-            assert missed == 0, (
-                "a disjoint region_id must MISS (nullptr), not alias the published slot"
-            )
-            assert torch_spyre._C.edge4_slot_skips() == 1, (
-                "a WaitBack on a region_id with no published back-event must SKIP"
-            )
-            assert torch_spyre._C.edge4_slot_hits() == 0, (
-                "no hit on a disjoint region_id"
-            )
-
     def test_project_real_plan_identity_valid_permuted_rejected(self):
         """#7a: project a REAL prepared plan through validate()'s exact path.
 
@@ -868,20 +691,20 @@ class TestPrepareKernel:
         projection, so a wiring bug in the step -> (kind, role) mapping would slip
         past it. _test_project_and_check_ordering runs the REAL projection over
         REAL step objects in a caller-given index order:
-          - identity order [0..6] must reproduce validate()'s acceptance ('');
-          - a permuted order that puts the real WaitBack before the real
-            HostCompute must be REJECTED by the same projection (the Placement
-            Invariant enforced over real steps, not name lists).
+          - identity order [0, 1, 2] must reproduce validate()'s acceptance ('');
+          - a permuted order that puts the real H2D before the real HostCompute
+            must be REJECTED by the same projection (the prep stream must begin
+            with HostCompute), enforced over real steps, not name lists.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             spyrecode_dir = self.create_mock_spyrecode(
                 tmpdir, exec_command="ComputeOnHost"
             )
             plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
-            assert plan.num_steps() == 7
+            assert plan.num_steps() == 3
 
             err_identity = torch_spyre._C._test_project_and_check_ordering(
-                plan, [0, 1, 2, 3, 4, 5, 6]
+                plan, [0, 1, 2]
             )
             assert err_identity == "", (
                 "real-step projection in canonical order must be accepted, "
@@ -889,28 +712,21 @@ class TestPrepareKernel:
             )
 
             err_permuted = torch_spyre._C._test_project_and_check_ordering(
-                plan, [1, 0, 2, 3, 4, 5, 6]
+                plan, [1, 0, 2]
             )
             assert err_permuted != "", (
-                "projecting the real steps with WaitBack before HostCompute must "
-                "be rejected by the Placement Invariant"
+                "projecting the real steps with H2D before HostCompute must "
+                "be rejected (prep stream must begin with HostCompute)"
             )
             assert "HostCompute" in err_permuted
 
 
-# The canonical instrumented two-stream projection (edit 6), as parallel
-# (StepKind, StreamRole) name lists. This is what checkJobPlanStepOrdering must
-# accept; the negative tests below mutate it to violate the Placement Invariant.
-_VALID_KINDS = [
-    "HostCompute",
-    "WaitBack",
-    "H2D",
-    "SignalForward",
-    "WaitForward",
-    "Compute",
-    "SignalBack",
-]
-_VALID_ROLES = ["Prep", "Prep", "Prep", "Prep", "Dev", "Dev", "Dev"]
+# The canonical correction triple, as parallel (StepKind, StreamRole) name
+# lists: [HostCompute(Prep), H2D(Prep), Compute(Dev)]. This is what
+# checkJobPlanStepOrdering must accept; the negative tests below mutate it to
+# violate the per-stream role ordering.
+_VALID_KINDS = ["HostCompute", "H2D", "Compute"]
+_VALID_ROLES = ["Prep", "Prep", "Dev"]
 
 
 class TestStepOrderingValidator:
@@ -918,80 +734,57 @@ class TestStepOrderingValidator:
 
     Exercised through the check_job_plan_step_ordering binding, which calls the
     pure checker over projected (StepKind, StreamRole) sequences. This lets the
-    Placement-Invariant NEGATIVE case be tested without constructing real steps
-    (a real HostCompute needs a deeptools::Hcm plus pinned host buffers). The
+    role-ordering NEGATIVE cases be tested without constructing real steps (a
+    real HostCompute needs a deeptools::Hcm plus pinned host buffers). The
     validator returns '' when valid, else a human-readable error string.
     """
 
-    def test_valid_instrumented_ordering_accepted(self):
-        """The canonical 7-step instrumented plan is accepted (returns '')."""
+    def test_valid_bare_triple_ordering_accepted(self):
+        """The canonical correction triple is accepted (returns '')."""
         err = torch_spyre._C.check_job_plan_step_ordering(_VALID_KINDS, _VALID_ROLES)
         assert err == "", f"expected valid ordering, got error: {err!r}"
 
-    def test_placement_invariant_waitback_before_hostcompute_rejected(self):
-        """NEGATIVE: WaitBack placed BEFORE HostCompute on S_prep is rejected.
+    def test_h2d_before_hostcompute_rejected(self):
+        """NEGATIVE: H2D before HostCompute on S_prep is rejected.
 
-        This is the core Placement Invariant: the edge-4 WaitBack must sit
-        AFTER the HostCompute and BEFORE the H2D. Moving it to the front of the
-        prep stream must be flagged (the prep stream must begin with
-        HostCompute).
+        The prep stream must be exactly HostCompute -> H2D, so it must begin
+        with HostCompute. Putting the H2D first is flagged.
         """
-        kinds = [
-            "WaitBack",
-            "HostCompute",
-            "H2D",
-            "SignalForward",
-            "WaitForward",
-            "Compute",
-            "SignalBack",
-        ]
-        roles = list(_VALID_ROLES)  # WaitBack still on Prep, just mis-ordered
+        kinds = ["H2D", "HostCompute", "Compute"]
+        roles = ["Prep", "Prep", "Dev"]
         err = torch_spyre._C.check_job_plan_step_ordering(kinds, roles)
-        assert err != "", "WaitBack-before-HostCompute must be rejected"
+        assert err != "", "H2D-before-HostCompute must be rejected"
         assert "HostCompute" in err
 
-    def test_placement_invariant_waitback_after_h2d_rejected(self):
-        """NEGATIVE: WaitBack placed AFTER H2D on S_prep is rejected."""
-        kinds = [
-            "HostCompute",
-            "H2D",
-            "WaitBack",
-            "SignalForward",
-            "WaitForward",
-            "Compute",
-            "SignalBack",
-        ]
-        roles = list(_VALID_ROLES)
+    def test_missing_h2d_on_prep_rejected(self):
+        """NEGATIVE: a HostCompute-led plan with no H2D on S_prep is rejected.
+
+        The prep stream must be exactly HostCompute -> H2D; dropping the H2D
+        leaves prep as just [HostCompute], which the S_prep walk rejects.
+        """
+        kinds = ["HostCompute", "Compute"]
+        roles = ["Prep", "Dev"]
         err = torch_spyre._C.check_job_plan_step_ordering(kinds, roles)
-        assert err != "", "WaitBack-after-H2D must be rejected"
+        assert err != "", "HostCompute with no following H2D must be rejected"
+        assert "H2D" in err
 
     def test_compute_on_prep_stream_rejected(self):
-        """NEGATIVE: a device Compute mis-assigned to S_prep is rejected."""
-        kinds = list(_VALID_KINDS)
-        roles = ["Prep", "Prep", "Prep", "Prep", "Dev", "Prep", "Dev"]
+        """NEGATIVE: a device Compute mis-assigned to S_prep is rejected.
+
+        Routing the Compute to Prep leaves prep as [HostCompute, H2D, Compute]
+        (an extra step past the H2D) and leaves S_dev empty -- both rejected.
+        """
+        kinds = ["HostCompute", "H2D", "Compute"]
+        roles = ["Prep", "Prep", "Prep"]
         err = torch_spyre._C.check_job_plan_step_ordering(kinds, roles)
         assert err != "", "Compute on the prep stream must be rejected"
 
-    def test_unmatched_forward_events_rejected(self):
-        """NEGATIVE: a SignalForward with no matching WaitForward is rejected."""
-        kinds = [
-            "HostCompute",
-            "WaitBack",
-            "H2D",
-            "SignalForward",
-            "Compute",
-            "SignalBack",
-        ]
-        roles = ["Prep", "Prep", "Prep", "Prep", "Dev", "Dev"]
-        err = torch_spyre._C.check_job_plan_step_ordering(kinds, roles)
-        assert err != "", "unmatched forward events must be rejected"
-
     def test_legacy_single_stream_plan_still_valid(self):
-        """A legacy plan (no HostCompute, no events) stays unconditionally valid.
+        """A legacy plan (no HostCompute) stays unconditionally valid.
 
         Guards backward-compat: pure ComputeOnDevice, standalone D2H, and tensor
-        .to() moves have neither a HostCompute nor an event step, so the checker
-        must not impose the two-stream shape on them.
+        .to() moves have no HostCompute, so the checker must not impose the
+        two-stream shape on them.
         """
         assert torch_spyre._C.check_job_plan_step_ordering(["Compute"], ["Dev"]) == ""
         assert torch_spyre._C.check_job_plan_step_ordering(["D2H"], ["Dev"]) == ""
@@ -1003,16 +796,15 @@ class TestStepOrderingValidator:
         )
 
     def test_hazard_tracker_bare_split_ordering_valid(self):
-        """LOCK: a HostCompute-led, split, NO-events plan is valid.
+        """LOCK: the HostCompute-led, split, NO-events triple is valid.
 
         Under SPYRE_HAZARD_TRACKER the correction triple is split across
-        S_prep/S_dev but carries NO event steps (flex inserts the cross-stream
-        events dynamically). The ordering validator must accept it: has_event is
-        false, so the forward-guard -- which requires a matched Ef pair for
-        two-stream plans -- is skipped. This locks that property so a future
-        validator change that would break hazard mode fails here loudly.
-        Contrast test_legacy_single_stream_plan_still_valid (no HostCompute):
-        this plan HAS a HostCompute but still no events.
+        S_prep/S_dev and carries NO event steps (flex inserts the cross-stream
+        edges dynamically at enqueue). The ordering validator must accept the
+        bare [HostCompute(Prep), H2D(Prep), Compute(Dev)] triple. This locks that
+        property so a future validator change that would break hazard mode fails
+        here loudly. Contrast test_legacy_single_stream_plan_still_valid (no
+        HostCompute): this plan HAS a HostCompute but still no events.
         """
         assert (
             torch_spyre._C.check_job_plan_step_ordering(
@@ -1021,63 +813,26 @@ class TestStepOrderingValidator:
             == ""
         )
 
-    def test_first_launch_waitback_noop_ordering_valid(self):
-        """The instrumented plan is valid even though its WaitBack is unmatched.
-
-        Back events are cross-launch: a single plan carries a WaitBack whose
-        paired SignalBack is in a DIFFERENT launch (and vice-versa). The checker
-        must NOT count-match them, so the standalone instrumented plan -- exactly
-        what the first launch replays, where the WaitBack no-ops on an empty
-        rolling slot -- is accepted.
-        """
-        assert (
-            torch_spyre._C.check_job_plan_step_ordering(_VALID_KINDS, _VALID_ROLES)
-            == ""
-        )
-
-    def test_back_events_without_forward_pair_rejected(self):
-        """#6 NEGATIVE: a two-stream plan with events but NO forward Ef pair.
-
-        Back events alone (WaitBack/SignalBack) already make this a two-stream
-        plan (has_event), but with zero SignalForward/WaitForward the
-        cross-stream H2D -> Compute RAW (edge-3) is left unserialized -- the
-        device Compute would race the H2D that feeds it. The count-match check
-        only catches ASYMMETRIC forward events (n_sig != n_wait); this
-        zero-forward case (n_sig == n_wait == 0) must be caught by the dedicated
-        forward-guard, whose message is uniquely "found none". This plan passes
-        both per-stream walks and the count-match, so it reaches -- and must be
-        rejected by -- that guard.
-        """
-        kinds = ["HostCompute", "WaitBack", "H2D", "Compute", "SignalBack"]
-        roles = ["Prep", "Prep", "Prep", "Dev", "Dev"]
-        err = torch_spyre._C.check_job_plan_step_ordering(kinds, roles)
-        assert err != "", (
-            "a two-stream plan with back events but no forward Ef pair must be "
-            "rejected (the H2D -> Compute RAW would be unserialized)"
-        )
-        assert "found none" in err, (
-            f"expected the zero-forward forward-guard message, got: {err!r}"
-        )
-
     def test_hostcompute_on_dev_stream_rejected(self):
-        """#7b NEGATIVE: HostCompute mis-assigned to the device stream (S_dev).
+        """NEGATIVE: HostCompute mis-assigned to the device stream (S_dev).
 
-        Placement Invariant: HostCompute belongs on S_prep. Flipping step 0's
-        role to Dev leaves S_prep beginning with WaitBack, which the S_prep walk
-        rejects (prep must begin with HostCompute).
+        HostCompute belongs on S_prep. Flipping step 0's role to Dev leaves
+        S_prep beginning with H2D, which the S_prep walk rejects (prep must
+        begin with HostCompute).
         """
-        roles = ["Dev", "Prep", "Prep", "Prep", "Dev", "Dev", "Dev"]
+        roles = ["Dev", "Prep", "Dev"]
         err = torch_spyre._C.check_job_plan_step_ordering(_VALID_KINDS, roles)
         assert err != "", "HostCompute on the device stream must be rejected"
+        assert "HostCompute" in err
 
     def test_h2d_on_dev_stream_rejected(self):
-        """#7b NEGATIVE: H2D mis-assigned to the device stream (S_dev).
+        """NEGATIVE: H2D mis-assigned to the device stream (S_dev).
 
-        Placement Invariant: the correction H2D belongs on S_prep. Flipping H2D's
-        role to Dev leaves S_prep with SignalForward where H2D must be (rejected
-        by the S_prep walk) and puts a forbidden H2D on the device stream.
+        The correction H2D belongs on S_prep. Flipping H2D's role to Dev leaves
+        S_prep as just [HostCompute] (rejected: expected H2D after HostCompute)
+        and puts a forbidden H2D on the device stream.
         """
-        roles = ["Prep", "Prep", "Dev", "Prep", "Dev", "Dev", "Dev"]
+        roles = ["Prep", "Dev", "Dev"]
         err = torch_spyre._C.check_job_plan_step_ordering(_VALID_KINDS, roles)
         assert err != "", "H2D on the device stream must be rejected"
 
