@@ -71,9 +71,10 @@ def decompose_index_for_tiling(index, var_ranges):
     """
     Decompose index into atoms + offset and validate assumptions.
 
-    An atom is a tuple (positive integer coefficient, iteration variable).
-    An offset is a non-negative integer.
-    Coefficients and offset may include symbols.
+    An atom is a tuple (positive integer coefficient, iteration variable). An
+    offset is a non-negative integer. Coefficients and offset may include
+    symbols. Tiling of indexes with ModularIndexing is not supported. Tiling of
+    indexes with negative coefficients is not supported.
     """
     vars = set(var_ranges.keys())
     vars_found = set()
