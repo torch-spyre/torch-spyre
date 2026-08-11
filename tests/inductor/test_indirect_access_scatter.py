@@ -22,10 +22,6 @@ reports an expected failure (pytest.xfail) on the value divergence / backend
 abort the backend currently produces for indirect scatter, while the
 capture-path checks above stay strict (a stage regression fails red).
 
-The two forms that crash during compilation -- index_fill (rank-0 scalar
-Constant codegen) and masked_scatter (mask-based CPU fallback) -- stay
-capture-only via check(expect=CRASHED); there is no bundle to run end-to-end.
-
 All scatter scenarios run with SENCORES=1.
 
 Status (validated on hardware build): index-tensor scatters reach a real op
@@ -41,6 +37,7 @@ import torch
 sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
     CRASHED,
+    GATHER_OP_SPEC,
     SCATTER_OP_SPEC,
     DIRECT_OP_SPEC,
     IndirectAccessTestCase,
@@ -233,8 +230,15 @@ class TestScatter(IndirectAccessTestCase):
 
         self.check(kernel, out, idx, expect=CRASHED)
 
-    def test_masked_scatter_crashes(self):
-        """torch.masked_scatter(out, mask, src) -- uses mask-based CPU fallback path."""
+    def test_masked_scatter_element_mask_unsupported(self):
+        """Element-level mask (stride(-1) != 0): the decomposition rejects it.
+
+        A full [M, N] per-element mask is not broadcast along the last dim, so
+        spyre_masked_scatter raises Unsupported -- an element scatter would index
+        into a packed 1-D source, and a lane within a stick is not addressable on
+        Spyre. The raise propagates out of torch.compile before any op spec is
+        produced (CRASHED in this harness); there is no bundle to run e2e.
+        """
         M, N = 64, 64
         out = torch.zeros(M, N, dtype=torch.float16).to("spyre")
         mask = torch.randint(0, 2, (M, N), dtype=torch.bool).to("spyre")
@@ -245,6 +249,131 @@ class TestScatter(IndirectAccessTestCase):
             return torch.masked_scatter(out, mask, src)
 
         self.check(kernel, out, mask, src, expect=CRASHED)
+
+    # -- Supported masked_scatter: row-broadcast mask lowers to a gather -------
+    def test_masked_scatter_row_broadcast(self):
+        """torch.masked_scatter with a mask broadcast along the last dim.
+
+        A row-broadcast mask (stride(-1) == 0 -- e.g. an attention mask [B, S]
+        expanded to [B, S, C]) selects whole rows, so spyre_masked_scatter lowers
+        it to a stick gather source_2d[row_idx] plus a where. That is an indirect
+        *read*, hence a GATHER_OP_SPEC (not an indirect-output scatter).
+        """
+        ROWS, COLS, SRC_ROWS, N_TRUE = 855, 5120, 266, 266
+        inp = torch.rand(1, ROWS, COLS, dtype=torch.float16).to("spyre")
+        src = torch.rand(SRC_ROWS, COLS, dtype=torch.float16).to("spyre")
+        # Row-broadcast mask: [1, ROWS] expanded to [1, ROWS, COLS] (stride(-1)==0).
+        mask_1d = torch.zeros(1, ROWS, dtype=torch.bool)
+        mask_1d[0, torch.randperm(ROWS)[:N_TRUE]] = True
+        mask = mask_1d.unsqueeze(-1).to("spyre").expand(1, ROWS, COLS)
+        self.name_dims(inp, {"B": 1, "ROWS": ROWS, "COLS": COLS})
+        self.name_dims(src, {"SRC_ROWS": SRC_ROWS, "COLS": COLS})
+
+        def kernel(inp, mask, src):
+            return torch.masked_scatter(inp, mask, src)
+
+        self._stage_and_e2e(
+            kernel, inp, mask, src, expect=GATHER_OP_SPEC, expect_close=True
+        )
+
+    def _row_broadcast_operands(self, shape, src_rows, n_true):
+        """Supported masked_scatter operands: `self` of `shape`, a mask broadcast
+        along the last dim (stride(-1) == 0) with `n_true` selected rows, and a
+        2-D `src[src_rows, shape[-1]]`. Returns (inp, mask, src) on "spyre"."""
+        *lead, cols = shape
+        rows = 1
+        for d in lead:
+            rows *= d
+        inp = torch.rand(*shape, dtype=torch.float16).to("spyre")
+        src = torch.rand(src_rows, cols, dtype=torch.float16).to("spyre")
+        flat = torch.zeros(rows, dtype=torch.bool)
+        flat[torch.randperm(rows)[:n_true]] = True
+        mask = flat.reshape(*lead, 1).to("spyre").expand(*shape)
+        # Share the column dim name "C" across self and src (house convention:
+        # the two operands' common last dim is one named dim, cf. _row_store).
+        lead_names = [f"L{i}" for i in range(len(lead))]
+        self.name_dims(inp, dict(zip(lead_names + ["C"], list(lead) + [cols])))
+        self.name_dims(src, {"SRC": src_rows, "C": cols})
+        return inp, mask, src
+
+    def test_masked_scatter_2d_row_broadcast(self):
+        """2-D self [M, N] with a row-broadcast mask -- the smallest supported
+        shape. Capture-only: assert it reaches a gather op spec (and a valid
+        indirect-access SDSC bundle), no device run needed."""
+        inp, mask, src = self._row_broadcast_operands(
+            (128, 256), src_rows=40, n_true=40
+        )
+
+        def kernel(inp, mask, src):
+            return torch.masked_scatter(inp, mask, src)
+
+        self.check(kernel, inp, mask, src, expect=GATHER_OP_SPEC)
+
+    def test_masked_scatter_batched_row_broadcast(self):
+        """Batched self [B, S, C] (rows = B*S) with a row-broadcast mask. Pins
+        that a leading batch dim still collapses to whole-row selection and
+        reaches a gather op spec."""
+        inp, mask, src = self._row_broadcast_operands(
+            (2, 64, 128), src_rows=40, n_true=40
+        )
+
+        def kernel(inp, mask, src):
+            return torch.masked_scatter(inp, mask, src)
+
+        self.check(kernel, inp, mask, src, expect=GATHER_OP_SPEC)
+
+    def test_masked_scatter_all_rows_selected(self):
+        """All-True mask: every row is selected, so src must supply exactly `rows`
+        rows and the result is `src` row-for-row. Exercises the max-selection
+        boundary end-to-end."""
+        M, N = 8, 128
+        inp = torch.rand(M, N, dtype=torch.float16).to("spyre")
+        src = torch.rand(M, N, dtype=torch.float16).to("spyre")
+        mask = torch.ones(M, 1, dtype=torch.bool).to("spyre").expand(M, N)
+        self.name_dims(inp, {"M": M, "N": N})
+        self.name_dims(src, {"M": M, "N": N})
+
+        def kernel(inp, mask, src):
+            return torch.masked_scatter(inp, mask, src)
+
+        self._stage_and_e2e(
+            kernel, inp, mask, src, expect=GATHER_OP_SPEC, expect_close=True
+        )
+
+    def test_masked_scatter_no_rows_selected(self):
+        """All-False mask: nothing is selected, so the result must equal `self`
+        unchanged. The gather still lowers (the mask is a runtime input, not a
+        compile-time constant), so this stays a GATHER_OP_SPEC."""
+        M, N = 8, 128
+        inp = torch.rand(M, N, dtype=torch.float16).to("spyre")
+        src = torch.rand(4, N, dtype=torch.float16).to("spyre")
+        mask = torch.zeros(M, 1, dtype=torch.bool).to("spyre").expand(M, N)
+        self.name_dims(inp, {"M": M, "N": N})
+        self.name_dims(src, {"SRC": 4, "N": N})
+
+        def kernel(inp, mask, src):
+            return torch.masked_scatter(inp, mask, src)
+
+        self._stage_and_e2e(
+            kernel, inp, mask, src, expect=GATHER_OP_SPEC, expect_close=True
+        )
+
+    def test_masked_scatter_degenerate_last_dim_unsupported(self):
+        """Degenerate last dim (cols == 1): a single-column row is not a real
+        shared row for the block-per-row equivalence, so the decomposition
+        rejects it with Unsupported (CRASHED here)."""
+        M = 128
+        inp = torch.rand(M, 1, dtype=torch.float16).to("spyre")
+        src = torch.rand(4, 1, dtype=torch.float16).to("spyre")
+        mask = torch.zeros(M, 1, dtype=torch.bool)
+        mask[torch.randperm(M)[:4]] = True
+        mask = mask.to("spyre")
+        self.name_dims(inp, {"M": M, "ONE": 1})
+
+        def kernel(inp, mask, src):
+            return torch.masked_scatter(inp, mask, src)
+
+        self.check(kernel, inp, mask, src, expect=CRASHED)
 
 
 if __name__ == "__main__":

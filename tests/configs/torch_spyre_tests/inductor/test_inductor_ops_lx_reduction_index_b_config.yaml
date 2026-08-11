@@ -37,4 +37,7 @@ test_suite_config:
             - LxPlanning.*::test_logsumexp_keepdim0_known_xfail.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_mean_3d_dim0_keepdim.*_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_index_copy_.*_lx_planning_(pointwise|reduction)
+            # Regression guard for LX producer/consumer core->slice agreement
+            # (#3374, #3387). Asserts both values and that the buffer stays in LX.
+            - LxPlanning.*::test_shared_input_two_reductions.*_lx_planning_(pointwise|reduction)
           mode: mandatory_success

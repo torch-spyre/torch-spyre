@@ -15,15 +15,15 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import dataclasses
 import threading
-from collections import OrderedDict
 from typing import Any, Literal, Sequence
 
 from sympy import Symbol, Expr, Function
-from torch_spyre._C import DataFormats, ElementArrangement, fill_tensor
-from torch_spyre._inductor.constants import DEVICE_NAME
+from torch_spyre._C import DataFormats, ElementArrangement
 import torch
+from torch_spyre import _C
 
 
 class IndirectAccess(Function):
@@ -176,7 +176,6 @@ class TensorArg:
     device_size: list[int]
     device_coordinates: list[Expr]
     allocation: Any
-    per_tile_fixed: bool = False
     name: str | None = None
     device_tile_advance_expr: Expr | None = None
     element_arrangement: ElementArrangement = dataclasses.field(
@@ -245,6 +244,34 @@ class OpSpec:
     debug_handle: DebugHandle | None = None
 
 
+# --- Module-level constant tensor cache --------------------------------------
+#
+# LRU cache for Spyre constant tensors to avoid redundant tensor creation across
+# multiple forward passes. Uses OrderedDict for least-recently-used eviction
+# with a maximum size limit to bound memory usage.
+#
+# Thread-safe for concurrent inference workloads.
+#
+_CACHE_MAX_SIZE = 1000  # Maximum number of cached constants (~128KB)
+_CONSTANT_TENSOR_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
+_CACHE_LOCK = threading.Lock()
+
+
+def clear_constant_tensor_cache():
+    """Clear the constant tensor cache.
+
+    Should be called when:
+    - Running torch.compiler.reset() to ensure test isolation
+    - Manually reclaiming device memory
+    - Starting a new inference session with different constants
+
+    Example:
+        >>> torch.compiler.reset()
+        >>> clear_constant_tensor_cache()  # Clear Spyre constants
+    """
+    _CONSTANT_TENSOR_CACHE.clear()
+
+
 @dataclasses.dataclass
 class UnimplementedOp:
     op: str
@@ -272,68 +299,73 @@ class LoopSpec:
     body: list[Any]
 
 
-# Module-level cache of device-side constant tensors, keyed by
-# (value, (device_type, device_index), dtype).  It is a MODULE global on
-# purpose: spyre_constant_tensor is emitted as source into the generated
-# runtime wrapper, so it runs at model *execution* time, after compile_fx has
-# torn down its graph handler.  A V.graph-scoped cache would land on a
-# throwaway handler on every call and never persist (see
-# repro_3392_v_graph_cache.py); the module global persists across compilation
-# and runtime so repeated identical const-scalar fills reuse one device tensor.
-_CONSTANT_TENSOR_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
-_CACHE_LOCK = threading.Lock()
-_CACHE_MAX_SIZE = 1000  # ~128KB of cached scalar tensors
-
-
-def clear_constant_tensor_cache() -> None:
-    """Empty the module-level constant-tensor cache (thread-safe)."""
-    with _CACHE_LOCK:
-        _CONSTANT_TENSOR_CACHE.clear()
-
-
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):
-    """Create or retrieve a cached constant tensor on the device.
+    """Create or retrieve a cached constant tensor for Spyre device.
 
-    On Spyre the constant is materialized with a device-side fill
-    (``torch.empty`` + ``fill_tensor``), avoiding the host-side
-    ``torch.tensor(...).to(device)`` H2D copy, and memoized in a module-level
-    LRU cache so repeated identical fills reuse one device tensor.  Non-Spyre
-    devices keep the unchanged host path and are not cached.
+    Uses module-level LRU cache that persists across forward passes with a
+    maximum size limit (default: 1000 entries, ~128KB). Least-recently-used
+    entries are automatically evicted when the cache exceeds the limit.
+
+    For test isolation, call clear_constant_tensor_cache() after
+    torch.compiler.reset().
+
+    WARNING: Returns a shared tensor that MUST NEVER be mutated in-place.
+
+    The returned tensor is reused across multiple calls with matching
+    (value, device, dtype). In-place mutation would corrupt all callers.
+
+    Inductor enforces immutability via:
+      - SpyreConstantFallback.should_allocate() == False
+      - SpyreConstantFallback.get_mutation_names() == []
+
+    Any pass that modifies this contract MUST update this function.
 
     Args:
-        const_val: The scalar constant value.
-        device: Target device (str or ``torch.device``, e.g. "spyre").
-        dtype: Tensor dtype (default: ``torch.float16``).
+        const_val: Scalar constant value
+        device: Target device (e.g., "spyre", "cpu", or torch.device(...))
+        dtype: Data type (default: torch.float16)
 
     Returns:
-        A 0-d tensor on ``device`` holding the constant value.  On the Spyre
-        path it is shared across callers requesting the same (value, device,
-        dtype) key and therefore MUST NOT BE MUTATED.
+        Immutable constant tensor (DO NOT MUTATE)
 
     Note:
-        ``float(const_val)`` makes NaN always miss the cache because
-        ``float("nan") != float("nan")``.  This is intentional: each NaN
-        request gets a fresh tensor rather than an accidental cache match.
-    """
-    device = torch.device(device)
+        For non-Spyre devices (e.g., CPU), uses standard torch.tensor path
+        without caching as these tensors are cheap to create.
 
-    # Non-Spyre devices (e.g. CPU): keep the plain host path, uncached.
-    if device.type != DEVICE_NAME:
+        float(const_val) makes NaN values always miss the cache because
+        float('nan') != float('nan'). This is intentional - it falls back to
+        creating a fresh tensor for each NaN request rather than attempting
+        cache matching.
+    """
+    # Normalize device to torch.device object if string is passed
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    # For non-Spyre devices (e.g., CPU), use standard PyTorch path without caching
+    if device.type != "spyre":
         return torch.tensor(const_val, dtype=dtype).to(device)
 
-    cache_key = (float(const_val), (device.type, device.index), dtype)
+    # Create cache key with normalized device (device.type, device.index)
+    device_key = (device.type, device.index)
+    cache_key = (float(const_val), device_key, dtype)
+
+    # Thread-safe cache lookup and insertion with LRU eviction
     with _CACHE_LOCK:
         if cache_key in _CONSTANT_TENSOR_CACHE:
+            # Cache hit: move to end (most recently used)
             _CONSTANT_TENSOR_CACHE.move_to_end(cache_key)
             return _CONSTANT_TENSOR_CACHE[cache_key]
 
-        # Device-side fill: allocate uninitialized, then fill via DMA.
+        # Cache miss: create new tensor with device-side fill
         t = torch.empty((), dtype=dtype, device=device)
-        fill_tensor(t, float(const_val))
+        _C.fill_tensor(t, float(const_val))
 
         _CONSTANT_TENSOR_CACHE[cache_key] = t
+
+        # Evict least-recently-used entries if over limit
         while len(_CONSTANT_TENSOR_CACHE) > _CACHE_MAX_SIZE:
-            _CONSTANT_TENSOR_CACHE.popitem(last=False)
+            _CONSTANT_TENSOR_CACHE.popitem(last=False)  # Remove oldest (LRU)
+
         return t
 
 

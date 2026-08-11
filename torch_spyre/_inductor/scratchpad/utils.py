@@ -86,10 +86,21 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
     at which that buffer is accessed (read or written).  Graph inputs are seeded with
     an empty list; unused inputs remain empty.
 
+    Indices are *distinct*: one entry per accessing operation, not per access.
+    ``rw.reads | rw.writes`` is a set of dependencies rather than of names, so an
+    op that touches one buffer through two different index expressions -- e.g. the
+    fused ``x[:, 0:512] + x[:, 512:1024]``, which reads ``arg0_1`` at
+    ``1024*d0 + d1`` and at ``1024*d0 + d1 + 512`` -- contributes two deps naming
+    it, and appending per dep would repeat that op's index.  A repeat is not
+    meaningful here (``start_time``/``end_time`` bracket the list and cannot see
+    it) and it inflates ``read_count``, so it is dropped.  This is what lets
+    :class:`~torch_spyre._inductor.scratchpad.plan_solver.LifetimeBoundBuffer`
+    require strictly increasing ``uses``, and makes ``read_count == 0`` mean
+    exactly "written but never read" for a computed buffer.
+
     Note: previously, unused graph inputs did not appear in the returned dict at
-    all.  Now they appear with an empty list.  Callers that skip buffers with
-    ``len(uses) <= 1`` (e.g. ``_build_bound_buffers``) will still skip unused inputs
-    correctly, since ``len([]) == 0 <= 1``."""
+    all.  Now they appear with an empty list, and ``_build_bound_buffers`` skips
+    them on ``not uses``."""
     liveness: dict[str, list[int]] = {}
     for input_name in graph.graph_input_names:
         liveness[input_name] = []
@@ -97,9 +108,10 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
         rw = op_read_writes(op)
         for mem_dep in rw.reads | rw.writes:
             buf_name = mem_dep.name
-            if buf_name not in liveness:
-                liveness[buf_name] = []
-            liveness[buf_name].append(i)
+            uses = liveness.setdefault(buf_name, [])
+            # Ops are walked in order, so only the tail can repeat i.
+            if not uses or uses[-1] != i:
+                uses.append(i)
     return liveness
 
 
@@ -220,21 +232,73 @@ def _is_tiled_advancing(op: Operation) -> bool:
 
     LX addresses are never registered as ``affine.apply`` symbols in the SDSC
     JSON (see ``compute_ops.py``'s ``is_tiled_lx`` check), so a buffer that
-    advances per loop iteration (tiled, and not ``per_tile_fixed``) has no way
-    to express its address change if pinned to LX. This mirrors that check,
-    but at IR time via ``loop_info`` instead of the later per-tensor strides
-    representation, letting the allocator exclude such buffers from LX
-    candidacy up front instead of crashing at codegen time.
+    advances per loop iteration has no way to express its address change if
+    pinned to LX. This derives the same answer ``is_tiled_lx`` derives, but
+    earlier (at IR/allocation time) and directly from ``loop_info``, letting
+    the allocator exclude such buffers from LX candidacy up front instead of
+    crashing at codegen time.
+
+    Note this checks ``output_tiled_dims`` -- whether *this op's own write*
+    advances -- not ``loop_tiled_dims``, which only says the op is tiled at
+    all. A loop-internal buffer (e.g. drained by a copy op every iteration)
+    can be tiled yet have its own write pinned at a fixed address; such a
+    buffer is LX-eligible.
     """
     layout = getattr(op, "layout", None)
-    if not isinstance(layout, FixedTiledLayout) or layout.per_tile_fixed:
+    if not isinstance(layout, FixedTiledLayout):
         return False
     loop_info = getattr(op, "loop_info", None)
     if loop_info is None:
         return False
-    return any(dims for dims in loop_info.loop_tiled_dims) or any(
-        dims for dims in getattr(loop_info, "loop_tiled_reduction_dims", [])
-    )
+    return any(dims for dims in loop_info.output_tiled_dims)
+
+
+def _is_read_advancing_anywhere(
+    name: str, buf_user_deps: dict[str, list[tuple[Operation, MemoryDep]]]
+) -> bool:
+    """True if some op reads buffer ``name`` via an advancing reference.
+
+    ``_is_tiled_advancing`` only asks whether ``name``'s own *producing*
+    write advances -- it says nothing about whether some other, unrelated
+    op *reads* ``name`` via a reference that advances across that reader's
+    own coarse-tile loop (e.g. a full HBM buffer with a fixed write, copied
+    into a nested tile every outer iteration). ``SpyreKernel.
+    _general_tile_advance`` derives a read reference's
+    ``device_tile_advance_expr`` from the *consuming* op's own
+    ``loop_info.tiled_dims_per_read``, not from the producer's
+    ``output_tiled_dims`` -- so a reader can advance even when the
+    producer's own write is fixed. ``compute_ops.py``'s ``is_tiled_lx``
+    check applies to every ``TensorArg`` (read and write) at codegen time,
+    so missing this at allocation time defers the same
+    ``NotImplementedError`` to codegen instead of routing the buffer to
+    HBM up front.
+
+    Mirrors ``_general_tile_advance``'s own positional dep-index matching:
+    for each reader op, ``name``'s occurrences among that op's
+    ``MemoryDep`` reads are matched in order to
+    ``loop_info.tiled_dims_per_read`` by position.
+    """
+    for reader_op, dep in buf_user_deps.get(name, []):
+        loop_info = getattr(reader_op, "loop_info", None)
+        if loop_info is None:
+            continue
+        read_deps = [
+            d for d in op_read_writes(reader_op).reads if isinstance(d, MemoryDep)
+        ]
+        if dep not in read_deps:
+            continue  # dep is name's write on this op, not a read
+        dep_idx = read_deps.index(dep)
+        if dep_idx >= len(loop_info.tiled_dims_per_read):
+            continue
+        # Mirrors _general_tile_advance's own per-level loop: a dep whose
+        # outer per-level list is non-empty but every level's own
+        # (dim, extent) list is empty (e.g. [[], []]) still advances by
+        # zero -- _general_tile_advance's `if not dim_extent_pairs:
+        # continue` never contributes a term for such a level, so the
+        # resulting device_tile_advance_expr is None, not merely small.
+        if any(loop_info.tiled_dims_per_read[dep_idx]):
+            return True
+    return False
 
 
 def _writes_at_constant_offset(op: Operation) -> bool:

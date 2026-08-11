@@ -58,7 +58,7 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP, RESTICKIFY_OP
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.propagate_hints import DimHint
-from torch_spyre._inductor.wsr.coarse_tile import coarse_tile
+from torch_spyre._inductor.wsr.coarse_tile import coarse_tile_post_stickify
 from torch_spyre._inductor.wsr.coarse_tile_span_overflow import (
     _SPAN_OVERFLOW_HINT_ID,
     span_overflow_groups,
@@ -1716,21 +1716,17 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertEqual(op.dim_hints[0].loop_var, sympy.Symbol("h"))
         self.assertEqual(groups[0][1][0][1], sympy.Integer(_E2E_SPLIT_COUNT))
 
-    @patch("torch_spyre._inductor.wsr.coarse_tile.insert_tiling_propagation")
     @patch(
         "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
         _out_coords_for_bhld,
     )
-    def test_coarse_tile_consumes_auto_group_and_stamps_op(
-        self,
-        _mock_insert_tiling_propagation,
-    ):
+    def test_coarse_tile_consumes_auto_group_and_stamps_op(self):
         op = _pointwise_op(_E2E_SHAPE)
 
         with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
             graph = _graph([op])
             groups = _apply_span_overflow(graph)
-            coarse_tile(graph, groups)
+            coarse_tile_post_stickify(graph, groups)
 
         self.assertEqual(list(op.data.ranges), _E2E_TILE_SHAPE)
         self.assertEqual(list(op.layout.size), _E2E_TILE_SHAPE)
@@ -2143,31 +2139,28 @@ class TestSpanOverflowLargeShapeContract(InductorTestCase):
             "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
             _out_coords_for_bhld,
         ):
-            with patch(
-                "torch_spyre._inductor.wsr.coarse_tile.insert_tiling_propagation"
-            ):
-                with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
-                    # Layer 2: adapter emits the same group shape as user hints.
-                    auto_graph = _graph([auto_op])
-                    auto_groups = _apply_span_overflow(auto_graph)
-                    manual_graph = _graph([manual_op])
-                    manual_groups = _manual_h_hint_group(manual_op)
+            with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
+                # Layer 2: adapter emits the same group shape as user hints.
+                auto_graph = _graph([auto_op])
+                auto_groups = _apply_span_overflow(auto_graph)
+                manual_graph = _graph([manual_op])
+                manual_groups = _manual_h_hint_group(manual_op)
 
-                    self.assertEqual(len(auto_groups), 1)
-                    self.assertEqual(len(manual_groups), 1)
-                    self.assertEqual(auto_groups[0][1][0][1], sympy.Integer(5))
-                    self.assertEqual(manual_groups[0][1][0][1], sympy.Integer(5))
-                    self.assertEqual(auto_groups[0][1][0][1], sympy.Integer(5))
-                    self.assertEqual(manual_groups[0][1][0][1], sympy.Integer(5))
-                    # Span-overflow tiling is always an output dim (never reduction).
-                    self.assertFalse(auto_op.dim_hints[0].is_reduction)
-                    self.assertFalse(manual_op.dim_hints[0].is_reduction)
-                    self.assertEqual(auto_op.dim_hints[0].loop_var, sympy.Symbol("h"))
-                    self.assertEqual(manual_op.dim_hints[0].loop_var, sympy.Symbol("h"))
+                self.assertEqual(len(auto_groups), 1)
+                self.assertEqual(len(manual_groups), 1)
+                self.assertEqual(auto_groups[0][1][0][1], sympy.Integer(5))
+                self.assertEqual(manual_groups[0][1][0][1], sympy.Integer(5))
+                self.assertEqual(auto_groups[0][1][0][1], sympy.Integer(5))
+                self.assertEqual(manual_groups[0][1][0][1], sympy.Integer(5))
+                # Span-overflow tiling is always an output dim (never reduction).
+                self.assertFalse(auto_op.dim_hints[0].is_reduction)
+                self.assertFalse(manual_op.dim_hints[0].is_reduction)
+                self.assertEqual(auto_op.dim_hints[0].loop_var, sympy.Symbol("h"))
+                self.assertEqual(manual_op.dim_hints[0].loop_var, sympy.Symbol("h"))
 
-                    # Layer 3: coarse_tile stamps identical per-tile IR shape.
-                    coarse_tile(auto_graph, auto_groups)
-                    coarse_tile(manual_graph, manual_groups)
+                # Layer 3: coarse_tile stamps identical per-tile IR shape.
+                coarse_tile_post_stickify(auto_graph, auto_groups)
+                coarse_tile_post_stickify(manual_graph, manual_groups)
 
         self.assertEqual(list(auto_op.data.ranges), _E2E_TILE_SHAPE)
         self.assertEqual(list(manual_op.data.ranges), _E2E_TILE_SHAPE)

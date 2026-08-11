@@ -78,7 +78,7 @@ print(
 
 # First-fit baseline on a deep copy so buffer.address fields stay clean.
 ff_buffers = copy.deepcopy(buffers)
-FirstFitLayoutSolver(capacity).plan_layout(ff_buffers)
+FirstFitLayoutSolver(ff_buffers, capacity).plan_layout()
 ff_quality = sum(b.size for b in ff_buffers if b.address is not None)
 print(f"First-fit quality: {ff_quality}/{total_size}")
 
