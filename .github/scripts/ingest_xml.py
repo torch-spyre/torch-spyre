@@ -248,8 +248,9 @@ def parse_benchmark_xml(
     return run_meta, benchmarks
 
 
-def parse_kernel_xml(xml_path: Path, workflow: str = "", ci_run_id: str = "",
-                     platform: str = ""):
+def parse_kernel_xml(
+    xml_path: Path, workflow: str = "", ci_run_id: str = "", platform: str = ""
+):
     """Parse a per-kernel breakdown XML into (run_meta, list[kernel_row]).
 
     One testcase is already one row, so unlike parse_benchmark_xml there is no
@@ -317,10 +318,11 @@ def parse_kernel_xml(xml_path: Path, workflow: str = "", ci_run_id: str = "",
                 "config_name": _null_tag(tags.get("config")),
                 "batch_size": batch_size,
                 "prompt_length": prompt_length,
-                "run_mode": _null_tag(tags.get("mode")) or (
-                    None if is_granite else "op_benchmark"
-                ),
-                "input_shapes": None if is_granite else _null_tag(tags.get("input_shape")),
+                "run_mode": _null_tag(tags.get("mode"))
+                or (None if is_granite else "op_benchmark"),
+                "input_shapes": None
+                if is_granite
+                else _null_tag(tags.get("input_shape")),
                 "duration_ms": _opt_float({"t": tc.get("time")}, "t"),
                 "torch_spyre_ms": _opt_float(tags, "torch_spyre_ms"),
                 "sendnn_ms": _opt_float(tags, "sendnn_ms"),
@@ -906,7 +908,9 @@ def main():
                 parameters={"sf": run_meta["source_file"]},
             )
             if existing.result_rows[0][0] > 0:
-                print(f"  Already ingested kernels — skipping {run_meta['source_file']}")
+                print(
+                    f"  Already ingested kernels — skipping {run_meta['source_file']}"
+                )
                 continue
 
             run_id = uuid.uuid4().int >> 64
