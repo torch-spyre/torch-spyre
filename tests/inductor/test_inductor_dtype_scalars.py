@@ -373,6 +373,49 @@ class TestDatatypeScalarOperations:
         # For large numbers, atol must be large, but rtol is the real gate
         _compare_modes(execution_mode, large_scalar_mul, x, atol=1e25, rtol=1e-3)
 
+    def test_add_0dim_fp32_scalar_to_fp16_tensor(self, execution_mode):
+        """
+        Regression test: adding a 0-D FP32 scalar tensor to an FP16 tensor.
+
+        Bug: compiling ``x + s`` where ``x`` is FP16 and ``s`` is a 0-D
+        FP32 tensor raised ``IndexError: list index out of range`` in
+        ``parse_op_spec`` (torch_spyre/_inductor/codegen/superdsc.py).
+        The fp32->fp16 dtype-conversion op for the scalar has no stick
+        dim (``op_stick_dim`` is ``None`` since the tensor is 0-D), and
+        the SDSC spec builder indexed into empty dim lists.
+        """
+
+        def add_scalar(x, s):
+            return x + s
+
+        x = torch.ones(64, dtype=torch.float16)
+        s = torch.tensor(2.0, dtype=torch.float32)
+        _compare_modes(execution_mode, add_scalar, x, s, atol=1e-3, rtol=1e-3)
+
+    @pytest.mark.parametrize(
+        "src_dtype,dst_dtype",
+        [
+            (torch.float32, torch.float16),
+            (torch.float16, torch.float32),
+        ],
+    )
+    def test_0dim_scalar_dtype_conversion(self, execution_mode, src_dtype, dst_dtype):
+        """
+        Regression test: explicit ``.to()`` dtype conversion on a 0-D scalar
+        tensor.
+
+        Exercises the fp32<->fp16 dtype-conversion SDSC op directly on a 0-D
+        tensor (``op_stick_dim`` is ``None``, same code path as
+        ``test_add_0dim_fp32_scalar_to_fp16_tensor``), independent of the
+        implicit conversion performed inside ``x + s``.
+        """
+
+        def convert_scalar(s):
+            return s.to(dst_dtype)
+
+        s = torch.tensor(2.0, dtype=src_dtype)
+        _compare_modes(execution_mode, convert_scalar, s, atol=1e-3, rtol=1e-3)
+
     @torch._dynamo.config.patch(assume_static_by_default=False)
     def test_dtype_conversion_with_symbolic_dimensions(self, execution_mode):
         """

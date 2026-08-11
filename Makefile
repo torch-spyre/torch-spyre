@@ -17,6 +17,7 @@ TEST_CONFIGS ?= tests/configs/torch_spyre_tests
 #                       LX/scratchpad planning, tensor layout, allocator/GC,
 #                       D2D copies (used as the default in integration-tests.yaml,
 #                       triggered by those upstream repos)
+#   full             — everything (core + LX-planning); default for `make tests`
 #   full             — everything (core + LX-planning) under TEST_CONFIGS;
 #                      default for `make tests`
 #   trunk            — full, run across every suite directory CI's four
@@ -80,6 +81,7 @@ precommit: ## Run all pre-commit hooks against every file
 # ---------------------------------------------------------------------------
 
 .PHONY: tests
+tests: ## Run torch spyre tests. Narrow scope with TEST_TYPE=smoke|core|full|perf|suite_<group>. TEST_CONFIGS may point at a config directory (filtered by TEST_TYPE) or a single config yaml file (run directly).
 tests: ## Run torch spyre tests. Narrow scope with TEST_TYPE=smoke|core|full|trunk|perf|suite_<group>. TEST_CONFIGS may point at a config directory (filtered by TEST_TYPE) or a single config yaml file (run directly); ignored when TEST_TYPE=trunk (see TRUNK_CONFIG_DIRS).
 # TEST_TYPE=perf is a benchmark mode, not a pytest-config suite: it does not
 # run the OOT config machinery below. It shells out to the installed

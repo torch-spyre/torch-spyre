@@ -1012,9 +1012,29 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     # require at least one outer spatial dim beyond the stick; inject a
     # virtual mb=1 row when the op's tensor has only the stick dim.
     mb_sym: Symbol | None = None
+    is_non_identity_dtype_op = (
+        DtypeOpTable.is_dtype_op(op_spec.op) and op_spec.op != IDENTITY_OP
+    )
+
+    if is_non_identity_dtype_op and op_stick_dim is None:
+        input_stick_label_idx = ndim if ndim != 0 else ndim + 1
+        input_stick_sym = Symbol(INPUT_DIM_LABELS[input_stick_label_idx])
+        sdsc_iteration_space[input_stick_sym] = op_spec.args[
+            0
+        ].device_dtype.elems_per_stick()
+        work_slices[input_stick_sym] = 1
+        dim_splits[input_stick_sym] = 1
+        output_stick_sym = Symbol(OUTPUT_DIM_LABELS[0])
+        sdsc_iteration_space[output_stick_sym] = max(
+            arg.device_dtype.elems_per_stick() for arg in op_spec.args
+        )
+        work_slices[output_stick_sym] = 1
+        dim_splits[output_stick_sym] = 1
+        op_dim_order = [output_stick_sym]
+        op_stick_dim = output_stick_sym
+
     if (
-        (DtypeOpTable.is_dtype_op(op_spec.op) or op_spec.op == "qfp8ch")
-        and op_spec.op != IDENTITY_OP
+        (is_non_identity_dtype_op or op_spec.op == "qfp8ch")
         and op_stick_dim is not None
         and all(d is op_stick_dim for d in op_dim_order)
     ):
