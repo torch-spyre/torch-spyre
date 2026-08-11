@@ -147,7 +147,6 @@ bool SpyreStream::query() const {
 }
 
 void SpyreStream::synchronize() const {
-  RECORD_FUNCTION("host::synchronize", {});
   c10::DeviceGuard device_guard(stream_.device());
 
   DEBUGINFO("SpyreStream::synchronize() - stream ", id(), " on device ",
