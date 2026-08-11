@@ -13,8 +13,13 @@ generation loop. Weights, tokenizer, and config come straight from
 
 hf-adapters is a separate Apache-2.0 project in the same
 [torch-spyre](https://github.com/torch-spyre) GitHub organization. It depends
-on `torch_spyre` for the Spyre device, so install and build Torch-Spyre first
-(see [Installation](../getting_started/installation.md)).
+on `torch_spyre` for the Spyre device. The `spyre` dependency group resolves
+`torch-spyre` from Git at the revision pinned in the hf-adapters
+`pyproject.toml` (currently `main`), so a separate local Torch-Spyre checkout
+is not used by default. For development against a specific Torch-Spyre
+revision, pin that rev in `[tool.uv.sources]` or add a local uv source
+override (see [Installation](../getting_started/installation.md) for building
+Torch-Spyre from source).
 
 ![How hf-adapters runs a stock HuggingFace checkpoint on Spyre: the loader selects an adapter by config type, keeps weights, tokenizer, embeddings, projections, and the MLP from transformers, and replaces only the operations Spyre cannot run natively.](../_static/images/hf-adapters/fig-hf-adapters-approach.svg)
 
@@ -22,12 +27,13 @@ The loader reads the checkpoint's config, picks the adapter for that model
 family, and patches one live HF model instance. Everything Spyre executes
 natively stays as it is in `transformers`. Only the operations Spyre cannot
 run natively are swapped: RoPE becomes a precomputed rotation matmul because
-Spyre has no `sin`/`cos`, RMSNorm stays in fp16 because Spyre does not convert
-dtype on-device, the LM head is padded to a stick-aligned vocab so work
-division fits the 256 MB per-core span limit, the decoder blocks become
-compiled `block_forward` functions with raw-tensor KV caches, the attention
-mask is built on CPU in fp16, and `generate()` is a 64-block padded decode
-loop. The per-operation rationale is documented in the project's
+Spyre has no `sin`/`cos`, RMSNorm is patched to compute in the model's device
+dtype rather than the float32 upcast stock HF uses, the LM head is padded to a
+stick-aligned vocab so work division fits the 256 MB per-core span limit, the
+decoder blocks become compiled `block_forward` functions with raw-tensor KV
+caches, the attention mask is built on CPU as a `float16` tensor, and
+`generate()` is a 64-block padded decode loop. The per-operation rationale is
+documented in the project's
 [ARCHITECTURE.md](https://github.com/torch-spyre/hf-adapters/blob/main/ARCHITECTURE.md#how-the-adapters-work).
 
 Coverage spans four kinds of model: generative causal-LMs, embedding models
@@ -52,8 +58,12 @@ uv sync --group spyre
 ```
 
 The `spyre` group is only needed on a host with Spyre hardware. The CPU
-accuracy tests, which compare an adapter against stock HF, run from a plain
-`uv sync` with no accelerator present.
+accuracy tests, which compare an adapter against stock HF, need no
+accelerator, but they do need the `test` group for `pytest`:
+
+```bash
+uv sync --group test
+```
 
 ## Generative models
 
@@ -76,11 +86,15 @@ print(outputs[0])
 
 The `generate` method attached to the model is not the stock HF one. It runs a
 64-block padded decode loop and takes the tokenizer and a list of prompts
-rather than pre-tokenized `input_ids`. The signature is
-`generate(tokenizer, prompts, max_new_tokens=128, do_sample=False,
-temperature=1.0, top_k=50)`. See
+rather than pre-tokenized `input_ids`. Its signature is
+`generate(tokenizer, prompts, max_new_tokens, do_sample=None,
+temperature=None, top_k=None, top_p=None, eos_token_id=..., timing=False)`.
+`max_new_tokens` is required. The sampling parameters default to `None` and
+resolve from the model's `generation_config` at call time, so the effective
+default follows `explicit kwarg > generation_config > HF global default`. See
 [docs/generate_vs_stock_hf.md](https://github.com/torch-spyre/hf-adapters/blob/main/docs/generate_vs_stock_hf.md)
-in the project for how it differs from `transformers.generate`.
+in the project for the full contract and how it differs from
+`transformers.generate`.
 
 ## Embedding models
 
@@ -101,15 +115,22 @@ the rest, work unchanged.
 
 ## A note on numerical accuracy
 
-Spyre has known numerical accuracy limits on the single-token decode path.
-Greedy token mismatches between a CPU run and a Spyre run are expected on some
-models until the relevant `torch_spyre` fixes merge. The hf-adapters test
-suite accounts for this: the multimodal tests, for example, assert a per-step
-logit cosine floor rather than exact token equality. If you are comparing
-Spyre output against a CPU reference and see divergence on later tokens, this
-is the reason. The per-adapter notes in
-[ARCHITECTURE.md](https://github.com/torch-spyre/hf-adapters/blob/main/ARCHITECTURE.md#verified-checkpoints)
-record which checkpoints are affected.
+Greedy decoding on Spyre can diverge from the same model on CPU. Prefill and
+the first decode token often match, but later tokens can drift, and once a
+token differs the rest of the sequence can become incoherent. The cause is not
+a single missing feature. Spyre uses dtype conversions that differ slightly
+from CPU, and greedy decoding is sensitive to small numerical differences: a
+tiny gap in the logits flips the argmax, and the error compounds token by
+token. Because the `torch_spyre` stack changes often, both the severity and
+the set of affected models shift over time, so treat multi-token generation as
+unreliable for any checkpoint you have not verified.
+
+The hf-adapters test suite accounts for this. The multimodal tests, for
+example, assert a per-step logit cosine floor rather than exact token
+equality. For which checkpoints have been verified and in which mode, use the
+per-adapter list in
+[ARCHITECTURE.md](https://github.com/torch-spyre/hf-adapters/blob/main/ARCHITECTURE.md#verified-checkpoints),
+which is kept current as the stack moves.
 
 ## Learn more about the approach
 
@@ -120,10 +141,6 @@ The hf-adapters project documents its design in detail:
   HuggingFace, per-model adaptations, and the verified checkpoint list.
 - [generate_vs_stock_hf.md](https://github.com/torch-spyre/hf-adapters/blob/main/docs/generate_vs_stock_hf.md)
   explains how the Spyre `generate()` differs from `transformers.generate`.
-- [spyre-numerical-findings.md](https://github.com/torch-spyre/hf-adapters/blob/main/docs/spyre-numerical-findings.md)
-  records the numerical accuracy findings behind the caveat above.
-- [fms_comparison.md](https://github.com/torch-spyre/hf-adapters/blob/main/docs/fms_comparison.md)
-  compares the adapter path with the Foundation Model Stack.
 
 ## See Also
 
