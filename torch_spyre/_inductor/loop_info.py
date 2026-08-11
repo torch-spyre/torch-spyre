@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Literal
 import sympy
 
 if TYPE_CHECKING:
+    from torch._inductor.dependencies import MemoryDep
     from torch._inductor.ir import ComputedBuffer
 
 
@@ -112,6 +113,56 @@ class PropagationPlan:
     reduction: ReductionPlan | None = None
     outside_consumer_names: tuple[str, ...] = ()
     is_graph_output: bool = False
+
+
+@dataclass(frozen=True)
+class ReadCopyEntry:
+    """One shared copy to insert for a cross-group buffer read.
+
+    Attributes
+    ----------
+    copy_name:
+        Qualified name to assign the inserted copy ComputedBuffer.
+    dep:
+        The canonical MemoryDep (buffer name + index + var_names + size)
+        every equivalent read in the group shares -- the same object one of
+        the consuming ops' own full_deps produced, used to size/index the
+        copy exactly as _insert_read_copy_ops does today.
+    insert_before_op_name:
+        get_operation_name() of the first (operations order) consuming op
+        in the group -- where the copy is inserted.
+    sizing_op_name:
+        get_operation_name() of the op supplying tiled_op.loop_info for
+        the copy's own read/write-level-extent computation (the first
+        consuming op, per the sizing-invariant in the design doc).
+    consumer_op_names:
+        Names of every op in the group that must have this dep's buffer
+        name patched (via _NameSwapHandler) to load from copy_name instead.
+    """
+
+    copy_name: str
+    dep: "MemoryDep"
+    insert_before_op_name: str
+    sizing_op_name: str
+    consumer_op_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ReadCopyPlan:
+    """Per-group plan for Pass 1 (read-copy insertion).
+
+    Computed once during planning (_plan_read_copies, run after every
+    group's _apply_plan) and consumed by a slimmed _insert_all_read_copy_ops
+    that only executes these decisions.
+
+    Attributes
+    ----------
+    entries:
+        One ReadCopyEntry per distinct (buffer name, canonical index expr)
+        pair read cross-group by at least one op in this group.
+    """
+
+    entries: tuple["ReadCopyEntry", ...]
 
 
 @dataclass

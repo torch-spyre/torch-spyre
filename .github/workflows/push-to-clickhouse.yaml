@@ -200,7 +200,8 @@ jobs:
             --run-id   "${TRIGGERING_RUN_ID}" \
             --triggered-at "${TRIGGERING_AT}" \
             --pr-number    "${{ steps.resolve-pr.outputs.pr_number }}" \
-            --trigger-type "${{ steps.extract-tier.outputs.tier }}"
+            --trigger-type "${{ steps.extract-tier.outputs.tier }}" \
+            --platform     x86_64
         env:
           # PROD INSTANCE
           CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}

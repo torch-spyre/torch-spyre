@@ -29,6 +29,8 @@ from torch._inductor.graph import GraphLowering
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import config as ts_inductor_config
+from torch_spyre._inductor.pass_utils import op_read_writes
+from torch_spyre._inductor.scratchpad.utils import calculate_liveness
 
 try:
     from ortools.sat.python import cp_model  # noqa: F401
@@ -1097,6 +1099,56 @@ class TestIntermediatePartialReadNotPinned(BaseTestScratchpadUsage):
         )
 
 
+class TestLivenessIndicesAreDistinct(BaseTestScratchpadUsage):
+    """``calculate_liveness`` records one distinct op index per accessing op.
+
+    ``rw.reads | rw.writes`` is a set of *dependencies*, not of names, so an op
+    touching one buffer through two index expressions contributes two deps naming
+    it; appending per dep would repeat that op's index. The repeat is invisible to
+    ``start_time``/``end_time``, inflates ``read_count``, and would let a buffer
+    written and read by the same op pass as an in-place parent -- so
+    ``calculate_liveness`` collapses it and
+    :class:`LifetimeBoundBuffer` asserts the result is strictly increasing.
+
+    That assertion is exercised elsewhere over hand-built lists, which proves it
+    fires but not that the producer satisfies it. Only a real lowering can show
+    that, which is what this test does.
+    """
+
+    def test_fused_slice_input_has_one_use_per_op(self):
+        seen: dict[str, list[int]] = {}
+        multi_dep: list[str] = []
+
+        def visitor(graph: GraphLowering) -> None:
+            seen.update(calculate_liveness(graph))
+            for op in graph.operations:
+                rw = op_read_writes(op)
+                names = [dep.name for dep in rw.reads | rw.writes]
+                multi_dep.extend(n for n in set(names) if names.count(n) > 1)
+
+        def fn(x):
+            # One fused add reading x at offset 0 and at offset 512: two deps on
+            # the same buffer from a single op, the shape the dedup exists for.
+            return x[:, 0:512] + x[:, 512:1024]
+
+        with self.pre_scheduling_iterating_pass(visitor):
+            # (64, 1024) matches the shape ``_input_read_at_multiple_offsets_is_correct``
+            # already drives this same expression with, so the two-deps lowering is
+            # known to hold for it.
+            torch.compile(fn, fullgraph=True)(self.rand_device((64, 1024))).to("cpu")
+
+        self.assertTrue(seen, "liveness visitor never ran")
+        # The scenario must still produce the two-deps-one-buffer shape, else the
+        # check below is free for every buffer and covers nothing.
+        self.assertTrue(
+            multi_dep, "no op read one buffer through two deps in this scenario"
+        )
+        for name, uses in seen.items():
+            # Distinct *and* ascending in one assertion: exactly what
+            # LifetimeBoundBuffer requires of ``uses``.
+            self.assertEqual(uses, sorted(set(uses)), name)
+
+
 class TestCpSatAllocatorFallback(
     BaseTestScratchpadUsage, metaclass=_ParameterizedScratchpadMeta
 ):
@@ -1302,14 +1354,14 @@ class TestSelectAllocator(unittest.TestCase):
         ):
             a = select_allocator()
             self.assertIs(type(a), ScratchpadAllocator)
-            self.assertIsInstance(a.layout_planning, GreedyLayoutSolver)
+            self.assertEqual(a.layout_planning, GreedyLayoutSolver)
 
         with ts_inductor_config.patch(
             layout_solver="bestfit", co_optimizing_lx_planning=False
         ):
             a = select_allocator()
             self.assertIs(type(a), ScratchpadAllocator)
-            self.assertIsInstance(a.layout_planning, BestFitLayoutSolver)
+            self.assertEqual(a.layout_planning, BestFitLayoutSolver)
 
         with ts_inductor_config.patch(
             layout_solver="greedy", co_optimizing_lx_planning=True
@@ -1327,7 +1379,7 @@ class TestSelectAllocator(unittest.TestCase):
                 self.assertIsInstance(a, CoOptimizingAllocator)
             else:
                 self.assertIs(type(a), ScratchpadAllocator)
-                self.assertIsInstance(a.layout_planning, GreedyLayoutSolver)
+                self.assertEqual(a.layout_planning, GreedyLayoutSolver)
 
         # cpsat without co-optimization is placement-only: a ScratchpadAllocator
         # driven by the CP-SAT solver on the pre-determined core divisions.
@@ -1341,10 +1393,10 @@ class TestSelectAllocator(unittest.TestCase):
                     CpSatLayoutSolver,
                 )
 
-                self.assertIsInstance(a.layout_planning, CpSatLayoutSolver)
+                self.assertEqual(a.layout_planning, CpSatLayoutSolver)
             else:
                 # ortools absent: falls back to greedy placement.
-                self.assertIsInstance(a.layout_planning, GreedyLayoutSolver)
+                self.assertEqual(a.layout_planning, GreedyLayoutSolver)
 
         with ts_inductor_config.patch(
             layout_solver="bogus", co_optimizing_lx_planning=False

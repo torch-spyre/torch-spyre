@@ -107,8 +107,8 @@ test_suite_config:
                       - value: 2.0
                       - value: false
                       - value: false
-                  description: 'site-packages/accelerate/hooks.py:192 in torch_dynamo_resume_in_new_forward_at_187, code: output = module._old_forward(*args,
-                    **kwargs)'
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L403 in forward,
+                    code: inputs_embeds = self.embed_tokens(input_ids)'
                   tags:
                     - bf16operation
                     - constant
@@ -124,12 +124,138 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: 12.0
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L439 in torch_dynamo_resume_in_forward_at_437,
-                    code: inputs_embeds = inputs_embeds * self.embedding_multiplier  # main diff with Llama'
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L405 in forward,
+                    code: inputs_embeds = inputs_embeds * self.embedding_multiplier'
                   tags:
                     - bf16operation
                     - constant
                     - torch.mul.1
+                - name: torch.arange
+                  sample_inputs_func:
+                    args:
+                      - value: 1
+                    kwargs:
+                      device: cuda:0
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/masking_utils.py#L507 in sdpa_mask, code: batch_arange
+                    = torch.arange(batch_size, device=device)'
+                  tags:
+                    - constant
+                    - torch.arange.1
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [41]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: 0
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/masking_utils.py#L509 in sdpa_mask, code: q_arange
+                    = torch.arange(q_length, device=device) + q_offset'
+                  tags:
+                    - constant
+                    - torch.add.1
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [2048]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: 0
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/masking_utils.py#L510 in sdpa_mask, code: kv_arange
+                    = torch.arange(kv_length, device=device) + kv_offset'
+                  tags:
+                    - constant
+                    - torch.add.2
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [41]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - py: (None, None, slice(None, None, None), None)
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/masking_utils.py#L366 in _non_vmap_expansion_sdpa,
+                    code: q_indices = q_indices[None, None, :, None]'
+                  tags:
+                    - constant
+                    - torch.getitem.1
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [2048]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - py: (None, None, None, slice(None, None, None))
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/masking_utils.py#L367 in _non_vmap_expansion_sdpa,
+                    code: kv_indices = kv_indices[None, None, None, :]'
+                  tags:
+                    - constant
+                    - torch.getitem.2
+                - name: torch.le
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1, 2048]
+                          stride: [2048, 2048, 2048, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - tensor:
+                          shape: [1, 1, 41, 1]
+                          stride: [41, 41, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/masking_utils.py#L80 in causal_mask_function,
+                    code: return kv_idx <= q_idx'
+                  tags:
+                    - torch.le.1
+                - name: torch.Tensor.expand
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 41, 2048]
+                          stride: [83968, 83968, 2048, 1]
+                          storage_offset: 0
+                          dtype: torch.bool
+                          device: cuda:0
+                      - value: 1
+                      - value: -1
+                      - value: 41
+                      - value: 2048
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/masking_utils.py#L518 in sdpa_mask, code: attention_mask
+                    = attention_mask.expand(batch_size, -1, q_length, kv_length)'
+                  tags:
+                    - constant
+                    - torch.Tensor.expand.1
                 - name: torch.getitem
                   sample_inputs_func:
                     args:
@@ -141,12 +267,12 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - py: (None, slice(None, None, None), None)
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L373 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L354 in forward,
                     code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
                   tags:
                     - fp32operation
                     - constant
-                    - torch.getitem.1
+                    - torch.getitem.3
                 - name: torch.float
                   sample_inputs_func:
                     args:
@@ -157,7 +283,7 @@ test_suite_config:
                           dtype: torch.float32
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L373 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L354 in forward,
                     code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
                   tags:
                     - fp32operation
@@ -175,12 +301,12 @@ test_suite_config:
                       - value: 1
                       - value: -1
                       - value: 1
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L373 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L354 in forward,
                     code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
                   tags:
                     - fp32operation
                     - constant
-                    - torch.Tensor.expand.1
+                    - torch.Tensor.expand.2
                 - name: torch.to
                   sample_inputs_func:
                     args:
@@ -192,7 +318,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: cuda:0
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L373 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L354 in forward,
                     code: inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
                   tags:
                     - fp32operation
@@ -211,11 +337,11 @@ test_suite_config:
                           init_args:
                             high: 1000
                       - py: (slice(None, None, None), None, slice(None, None, None))
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L374 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L355 in forward,
                     code: position_ids_expanded = position_ids[:, None, :].float()'
                   tags:
                     - constant
-                    - torch.getitem.2
+                    - torch.getitem.4
                 - name: torch.float
                   sample_inputs_func:
                     args:
@@ -228,7 +354,7 @@ test_suite_config:
                           init: randint
                           init_args:
                             high: 1000
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L374 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L355 in forward,
                     code: position_ids_expanded = position_ids[:, None, :].float()'
                   tags:
                     - torch.float.2
@@ -242,7 +368,7 @@ test_suite_config:
                           dtype: torch.float32
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L378 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L359 in forward,
                     code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
                   tags:
                     - fp32operation
@@ -264,7 +390,7 @@ test_suite_config:
                           dtype: torch.float32
                           device: cuda:0
                           init: xavier
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L378 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L359 in forward,
                     code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
                   tags:
                     - fp32operation
@@ -281,7 +407,7 @@ test_suite_config:
                           init: rand
                       - value: 1
                       - value: 2
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L378 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L359 in forward,
                     code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
                   tags:
                     - fp32operation
@@ -305,7 +431,7 @@ test_suite_config:
                             init: rand
                     kwargs:
                       dim: -1
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L379 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L360 in forward,
                     code: emb = torch.cat((freqs, freqs), dim=-1)'
                   tags:
                     - fp32operation
@@ -321,7 +447,7 @@ test_suite_config:
                           dtype: torch.float32
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L380 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L361 in forward,
                     code: cos = emb.cos() * self.attention_scaling'
                   tags:
                     - fp32operation
@@ -337,7 +463,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: 1.0
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L380 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L361 in forward,
                     code: cos = emb.cos() * self.attention_scaling'
                   tags:
                     - fp32operation
@@ -353,7 +479,7 @@ test_suite_config:
                           dtype: torch.float32
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L381 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L362 in forward,
                     code: sin = emb.sin() * self.attention_scaling'
                   tags:
                     - fp32operation
@@ -370,11 +496,20 @@ test_suite_config:
                           init: rand
                     kwargs:
                       dtype: torch.bfloat16
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L383 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L364 in forward,
                     code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
                   tags:
                     - fp32operation
                     - torch.to.2
+                - name: torch._C._log_api_usage_once
+                  sample_inputs_func:
+                    args:
+                      - value: python.nn_module
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L426 in forward,
+                    code: for decoder_layer in self.layers[: self.config.num_hidden_layers]:'
+                  tags:
+                    - constant
+                    - torch._C._log_api_usage_once.1
                 - name: torch.to
                   sample_inputs_func:
                     args:
@@ -386,7 +521,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: torch.float32
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L200 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L194 in forward,
                     code: hidden_states = hidden_states.to(torch.float32)'
                   tags:
                     - bf16operation
@@ -403,7 +538,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: 2
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L201 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L195 in forward,
                     code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
                   tags:
                     - fp32operation
@@ -422,7 +557,7 @@ test_suite_config:
                       - value: -1
                     kwargs:
                       keepdim: true
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L201 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L195 in forward,
                     code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
                   tags:
                     - fp32operation
@@ -439,12 +574,12 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: 1.0e-05
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L202 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L196 in forward,
                     code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
                   tags:
                     - fp32operation
                     - constant
-                    - torch.add.1
+                    - torch.add.3
                 - name: torch.rsqrt
                   sample_inputs_func:
                     args:
@@ -455,7 +590,7 @@ test_suite_config:
                           dtype: torch.float32
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L202 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L196 in forward,
                     code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
                   tags:
                     - fp32operation
@@ -477,7 +612,7 @@ test_suite_config:
                           dtype: torch.float32
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L202 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L196 in forward,
                     code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
                   tags:
                     - fp32operation
@@ -493,7 +628,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: torch.bfloat16
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L203 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L197 in forward,
                     code: return self.weight * hidden_states.to(input_dtype)'
                   tags:
                     - fp32operation
@@ -516,7 +651,7 @@ test_suite_config:
                           dtype: torch.bfloat16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L203 in forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L197 in forward,
                     code: return self.weight * hidden_states.to(input_dtype)'
                   tags:
                     - bf16operation
@@ -539,8 +674,8 @@ test_suite_config:
                           device: cuda:0
                           init: xavier
                       - value: null
-                  description: 'site-packages/accelerate/hooks.py:192 in torch_dynamo_resume_in_new_forward_at_187, code: output = module._old_forward(*args,
-                    **kwargs)'
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L152 in forward,
+                    code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
                   tags:
                     - bf16operation
                     - constant
@@ -556,7 +691,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: (1, 41, -1, 128)
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L156 in torch_dynamo_resume_in_forward_at_156,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L152 in forward,
                     code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
                   tags:
                     - bf16operation
@@ -574,7 +709,7 @@ test_suite_config:
                           init: rand
                       - value: 1
                       - value: 2
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L156 in torch_dynamo_resume_in_forward_at_156,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L152 in forward,
                     code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
                   tags:
                     - bf16operation
@@ -598,8 +733,8 @@ test_suite_config:
                           device: cuda:0
                           init: xavier
                       - value: null
-                  description: 'site-packages/accelerate/hooks.py:192 in torch_dynamo_resume_in_new_forward_at_187, code: output = module._old_forward(*args,
-                    **kwargs)'
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L153 in forward,
+                    code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
                   tags:
                     - bf16operation
                     - constant
@@ -615,7 +750,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: (1, 41, -1, 128)
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L157 in torch_dynamo_resume_in_forward_at_157,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L153 in forward,
                     code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
                   tags:
                     - bf16operation
@@ -633,7 +768,7 @@ test_suite_config:
                           init: rand
                       - value: 1
                       - value: 2
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L157 in torch_dynamo_resume_in_forward_at_157,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L153 in forward,
                     code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
                   tags:
                     - bf16operation
@@ -650,7 +785,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: 1
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L73 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L70 in apply_rotary_pos_emb,
                     code: cos = cos.unsqueeze(unsqueeze_dim)'
                   tags:
                     - bf16operation
@@ -673,7 +808,7 @@ test_suite_config:
                           dtype: torch.bfloat16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L75 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L72 in apply_rotary_pos_emb,
                     code: q_embed = (q * cos) + (rotate_half(q) * sin)'
                   tags:
                     - bf16operation
@@ -689,12 +824,12 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - py: (Ellipsis, slice(None, 64, None))
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L49 in rotate_half,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L46 in rotate_half,
                     code: x1 = x[..., : x.shape[-1] // 2]'
                   tags:
                     - bf16operation
                     - constant
-                    - torch.getitem.3
+                    - torch.getitem.5
                 - name: torch.neg
                   sample_inputs_func:
                     args:
@@ -705,7 +840,7 @@ test_suite_config:
                           dtype: torch.bfloat16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L51 in rotate_half,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L48 in rotate_half,
                     code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - bf16operation
@@ -728,7 +863,7 @@ test_suite_config:
                             init: rand
                     kwargs:
                       dim: -1
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L51 in rotate_half,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L48 in rotate_half,
                     code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - bf16operation
@@ -751,7 +886,7 @@ test_suite_config:
                           dtype: torch.bfloat16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L75 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L72 in apply_rotary_pos_emb,
                     code: q_embed = (q * cos) + (rotate_half(q) * sin)'
                   tags:
                     - bf16operation
@@ -773,11 +908,11 @@ test_suite_config:
                           dtype: torch.bfloat16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L75 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L72 in apply_rotary_pos_emb,
                     code: q_embed = (q * cos) + (rotate_half(q) * sin)'
                   tags:
                     - bf16operation
-                    - torch.add.2
+                    - torch.add.4
                 - name: torch.mul
                   sample_inputs_func:
                     args:
@@ -795,7 +930,7 @@ test_suite_config:
                           dtype: torch.bfloat16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L76 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L73 in apply_rotary_pos_emb,
                     code: k_embed = (k * cos) + (rotate_half(k) * sin)'
                   tags:
                     - bf16operation
@@ -811,12 +946,12 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - py: (Ellipsis, slice(None, 64, None))
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L49 in rotate_half,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L46 in rotate_half,
                     code: x1 = x[..., : x.shape[-1] // 2]'
                   tags:
                     - bf16operation
                     - constant
-                    - torch.getitem.4
+                    - torch.getitem.6
                 - name: torch.neg
                   sample_inputs_func:
                     args:
@@ -827,7 +962,7 @@ test_suite_config:
                           dtype: torch.bfloat16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L51 in rotate_half,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L48 in rotate_half,
                     code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - bf16operation
@@ -850,7 +985,7 @@ test_suite_config:
                             init: rand
                     kwargs:
                       dim: -1
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L51 in rotate_half,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L48 in rotate_half,
                     code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - bf16operation
@@ -873,7 +1008,7 @@ test_suite_config:
                           dtype: torch.bfloat16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L76 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L73 in apply_rotary_pos_emb,
                     code: k_embed = (k * cos) + (rotate_half(k) * sin)'
                   tags:
                     - bf16operation
@@ -895,11 +1030,11 @@ test_suite_config:
                           dtype: torch.bfloat16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L76 in apply_rotary_pos_emb,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L73 in apply_rotary_pos_emb,
                     code: k_embed = (k * cos) + (rotate_half(k) * sin)'
                   tags:
                     - bf16operation
-                    - torch.add.3
+                    - torch.add.5
                 - name: torch.zeros
                   sample_inputs_func:
                     args:
@@ -907,11 +1042,72 @@ test_suite_config:
                     kwargs:
                       dtype: torch.bfloat16
                       device: cuda:0
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/cache_utils.py#L290 in lazy_initialization, code:
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L378 in lazy_initialization, code:
                     self.keys = torch.zeros('
                   tags:
                     - constant
                     - torch.zeros.1
+                - name: torch.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: []
+                          stride: []
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cpu
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: cuda:0
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L388 in lazy_initialization, code:
+                    self.cumulative_length = self.cumulative_length.to(self.device)'
+                  tags:
+                    - constant
+                    - tensorsoncpu
+                    - torch.to.5
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [41]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - tensor:
+                          shape: []
+                          stride: []
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L420 in update, code: cache_position
+                    = torch.arange(kv_length, device=self.device) + self.cumulative_length'
+                  tags:
+                    - torch.add.6
+                - name: torch.add_
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: []
+                          stride: []
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - value: 41
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L422 in update, code: self.cumulative_length.add_(kv_length)'
+                  tags:
+                    - constant
+                    - torch.add_.1
                 - name: torch.index_copy_
                   sample_inputs_func:
                     args:
@@ -939,7 +1135,7 @@ test_suite_config:
                           dtype: torch.bfloat16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/cache_utils.py#L340 in update, code: self.keys.index_copy_(2,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L426 in update, code: self.keys.index_copy_(2,
                     cache_position, key_states)'
                   tags:
                     - bf16operation
@@ -956,12 +1152,12 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - py: (slice(None, None, None), slice(None, None, None), None, slice(None, None, None), slice(None, None, None))
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L24 in repeat_kv,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L24 in repeat_kv,
                     code: hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)'
                   tags:
                     - bf16operation
                     - constant
-                    - torch.getitem.5
+                    - torch.getitem.7
                 - name: torch.Tensor.expand
                   sample_inputs_func:
                     args:
@@ -977,12 +1173,12 @@ test_suite_config:
                       - value: 4
                       - value: 2048
                       - value: 128
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L24 in repeat_kv,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L24 in repeat_kv,
                     code: hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)'
                   tags:
                     - bf16operation
                     - constant
-                    - torch.Tensor.expand.2
+                    - torch.Tensor.expand.3
                 - name: torch.reshape
                   sample_inputs_func:
                     args:
@@ -994,7 +1190,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: (1, 32, 2048, 128)
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L25 in repeat_kv,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L25 in repeat_kv,
                     code: return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)'
                   tags:
                     - bf16operation
@@ -1028,7 +1224,7 @@ test_suite_config:
                       dropout_p: 0.0
                       scale: 0.0078125
                       is_causal: false
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L92 in sdpa_attention_forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
                     code: attn_output = torch.nn.functional.scaled_dot_product_attention('
                   tags:
                     - bf16operation
@@ -1045,7 +1241,7 @@ test_suite_config:
                           init: rand
                       - value: 1
                       - value: 2
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L102 in sdpa_attention_forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L164 in sdpa_attention_forward,
                     code: attn_output = attn_output.transpose(1, 2).contiguous()'
                   tags:
                     - bf16operation
@@ -1061,7 +1257,7 @@ test_suite_config:
                           dtype: torch.bfloat16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/integrations/sdpa_attention.py#L102 in sdpa_attention_forward,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L164 in sdpa_attention_forward,
                     code: attn_output = attn_output.transpose(1, 2).contiguous()'
                   tags:
                     - bf16operation
@@ -1077,7 +1273,7 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: (1, 41, -1)
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L183 in torch_dynamo_resume_in_forward_at_158,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L177 in forward,
                     code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
                   tags:
                     - bf16operation
@@ -1093,7 +1289,7 @@ test_suite_config:
                           dtype: torch.bfloat16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L183 in torch_dynamo_resume_in_forward_at_158,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L177 in forward,
                     code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
                   tags:
                     - bf16operation
@@ -1115,11 +1311,95 @@ test_suite_config:
                           dtype: torch.bfloat16
                           device: cuda:0
                           init: rand
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L286 in torch_dynamo_resume_in_forward_at_275,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L273 in forward,
                     code: hidden_states = residual + hidden_states * self.residual_multiplier'
                   tags:
                     - bf16operation
-                    - torch.add.4
+                    - torch.add.7
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: xavier
+                      - tensor:
+                          shape: [12800, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: xavier
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L215 in forward,
+                    code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.linear.3
+                - name: torch.nn.functional.silu
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 12800]
+                          stride: [524800, 12800, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/activations.py#L103 in forward, code: return nn.functional.silu(input)'
+                  tags:
+                    - bf16operation
+                    - torch.nn.functional.silu.1
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 12800]
+                          stride: [524800, 12800, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 41, 12800]
+                          stride: [524800, 12800, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L215 in forward,
+                    code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+                  tags:
+                    - bf16operation
+                    - torch.mul.9
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 41, 12800]
+                          stride: [524800, 12800, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: xavier
+                      - tensor:
+                          shape: [4096, 12800]
+                          stride: [12800, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: xavier
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L215 in forward,
+                    code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.linear.4
                 - name: torch.getitem
                   sample_inputs_func:
                     args:
@@ -1131,12 +1411,36 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L575 in torch_dynamo_resume_in_forward_at_559,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L503 in forward,
                     code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
                   tags:
                     - bf16operation
                     - constant
-                    - torch.getitem.6
+                    - torch.getitem.8
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [167936, 4096, 1]
+                          storage_offset: 163840
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: xavier
+                      - tensor:
+                          shape: [49159, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: xavier
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L503 in forward,
+                    code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.linear.5
                 - name: torch.truediv
                   sample_inputs_func:
                     args:
@@ -1148,10 +1452,1118 @@ test_suite_config:
                           device: cuda:0
                           init: rand
                       - value: 16.0
-                  description: 'https://github.com/huggingface/transformers/blob/v5.2.0/src/transformers/models/granite/modeling_granite.py#L576 in torch_dynamo_resume_in_forward_at_575,
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L504 in forward,
                     code: logits = logits / self.config.logits_scaling  # main diff with Llama'
                   tags:
                     - bf16operation
                     - constant
                     - torch.truediv.1
-cases: []
+                - name: torch.nn.functional.embedding
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1]
+                          stride: [1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - tensor:
+                          shape: [49159, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 0
+                      - value: null
+                      - value: 2.0
+                      - value: false
+                      - value: false
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L403 in forward,
+                    code: inputs_embeds = self.embed_tokens(input_ids)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.embedding.2
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 12.0
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L405 in forward,
+                    code: inputs_embeds = inputs_embeds * self.embedding_multiplier'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.mul.10
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1]
+                          stride: [1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - py: (slice(None, None, None), None, slice(None, None, None))
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L355 in forward,
+                    code: position_ids_expanded = position_ids[:, None, :].float()'
+                  tags:
+                    - constant
+                    - torch.getitem.9
+                - name: torch.float
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L355 in forward,
+                    code: position_ids_expanded = position_ids[:, None, :].float()'
+                  tags:
+                    - torch.float.4
+                - name: torch.float
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L359 in forward,
+                    code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+                  tags:
+                    - fp32operation
+                    - torch.float.5
+                - name: torch.matmul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1]
+                          stride: [64, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: xavier
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: xavier
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L359 in forward,
+                    code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+                  tags:
+                    - fp32operation
+                    - torch.matmul.2
+                - name: torch.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 64, 1]
+                          stride: [64, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L359 in forward,
+                    code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.transpose.5
+                - name: torch.cat
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 1, 64]
+                            stride: [64, 1, 1]
+                            storage_offset: 0
+                            dtype: torch.float32
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 1, 64]
+                            stride: [64, 1, 1]
+                            storage_offset: 0
+                            dtype: torch.float32
+                            device: cuda:0
+                            init: rand
+                    kwargs:
+                      dim: -1
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L360 in forward,
+                    code: emb = torch.cat((freqs, freqs), dim=-1)'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.cat.4
+                - name: torch.cos
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 128]
+                          stride: [128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L361 in forward,
+                    code: cos = emb.cos() * self.attention_scaling'
+                  tags:
+                    - fp32operation
+                    - torch.cos.2
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 128]
+                          stride: [128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L361 in forward,
+                    code: cos = emb.cos() * self.attention_scaling'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.mul.11
+                - name: torch.sin
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 128]
+                          stride: [128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L362 in forward,
+                    code: sin = emb.sin() * self.attention_scaling'
+                  tags:
+                    - fp32operation
+                    - torch.sin.2
+                - name: torch.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 128]
+                          stride: [128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      dtype: torch.bfloat16
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L364 in forward,
+                    code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
+                  tags:
+                    - fp32operation
+                    - torch.to.6
+                - name: torch.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: torch.float32
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L194 in forward,
+                    code: hidden_states = hidden_states.to(torch.float32)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.to.7
+                - name: torch.pow
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L195 in forward,
+                    code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.pow.2
+                - name: torch.mean
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: -1
+                    kwargs:
+                      keepdim: true
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L195 in forward,
+                    code: variance = hidden_states.pow(2).mean(-1, keepdim=True)'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.mean.2
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: 1.0e-05
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L196 in forward,
+                    code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.add.8
+                - name: torch.rsqrt
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L196 in forward,
+                    code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
+                  tags:
+                    - fp32operation
+                    - torch.rsqrt.2
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1]
+                          stride: [1, 1, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L196 in forward,
+                    code: hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)'
+                  tags:
+                    - fp32operation
+                    - torch.mul.12
+                - name: torch.to
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.float32
+                          device: cuda:0
+                          init: rand
+                      - value: torch.bfloat16
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L197 in forward,
+                    code: return self.weight * hidden_states.to(input_dtype)'
+                  tags:
+                    - fp32operation
+                    - constant
+                    - torch.to.8
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [4096]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L197 in forward,
+                    code: return self.weight * hidden_states.to(input_dtype)'
+                  tags:
+                    - bf16operation
+                    - torch.mul.13
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: xavier
+                      - tensor:
+                          shape: [4096, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: xavier
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L152 in forward,
+                    code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.linear.6
+                - name: torch.Tensor.view
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 1, -1, 128)
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L152 in forward,
+                    code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.view.3
+                - name: torch.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 32, 128]
+                          stride: [4096, 4096, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L152 in forward,
+                    code: query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.transpose.6
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: xavier
+                      - tensor:
+                          shape: [1024, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: xavier
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L153 in forward,
+                    code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.linear.7
+                - name: torch.Tensor.view
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 1024]
+                          stride: [1024, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 1, -1, 128)
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L153 in forward,
+                    code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.Tensor.view.4
+                - name: torch.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 8, 128]
+                          stride: [1024, 1024, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L153 in forward,
+                    code: key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.transpose.7
+                - name: torch.unsqueeze
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 128]
+                          stride: [128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L70 in apply_rotary_pos_emb,
+                    code: cos = cos.unsqueeze(unsqueeze_dim)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.unsqueeze.2
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1, 128]
+                          stride: [128, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L72 in apply_rotary_pos_emb,
+                    code: q_embed = (q * cos) + (rotate_half(q) * sin)'
+                  tags:
+                    - bf16operation
+                    - torch.mul.14
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - py: (Ellipsis, slice(None, 64, None))
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L46 in rotate_half,
+                    code: x1 = x[..., : x.shape[-1] // 2]'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.getitem.10
+                - name: torch.neg
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 64]
+                          stride: [4096, 128, 4096, 1]
+                          storage_offset: 64
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L48 in rotate_half,
+                    code: return torch.cat((-x2, x1), dim=-1)'
+                  tags:
+                    - bf16operation
+                    - torch.neg.3
+                - name: torch.cat
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 32, 1, 64]
+                            stride: [2048, 64, 64, 1]
+                            storage_offset: 0
+                            dtype: torch.bfloat16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 32, 1, 64]
+                            stride: [4096, 128, 4096, 1]
+                            storage_offset: 0
+                            dtype: torch.bfloat16
+                            device: cuda:0
+                            init: rand
+                    kwargs:
+                      dim: -1
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L48 in rotate_half,
+                    code: return torch.cat((-x2, x1), dim=-1)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.cat.5
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1, 128]
+                          stride: [128, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L72 in apply_rotary_pos_emb,
+                    code: q_embed = (q * cos) + (rotate_half(q) * sin)'
+                  tags:
+                    - bf16operation
+                    - torch.mul.15
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L72 in apply_rotary_pos_emb,
+                    code: q_embed = (q * cos) + (rotate_half(q) * sin)'
+                  tags:
+                    - bf16operation
+                    - torch.add.9
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1, 128]
+                          stride: [128, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L73 in apply_rotary_pos_emb,
+                    code: k_embed = (k * cos) + (rotate_half(k) * sin)'
+                  tags:
+                    - bf16operation
+                    - torch.mul.16
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - py: (Ellipsis, slice(None, 64, None))
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L46 in rotate_half,
+                    code: x1 = x[..., : x.shape[-1] // 2]'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.getitem.11
+                - name: torch.neg
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 64]
+                          stride: [1024, 128, 1024, 1]
+                          storage_offset: 64
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L48 in rotate_half,
+                    code: return torch.cat((-x2, x1), dim=-1)'
+                  tags:
+                    - bf16operation
+                    - torch.neg.4
+                - name: torch.cat
+                  sample_inputs_func:
+                    args:
+                      - tensor_list:
+                          - shape: [1, 8, 1, 64]
+                            stride: [512, 64, 64, 1]
+                            storage_offset: 0
+                            dtype: torch.bfloat16
+                            device: cuda:0
+                            init: rand
+                          - shape: [1, 8, 1, 64]
+                            stride: [1024, 128, 1024, 1]
+                            storage_offset: 0
+                            dtype: torch.bfloat16
+                            device: cuda:0
+                            init: rand
+                    kwargs:
+                      dim: -1
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L48 in rotate_half,
+                    code: return torch.cat((-x2, x1), dim=-1)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.cat.6
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 1, 128]
+                          stride: [128, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L73 in apply_rotary_pos_emb,
+                    code: k_embed = (k * cos) + (rotate_half(k) * sin)'
+                  tags:
+                    - bf16operation
+                    - torch.mul.17
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L73 in apply_rotary_pos_emb,
+                    code: k_embed = (k * cos) + (rotate_half(k) * sin)'
+                  tags:
+                    - bf16operation
+                    - torch.add.10
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                      - tensor:
+                          shape: []
+                          stride: []
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 1000
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L420 in update, code: cache_position
+                    = torch.arange(kv_length, device=self.device) + self.cumulative_length'
+                  tags:
+                    - torch.add.11
+                - name: torch.index_copy_
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 2048, 128]
+                          stride: [2097152, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2048
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L426 in update, code: self.keys.index_copy_(2,
+                    cache_position, key_states)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.index_copy_.2
+                - name: torch.index_copy_
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 8, 2048, 128]
+                          stride: [2097152, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 2
+                      - tensor:
+                          shape: [1]
+                          stride: [1]
+                          storage_offset: 0
+                          dtype: torch.int64
+                          device: cuda:0
+                          init: randint
+                          init_args:
+                            high: 2048
+                      - tensor:
+                          shape: [1, 8, 1, 128]
+                          stride: [1024, 128, 1024, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L427 in update, code: self.values.index_copy_(2,
+                    cache_position, value_states)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.index_copy_.3
+                - name: torch.nn.functional.scaled_dot_product_attention
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 2048, 128]
+                          stride: [8388608, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 32, 2048, 128]
+                          stride: [8388608, 262144, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                    kwargs:
+                      dropout_p: 0.0
+                      scale: 0.0078125
+                      is_causal: false
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
+                    code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+                  tags:
+                    - bf16operation
+                    - torch.nn.functional.scaled_dot_product_attention.2
+                - name: torch.transpose
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 32, 1, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: 1
+                      - value: 2
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L164 in sdpa_attention_forward,
+                    code: attn_output = attn_output.transpose(1, 2).contiguous()'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.transpose.8
+                - name: torch.Tensor.contiguous
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 32, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L164 in sdpa_attention_forward,
+                    code: attn_output = attn_output.transpose(1, 2).contiguous()'
+                  tags:
+                    - bf16operation
+                    - torch.Tensor.contiguous.3
+                - name: torch.reshape
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 32, 128]
+                          stride: [4096, 128, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - value: (1, 1, -1)
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L177 in forward,
+                    code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.reshape.3
+                - name: torch.Tensor.contiguous
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L177 in forward,
+                    code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
+                  tags:
+                    - bf16operation
+                    - torch.Tensor.contiguous.4
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 128, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: xavier
+                      - tensor:
+                          shape: [4096, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: xavier
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L178 in forward,
+                    code: attn_output = self.o_proj(attn_output)'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.linear.8
+                - name: torch.add
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L273 in forward,
+                    code: hidden_states = residual + hidden_states * self.residual_multiplier'
+                  tags:
+                    - bf16operation
+                    - torch.add.12
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: xavier
+                      - tensor:
+                          shape: [12800, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: xavier
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L215 in forward,
+                    code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.linear.9
+                - name: torch.nn.functional.silu
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 12800]
+                          stride: [12800, 12800, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/activations.py#L103 in forward, code: return nn.functional.silu(input)'
+                  tags:
+                    - bf16operation
+                    - torch.nn.functional.silu.2
+                - name: torch.mul
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 12800]
+                          stride: [12800, 12800, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - tensor:
+                          shape: [1, 1, 12800]
+                          stride: [12800, 12800, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L215 in forward,
+                    code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+                  tags:
+                    - bf16operation
+                    - torch.mul.18
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 12800]
+                          stride: [12800, 12800, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: xavier
+                      - tensor:
+                          shape: [4096, 12800]
+                          stride: [12800, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: xavier
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L215 in forward,
+                    code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.linear.10
+                - name: torch.getitem
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: rand
+                      - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L503 in forward,
+                    code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.getitem.12
+                - name: torch.nn.functional.linear
+                  sample_inputs_func:
+                    args:
+                      - tensor:
+                          shape: [1, 1, 4096]
+                          stride: [4096, 4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: xavier
+                      - tensor:
+                          shape: [49159, 4096]
+                          stride: [4096, 1]
+                          storage_offset: 0
+                          dtype: torch.bfloat16
+                          device: cuda:0
+                          init: xavier
+                      - value: null
+                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/granite/modeling_granite.py#L503 in forward,
+                    code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
+                  tags:
+                    - bf16operation
+                    - constant
+                    - torch.nn.functional.linear.11
