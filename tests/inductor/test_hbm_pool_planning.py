@@ -247,9 +247,12 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
         accumulator and the loop's own scratch tile are simultaneously
         live at runtime throughout the loop's execution. With the fix
         (bundle.get_nodes() -- one entry for the whole loop, not one per
-        body-op -- passed to _compute_live_ranges), "acc"'s live range
-        spans the loop's own single index, overlapping "other", and the
-        two buffers get distinct offsets.
+        body-op -- passed to _compute_live_ranges), the loop node's merged
+        read/write set (ReadWrites.merge_list) drops "acc" entirely, since
+        it is both written and read within the same node; with no visible
+        read, _compute_live_ranges conservatively keeps "acc" live through
+        the rest of the bundle, which safely overlaps "other" and gives the
+        two buffers distinct offsets.
         """
         _make_ftl_buffer("acc")
         _make_ftl_buffer("other")
