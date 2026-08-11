@@ -35,8 +35,9 @@ from torch_spyre._C import ElementArrangement
 
 from .constants import BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP
 from .errors import Unsupported
-from .pass_utils import concretize_expr, indirect_info_from_op
+from .pass_utils import concretize_expr, indirect_info_from_op, op_read_writes
 from .logging_utils import get_inductor_logger
+from . import config
 
 if typing.TYPE_CHECKING:
     # Deferred to avoid a circular import: work_division.py imports from this
@@ -92,6 +93,7 @@ def collect_work_division_constraints(
     pinned: dict[Symbol, int] = {}
     for constraint in (
         coordinate_mask_blocked_vars,
+        conv_spatial_blocked_vars,
         qfp8wt_pinned_vars,
         qfp8wt_matmul_k_pinned,
         indirect_access_pinned_vars,
@@ -141,6 +143,33 @@ def coordinate_mask_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintRes
         for v in ctx.reduction_vars
         if v in ctx.stick_vars
         and concretize_expr(ctx.it_space[v]) % ctx.stick_vars[v] != 0
+    }
+    return ConstraintResult(blocked=blocked)
+
+
+def conv_spatial_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
+    """Block output image dims for strided convolutions.
+
+    Splitting spatial dims produces incorrect per-core DSM addressing. Span-limit
+    commitments win, handled uniformly by ``collect_work_division_constraints``.
+    """
+    if not config.disable_conv2d_spatial_split:
+        return ConstraintResult()
+
+    op_info = getattr(ctx.op.data, "op_info", None)
+    if not isinstance(op_info, dict):
+        return ConstraintResult()
+    conv_params = op_info.get("conv_params")
+    if not isinstance(conv_params, dict):
+        return ConstraintResult()
+    if conv_params.get("stride_i", 1) <= 1 and conv_params.get("stride_j", 1) <= 1:
+        return ConstraintResult()
+
+    write_ranges = list(next(iter(op_read_writes(ctx.op).writes)).ranges)
+    blocked = {
+        sym
+        for sym in write_ranges[-2:]
+        if sym in ctx.it_space and concretize_expr(ctx.it_space[sym]) > 1
     }
     return ConstraintResult(blocked=blocked)
 

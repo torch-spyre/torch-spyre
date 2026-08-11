@@ -33,6 +33,7 @@ from torch_spyre._inductor.work_division_constraints import (
     ConstraintResult,
     WorkDivConstraintContext,
     collect_work_division_constraints,
+    conv_spatial_blocked_vars,
     coordinate_mask_blocked_vars,
     indirect_access_pinned_vars,
     qfp8wt_matmul_k_pinned,
@@ -197,6 +198,46 @@ class TestCoordinateMaskBlockedVars(unittest.TestCase):
         self.assertEqual(result.blocked, set())
 
 
+class TestConvSpatialBlockedVars(unittest.TestCase):
+    _PATCH_TARGET = "torch_spyre._inductor.work_division_constraints.op_read_writes"
+    _PLACEHOLDER_TD = _tensor_dep("conv_placeholder", (128,), (_isym("_conv"),))
+
+    def _context(self, stride):
+        mb, out, i, j = (_isym(name) for name in ("mb", "out", "i", "j"))
+        op = _computed_buffer((2, 3, 8, 16), name="strided_conv")
+        op.data.op_info = {
+            "conv_params": {"stride_i": stride[0], "stride_j": stride[1]}
+        }
+        return (
+            _make_context(
+                op,
+                self._PLACEHOLDER_TD,
+                it_space={mb: 2, out: 3, i: 8, j: 16},
+            ),
+            i,
+            j,
+        )
+
+    def test_blocks_spatial_dims_for_strided_conv(self):
+        ctx, i, j = self._context((2, 1))
+        rw = MagicMock()
+        rw.writes = [MagicMock(ranges=(_isym("mb"), _isym("out"), i, j))]
+        with patch(self._PATCH_TARGET, return_value=rw):
+            self.assertEqual(conv_spatial_blocked_vars(ctx).blocked, {i, j})
+
+    def test_allows_spatial_dims_for_unstrided_conv(self):
+        ctx, _, _ = self._context((1, 1))
+        self.assertEqual(conv_spatial_blocked_vars(ctx).blocked, set())
+
+    def test_span_commit_overrides_spatial_block(self):
+        ctx, i, j = self._context((2, 1))
+        ctx.committed_splits = {i: 2}
+        rw = MagicMock()
+        rw.writes = [MagicMock(ranges=(_isym("mb"), _isym("out"), i, j))]
+        with patch(self._PATCH_TARGET, return_value=rw):
+            self.assertEqual(collect_work_division_constraints(ctx).blocked, {j})
+
+
 class TestQfp8wtConstraints(unittest.TestCase):
     def test_output_second_stick_coord_pinned_for_qfp8wt_output(self):
         b, m, n = _isym("b"), _isym("m"), _isym("n")
@@ -287,6 +328,7 @@ class TestCollectWorkDivisionConstraints(unittest.TestCase):
     def _collect(self, results, **context_kwargs):
         rules = (
             "coordinate_mask_blocked_vars",
+            "conv_spatial_blocked_vars",
             "qfp8wt_pinned_vars",
             "qfp8wt_matmul_k_pinned",
             "indirect_access_pinned_vars",
@@ -313,6 +355,7 @@ class TestCollectWorkDivisionConstraints(unittest.TestCase):
                 ConstraintResult(),
                 ConstraintResult(),
                 ConstraintResult(),
+                ConstraintResult(),
             ),
             committed_splits={r0: 2},
         )
@@ -327,6 +370,7 @@ class TestCollectWorkDivisionConstraints(unittest.TestCase):
                     ConstraintResult(pinned={r0: 1}),
                     ConstraintResult(),
                     ConstraintResult(),
+                    ConstraintResult(),
                 )
             )
 
@@ -335,6 +379,7 @@ class TestCollectWorkDivisionConstraints(unittest.TestCase):
         with self.assertRaisesRegex(Unsupported, "hardware memory-span limit"):
             self._collect(
                 (
+                    ConstraintResult(),
                     ConstraintResult(),
                     ConstraintResult(),
                     ConstraintResult(pinned={k: 1}),
@@ -351,6 +396,7 @@ class TestCollectWorkDivisionConstraints(unittest.TestCase):
                     ConstraintResult(),
                     ConstraintResult(),
                     ConstraintResult(),
+                    ConstraintResult(),
                     ConstraintResult(pinned={i0: 1}),
                 ),
                 committed_splits={i0: 2},
@@ -362,6 +408,7 @@ class TestCollectWorkDivisionConstraints(unittest.TestCase):
             (
                 ConstraintResult(blocked={r0}, pinned={r2: 1}),
                 ConstraintResult(blocked={r1}, pinned={r3: 2}),
+                ConstraintResult(blocked={r1}),
                 ConstraintResult(pinned={r2: 1}),
                 ConstraintResult(),
             )
