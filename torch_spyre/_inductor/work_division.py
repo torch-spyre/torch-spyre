@@ -818,9 +818,13 @@ def _apply_user_hint(
     it_space_adjusted: dict[Symbol, Expr],
     output_td: TensorDep,
     max_cores: int,
+    blocked: set[Symbol] | None = None,
+    pinned: dict[Symbol, int] | None = None,
 ) -> dict[Symbol, int]:
     """Apply splits in insertion order, pruning lower-priority overflows."""
     op_name = op.get_name()
+    blocked = blocked or set()
+    pinned = pinned or {}
 
     splits: dict[Symbol, int] = {}
     cores_used = 1
@@ -842,6 +846,15 @@ def _apply_user_hint(
             raise Unsupported(
                 f"work_division_hint: {op_name} dim {sym} is not in the "
                 f"work-division iteration space."
+            )
+        if split > 1 and sym in blocked:
+            raise Unsupported(
+                f"work_division_hint: {op_name} cannot split constrained dim {sym}."
+            )
+        if sym in pinned and split != pinned[sym]:
+            raise Unsupported(
+                f"work_division_hint: {op_name} dim {sym} is pinned to split="
+                f"{pinned[sym]}."
             )
 
         next_cores = cores_used * split
@@ -876,6 +889,15 @@ def _apply_user_hint(
             f"work_division_hint: {op_name} splits "
             f"{len(reduction_vars_to_split)} reduction dimensions "
             f"({reduction_vars_to_split}), but the backend supports at most 1."
+        )
+
+    conflicting_pins = {
+        sym: split for sym, split in pinned.items() if splits.get(sym, 1) != split
+    }
+    if conflicting_pins:
+        raise Unsupported(
+            f"work_division_hint: {op_name} conflicts with pinned splits "
+            f"{conflicting_pins}."
         )
 
     return splits
@@ -935,7 +957,9 @@ def span_reduction_pass(
     )
     min_splits.update(constraint_result.pinned)
 
-    reduction_vars_to_split = set(min_splits) - coord_vars
+    reduction_vars_to_split = {
+        v for v, split in min_splits.items() if split > 1 and v not in coord_vars
+    }
     # Each entry in Reduction.reduction_ranges maps to at most one Symbol via
     # index_vars_squeeze (size-1 entries are squeezed away). So len > 1 means
     # genuinely distinct reduction dimensions, not multiple symbols from one dim.
@@ -1073,7 +1097,13 @@ def work_distribution_pass(
         user_splits = _resolve_work_div_hint(op, it_space_adjusted)
         if user_splits is not None:
             user_splits = _apply_user_hint(
-                op, user_splits, it_space_adjusted, output_td, max_cores
+                op,
+                user_splits,
+                it_space_adjusted,
+                output_td,
+                max_cores,
+                blocked,
+                constraint_result.pinned,
             )
             dropped = {
                 s: v for s, v in committed_splits.items() if user_splits.get(s, 1) < v

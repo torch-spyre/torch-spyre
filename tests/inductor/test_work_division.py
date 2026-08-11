@@ -29,6 +29,7 @@ from torch_spyre._inductor.work_division import (
     TensorDep,
     _default_split,
     multi_dim_iteration_space_split,
+    span_reduction_pass,
 )
 from torch_spyre._inductor.work_division_constraints import (
     ConstraintResult,
@@ -432,6 +433,37 @@ class TestCollectWorkDivisionConstraints(unittest.TestCase):
         )
         self.assertEqual(result.blocked, {r0, r1})
         self.assertEqual(result.pinned, {r2: 1, r3: 2})
+
+
+class TestSpanReductionConstraints(unittest.TestCase):
+    _PATCH_TARGET = "torch_spyre._inductor.work_division"
+
+    def test_multidim_indirect_reduction_stays_single_core(self):
+        o, r0, r1 = (_isym(name) for name in ("o", "r0", "r1"))
+        op = _computed_buffer((8,), name="indirect_reduction")
+        output_td = _tensor_dep("indirect_reduction", (8,), (o,))
+        with (
+            patch(
+                f"{self._PATCH_TARGET}.iteration_space_from_op",
+                return_value={o: 8, r0: 8, r1: 8},
+            ),
+            patch(
+                f"{self._PATCH_TARGET}.collect_tensor_deps",
+                return_value=([], output_td),
+            ),
+            patch(
+                f"{self._PATCH_TARGET}.adjust_it_space_for_sticks",
+                return_value=({o: 8, r0: 8, r1: 8}, {}),
+            ),
+            patch(f"{self._PATCH_TARGET}.must_split_vars", return_value={}),
+            patch(
+                f"{self._PATCH_TARGET}.collect_work_division_constraints",
+                return_value=ConstraintResult(pinned={r0: 1, r1: 1}),
+            ),
+            patch(f"{self._PATCH_TARGET}.apply_splits") as apply_splits,
+        ):
+            span_reduction_pass(op, [], 32)
+        self.assertEqual(apply_splits.call_args.args[1], {r0: 1, r1: 1})
 
 
 class TestIndirectAccessPinnedVars(unittest.TestCase):
