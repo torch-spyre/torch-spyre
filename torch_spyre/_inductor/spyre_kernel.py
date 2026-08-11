@@ -733,6 +733,16 @@ class SpyreKernel(Kernel[CSEVariable]):
         tensor: TensorAccess,
         opspec_name: "str | None" = None,
     ) -> TensorArg:
+        # OpSpec->KTIR needs a stable per-buffer identity for register-threaded
+        # fused intermediates (all arg_index == -1): _buf_id keys on TensorArg.name,
+        # which is serialized into the emitted op-spec literal and read back by
+        # generate_ktir.  The SDSC/flex literal identifies buffers by arg_index +
+        # allocation address and only needs name for gather indices, so populate it
+        # from the buffer name only when the KTIR emitter is enabled
+        # (config.ktir_emitter, i.e. TORCH_SPYRE_KTIR=1) -- leaving the default
+        # SDSC literal byte-identical.
+        if opspec_name is None and _spyre_config.ktir_emitter:
+            opspec_name = name
         it_space = iteration_space(self.current_node)
         # With dynamic=True the host index may contain symbolic strides
         # (e.g. x0*s1+x1).  Concretize size symbols so normalize_coordinates
