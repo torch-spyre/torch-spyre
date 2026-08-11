@@ -330,6 +330,32 @@ class TestCollectWorkDivisionConstraints(unittest.TestCase):
                 )
             )
 
+    def test_qfp8wt_k_pin_conflicting_with_span_split_raises_unsupported(self):
+        k = _isym("k")
+        with self.assertRaisesRegex(Unsupported, "hardware memory-span limit"):
+            self._collect(
+                (
+                    ConstraintResult(),
+                    ConstraintResult(),
+                    ConstraintResult(pinned={k: 1}),
+                    ConstraintResult(),
+                ),
+                committed_splits={k: 2},
+            )
+
+    def test_indirect_pin_conflicting_with_span_split_raises_unsupported(self):
+        i0 = _isym("i0")
+        with self.assertRaisesRegex(Unsupported, "hardware memory-span limit"):
+            self._collect(
+                (
+                    ConstraintResult(),
+                    ConstraintResult(),
+                    ConstraintResult(),
+                    ConstraintResult(pinned={i0: 1}),
+                ),
+                committed_splits={i0: 2},
+            )
+
     def test_combines_non_conflicting_rules(self):
         r0, r1, r2, r3 = (_isym(f"r{i}") for i in range(4))
         result = self._collect(

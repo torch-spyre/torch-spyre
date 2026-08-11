@@ -24,7 +24,6 @@ QFP8WT tensor's second stick dimension must stay whole.
 so work_division.py's call sites only need one call instead of hand-invoking
 every rule.
 
-See GitHub issue #3631.
 """
 
 import dataclasses
@@ -86,9 +85,8 @@ def collect_work_division_constraints(
     e.g. span_reduction satisfying the hardware span limit — outranks a
     constraint's preference not to split that dim further.
 
-    Raises Unsupported if two constraints pin the same dim to different
-    values; that is a genuine conflict between the two rules' preconditions,
-    not something to silently arbitrate.
+    Raises Unsupported if a pin conflicts with a prior span-limit commitment,
+    or if two constraints pin the same dim to different values.
     """
     blocked: set[Symbol] = set()
     pinned: dict[Symbol, int] = {}
@@ -112,6 +110,13 @@ def collect_work_division_constraints(
         blocked |= result.blocked - forced
 
         for sym, split in result.pinned.items():
+            committed_split = ctx.committed_splits.get(sym)
+            if committed_split is not None and committed_split != split:
+                raise Unsupported(
+                    f"{ctx.op.get_name()}: pinned split for {sym} is {split} "
+                    f"({constraint.__name__}), but hardware memory-span limit "
+                    f"committed {committed_split}."
+                )
             if sym in pinned and pinned[sym] != split:
                 raise Unsupported(
                     f"{ctx.op.get_name()}: conflicting pinned split for {sym}: "
