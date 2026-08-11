@@ -18,6 +18,7 @@ from torch_spyre._C import ElementArrangement
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
+DEPTHWISE_CONV2D_OP = "depthwiseconv2dnative"
 BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
 MATMUL_REDUCTION_OPS = frozenset({BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP})
 
@@ -183,6 +184,7 @@ TOPK_OPS = {"topkvalue", "topkindex"}
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
+CONV2D_LAYOUT_LABELS = ["OUTPUT", "INPUT", "KERNEL", "KERNEL_IDX"]
 
 AVGPOOL2D_OP = "avgpoolfwd"
 # Pool opfunc names, mirroring TOPK_OPS. Add maxpool/minpool here as they land so
@@ -193,12 +195,16 @@ POOL_OPS = {AVGPOOL2D_OP}
 # windowed spatial dims -- a hybrid of the matmul and pool patterns. Kept as a
 # set so _is_conv is a single membership test as fp8/int8/int4 variants land.
 CONV2D_FWD_OP = "conv2d"
-CONV_OPS = {CONV2D_FWD_OP}
+# Both the forward conv2d (aten.convolution direct lowering, PR #3284) and the
+# depthwise conv2d (spyre.conv2d, PR #3510) op strings are convolutions for the
+# purposes of codegen dispatch (_is_conv). DEPTHWISE_CONV2D_OP is defined above.
+CONV_OPS = {CONV2D_FWD_OP, DEPTHWISE_CONV2D_OP}
 
 # Populate more valid labels from deeptools here if needed
 INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j", "ki", "kj"]
 OUTPUT_DIM_LABELS = ["out"]
 MATMUL_DIM_LABELS = ["ki", "kj", "y", "x", "mb", "out", "in"]
+CONV2D_DIM_LABELS = ["mb", "out", "i", "j", "ki", "kj"]
 # Canonical avgpool iteration-space order: batch, out-H, out-W, channel,
 # kernel-H, kernel-W. These SDSC labels are owned by the codegen layer; dim-role
 # survival is derived from the node's live output ranges

@@ -564,6 +564,7 @@ def _make_sdsc_spec(
         },
         args=[tensor],
         constants={},
+        conv_params={},
         coordinate_masking={},
     )
 
@@ -2475,6 +2476,7 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             },
             args=[tensor],
             constants={},
+            conv_params={},
             coordinate_masking={},
         )
         symbols: list[int] = []
@@ -6651,6 +6653,7 @@ class TestSymbolKind(unittest.TestCase):
             },
             args=[tensor],
             constants={},
+            conv_params={},
             coordinate_masking={},
         )
         symbols: list[int] = []
