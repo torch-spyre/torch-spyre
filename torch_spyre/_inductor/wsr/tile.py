@@ -16,6 +16,8 @@ import sympy
 
 from torch.utils._sympy.functions import ModularIndexing
 
+from ..errors import Unsupported
+
 # An irregular dimension is a dimension with size one or stride zero.
 
 
@@ -27,7 +29,8 @@ def compute_tile_stride(size, stride, tile_size):
     Cumulative tile counts must divide strides. Padding is reduced in proportion
     of tile counts. Tile strides of irregular tile dimensions are set to zero.
     """
-    assert all(x % y == 0 for x, y in zip(size, tile_size))
+    if not all(x % y == 0 for x, y in zip(size, tile_size)):
+        raise Unsupported(f"tile sizes {tile_size} do not divide tensor sizes {size}")
     # exclude irregular tensor dimensions (size==1 or stride==0)
     dims = [d for d, (s, t) in enumerate(zip(size, stride)) if s != 1 and t != 0]
     # order regular dimensions in increasing stride order
@@ -35,7 +38,11 @@ def compute_tile_stride(size, stride, tile_size):
     tile_stride = [sympy.S.Zero] * len(tile_size)
     running_tile_count = sympy.S.One
     for d in dims:
-        assert stride[d] % running_tile_count == 0
+        if stride[d] % running_tile_count != 0:
+            raise Unsupported(
+                f"stride {stride[d]} at dim {d} is not divisible by cumulative"
+                f" tile count {running_tile_count}"
+            )
         if tile_size[d] > 1:
             tile_stride[d] = stride[d] // running_tile_count
         running_tile_count *= size[d] // tile_size[d]
@@ -53,7 +60,10 @@ def compute_tile_offset(offset, paired_strides):
     for s, t in paired_strides:
         q, offset = divmod(offset, s)
         tile_offset += q * t
-    assert offset == 0
+    if offset != 0:
+        raise Unsupported(
+            f"offset {offset} is not expressible in terms of the given strides"
+        )
     return tile_offset
 
 
@@ -74,28 +84,48 @@ def decompose_index_for_tiling(index, var_ranges):
         if len(term_vars) == 0:
             offset += term
             continue
-        assert len(term_vars) == 1
+        if len(term_vars) != 1:
+            raise Unsupported(
+                f"index term {term} depends on multiple iteration variables {term_vars}"
+            )
         var = term_vars[0]
-        assert var not in vars_found
+        if var in vars_found:
+            raise Unsupported(
+                f"iteration variable {var} appears in multiple index terms"
+            )
         vars_found.add(var)
-        assert not isinstance(term, ModularIndexing)
+        if isinstance(term, ModularIndexing):
+            raise Unsupported(
+                f"ModularIndexing in index term {term} is not supported for tiling"
+            )
         if term == var:
             atoms.append((sympy.S.One, var))
             continue
-        assert term.func == sympy.Mul
+        if term.func != sympy.Mul:
+            raise Unsupported(f"index term {term} is not a linear monomial")
         prod = sympy.S.One
         mi = []
         var_found = False
         for arg in term.args:
-            assert not isinstance(arg, ModularIndexing)
+            if isinstance(arg, ModularIndexing):
+                raise Unsupported(
+                    f"ModularIndexing in index term argument {arg} is not"
+                    " supported for tiling"
+                )
             if arg == var:
-                assert not var_found
+                if var_found:
+                    raise Unsupported(
+                        f"iteration variable {var} appears more than once in"
+                        f" term {term}"
+                    )
                 var_found = True
                 continue
             prod *= arg
-        assert prod > 0
+        if prod <= 0:
+            raise Unsupported(f"index term {term} has non-positive coefficient {prod}")
         atoms.append((prod, var, *mi))
-    assert offset >= 0
+    if offset < 0:
+        raise Unsupported(f"index has negative offset {offset}")
     return atoms, offset
 
 
