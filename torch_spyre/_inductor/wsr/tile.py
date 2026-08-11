@@ -14,7 +14,7 @@
 
 import sympy
 
-from ..views import convert_modular_indexing
+from torch.utils._sympy.functions import ModularIndexing
 
 # An irregular dimension is a dimension with size one or stride zero.
 
@@ -57,7 +57,49 @@ def compute_tile_offset(offset, paired_strides):
     return tile_offset
 
 
-def compute_tile_index(index, size, stride, tile_stride):
+def decompose_index_for_tiling(index, var_ranges):
+    """
+    Decompose index into atoms + offset and validate assumptions.
+
+    An atom is a tuple (positive integer coefficient, iteration variable).
+    An offset is a non-negative integer.
+    Coefficients and offset may include symbols.
+    """
+    vars = set(var_ranges.keys())
+    vars_found = set()
+    offset = sympy.S.Zero
+    atoms = []
+    for term in index.as_ordered_terms():
+        term_vars = list(set(term.free_symbols) & vars)
+        if len(term_vars) == 0:
+            offset += term
+            continue
+        assert len(term_vars) == 1
+        var = term_vars[0]
+        assert var not in vars_found
+        vars_found.add(var)
+        assert not isinstance(term, ModularIndexing)
+        if term == var:
+            atoms.append((sympy.S.One, var))
+            continue
+        assert term.func == sympy.Mul
+        prod = sympy.S.One
+        mi = []
+        var_found = False
+        for arg in term.args:
+            assert not isinstance(arg, ModularIndexing)
+            if arg == var:
+                assert not var_found
+                var_found = True
+                continue
+            prod *= arg
+        assert prod > 0
+        atoms.append((prod, var, *mi))
+    assert offset >= 0
+    return atoms, offset
+
+
+def compute_tile_index(index, var_ranges, size, stride, tile_stride):
     """
     Convert a tensor index to a tile index.
 
@@ -65,23 +107,14 @@ def compute_tile_index(index, size, stride, tile_stride):
     same order. Irregular tensor and tile dimensions are supported. Index
     derived from views are supported.
     """
+    atoms, offset = decompose_index_for_tiling(index, var_ranges)
     # exclude irregular tensor dimensions (size==1 or stride==0)
     dims = [d for d, (s, t) in enumerate(zip(size, stride)) if s != 1 and t != 0]
     stride = [stride[d] for d in dims]
     tile_stride = [tile_stride[d] for d in dims]
     paired_strides = list(reversed(sorted(zip(stride, tile_stride))))
-    # sanitize index
-    index = convert_modular_indexing(index).replace(sympy.floor, lambda x: x).expand()
-    # handle constant offset
-    offset = index.xreplace({var: sympy.S.Zero for var in index.free_symbols})
     tile_index = compute_tile_offset(offset, paired_strides)
     # handle iteration variables
-    for term in (index - offset).as_ordered_terms():
-        assert len(term.free_symbols) == 1
-        if term.is_Symbol or term.func == sympy.Mod:
-            offset = sympy.S.One
-        else:
-            assert term.func == sympy.Mul and term.args[0].is_Rational
-            offset = term.args[0].numerator
-        tile_index += compute_tile_offset(offset, paired_strides) * term // offset
+    for atom in atoms:
+        tile_index += compute_tile_offset(atom[0], paired_strides) * atom[1]
     return tile_index

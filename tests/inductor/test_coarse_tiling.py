@@ -7563,37 +7563,51 @@ class TestTileHelpers(unittest.TestCase):
     def test_compute_tile_index_2d(self):
         p0, p1 = sympy.symbols("p0 p1", integer=True)
         self.assertEqual(
-            compute_tile_index(4096 * p0 + p1, [1024, 4096], [4096, 1], [1024, 1]),
+            compute_tile_index(
+                4096 * p0 + p1, {p0: 1024, p1: 4096}, [1024, 4096], [4096, 1], [1024, 1]
+            ),
             1024 * p0 + p1,
         )
         self.assertEqual(
-            compute_tile_index(p0 + 1024 * p1, [4096, 1024], [1024, 1], [512, 1]),
+            compute_tile_index(
+                p0 + 1024 * p1, {p0: 4096, p1: 1024}, [4096, 1024], [1024, 1], [512, 1]
+            ),
             p0 + 512 * p1,
         )
 
     def test_compute_tile_index_2d_diagonal(self):
         p0 = sympy.Symbol("p0", integer=True)
         self.assertEqual(
-            compute_tile_index(4097 * p0, [1024, 4096], [4096, 1], [1024, 1]), 1025 * p0
+            compute_tile_index(
+                1025 * p0, {p0: 1024}, [1024, 1024], [1024, 1], [512, 1]
+            ),
+            513 * p0,
         )
 
     def test_compute_tile_index_2d_col_major(self):
         p0, p1 = sympy.symbols("p0 p1", integer=True)
         self.assertEqual(
-            compute_tile_index(p0 + 1024 * p1, [1024, 4096], [1, 1024], [1, 512]),
+            compute_tile_index(
+                p0 + 1024 * p1, {p0: 4096, p1: 1024}, [1024, 4096], [1, 1024], [1, 512]
+            ),
             p0 + 512 * p1,
         )
 
     def test_compute_tile_index_2d_constant_offset(self):
         p0 = sympy.Symbol("p0", integer=True)
         self.assertEqual(
-            compute_tile_index(4096 + p0, [1024, 4096], [4096, 1], [1024, 1]), 1024 + p0
+            compute_tile_index(
+                4096 + p0, {p0: 1024}, [1024, 4096], [4096, 1], [1024, 1]
+            ),
+            1024 + p0,
         )
 
     def test_compute_tile_index_2d_no_tiling(self):
         p0 = sympy.Symbol("p0", integer=True)
         self.assertEqual(
-            compute_tile_index(4096 * p0 + 2048, [1024, 4096], [4096, 1], [4096, 1]),
+            compute_tile_index(
+                4096 * p0 + 2048, {p0: 1024}, [1024, 4096], [4096, 1], [4096, 1]
+            ),
             4096 * p0 + 2048,
         )
 
