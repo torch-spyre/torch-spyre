@@ -70,12 +70,28 @@ _PERF_NAME_RE = re.compile(
 _GRANITE_CONFIG_RE = re.compile(r"bs(?P<batch_size>\d+)(?:_pl(?P<prompt_length>\d+))?")
 
 
+KERNEL_CLASSNAME = "kernel_benchmark"
+
+
 def is_benchmark_xml(root) -> bool:
     """Return True if every testcase has classname containing 'benchmark'."""
     cases = root.findall(".//testcase")
     if not cases:
         return False
     return all("benchmark" in (tc.get("classname", "")) for tc in cases)
+
+
+def is_kernel_benchmark_xml(root) -> bool:
+    """Return True for spyre-perf-suite's per-kernel breakdown XMLs.
+
+    Must be tested BEFORE is_benchmark_xml(), which also matches these — their
+    classname contains 'benchmark' — and would parse them as op benchmarks,
+    yielding a run row with zero measurements.
+    """
+    cases = root.findall(".//testcase")
+    if not cases:
+        return False
+    return all(KERNEL_CLASSNAME in (tc.get("classname", "")) for tc in cases)
 
 
 def parse_benchmark_xml(
@@ -232,6 +248,95 @@ def parse_benchmark_xml(
     return run_meta, benchmarks
 
 
+def parse_kernel_xml(xml_path: Path, workflow: str = "", ci_run_id: str = "",
+                     platform: str = ""):
+    """Parse a per-kernel breakdown XML into (run_meta, list[kernel_row]).
+
+    One testcase is already one row, so unlike parse_benchmark_xml there is no
+    grouping or metric pivoting. Every field is read from the testcase's own
+    tag properties rather than parsed out of its name.
+    """
+    tree = etree.parse(str(xml_path))
+    root = tree.getroot()
+
+    suite = root.find(".//testsuite")
+    if suite is None:
+        print(f"  [warn] No <testsuite> in {xml_path.name}", file=sys.stderr)
+        return None, []
+
+    try:
+        created_at = datetime.fromisoformat(
+            suite.get("timestamp", "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        created_at = datetime.now(timezone.utc)
+
+    version_info = None
+    suite_props = suite.find("properties")
+    if suite_props is not None:
+        for p in suite_props.findall("property"):
+            if p.get("name") == "version_info":
+                version_info = p.get("value", "").strip() or None
+                break
+
+    kernels = []
+    for tc in suite.findall(".//testcase"):
+        tags = _tag_props(tc)
+        kernel_name = tags.get("kernel")
+        if not kernel_name:
+            print(
+                f"  [warn] testcase without a kernel tag: {tc.get('name')}",
+                file=sys.stderr,
+            )
+            continue
+
+        operation_name = tags.get("op", "")
+        is_granite = operation_name.startswith("granite_")
+        num_runs = _opt_float(tags, "num_runs")
+
+        kernels.append(
+            {
+                "kernel_id": uuid.uuid4().int >> 64,
+                "record_type": "model" if is_granite else "op",
+                "operation_name": "granite" if is_granite else (operation_name or None),
+                "kernel_name": kernel_name,
+                # A section's Total is the sum of its siblings; flagged so
+                # queries can aggregate without double-counting.
+                "is_total": 1 if kernel_name == "Total" else 0,
+                "metric": tags.get("metric") or None,
+                "config_name": _null_tag(tags.get("config")),
+                "run_mode": _null_tag(tags.get("mode")) or (
+                    None if is_granite else "op_benchmark"
+                ),
+                "input_shapes": None if is_granite else _null_tag(tags.get("input_shape")),
+                "duration_ms": float(tc.get("time", 0) or 0),
+                "torch_spyre_ms": _opt_float(tags, "torch_spyre_ms"),
+                "sendnn_ms": _opt_float(tags, "sendnn_ms"),
+                "ratio": _opt_float(tags, "ratio"),
+                "pt_util_percent": _opt_float(tags, "pt_util"),
+                "num_runs": int(num_runs) if num_runs is not None else None,
+                "created_at": created_at,
+            }
+        )
+
+    run_key = ci_run_id or created_at.strftime("%Y%m%dT%H%M%SZ")
+    source_file = "/".join(p for p in (workflow, run_key, xml_path.name) if p)
+
+    run_meta = {
+        "source_file": source_file,
+        "created_at": created_at,
+        "version_info": version_info,
+        "workflow": workflow,
+        "platform": platform,
+    }
+    return run_meta, kernels
+
+
+def _null_tag(value):
+    """The perf suite writes the literal 'null'/'N/A' for absent tag values."""
+    return None if value in (None, "", "null", "N/A") else value
+
+
 # ---------------------------------------------------------------------------
 # ── BENCHMARK ClickHouse insertion ─────────────────────────────────────────
 # ---------------------------------------------------------------------------
@@ -311,6 +416,84 @@ def insert_perf_benchmarks(client, run_id: int, benchmarks: list[dict]) -> None:
             "regression_status",
             "created_at",
         ],
+    )
+
+
+# perf_kernels is created here rather than in the dashboard's schema.py so a
+# fresh ClickHouse gets it without a coordinated deploy; IF NOT EXISTS makes it
+# a no-op once the dashboard owns it too.
+PERF_KERNELS_DDL = """
+CREATE TABLE IF NOT EXISTS perf_kernels (
+    kernel_id       UInt64          DEFAULT rand64(),
+    run_id          UInt64,
+    record_type     String,
+    operation_name  Nullable(String),
+    kernel_name     String,
+    is_total        UInt8           DEFAULT 0,
+    metric          Nullable(String),
+    config_name     Nullable(String),
+    run_mode        Nullable(String),
+    input_shapes    Nullable(String),
+    duration_ms     Nullable(Float64),
+    torch_spyre_ms  Nullable(Float64),
+    sendnn_ms       Nullable(Float64),
+    ratio           Nullable(Float64),
+    pt_util_percent Nullable(Float64),
+    num_runs        Nullable(Int32),
+    created_at      DateTime        DEFAULT now()
+) ENGINE = MergeTree()
+ORDER BY (run_id, kernel_id)
+"""
+
+_PERF_KERNEL_COLUMNS = [
+    "kernel_id",
+    "run_id",
+    "record_type",
+    "operation_name",
+    "kernel_name",
+    "is_total",
+    "metric",
+    "config_name",
+    "run_mode",
+    "input_shapes",
+    "duration_ms",
+    "torch_spyre_ms",
+    "sendnn_ms",
+    "ratio",
+    "pt_util_percent",
+    "num_runs",
+    "created_at",
+]
+
+
+def insert_perf_kernels(client, run_id: int, kernels: list[dict]) -> None:
+    if not kernels:
+        return
+    client.insert(
+        "perf_kernels",
+        [
+            [
+                k["kernel_id"],
+                run_id,
+                k["record_type"],
+                k["operation_name"],
+                k["kernel_name"],
+                k["is_total"],
+                k["metric"],
+                k["config_name"],
+                k["run_mode"],
+                k["input_shapes"],
+                k["duration_ms"],
+                k["torch_spyre_ms"],
+                k["sendnn_ms"],
+                k["ratio"],
+                k["pt_util_percent"],
+                k["num_runs"],
+                k["created_at"].replace(tzinfo=None),
+            ]
+            for k in kernels
+        ],
+        column_names=_PERF_KERNEL_COLUMNS,
     )
 
 
@@ -670,9 +853,11 @@ def main():
     client.command(
         "ALTER TABLE benchmark_runs ADD COLUMN IF NOT EXISTS platform String DEFAULT ''"
     )
+    client.command(PERF_KERNELS_DDL)
 
     total_cases = 0
     total_benchmarks = 0
+    total_kernels = 0
 
     for xml_path in xml_files:
         print(f"Processing: {xml_path.name}")
@@ -680,8 +865,34 @@ def main():
         tree = etree.parse(str(xml_path))
         root = tree.getroot()
 
-        # ── Dispatch: benchmark vs test-result ─────────────────────────────
-        if is_benchmark_xml(root):
+        # ── Dispatch: kernel breakdown vs benchmark vs test-result ─────────
+        # Kernel first: is_benchmark_xml() also matches these.
+        if is_kernel_benchmark_xml(root):
+            print("  Detected: per-kernel breakdown XML")
+            run_meta, kernels = parse_kernel_xml(
+                xml_path, args.workflow, args.run_id, args.platform
+            )
+            if run_meta is None:
+                continue
+
+            existing = client.query(
+                "SELECT count() FROM benchmark_runs WHERE source_file = {sf:String}",
+                parameters={"sf": run_meta["source_file"]},
+            )
+            if existing.result_rows[0][0] > 0:
+                print(f"  Already ingested kernels — skipping {run_meta['source_file']}")
+                continue
+
+            run_id = uuid.uuid4().int >> 64
+            print(f"  run_id={run_id}  kernels={len(kernels)}")
+
+            insert_benchmark_run(client, run_id, run_meta)
+            insert_perf_kernels(client, run_id, kernels)
+
+            total_kernels += len(kernels)
+            print(f"  Inserted {len(kernels)} kernel rows")
+
+        elif is_benchmark_xml(root):
             print("  Detected: performance benchmark XML")
             run_meta, benchmarks = parse_benchmark_xml(
                 xml_path, args.workflow, args.run_id, args.platform
@@ -769,6 +980,7 @@ def main():
     print(f"\nDone. {len(xml_files)} file(s) processed.")
     print(f"  Test cases ingested:  {total_cases}")
     print(f"  Benchmarks ingested:  {total_benchmarks}")
+    print(f"  Kernels ingested:     {total_kernels}")
 
 
 if __name__ == "__main__":
