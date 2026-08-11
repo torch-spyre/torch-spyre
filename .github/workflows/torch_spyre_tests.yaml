@@ -3,7 +3,7 @@ name: tests
 # One of torch-spyre's four "trunk" (push-to-main) workflows -- see
 # model_ops_tests.yaml, upstream_tests.yaml, upstream_tests_beta.yaml for the
 # others. A push run passes test_type: trunk (below) so it's distinguishable
-# from a manually-dispatched full run once tier-tagging reaches ClickHouse.
+# from a manually-dispatched regression run once tier-tagging reaches ClickHouse.
 on:
   push:
     branches: [main]
@@ -56,11 +56,13 @@ on:
         default: ''
       test_type:
         description: >-
-          Suite subset to run: smoke | core | full | suite_<group> | <label>.
-          Default: full (every config).
+          Suite subset to run: smoke | unit | integration | regression |
+          trunk | suite_<group> | <label>.
+          Default: regression (every config labeled for full functional
+          coverage).
         required: false
         type: string
-        default: full
+        default: regression
 
 concurrency:
   group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.html_url) || (github.event_name == 'workflow_dispatch'
@@ -124,7 +126,7 @@ jobs:
       rpm_location: ${{ inputs.rpm_location || '' }}
       rpm_names: ${{ inputs.rpm_names || '' }}
       build_torch_spyre: ${{ inputs.build_torch_spyre == true }}
-      test_type: ${{ inputs.test_type || (github.event_name == 'push' && 'trunk' || 'full') }}
+      test_type: ${{ inputs.test_type || (github.event_name == 'push' && 'trunk' || 'regression') }}
 
   # ---------------------------------------------------------------------------
   # Job 3: run-spyre-unit-tests (required check gate)

@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 360" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14">
+  <defs>
+    <marker id="ah2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#444"/>
+    </marker>
+    <style>
+      .title   { fill: #222; font-size: 16px; font-weight: 700; }
+      .caption { fill: #555; font-size: 12px; font-style: italic; }
+      .panel   { fill: #222; font-size: 14px; font-weight: 700; }
+      .lx      { fill: #d6efd6; stroke: #2d7a2d; stroke-width: 1.4; }
+      .hbm     { fill: #ffe0e0; stroke: #a32020; stroke-width: 1.4; }
+      .op      { fill: #e6f0ff; stroke: #2c5aa0; stroke-width: 1.4; }
+      .lbl     { fill: #222; font-size: 13px; font-weight: 600; }
+      .arrow   { stroke: #444; stroke-width: 1.6; fill: none; }
+      .good    { fill: #2d7a2d; font-size: 13px; font-weight: 700; }
+      .bad     { fill: #a32020; font-size: 13px; font-weight: 700; }
+    </style>
+  </defs>
+
+  <text x="360" y="26" text-anchor="middle" class="title">Cost of a core-division mismatch</text>
+  <text x="360" y="46" text-anchor="middle" class="caption">A shared buffer of size S. Whether it stays on LX depends on the writer and reader agreeing on the per-core split.</text>
+
+  <!-- ===== LEFT: splits agree, buffer stays on LX ===== -->
+  <text x="40" y="86" class="panel">Splits agree: buffer stays on LX</text>
+
+  <rect class="op" x="40"  y="104" width="120" height="44" rx="8"/>
+  <text class="lbl" x="100" y="131" text-anchor="middle">writer op</text>
+
+  <rect class="lx" x="220" y="104" width="140" height="44" rx="8"/>
+  <text class="lbl" x="290" y="126" text-anchor="middle">buffer on LX</text>
+  <text class="lbl" x="290" y="142" text-anchor="middle" font-size="11">per-core slice</text>
+
+  <rect class="op" x="420" y="104" width="120" height="44" rx="8"/>
+  <text class="lbl" x="480" y="131" text-anchor="middle">reader op</text>
+
+  <path class="arrow" marker-end="url(#ah2)" d="M160,126 L216,126"/>
+  <path class="arrow" marker-end="url(#ah2)" d="M360,126 L416,126"/>
+  <text class="good" x="290" y="180" text-anchor="middle">0 extra off-chip bytes</text>
+
+  <!-- ===== RIGHT: splits disagree, buffer spills to HBM ===== -->
+  <text x="40" y="228" class="panel">Splits disagree (core_div_mismatch): buffer spills to HBM</text>
+
+  <rect class="op" x="40"  y="246" width="110" height="44" rx="8"/>
+  <text class="lbl" x="95" y="273" text-anchor="middle">writer op</text>
+
+  <rect class="hbm" x="270" y="246" width="150" height="44" rx="8"/>
+  <text class="lbl" x="345" y="273" text-anchor="middle">buffer in HBM</text>
+
+  <rect class="op" x="540" y="246" width="110" height="44" rx="8"/>
+  <text class="lbl" x="595" y="273" text-anchor="middle">reader op</text>
+
+  <path class="arrow" marker-end="url(#ah2)" d="M150,268 L266,268"/>
+  <text class="bad" x="208" y="260" text-anchor="middle" font-size="11">write S</text>
+  <path class="arrow" marker-end="url(#ah2)" d="M420,268 L536,268"/>
+  <text class="bad" x="478" y="260" text-anchor="middle" font-size="11">read S</text>
+
+  <text class="bad" x="345" y="320" text-anchor="middle">2 x S off-chip bytes: one write, one later read</text>
+</svg>

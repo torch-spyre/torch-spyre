@@ -18,6 +18,7 @@ from torch_spyre._C import ElementArrangement
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
+DEPTHWISE_CONV2D_OP = "depthwiseconv2dnative"
 BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
 MATMUL_REDUCTION_OPS = frozenset({BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP})
 
@@ -183,6 +184,7 @@ TOPK_OPS = {"topkvalue", "topkindex"}
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
+CONV2D_LAYOUT_LABELS = ["OUTPUT", "INPUT", "KERNEL", "KERNEL_IDX"]
 
 AVGPOOL2D_OP = "avgpoolfwd"
 # Pool opfunc names, mirroring TOPK_OPS. Add maxpool/minpool here as they land so
@@ -193,6 +195,7 @@ POOL_OPS = {AVGPOOL2D_OP}
 INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j", "ki", "kj"]
 OUTPUT_DIM_LABELS = ["out"]
 MATMUL_DIM_LABELS = ["ki", "kj", "y", "x", "mb", "out", "in"]
+CONV2D_DIM_LABELS = ["mb", "out", "i", "j", "ki", "kj"]
 # Canonical avgpool iteration-space order: batch, out-H, out-W, channel,
 # kernel-H, kernel-W. These SDSC labels are owned by the codegen layer; dim-role
 # survival is derived from the node's live output ranges

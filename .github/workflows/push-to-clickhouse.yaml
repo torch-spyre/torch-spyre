@@ -182,7 +182,7 @@ jobs:
       - name: Extract suite tier from display title
         id: extract-tier
         run: |
-          # display_title is "integration-tests (full)" / "integration-tests (device_critical)" / etc.
+          # display_title is "integration-tests (regression)" / "integration-tests (integration)" / etc.
           # Fall back to empty (ingest_xml.py defaults it to 'unknown') for manual workflow_dispatch
           # re-ingests or older runs whose display_title predates this convention.
           TIER=$(echo "${TRIGGERING_DISPLAY_TITLE}" | sed -n 's/.*(\(.*\))\s*$/\1/p')

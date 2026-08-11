@@ -79,19 +79,21 @@ on:
         default: true
       test_type:
         description: >-
-          Suite subset to run: smoke | core | full | device_critical |
-          suite_<group> | <label>. Selects configs whose
-          test_suite_config.labels array contains this value, or (for
-          suite_<group>) whose path sits under that directory.
-          device_critical covers the device-layer surfaces flex and
+          Suite subset to run: smoke | unit | integration | regression |
+          trunk | suite_<group> | <label>. Selects configs whose
+          test_suite_config.labels array contains this value literally, or
+          (for suite_<group>) whose path sits under that directory -- there
+          is no catch-all value that ignores a config's labels.
+          integration covers the device-layer surfaces flex and
           deeptools/dxp_standalone exercise most (streams, job launch
           plans, codegen, LX/scratchpad planning, tensor layout,
-          allocator/GC, D2D copies). Default: full (every config) -- callers
-          that want the narrower CI default (e.g. integration-tests.yaml)
-          pass test_type explicitly.
+          allocator/GC, D2D copies). Default: regression (every config
+          labeled for full functional coverage) -- callers that want the
+          narrower CI default (e.g. integration-tests.yaml) pass test_type
+          explicitly.
         required: false
         type: string
-        default: full
+        default: regression
 
       # Spyre-Next integration path: test the PRE-BAKED dev image directly instead
       # of checking out + rebuilding torch-spyre on the runner. The ephemeral ARC
@@ -131,7 +133,7 @@ jobs:
   # output via fromJSON so that only the requested subset of runners starts.
   # ---------------------------------------------------------------------------
   generate_matrix:
-    name: Generate test matrix (${{ inputs.test_type || 'full' }})
+    name: Generate test matrix (${{ inputs.test_type || 'regression' }})
     # Normal path: ubuntu-latest with a fresh sparse checkout of the configs.
     # Prebaked path: run ON the runner image so the matrix is computed from the
     # SAME PR-pinned configs baked into the dev image (not a re-fetch of main),
@@ -157,7 +159,7 @@ jobs:
       - name: Filter configs by TEST_TYPE
         id: filter
         env:
-          RAW_TEST_TYPE: ${{ inputs.test_type || 'full' }}
+          RAW_TEST_TYPE: ${{ inputs.test_type || 'regression' }}
         run: |
           # Prebaked: read the configs baked in the dev image; else the checkout cwd.
           # cd into the source root so every path below stays repo-relative and
@@ -175,18 +177,12 @@ jobs:
             --format matrix-json)
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
-          # Everything downstream of this job (TORCH_SPYRE_TEST_TYPE env var, the
-          # test_multi_spyre distributed-suite gate) compares test_type by literal
-          # string, bypassing filter_configs.py's own alias resolution -- resolve
-          # once here via the same source of truth so unit/integration/regression
-          # behave identically everywhere, not just in the label-matching path.
-          resolved=$(python3 -c "
-          import sys
-          sys.path.insert(0, 'tests/oot_framework/utils')
-          from filter_configs import resolve_test_type
-          import os
-          print(resolve_test_type(os.environ['RAW_TEST_TYPE'].strip()))
-          ")
+          # test_type is now the literal label vocabulary (smoke/unit/
+          # integration/regression/trunk) with no alias-resolution layer, so
+          # everything downstream (TORCH_SPYRE_TEST_TYPE env var, the
+          # test_multi_spyre distributed-suite gate) can compare against the
+          # trimmed raw input directly.
+          resolved=$(echo "${RAW_TEST_TYPE}" | xargs)
           echo "resolved_test_type=$resolved" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
@@ -377,14 +373,20 @@ jobs:
   # Job 2: Multi-Spyre test matrix
   #
   # Only runs for test_type values that include the distributed suite:
-  #   full              — includes everything
-  #   device_critical    — used as the reduced default by integration-tests.yaml;
+  #   regression         — includes everything (distributed_tests configs
+  #                        carry the regression label)
+  #   trunk              — push-to-main coverage (distributed_tests configs
+  #                        carry the trunk label too)
+  #   integration        — used as the reduced default by integration-tests.yaml;
   #                        distributed comms (streams/barrier/broadcast/gather/
   #                        allgather) are exactly the device-layer surface this
-  #                        label exists to protect, so it always runs alongside it
+  #                        tier exists to protect, so it always runs alongside it
+  #                        (distributed_tests configs carry the "integration"
+  #                        label too, so this also matches filter_configs.py's
+  #                        own label matching)
   #   suite_distributed — targets the distributed_tests/ directory directly
-  #   (empty)           — same as full
-  # For smoke / core / suite_<other> the distributed job is skipped entirely
+  #   (empty)           — same as regression
+  # For smoke / unit / suite_<other> the distributed job is skipped entirely
   # so no x2 runners are allocated.
   # ---------------------------------------------------------------------------
   test_multi_spyre:
@@ -398,8 +400,9 @@ jobs:
     if: >-
       !cancelled() &&
       (needs.generate_matrix.outputs.resolved_test_type == '' ||
-       needs.generate_matrix.outputs.resolved_test_type == 'full' ||
-       needs.generate_matrix.outputs.resolved_test_type == 'device_critical' ||
+       needs.generate_matrix.outputs.resolved_test_type == 'regression' ||
+       needs.generate_matrix.outputs.resolved_test_type == 'trunk' ||
+       needs.generate_matrix.outputs.resolved_test_type == 'integration' ||
        needs.generate_matrix.outputs.resolved_test_type == 'suite_distributed') &&
       (needs.build_torch_spyre.result == 'success' ||
        needs.build_torch_spyre.result == 'skipped')

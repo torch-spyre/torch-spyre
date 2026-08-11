@@ -1568,7 +1568,7 @@ class TestsBlock(BaseModel):
 
     files: List[FileEntry]
     global_config: GlobalConfig = GlobalConfig()
-    labels: List[str] = ["full"]
+    labels: List[str] = []
 
     @model_validator(mode="before")
     @classmethod
