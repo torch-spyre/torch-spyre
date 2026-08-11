@@ -29,8 +29,10 @@ logger = get_inductor_logger("scratchpad.greedy_solver")
 
 
 class GreedyLayoutSolver(MemoryPlanSolver):
-    def __init__(self, size: int, alignment: int = 128):
-        super().__init__(size, alignment)
+    def __init__(
+        self, buffers: Sequence[LifetimeBoundBuffer], size: int, alignment: int = 128
+    ):
+        super().__init__(buffers, size, alignment)
         # `usage` tracks live placements during planning. It is specific to the
         # greedy time-stepping algorithm; the gap-based solvers don't use it.
         self.usage: list[LifetimeBoundBuffer] = []
@@ -131,10 +133,8 @@ class GreedyLayoutSolver(MemoryPlanSolver):
             if buf in self.usage:
                 self.usage.remove(buf)
 
-    def plan_layout(
-        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
-    ) -> list[LifetimeBoundBuffer]:
-        """Allocates addresses to the provided buffer list
+    def plan_layout(self, log_lx_usage: bool = False) -> list[LifetimeBoundBuffer]:
+        """Allocates addresses to :attr:`buffers`.
 
         Accepts a set of buffers with pre-defined sizes and lifetimes. These buffers are
         allocated addresses with 0 -> `limit` where the maximum starting address of
@@ -155,12 +155,10 @@ class GreedyLayoutSolver(MemoryPlanSolver):
                 allocations and find where gaps exceed current size. Allocate if
                 current gap is larger than current size + alignment.
 
-        Args:
-            buffers (list[LifetimeBoundBuffer]): The set of buffers to be planned.
-
         Returns:
             list[LifetimeBoundBuffer]: The supplied buffers with addresses assigned.
         """
+        buffers = self.buffers
         if not buffers:
             return []
         assert all(buf.address is None for buf in buffers), (
@@ -170,7 +168,7 @@ class GreedyLayoutSolver(MemoryPlanSolver):
 
         # Barred buffers keep address=None and never enter the time-stepping
         # loop, so they can neither be placed nor occupy space others need.
-        placeable, _ = self.partition(buffers)
+        placeable, _ = self.partition()
         if not placeable:
             return list(buffers)
 

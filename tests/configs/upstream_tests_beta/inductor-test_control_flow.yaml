@@ -1,0 +1,1042 @@
+test_suite_config:
+
+  files:
+    - path: ${TORCH_ROOT}/test/inductor/test_control_flow.py
+      unlisted_test_mode: skip
+      tests:
+        # These tests exercise control flow operations, specifically handling infinite loops.
+        # They are classified as mandatory_success because Spyre must handle control flow without errors.
+        # Relevant Spyre capabilities include robust control flow handling and error detection.
+        - names:
+            - WhileLoopTests::test_while_loop_infinite_loop_error
+          mode: mandatory_success
+        - names:
+            - AssociativeScanTests::test_associative_scan_CUDA_flip
+            - AssociativeScanTests::test_associative_scan_CUDA_flip_combine_mode_generic_backend_inductor_cpu
+            - AssociativeScanTests::test_associative_scan_CUDA_flip_combine_mode_generic_backend_inductor_device_cuda
+            - AssociativeScanTests::test_associative_scan_CUDA_flip_combine_mode_pointwise_backend_inductor_cpu
+            - AssociativeScanTests::test_associative_scan_CUDA_flip_combine_mode_pointwise_backend_inductor_device_cuda
+            - CondTests::test_cond_advanced_dynamic_shapes
+            - CondTests::test_cond_advanced_dynamic_shapes_device_cpu
+            - CondTests::test_cond_advanced_dynamic_shapes_device_cuda
+            - CondTests::test_cond_aliasing_outputs
+            - CondTests::test_cond_control_flow_with_precomputed_size
+            - CondTests::test_cond_decompose_ops_in_subgraph
+            - CondTests::test_cond_decompose_ops_in_subgraph_device_cpu
+            - CondTests::test_cond_decompose_ops_in_subgraph_device_cuda
+            - CondTests::test_cond_decompose_ops_in_subgraph_recursive
+            - CondTests::test_cond_decompose_ops_in_subgraph_recursive_device_cpu
+            - CondTests::test_cond_decompose_ops_in_subgraph_recursive_device_cuda
+            - CondTests::test_cond_functional_call
+            - CondTests::test_cond_functional_call_device_cpu_dynamic_False
+            - CondTests::test_cond_functional_call_device_cpu_dynamic_True
+            - CondTests::test_cond_functional_call_device_cuda_dynamic_False
+            - CondTests::test_cond_functional_call_device_cuda_dynamic_True
+            - CondTests::test_cond_inductor_fx_passes_recursively_applied
+            - CondTests::test_cond_mismatched_branch_output_size
+            - CondTests::test_cond_mismatched_branch_output_size_device_cpu_dynamic_False
+            - CondTests::test_cond_mismatched_branch_output_size_device_cpu_dynamic_True
+            - CondTests::test_cond_mismatched_branch_output_size_device_cuda_dynamic_False
+            - CondTests::test_cond_mismatched_branch_output_size_device_cuda_dynamic_True
+            - CondTests::test_cond_multiple_outputs
+            - CondTests::test_cond_multiple_outputs_device_cpu_dynamic_False
+            - CondTests::test_cond_multiple_outputs_device_cpu_dynamic_True
+            - CondTests::test_cond_multiple_outputs_device_cuda_dynamic_False
+            - CondTests::test_cond_multiple_outputs_device_cuda_dynamic_True
+            - CondTests::test_cond_nested_control_flow
+            - CondTests::test_cond_nested_control_flow_device_cpu_dynamic_False
+            - CondTests::test_cond_nested_control_flow_device_cpu_dynamic_True
+            - CondTests::test_cond_nested_control_flow_device_cuda_dynamic_False
+            - CondTests::test_cond_nested_control_flow_device_cuda_dynamic_True
+            - CondTests::test_cond_non_tensor_predicates
+            - CondTests::test_cond_non_tensor_predicates_device_cpu_dynamic_False
+            - CondTests::test_cond_non_tensor_predicates_device_cpu_dynamic_True
+            - CondTests::test_cond_non_tensor_predicates_device_cuda_dynamic_False
+            - CondTests::test_cond_non_tensor_predicates_device_cuda_dynamic_True
+            - CondTests::test_cond_outer_code_before_after
+            - CondTests::test_cond_outer_code_before_after_device_cpu_dynamic_False
+            - CondTests::test_cond_outer_code_before_after_device_cpu_dynamic_True
+            - CondTests::test_cond_outer_code_before_after_device_cuda_dynamic_False
+            - CondTests::test_cond_outer_code_before_after_device_cuda_dynamic_True
+            - CondTests::test_cond_reintepret_view_inputs_outputs
+            - CondTests::test_cond_select_with_input_idx
+            - CondTests::test_cond_select_with_input_idx_device_cpu_dynamic_False
+            - CondTests::test_cond_select_with_input_idx_device_cpu_dynamic_True
+            - CondTests::test_cond_select_with_input_idx_device_cuda_dynamic_False
+            - CondTests::test_cond_select_with_input_idx_device_cuda_dynamic_True
+            - CondTests::test_cond_simple_control_flow
+            - CondTests::test_cond_simple_control_flow_device_cpu_dynamic_False
+            - CondTests::test_cond_simple_control_flow_device_cpu_dynamic_True
+            - CondTests::test_cond_simple_control_flow_device_cuda_dynamic_False
+            - CondTests::test_cond_simple_control_flow_device_cuda_dynamic_True
+            - CondTests::test_cond_simple_with_int_closure
+            - CondTests::test_cond_simple_with_int_closure_device_cpu
+            - CondTests::test_cond_simple_with_int_closure_device_cuda
+            - CondTests::test_cond_subgraph_output_stride_padding
+            - CondTests::test_cond_subgraphs_with_parameters
+            - CondTests::test_cond_subgraphs_with_parameters_device_cpu_dynamic_False
+            - CondTests::test_cond_subgraphs_with_parameters_device_cpu_dynamic_True
+            - CondTests::test_cond_subgraphs_with_parameters_device_cuda_dynamic_False
+            - CondTests::test_cond_subgraphs_with_parameters_device_cuda_dynamic_True
+            - CondTests::test_cond_unbacked_symint_closure
+            - CondTests::test_cond_unbacked_symint_closure_device_cpu_dynamic_False
+            - CondTests::test_cond_unbacked_symint_closure_device_cpu_dynamic_True
+            - CondTests::test_cond_unbacked_symint_closure_device_cuda_dynamic_False
+            - CondTests::test_cond_unbacked_symint_closure_device_cuda_dynamic_True
+            - CondTests::test_cond_unbacked_symint_inner
+            - CondTests::test_cond_unbacked_symint_inner_device_cpu
+            - CondTests::test_cond_unbacked_symint_inner_device_cuda
+            - CondTests::test_cond_unbacked_symint_inner_to_outer
+            - CondTests::test_cond_unbacked_symint_inner_to_outer_device_cpu
+            - CondTests::test_cond_unbacked_symint_inner_to_outer_device_cuda
+            - CondTests::test_cond_unbacked_symint_outer_to_inner
+            - CondTests::test_cond_unbacked_symint_outer_to_inner_device_cpu
+            - CondTests::test_cond_unbacked_symint_outer_to_inner_device_cuda
+            - CondTests::test_cond_use_buffers_from_outer_scope
+            - CondTests::test_output_on_different_device
+            - MapTests::test_map_nested_with_cond
+            - MapTests::test_map_nested_with_cond_device_cpu_dynamic_False_autograd_False
+            - MapTests::test_map_nested_with_cond_device_cpu_dynamic_False_autograd_True
+            - MapTests::test_map_nested_with_cond_device_cpu_dynamic_True_autograd_False
+            - MapTests::test_map_nested_with_cond_device_cpu_dynamic_True_autograd_True
+            - MapTests::test_map_nested_with_cond_device_cuda_dynamic_False_autograd_False
+            - MapTests::test_map_nested_with_cond_device_cuda_dynamic_False_autograd_True
+            - MapTests::test_map_nested_with_cond_device_cuda_dynamic_True_autograd_False
+            - MapTests::test_map_nested_with_cond_device_cuda_dynamic_True_autograd_True
+            - MapTests::test_map_pytree_in_out
+            - MapTests::test_map_pytree_in_out_device_cpu_dynamic_False_autograd_False
+            - MapTests::test_map_pytree_in_out_device_cpu_dynamic_False_autograd_True
+            - MapTests::test_map_pytree_in_out_device_cpu_dynamic_True_autograd_False
+            - MapTests::test_map_pytree_in_out_device_cpu_dynamic_True_autograd_True
+            - MapTests::test_map_pytree_in_out_device_cuda_dynamic_False_autograd_False
+            - MapTests::test_map_pytree_in_out_device_cuda_dynamic_False_autograd_True
+            - MapTests::test_map_pytree_in_out_device_cuda_dynamic_True_autograd_False
+            - MapTests::test_map_pytree_in_out_device_cuda_dynamic_True_autograd_True
+            - MapTests::test_map_simple
+            - MapTests::test_map_simple_device_cpu_dynamic_False_autograd_False
+            - MapTests::test_map_simple_device_cpu_dynamic_False_autograd_True
+            - MapTests::test_map_simple_device_cpu_dynamic_True_autograd_False
+            - MapTests::test_map_simple_device_cpu_dynamic_True_autograd_True
+            - MapTests::test_map_simple_device_cuda_dynamic_False_autograd_False
+            - MapTests::test_map_simple_device_cuda_dynamic_False_autograd_True
+            - MapTests::test_map_simple_device_cuda_dynamic_True_autograd_False
+            - MapTests::test_map_simple_device_cuda_dynamic_True_autograd_True
+            - MapTests::test_map_simple_linear_with_view
+            - MapTests::test_map_simple_linear_with_view_device_cpu_dynamic_False_autograd_False
+            - MapTests::test_map_simple_linear_with_view_device_cpu_dynamic_False_autograd_True
+            - MapTests::test_map_simple_linear_with_view_device_cpu_dynamic_True_autograd_False
+            - MapTests::test_map_simple_linear_with_view_device_cpu_dynamic_True_autograd_True
+            - MapTests::test_map_simple_linear_with_view_device_cuda_dynamic_False_autograd_False
+            - MapTests::test_map_simple_linear_with_view_device_cuda_dynamic_False_autograd_True
+            - MapTests::test_map_simple_linear_with_view_device_cuda_dynamic_True_autograd_False
+            - MapTests::test_map_simple_linear_with_view_device_cuda_dynamic_True_autograd_True
+            - ScanTests::test_cond_in_scan
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_False_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_False_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_False_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_False_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_False_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_False_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_False_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_False_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_False_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_False_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_False_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_False_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_True_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_True_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_True_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_True_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_True_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_True_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_True_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_True_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_True_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_True_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_True_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_False_reverse_True_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_False_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_False_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_False_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_False_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_False_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_False_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_False_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_False_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_False_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_False_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_False_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_False_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_True_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_True_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_True_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_True_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_True_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_True_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_True_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_True_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_True_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_True_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_True_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cpu_dynamic_True_reverse_True_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_False_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_False_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_False_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_False_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_False_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_False_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_False_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_False_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_False_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_False_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_False_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_False_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_True_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_True_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_True_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_True_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_True_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_True_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_True_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_True_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_True_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_True_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_True_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_False_reverse_True_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_False_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_False_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_False_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_False_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_False_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_False_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_False_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_False_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_False_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_False_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_False_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_False_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_True_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_True_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_True_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_True_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_True_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_True_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_True_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_True_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_True_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_True_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_True_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_cond_in_scan_device_cuda_dynamic_True_reverse_True_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_scan_chunked_ce
+            - ScanTests::test_scan_chunked_ce_device_cpu_dynamic_False_autograd_False
+            - ScanTests::test_scan_chunked_ce_device_cpu_dynamic_False_autograd_True
+            - ScanTests::test_scan_chunked_ce_device_cpu_dynamic_True_autograd_False
+            - ScanTests::test_scan_chunked_ce_device_cpu_dynamic_True_autograd_True
+            - ScanTests::test_scan_chunked_ce_device_cuda_dynamic_False_autograd_False
+            - ScanTests::test_scan_chunked_ce_device_cuda_dynamic_False_autograd_True
+            - ScanTests::test_scan_chunked_ce_device_cuda_dynamic_True_autograd_False
+            - ScanTests::test_scan_chunked_ce_device_cuda_dynamic_True_autograd_True
+            - ScanTests::test_scan_compare_chunked_ce_with_no_scan
+            - ScanTests::test_scan_compare_chunked_ce_with_no_scan_device_cpu_dynamic_False
+            - ScanTests::test_scan_compare_chunked_ce_with_no_scan_device_cpu_dynamic_True
+            - ScanTests::test_scan_compare_chunked_ce_with_no_scan_device_cuda_dynamic_False
+            - ScanTests::test_scan_compare_chunked_ce_with_no_scan_device_cuda_dynamic_True
+            - ScanTests::test_scan_conv
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_False_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_False_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_False_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_False_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_False_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_False_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_False_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_False_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_False_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_False_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_False_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_False_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_True_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_True_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_True_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_True_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_True_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_True_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_True_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_True_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_True_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_True_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_True_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_False_reverse_True_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_False_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_False_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_False_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_False_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_False_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_False_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_False_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_False_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_False_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_False_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_False_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_False_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_True_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_True_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_True_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_True_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_True_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_True_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_True_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_True_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_True_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_True_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_True_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cpu_dynamic_True_reverse_True_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_False_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_False_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_False_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_False_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_False_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_False_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_False_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_False_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_False_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_False_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_False_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_False_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_True_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_True_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_True_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_True_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_True_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_True_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_True_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_True_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_True_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_True_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_True_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_False_reverse_True_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_False_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_False_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_False_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_False_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_False_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_False_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_False_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_False_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_False_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_False_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_False_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_False_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_True_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_True_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_True_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_True_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_True_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_True_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_True_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_True_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_True_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_True_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_True_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_scan_conv_device_cuda_dynamic_True_reverse_True_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_0_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_0_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_0_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_0_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_0_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_0_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_0_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_0_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_1_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_1_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_1_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_1_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_1_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_1_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_1_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_1_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_3_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_3_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_3_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_3_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_3_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_3_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_3_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_False_dim_3_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_0_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_0_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_0_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_0_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_0_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_0_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_0_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_0_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_1_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_1_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_1_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_1_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_1_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_1_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_1_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_1_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_3_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_3_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_3_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_3_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_3_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_3_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_3_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_False_reverse_True_dim_3_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_0_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_0_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_0_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_0_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_0_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_0_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_0_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_0_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_1_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_1_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_1_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_1_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_1_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_1_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_1_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_1_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_3_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_3_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_3_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_3_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_3_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_3_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_3_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_False_dim_3_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_0_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_0_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_0_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_0_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_0_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_0_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_0_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_0_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_1_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_1_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_1_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_1_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_1_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_1_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_1_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_1_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_3_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_3_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_3_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_3_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_3_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_3_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_3_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cpu_dynamic_True_reverse_True_dim_3_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_0_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_0_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_0_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_0_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_0_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_0_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_0_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_0_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_1_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_1_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_1_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_1_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_1_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_1_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_1_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_1_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_3_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_3_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_3_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_3_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_3_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_3_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_3_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_False_dim_3_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_0_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_0_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_0_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_0_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_0_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_0_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_0_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_0_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_1_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_1_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_1_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_1_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_1_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_1_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_1_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_1_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_3_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_3_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_3_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_3_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_3_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_3_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_3_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_False_reverse_True_dim_3_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_0_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_0_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_0_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_0_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_0_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_0_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_0_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_0_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_1_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_1_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_1_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_1_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_1_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_1_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_1_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_1_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_3_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_3_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_3_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_3_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_3_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_3_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_3_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_False_dim_3_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_0_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_0_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_0_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_0_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_0_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_0_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_0_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_0_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_1_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_1_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_1_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_1_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_1_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_1_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_1_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_1_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_3_pred_False_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_3_pred_False_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_3_pred_False_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_3_pred_False_scan_length_5_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_3_pred_True_scan_length_1_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_3_pred_True_scan_length_1_autograd_True
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_3_pred_True_scan_length_5_autograd_False
+            - ScanTests::test_scan_in_cond_device_cuda_dynamic_True_reverse_True_dim_3_pred_True_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_False_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_False_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_False_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_False_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_False_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_False_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_False_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_False_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_False_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_False_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_False_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_False_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_True_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_True_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_True_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_True_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_True_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_True_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_True_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_True_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_True_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_True_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_True_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_False_reverse_True_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_False_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_False_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_False_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_False_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_False_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_False_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_False_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_False_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_False_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_False_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_False_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_False_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_True_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_True_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_True_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_True_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_True_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_True_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_True_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_True_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_True_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_True_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_True_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cpu_dynamic_True_reverse_True_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_False_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_False_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_False_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_False_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_False_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_False_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_False_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_False_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_False_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_False_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_False_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_False_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_True_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_True_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_True_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_True_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_True_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_True_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_True_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_True_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_True_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_True_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_True_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_False_reverse_True_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_False_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_False_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_False_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_False_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_False_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_False_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_False_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_False_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_False_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_False_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_False_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_False_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_True_dim_0_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_True_dim_0_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_True_dim_0_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_True_dim_0_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_True_dim_1_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_True_dim_1_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_True_dim_1_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_True_dim_1_scan_length_5_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_True_dim_3_scan_length_1_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_True_dim_3_scan_length_1_autograd_True
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_True_dim_3_scan_length_5_autograd_False
+            - ScanTests::test_scan_nn_modules_device_cuda_dynamic_True_reverse_True_dim_3_scan_length_5_autograd_True
+            - ScanTests::test_scan_pytree_in_out
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_False_reverse_False_dim_0_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_False_reverse_False_dim_0_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_False_reverse_False_dim_1_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_False_reverse_False_dim_1_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_False_reverse_False_dim_2_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_False_reverse_False_dim_2_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_False_reverse_True_dim_0_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_False_reverse_True_dim_0_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_False_reverse_True_dim_1_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_False_reverse_True_dim_1_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_False_reverse_True_dim_2_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_False_reverse_True_dim_2_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_True_reverse_False_dim_0_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_True_reverse_False_dim_0_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_True_reverse_False_dim_1_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_True_reverse_False_dim_1_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_True_reverse_False_dim_2_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_True_reverse_False_dim_2_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_True_reverse_True_dim_0_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_True_reverse_True_dim_0_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_True_reverse_True_dim_1_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_True_reverse_True_dim_1_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_True_reverse_True_dim_2_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cpu_dynamic_True_reverse_True_dim_2_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_False_reverse_False_dim_0_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_False_reverse_False_dim_0_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_False_reverse_False_dim_1_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_False_reverse_False_dim_1_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_False_reverse_False_dim_2_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_False_reverse_False_dim_2_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_False_reverse_True_dim_0_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_False_reverse_True_dim_0_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_False_reverse_True_dim_1_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_False_reverse_True_dim_1_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_False_reverse_True_dim_2_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_False_reverse_True_dim_2_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_True_reverse_False_dim_0_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_True_reverse_False_dim_0_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_True_reverse_False_dim_1_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_True_reverse_False_dim_1_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_True_reverse_False_dim_2_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_True_reverse_False_dim_2_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_True_reverse_True_dim_0_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_True_reverse_True_dim_0_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_True_reverse_True_dim_1_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_True_reverse_True_dim_1_autograd_True
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_True_reverse_True_dim_2_autograd_False
+            - ScanTests::test_scan_pytree_in_out_device_cuda_dynamic_True_reverse_True_dim_2_autograd_True
+            - ScanTests::test_scan_with_clamp
+            - ScanTests::test_scan_with_clamp_device_cpu_dynamic_False_autograd_False
+            - ScanTests::test_scan_with_clamp_device_cpu_dynamic_False_autograd_True
+            - ScanTests::test_scan_with_clamp_device_cpu_dynamic_True_autograd_False
+            - ScanTests::test_scan_with_clamp_device_cpu_dynamic_True_autograd_True
+            - ScanTests::test_scan_with_clamp_device_cuda_dynamic_False_autograd_False
+            - ScanTests::test_scan_with_clamp_device_cuda_dynamic_False_autograd_True
+            - ScanTests::test_scan_with_clamp_device_cuda_dynamic_True_autograd_False
+            - ScanTests::test_scan_with_clamp_device_cuda_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_models_with_mixed_device
+            - WhileLoopTests::test_while_loop_models_with_mixed_device_device_cuda
+            - WhileLoopTests::test_while_loop_nested_control_flow
+            - WhileLoopTests::test_while_loop_nested_control_flow_device_cpu_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_nested_control_flow_device_cpu_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_nested_control_flow_device_cpu_dynamic_True_autograd_False
+            - WhileLoopTests::test_while_loop_nested_control_flow_device_cpu_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_nested_control_flow_device_cuda_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_nested_control_flow_device_cuda_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_nested_control_flow_device_cuda_dynamic_True_autograd_False
+            - WhileLoopTests::test_while_loop_nested_control_flow_device_cuda_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_simple_control_flow
+            - WhileLoopTests::test_while_loop_simple_control_flow_device_cpu_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_simple_control_flow_device_cpu_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_simple_control_flow_device_cpu_dynamic_True_autograd_False
+            - WhileLoopTests::test_while_loop_simple_control_flow_device_cpu_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_simple_control_flow_device_cuda_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_simple_control_flow_device_cuda_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_simple_control_flow_device_cuda_dynamic_True_autograd_False
+            - WhileLoopTests::test_while_loop_simple_control_flow_device_cuda_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_stack_output_simple
+            - WhileLoopTests::test_while_loop_stack_output_simple_device_cpu_dynamic_False
+            - WhileLoopTests::test_while_loop_stack_output_simple_device_cpu_dynamic_True
+            - WhileLoopTests::test_while_loop_stack_output_simple_device_cuda_dynamic_False
+            - WhileLoopTests::test_while_loop_stack_output_simple_device_cuda_dynamic_True
+            - WhileLoopTests::test_while_loop_with_conv
+            - WhileLoopTests::test_while_loop_with_conv_device_cpu_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_with_conv_device_cpu_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_with_conv_device_cpu_dynamic_True_autograd_False
+            - WhileLoopTests::test_while_loop_with_conv_device_cpu_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_with_conv_device_cuda_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_with_conv_device_cuda_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_with_conv_device_cuda_dynamic_True_autograd_False
+            - WhileLoopTests::test_while_loop_with_conv_device_cuda_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_with_data_dependent_in_out
+            - WhileLoopTests::test_while_loop_with_data_dependent_in_out_device_cpu_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_with_data_dependent_in_out_device_cpu_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_with_data_dependent_in_out_device_cpu_dynamic_True_autograd_False
+            - WhileLoopTests::test_while_loop_with_data_dependent_in_out_device_cpu_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_with_data_dependent_in_out_device_cuda_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_with_data_dependent_in_out_device_cuda_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_with_data_dependent_in_out_device_cuda_dynamic_True_autograd_False
+            - WhileLoopTests::test_while_loop_with_data_dependent_in_out_device_cuda_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_with_data_dependent_in_out_mismatch
+            - WhileLoopTests::test_while_loop_with_data_dependent_in_out_mismatch_dynamic_False
+            - WhileLoopTests::test_while_loop_with_data_dependent_in_out_mismatch_dynamic_True
+            - WhileLoopTests::test_while_loop_with_data_dependent_ops
+            - WhileLoopTests::test_while_loop_with_data_dependent_ops_device_cpu_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_with_data_dependent_ops_device_cpu_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_with_data_dependent_ops_device_cpu_dynamic_True_autograd_False
+            - WhileLoopTests::test_while_loop_with_data_dependent_ops_device_cpu_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_with_data_dependent_ops_device_cuda_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_with_data_dependent_ops_device_cuda_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_with_data_dependent_ops_device_cuda_dynamic_True_autograd_False
+            - WhileLoopTests::test_while_loop_with_data_dependent_ops_device_cuda_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_with_outer_buffers
+            - WhileLoopTests::test_while_loop_with_outer_buffers_device_cpu_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_with_outer_buffers_device_cpu_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_with_outer_buffers_device_cuda_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_with_outer_buffers_device_cuda_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_with_outer_code
+            - WhileLoopTests::test_while_loop_with_outer_code_device_cpu_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_with_outer_code_device_cpu_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_with_outer_code_device_cpu_dynamic_True_autograd_False
+            - WhileLoopTests::test_while_loop_with_outer_code_device_cpu_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_with_outer_code_device_cuda_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_with_outer_code_device_cuda_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_with_outer_code_device_cuda_dynamic_True_autograd_False
+            - WhileLoopTests::test_while_loop_with_outer_code_device_cuda_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_with_parameters
+            - WhileLoopTests::test_while_loop_with_parameters_device_cpu_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_with_parameters_device_cpu_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_with_parameters_device_cpu_dynamic_True_autograd_False
+            - WhileLoopTests::test_while_loop_with_parameters_device_cpu_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_with_parameters_device_cuda_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_with_parameters_device_cuda_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_with_parameters_device_cuda_dynamic_True_autograd_False
+            - WhileLoopTests::test_while_loop_with_parameters_device_cuda_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_with_pytree_inputs
+            - WhileLoopTests::test_while_loop_with_pytree_inputs_device_cpu_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_with_pytree_inputs_device_cpu_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_with_pytree_inputs_device_cpu_dynamic_True_autograd_False
+            - WhileLoopTests::test_while_loop_with_pytree_inputs_device_cpu_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_with_pytree_inputs_device_cuda_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_with_pytree_inputs_device_cuda_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_with_pytree_inputs_device_cuda_dynamic_True_autograd_False
+            - WhileLoopTests::test_while_loop_with_pytree_inputs_device_cuda_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_with_sym_expr_cond
+            - WhileLoopTests::test_while_loop_with_sym_expr_cond_device_cpu_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_with_sym_expr_cond_device_cpu_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_with_sym_expr_cond_device_cpu_dynamic_True_autograd_False
+            - WhileLoopTests::test_while_loop_with_sym_expr_cond_device_cpu_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_with_sym_expr_cond_device_cuda_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_with_sym_expr_cond_device_cuda_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_with_sym_expr_cond_device_cuda_dynamic_True_autograd_False
+            - WhileLoopTests::test_while_loop_with_sym_expr_cond_device_cuda_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_with_unbacked_symint_closure
+            - WhileLoopTests::test_while_loop_with_unbacked_symint_closure_device_cpu_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_with_unbacked_symint_closure_device_cpu_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_with_unbacked_symint_closure_device_cpu_dynamic_True_autograd_False
+            - WhileLoopTests::test_while_loop_with_unbacked_symint_closure_device_cpu_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_with_unbacked_symint_closure_device_cuda_dynamic_False_autograd_False
+            - WhileLoopTests::test_while_loop_with_unbacked_symint_closure_device_cuda_dynamic_False_autograd_True
+            - WhileLoopTests::test_while_loop_with_unbacked_symint_closure_device_cuda_dynamic_True_autograd_False
+            - WhileLoopTests::test_while_loop_with_unbacked_symint_closure_device_cuda_dynamic_True_autograd_True
+            - WhileLoopTests::test_while_loop_zero_loop
+            - WhileLoopTests::test_while_loop_zero_loop_device_cpu_dynamic_False
+            - WhileLoopTests::test_while_loop_zero_loop_device_cpu_dynamic_True
+            - WhileLoopTests::test_while_loop_zero_loop_device_cuda_dynamic_False
+            - WhileLoopTests::test_while_loop_zero_loop_device_cuda_dynamic_True
+          mode: skip  # does not engage the torch-spyre layer
+
+  global:
+    supported_dtypes:
+      - name: bfloat16
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype
