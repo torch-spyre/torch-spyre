@@ -121,11 +121,11 @@ def decompose_index_for_tiling(index, var_ranges):
                 var_found = True
                 continue
             prod *= arg
-        if prod <= 0:
-            raise Unsupported(f"index term {term} has non-positive coefficient {prod}")
+        if not (prod > 0 and prod.is_integer):
+            raise Unsupported(f"index coefficient {prod} is not a positive integer")
         atoms.append((prod, var))
-    if offset < 0:
-        raise Unsupported(f"index has negative offset {offset}")
+    if not (offset >= 0 and offset.is_integer):
+        raise Unsupported(f"index offset {offset} is not a non-negative integer")
     return atoms, offset
 
 
