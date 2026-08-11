@@ -1,153 +1,182 @@
-# HBM intermediates-pool planning
+# HBM Pool Planning
 
-How torch-spyre packs intermediate tensors into a shared region of device
-memory, and how that pass relates to LX scratchpad planning.
+HBM pool planning is the compiler stage that allocates intermediate tensors
+into a pool of bulk HBM memory, allowing non-overlapping tensors to reuse the
+same storage region and reducing peak HBM pressure. This page describes what
+the pool is, how it is scoped, how it interacts with LX scratchpad planning,
+and the cross-bundle exclusion rule that prevents intermediates from being
+pool-allocated across kernel invocation boundaries.
 
-:::{admonition} Status
-:class: note
+## What the HBM pool is
 
-HBM pool planning runs by default. The pass is gated by
-`config.hbm_pool_planning`, which defaults to `True` and reads from the
-`HBM_POOL_PLANNING` environment variable. It is implemented in
-`torch_spyre/_inductor/hbm_pool_planning.py` and runs in
-`CustomPostFusionPasses`.
+The HBM pool (also called the *intermediates segment*) is a contiguous region
+of bulk HBM memory (not on-core SRAM) that houses intermediate tensors whose
+data does not need to persist beyond the kernel invocation in which they are
+produced. This is distinct from the LX scratchpad, which is a small, on-core
+SRAM dedicated to holding reused operands within a single Spyre core.
+
+:::{admonition} Terminology clarification
+:class: warning
+
+- **LX scratchpad:** 2 MB of on-core SRAM per core; managed by
+  [scratchpad planning](scratchpad_planning.md); tiny but fast; core-local.
+- **HBM pool:** bulk off-chip HBM memory; managed by this pass; plentiful but
+  slower; globally accessible. The pool exists to allow safe temporary
+  storage for intermediate computation results that will be consumed by the
+  next operation and then discarded.
+
+The two passes are independent tiers of the memory hierarchy. A single buffer
+is placed in *either* LX *or* the HBM pool, never both.
+
 :::
 
-**Quick navigation:**
+## Per-bundle scoping
 
-- [What the pass does](#what-the-pass-does)
-- [Relationship to LX scratchpad planning](#relationship-to-lx-scratchpad-planning)
-- [Pipeline position](#pipeline-position)
-- [Pool candidates](#pool-candidates)
-- [Allocation](#allocation)
-- [Codegen integration](#codegen-integration)
-- [Related documents](#related-documents)
+HBM pool planning runs in `CustomPostFusionPasses`, after `spyre_fuse_nodes`
+has already determined the final set of SDSC bundles (kernel invocations).
+Each bundle is a separate `SpyreKernel` that compiles to a single `.run()`
+call in the generated wrapper code.
 
-## What the pass does
+The fundamental constraint is:
 
-An inference graph produces many intermediate tensors that are written by
-one operation and read by a later one. If every intermediate received its
-own device-memory allocation, peak memory would scale with the number of
-intermediates in the graph rather than with the number that are live at
-the same time.
+> A buffer's pool allocation is scoped to a single bundle. The pool tensor
+> is allocated immediately before that bundle's `.run()` call and freed
+> immediately after. Separate bundles do not share a pool.
 
-HBM pool planning assigns intermediates to offsets inside a single shared
-region of device memory, the *intermediates segment*
-(`constants.INTERMEDIATES_SEGMENT`, size `constants.SEGMENT_SIZE` = 16 GB).
-Two intermediates whose live ranges do not overlap reuse the same offset,
-so the segment only has to be as large as the peak concurrent footprint,
-not the sum of all intermediates. The pass raises a `RuntimeError` if that
-peak exceeds the segment size.
+This means:
 
-Only device memory is planned here. The 2 MB per-core LX scratchpad is
-planned by a separate pass; see below.
+- A buffer written and read entirely within one bundle (its producer and all
+  its consumers in the same bundle) is eligible for pool allocation within
+  that bundle's dedicated pool.
+- A buffer written in bundle A and read by bundle B (a *cross-bundle buffer*)
+  cannot be pool-allocated, because the two bundles execute as separate,
+  sequential kernel invocations and no pool-scoped storage can persist
+  between them. Such buffers fall back to standalone HBM allocation, the same
+  as any other non-pool-eligible intermediate today.
 
-## Relationship to LX scratchpad planning
+This design enables bundle-local pool lifetimes, which reduces peak HBM
+pressure: instead of allocating pools for all bundles up front and keeping
+them resident for the entire graph execution, each bundle's pool is freed as
+soon as that bundle's computation is complete.
 
-Both passes decide where an intermediate tensor's data lives, but they
-operate on different memory and at different points in the pipeline. A
-buffer is a pool candidate only if LX planning did *not* already claim it
-(`"lx" not in layout.allocation`), so the two passes are mutually
-exclusive per buffer and are applied in that order.
+## Comparison with LX scratchpad planning
 
-| | LX scratchpad planning | HBM intermediates-pool planning |
-|---|---|---|
-| Memory | 2 MB on-core SRAM scratchpad, per core | Regular device memory (LPDDR5), the 16 GB intermediates segment |
-| Pipeline stage | `CustomPreSchedulingPasses`, before the `Scheduler` is constructed | `CustomPostFusionPasses`, after Inductor's fusion pass has run |
-| Gating | `config.lx_planning` (`LX_PLANNING`) | `config.hbm_pool_planning` (`HBM_POOL_PLANNING`) |
-| Goal | Keep reused tensors on fast core-local memory to cut device-memory traffic | Share one device-memory region across non-overlapping intermediates to bound peak footprint |
-| Allocation | Fixed per-core SRAM address | Bump/free-list offset in the intermediates segment |
-| Entry point | `scratchpad_planning()` in `scratchpad/allocator.py` | `hbm_pool_planning()` in `hbm_pool_planning.py` |
+Both HBM pool planning and LX scratchpad planning are allocation passes that
+decide where intermediate tensors live in the memory hierarchy. Here are the
+key differences:
 
-The two passes are complementary. LX planning claims the buffers that fit
-on the scratchpad and benefit from staying there; HBM pool planning then
-packs every remaining intermediate into the shared segment.
+| Aspect | HBM Pool Planning | LX Scratchpad Planning |
+|--------|-------------------|----------------------|
+| **Memory tier** | Bulk HBM | 2 MB on-core SRAM (fast) |
+| **Pipeline stage** | `CustomPostFusionPasses` (after fusion, after bundles exist) | `CustomPreSchedulingPasses` (before scheduler, before bundles exist) |
+| **Allocation strategy** | Bump-allocator with free-list reuse; same offset reused by non-overlapping buffers | Core-local address assignment; each buffer gets a fixed on-core address |
+| **Scope of sharing** | Per-bundle (a pool is local to one kernel invocation) | Per-core (an LX address persists across multiple ops executed on the same core) |
+| **Exclusion rules** | Buffers with cross-bundle live ranges are excluded | Buffers read by CPU-fallback nodes are excluded |
+| **Gating** | Enabled by `config.hbm_pool_planning` (default: on) | Enabled by `LX_PLANNING=1` (default: on) |
+
+LX planning runs first (at `CustomPreSchedulingPasses`), so it sees a flat
+operations list before bundle boundaries are known. Pool planning runs later
+(at `CustomPostFusionPasses`) and sees the final, fused, bundle-organized
+list. A buffer claimed by LX planning is excluded from pool allocation; the
+two passes are mutually exclusive per buffer, applied in that order.
 
 ## Pipeline position
 
-`hbm_pool_planning` runs inside `CustomPostFusionPasses`, which executes
-over the graph of LoopLevelIR nodes immediately after Inductor's fusion
-pass. The pass order is:
+HBM pool planning runs in `CustomPostFusionPasses`, after both work-division
+and fusion have already run:
 
 ```
-demote_incoherent_lx_buffers    # re-check LX core->slice coherence with final loop orders
-hbm_pool_planning               # ← THIS PASS, gated by config.hbm_pool_planning
-spyre_fuse_nodes
+CustomPreSchedulingPasses:
+  work_division
+  scratchpad_planning                  # LX allocation (phase 1)
+
+... Inductor scheduler construction ...
+
+CustomPostFusionPasses:
+  demote_incoherent_lx_buffers         # LX fixups (phase 2)
+  spyre_fuse_nodes                     # Determine bundle boundaries
+  hbm_pool_planning                    # Per-bundle HBM pool allocation (this pass)
 ```
 
-`demote_incoherent_lx_buffers` runs first for a reason: it re-checks LX
-core-to-slice coherence now that loop orders are final, and any buffer it
-demotes off LX must still be visible to `hbm_pool_planning` as an
-unclaimed intermediate.
+By the time this pass runs, `nodes` is the final, post-fusion top-level list.
+Each entry in `nodes` is exactly one bundle:
 
-## Pool candidates
+- A `FusedSchedulerNode` wrapping multiple fused operations.
+- A `CountedLoopSchedulerNode` (which is a `FusedSchedulerNode` subclass)
+  wrapping a loop and its body operations.
+- A standalone `SchedulerNode` or other node type that fusion left untouched
+  because it had no fusible neighbors.
 
-The pass collects candidates from two sources:
+## Algorithm: per-bundle live-range analysis and allocation
 
-- **Kernel intermediates.** Buffers both written and read within the
-  graph, detected from the written and read dependency sets on
-  `ComputedBuffer` nodes.
-- **`SpyreEmptyFallback` full buffers** created by coarse tiling for
-  non-outputs. These are `ExternKernel` nodes that emit no dependency-
-  tracked write, so they are collected explicitly by the underlying
-  buffer name.
+For each top-level entry (bundle) in the post-fusion node list:
 
-A candidate must carry a `FixedTiledLayout`, must not have been claimed by
-LX planning, and must not alias a graph input or output. Graph inputs and
-outputs are excluded because they are addressed by the caller, not by the
-pool. Buffers read by fallback, extern, or nop kernels are also excluded,
-because those consumers require Python-side tensors rather than a pooled
-offset.
+1. Flatten the bundle's tree to a list of leaf operations (to handle
+   nested `FusedSchedulerNode` and `CountedLoopSchedulerNode` hierarchies).
+2. Identify candidates: buffers that are:
+   - Written and read (not only written or only read).
+   - Not graph inputs or outputs.
+   - Not already claimed by LX planning.
+   - Not read by CPU-fallback nodes.
+   - Fully contained within the bundle (same bundle writes and reads them).
+3. For each bundle's local candidate set, compute live ranges: a buffer's
+   live range is the interval from its producer op to its last consumer op
+   within that bundle.
+4. Sort by producer order (start step), then by end step and name for
+   determinism.
+5. Allocate sequentially with a bump-allocator and free-list reuse:
+   - Process buffers in order.
+   - Before allocating a new buffer, free any previously-allocated blocks
+     whose live range ended before this buffer's start step.
+   - Assign each buffer an offset within the bundle's dedicated pool.
+6. Record the pool's final extent (total bytes needed) in
+   `V.graph.hbm_pool_sizes[bundle_name]`.
 
-Because mutation buffers share the same `layout.allocation` dictionary
-object as their target, input/output exclusion is checked by the identity
-of the allocation object (`id(layout.allocation)`), not by name.
+Only bundles with at least one pool-eligible buffer get an entry in
+`V.graph.hbm_pool_sizes`; bundles with no pool candidates get no pool tensor
+and no allocation overhead.
 
-## Allocation
+## Integration with code generation
 
-Each candidate's live range is `(start_step, end_step)`, where the start
-is the timestep of the node that writes the buffer and the end is the last
-timestep at which any node reads it. Candidates are sorted by start step,
-tie-broken by `(end_step, name)` for determinism, and processed in that
-order.
+During code generation, the scheduler looks up each bundle's pool size from
+`V.graph.hbm_pool_sizes` and passes it to `SpyreKernel`'s constructor. The
+kernel then emits pool allocation and deallocation code around its own
+`.run()` call:
 
-The `Allocator` tracks free blocks within the segment as `(offset, size)`
-pairs in bytes. For each buffer it first frees any block whose live range
-has ended, then allocates:
+```python
+_pool_{bundle_name} = spyre_empty_with_layout((pool_size_bytes,), (1,), torch.uint8, ...)
+sdsc_fused__{bundle_name}.run(_pool_{bundle_name}, ...)
+del _pool_{bundle_name}
+```
 
-1. Reuse the first free block large enough, returning any leftover
-   fragment to the free list.
-2. Otherwise extend the pool by appending at the current pool end.
+This per-bundle scoping ensures that the pool tensor's lifetime is limited to
+the bundle's own kernel invocation, minimizing peak HBM usage across the
+entire graph execution.
 
-Sizes are the buffer's stick-aligned device footprint: the product of the
-device-side dimensions above the stick dimension, times 128 bytes per
-stick, rounded up to a 128-byte (one-stick) boundary. The allocator tracks
-peak concurrent usage and raises if it exceeds `SEGMENT_SIZE`.
+## Configuration and limitations
 
-The chosen offset is written to `layout.allocation["hbm_pool"]`. With
-`config.bundle_symbolic_args` the raw offset is stored (the segment base is
-added later during bundling); otherwise the absolute
-`INTERMEDIATES_SEGMENT + offset` is stored. The final pool extent is
-recorded on `V.graph.hbm_pool_size`.
+HBM pool planning is controlled by `config.hbm_pool_planning`, which defaults
+to on. Set `HBM_POOL_PLANNING=0` to disable it globally; in that mode all
+intermediates fall back to standalone HBM.
 
-A `SpyreEmptyFallback` buffer that is pool-allocated is added to
-`V.graph.removed_buffers`. Its `should_allocate()` returns `False` once
-pooled, so the wrapper never emits an allocate line for it; adding the name
-to `removed_buffers` also keeps base Inductor's free machinery from
-emitting a `del` for a buffer it never allocated.
+**Interaction with symbolic arguments:**
 
-## Codegen integration
+In `bundle_symbolic_args=False` mode (not the default -- the default is
+`True`), `spyre_fuse_nodes` is
+disabled and every scheduler node becomes its own single-op bundle. In this
+degenerate case, any buffer read by a later node is cross-bundle by
+construction and falls back to standalone HBM. Pool allocation is effectively
+disabled, which is correct: the benefit of pooling (sharing HBM across
+non-overlapping bundle-local temporaries) does not apply when there are no
+multi-op bundles to localize to. No special handling is needed in the
+planner; the cross-bundle exclusion logic automatically handles this edge
+case.
 
-A pooled buffer is not allocated as an independent tensor. Its
-`layout.allocation["hbm_pool"]` offset places it within the shared segment,
-and the generated wrapper addresses it against that segment rather than
-emitting a standalone allocation and free.
+## See Also
 
-## Related documents
-
-- [`scratchpad_planning.md`](scratchpad_planning.md) describes LX
-  scratchpad planning, the complementary pass that claims buffers for the
-  on-core SRAM before HBM pool planning packs the remainder.
-- [`coarse_tiling_loops.md`](coarse_tiling_loops.md) describes coarse
-  tiling, which creates the `SpyreEmptyFallback` full buffers that this
-  pass collects as a second candidate source.
+- [Scratchpad Planning](scratchpad_planning.md) covers LX allocation and the
+  interaction between the two memory tiers.
+- [Tensor Layouts](../user_guide/tensors_and_layouts.md) covers device
+  layouts and memory hierarchy concepts.
+- [Spyre Accelerator](../architecture/spyre_accelerator.md) gives the full
+  hardware overview.

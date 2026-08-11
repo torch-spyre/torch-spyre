@@ -169,8 +169,7 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
     of it; a buffer written in one bundle and read from a different one
     falls back to standalone HBM, since bundle-scoped pools do not
     coexist across separate kernel invocations.  Pool offsets, sizes, and
-    live-range analysis are all computed independently per bundle -- see
-    docs/superpowers/specs/2026-08-10-pool-per-bundle-design.md.
+    live-range analysis are all computed independently per bundle.
 
     See docs/source/compiler/hbm_pool_planning.md for the full design and a
     side-by-side comparison table with LX scratchpad planning.
@@ -247,14 +246,10 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
     # bundles.
     buffer_writer_bundle: dict[str, str] = {}
     buffer_reader_bundles: dict[str, set[str]] = {}
-    # bundle_name -> that bundle's own flattened node list, cached so the
-    # per-bundle allocation loop below doesn't redo _iter_all_nodes.
-    bundle_flat_nodes: dict[str, list[BaseSchedulerNode]] = {}
 
     for bundle in nodes:
         bundle_name = bundle.get_name()
         bundle_flat = list(_iter_all_nodes([bundle]))
-        bundle_flat_nodes[bundle_name] = bundle_flat
         bundle_non_kernel = [
             n for n in bundle_flat if not isinstance(n, _kernel_arg_types)
         ]
@@ -303,7 +298,6 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
 
     for bundle in nodes:
         bundle_name = bundle.get_name()
-        bundle_flat = bundle_flat_nodes[bundle_name]
         # Restrict to buffers this bundle actually writes -- buffer_writer_
         # bundle[name] == bundle_name is implied by membership in
         # all_candidates plus this bundle's own written set, but recomputing
@@ -317,7 +311,7 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
             continue
 
         # Use the bundle's own direct, unflattened children here (not the
-        # recursively-flattened bundle_flat used above for candidate
+        # recursively-flattened list used above for candidate
         # identification). A CountedLoopSchedulerNode's merged read/write
         # set (see ReadWrites.merge_list) drops any buffer the loop both
         # writes and reads internally -- a loop-carried accumulator has no
