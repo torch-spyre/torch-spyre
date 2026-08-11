@@ -19,6 +19,7 @@
 #include <ATen/ATen.h>
 #include <c10/core/Stream.h>
 
+#include <memory>
 #include <vector>
 
 #include "module.h"
@@ -60,6 +61,8 @@ class SpyreStream {
   void launchD2H(flex::DmaParams* params) const;
   void launchCompute(flex::ComputeParams* params) const;
   void launchHostCallback(flex::HostCallbackParams* params) const;
+  void launchEventSignal(std::shared_ptr<flex::Event> event) const;
+  void launchEventWait(std::shared_ptr<flex::Event> event) const;
   // Device-side MEMORY_FILL DMA. Routes through the typed
   // flex::RuntimeStream::fillAsync overload, which performs the value->pattern
   // conversion internally (no FillParams construction here).

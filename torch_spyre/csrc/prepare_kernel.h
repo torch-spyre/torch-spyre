@@ -168,6 +168,10 @@ class JobPlanBuilder {
       const nlohmann::json& cmd);
   /// Translate a DataTransfer command to a JobPlanStepH2D or JobPlanStepD2H
   std::unique_ptr<JobPlanStep> translateDataTransfer(const nlohmann::json& cmd);
+  /// Translate an EventSignal command to a JobPlanStepEventSignal
+  std::unique_ptr<JobPlanStep> translateEventSignal(const nlohmann::json& cmd);
+  /// Translate an EventWait command to a JobPlanStepEventWait
+  std::unique_ptr<JobPlanStep> translateEventWait(const nlohmann::json& cmd);
 };
 
 /**

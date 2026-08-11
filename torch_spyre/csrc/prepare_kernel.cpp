@@ -43,6 +43,8 @@ enum class SpyreCodeCommandType {
   DataTransfer,
   Allocate,
   InitTransfer,
+  EventSignal,
+  EventWait,
   Unknown
 };
 
@@ -66,7 +68,9 @@ static SpyreCodeCommandType parse_command_type(const std::string& command_str) {
       {"ComputeOnHost", SpyreCodeCommandType::ComputeOnHost},
       {"DataTransfer", SpyreCodeCommandType::DataTransfer},
       {"Allocate", SpyreCodeCommandType::Allocate},
-      {"InitTransfer", SpyreCodeCommandType::InitTransfer}};
+      {"InitTransfer", SpyreCodeCommandType::InitTransfer},
+      {"EventSignal", SpyreCodeCommandType::EventSignal},
+      {"EventWait", SpyreCodeCommandType::EventWait}};
 
   auto it = mapping.find(command_str);
   return it != mapping.end() ? it->second : SpyreCodeCommandType::Unknown;
@@ -565,6 +569,22 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateDataTransfer(
   return nullptr;
 }
 
+std::unique_ptr<JobPlanStep> JobPlanBuilder::translateEventSignal(
+    const nlohmann::json& cmd) {
+  TORCH_CHECK(cmd.contains("event_id"),
+              "EventSignal command missing 'event_id' property");
+  int event_id = cmd["event_id"].get<int>();
+  return std::make_unique<JobPlanStepEventSignal>(event_id);
+}
+
+std::unique_ptr<JobPlanStep> JobPlanBuilder::translateEventWait(
+    const nlohmann::json& cmd) {
+  TORCH_CHECK(cmd.contains("event_id"),
+              "EventWait command missing 'event_id' property");
+  int event_id = cmd["event_id"].get<int>();
+  return std::make_unique<JobPlanStepEventWait>(event_id);
+}
+
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateCommand(
     const nlohmann::json& cmd, size_t step_idx) {
   TORCH_CHECK(cmd.contains("command") && cmd["command"].is_string(),
@@ -584,6 +604,12 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateCommand(
 
     case SpyreCodeCommandType::DataTransfer:
       return translateDataTransfer(properties);
+
+    case SpyreCodeCommandType::EventSignal:
+      return translateEventSignal(properties);
+
+    case SpyreCodeCommandType::EventWait:
+      return translateEventWait(properties);
 
     case SpyreCodeCommandType::Unknown:
     default:

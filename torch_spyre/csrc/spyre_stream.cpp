@@ -262,6 +262,16 @@ void SpyreStream::launchHostCallback(flex::HostCallbackParams* params) const {
   resolveRuntimeHandle()->launchOperationHostCallback(params);
 }
 
+void SpyreStream::launchEventSignal(std::shared_ptr<flex::Event> event) const {
+  flex::EventSignalOp op(std::move(event));
+  resolveRuntimeHandle()->launchOperationEventSignal(&op);
+}
+
+void SpyreStream::launchEventWait(std::shared_ptr<flex::Event> event) const {
+  flex::EventWaitOp op(std::move(event));
+  resolveRuntimeHandle()->launchOperationEventWait(&op);
+}
+
 void SpyreStream::fillAsync(const flex::CompositeAddress* dst, double value,
                             DataFormats dtype, bool use_dmai) const {
   RECORD_FUNCTION("launch::Memset", {});

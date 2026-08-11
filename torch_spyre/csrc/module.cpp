@@ -29,6 +29,7 @@
 #include <flex/flex.hpp>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -440,11 +441,25 @@ PYBIND11_MODULE(_C, m) {
             } else if (dynamic_cast<const spyre::JobPlanStepHostCompute*>(
                            step.get())) {
               return "HostCompute";
+            } else if (dynamic_cast<const spyre::JobPlanStepEventSignal*>(
+                           step.get())) {
+              return "EventSignal";
+            } else if (dynamic_cast<const spyre::JobPlanStepEventWait*>(
+                           step.get())) {
+              return "EventWait";
             } else {
               return "Unknown";
             }
           },
           py::arg("idx"), "Get the type of step at the given index")
+      .def(
+          "__str__",
+          [](const spyre::JobPlan& plan) {
+            std::ostringstream oss;
+            oss << plan;
+            return oss.str();
+          },
+          "Get a human-readable description of the JobPlan")
       .def(
           "get_step_pipeline_barrier",
           [](const spyre::JobPlan& plan, size_t idx) {

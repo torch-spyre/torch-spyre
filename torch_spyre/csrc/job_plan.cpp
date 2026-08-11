@@ -28,6 +28,20 @@
 
 namespace spyre {
 
+std::shared_ptr<flex::Event> LaunchContext::getOrCreateEvent(int event_id) {
+  auto it = event_registry_.find(event_id);
+
+  if (it != event_registry_.end()) {
+    // If the event_id exists as a key in the map, return the associated value
+    return it->second;
+  }
+  // Otherwise create a new flex event wrapped by a shared_ptr, insert it into
+  // the unordered map, and return a shared ptr to the newly created event
+  auto new_event = std::make_shared<flex::Event>();
+  event_registry_.insert(it, {event_id, new_event});
+  return new_event;
+}
+
 void JobPlanStepH2D::construct(LaunchContext&,
                                const SpyreStream& stream) const {
   auto* params =
@@ -197,6 +211,26 @@ void JobPlanStepHostCompute::write(std::ostream& os) const {
   os << "    HCM metadata: " << (hcm_ ? "present" : "null") << "\n";
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")
      << "\n";
+}
+
+void JobPlanStepEventSignal::construct(LaunchContext& ctx,
+                                       const SpyreStream& stream) const {
+  stream.launchEventSignal(ctx.getOrCreateEvent(event_id_));
+}
+
+void JobPlanStepEventSignal::write(std::ostream& os) const {
+  os << "  Event Signal\n";
+  os << "    Event ID: " << event_id_ << "\n";
+}
+
+void JobPlanStepEventWait::construct(LaunchContext& ctx,
+                                     const SpyreStream& stream) const {
+  stream.launchEventWait(ctx.getOrCreateEvent(event_id_));
+}
+
+void JobPlanStepEventWait::write(std::ostream& os) const {
+  os << "  Event Wait\n";
+  os << "    Event ID: " << event_id_ << "\n";
 }
 
 std::ostream& operator<<(std::ostream& os, const JobPlan& plan) {

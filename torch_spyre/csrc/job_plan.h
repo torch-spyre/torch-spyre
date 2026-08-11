@@ -24,6 +24,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -186,9 +187,22 @@ class HostBuffer {
 struct LaunchContext {
   /**
    * @brief at::Tensor list of inputs and outputs
-   *
    */
   const std::vector<at::Tensor>& inputs_outputs;
+
+  /**
+   * @brief Get or create the shared `flex::Event` for the given `event_id`.
+   *
+   * Returns the `flex::Event` associated with `event_id`. If no event exists
+   * for that ID, one is created, inserted into the registry, and returned.
+   * Calling with the same `event_id` twice always returns the same object.
+   *
+   * @param event_id Integer key identifying the event.
+   * @return Shared pointer to the `flex::Event` associated with `event_id`.
+   */
+  std::shared_ptr<flex::Event> getOrCreateEvent(int event_id);
+
+  std::unordered_map<int, std::shared_ptr<flex::Event>> event_registry_;
 };
 
 /**
@@ -446,6 +460,64 @@ class JobPlanStepHostCompute final : public JobPlanStep {
   void* output_buffer_;       // Non-owning pointer (JobPlan owns the buffer)
   const void* input_buffer_;  // Non-owning pointer (JobPlan owns the buffer)
   std::vector<int64_t> ishape_;
+};
+
+/**
+ * @brief JobPlanStep that signals a shared `flex::Event` at launch time.
+ *
+ * When construct() is called, retrieves (or creates) the `flex::Event`
+ * for `event_id_` from the `LaunchContext` registry and submits an
+ * `EventSignalOp` to the stream. A paired `JobPlanStepEventWait` with the
+ * same `event_id` on another stream will block until this signal is delivered.
+ */
+class JobPlanStepEventSignal final : public JobPlanStep {
+ public:
+  explicit JobPlanStepEventSignal(int event_id) : event_id_(event_id) {}
+
+  /**
+   * @brief Submit an EventSignalOp for this step's event onto the stream.
+   * @param ctx Launch context holding the shared event registry.
+   * @param stream Stream to submit the signal operation onto.
+   */
+  void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
+
+  /**
+   * @brief Write a human-readable description of this step to `os`.
+   * @param os Output stream to write to.
+   */
+  void write(std::ostream& os) const override;
+
+ private:
+  int event_id_;
+};
+
+/**
+ * @brief JobPlanStep that waits on a shared `flex::Event` at launch time.
+ *
+ * When construct() is called, retrieves (or creates) the `flex::Event`
+ * for `event_id_` from the `LaunchContext` registry and submits an
+ * `EventWaitOp` to the stream. The stream blocks until the paired
+ * `JobPlanStepEventSignal` with the same `event_id` delivers its signal.
+ */
+class JobPlanStepEventWait final : public JobPlanStep {
+ public:
+  explicit JobPlanStepEventWait(int event_id) : event_id_(event_id) {}
+
+  /**
+   * @brief Submit an EventWaitOp for this step's event onto the stream.
+   * @param ctx Launch context holding the shared event registry.
+   * @param stream Stream to submit the wait operation onto.
+   */
+  void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
+
+  /**
+   * @brief Write a human-readable description of this step to `os`.
+   * @param os Output stream to write to.
+   */
+  void write(std::ostream& os) const override;
+
+ private:
+  int event_id_;
 };
 
 /**
