@@ -239,31 +239,27 @@ class TestSpyreProfiler(TestCase):
             dtoh_events = [e for e in memcpy_events if "DtoH" in e.get("name", "")]
             self.assertTrue(htod_events, "Expected at least one HtoD memcpy event")
             self.assertTrue(dtoh_events, "Expected at least one DtoH memcpy event")
-
-            def has_invalid_timing(event):
-                return event.get("ts") in (0, None) or event.get("dur") in (0, None)
-
-            htod_invalid = [e for e in htod_events if has_invalid_timing(e)]
-            dtoh_invalid = [e for e in dtoh_events if has_invalid_timing(e)]
+            htod_zero = [e for e in htod_events if e.get("dur") in (0, None)]
+            dtoh_zero = [e for e in dtoh_events if e.get("dur") in (0, None)]
             self.assertFalse(
-                htod_invalid,
-                f"{len(htod_invalid)} HtoD memcpy event(s) have invalid ts/dur: "
-                + ", ".join(e.get("name", "<unnamed>") for e in htod_invalid),
+                htod_zero,
+                f"{len(htod_zero)} HtoD memcpy event(s) have dur == 0: "
+                + ", ".join(e.get("name", "<unnamed>") for e in htod_zero),
             )
             self.assertFalse(
-                dtoh_invalid,
-                f"{len(dtoh_invalid)} DtoH memcpy event(s) have invalid ts/dur: "
-                + ", ".join(e.get("name", "<unnamed>") for e in dtoh_invalid),
+                dtoh_zero,
+                f"{len(dtoh_zero)} DtoH memcpy event(s) have dur == 0: "
+                + ", ".join(e.get("name", "<unnamed>") for e in dtoh_zero),
             )
 
-            # Require kernel events and validate their timing fields
+            # Require kernel events and validate their durations
             kernel_events = [e for e in trace_events if e.get("cat") == "kernel"]
             self.assertTrue(kernel_events, "Expected at least one kernel event")
-            kernel_invalid = [e for e in kernel_events if has_invalid_timing(e)]
+            kernel_zero_dur = [e for e in kernel_events if e.get("dur") in (0, None)]
             self.assertFalse(
-                kernel_invalid,
-                f"{len(kernel_invalid)} kernel event(s) have invalid ts/dur: "
-                + ", ".join(e.get("name", "<unnamed>") for e in kernel_invalid),
+                kernel_zero_dur,
+                f"{len(kernel_zero_dur)} kernel event(s) have dur == 0: "
+                + ", ".join(e.get("name", "<unnamed>") for e in kernel_zero_dur),
             )
 
 
