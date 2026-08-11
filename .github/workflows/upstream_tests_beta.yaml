@@ -151,6 +151,34 @@ jobs:
             config: inductor-test_scatter_optimization.yaml
           - name: Inductor torch binding
             config: inductor-test_torchbind.yaml
+          - name: Inductor auto functionalize
+            config: inductor-test_auto_functionalize.yaml
+          - name: Inductor benchmark fusion
+            config: inductor-test_benchmark_fusion.yaml
+          - name: Inductor test code cache
+            config: inductor-test_codecache.yaml
+          - name: Inductor test compile
+            config: inductor-test_compile.yaml
+          - name: Inductor test compile subprocess
+            config: inductor-test_compile_subprocess.yaml
+          - name: Inductor test compiled optimizers
+            config: inductor-test_compiled_optimizers.yaml
+          - name: Inductor test config
+            config: inductor-test_config.yaml
+          - name: Inductor test control flow
+            config: inductor-test_control_flow.yaml
+          # Inductor test cpu select algorithm is split it into three parts to prevent job timeout
+          - name: Inductor test cpu select algorithm part 1
+            config: inductor-test_cpu_select_algorithm_part1.yaml
+          - name: Inductor test cpu select algorithm part 2
+            config: inductor-test_cpu_select_algorithm_part2.yaml
+          - name: Inductor test cpu select algorithm part 3
+            config: inductor-test_cpu_select_algorithm_part3.yaml
+          ####################
+          - name: Inductor test custom op autotune
+            config: inductor-test_custom_op_autotune.yaml
+          - name: Inducotr test custom post grad passes
+            config: inductor-test_custom_post_grad_passes.yaml
           # All xfail tests. Will result in zero tests collected in "no xfail" mode.
           # There are some mandatory success tests which have been commented out due a potential exclude bug.
           # Once the bug is resolved, this config can be enabled. 

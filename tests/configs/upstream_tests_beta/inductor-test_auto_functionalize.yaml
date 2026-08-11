@@ -1,0 +1,298 @@
+test_suite_config:
+
+  files:
+    - path: ${TORCH_ROOT}/test/inductor/test_auto_functionalize.py
+      unlisted_test_mode: skip
+      tests:
+        # These tests exercise tensor aliasing and mutation behaviors, including operations like `alias`, `slice`, and `split`.
+        # They are classified as mandatory_success on the Spyre backend because they require full support for tensor aliasing and mutation, which are core capabilities of the backend.
+        # The relevant Spyre capabilities include handling tensor views, mutations, and ensuring data consistency across operations.
+        - names:
+            - AutoFunctionalizeTests::test_alias
+            - AutoFunctionalizeTests::test_alias2
+            - AutoFunctionalizeTests::test_alias_id_output
+            - AutoFunctionalizeTests::test_auto_functionalize_can_with_default
+            - AutoFunctionalizeTests::test_auto_functionalize_can_with_none_return
+            - AutoFunctionalizeTests::test_auto_functionalize_extra1
+            - AutoFunctionalizeTests::test_auto_functionalize_extra2
+            - AutoFunctionalizeTests::test_auto_functionalize_extra3
+            - AutoFunctionalizeTests::test_auto_functionalize_extra4
+            - AutoFunctionalizeTests::test_auto_functionalize_extra5
+            - AutoFunctionalizeTests::test_auto_functionalize_old
+            - AutoFunctionalizeTests::test_auto_functionalize_on_view
+            - AutoFunctionalizeTests::test_auto_functionalize_optional_old
+            - AutoFunctionalizeTests::test_auto_functionalize_optional_v2
+            - AutoFunctionalizeTests::test_auto_functionalize_self_as_mutate_arg
+            - AutoFunctionalizeTests::test_auto_functionalize_tensorlist
+            - AutoFunctionalizeTests::test_auto_functionalize_v2
+            - AutoFunctionalizeTests::test_auto_functionalize_with_returns_old
+            - AutoFunctionalizeTests::test_auto_functionalize_with_returns_v2
+            - AutoFunctionalizeTests::test_graph_input_is_view
+            - AutoFunctionalizeTests::test_inference_mode_view
+            - AutoFunctionalizeTests::test_recompile
+            - AutoFunctionalizeTests::test_scheduling_with_multiple_mutates
+            - AutoFunctionalizeTests::test_slice
+            - AutoFunctionalizeTests::test_split
+            - AutoFunctionalizeTests::test_unbacked_auto_functionalize_op
+          mode: mandatory_success
+        # These tests exercise dynamic tensor operations and inference modes, but do not engage the torch-spyre layer.
+        # They are classified as 'skip' because the tests do not utilize the Spyre backend, focusing on PyTorch core functionality.
+        # Relevant Spyre capabilities include support for dynamic tensor operations and inference modes, but these tests bypass that layer.
+        - names:
+            - AutoFunctionalizeTests::test_alias2_dynamic
+            - AutoFunctionalizeTests::test_alias_id_input_to_custom_op
+            - AutoFunctionalizeTests::test_can_auto_functionalize
+            - AutoFunctionalizeTests::test_dynamic2_v2
+            - AutoFunctionalizeTests::test_dynamic3_v2
+            - AutoFunctionalizeTests::test_dynamic_v2
+            - AutoFunctionalizeTests::test_inference_mode1_v2
+            - AutoFunctionalizeTests::test_inference_mode2_v2
+            - AutoFunctionalizeTests::test_inference_mode3_v2
+            - AutoFunctionalizeTests::test_inference_mode4_v2
+            - AutoFunctionalizeTests::test_slice_dynamic
+            - AutoFunctionalizeTests::test_split_dynamic
+            - AutoFunctionalizeTests::test_try_use_slice
+          mode: skip  # does not engage the torch-spyre layer
+
+  global:
+    supported_dtypes:
+      - name: bfloat16
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype

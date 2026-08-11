@@ -16,7 +16,7 @@ import logging
 import math
 import time
 from collections.abc import Sequence
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import sympy
 import torch
@@ -107,6 +107,17 @@ _LX_TRACKER_CAPACITY_BYTES = (
 )
 _LX_ALLOCATION_GRANULARITY_BYTES = 128
 
+# A ``MemoryPlanSolver`` is single-use (buffers are required at construction),
+# so the allocators hold a factory -- how to build a solver for a given buffer
+# set -- rather than a live instance, and build a fresh one per solve.
+LayoutSolverFactory = Callable[[Sequence[LifetimeBoundBuffer], int], MemoryPlanSolver]
+# Same argument type as ``LayoutSolverFactory`` (``Callable`` parameters are
+# contravariant, and every ``CoreDivisionBuffer`` sequence is already a
+# ``Sequence[LifetimeBoundBuffer]``); only the narrower return type differs.
+CoreDivisionSolverFactory = Callable[
+    [Sequence[LifetimeBoundBuffer], int], CoreDivisionLayoutSolver
+]
+
 
 class ScratchpadAllocator:
     """
@@ -115,15 +126,20 @@ class ScratchpadAllocator:
 
     def __init__(
         self,
-        layout_planning: MemoryPlanSolver,
+        layout_planning: LayoutSolverFactory,
+        size: int,
         pre_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
         post_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
     ):
-        """Configure the allocator with an optional solver and graph passes.
+        """Configure the allocator with a solver factory and graph passes.
 
         Args:
-            layout_planning: Solver that assigns LX addresses to lifetime-bound
-                buffers. Defaults to GreedyLayoutSolver sized to available LX memory.
+            layout_planning: Factory that builds a solver (already bound to a
+                given buffer set) that assigns LX addresses to lifetime-bound
+                buffers. A solver is single-use -- buffers are required at its
+                construction -- so the allocator builds a fresh one per solve
+                (see :meth:`_build_solver`) rather than holding a live instance.
+            size: LX size
             pre_optimization_passes: Graph passes applied before layout planning.
                 Defaults to no passes.
             post_optimization_passes: Graph passes applied after layout planning.
@@ -138,18 +154,23 @@ class ScratchpadAllocator:
         # Stamped by _record_spill_reasons from the solver's own spill_reasons
         # (the declared residency verdict, or its capacity check)
         # (for the solver decision). Reset at the start of each plan_allocation.
-        self.reject_reasons: dict[str, str] = {}
         self.pre_optimization_passes = pre_optimization_passes
         self.post_optimization_passes = post_optimization_passes
-        self.layout_planning: Optional[MemoryPlanSolver] = layout_planning
+        self.layout_planning: Optional[LayoutSolverFactory] = layout_planning
+        self.size = size
+
+    def _build_solver(self, buffers: Sequence[Any]) -> MemoryPlanSolver:
+        """Build a fresh solver over ``buffers`` from :attr:`layout_planning`."""
+        assert self.layout_planning is not None
+        return self.layout_planning(buffers, self.size)
 
     def plan_allocation(self, graph: GraphLowering):
         """Run pre-passes, assign LX addresses to eligible buffers, then run post-passes.
 
-        This is a template method: the skeleton (reset reasons -> pre-passes ->
+        This is a template method: the skeleton (pre-passes ->
         generate buffers -> solve -> commit -> record reasons -> push -> log ->
         post-passes) is fixed, while subclasses override the ``_prepare_buffers``
-        / ``_solve`` / ``_post_solve`` / ``_record_reject_reasons`` hooks to swap
+        / ``_solve`` / ``_post_solve`` / ``_record_spill_reasons`` hooks to swap
         in their buffer type, solver call, and post-solve commit. The base hooks
         implement the fixed-division, placement-only flow.
 
@@ -157,14 +178,14 @@ class ScratchpadAllocator:
             graph: Lowered graph whose buffers will be assigned LX scratchpad
                 addresses where viable.
         """
-        self.reject_reasons = {}
         self._run_passes(self.pre_optimization_passes, graph)
         buffers = self._prepare_buffers(graph)
-        allocation = self._solve(buffers)
+        solver = self._build_solver(buffers)
+        allocation = self._solve(solver)
         self._post_solve(graph, allocation)
-        self._record_reject_reasons(allocation)
+        reasons = self._get_spill_reasons(solver, allocation)
         self._push_allocation(graph, allocation)
-        self._log_lx_pinning(graph)
+        self._log_lx_pinning(graph, reasons)
         self._run_passes(self.post_optimization_passes, graph)
 
     @staticmethod
@@ -178,36 +199,32 @@ class ScratchpadAllocator:
         """Buffers to hand the solver. Base: fixed-division LifetimeBoundBuffers."""
         return self._generate_buffers(graph)
 
-    def _solve(self, buffers: Sequence[Any]) -> Sequence[Any]:
+    def _solve(self, solver: MemoryPlanSolver) -> Sequence[Any]:
         """Assign LX addresses. Base: placement-only ``plan_layout``."""
-        assert self.layout_planning is not None
-        return self.layout_planning.plan_layout(buffers, log_lx_usage=True)
+        return solver.plan_layout(log_lx_usage=True)
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
         """Hook run after the solve, before reasons/push. Base: nothing to commit."""
 
-    def _record_reject_reasons(self, allocation: Sequence[Any]) -> None:
-        """Stamp ``reject_reasons`` for spilled buffers. Base: from the solver's
-        per-buffer :meth:`_record_spill_reasons`."""
-        self._record_spill_reasons(allocation)
-
-    def _record_spill_reasons(self, allocation: Sequence[LifetimeBoundBuffer]) -> None:
-        """Stamp ``reject_reasons`` for every buffer that did not land in LX.
+    def _get_spill_reasons(
+        self, solver: MemoryPlanSolver, allocation: Sequence[LifetimeBoundBuffer]
+    ) -> dict:
+        """Get spill reasons for every buffer that did not land in LX.
 
         The solver's own :attr:`spill_reasons` is authoritative -- it carries the
         declared verdict (``residency_reason``) or its capacity check. Anything
         spilled without a reason there simply did not fit once the higher-value
         buffers were placed.
         """
-        assert self.layout_planning is not None
-        solver_reasons = self.layout_planning.spill_reasons
+        solver_reasons = dict(solver.spill_reasons)
         for b in allocation:
             if b.address is None:
-                self.reject_reasons[b.name] = solver_reasons.get(
+                solver_reasons[b.name] = solver_reasons.get(
                     b.name,
                     f"no room on scratchpad (t={b.start_time}-{b.end_time},"
                     f" size={b.size // 1024} KB)",
                 )
+        return solver_reasons
 
     def _get_op_name(self, op: Any) -> str:
         return _op_short_name(op)
@@ -229,8 +246,11 @@ class ScratchpadAllocator:
     def _read_count(uses: list[int]) -> int:
         """Reads residency would serve from LX. The first use is never one of
         them: it is either the producer's write (an intermediate) or the clone-in
-        read a graph input cannot avoid. Mirrors
-        ``LifetimeBoundBuffer.read_count``."""
+        read a graph input cannot avoid.
+
+        Deliberately not ``LifetimeBoundBuffer.read_count``, which counts the
+        buffer's reads and so includes an input's clone-in; this is the savings,
+        which discounts it in both cases (as ``spill_cost`` does)."""
         return max(0, len(uses) - 1)
 
     @staticmethod
@@ -773,13 +793,13 @@ class ScratchpadAllocator:
             ncores_reasons=ncores_reasons,
         )
 
-    def _log_lx_pinning(self, graph: GraphLowering) -> None:
+    def _log_lx_pinning(self, graph: GraphLowering, reasons: dict) -> None:
         """Log the final LX pinning decision for every op in the graph."""
         # Skip the per-op getattr walk unless DEBUG is on.
         if not logger.isEnabledFor(logging.DEBUG):
             return
         for op in graph.operations:
-            reason = self.reject_reasons.get(op.name, "lx")
+            reason = reasons.get(op.name, "lx")
             logger.debug(
                 "lx_pinning: %s (%s) → %s",
                 op.name,
@@ -1281,7 +1301,6 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
     """
 
     def plan_allocation(self, graph: GraphLowering):
-        self.reject_reasons = {}
         for p in self.pre_optimization_passes:
             p.apply_pass(graph)
 
@@ -1344,11 +1363,11 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
             cache=None if clone_inserted else search_cache,
             lifetimes=None if clone_inserted else search_lifetimes,
         )
-        assert self.layout_planning is not None
-        allocation = self.layout_planning.plan_layout(buffers, log_lx_usage=True)
-        self._record_spill_reasons(allocation)
+        solver = self._build_solver(buffers)
+        allocation = solver.plan_layout(log_lx_usage=True)
+        reasons = self._get_spill_reasons(solver, allocation)
         self._push_allocation(graph, allocation)
-        self._log_lx_pinning(graph)
+        self._log_lx_pinning(graph, reasons)
         for p in self.post_optimization_passes:
             p.apply_pass(graph)
 
@@ -1464,8 +1483,7 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
         Note: 0-byte entries are guaranteed never to appear in pinned_names.
         """
         buffers = self._generate_buffers(graph, cache, timings, lifetimes)
-        assert self.layout_planning is not None
-        allocation = self.layout_planning.plan_layout(buffers)
+        allocation = self._build_solver(buffers).plan_layout()
         pinned_names = {b.name for b in allocation if b.address is not None}
 
         return sum(
@@ -1476,30 +1494,33 @@ class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
 class CoOptimizingAllocator(ScratchpadAllocator):
     def __init__(
         self,
-        layout_planning: CoreDivisionLayoutSolver,
+        layout_planning: CoreDivisionSolverFactory,
+        size: int,
         pre_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
         post_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
     ):
         """Joint core-division + LX-placement allocator.
 
         Args:
-            layout_planning: A core-division-aware solver (the OR-Tools
-                ``CpSatLayoutSolver``). This allocator drives the *joint* entry
-                point, so it needs the ``CoreDivisionLayoutSolver`` interface
-                rather than a plain ``MemoryPlanSolver``. The ortools-missing
-                fallback to greedy placement lives in :func:`select_allocator`,
-                which never constructs this allocator without a valid solver.
+            layout_planning: Factory for a core-division-aware solver (the
+                OR-Tools ``CpSatLayoutSolver``). This allocator drives the
+                *joint* entry point, so it needs the ``CoreDivisionLayoutSolver``
+                interface rather than a plain ``MemoryPlanSolver``. The
+                ortools-missing fallback to greedy placement lives in
+                :func:`select_allocator`, which never constructs this allocator
+                without a valid solver.
             pre_optimization_passes: Graph passes applied before layout planning.
             post_optimization_passes: Graph passes applied after layout planning.
         """
         super().__init__(
             layout_planning=layout_planning,
+            size=size,
             pre_optimization_passes=pre_optimization_passes,
             post_optimization_passes=post_optimization_passes,
         )
-        # Narrow the base's ``MemoryPlanSolver`` annotation: the joint entry
+        # Narrow the base's ``LayoutSolverFactory`` annotation: the joint entry
         # point requires the core-division interface.
-        self.layout_planning: Optional[CoreDivisionLayoutSolver] = layout_planning
+        self.layout_planning: Optional[CoreDivisionSolverFactory] = layout_planning
 
     def _prepare_buffers(self, graph: GraphLowering) -> Sequence[Any]:
         in_place = self._determine_in_place_division_invariant(graph)
@@ -1508,9 +1529,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         )
         return buffers
 
-    def _solve(self, buffers: Sequence[Any]) -> Sequence[Any]:
-        assert self.layout_planning is not None
-        return self.layout_planning.plan_layout_and_core_divisions(buffers)
+    def _solve(self, solver: MemoryPlanSolver) -> Sequence[Any]:
+        assert isinstance(solver, CoreDivisionLayoutSolver)
+        return solver.plan_layout_and_core_divisions()
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
         # The divisions must be committed such that any buffer clones can correctly
@@ -1518,11 +1539,16 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # is updated with clones in ``_push_allocation``.
         self._commit_divisions(graph, allocation)
 
-    def _record_reject_reasons(self, allocation: Sequence[Any]) -> None:
+    def _get_spill_reasons(
+        self,
+        solver: MemoryPlanSolver,
+        allocation: Sequence[LifetimeBoundBuffer],
+    ) -> dict:
         # Surface the solver's per-buffer spill causes so the LX-pinning debug
         # log reports why each buffer landed in HBM, on par with the other
-        # allocators. ``getattr`` because only ``CpSatLayoutSolver`` exposes it.
-        self.reject_reasons = dict(getattr(self.layout_planning, "spill_reasons", {}))
+        # allocators.
+        assert isinstance(solver, CoreDivisionLayoutSolver)
+        return solver.spill_reasons
 
     def _division_map(self, graph: GraphLowering) -> dict[str, list[CoreDivision]]:
         """Per-op core-division candidates for the joint-division solve.
@@ -1844,7 +1870,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     output_name,
                     size,
                     uses,
-                    first_use_is_read=True,
+                    # An op output is a computed buffer: ``uses[0]`` is the
+                    # producing write, as on the placement path above. (Only the
+                    # input-clone loop above sets this True.)
+                    first_use_is_read=False,
                     in_place_parents=parents,
                     core_divisions=buf_divisions,
                     parents=parent_proj,
@@ -2113,20 +2142,28 @@ _PLACEMENT_SOLVERS: dict[str, type[MemoryPlanSolver]] = {
 }
 
 
-def _make_cpsat_solver(size: int) -> Optional[MemoryPlanSolver]:
-    """Build the CP-SAT layout solver, or ``None`` when ortools is unavailable.
+def _make_cpsat_solver() -> Optional[CoreDivisionSolverFactory]:
+    """Build a CP-SAT layout solver factory, or ``None`` when ortools is
+    unavailable.
 
     Imported lazily so this module (and every non-cpsat path) loads without
     ortools installed; ``CpSatLayoutSolver.__init__`` raises ``ImportError`` when
     ortools (``cp_model``) is missing, which we translate to ``None`` so callers
-    can fall back to a placement-only greedy solve.
+    can fall back to a placement-only greedy solve. Availability is probed with
+    a throwaway empty-buffers instance -- solvers require their buffers at
+    construction, so there is nothing to build ahead of time here.
     """
     try:
         from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
             CpSatLayoutSolver,
         )
 
-        return CpSatLayoutSolver(size)
+        # Throwaway instance: CpSatLayoutSolver.__init__ is where the
+        # ortools-missing ImportError actually raises (module import alone
+        # never does -- ilp_solver_ortools swallows it at module scope), so
+        # the probe has to construct one to detect availability here.
+        CpSatLayoutSolver([], 0)
+        return CpSatLayoutSolver
     except ImportError as exc:
         logger.warning(
             "cpsat layout solver unavailable (%s); falling back to the "
@@ -2158,24 +2195,23 @@ def select_allocator() -> ScratchpadAllocator:
     size = _lx_planning_size()
     if config.layout_solver == "cpsat":
         # Both cpsat paths share the same ortools-missing degradation: build the
-        # CP-SAT solver here and fall back to greedy placement (still correct)
-        # when it is unavailable, so the allocators never see a ``None`` solver.
-        solver = _make_cpsat_solver(size)
+        # CP-SAT solver factory here and fall back to greedy placement (still
+        # correct) when it is unavailable, so the allocators never see a
+        # ``None`` factory.
+        solver = _make_cpsat_solver()
         if config.co_optimizing_lx_planning:
             if solver is None:
-                return ScratchpadAllocator(layout_planning=GreedyLayoutSolver(size))
-            # CpSatLayoutSolver implements the core-division interface the joint
-            # allocator drives; the narrowing is safe since this is the only
-            # solver _make_cpsat_solver ever returns.
-            assert isinstance(solver, CoreDivisionLayoutSolver)
-            return CoOptimizingAllocator(layout_planning=solver)
+                return ScratchpadAllocator(
+                    layout_planning=GreedyLayoutSolver, size=size
+                )
+            return CoOptimizingAllocator(layout_planning=solver, size=size)
         # Placement-only CP-SAT on the pre-determined core divisions.
         if solver is None:
             logger.debug(
                 "falling back to greedy solver. Make sure Or-Tools is available"
             )
-            return ScratchpadAllocator(layout_planning=GreedyLayoutSolver(size))
-        return ScratchpadAllocator(layout_planning=solver)
+            return ScratchpadAllocator(layout_planning=GreedyLayoutSolver, size=size)
+        return ScratchpadAllocator(layout_planning=solver, size=size)
 
     try:
         solver_cls = _PLACEMENT_SOLVERS[config.layout_solver]
@@ -2183,11 +2219,10 @@ def select_allocator() -> ScratchpadAllocator:
         raise ValueError(
             f"Invalid layout_solver config option '{config.layout_solver}'."
         )
-    solver = solver_cls(size)
 
     if config.co_optimizing_lx_planning:
-        return StrategyBCoOptimizingAllocator(layout_planning=solver)
-    return ScratchpadAllocator(layout_planning=solver)
+        return StrategyBCoOptimizingAllocator(layout_planning=solver_cls, size=size)
+    return ScratchpadAllocator(layout_planning=solver_cls, size=size)
 
 
 def scratchpad_planning(
@@ -2214,6 +2249,6 @@ def scratchpad_planning(
         # the state of the graph allowing a second attempt with a
         # greedy approach.
         logger.debug("solve error detected. falling back to greedy solver.")
-        ScratchpadAllocator(GreedyLayoutSolver(_lx_planning_size())).plan_allocation(
-            graph
-        )
+        ScratchpadAllocator(
+            GreedyLayoutSolver, size=_lx_planning_size()
+        ).plan_allocation(graph)

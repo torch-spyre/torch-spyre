@@ -207,13 +207,18 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
     # ------------------------------ residency ------------------------------
     def spill_cost(self) -> int:
         """Differential HBM traffic a spill adds over residency: the reads
-        residency would have served from LX (``read_count``, computed by the
-        allocator) plus the producer's write, which residency turns into a free
-        LX write. A graph input has no producer write to save; a graph output's
-        write-out is unavoidable either way, so it too cancels. Both cases are
-        exactly ``boundary != Intermediate`` -- for a plain
-        :class:`LifetimeBoundBuffer`, whose boundary is not tracked,
-        ``first_use_is_read`` marks the same distinction for inputs."""
+        residency would have served from LX plus the producer's write, which
+        residency turns into a free LX write. A graph input has no producer write
+        to save; a graph output's write-out is unavoidable either way, so it too
+        cancels. Both cases are exactly ``boundary != Intermediate`` -- for a
+        plain :class:`LifetimeBoundBuffer`, whose boundary is not tracked,
+        ``first_use_is_read`` marks the same distinction for inputs.
+
+        An input's first read is the clone-in that pinning cannot avoid, so it is
+        not one of the reads residency serves and is discounted from
+        ``read_count`` (which counts the buffer's reads, not the savings). For a
+        computed buffer the first use is the write and ``read_count`` already
+        excludes it, hence the discount is keyed on ``first_use_is_read``."""
         b = self.buffer
         boundary = getattr(b, "boundary", None)
         is_intermediate = (
@@ -221,7 +226,8 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
             if boundary is not None
             else not b.first_use_is_read
         )
-        return (b.read_count + (1 if is_intermediate else 0)) * b.size
+        reads_served = b.read_count - (1 if b.first_use_is_read else 0)
+        return (reads_served + (1 if is_intermediate else 0)) * b.size
 
     def constrain_residency(self, model, kids, bufs) -> None:
         """Placement-only: any buffer may reside, so there is no slicing gate."""
@@ -327,6 +333,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
     def __init__(
         self,
+        buffers: Sequence[LifetimeBoundBuffer],
         size: int,
         alignment: int = 128,
         time_limit_seconds: float = 600.0,
@@ -338,16 +345,14 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 "which is not installed. Install it with 'pip install ortools' "
                 "or select a different layout_solver (e.g. 'greedy')."
             )
-        super().__init__(size, alignment)
+        super().__init__(buffers, size, alignment)
         # The solver works in alignment-sized units so every offset it picks is
         # automatically aligned; plan_layout scales sizes/offsets in and out.
         self._capacity_units = self.limit // self.alignment
         self._time_limit_seconds = time_limit_seconds
         self._bottom_justify = bottom_justify
 
-    def plan_layout(
-        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
-    ) -> list[LifetimeBoundBuffer]:
+    def plan_layout(self, log_lx_usage: bool = False) -> list[LifetimeBoundBuffer]:
         """Place buffers on their already-fixed core divisions (placement-only).
 
         Same model as :meth:`plan_layout_and_core_divisions` minus the joint
@@ -357,24 +362,19 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         Dispatch is per buffer and keys on whether it carries candidate
         divisions, not on its class, so a :class:`CoreDivisionBuffer` with an
         empty candidate list is placed here rather than divided."""
-        return cast(
-            "list[LifetimeBoundBuffer]", list(self._plan_layout_generic(buffers))
-        )
+        return cast("list[LifetimeBoundBuffer]", list(self._plan_layout_generic()))
 
-    def plan_layout_and_core_divisions(
-        self, buffers: Sequence[CoreDivisionBuffer]
-    ) -> list[CoreDivisionBuffer]:
+    def plan_layout_and_core_divisions(self) -> list[CoreDivisionBuffer]:
         """Jointly choose each buffer's core division and its LX placement.
 
         The full model described in the module docstring. Every buffer must
         carry enumerated candidate divisions; the chosen index is written back
         to ``chosen_division`` for the allocator to commit."""
+        buffers = cast("Sequence[CoreDivisionBuffer]", self.buffers)
         assert all(len(b.core_divisions) != 0 for b in buffers), (
             "All buffers must have at least 1 valid core division"
         )
-        return cast(
-            "list[CoreDivisionBuffer]", list(self._plan_layout_generic(buffers))
-        )
+        return cast("list[CoreDivisionBuffer]", list(self._plan_layout_generic()))
 
     def _wrap(
         self, model: "cp_model.CpModel", buffer: LifetimeBoundBuffer
@@ -398,9 +398,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
     def _plan_layout_generic(
         self,
-        buffers: Sequence[LifetimeBoundBuffer | CoreDivisionBuffer],
         log_lx_usage: bool = False,
     ) -> list[LifetimeBoundBuffer | CoreDivisionBuffer]:
+        buffers = self.buffers
         if not buffers:
             return []
         assert all(b.address is None for b in buffers), (
@@ -415,7 +415,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # ``partition`` these out -- we still hand the barred buffers to the
         # model (they must stay available for slicing matching and in-place
         # chains) but pin them non-resident below, so we only need the reasons.
-        forced_reasons = dict(self.record_exclusions(buffers))
+        forced_reasons = dict(self.record_exclusions())
 
         model = cp_model.CpModel()
         # Solve on copies so we never mutate the caller's buffers.
