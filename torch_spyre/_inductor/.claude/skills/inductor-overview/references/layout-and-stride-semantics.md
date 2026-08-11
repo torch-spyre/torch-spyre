@@ -1,7 +1,7 @@
 # Layout and stride semantics
 
 For the full tiled-tensor layout specification, see
-[`docs/source/user_guide/tensors_and_layouts.md`](../../../../../docs/source/user_guide/tensors_and_layouts.md).
+[`docs/source/user_guide/tensors_and_layouts.md`](../../../../../../docs/source/user_guide/tensors_and_layouts.md).
 This file covers the `stride_map` concept specifically, which trips people
 up because it's easy to conflate with `device_stride`.
 

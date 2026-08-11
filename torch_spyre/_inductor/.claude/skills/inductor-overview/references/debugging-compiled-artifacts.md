@@ -58,7 +58,7 @@ For a full worked example of what a coarse-tiled kernel's generated
 `OpSpec` (Python wrapper source) and `bundle.mlir` actually look like side
 by side, see the "Generated OpSpec" and "Generated `bundle.mlir`" sections
 in
-[`docs/source/compiler/coarse_tiling_loops.md`](../../../../../docs/source/compiler/coarse_tiling_loops.md).
+[`docs/source/compiler/coarse_tiling_loops.md`](../../../../../../docs/source/compiler/coarse_tiling_loops.md).
 
 ## Provenance tracking
 
@@ -66,8 +66,12 @@ in
 buffer origin/provenance info across the pass pipeline. It's disabled by
 default; enable with `INDUCTOR_PROVENANCE=1`, or it follows
 `TORCH_COMPILE_DEBUG=1` when `INDUCTOR_PROVENANCE` is unset. Set
-`INDUCTOR_PROVENANCE=0` to force it off explicitly. See
-[`docs/source/compiler/adding_operations.md`](../../../../../docs/source/compiler/adding_operations.md)
+`INDUCTOR_PROVENANCE=0` to force it off explicitly. `INDUCTOR_PROVENANCE`
+itself is parsed by upstream PyTorch Inductor's config layer, not by
+torch-spyre — torch-spyre's `provenance.py` only reads the resulting
+`trace.provenance_tracking_level` config value, so `grep INDUCTOR_PROVENANCE
+torch_spyre/` turning up nothing is expected. See
+[`docs/source/compiler/adding_operations.md`](../../../../../../docs/source/compiler/adding_operations.md)
 for the full contract (`SOURCELESS_CREATION_PASSES`,
 `INTENTIONAL_PROVENANCE_REMAP_PASSES`,
 `INTENTIONAL_PROVENANCE_REMOVAL_PASSES`).

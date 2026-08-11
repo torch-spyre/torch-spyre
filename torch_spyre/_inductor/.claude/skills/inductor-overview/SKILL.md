@@ -43,10 +43,18 @@ means a bulk-allocated **HBM** region (`memory_planning.py`'s
 *not* scratchpad. Only `allocation={'lx': ...}` is actual on-chip
 scratchpad memory. (`hbm_pool` was renamed from the older key name `pool`;
 if you see `'pool'` in older docs or history, it refers to the same thing.)
-Buffers in `lx` are `per_tile_fixed=True` (pinned address, no
-`affine.apply` needed); `hbm_pool` buffers are ordinary HBM addresses that
-still need per-iteration `affine.apply` addressing like any other HBM
-operand.
+Whether a buffer's address is pinned (no `affine.apply` needed) or needs
+per-iteration `affine.apply` addressing is determined by
+`loop_info.output_tiled_dims`/`tiled_dims_per_read` and
+`TensorArg.device_tile_advance_expr` — not a standalone flag. (An older
+`per_tile_fixed` boolean duplicated this decision and was removed; if you
+see it mentioned in older docs or history, it's the same "pinned vs.
+advancing" distinction now derived from `loop_info`/
+`device_tile_advance_expr` directly.) `lx` buffers are typically pinned;
+`hbm_pool` buffers are ordinary HBM addresses that usually still need
+per-iteration addressing like any other HBM operand — but check
+`loop_info`/`device_tile_advance_expr` for the specific buffer rather than
+assuming from the allocation kind alone.
 
 ## `WrapperHandler` swaps must account for stride, not just name
 
@@ -77,11 +85,5 @@ for the specific suites to run locally instead.
 
 ## Adding to this skill
 
-- Keep guidance specific to `torch_spyre/_inductor/` here. Repo-wide
-  conventions (license headers, commit signing, `import regex`, line length)
-  stay in the top-level `CLAUDE.md` — don't duplicate them.
-- Follow the top-level `CLAUDE.md` conventions for `SKILL.md` frontmatter:
-  a quoted single-line `description`, not a multi-line `>-` block scalar.
-- Companion reference files for this skill (decision trees, checklists,
-  templates) belong alongside this file, under
-  `torch_spyre/_inductor/.claude/skills/inductor-overview/`.
+Follow the top-level `CLAUDE.md` conventions for `SKILL.md` frontmatter:
+a quoted single-line `description`, not a multi-line `>-` block scalar.
