@@ -25,6 +25,7 @@ from torch._inductor.virtualized import V
 from .constants import SEGMENT_SIZE, INTERMEDIATES_SEGMENT
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .logging_utils import get_inductor_logger
+from .scheduler import CountedLoopSchedulerNode
 from . import config
 
 logger = get_inductor_logger("HBM_POOL_PLANNING")
@@ -323,7 +324,20 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
         # timestep, ending its live range there and letting the allocator
         # free and reuse its offset for a different, still-live buffer
         # (e.g. the loop's own per-iteration scratch tile).
-        live_ranges = _compute_live_ranges(bundle.get_nodes(), bundle_candidates)
+        #
+        # This opacity relies on `bundle` being a FusedSchedulerNode whose
+        # `get_nodes()` returns *other* nodes (the loop appearing as one
+        # timestep among siblings). When spyre_fuse_nodes has no fusible
+        # neighbors to group a loop with, `_make_fused` returns the bare
+        # CountedLoopSchedulerNode itself as the top-level bundle -- in that
+        # case `bundle.get_nodes()` returns the loop's own internal snodes,
+        # bypassing the opacity entirely. Guard against that by treating a
+        # bare loop bundle as a single opaque timestep.
+        if isinstance(bundle, CountedLoopSchedulerNode):
+            live_range_nodes = [bundle]
+        else:
+            live_range_nodes = bundle.get_nodes()
+        live_ranges = _compute_live_ranges(live_range_nodes, bundle_candidates)
         sorted_bufs = sorted(live_ranges.items(), key=_alloc_sort_key)
 
         allocator = Allocator(SEGMENT_SIZE)

@@ -278,6 +278,51 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
             other_buf.get_layout().allocation["hbm_pool"],
         )
 
+    def test_counted_loop_accumulator_stays_live_as_bare_top_level_bundle(self):
+        """The opacity fix above relies on the loop appearing as one entry
+        inside an outer FusedSchedulerNode's own get_nodes() list. When a
+        CountedLoopSchedulerNode has no fusible neighbors, spyre_fuse_nodes's
+        _make_fused returns it directly as the top-level bundle (see
+        _make_fused in fusion.py: `len(nodes) == 1` returns `nodes[0]`
+        unwrapped, not a FusedSchedulerNode of one). In that case `bundle`
+        passed to hbm_pool_planning's per-bundle loop *is* the loop itself,
+        so `bundle.get_nodes()` would return the loop's own internal snodes
+        (acc_step, other_step, other_reader) instead of treating the loop as
+        one opaque step.
+
+        Both "acc" and "other" are written and read entirely within the
+        loop body (a loop-carried accumulator and a same-iteration temp
+        respectively), so both are pool candidates. With the bug, "acc"'s
+        merged read/write set still hides its internal read (start=end=0
+        collapsed away by the opacity check design), but "other" is read by
+        a *distinct* body op (other_reader) at a later flattened index than
+        its writer -- exposing a real, non-degenerate live range that ends
+        before the loop's remaining iterations complete, so the allocator
+        frees and reuses its offset. This reproduces the same class of
+        offset collision as the nested-loop test above, via the
+        independently-reachable bare-top-level-bundle path.
+        """
+        _make_ftl_buffer("acc")
+        _make_ftl_buffer("other")
+
+        acc_step = _make_snode_with_rw("acc_step", writes=["acc"], reads=["acc"])
+        other_step = _make_snode_with_rw("other_step", writes=["other"], reads=[])
+        other_reader = _make_snode_with_rw("other_reader", writes=[], reads=["other"])
+        loop = CountedLoopSchedulerNode(
+            MagicMock(), [acc_step, other_step, other_reader], Integer(4)
+        )
+
+        hbm_pool_planning([loop])
+
+        acc_buf = V.graph.get_buffer("acc")
+        other_buf = V.graph.get_buffer("other")
+        self.assertIn("hbm_pool", acc_buf.get_layout().allocation)
+        self.assertIn("hbm_pool", other_buf.get_layout().allocation)
+        self.assertNotEqual(
+            acc_buf.get_layout().allocation["hbm_pool"],
+            other_buf.get_layout().allocation["hbm_pool"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
