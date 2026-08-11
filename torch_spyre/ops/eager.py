@@ -243,6 +243,34 @@ register_torch_compile_kernel(
 )
 
 
+def register_inplace_arith_kernel(inplace_op):
+    """Register an in-place arithmetic op (``mul_``/``add_``/...) as
+    functional-compute + ``copy_`` back.
+
+    """
+    functional_name = inplace_op.__name__.rstrip("_")
+    functional_op = getattr(aten, functional_name)
+    for overload in inplace_op.overloads():
+        if overload not in functional_op.overloads():
+            continue
+        op = getattr(inplace_op, overload)
+        if "Tensor" not in str(op._schema):
+            # skip list overloads like ``add_.t(t[] self, t[] b)`` whose
+            # ``self`` is not a tensor (matches register_torch_compile_kernel)
+            continue
+        func = getattr(functional_op, overload)
+
+        def kernel(self, *args, _func=func, **kwargs):
+            self.copy_(_func(self, *args, **kwargs))
+            return self
+
+        torch.library.register_kernel(op.name(), ["spyre"])(kernel)
+
+
+for _inplace_op in (aten.mul_, aten.add_, aten.sub_, aten.div_):
+    register_inplace_arith_kernel(_inplace_op)
+
+
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])  # type:ignore
 def spyre__fill_scalar(
     self: torch.Tensor, other: int | float | bool | complex
