@@ -1282,6 +1282,12 @@ class SpyreKernel(Kernel[CSEVariable]):
         call_args = []
 
         uses_pool = self._kernel_uses_hbm_pool()
+        # `name` is this kernel's own wrapper-module variable name (e.g.
+        # "sdsc_fused__buf12"), already guaranteed unique across kernels by
+        # Inductor's wrapper codegen -- two kernels sharing a Python
+        # identifier in the same generated module would already break
+        # `{name}.run(...)` codegen independent of pool allocation. Deriving
+        # the pool variable's name from it is therefore also collision-free.
         pool_var_name = f"_pool_{name}"
         if uses_pool:
             wrapper.writeline(
