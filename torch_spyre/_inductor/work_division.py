@@ -1514,6 +1514,70 @@ def divide_pointwise_op(
     pass_fn(op, args, max_cores)
 
 
+# Maximum k rows that the topk hardware op can process per core.
+_TOPK_MAX_K_PER_CORE = 4
+
+
+def _divide_topk_op(
+    op: ComputedBuffer,
+    args: list[SchedNodeArg],
+    max_cores: int,
+) -> None:
+    """Apply multi-core work division for topk ops where k > _TOPK_MAX_K_PER_CORE.
+
+    The topk backend processes at most _TOPK_MAX_K_PER_CORE output rows per
+    core.  When k exceeds this limit the k dimension must be split across
+    cores, with each core computing k/num_cores output rows.
+
+    The required number of cores is the smallest divisor of k for which
+    k / divisor <= _TOPK_MAX_K_PER_CORE, capped at max_cores.  If no such
+    divisor exists, Unsupported is raised to trigger the fallback path.
+    """
+    input_tds, output_td = collect_tensor_deps(op, args)
+
+    it_space = iteration_space_from_op(op)
+
+    # Identify the k symbol: the only non-stick output dimension.
+    it_space_adjusted, _ = adjust_it_space_for_sticks(it_space, input_tds + [output_td])
+    output_dims, _ = prioritize_dimensions(output_td, it_space_adjusted)
+    if not output_dims:
+        return
+
+    # For topk the only non-stick output dim is k (mb is the stick dim).
+    k_sym = output_dims[0]
+    k_val = concretize_expr(it_space[k_sym])
+
+    if k_val <= _TOPK_MAX_K_PER_CORE:
+        return
+
+    # Find the smallest divisor of k such that k/divisor <= _TOPK_MAX_K_PER_CORE,
+    # capped at max_cores.
+    required_cores = None
+    for d in sorted(divisors(k_val)):
+        if d > 1 and k_val // d <= _TOPK_MAX_K_PER_CORE and d <= max_cores:
+            required_cores = d
+            break
+
+    if required_cores is None:
+        raise Unsupported(
+            f"topk: k={k_val} cannot be split across at most {max_cores} cores "
+            f"such that k_per_core <= {_TOPK_MAX_K_PER_CORE}; "
+            f"no valid divisor exists in [2, {max_cores}]"
+        )
+
+    splits = {sym: 1 for sym in it_space}
+    splits[k_sym] = required_cores
+    apply_splits(op, splits, output_td)
+
+    logger.debug(
+        "_divide_topk_op %s: k=%d, cores=%d, k_per_core=%d",
+        op.get_name(),
+        k_val,
+        required_cores,
+        k_val // required_cores,
+    )
+
+
 def divide_reduction_op(
     op: ComputedBuffer,
     args: list[SchedNodeArg],
@@ -1522,14 +1586,13 @@ def divide_reduction_op(
 ) -> None:
     red: Reduction = op.data
 
-    # Currently we support Topk for k<=4, which can be handled efficiently on single core
-    # TODO: Modification will be required to enable Topk for k>4
     if red.reduction_type in TOPK_OPS:
-        if not config.ignore_work_division_hints and _has_work_div_hint(op):
-            logger.warning(
-                f"work_division_hint: {op.get_name()} ignores work_div hint "
-                f"because TOPK reductions run single-core."
-            )
+        # Topk requires at most _TOPK_MAX_K_PER_CORE output rows per core.
+        # For k <= _TOPK_MAX_K_PER_CORE a single core suffices; for larger k
+        # the k dimension must be split across cores.  Work distribution passes
+        # (span_reduction, work_distribution) are not applicable to topk so we
+        # handle the split here directly.
+        _divide_topk_op(op, args, max_cores)
         return
 
     pass_fn(op, args, max_cores)

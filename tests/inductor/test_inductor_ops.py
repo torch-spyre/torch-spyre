@@ -1185,7 +1185,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     -1,
                 ),
                 # "2d_k4_dim0_lessthanstick": (unique_randn_along_dim((8, 32), dim=0), 4, 0),
-                # "2d_k4_dim_minusone_lessthanstick": (unique_randn_along_dim((1, 32), dim=-1), 4, -1),
+                "2d_k4_dim_minusone_11x32": (
+                    unique_randn_along_dim((11, 32), dim=-1),
+                    4,
+                    -1,
+                ),
+                "2d_k4_dim_minusone_1x32": (
+                    unique_randn_along_dim((1, 32), dim=-1),
+                    4,
+                    -1,
+                ),
+                "2d_k6_dim_minusone_11x32": (
+                    unique_randn_along_dim((11, 32), dim=-1),
+                    6,
+                    -1,
+                ),
             },
         },
         ("test_reduce_keepdim0", "test_reduce_keepdim0_cpu"): {

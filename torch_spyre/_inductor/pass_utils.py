@@ -1185,6 +1185,11 @@ def replace_computed_buffer_body(
 
     op_idx = operations.index(op)
     operations[op_idx] = new_buf
+
+    # Keep V.graph.name_to_buffer in sync so get_buffer() returns the new object.
+    if op.get_name() in V.graph.name_to_buffer:
+        V.graph.name_to_buffer[op.get_name()] = new_buf
+
     return new_buf
 
 

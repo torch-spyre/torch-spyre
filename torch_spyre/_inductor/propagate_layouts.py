@@ -1161,8 +1161,13 @@ def _topk_layouts(
     x_coords = host_coordinates(x.layout, x.dep, None)
     out_coords = host_coordinates(output, output_dep, None)
 
-    # Reduction var: in x's index but absent from output's.
-    reduction_var = find_reduction_var(x.dep, output_dep)
+    # Reduction coordinate: in x's host coords but absent from output's host coords.
+    reduction_coord = next(
+        c
+        for c in x_coords
+        if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is None
+    )
+    reduction_dim = matching_dim(x_coords, reduction_coord)
 
     # Coords that survive the reduction into the output.
     surviving_coords = [
@@ -1171,21 +1176,33 @@ def _topk_layouts(
         if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is not None
     ]
 
+    # The output mb dimension is the one that is NOT the k (output-size)
+    # dimension.  For the non-degenerate case (mb > 1) it corresponds to a
+    # surviving coord; for mb == 1 surviving_coords is empty so we derive the
+    # mb output dim as the complement of the k dim (the only output dim whose
+    # coord has free symbols).
+    if surviving_coords:
+        mb_out_dim = matching_dim(out_coords, surviving_coords[0])
+    else:
+        # mb is size-1: its input coord is constant, so no surviving coord.
+        # The k output dim is the only one with free symbols; mb is the other.
+        k_out_dims = [i for i, c in enumerate(out_coords) if len(c.free_symbols) > 0]
+        if len(k_out_dims) == 1:
+            mb_out_dim = 1 - k_out_dims[0]
+        else:
+            mb_out_dim = None
+
     # Collect candidate output stick dims. A valid input stick passes through;
-    # a stick on the reduction var requires a restickify, so every surviving
-    # coord becomes a candidate.
+    # a stick on the reduction dim requires a restickify to the mb output dim.
     out_stick_dims: set[int | None] = set()
     for stl in x.layouts:
         x_stick_expr = device_coordinates(stl, x.dep, None)[-1]
-        if reduction_var in x_stick_expr.free_symbols:
-            for c in surviving_coords:
-                out_stick_dims.add(matching_dim(out_coords, c))
+        if matching_dim(x_coords, x_stick_expr) == reduction_dim:
+            out_stick_dims.add(mb_out_dim)
         else:
             out_stick_dims.add(matching_dim(out_coords, x_stick_expr))
 
     # Build one output STL per candidate stick dim.
-    # Note: the stick dim STL will never be added so will never be
-    #       selected as a candidate output STL
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
     results: list[SpyreTensorLayout] = []
@@ -1197,7 +1214,20 @@ def _topk_layouts(
             out_dim_order += [out_stick_dim]
         results.append(SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order))
 
-    op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep, op)
+    # Topk requires the input stick to be on the mb (surviving) dimension.  Use
+    # bypass_stick_compat=True so that stick_compatible()'s false-positive for
+    # size-1 mb (constant device coordinate) does not suppress the restickify.
+    # The required input STL has stick on the input mb (non-reduction) dimension.
+    x_size = [concretize_expr(s) for s in x.layout.size]
+    x_stride = [concretize_expr(s) for s in x.layout.stride]
+    assert reduction_dim is not None
+    mb_in_dim = 1 - reduction_dim
+    req_in_dim_order = [d for d in range(len(x_size)) if d != mb_in_dim] + [mb_in_dim]
+    req_in_stl = SpyreTensorLayout(x_size, x_stride, x.layout.dtype, req_in_dim_order)
+    req_out_stl = results[0]
+    op.restick_cost_fn = FixedInOutNode.from_args(
+        [args[0]], req_out_stl, [req_in_stl], op, bypass_stick_compat=True
+    )
     return results
 
 
@@ -1798,9 +1828,28 @@ def propagate_spyre_tensor_layouts(
                         op._restickify_plan = (target_name, target_stl, alt_stl)
                         target_stl = alt_stl
                 op.layouts = [target_stl]
-                op.restick_cost_fn = AllSameNode.from_args(
-                    args, [target_stl], output_dep, op
-                )
+                if isinstance(op.data, Reduction) and isinstance(
+                    target_layout, FixedLayout
+                ):
+                    # Reductions (e.g. matmul) have fixed per-input stick
+                    # requirements that differ from the output stick.
+                    # AllSameNode would incorrectly require all inputs to be
+                    # stick-compatible with the output, so use compute_layouts
+                    # to get the proper cost function (e.g. FixedInOutNode).
+                    compute_layouts(op, target_layout, output_dep, args)
+                    # If an alternative mutation STL was selected above,
+                    # target_stl is now alt_stl. The FixedInOutNode installed
+                    # by compute_layouts derived required_out_stl from
+                    # target_layout, which may differ. Align it with the
+                    # forced output so cost() does not return INF for the
+                    # sole candidate layout.
+                    if isinstance(op.restick_cost_fn, FixedInOutNode):
+                        op.restick_cost_fn.required_out_stl = target_stl
+                    op.layouts = [target_stl]
+                else:
+                    op.restick_cost_fn = AllSameNode.from_args(
+                        args, [target_stl], output_dep, op
+                    )
                 continue
             op.decide_layout()
             rw = op.get_read_writes()

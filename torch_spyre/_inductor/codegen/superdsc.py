@@ -628,8 +628,18 @@ def _create_sdsc_tensors(
         # Step 3: Handle missing stick dimension — skip for index tensors.
         if op_stick_dim is None:
             if not (has_indirect_access and i in index_tensor_indices):
-                stick_dim = next(d for d in dims if d not in op_dim_order)
-                dim_order = dim_order + [stick_dim]
+                if _is_topk(op_spec.op):
+                    # When mb=1, Inductor drops mb from iteration_space so the
+                    # k-dimension gets the "mb" label.  The generic next() search
+                    # would find Symbol("mb") again (already in dim_order for the
+                    # output tensor), producing [mb, mb].  Use the injected
+                    # Symbol("x") instead — it is the true stick for topk in this
+                    # degenerate case and is never already in dim_order.
+                    stick_dim = Symbol("x")
+                else:
+                    stick_dim = next(d for d in dims if d not in op_dim_order)
+                if stick_dim not in dim_order:
+                    dim_order = dim_order + [stick_dim]
 
         if op_spec.op == "layernormscale" and len(sdsc_args) == 0:
             reduced_dims = [stick_dim]
@@ -726,6 +736,21 @@ def _create_sdsc_tensors(
                 max_dim_sizes[mb_sym] = 1
             else:
                 max_dim_sizes[mb_sym] = -1
+
+        if (
+            _is_topk(op_spec.op)
+            and op_stick_dim is not None
+            and op_stick_dim not in dim_order
+        ):
+            # When mb=1 the stick/mb dim (Symbol("x")) has trivial range and is absent
+            # from device_coordinates, so _get_device_dim_order omits it.  Append it
+            # after the stride loop so the layout dim_order, scale_, and coordInfo include
+            # the "x" dim that the backend requires for topkvalue/topkindex.
+            dim_order = dim_order + [op_stick_dim]
+            scales[op_stick_dim] = 1
+            strides[op_stick_dim] = _calculate_device_stride(0, arg.device_size)
+            offsets[op_stick_dim] = 0
+            max_dim_sizes[op_stick_dim] = -1
 
         effective_stick = [op_stick_dim if stick_dim is None else stick_dim]
         layout_labels = MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS
@@ -1072,6 +1097,17 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             # restate the invariant so the index is well-typed.
             assert op_spec.node_output_ranges is not None
             sdsc_iteration_space[stick_sym] = int(op_spec.node_output_ranges[1])
+        elif _is_topk(op_spec.op):
+            # When mb=1 the mb symbol has trivial range and is absent from iteration_space,
+            # so _get_topk_symbol_mapping omits Symbol("x") and sdsc_iteration_space lacks it.
+            # Inject it with value 1 so _extend_topk_mb_to_padded can round it up to 64.
+            # Also inject into dim_splits and work_slices so the core/slice mapping is correct.
+            stick_sym = Symbol("x")
+            op_dim_order = [d for d in op_dim_order if d != stick_sym] + [stick_sym]
+            if stick_sym not in sdsc_iteration_space:
+                sdsc_iteration_space[stick_sym] = 1
+                dim_splits[stick_sym] = 1
+                work_slices[stick_sym] = 1
         else:
             stick_sym = Symbol(INPUT_DIM_LABELS[ndim])
             sdsc_iteration_space[stick_sym] = op_spec.args[

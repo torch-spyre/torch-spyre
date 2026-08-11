@@ -56,6 +56,7 @@ class EdgeCostMap:
         target_layouts: list,
         target_dep: "MemoryDep",
         op,
+        strict_stl: "SpyreTensorLayout | None" = None,
     ):
         self.dep = dep
         self._op = op
@@ -64,6 +65,10 @@ class EdgeCostMap:
         self._target_dep = target_dep
         self._dep_layout = V.graph.get_buffer(dep.name).get_layout()
         self._target_dep_layout = V.graph.get_buffer(target_dep.name).get_layout()
+        # When set, bypass stick_compatible and treat any in_stl != strict_stl as
+        # requiring a restickify to strict_stl.  Used for topk where size-1 mb
+        # produces a constant device coordinate that fools stick_compatible.
+        self._strict_stl = strict_stl
 
         # _cost and _layout are parallel maps.
         # _cost stores the cost for a given in/target layout pair
@@ -91,6 +96,14 @@ class EdgeCostMap:
           INFEASIBLE         — restickify needed but compute_restickify_target_layout returned None
           SpyreTensorLayout  — feasible restickify target layout
         """
+        if self._strict_stl is not None:
+            if in_stl == self._strict_stl:
+                self._cost[in_stl][target_stl] = 0.0
+                self._layout[in_stl][target_stl] = None
+            else:
+                self._cost[in_stl][target_stl] = float(math.prod(in_stl.device_size))
+                self._layout[in_stl][target_stl] = self._strict_stl
+            return
         needed, tgt = compute_restickify_needed(
             in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
         )
@@ -225,10 +238,17 @@ class FixedInOutNode(RestickNodeCost):
         )
 
     @classmethod
-    def from_args(cls, args, out_stl, req_stls, op):
+    def from_args(cls, args, out_stl, req_stls, op, bypass_stick_compat=False):
         assert req_stls, "FixedInOutNode.from_args: req_stls is empty"
         edge_costs = [
-            EdgeCostMap(arg.dep, arg.layouts, [req], arg.dep, op)
+            EdgeCostMap(
+                arg.dep,
+                arg.layouts,
+                [req],
+                arg.dep,
+                op,
+                strict_stl=req if bypass_stick_compat else None,
+            )
             for arg, req in zip(args, req_stls)
         ]
         return cls(edge_costs, required_out_stl=out_stl, required_in_stls=req_stls)
