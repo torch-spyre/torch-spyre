@@ -294,6 +294,16 @@ def parse_kernel_xml(xml_path: Path, workflow: str = "", ci_run_id: str = "",
         is_granite = operation_name.startswith("granite_")
         num_runs = _opt_float(tags, "num_runs")
 
+        # config__/mode__ carry only full_model|one_block and prefill|decode, so
+        # without bs/pl two Granite configs would be indistinguishable here.
+        batch_size = prompt_length = None
+        if is_granite:
+            config_m = _GRANITE_CONFIG_RE.search(operation_name)
+            if config_m:
+                batch_size = int(config_m.group("batch_size"))
+                pl_raw = config_m.group("prompt_length")
+                prompt_length = int(pl_raw) if pl_raw and pl_raw.isdigit() else None
+
         kernels.append(
             {
                 "kernel_id": uuid.uuid4().int >> 64,
@@ -303,13 +313,15 @@ def parse_kernel_xml(xml_path: Path, workflow: str = "", ci_run_id: str = "",
                 # A section's Total is the sum of its siblings; flagged so
                 # queries can aggregate without double-counting.
                 "is_total": 1 if kernel_name == "Total" else 0,
-                "metric": tags.get("metric") or None,
+                "metric": _null_tag(tags.get("metric")),
                 "config_name": _null_tag(tags.get("config")),
+                "batch_size": batch_size,
+                "prompt_length": prompt_length,
                 "run_mode": _null_tag(tags.get("mode")) or (
                     None if is_granite else "op_benchmark"
                 ),
                 "input_shapes": None if is_granite else _null_tag(tags.get("input_shape")),
-                "duration_ms": float(tc.get("time", 0) or 0),
+                "duration_ms": _opt_float({"t": tc.get("time")}, "t"),
                 "torch_spyre_ms": _opt_float(tags, "torch_spyre_ms"),
                 "sendnn_ms": _opt_float(tags, "sendnn_ms"),
                 "ratio": _opt_float(tags, "ratio"),
@@ -328,6 +340,7 @@ def parse_kernel_xml(xml_path: Path, workflow: str = "", ci_run_id: str = "",
         "version_info": version_info,
         "workflow": workflow,
         "platform": platform,
+        "run_type": "kernel",
     }
     return run_meta, kernels
 
@@ -353,6 +366,7 @@ def insert_benchmark_run(client, run_id: int, run_meta: dict) -> None:
                 run_meta["created_at"].replace(tzinfo=None),
                 run_meta.get("workflow", ""),
                 run_meta.get("platform", ""),
+                run_meta.get("run_type", "benchmark"),
             ]
         ],
         column_names=[
@@ -362,6 +376,7 @@ def insert_benchmark_run(client, run_id: int, run_meta: dict) -> None:
             "created_at",
             "workflow",
             "platform",
+            "run_type",
         ],
     )
 
@@ -432,6 +447,8 @@ CREATE TABLE IF NOT EXISTS perf_kernels (
     is_total        UInt8           DEFAULT 0,
     metric          Nullable(String),
     config_name     Nullable(String),
+    batch_size      Nullable(Int32),
+    prompt_length   Nullable(Int32),
     run_mode        Nullable(String),
     input_shapes    Nullable(String),
     duration_ms     Nullable(Float64),
@@ -454,6 +471,8 @@ _PERF_KERNEL_COLUMNS = [
     "is_total",
     "metric",
     "config_name",
+    "batch_size",
+    "prompt_length",
     "run_mode",
     "input_shapes",
     "duration_ms",
@@ -481,6 +500,8 @@ def insert_perf_kernels(client, run_id: int, kernels: list[dict]) -> None:
                 k["is_total"],
                 k["metric"],
                 k["config_name"],
+                k["batch_size"],
+                k["prompt_length"],
                 k["run_mode"],
                 k["input_shapes"],
                 k["duration_ms"],
@@ -852,6 +873,11 @@ def main():
     )
     client.command(
         "ALTER TABLE benchmark_runs ADD COLUMN IF NOT EXISTS platform String DEFAULT ''"
+    )
+    # A CI run now writes three benchmark_runs rows (report + 2 kernel files);
+    # without this the two kernel ones look like runs that measured nothing.
+    client.command(
+        "ALTER TABLE benchmark_runs ADD COLUMN IF NOT EXISTS run_type String DEFAULT 'benchmark'"
     )
     client.command(PERF_KERNELS_DDL)
 
