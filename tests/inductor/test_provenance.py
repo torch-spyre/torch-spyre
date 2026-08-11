@@ -408,6 +408,7 @@ class TestSDSCSpecDebugHandle:
             layouts={},
             args=[],
             constants={},
+            conv_params={},
             coordinate_masking={},
             **kw,
         )

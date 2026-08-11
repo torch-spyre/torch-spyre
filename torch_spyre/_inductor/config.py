@@ -27,6 +27,12 @@ hbm_pool_planning: bool = _get_env_bool("HBM_POOL_PLANNING", True)
 
 global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == "1"
 
+# Opt-in OpSpec->KTIR emitter (experimental, #3380). When enabled the scheduler
+# emits ``async_compile.ktir(...)`` instead of the SDSC bundle, and
+# ``create_tensor_arg`` populates the op-spec buffer name so the emitter has a
+# stable per-buffer identity. Inert by default: the SDSC/flex path is unchanged.
+ktir_emitter: bool = os.environ.get("TORCH_SPYRE_KTIR", "0") == "1"
+
 allow_all_ops_in_lx_planning: bool = False
 
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
@@ -89,6 +95,15 @@ enable_reduction_tiling: bool = (
 # cores at SDSC emission. Set SPYRE_CORE_ID_K_FAST_EMISSION=0 to disable.
 core_id_k_fast_emission: bool = (
     os.environ.get("SPYRE_CORE_ID_K_FAST_EMISSION", "1") == "1"
+)
+
+# Disable splitting on spatial image dimensions (i, j) for conv2d operations when stride > 1.
+# When enabled (default True), splits are disabled only for strided convolutions to prevent
+# DSM/strided memory access complexity that degrades correctness. For stride=1 convolutions,
+# splitting may still occur unless the backend heuristics choose not to split.
+# Set SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT=0 to allow splitting on i/j dims regardless of stride.
+disable_conv2d_spatial_split: bool = (
+    os.environ.get("SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT", "1") == "1"
 )
 
 # When True (default), HBM tensor addresses are emitted as runtime symbols

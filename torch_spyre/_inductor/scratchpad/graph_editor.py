@@ -160,6 +160,7 @@ class GraphEditor:
                 layout.size,  # pyright: ignore[reportArgumentType]
                 layout.stride,  # pyright: ignore[reportArgumentType]
                 layout.device_layout,
+                offset=layout.offset,
             ),  # create a new copy of FixedTiledLayout from buffer's layout
             data=pw_ir_tb.data.data,  # type: ignore
         )

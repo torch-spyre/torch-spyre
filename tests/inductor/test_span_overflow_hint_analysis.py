@@ -58,7 +58,7 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP, RESTICKIFY_OP
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.propagate_hints import DimHint
-from torch_spyre._inductor.wsr.coarse_tile import coarse_tile
+from torch_spyre._inductor.wsr.coarse_tile import coarse_tile_post_stickify
 from torch_spyre._inductor.wsr.coarse_tile_span_overflow import (
     _SPAN_OVERFLOW_HINT_ID,
     span_overflow_groups,
@@ -1726,7 +1726,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
             graph = _graph([op])
             groups = _apply_span_overflow(graph)
-            coarse_tile(graph, groups)
+            coarse_tile_post_stickify(graph, groups)
 
         self.assertEqual(list(op.data.ranges), _E2E_TILE_SHAPE)
         self.assertEqual(list(op.layout.size), _E2E_TILE_SHAPE)
@@ -2159,8 +2159,8 @@ class TestSpanOverflowLargeShapeContract(InductorTestCase):
                 self.assertEqual(manual_op.dim_hints[0].loop_var, sympy.Symbol("h"))
 
                 # Layer 3: coarse_tile stamps identical per-tile IR shape.
-                coarse_tile(auto_graph, auto_groups)
-                coarse_tile(manual_graph, manual_groups)
+                coarse_tile_post_stickify(auto_graph, auto_groups)
+                coarse_tile_post_stickify(manual_graph, manual_groups)
 
         self.assertEqual(list(auto_op.data.ranges), _E2E_TILE_SHAPE)
         self.assertEqual(list(manual_op.data.ranges), _E2E_TILE_SHAPE)

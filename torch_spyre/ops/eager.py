@@ -59,8 +59,122 @@ def maybe_wrap_dim(dim: int, ndims: int) -> int:
     return dim
 
 
-def dispatch_to_torch_compile(*args, compiled=None, **kwargs):
-    return compiled(*args, **kwargs)
+def _materialize_offset_view(x):
+    """Return an offset-0 copy of a Spyre tensor that carries a nonzero
+    ``storage_offset``; pass everything else through unchanged.
+
+    A standalone-compiled kernel drops its input's ``storage_offset`` (upstream
+    Inductor's placeholder path reads sizes/strides only, and SpyreTensorLayout
+    has no offset field), so it binds the storage BASE pointer and reads from
+    element 0 regardless of the view's true offset — see ``_reoffset`` in
+    ``torch_spyre/_inductor/lowering.py``. Only ``spyre::copy_from_d2d``
+    re-injects the offset in-graph; every other compiled eager op would
+    silently read the wrong data.
+
+    ``clone()`` dispatches ``aten::clone`` -> ``aten::copy_`` ->
+    ``spyre::copy_from_d2d``, i.e. that same offset-honoring path, producing a
+    correct offset-0 buffer. This is a no-op for the overwhelmingly common
+    offset-0 case (fresh buffers, and slices that already forced a copy).
+
+    ``List[Tensor]`` args (e.g. ``aten.cat``/``aten.stack``) are recursed into
+    element-wise so an offset view nested in a list is materialized too;
+    otherwise those ops would silently read element 0 of each nested view.
+    """
+    if isinstance(x, torch.Tensor):
+        if x.device.type == "spyre" and x.storage_offset() != 0:
+            return x.clone()
+        return x
+    if isinstance(x, (list, tuple)):
+        return type(x)(_materialize_offset_view(e) for e in x)
+    return x
+
+
+def _write_arg_slots(op):
+    """Positions and names of an op's mutated (write-aliased) arguments.
+
+    Such arguments (e.g. ``out=`` of an out-variant, ``self`` of an in-place op)
+    need read-modify-write handling rather than a plain read-side clone: the
+    standalone-compiled kernel would write to the storage base (element 0)
+    instead of the view's ``storage_offset``. ``alias_info.is_write`` identifies
+    them from the schema.
+    """
+    positions: set[int] = set()
+    names: set[str] = set()
+    for i, arg in enumerate(op._schema.arguments):
+        if arg.alias_info is not None and arg.alias_info.is_write:
+            positions.add(i)
+            names.add(arg.name)
+    return positions, names
+
+
+def _remap_result(result, lookup):
+    """Swap substituted clones back to the caller's originals in a return value.
+
+    ``lookup`` maps ``id(clone) -> original``. The compiled kernel echoes the
+    write-arg object it was handed (verified: ``relu_``/``add.out`` return the
+    same object), so an in-place/out op returns the clone we substituted;
+    restore the caller's tensor identity so aliasing is preserved.
+    """
+    if isinstance(result, torch.Tensor):
+        return lookup.get(id(result), result)
+    if isinstance(result, tuple):
+        mapped = [_remap_result(r, lookup) for r in result]
+        if hasattr(type(result), "_make"):  # namedtuple / structseq
+            return type(result)._make(mapped)
+        return tuple(mapped)
+    if isinstance(result, list):
+        return [_remap_result(r, lookup) for r in result]
+    return result
+
+
+def _make_offset_safe_dispatch(op):
+    """Build a dispatch wrapper that keeps nonzero-offset Spyre tensors correct
+    across the standalone-compiled kernel.
+
+    - Read (non-write) args: materialize a nonzero-offset view to a fresh
+      offset-0 buffer (``_materialize_offset_view``) before the call.
+    - Write (mutated) args: read-modify-write. Clone the offset view to an
+      offset-0 buffer, run the kernel against the clone, then ``copy_`` the
+      result back into the caller's view.
+
+    Everything is a no-op for the common offset-0 case.
+    """
+    write_positions, write_names = _write_arg_slots(op)
+
+    def dispatch(*args, compiled=None, **kwargs):
+        write_back = []  # (clone, original) for each substituted write view
+
+        def prep_write(x):
+            if isinstance(x, torch.Tensor):
+                if x.device.type == "spyre" and x.storage_offset() != 0:
+                    local = x.clone()
+                    write_back.append((local, x))
+                    return local
+                return x
+            if isinstance(x, (list, tuple)):
+                return type(x)(prep_write(e) for e in x)
+            return x
+
+        args = tuple(
+            prep_write(a) if i in write_positions else _materialize_offset_view(a)
+            for i, a in enumerate(args)
+        )
+        kwargs = {
+            k: (prep_write(v) if k in write_names else _materialize_offset_view(v))
+            for k, v in kwargs.items()
+        }
+
+        result = compiled(*args, **kwargs)
+
+        if write_back:
+            for local, original in write_back:
+                original.copy_(local)
+            result = _remap_result(
+                result, {id(local): original for local, original in write_back}
+            )
+        return result
+
+    return dispatch
 
 
 def register_torch_compile_kernel(ops):
@@ -72,7 +186,8 @@ def register_torch_compile_kernel(ops):
         if "dtype" in op.name():
             # ops that change dtype are not supported yet
             continue
-        compiled_kernel = compile_once(op, dynamic=False)(dispatch_to_torch_compile)
+        dispatch = _make_offset_safe_dispatch(op)
+        compiled_kernel = compile_once(op, dynamic=False)(dispatch)
         torch.library.register_kernel(op.name(), ["spyre"])(compiled_kernel)
 
 

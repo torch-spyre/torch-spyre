@@ -260,6 +260,29 @@ def _autoload():
         return
     _autoload._ran = True
 
+    try:
+        _autoload_impl()
+    except BaseException:
+        # PyTorch's _import_device_backends() catches whatever this entrypoint
+        # raises and re-raises a generic "Failed to load the backend extension:
+        # torch_spyre" RuntimeError. In CI logs the chained cause is often not
+        # printed, so the real reason (e.g. an ImportError for an undefined
+        # symbol in a native runtime library such as libspyre_comms /
+        # libflex) is hidden and the failure looks like a mystery. Log the full
+        # traceback here, before control returns to PyTorch, then re-raise so
+        # behaviour is otherwise unchanged.
+        import sys
+        import traceback
+
+        print(
+            "torch_spyre backend autoload failed; underlying error follows:",
+            file=sys.stderr,
+        )
+        traceback.print_exc()
+        raise
+
+
+def _autoload_impl():
     import torch  # noqa: E402
 
     # Set all the appropriate state on PyTorch

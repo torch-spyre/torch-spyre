@@ -490,6 +490,16 @@ controls this codegen-side permutation. The name is legacy from when
 k-fast was also a planner. The permutation runs whenever any planner
 picks a K-split.
 
+:::{figure} ../_static/images/work-division/core-id-k-mapping.svg
+:alt: Default core order places the two K slices of one output tile four cores apart; contiguous_dim on K places them on adjacent cores.
+:width: 100%
+
+`contiguous_dim` selects which dimension varies fastest across `core_id`.
+Setting it to the K dimension puts the cores that reduce the same output
+tile next to each other, so their partial sums accumulate over one ring
+hop instead of several.
+:::
+
 ### Scratchpad planning
 
 Each pass plans one op at a time. When two adjacent ops share a tensor

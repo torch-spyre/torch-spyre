@@ -22,6 +22,31 @@ import shared_config
 from oot_framework.oot_test_utilities import _RUNTIME_TAGS, _RUNTIME_SHAPES
 
 
+# Cap on the failure message folded into wasxfail (see _extract_failure_message):
+# keeps the terminal short-summary line and JUnit XML message attribute readable.
+_MAX_XFAIL_REASON_LEN = 300
+
+
+def _extract_failure_message(rep):
+    """One-line summary of the exception/skip reason behind `rep`."""
+    # rep.longrepr is an ExceptionRepr (has .reprcrash.message) for a real
+    # call failure, or a (path, lineno, message) 3-tuple for pytest.skip().
+    longrepr = rep.longrepr
+    if longrepr is None:
+        return ""
+    reprcrash = getattr(longrepr, "reprcrash", None)
+    if reprcrash is not None:
+        message = reprcrash.message
+    elif isinstance(longrepr, tuple) and len(longrepr) == 3:
+        message = str(longrepr[2])
+    else:
+        message = str(longrepr)
+    message = " ".join(message.split())
+    if len(message) > _MAX_XFAIL_REASON_LEN:
+        message = message[:_MAX_XFAIL_REASON_LEN] + "..."
+    return message
+
+
 # Attaches per-test tags to the pytest report object after each test call.
 # Tags come from _RUNTIME_TAGS (set by print_test_tags_oot during test execution,
 # includes per-occurrence op tags) with fallback to _spyre_method_tags
@@ -76,8 +101,13 @@ def pytest_runtest_makereport(item, call):
         if xfail_mark is not None:
             strict = xfail_mark.kwargs.get("strict", False)
             if rep.skipped or rep.failed:
+                reason = _extract_failure_message(rep)
                 rep.outcome = "skipped"
-                rep.wasxfail = "expected failure (OOT xfail)"
+                rep.wasxfail = (
+                    f"expected failure (OOT xfail): {reason}"
+                    if reason
+                    else "expected failure (OOT xfail)"
+                )
             elif rep.passed:
                 if strict:
                     # Strict XPASS: test passed but was required to fail.
@@ -104,6 +134,9 @@ def pytest_runtest_logreport(report):
         shapes = getattr(report, "_spyre_shapes", None)
         if shapes:
             os.write(1, f"  [INPUT SHAPES]\n{shapes}\n".encode())
+        wasxfail = getattr(report, "wasxfail", None)
+        if wasxfail and report.skipped:
+            os.write(1, f"  [REASON = {wasxfail}]\n".encode())
 
 
 def _get_case_marks(case: dict) -> set[str]:
