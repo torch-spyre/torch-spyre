@@ -222,6 +222,72 @@ def coordinate_mask_blocked_vars(
     }
 
 
+# A conv2d's output index is (mb, out, i, j) -- see the ``index`` unpacking in
+# ``lower_convolution``'s ``inner_fn`` -- so the output-spatial (image H/W) dims
+# are the trailing pair of the write dependency's ranges. Indexing from the end
+# tolerates Inductor collapsing leading unit dims (a batch-1 input yields a
+# rank-3 write dep, not rank 4).
+_CONV2D_NUM_SPATIAL_DIMS = 2
+
+
+def conv_spatial_blocked_vars(
+    op: ComputedBuffer,
+    it_space: dict[Symbol, Expr],
+    committed_splits: dict[Symbol, int] | None = None,
+) -> set[Symbol]:
+    """Return the output-spatial iteration vars of a strided conv2d.
+
+    Splitting the output image dims (i, j) of a strided convolution across
+    cores produces incorrect per-core DSM/strided addressing. Blocking them
+    here -- rather than resetting the splits during codegen -- lets the
+    distributor spend those cores on dims that can absorb them (mb, out)
+    instead of dropping them.
+
+    ``committed_splits`` are the splits ``span_reduction_pass`` already
+    committed to satisfy ``MAX_SPAN_BYTES``. Those are mandatory: a spatial dim
+    among them is excluded from the returned set (and warned about) rather than
+    blocked, since un-splitting it would violate the hardware span limit.
+
+    Returns an empty set for non-conv ops, unstrided convs, spatial dims of
+    size 1 (unsplittable anyway), and when
+    ``config.disable_conv2d_spatial_split`` is off.
+    """
+    if not config.disable_conv2d_spatial_split:
+        return set()
+
+    op_info = getattr(op.data, "op_info", None)
+    if not isinstance(op_info, dict):
+        return set()
+    conv_params = op_info.get("conv_params")
+    if not isinstance(conv_params, dict):
+        return set()
+
+    if conv_params.get("stride_i", 1) <= 1 and conv_params.get("stride_j", 1) <= 1:
+        return set()
+
+    # Trailing pair of the output ranges. When the spatial dims themselves
+    # collapse to size 1 the write dep is shorter than that; the size filter
+    # below drops whatever remains.
+    write_ranges = list(next(iter(op_read_writes(op).writes)).ranges)
+    spatial = write_ranges[-_CONV2D_NUM_SPATIAL_DIMS:]
+
+    blocked = {
+        sym for sym in spatial if sym in it_space and concretize_expr(it_space[sym]) > 1
+    }
+
+    # Span reduction outranks the spatial-split preference: honour its commits.
+    forced = {s for s in blocked if (committed_splits or {}).get(s, 1) > 1}
+    if forced:
+        logger.warning(
+            f"{op.get_name()}: SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT is set, "
+            f"but the hardware memory-span limit requires splitting spatial "
+            f"dim(s) {sorted(str(s) for s in forced)} "
+            f"({ {str(s): (committed_splits or {})[s] for s in forced} }); "
+            f"the flag is not honoured for those dims."
+        )
+    return blocked - forced
+
+
 def multi_dim_iteration_space_split(
     iteration_space: dict[Symbol, Expr],
     max_cores: int,
@@ -791,6 +857,7 @@ def enumerate_work_division_candidates(
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
     mask_blocked = coordinate_mask_blocked_vars(reduction_vars, stick_vars, it_space)
+    mask_blocked |= conv_spatial_blocked_vars(op, it_space_adjusted)
 
     # Per-dim candidate factors, mirroring must_split_vars.valid_splits but with
     # no ``>= current_min`` floor (we want the full set, including 1).
@@ -1046,9 +1113,12 @@ def _default_split(
     if any(v not in coord_vars for v in committed_splits):
         reduction_dims = []
 
-    # Drop reduction dims the backend compiler can't split across cores before
-    # the greedy distributor commits them.
+    # Drop dims the backend compiler can't split across cores before the greedy
+    # distributor commits them. Output dims are filtered too: coordinate masking
+    # only blocks reduction dims, but conv2d spatial blocking applies to output
+    # dims, and the distributor must not hand cores to either.
     reduction_dims = [v for v in reduction_dims if v not in blocked]
+    output_dims = [v for v in output_dims if v not in blocked]
 
     # Pass max_cores, not remaining_cores: multi_dim_iteration_space_split
     # accounts for committed_splits in its first pass, consuming those cores
@@ -1144,6 +1214,7 @@ def work_distribution_pass(
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
     blocked = coordinate_mask_blocked_vars(reduction_vars, stick_vars, it_space)
+    blocked |= conv_spatial_blocked_vars(op, it_space_adjusted, committed_splits)
     splits, output_dims, reduction_dims = _default_split(
         it_space_adjusted, output_td, committed_splits, max_cores, symbol_meta, blocked
     )
