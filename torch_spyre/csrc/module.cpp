@@ -73,13 +73,14 @@ void set_downcast_warn_enabled(bool enabled) {
   g_downcast_warn_enabled.store(enabled, std::memory_order_relaxed);
 }
 
-// SPYRE_HAZARD_TRACKER latch: when on, torch-spyre skips emitting the static
-// edge-3/4 event steps and instead splits the correction triple across
-// S_prep/S_dev while flex's per-region hazard tracker inserts the cross-stream
-// RAW/WAR events dynamically at enqueue. Default OFF => byte-identical to the
-// static-edge overlap path. Read once from the env in init_from_env and applied
-// to the flex RuntimeContext in _startRuntime.
-std::atomic<bool> g_hazard_tracker_enabled{false};  // default OFF
+// SPYRE_HAZARD_TRACKER latch: when on (default), torch-spyre splits the
+// correction triple across S_prep/S_dev while flex's per-region hazard tracker
+// inserts the cross-stream RAW/WAR events dynamically at enqueue -- torch-spyre
+// emits no cross-stream event steps of its own. SPYRE_HAZARD_TRACKER=0 keeps
+// every step on S_dev: the single-stream floor, byte-identical to the
+// pre-overlap path (the STATIC event-step path was retired). Read once from the
+// env in init_from_env; applied to the flex RuntimeContext in _startRuntime.
+std::atomic<bool> g_hazard_tracker_enabled{true};  // default ON (HAZARD)
 
 bool get_hazard_tracker_enabled() {
   return g_hazard_tracker_enabled.load(std::memory_order_relaxed);
@@ -107,8 +108,10 @@ static void init_from_env() {
     bool enable = !(s == "0" || s == "false" || s == "off");
     g_downcast_warn_enabled.store(enable, std::memory_order_relaxed);
   }
-  // SPYRE_HAZARD_TRACKER is a correctness gate: strict "1" semantics (matching
-  // SPYRE_DISABLE_HC_DMA_OVERLAP), NOT the permissive downcast parser above.
+  // SPYRE_HAZARD_TRACKER is a correctness gate: strict "1" semantics, NOT the
+  // permissive downcast parser above. The atomic defaults ON, so leaving the
+  // env UNSET selects HAZARD; setting it to any value other than "1" (e.g. "0")
+  // selects the single-stream floor (all steps on S_dev, no overlap).
   if (const char* v = std::getenv("SPYRE_HAZARD_TRACKER")) {
     g_hazard_tracker_enabled.store(std::string(v) == "1",
                                    std::memory_order_relaxed);
@@ -484,9 +487,8 @@ PYBIND11_MODULE(_C, m) {
           [](const spyre::JobPlan& plan, size_t idx) {
             TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");
             // Single source of truth for step-type identification (also used by
-            // the P2-14 ordering validator). Recognizes the two-stream event
-            // steps (SignalForward/WaitForward/SignalBack/WaitBack) that the
-            // old dynamic_cast chain reported as "Unknown".
+            // the P2-14 ordering validator). Returns
+            // HostCompute/H2D/D2H/Compute or Unknown.
             return spyre::stepKindName(spyre::classifyStep(*plan.steps[idx]));
           },
           py::arg("idx"), "Get the type of step at the given index")
@@ -507,27 +509,6 @@ PYBIND11_MODULE(_C, m) {
           },
           py::arg("idx"),
           "Get the stream role (Prep/Dev) for the step at the given index")
-      .def(
-          "get_step_region_id",
-          [](const spyre::JobPlan& plan, size_t idx) -> uint64_t {
-            TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");
-            const auto* step = plan.steps[idx].get();
-            if (const auto* sb =
-                    dynamic_cast<const spyre::JobPlanStepEventSignalBack*>(
-                        step)) {
-              return sb->regionId();
-            }
-            if (const auto* wb =
-                    dynamic_cast<const spyre::JobPlanStepEventWaitBack*>(
-                        step)) {
-              return wb->regionId();
-            }
-            TORCH_CHECK(false, "Step at index ", idx,
-                        " is not a back-event step (SignalBack/WaitBack); has "
-                        "no region_id");
-          },
-          py::arg("idx"),
-          "Get the edge-4 region_id key for a SignalBack/WaitBack step")
       .def("__repr__", [](const spyre::JobPlan& plan) {
         return "<JobPlan steps=" + std::to_string(plan.steps.size()) +
                " job_allocation_size=" +
@@ -558,13 +539,12 @@ PYBIND11_MODULE(_C, m) {
         "    job_plan: The JobPlan to execute\n"
         "    args: Sequence of input/output tensors");
 
-  // ── Two-stream overlap: step-ordering validator + edge-4 instrumentation ──
+  // ── Two-stream overlap: step-ordering validator + test hooks ──
 
-  // Direct binding of the pure P2-14 ordering checker so the
-  // Placement-Invariant rejection can be tested without constructing real steps
-  // (a real HostCompute needs a deeptools::Hcm + pinned buffers). Takes
-  // parallel lists of StepKind names ("HostCompute"/"H2D"/... per stepKindName)
-  // and StreamRole names
+  // Direct binding of the pure P2-14 ordering checker so a role-misplacement
+  // rejection can be tested without constructing real steps (a real HostCompute
+  // needs a deeptools::Hcm + pinned buffers). Takes parallel lists of StepKind
+  // names ("HostCompute"/"H2D"/... per stepKindName) and StreamRole names
   // ("Prep"/"Dev"), returns "" when valid or a human-readable error otherwise.
   m.def(
       "check_job_plan_step_ordering",
@@ -589,61 +569,13 @@ PYBIND11_MODULE(_C, m) {
       "Validate a projected two-stream step ordering; '' if valid else the "
       "error message.");
 
-  m.def(
-      "edge4_slot_hits", []() { return spyre::SpyreStream::edge4SlotHits(); },
-      "Number of WaitBack rolling-slot HITS (found a published back-event).");
-  m.def(
-      "edge4_slot_skips", []() { return spyre::SpyreStream::edge4SlotSkips(); },
-      "Number of WaitBack rolling-slot SKIPS (empty slot, no-op'd).");
-  m.def(
-      "reset_edge4_slot_stats",
-      []() { spyre::SpyreStream::resetEdge4SlotStats(); },
-      "Reset the edge-4 rolling-slot hit/skip counters to zero.");
-
-  // ── Test-only edge-4 rolling-slot hooks (#2 cross-kernel WAR gate) ──
-  // These drive the REAL SpyreStream::setEdge4Slot/getEdge4Slot map that
-  // SignalBack::construct / WaitBack::construct use, keyed by a region_id the
-  // test obtains from a REAL prepared plan (get_step_region_id). A device-free
-  // test proves: after producer A publishes a back-event under region_id R, a
-  // consumer B looking up the SAME derived R gets the SAME Event (pointer
-  // identity) with edge4_slot_hits going 0->1 -- the cross-kernel WAR "hit"
-  // that the shipped e2e never asserts -- and a disjoint region misses
-  // (nullptr, edge4_slot_skips increments). NOT compiled out, but purely
-  // additive and unused by the production launch path.
-  m.def(
-      "_test_edge4_signal_store",
-      [](uint64_t region_id) -> uintptr_t {
-        auto event = flex::createEvent();
-        spyre::SpyreStream::setEdge4Slot(region_id, event);
-        return reinterpret_cast<uintptr_t>(event.get());
-      },
-      py::arg("region_id"),
-      "TEST-ONLY: publish a fresh back-event under region_id (mirrors "
-      "SignalBack::construct's setEdge4Slot); returns the Event pointer.");
-  m.def(
-      "_test_edge4_wait_probe",
-      [](uint64_t region_id) -> uintptr_t {
-        auto event = spyre::SpyreStream::getEdge4Slot(region_id);
-        return event ? reinterpret_cast<uintptr_t>(event.get())
-                     : static_cast<uintptr_t>(0);
-      },
-      py::arg("region_id"),
-      "TEST-ONLY: look up the back-event for region_id (mirrors "
-      "WaitBack::construct's getEdge4Slot); returns the Event pointer or 0. "
-      "Increments edge4_slot_hits on a hit, edge4_slot_skips on a miss.");
-  m.def(
-      "_test_clear_edge4_slots",
-      []() { spyre::SpyreStream::clearEdge4Slots(); },
-      "TEST-ONLY: drop all published edge-4 back-events (test isolation; the "
-      "mock device address yields a deterministic region_id across tests).");
-
   // ── Test-only validator projection hook (#7a) ──
   // Projects a REAL prepared plan's steps through the SAME path validate()
   // uses -- classifyStep(*step) + step->role() -- in a caller-specified index
   // order, then runs the ordering checker. Exercises the JobPlanStep->(kind,
-  // role) projection end-to-end, where a real edit-6 wiring bug would live (the
+  // role) projection end-to-end, where a real plan-wiring bug would live (the
   // check_job_plan_step_ordering binding takes name lists and bypasses this
-  // projection). Passing a permuted `order` injects a Placement-Invariant
+  // projection). Passing a permuted `order` injects a role-ordering
   // violation over the real step objects. Returns '' if valid else the error.
   m.def(
       "_test_project_and_check_ordering",

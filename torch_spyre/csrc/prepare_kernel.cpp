@@ -615,111 +615,17 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
     }
   }
 
-  // ---- EDIT 6: two-stream overlap instrumentation (phase1-design.md §1/§3)
-  // ---- The granite decode structure is a single triple [HostCompute, H2D,
-  // ComputeOnDevice] (verified 65/65 kernels). Instrument exactly that shape so
-  // HostCompute+H2D run on S_prep and Compute runs on S_dev, and insert the two
-  // cross-stream event pairs that keep the replay BYTE-IDENTICAL to the
-  // single-stream order (every hazard edge present and TAKEN, §6):
-  //   Forward Ef (edge 3, intra-launch RAW H2D->Compute): SigFwd after H2D on
-  //     S_prep, WaitFwd before Compute on S_dev, both bound to
-  //     LaunchContext.events[0].
-  //   Back Eb (edge 4, cross-launch + cross-kernel WAR on the shared correction
-  //     region): WaitBack after HC / before H2D on S_prep (Placement
-  //     Invariant), SigBack after Compute on S_dev, both keyed by the region_id
-  //     resolved from the BOUND H2D device address. The rolling slot lives on
-  //     the StreamPool singleton (edit 5c) so it bridges consecutive launches
-  //     of DIFFERENT cached plans that share the region.
-  // Resulting submission order preserves each stream's projected order AND the
-  // SigFwd-before-WaitFwd dependency on ctx.events[0] (SigFwd writes the slot,
-  // WaitFwd reads it), AND makes WaitBack (index 1) read the PRIOR launch's
-  // rolling slot rather than this launch's SigBack (index 6):
-  //   [HostCompute, WaitBack, H2D, SigFwd, WaitFwd, Compute, SigBack]
-  // Any other plan shape is left untouched -> runs single-stream (the launch
-  // router's has_event_step gate keeps it byte-identical to the pre-overlap
-  // path). This also fails safe if a triple's region_id cannot be resolved.
-  // #1(a) INSTRUMENTATION OPT-OUT: SPYRE_DISABLE_HC_DMA_OVERLAP=1 emits the
-  // un-split 3-step [HostCompute, H2D, Compute] plan -- the pre-change,
-  // single-stream baseline -- so the R8 byte-identical numeric gate can run the
-  // SAME granite decode with overlap ON (default, env unset) vs OFF and
-  // torch.equal the FULL output token-id tensor. Only the exact value "1"
-  // disables; anything else (or unset) keeps overlap ON. This is the ONLY
-  // production behavior toggle added; the instrumented path is otherwise
-  // unchanged.
-  const char* disable_overlap_env = std::getenv("SPYRE_DISABLE_HC_DMA_OVERLAP");
-  const bool overlap_enabled = (disable_overlap_env == nullptr ||
-                                std::string(disable_overlap_env) != "1");
-  // SPYRE_HAZARD_TRACKER short-circuit: when the flex per-region hazard tracker
-  // is enabled we do NOT emit the static edge-3/4 event steps below (nor run
-  // the scalar-region_id TORCH_CHECK). flex inserts the cross-stream RAW/WAR
-  // events dynamically per-region at enqueue, which is exactly the intended way
-  // past the single-Program-region limit the scalar key assumed -- so that
-  // check must not run in hazard mode. The plain [HostCompute(Prep), H2D(Prep),
-  // Compute(Dev)] triple already carries the correct roles (assigned by step
-  // type in the ctors) and passes checkJobPlanStepOrdering unchanged
-  // (has_event=false skips its forward-guard); the launch router splits it
-  // across S_prep/S_dev by role(). Hazard mode thus makes overlap_enabled /
-  // SPYRE_DISABLE_HC_DMA_OVERLAP moot, which is correct.
-  if (!get_hazard_tracker_enabled() && overlap_enabled && steps.size() == 3 &&
-      dynamic_cast<JobPlanStepHostCompute*>(steps[0].get()) != nullptr &&
-      dynamic_cast<JobPlanStepH2D*>(steps[1].get()) != nullptr &&
-      dynamic_cast<JobPlanStepCompute*>(steps[2].get()) != nullptr) {
-    auto* h2d = static_cast<JobPlanStepH2D*>(steps[1].get());
-
-    // #3 EDGE-4 KEY PREMISE (design §3; DEFAULT_1P0_NUM_PROGRAM_REGIONS==1):
-    // the rolling-slot WAR key is a SCALAR region_id, sound ONLY while there is
-    // a single Program region -- then every cached kernel's correction H2D
-    // collapses to the same region_id and consecutive launches serialize
-    // through one slot. If the allocator is ever configured with >1 program
-    // region, distinct kernels' corrections could resolve to DIFFERENT regions
-    // and a scalar key would mis-serialize (or drop) the cross-kernel WAR ->
-    // silent wrong numerics. Fail building the instrumented plan rather than
-    // corrupt, so a future multi-program-region change trips here first.
-    const size_t num_program_regions = SpyreAllocator::getNumProgramRegions();
-    TORCH_CHECK(
-        num_program_regions <= 1,
-        "Two-stream overlap: the edge-4 scalar region_id key assumes a single "
-        "Program region (DEFAULT_1P0_NUM_PROGRAM_REGIONS==1), but the "
-        "allocator reports ",
-        num_program_regions,
-        " program regions. A scalar key would mis-serialize the cross-kernel "
-        "WAR; update the edge-4 key design (per-region keying) before "
-        "enabling >1 program region.");
-
-    // region_id is RUNTIME-resolved from the bound CompositeAddress, NOT
-    // present in the SpyreCode JSON. Resolve it through the H2D device address,
-    // never a raw runtime pointer (design "Hard invariants").
-    const auto& dev_addr = h2d->deviceAddress();
-    // chunks().size()==1 asserts only that THIS correction's device address is
-    // a SINGLE contiguous chunk, so chunks()[0] spans the whole correction
-    // range and its region_id is the well-defined key for THIS plan. It does
-    // NOT, by itself, prove a single shared correction region across kernels --
-    // that is the num_program_regions premise guarded above. A multi-chunk
-    // correction address would make chunks()[0].region_id an incomplete key ->
-    // STOP.
-    TORCH_CHECK(dev_addr.chunks().size() == 1,
-                "Two-stream overlap: H2D correction address must resolve to a "
-                "single chunk (region_id key), got ",
-                dev_addr.chunks().size(), " chunks");
-    const uint64_t region_id = dev_addr.chunks()[0].addr.region_id;
-
-    std::vector<std::unique_ptr<JobPlanStep>> instrumented;
-    instrumented.reserve(7);
-    // S_prep projection: HostCompute -> WaitBack -> H2D -> SigFwd
-    instrumented.push_back(std::move(steps[0]));  // HostCompute (role Prep)
-    instrumented.push_back(std::make_unique<JobPlanStepEventWaitBack>(
-        StreamRole::Prep, region_id));
-    instrumented.push_back(std::move(steps[1]));  // H2D (role Prep)
-    instrumented.push_back(std::make_unique<JobPlanStepEventSignalForward>(
-        StreamRole::Prep, /*slot=*/0));
-    // S_dev projection: WaitFwd -> Compute -> SigBack
-    instrumented.push_back(std::make_unique<JobPlanStepEventWaitForward>(
-        StreamRole::Dev, /*slot=*/0));
-    instrumented.push_back(std::move(steps[2]));  // Compute (role Dev)
-    instrumented.push_back(std::make_unique<JobPlanStepEventSignalBack>(
-        StreamRole::Dev, region_id));
-    steps = std::move(instrumented);
-  }
+  // Two-stream overlap (phase1-design.md §1): the granite decode correction is
+  // the single triple [HostCompute, H2D, ComputeOnDevice]. The step ctors tag
+  // HostCompute+H2D with role Prep and Compute with role Dev, so the launch
+  // router runs HostCompute+H2D on S_prep and Compute on S_dev while every op
+  // keeps pipeline_barrier=true (strict per-stream FIFO). torch-spyre emits NO
+  // cross-stream event steps: the flex per-region hazard tracker
+  // (SPYRE_HAZARD_TRACKER, default on) inserts the cross-stream RAW/WAR edges
+  // dynamically at enqueue from the per-launch footprints. With the tracker OFF
+  // the launch router keeps every step on S_dev -- byte-identical to the
+  // pre-overlap single-stream path. No plan rewrite happens here; the plain
+  // triple's ctor-assigned roles pass checkJobPlanStepOrdering directly.
 
   // TODO(jni): expected_input_shapes to be added once provided in SpyreCode
   // Create pinned_buffers vector from pinned_buffer_map_
@@ -753,21 +659,18 @@ JobPlanBuilder::ValidationResult JobPlanBuilder::validate(
 
   // P2-14: JobPlan step ordering validation.
   //
-  // The pre-overlap validator hard-coded a single-stream HostCompute -> H2D ->
-  // Compute sequence. That is wrong for the two-stream overlap topology, whose
-  // instrumented plan is
-  //   [HostCompute, WaitBack, H2D, SignalForward, WaitForward, Compute,
-  //    SignalBack]
-  // spread across S_prep (HostCompute/H2D + their events) and S_dev (Compute +
-  // its events). Ordering is now a PURE function over the plan projected into
-  // parallel (StepKind, StreamRole) vectors so it can be unit-tested (the
-  // Placement-Invariant negative test) without constructing real steps, and so
-  // both streams' subsequences are checked independently. See
-  // checkJobPlanStepOrdering (job_plan.cpp) and phase1-design.md §4/§7.
+  // The correction plan is the plain role-tagged triple [HostCompute(Prep),
+  // H2D(Prep), Compute(Dev)]; torch-spyre emits no cross-stream event steps
+  // (flex's per-region hazard tracker derives the RAW/WAR edges). Ordering is a
+  // PURE function over the plan projected into parallel (StepKind, StreamRole)
+  // vectors so it can be unit-tested (a role-misplacement negative test)
+  // without constructing real steps, and so both streams' subsequences are
+  // checked independently: S_prep must be HostCompute -> H2D and S_dev must be
+  // Compute. See checkJobPlanStepOrdering (job_plan.cpp) and phase1-design.md
+  // §4/§7.
   //
-  // A legacy single-stream plan (no HostCompute and no event step) is left
-  // valid by the checker, preserving pure-ComputeOnDevice / standalone-D2H /
-  // tensor-.to() paths.
+  // A legacy single-stream plan (no HostCompute) is left valid by the checker,
+  // preserving pure-ComputeOnDevice / standalone-D2H / tensor-.to() paths.
   {
     std::vector<StepKind> kinds;
     std::vector<StreamRole> roles;
