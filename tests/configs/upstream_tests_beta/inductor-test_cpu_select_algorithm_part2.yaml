@@ -1,0 +1,303 @@
+test_suite_config:
+
+  files:
+    - path: ${TORCH_ROOT}/test/inductor/test_cpu_select_algorithm.py
+      unlisted_test_mode: skip
+      tests:
+        # These tests primarily exercise matrix multiplication (bmm, mm) and linear operations (linear) with various data types (bfloat16, float16, float32) and tensor shapes.
+        # They are classified as mandatory_success because they test core functionalities that must pass for the backend to be considered operational.
+        # The relevance of these tests is determined by the backend's support for specific data types and operations, particularly bfloat16 and float16, which are critical for performance on AI accelerators like Spyre.
+        - names:
+            - TestSelectAlgorithm::test_cpp_weight_prune
+            - TestSelectAlgorithm::test_grouped_linear
+            - TestSelectAlgorithm::test_grouped_linear_invalid
+            - TestSelectAlgorithm::test_int4_concat_woq_mm
+            - TestSelectAlgorithm::test_int4_woq_mm_amx
+            - TestSelectAlgorithm::test_int4_woq_mm_amx_Nc_larger_than_one
+            - TestSelectAlgorithm::test_int4_woq_mm_with_small_buffer_config
+            - TestSelectAlgorithm::test_linear_amx
+            - TestSelectAlgorithm::test_linear_cache_blocking
+            - TestSelectAlgorithm::test_linear_input_transpose
+            - TestSelectAlgorithm::test_linear_k_slicing
+            - TestSelectAlgorithm::test_linear_reuse_kernels
+          mode: mandatory_success
+        # These tests exercise various linear and batch matrix multiplication operations with different data types and tensor layouts.
+        # They are classified as xfail due to unsupported dynamic shapes and fused epilogues, which are not yet supported by the Spyre backend.
+        # The relevant Spyre limitations include lack of support for dynamic tensor shapes and certain fused operations, particularly with bfloat16 and float16 data types.
+        - names:
+            - TestSelectAlgorithmDynamicShapes::test_bmm_epilogue_dynamic_reshape
+            - TestSelectAlgorithm::test_aoti_bmm_unique_identifiers
+            - TestSelectAlgorithm::test_aoti_linear
+            - TestSelectAlgorithm::test_aoti_linear_multi_view_operations
+            - TestSelectAlgorithm::test_bmm_with_fused_epilogues
+            - TestSelectAlgorithm::test_bmm_with_y_storage_offset
+            - TestSelectAlgorithm::test_int4_woq_mm_avx512
+            - TestSelectAlgorithm::test_int8_woq_mm
+            - TestSelectAlgorithm::test_int8_woq_mm_concat
+            - TestSelectAlgorithm::test_linear_local_and_global_buffer_dynamic_shapes
+            - TestSelectAlgorithm::test_linear_to_lowp_fp
+            - TestSelectAlgorithm::test_linear_unsupported_epilogue_fusion
+            - TestSelectAlgorithm::test_linear_with_in_out_buffer
+            - TestSelectAlgorithm::test_linear_with_indirect_indexing
+            - TestSelectAlgorithm::test_linear_with_input_of_flexible_layout
+            - TestSelectAlgorithm::test_linear_with_multiple_reindexers
+            - TestSelectAlgorithm::test_linear_with_permute
+            - TestSelectAlgorithm::test_local_and_global_accumulator
+            - TestSelectAlgorithm::test_qlinear_pointwise_int8_layout
+            - TestSelectAlgorithm::test_grouped_linear_epilogue
+          mode: xfail
+        # These tests exercise the `bmm` operation with flexible tensor layouts.
+        # They are classified as `xfail` due to a missing module in the Spyre backend.
+        # The relevant Spyre limitation is the unavailability of the `_oot_pre_test_cpu_select_algorithm` module.
+        - names:
+            - TestSelectAlgorithm::test_bmm_flexible_layout
+          mode: xfail  # xfail: torch._dynamo.exc.InternalTorchDynamoError
+        # These tests exercise the `bmm` operation with various tensor dimensions and data types.
+        # They are skipped because the tests do not invoke the torch-spyre layer, which is required for backend-specific operations.
+        # The relevant Spyre capability is the support for `bmm` with specific data types, which is not engaged in these tests.
+        - names:
+            - TestSelectAlgorithm::test_bmm_2d_permute
+          mode: skip  # does not engage the torch-spyre layer
+
+  global:
+    supported_dtypes:
+      - name: bfloat16
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype

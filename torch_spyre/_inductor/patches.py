@@ -137,6 +137,20 @@ def enable_spyre_context(example_inputs: list[InputType]):
 
     SchedulerNode.has_side_effects = _spyre_scheduler_node_has_side_effects  # type: ignore[method-assign]
 
+    # Prevent remove_noop_ops from eliminating aten.copy, aten.clone, and
+    # aten.alias nodes.  That pass treats them as no-ops and replaces them
+    # with their input, discarding the op before it reaches lowering.
+    # aten.copy.out normalizes to aten.copy.default before remove_noop_ops
+    # runs, so popping copy.default covers both copy overloads.
+    # aten.alias is a bookkeeping view node with no data movement; we preserve
+    # it defensively so downstream passes see the full graph.
+    from torch._inductor.fx_passes.post_grad import noop_registry
+
+    _saved_copy_noop = noop_registry.pop(torch.ops.aten.copy.default, None)
+    _saved_clone_noop = noop_registry.pop(torch.ops.aten.clone.default, None)
+    _saved_clone_out_noop = noop_registry.pop(torch.ops.aten.clone.out, None)
+    _saved_alias_noop = noop_registry.pop(torch.ops.aten.alias.default, None)
+
     with (
         spyre_data_types(),
         enable_spyre_lowerings(),
@@ -151,6 +165,14 @@ def enable_spyre_context(example_inputs: list[InputType]):
             Loops.has_large_inner_fn = old_loop
             GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]
             SchedulerNode.has_side_effects = old_scheduler_node_has_side_effects  # type: ignore[method-assign]
+            if _saved_copy_noop is not None:
+                noop_registry[torch.ops.aten.copy.default] = _saved_copy_noop
+            if _saved_clone_noop is not None:
+                noop_registry[torch.ops.aten.clone.default] = _saved_clone_noop
+            if _saved_clone_out_noop is not None:
+                noop_registry[torch.ops.aten.clone.out] = _saved_clone_out_noop
+            if _saved_alias_noop is not None:
+                noop_registry[torch.ops.aten.alias.default] = _saved_alias_noop
 
 
 OBSERVER_HOOKS_KEY = "__spyre_hooks_meta"

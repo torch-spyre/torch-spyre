@@ -1,0 +1,318 @@
+test_suite_config:
+
+  files:
+    - path: ${TORCH_ROOT}/test/inductor/test_codecache.py
+      unlisted_test_mode: skip
+      tests:
+        - names:
+            - TestCompilationEventLogging::test_log_event_all_caches
+            - TestCompilationEventLogging::test_log_event_inductor_remote
+            - TestFxGraphCacheHashing::test_non_serializable_custom_passes_causes_cache_miss
+            - TestFxGraphCache::test_cache_clear
+            - TestFxGraphCache::test_cache_guard
+            - TestFxGraphCache::test_cache_guard_overspec
+            - TestFxGraphCache::test_cache_hot_load_pgo
+            - TestFxGraphCache::test_cache_hot_load_pgo_swap_file_names
+            - TestFxGraphCache::test_cache_hot_load_repeat
+            - TestFxGraphCache::test_cache_with_nt
+            - TestFxGraphCache::test_cache_with_symint_non_arg_guard
+            - TestFxGraphCache::test_generated_kernel_count
+            - TestFxGraphCache::test_inductor_counters
+            - TestStandaloneCompile::test_custom_pass_handling
+            - TestStandaloneCompile::test_different_process
+            - TestStandaloneCompile::test_is_saveable
+            - TestStandaloneCompile::test_save_in_new_path
+            - TestUtils::test_fresh_cache
+          mode: mandatory_success
+        # These tests exercise event logging and graph cache hashing functionalities in PyTorch, including autograd and inductor operations.
+        # They are classified as xfail due to unknown issues causing assertion failures, likely related to Spyre's custom backend and partitioning functions.
+        # Relevant Spyre limitations include incomplete support for custom partitioning and backend configurations, leading to unexpected cache behavior.
+        - names:
+            - TestCompilationEventLogging::test_log_event_autograd_local
+            - TestCompilationEventLogging::test_log_event_autograd_remote
+            - TestCompilationEventLogging::test_log_event_inductor_both
+            - TestCompilationEventLogging::test_log_event_inductor_local
+            - TestFxGraphCacheHashing::test_hash_custom_backend_config
+            - TestFxGraphCacheHashing::test_hash_custom_backend_pass
+            - TestFxGraphCacheHashing::test_hash_custom_partitioner_fn
+            - TestFxGraphCacheHashing::test_hash_private_config_changes
+            - TestFxGraphCacheHashing::test_hash_var_to_hint_override
+          mode: xfail  # xfail: UNKNOWN
+        # These tests exercise the hashing and caching mechanisms in PyTorch, including custom passes and keyword arguments.
+        # They are classified as xfail due to mismatched sequence lengths and string comparisons, indicating issues with Spyre's handling of these mechanisms.
+        # Relevant Spyre limitations include incomplete support for certain tensor operations and potential discrepancies in runtime behavior.
+        - names:
+            - TestFxGraphCacheHashing::test_hash_config_changes
+            - TestFxGraphCacheHashing::test_hash_custom_passes
+            - TestFxGraphCacheHashing::test_hash_kwargs
+            - TestPyCodeCache::test_editable_cached_wrapper
+          mode: xfail  # xfail: AssertionError
+        # These tests primarily focus on caching mechanisms and error handling in PyTorch, which do not directly interact with the torch-spyre layer.
+        # They are classified as 'skip' because they do not require the Spyre backend for execution.
+        # Relevant Spyre capabilities include support for various dtypes and ops, but these tests do not leverage those features.
+        - names:
+            - TestAutotuneCache::test_autotune_cache
+            - TestAutotuneCache::test_autotune_cache_warm_start
+            - TestAutotuneCache::test_bundled_autotune_remote_cache
+            - TestCudaCompileCommand::test_cuda_compile_command
+            - TestFxGraphCacheHashing::test_bypass_on_runtime_error
+            - TestFxGraphCacheHashing::test_bypass_unsupported
+            - TestFxGraphCacheHashing::test_get_hash_for_files
+            - TestFxGraphCacheHashing::test_hash_fake_tensors
+            - TestFxGraphCacheHashing::test_non_pybind11_runtime_error_propagates
+            - TestFxGraphCacheHashing::test_parameter_constants
+            - TestFxGraphCacheHashing::test_stable_strings
+            - TestFxGraphCache::test_async_compile_cache
+            - TestFxGraphCache::test_cache_hot_load_empty
+            - TestFxGraphCache::test_cache_hot_load_generic
+            - TestFxGraphCache::test_flex_attention_caching
+            - TestFxGraphCache::test_no_arguments_tensor_device_guards
+            - TestFxGraphCache::test_tensor_device_guards_cpu_tensor
+            - TestPyCodeCache::test_linemaps_empty
+            - TestRemoteAOTAutogradCache::test_autograd_remote_cache
+            - TestRemoteAOTAutogradCache::test_autograd_remote_lazy_backward
+            - TestUtils::test_force_disable_coordinate_descent
+          mode: skip  # does not engage the torch-spyre layer
+
+  global:
+    supported_dtypes:
+      - name: bfloat16
+      - name: bool
+      - name: float16
+      - name: float32
+      - name: int64
+    supported_ops:
+      - name: _scaled_dot_product_fused_attention_overrideable
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: _scaled_mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: add
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: addmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_and
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bitwise_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: bmm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: cat
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ceil
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clamp_min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: clone
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: constant_pad_nd
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: convolution
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: copy_
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: full
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: gelu
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: layer_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: linear
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: logical_not
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: max
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: maximum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mean
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: min
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: minimum
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: mul
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: new_ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: ones
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: rms_norm
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sign
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: softplus
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: sub
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: topk
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: where
+        dtypes:
+          - name: bfloat16
+          - name: bool
+          - name: float16
+          - name: int64
+      - name: realdiv
+      - name: relufwd
+      - name: reciprocal
+      - name: sum
+      - name: layernormscale
+      - name: abs
+      - name: neg
+      - name: exp
+      - name: sigmoid
+      - name: exx2
+      - name: layernormnorm
+      - name: identity
+      - name: sqrt
+      - name: rsqrt
+      - name: topkvalue
+      - name: topkindex
+      - name: floor
+      - name: to_dtype

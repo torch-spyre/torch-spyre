@@ -256,6 +256,48 @@ class TestUnrepresentableStickCandidates(TestCase):
         d2 = sympy.Symbol("d2", integer=True, nonnegative=True)
         self.assertEqual(device_coordinates(good, dep, None)[-1].free_symbols, {d2})
 
+    def test_reversed_dim_rejected(self):
+        # prims.rev / Tensor.flip(0) on a (4, 64) tensor reads
+        # x[64*(3 - p0) + p1], i.e. p0 carries a negative coefficient.  No
+        # device coordinate can walk a dim backwards, and the term used to be
+        # dropped silently, leaving coord=3 for every p0 (issue #3558).
+        with self.assertRaisesRegex(Unsupported, "runs backwards"):
+            compute_coordinates(
+                [4, 64],
+                [64, 1],
+                {p0: 4, p1: 64},
+                192 - 64 * p0 + p1,
+            )
+
+        # Same for a reversal of the innermost (stick) dim.
+        with self.assertRaisesRegex(Unsupported, "runs backwards"):
+            compute_coordinates(
+                [4, 64],
+                [64, 1],
+                {p0: 4, p1: 64},
+                64 * p0 - p1 + 63,
+            )
+
+        # The guard keys off the direction of travel, not the sign of ``step``:
+        # an ascending term whose ``step`` is dragged negative by a constant
+        # folded into it must still be accepted.
+        cx = compute_coordinates(
+            [4, 64],
+            [64, 1],
+            {p0: 4, p1: 64},
+            64 * p0 + p1 - 5,
+        )
+        self.assertEqual(len(cx), 2)
+
+        # The ordinary ascending access is untouched.
+        cx = compute_coordinates(
+            [4, 64],
+            [64, 1],
+            {p0: 4, p1: 64},
+            64 * p0 + p1,
+        )
+        self.assertEqual(cx, [p0, p1])
+
     def test_check_supported_input_sticks_tolerates_mixed_list(self):
         # arg with one unrepresentable candidate and one valid one: the guard
         # must not raise (it previously aborted the whole compile).
