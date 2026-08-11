@@ -356,7 +356,10 @@ def spyre_softplus(
     # The runtime primitive drops the outer 1/beta factor, so beta == 1 is its
     # only exact path. Scale into it and back out; the threshold branch stays
     # exact because 1 * (beta * x) > threshold is PyTorch's beta * x > threshold.
-    return torch.ops.spyre.softplus(input * beta, 1.0, threshold) * (1.0 / beta)
+    # aten accepts beta == 0 and saturates every element to +-inf, so take the
+    # reciprocal under IEEE rules rather than letting Python raise here.
+    inv_beta = math.copysign(math.inf, beta) if beta == 0.0 else 1.0 / beta
+    return torch.ops.spyre.softplus(input * beta, 1.0, threshold) * inv_beta
 
 
 @register_spyre_decompositions([torch.ops.aten.linear.default])
