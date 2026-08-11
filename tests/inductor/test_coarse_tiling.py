@@ -76,6 +76,7 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _REDUCTION_FREE_SYMS_KEY,
     _RetiledBufferInfo,
     _apply_plan,
+    _compute_fill_loop_info_planned,
     _divide_ranges,
     _full_buffer_read_deps,
     _insert_read_copy_ops,
@@ -713,6 +714,55 @@ class TestCoarseTileInfo(unittest.TestCase):
             info.output_tiled_dims,
             [[(0, Integer(512))], [(1, Integer(1024))]],
         )
+
+
+class TestComputeFillLoopInfoPlannedTopology(unittest.TestCase):
+    """_compute_fill_loop_info_planned classifies output/reduction topologies.
+
+    Levels are ordered outermost-first. A level is "output" if
+    loop_tiled_dims[i] is non-empty, "reduction" if
+    loop_tiled_reduction_dims[i] is non-empty. Flat and nested topologies
+    are supported (see the function's docstring); any topology where an
+    output level is interleaved with the reduction levels -- straddling a
+    single reduction level from both sides, or sandwiched between two
+    separate reduction levels -- must raise Unsupported.
+    """
+
+    def _info(self, loop_tiled_dims, loop_tiled_reduction_dims):
+        n = len(loop_tiled_dims)
+        return CoarseTileInfo(
+            loop_group_id=tuple([0] * n),
+            loop_count=[Integer(4)] * n,
+            loop_tiled_dims=loop_tiled_dims,
+            loop_tiled_reduction_dims=loop_tiled_reduction_dims,
+        )
+
+    def test_flat_reduction_outer_output_inner(self):
+        # softmax(dim=0) tiled A/4, B/4: A-reduction outer, B-output inner.
+        info = self._info([[], [0]], [[0], []])
+        self.assertIsNone(_compute_fill_loop_info_planned(info))
+
+    def test_nested_output_outer_reduction_inner(self):
+        # mm outer M, inner K.
+        info = self._info([[0], []], [[], [0]])
+        result = _compute_fill_loop_info_planned(info)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.loop_tiled_dims, [[0]])
+
+    def test_output_straddling_single_reduction_level_unsupported(self):
+        # output, reduction, output: output on both sides of one reduction
+        # level.
+        info = self._info([[0], [], [1]], [[], [0], []])
+        with self.assertRaises(Unsupported):
+            _compute_fill_loop_info_planned(info)
+
+    def test_output_sandwiched_between_two_reduction_levels_unsupported(self):
+        # reduction, output, reduction: no single reduction level has
+        # output on both sides of it, but the output level is still
+        # interleaved with the reduction as a whole.
+        info = self._info([[], [0], []], [[0], [], [1]])
+        with self.assertRaises(Unsupported):
+            _compute_fill_loop_info_planned(info)
 
 
 class TestConfigFlags(unittest.TestCase):

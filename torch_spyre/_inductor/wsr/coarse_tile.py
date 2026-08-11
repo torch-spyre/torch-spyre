@@ -439,19 +439,42 @@ def _compute_fill_loop_info_planned(
         # tiling is entirely inner to the reduction; flat case.
         return None
 
-    # Interleaved topology: some output-dim level(s) are outer to a reduction
-    # level while other output-dim level(s) are inner to it. Neither the flat
-    # nor the nested accumulator scheme is correct here.
+    # Interleaved topology: either (a) some output-dim level(s) are outer to
+    # a reduction level while other output-dim level(s) are inner to that
+    # *same* level, or (b) an output-dim level sits strictly between two
+    # separate reduction levels (e.g. reduction/output/reduction nesting) —
+    # it re-runs once per outer reduction tile just as surely as case (a)
+    # would, but no single reduction level in isolation has output on both
+    # sides of it, so (a) alone can't see it. Checking only the aggregate
+    # outermost-output-vs-innermost-reduction boundary (as a prior version of
+    # this function did) misses (b) entirely: that comparison only ever
+    # relates the outermost output level to the *innermost* reduction level,
+    # never to a reduction level in the interior of the reduction set.
     innermost_reduction = max(reduction_level_indices)
-    if max(output_level_indices) > innermost_reduction:
-        inner_output = [i for i in output_level_indices if i > innermost_reduction]
-        outer_output = [i for i in output_level_indices if i < innermost_reduction]
+    outermost_reduction = min(reduction_level_indices)
+    for r in reduction_level_indices:
+        outer_output = [i for i in output_level_indices if i < r]
+        inner_output = [i for i in output_level_indices if i > r]
+        if outer_output and inner_output:
+            raise Unsupported(
+                f"coarse_tile: interleaved reduction tiling not supported — "
+                f"output-dim level(s) {outer_output} are outer to reduction "
+                f"level {r} but output-dim level(s) {inner_output} are inner "
+                f"to it (reduction levels: {reduction_level_indices}). "
+                f"Reorder spyre_hint scopes so all output dims are outer to "
+                f"all reduction dims."
+            )
+    sandwiched = [
+        i for i in output_level_indices if outermost_reduction < i < innermost_reduction
+    ]
+    if sandwiched:
         raise Unsupported(
             f"coarse_tile: interleaved reduction tiling not supported — "
-            f"output-dim levels {outer_output} are outer to reduction levels "
-            f"{reduction_level_indices} but output-dim levels {inner_output} "
-            f"are inner. Reorder spyre_hint scopes so all output dims are "
-            f"outer to all reduction dims."
+            f"output-dim level(s) {sandwiched} are sandwiched between "
+            f"reduction levels {reduction_level_indices} (between level "
+            f"{outermost_reduction} and level {innermost_reduction}). "
+            f"Reorder spyre_hint scopes so all output dims are outer to all "
+            f"reduction dims."
         )
 
     # Nested: collect only the output-dim levels that are outer to a
@@ -1721,7 +1744,10 @@ def validate_reader_tile_advance(operations: list[Operation]) -> None:
                 dep for dep in op.get_read_writes().reads if isinstance(dep, MemoryDep)
             ]
         except Exception as e:
-            logger.debug(
+            # This validator exists to catch otherwise-silent wrong numerics,
+            # so silently skipping an op whose deps couldn't even be computed
+            # would itself be a blind spot -- log at warning, not debug.
+            logger.warning(
                 "validate_reader_tile_advance: get_read_writes() raised for %s: %s",
                 reader_name,
                 e,
