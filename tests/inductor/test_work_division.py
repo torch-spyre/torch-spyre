@@ -27,6 +27,7 @@ from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.work_division import (
     TensorDep,
+    _default_split,
     multi_dim_iteration_space_split,
 )
 from torch_spyre._inductor.work_division_constraints import (
@@ -236,6 +237,22 @@ class TestConvSpatialBlockedVars(unittest.TestCase):
         rw.writes = [MagicMock(ranges=(_isym("mb"), _isym("out"), i, j))]
         with patch(self._PATCH_TARGET, return_value=rw):
             self.assertEqual(collect_work_division_constraints(ctx).blocked, {j})
+
+    def test_blocked_spatial_dims_are_not_distributed(self):
+        mb, out, i, j = (_isym(name) for name in ("mb", "out", "i", "j"))
+        output_td = _tensor_dep("conv_out", (2, 32, 32, 32), (mb, out, i, j))
+        splits, output_dims, _ = _default_split(
+            {mb: 2, out: 32, i: 32, j: 32},
+            output_td,
+            {},
+            32,
+            {},
+            {i, j},
+        )
+        self.assertNotIn(i, output_dims)
+        self.assertNotIn(j, output_dims)
+        self.assertEqual(splits[i], 1)
+        self.assertEqual(splits[j], 1)
 
 
 class TestQfp8wtConstraints(unittest.TestCase):

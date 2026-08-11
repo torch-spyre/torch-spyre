@@ -997,8 +997,9 @@ def _default_split(
     if any(v not in coord_vars for v in committed_splits):
         reduction_dims = []
 
-    # Drop reduction dims the backend compiler can't split across cores before
-    # the greedy distributor commits them.
+    # Drop blocked dims before the greedy distributor commits them. Coordinate
+    # masking only blocks reduction dims; strided conv also blocks output dims.
+    output_dims = [v for v in output_dims if v not in blocked]
     reduction_dims = [v for v in reduction_dims if v not in blocked]
 
     # Pass max_cores, not remaining_cores: multi_dim_iteration_space_split
