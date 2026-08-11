@@ -4898,14 +4898,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     1,
                 ),
-                "1x64_ksize3_depthwise": (
-                    cached_randn((1, 64, 32, 32)),
-                    cached_randn((64, 1, 3, 3)),
-                    None,
-                    (1, 1),
-                    (1, 1),
-                    64,
-                ),
                 "mistral_model": (
                     cached_randn((1, 3, 392, 532)),
                     cached_randn((1024, 3, 14, 14)),
@@ -4930,13 +4922,79 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     1,
                 ),
-                "8x64_ksize3_pad1": (
+            },
+        },
+        ("test_dwise_conv2d", "test_dwise_conv2d_cpu"): {
+            "param_sets": {
+                "1x64_ksize3_depthwise": (
+                    cached_randn((1, 64, 32, 32)),
+                    cached_randn((64, 1, 3, 3)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    64,
+                    [[32, 32, 1, 1, 64], [3, 3, 1, 1, 64]],
+                    [[1, 32, -1, 65536, 1024], [1, 3, -1, 9, 9]],
+                ),
+                "8x64_ksize3_depthwise": (
                     cached_randn((8, 64, 128, 128)),
                     cached_randn((64, 1, 3, 3)),
                     None,
-                    (1, 1),
+                    (0, 0),
                     (1, 1),
                     64,
+                    [[128, 128, 1, 8, 64], [3, 3, 1, 1, 64]],
+                    [[1, 128, -1, 1048576, 16384], [1, 3, -1, 9, 9]],
+                ),
+                "1x3x64_ksize3_depthwise": (
+                    cached_randn((1, 3, 64, 64)),
+                    cached_randn((3, 1, 3, 3)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    3,
+                    [[64, 64, 1, 1, 64], [3, 3, 1, 1, 64]],
+                    [[1, 64, -1, 12288, 4096], [1, 3, -1, 9, 9]],
+                ),
+                "2x3x32_ksize1_depthwise": (
+                    cached_randn((2, 3, 32, 32)),
+                    cached_randn((3, 1, 1, 1)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    3,
+                    [[32, 32, 1, 2, 64], [1, 1, 1, 1, 64]],
+                    [[1, 32, -1, 3072, 1024], [1, 1, -1, 1, 1]],
+                ),
+                "1x16x64_ksize3_depthwise": (
+                    cached_randn((1, 16, 64, 64)),
+                    cached_randn((16, 1, 3, 3)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    16,
+                    [[64, 64, 1, 1, 64], [3, 3, 1, 1, 64]],
+                    [[1, 64, -1, 65536, 4096], [1, 3, -1, 9, 9]],
+                ),
+                "2x32_ksize1_stride2_depthwise": (
+                    cached_randn((2, 32, 64, 64)),
+                    cached_randn((32, 1, 1, 1)),
+                    None,
+                    (0, 0),
+                    (2, 2),
+                    32,
+                    [[64, 64, 1, 2, 64], [1, 1, 1, 1, 64]],
+                    [[1, 64, -1, 131072, 4096], [1, 1, -1, 1, 1]],
+                ),
+                "1x3x128_ksize5_depthwise": (
+                    cached_randn((1, 3, 128, 128)),
+                    cached_randn((3, 1, 5, 5)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    3,
+                    [[128, 128, 1, 1, 64], [5, 5, 1, 1, 64]],
+                    [[1, 128, -1, 49152, 16384], [1, 5, -1, 25, 25]],
                 ),
             },
         },
@@ -7134,6 +7192,63 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             atol=0.5,
             rtol=0.1,
         )
+
+    def test_dwise_conv2d_cpu(
+        self, x, weight, bias, padding, stride, groups, dev_layout, dev_stride
+    ):
+        from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+        torch._dynamo.reset()
+        torch._inductor.codecache.FxGraphCache.clear()
+
+        device_dtype_fp16 = get_device_dtype(torch.float16)
+        x_layout = SpyreTensorLayout(dev_layout[0], dev_stride[0], device_dtype_fp16)
+        weight_layout = SpyreTensorLayout(
+            dev_layout[1], dev_stride[1], device_dtype_fp16
+        )
+
+        x_dev = x.to(device_layout=x_layout)
+        weight_dev = weight.to(device_layout=weight_layout)
+
+        def fn(x, weight, bias, padding, stride, groups):
+            return torch.conv2d(
+                x, weight, bias, stride=stride, padding=padding, groups=groups
+            )
+
+        cpu_result = fn(x, weight, bias, padding, stride, groups)
+
+        spyre_compiled = torch.compile(fn)(
+            x_dev, weight_dev, bias, padding, stride, groups
+        ).cpu()
+        spyre_eager = fn(x_dev, weight_dev, bias, padding, stride, groups).cpu()
+        torch.testing.assert_close(
+            spyre_compiled,
+            cpu_result,
+            equal_nan=True,
+            atol=0.5,
+            rtol=0.1,
+            msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
+        )
+        torch.testing.assert_close(
+            spyre_eager,
+            cpu_result,
+            equal_nan=True,
+            atol=0.5,
+            rtol=0.1,
+            msg=lambda msg: f"eager mode spyre <-> cpu mismatch\n\n{msg}\n",
+        )
+
+        # self.compare_with_cpu(
+        #    fn,
+        #    x,
+        #    weight,
+        #    bias,
+        #    padding,
+        #    stride,
+        #    groups,
+        #    atol=0.5,
+        #    rtol=0.1,
+        # )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_index_copy_cpu(self):

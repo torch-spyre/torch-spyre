@@ -97,6 +97,15 @@ core_id_k_fast_emission: bool = (
     os.environ.get("SPYRE_CORE_ID_K_FAST_EMISSION", "1") == "1"
 )
 
+# Disable splitting on spatial image dimensions (i, j) for conv2d operations when stride > 1.
+# When enabled (default True), splits are disabled only for strided convolutions to prevent
+# DSM/strided memory access complexity that degrades correctness. For stride=1 convolutions,
+# splitting may still occur unless the backend heuristics choose not to split.
+# Set SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT=0 to allow splitting on i/j dims regardless of stride.
+disable_conv2d_spatial_split: bool = (
+    os.environ.get("SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT", "1") == "1"
+)
+
 # When True (default), HBM tensor addresses are emitted as runtime symbols
 # with !sdscbundle.input_arg<index> parameters and input_arg_extract ops
 # in the bundle.mlir.
