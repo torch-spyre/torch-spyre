@@ -5782,20 +5782,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         scratchpad before hbm_pool_planning ever sees them, leaving every
         bundle's pool_size at 0 and proving nothing about the plumbing this
         test exists to check.
-
-        The generated wrapper's `.run(_pool, ...)` call site is only made
-        valid by Task 4's per-bundle pool codegen (not yet landed): today
-        `wrapper.py.allocate_hbm_pool()`/`generate()` still key off the old
-        graph-global `V.graph.hbm_pool_size` scalar that Task 2 replaced
-        with the `V.graph.hbm_pool_sizes` dict, so `_pool` is never emitted
-        and calling the compiled function raises `NameError: name '_pool'
-        is not defined` at runtime -- reproducible on this branch even
-        without this test's changes. That failure happens inside the
-        generated `call()` function, strictly after `codegen_node` (and
-        therefore every `SpyreKernel()` construction this test observes)
-        has already run, so it does not affect what this test checks.
-        Catch it explicitly rather than letting it fail the test or
-        loosening the assertion below.
         """
         from unittest.mock import patch
 
@@ -5822,11 +5808,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
         ):
-            try:
-                torch.compile(fn)(x, y)
-            except NameError as e:
-                if "_pool" not in str(e):
-                    raise
+            torch.compile(fn)(x, y)
 
         self.assertTrue(seen_pool_sizes)
         self.assertTrue(
