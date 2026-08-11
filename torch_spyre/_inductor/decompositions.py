@@ -742,6 +742,48 @@ def _is_direct_conv_supported(
       stay on the im2col+matmul path. A ragged *height* is harmless (height is
       untiled) and stride==1 is never ragged, so this only excludes strided
       convs whose width does not divide evenly (all HW-verified).
+
+    Why these gates run here (decomposition/routing time) rather than in layout
+    propagation, where the device stick dim is actually assigned:
+
+    - Declining here is what preserves the fallback. conv2d_via_bmm_decomp either
+      defers (returns NotImplemented, leaving aten.convolution for
+      lower_convolution to direct-lower) or expands into im2col+matmul -- and once
+      it expands, the conv node is gone, replaced by a reshape+bmm subgraph.
+      Inductor lowering is a single forward pass with no backtracking, so there is
+      no way to un-decompose and re-route afterwards. By the time layout
+      propagation runs, the graph is already committed to the direct path; a
+      stick-alignment failure discovered there is a hard compile error, not a
+      graceful fallback. So the decision has to be made before the branch, i.e.
+      here.
+    - Making it this early is correct because the stick-alignment gate is
+      layout-invariant. C_in is logical dim 1 by the aten.convolution NCHW
+      contract (guarded by input.dim() == 4), and ``C_in % stick == 0`` is a
+      property of the channel *count*, which no layout choice changes -- layout
+      propagation picks stick *placement*, not size. We are not assuming which
+      host dim becomes the stick: the direct path itself forces channel-last (C on
+      the stick) to feed the PE-array contraction, so this validates a
+      precondition of the layout the path *will request*, not a guess about an
+      assignment the solver is free to make differently. The stick width is
+      get_elem_in_stick(torch.float16) == 64, derived from the dtype the fp16 gate
+      above already pins -- not a hardcoded dim assumption.
+
+    Assumption this routing decision rests on (documented, not enforced here):
+    the gate reads C_in from logical dim 1 (guaranteed by the aten.convolution
+    NCHW contract) and assumes the direct path will place C_in on the device
+    stick. That stick placement is NOT decided here -- it is requested by the
+    direct path and enforced downstream in propagate_layouts (_conv_layouts /
+    find_stick_compatible_input_layout), which restickify the activation onto
+    C_in or raise Unsupported if they cannot. So the ``C_in % stick == 0`` check
+    below is a precondition of the channel-last layout the path *will request*,
+    validated against the channel *count* (which no layout choice changes). The
+    assumption is only that C_in-on-stick keeps being the layout a direct-conv
+    node lands in; if that ever stops holding (e.g. a solver change assigns a
+    different stick dim to a direct-conv node), this gate would be checking the
+    wrong dimension and could route wrongly. It is documented here as an
+    assumption rather than re-checked after layout assignment because by then
+    the im2col+matmul fallback branch is gone (see above) -- a mismatch surfaces
+    downstream as a hard Unsupported, not silent wrong numerics.
     """
     kH, kW = weight.shape[-2], weight.shape[-1]
     C_in = input.shape[1]
@@ -762,6 +804,9 @@ def _is_direct_conv_supported(
         # to be stick-aligned, so fall back to the decomposition rather than
         # branching on a symbolic divisibility (which would add a shape guard).
         and isinstance(C_in, int)
+        # Assumes the direct path lands C_in (logical dim 1) on the stick; that
+        # is requested by the path and enforced in propagate_layouts, not here.
+        # See the "Assumption this routing decision rests on" note above.
         and C_in % eps == 0
     )
     if not supported:
