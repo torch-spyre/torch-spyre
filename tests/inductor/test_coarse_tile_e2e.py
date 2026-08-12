@@ -5961,7 +5961,9 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     def test_pool_size_kwarg_in_generated_sdsc_call(self):
         """define_kernel() must append pool_size=<N> to the generated
         async_compile.sdsc(...) call text for a kernel whose pool_size > 0,
-        and omit the kwarg entirely for a kernel with no pool usage."""
+        and pool_size=0 must never be emitted explicitly. See
+        test_pool_size_kwarg_omitted_when_no_pool below for the omission
+        case on a kernel with no pool usage at all."""
 
         def fn(x, y):
             a = x + y
@@ -5983,6 +5985,36 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         # Every async_compile.sdsc( call either has no pool_size kwarg, or a
         # positive one -- pool_size=0 must never be emitted explicitly.
         self.assertNotIn("pool_size=0", src)
+
+    @config.patch({"lx_planning": True})
+    def test_pool_size_kwarg_omitted_when_no_pool(self):
+        """A kernel with no pool usage gets no pool_size kwarg at all.
+
+        With lx_planning enabled, the `a = x + y` intermediate is claimed by
+        LX scratchpad planning before hbm_pool_planning ever sees it (see
+        OP_OUTPUT_GOOD_FOR_LX_REUSE in scratchpad/utils.py), so this bundle
+        has no pool-eligible buffer and define_kernel() must omit the
+        pool_size kwarg entirely rather than emit pool_size=0.
+        """
+
+        def fn(x, y):
+            a = x + y
+            b = a * 2
+            return b - x
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+        y = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), x, y)
+        src = source_codes[0]
+
+        self.assertIn("async_compile.sdsc(", src)
+        self.assertNotIn("pool_size", src)
 
 
 class TestNamedDimsHint(InductorTestCase):
