@@ -2790,11 +2790,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             "expect_fail": ["8_groups"],
         },
+        # beta is a Python constant folded into the traced graph. beta=2 stays
+        # on the log branch; beta=50 pushes most elements past the threshold;
+        # beta=0 is legal in aten and saturates every element to +inf.
         ("test_softplus", "test_softplus_cpu"): {
             "param_sets": {
-                "2d": (cached_randn((256, 128), dtype=torch.float16),),
-                "3d": (cached_randn((64, 256, 128), dtype=torch.float16),),
-                "4d": (cached_randn((4, 17, 256, 128), dtype=torch.float16),),
+                "2d": (cached_randn((256, 128), dtype=torch.float16), 1.0),
+                "3d": (cached_randn((64, 256, 128), dtype=torch.float16), 1.0),
+                "4d": (cached_randn((4, 17, 256, 128), dtype=torch.float16), 1.0),
+                "5d": (cached_randn((1, 1, 7, 13, 19), dtype=torch.float16), 1.0),
+                "2d_beta_0p5": (cached_randn((256, 128), dtype=torch.float16), 0.5),
+                "2d_beta_50": (cached_randn((256, 128), dtype=torch.float16), 50.0),
+                "2d_beta_0": (cached_randn((256, 128), dtype=torch.float16), 0.0),
+                "5d_beta_0p5": (
+                    cached_randn((1, 1, 7, 13, 19), dtype=torch.float16),
+                    0.5,
+                ),
+                "5d_beta_2": (
+                    cached_randn((1, 1, 7, 13, 19), dtype=torch.float16),
+                    2.0,
+                ),
+                "5d_beta_50": (
+                    cached_randn((1, 1, 7, 13, 19), dtype=torch.float16),
+                    50.0,
+                ),
             },
         },
         # --- Migrated from test_ops.py ---
@@ -6650,8 +6669,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x)
 
-    def test_softplus_cpu(self, x):
-        beta = 1.0
+    def test_softplus_cpu(self, x, beta):
         threshold = 20.0
 
         def fn(input):

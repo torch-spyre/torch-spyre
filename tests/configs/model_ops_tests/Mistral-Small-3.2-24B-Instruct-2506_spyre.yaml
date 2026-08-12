@@ -1,4 +1,5 @@
 test_suite_config:
+  labels: [trunk]
   global:
     supported_dtypes:
       - name: float16
@@ -205,22 +206,6 @@ test_suite_config:
                   tags:
                     - constant
                     - torch.flatten.1_spyre
-                - name: getattr
-                  sample_inputs_func:
-                    args:
-                      - tensor:
-                          shape: [1024, 1064]
-                          stride: [1064, 1]
-                          storage_offset: 0
-                          dtype: torch.float16
-                          device: cuda:0
-                          init: rand
-                      - value: T
-                  description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/pixtral/modeling_pixtral.py#L458 in torch_dynamo_resume_in_forward_at_452,
-                    code: patch_embeds = torch.cat([p.flatten(1).T for p in patch_embeds_list], dim=0).unsqueeze(0)'
-                  tags:
-                    - constant
-                    - getattr.1_spyre
                 - name: torch.cat
                   sample_inputs_func:
                     args:

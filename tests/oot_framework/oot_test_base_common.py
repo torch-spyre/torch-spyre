@@ -418,14 +418,17 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
 
         # per-test label filter — skip if this entry's labels don't include the
         # active TEST_TYPE.  Empty labels means "no restriction; run whenever the
-        # suite runs" so the check is a no-op for unlabelled entries.
+        # suite runs" so the check is a no-op for unlabelled entries. There is no
+        # catch-all TEST_TYPE value that bypasses an entry's explicit labels
+        # (matching filter_configs.py's file-level matching) -- only an unset
+        # TEST_TYPE (e.g. running pytest directly, outside make/CI) skips
+        # filtering entirely.
         # suite_<group> values are structural (handled by filter_configs.py at the
         # config-file level) and are ignored here.
         if entry is not None and entry.labels:
-            test_type = os.environ.get(ENV_TEST_TYPE, "full")
+            test_type = os.environ.get(ENV_TEST_TYPE, "")
             if (
                 test_type
-                and test_type != "full"
                 and not test_type.startswith("suite_")
                 and test_type not in entry.labels
             ):

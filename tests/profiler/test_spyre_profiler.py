@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import json
 import pytest
 import unittest
@@ -30,6 +31,18 @@ if hasattr(torch, "spyre"):
     Test_spyre = torch.spyre.is_available()
 else:
     Test_spyre = False
+
+
+class _ProfilerMLP(torch.nn.Module):
+    """Small stick-aligned model for compiled device-event provenance."""
+
+    def __init__(self):
+        super().__init__()
+        self.fc1 = torch.nn.Linear(128, 256)
+        self.fc2 = torch.nn.Linear(256, 128)
+
+    def forward(self, x):
+        return self.fc2(torch.relu(self.fc1(x)))
 
 
 class TestSpyreProfiler(TestCase):
@@ -202,6 +215,136 @@ def test_synchronize_callable():
 
     assert result.numel() == 64 * 64
     assert torch.isfinite(result).all()
+
+
+@pytest.mark.requires_spyre_profiler
+def test_compiled_kernel_event_keys_match_captured_debug_handles(monkeypatch):
+    """Real events carry compiler keys and direct handles from the same process."""
+    from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
+    from torch_spyre._inductor.profiler_event import (
+        AIUPTI_ACTIVITY_NAME_MAX_BYTES,
+        extract_kernel_provenance_key,
+    )
+    from torch_spyre.execution.async_compile import SpyreAsyncCompile
+
+    captures = []
+    original_sdsc = SpyreAsyncCompile.sdsc
+
+    def capture_sdsc(self, kernel_name, specs):
+        runner = original_sdsc(self, kernel_name, specs)
+        handles = []
+
+        def collect(spec_list):
+            for spec in spec_list:
+                if isinstance(spec, OpSpec) and spec.debug_handle is not None:
+                    handles.append(spec.debug_handle)
+                elif isinstance(spec, LoopSpec):
+                    collect(spec.body)
+
+        collect(specs)
+        if runner.kernel_provenance is not None:
+            captures.append(
+                (runner.kernel_provenance, runner.profiler_event_name, tuple(handles))
+            )
+        return runner
+
+    monkeypatch.setattr(SpyreAsyncCompile, "sdsc", capture_sdsc)
+    monkeypatch.setattr(torch._inductor.config, "force_disable_caches", True)
+    torch._dynamo.reset()
+
+    model = _ProfilerMLP().half().to("spyre").eval()
+    x = torch.randn(2, 128, dtype=torch.float16, device="spyre")
+    compiled = torch.compile(model, fullgraph=True)
+
+    with torch.no_grad():
+        compiled(x)
+        torch.spyre.synchronize()
+
+        assert captures, "compilation produced no provenance-aware Spyre runners"
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+        ) as prof:
+            result = compiled(x)
+            torch.spyre.synchronize()
+
+    assert result.shape == (2, 128)
+
+    with TemporaryFileName(mode="w+") as fname:
+        prof.export_chrome_trace(fname)
+        with open(fname) as f:
+            trace = json.load(f)
+
+    events = trace["traceEvents"]
+    for descriptor, event_name, handles in captures:
+        assert event_name is not None
+        expected_ids = tuple(dict.fromkeys(str(handle.id) for handle in handles))
+        assert descriptor.debug_handle_ids == expected_ids
+
+        matching_events = [
+            event
+            for event in events
+            if extract_kernel_provenance_key(event.get("name", "")) == descriptor.key
+        ]
+        assert matching_events, (
+            f"no device event contained kernel provenance key {descriptor.key}"
+        )
+        assert all(
+            event.get("cat") == "kernel" and event.get("ph") == "X"
+            for event in matching_events
+        )
+        assert all(
+            event["name"].startswith(f"{event_name}#")
+            and event["name"].rsplit("#", 1)[1].isdecimal()
+            for event in matching_events
+        )
+        assert all(
+            len(event["name"].encode("ascii")) <= AIUPTI_ACTIVITY_NAME_MAX_BYTES
+            for event in matching_events
+        )
+        for event in matching_events:
+            args = event.get("args", {})
+            assert args.get("provenance_key") == descriptor.key
+            debug_handles = args.get("debug_handles")
+            assert isinstance(debug_handles, list), (
+                "args.debug_handles must be a JSON array, not a quoted string"
+            )
+            assert all(isinstance(handle_id, str) for handle_id in debug_handles)
+            assert debug_handles == list(descriptor.debug_handle_ids)
+
+    def lineage(handle):
+        yield handle
+        for constituent in handle.fused_from:
+            yield from lineage(constituent)
+
+    source_line = inspect.getsourcelines(_ProfilerMLP.forward)[1] + 1
+    source_handles = [
+        candidate
+        for _, _, handles in captures
+        for handle in handles
+        for candidate in lineage(handle)
+        if candidate.source is not None
+    ]
+    captured_lineage = [
+        (
+            handle.source.file,
+            handle.source.start_line,
+            handle.aten_op,
+        )
+        for handle in source_handles
+    ]
+    assert any(
+        handle.source.file.endswith("test_spyre_profiler.py")
+        and handle.source.start_line == source_line
+        and handle.aten_op == "aten.linear.default"
+        for handle in source_handles
+    ), (
+        "the captured provenance did not contain the model's linear source line; "
+        f"captured lineage: {captured_lineage}"
+    )
+    assert any(
+        len(handle.fused_from) >= 2 for _, _, handles in captures for handle in handles
+    ), "the compiled kernel did not retain its fused provenance constituents"
 
 
 @pytest.mark.requires_spyre_profiler

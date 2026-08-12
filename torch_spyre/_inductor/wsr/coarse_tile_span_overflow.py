@@ -218,7 +218,7 @@ def span_overflow_groups(
     already carry user dim hints are left for the user-hint grouping path.
     ``is_reduction`` is not carried in the group-level ``levels`` list; it
     lives on each op's own ``DimHint`` and is consulted directly by
-    ``plan_coarse_tile_groups`` (via ``_op_hint_dim_positions``).
+    ``plan_coarse_tile_groups``.
 
     Returns a ``(groups, dim_hint_assignments)`` pair.  ``dim_hint_assignments``
     is a list of ``(op, dim_hints)`` pairs this function decided on but did
