@@ -6169,7 +6169,8 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         self.assertIn("%arg_0_base_addr: !sdscbundle.input_arg<index>", mlir)
         self.assertNotIn("arith.constant 17179869184", mlir)
         # Second sym → pool: arith.addi %pool, <offset>
-        self.assertIn("%pool_base_addr: !sdscbundle.input_arg<index>", mlir)
+        self.assertNotIn("%pool_base_addr", mlir)
+        self.assertIn("sdscbundle.device_mem_allocate", mlir)
         self.assertIn("%pool_addr_0 = arith.addi %pool", mlir)
 
     def test_multi_sdsc_two_tensor_args_snapshot(self):
