@@ -41,8 +41,21 @@ runs:
             labeled=true
           fi
         elif [ "$EVENT_NAME" = "merge_group" ]; then
-          # gh-readonly-queue/main/pr-3695-<sha> -> 3695
-          pr="$(printf '%s' "$MERGE_GROUP_REF" | sed -n 's|.*/pr-\([0-9]\+\)-[0-9a-f]\+$|\1|p')"
+          # gh-readonly-queue/main/pr-3695-<sha> -> 3695. Bash parameter expansion
+          # rather than sed: `\+` is a GNU extension that yields an EMPTY match on BSD
+          # sed instead of erroring, so a regex that works on the runner can silently
+          # extract nothing elsewhere -- and "no PR number" reads as "unlabeled", which
+          # would quietly run the full suite on every queued entry.
+          pr=""
+          case "$MERGE_GROUP_REF" in
+            */pr-*-*)
+              pr="${MERGE_GROUP_REF##*/pr-}"   # 3695-<sha>
+              pr="${pr%%-*}"                    # 3695
+              case "$pr" in
+                ''|*[!0-9]*) pr="" ;;           # not all digits -> treat as unparseable
+              esac
+              ;;
+          esac
           if [ -n "$pr" ]; then
             # Fail OPEN: on any API error the label is treated as absent, so the
             # tests run. A spurious run is recoverable; silently skipping the only
