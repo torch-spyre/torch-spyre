@@ -215,6 +215,7 @@ class TestSpyreKernelLogging:
                     kernel.args = MagicMock()
                     kernel.args.python_argdefs.return_value = (None, [])
                     kernel.spyre_kernel_args = []
+                    kernel.pool_size = 0
 
                     with patch("torch_spyre._inductor.spyre_kernel.simplify_op_spec"):
                         kernel.codegen_kernel()
@@ -240,6 +241,7 @@ class TestSpyreKernelLogging:
                 kernel.args = MagicMock()
                 kernel.args.python_argdefs.return_value = (None, [])
                 kernel.spyre_kernel_args = []
+                kernel.pool_size = 0
 
                 with patch("torch_spyre._inductor.spyre_kernel.simplify_op_spec"):
                     kernel.codegen_kernel()

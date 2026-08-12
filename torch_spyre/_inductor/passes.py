@@ -285,8 +285,10 @@ class CustomPostFusionPasses(_SpyreNodePassPipeline):
         # demote_incoherent_lx_buffers runs first: it re-checks LX core->slice
         # coherence now that loop orders are final, and anything it demotes must
         # still be visible to hbm_pool_planning as an unclaimed intermediate.
+        # hbm_pool_planning runs after spyre_fuse_nodes so it can compute
+        # bundle-scoped live ranges.
         super().__init__(
-            [demote_incoherent_lx_buffers, hbm_pool_planning, spyre_fuse_nodes]
+            [demote_incoherent_lx_buffers, spyre_fuse_nodes, hbm_pool_planning]
         )
 
 

@@ -7153,5 +7153,33 @@ class TestTileHelpers(unittest.TestCase):
         )
 
 
+class TestCustomPostFusionPassesOrder(unittest.TestCase):
+    def test_hbm_pool_planning_runs_after_fusion(self):
+        """hbm_pool_planning must see post-fusion bundles, not pre-fusion nodes."""
+        from torch_spyre._inductor.passes import CustomPostFusionPasses
+        from torch_spyre._inductor.fusion import spyre_fuse_nodes
+        from torch_spyre._inductor.hbm_pool_planning import hbm_pool_planning
+
+        pipeline = CustomPostFusionPasses()
+        names = [p.__name__ for p in pipeline.passes]
+        self.assertLess(
+            names.index(spyre_fuse_nodes.__name__),
+            names.index(hbm_pool_planning.__name__),
+            "spyre_fuse_nodes must run before hbm_pool_planning",
+        )
+
+
+class TestSpyreKernelPoolSize(unittest.TestCase):
+    def test_spyre_kernel_accepts_pool_size(self):
+        """SpyreKernel must accept a per-bundle pool_size, defaulting to 0."""
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        kernel = SpyreKernel(pool_size=2048)
+        self.assertEqual(kernel.pool_size, 2048)
+
+        default_kernel = SpyreKernel()
+        self.assertEqual(default_kernel.pool_size, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

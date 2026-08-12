@@ -5770,6 +5770,103 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 fn, x, y, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
             )
 
+    # ------------------------------------------------------------------
+    # Per-bundle hbm_pool_sizes threading into SpyreKernel
+    # ------------------------------------------------------------------
+
+    @config.patch({"lx_planning": False})
+    def test_bundle_pool_size_threaded_from_hbm_pool_sizes(self):
+        """codegen_node must look up this bundle's own pool_size from
+        V.graph.hbm_pool_sizes, not a stale graph-global scalar.
+
+        lx_planning is disabled here so the `a = x + y` intermediate isn't
+        claimed by LX scratchpad planning first -- with LX planning on,
+        `add`/`mul`/`sub` outputs are all LX-eligible by default (see
+        OP_OUTPUT_GOOD_FOR_LX_REUSE in scratchpad/utils.py) and may win the
+        scratchpad before hbm_pool_planning ever sees them, leaving every
+        bundle's pool_size at 0 and proving nothing about the plumbing this
+        test exists to check.
+        """
+        from unittest.mock import patch
+
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        seen_pool_sizes = []
+        orig_init = SpyreKernel.__init__
+
+        def _recording_init(self, pool_size=0, **kwargs):
+            seen_pool_sizes.append(pool_size)
+            orig_init(self, pool_size=pool_size, **kwargs)
+
+        def fn(x, y):
+            a = x + y
+            b = a * 2
+            return b - x
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+        y = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        with (
+            patch.object(SpyreKernel, "__init__", _recording_init),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            torch.compile(fn)(x, y)
+
+        self.assertTrue(seen_pool_sizes)
+        self.assertTrue(
+            any(seen_pool_sizes),
+            f"expected at least one bundle with a nonzero pool_size, got "
+            f"{seen_pool_sizes}",
+        )
+
+    @config.patch({"lx_planning": False})
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_pool_alloc_scoped_per_bundle_across_fallback_boundary(self):
+        """A CPU-fallback op (torch.sin) splits the graph into multiple
+        bundles. Each bundle's pool tensor (if any) is allocated right
+        before its own .run() call and freed right after -- there is no
+        single graph-global "_pool" shared across bundles, and the
+        intermediate crossing the fallback boundary is not pool-allocated."""
+
+        def fn(t):
+            a = torch.exp(t) * 2  # compiled bundle 1; `a` crosses the
+            b = torch.sin(a)  # fallback op -- forces a bundle boundary
+            c = torch.exp(b) * 2  # compiled bundle 2
+            return c
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+            pytest.warns(UserWarning),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), x)
+        src = source_codes[0]
+
+        # No single graph-global "_pool = " assignment (the old scheme).
+        self.assertNotIn("_pool = spyre_empty_with_layout", src)
+        # Any pool tensor that does appear is kernel-scoped
+        # ("_pool_<kernel_name> = ..."), never the bare literal "_pool".
+        pool_alloc_lines = [
+            line
+            for line in src.splitlines()
+            if "spyre_empty_with_layout" in line and "uint8" in line
+        ]
+        for line in pool_alloc_lines:
+            self.assertRegex(line.strip(), r"^_pool_\S+\s*=")
+        # Each pool alloc line's variable is del'd, and each .run( call that
+        # uses a pool passes that same per-kernel variable, not a shared name.
+        pool_var_names = [
+            line.strip().split("=", 1)[0].strip() for line in pool_alloc_lines
+        ]
+        self.assertEqual(len(pool_var_names), len(set(pool_var_names)))
+        for var_name in pool_var_names:
+            self.assertIn(f"del {var_name}", src)
+
 
 class TestNamedDimsHint(InductorTestCase):
     """Tests for propagate_named_dims handling of ops with a named_dims hint.
