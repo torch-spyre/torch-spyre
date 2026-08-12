@@ -48,6 +48,7 @@ from oot_framework.oot_upstream_patcher import (
     _OOTCpuMovePatcher,
     _OOTNoGradPatcher,
     _OOTPlatformMarkerPatcher,
+    _OOTTestTypeMarkerPatcher,
 )
 from oot_framework.oot_test_config_models import (
     OOTTestConfig,
@@ -143,6 +144,10 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
     GLOBAL_DTYPE_PRECISION: Dict[torch.dtype, "Precision"] = {}
     GLOBAL_DTYPE_FORCE_XFAIL: Set[torch.dtype] = set()
 
+    # test_suite_config.labels from the YAML, e.g. ["unit", "regression", "trunk"].
+    # Drives the testtype__<label> pytest markers (see _OOTTestTypeMarkerPatcher).
+    TEST_SUITE_LABELS: List[str] = []
+
     # File-level module filtering (populated during config load)
     # Use None as sentinel to indicate not yet initialized, avoiding shared mutable default
     _FILE_LEVEL_INCLUDED_MODULES: Optional[Set[str]] = None
@@ -221,6 +226,18 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
         )
 
         file_entry: FileEntry = resolve_current_file(config, path)
+
+        # Prefer file_entry.labels: for a multi-config directory run,
+        # merge_yaml_configs() threads each source config's own
+        # test_suite_config.labels onto its file entries (the merged
+        # document has no single top-level labels field that could
+        # represent per-file provenance once files from different configs
+        # are combined). Empty there means a single-config run (the source
+        # YAML never sets per-file labels), so fall back to the top-level
+        # field, which correctly applies to every file in that one config.
+        cls.TEST_SUITE_LABELS = list(
+            file_entry.labels or config.test_suite_config.labels
+        )
 
         # Build the exact-name lookup map and the regex-pattern list.
         # Regex patterns (names containing regex metacharacters) go into
@@ -697,6 +714,10 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
 
         # Attaches platform__<arch> marker
         _OOTPlatformMarkerPatcher(test).patch()
+
+        # Attaches testtype__<label> marker(s) from this config's
+        # test_suite_config.labels
+        _OOTTestTypeMarkerPatcher(test, cls.TEST_SUITE_LABELS).patch()
 
         existing_methods = set(cls.__dict__.keys())
         super().instantiate_test(name, test, generic_cls=generic_cls)

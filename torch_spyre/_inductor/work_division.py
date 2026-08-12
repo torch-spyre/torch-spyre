@@ -56,7 +56,11 @@ from .pass_utils import (
     op_read_writes,
 )
 from .propagate_hints import get_op_hints
-from collections.abc import Iterable
+from .work_division_constraints import (
+    WorkDivConstraintContext,
+    collect_work_division_constraints,
+    has_qfp8wt_tensor,
+)
 from typing import Callable
 
 from .logging_utils import get_inductor_logger
@@ -193,101 +197,6 @@ def _most_splittable_dim(
     return (best_dim, best_split) if best_split > 1 else None
 
 
-def coordinate_mask_blocked_vars(
-    reduction_vars: Iterable[Symbol],
-    stick_vars: dict[Symbol, int],
-    it_space: dict[Symbol, Expr],
-) -> set[Symbol]:
-    """Return reduction stick vars that cannot be split across cores.
-
-    The backend compiler cannot apply coordinate masking to a dimension spread
-    over cores, and masking is applied to a dim that is padded, reduced, and the
-    stick dim (mirrors ``_get_coordinate_mask`` in codegen/superdsc.py). A stick
-    var is guaranteed non-symbolic, so its element count concretizes; it is
-    padded iff not stick-aligned.
-
-    ``it_space`` must be the element-valued iteration space (not the
-    stick-adjusted copy), since padding is defined on element counts.
-    ``stick_vars`` maps each stick var to its elems_per_stick (as returned by
-    ``adjust_it_space_for_sticks``).
-
-    Both work-division paths consult this: the greedy path drops these from its
-    reduction candidates, and ``enumerate_work_division_candidates`` rejects any
-    split that divides one of them.
-    """
-    return {
-        v
-        for v in reduction_vars
-        if v in stick_vars and concretize_expr(it_space[v]) % stick_vars[v] != 0
-    }
-
-
-# A conv2d's output index is (mb, out, i, j) -- see the ``index`` unpacking in
-# ``lower_convolution``'s ``inner_fn`` -- so the output-spatial (image H/W) dims
-# are the trailing pair of the write dependency's ranges. Indexing from the end
-# tolerates Inductor collapsing leading unit dims (a batch-1 input yields a
-# rank-3 write dep, not rank 4).
-_CONV2D_NUM_SPATIAL_DIMS = 2
-
-
-def conv_spatial_blocked_vars(
-    op: ComputedBuffer,
-    it_space: dict[Symbol, Expr],
-    committed_splits: dict[Symbol, int] | None = None,
-) -> set[Symbol]:
-    """Return the output-spatial iteration vars of a strided conv2d.
-
-    Splitting the output image dims (i, j) of a strided convolution across
-    cores produces incorrect per-core DSM/strided addressing. Blocking them
-    here -- rather than resetting the splits during codegen -- lets the
-    distributor spend those cores on dims that can absorb them (mb, out)
-    instead of dropping them.
-
-    ``committed_splits`` are the splits ``span_reduction_pass`` already
-    committed to satisfy ``MAX_SPAN_BYTES``. Those are mandatory: a spatial dim
-    among them is excluded from the returned set (and warned about) rather than
-    blocked, since un-splitting it would violate the hardware span limit.
-
-    Returns an empty set for non-conv ops, unstrided convs, spatial dims of
-    size 1 (unsplittable anyway), and when
-    ``config.disable_conv2d_spatial_split`` is off.
-    """
-    if not config.disable_conv2d_spatial_split:
-        return set()
-
-    op_info = getattr(op.data, "op_info", None)
-    if not isinstance(op_info, dict):
-        return set()
-    conv_params = op_info.get("conv_params")
-    if not isinstance(conv_params, dict):
-        return set()
-
-    if conv_params.get("stride_i", 1) <= 1 and conv_params.get("stride_j", 1) <= 1:
-        return set()
-
-    # Trailing pair of the output ranges. When the spatial dims themselves
-    # collapse to size 1 the write dep is shorter than that; the size filter
-    # below drops whatever remains.
-    write_ranges = list(next(iter(op_read_writes(op).writes)).ranges)
-    spatial = write_ranges[-_CONV2D_NUM_SPATIAL_DIMS:]
-
-    blocked = {
-        sym for sym in spatial if sym in it_space and concretize_expr(it_space[sym]) > 1
-    }
-
-    # Span reduction outranks the spatial-split preference: honour its commits.
-    forced = {s for s in blocked if (committed_splits or {}).get(s, 1) > 1}
-    if forced:
-        logger.warning(
-            f"{op.get_name()}: SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT is set, "
-            f"but the hardware memory-span limit requires splitting spatial "
-            f"dim(s) {sorted(str(s) for s in forced)} "
-            f"({ {str(s): (committed_splits or {})[s] for s in forced} }); "
-            f"the flag is not honoured for those dims."
-        )
-    return blocked - forced
-
-
 def multi_dim_iteration_space_split(
     iteration_space: dict[Symbol, Expr],
     max_cores: int,
@@ -368,49 +277,6 @@ def multi_dim_iteration_space_split(
             splits[best_dim] = best_split
 
     return splits
-
-
-def _has_qfp8wt_tensor(tds: list[TensorDep]) -> bool:
-    """Check if any tensor has QFP8WT element arrangement."""
-    return any(
-        hasattr(td.layout.device_layout, "element_arrangement")
-        and td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT
-        for td in tds
-    )
-
-
-def _is_qfp8wt_tensor(td: TensorDep) -> bool:
-    """Check if a specific tensor has QFP8WT element arrangement."""
-    return (
-        hasattr(td.layout.device_layout, "element_arrangement")
-        and td.layout.device_layout.element_arrangement == ElementArrangement.QFP8WT
-    )
-
-
-def _get_qfp8wt_split_constraints(
-    input_tds: list[TensorDep],
-    output_td: TensorDep,
-) -> dict[Symbol, int]:
-    """Return split constraints (=1) for QFP8WT second stick dimension."""
-    constraints: dict[Symbol, int] = {}
-    if not _has_qfp8wt_tensor(input_tds + [output_td]):
-        return constraints
-
-    # Kernel tensor (second input for batchmatmul)
-    if len(input_tds) > 1:
-        kernel_td = input_tds[1]
-        if len(kernel_td.device_coords) > 1 and _is_qfp8wt_tensor(kernel_td):
-            second_stick_vars = kernel_td.device_coords[-2].free_symbols
-            for var in second_stick_vars:
-                constraints[var] = 1
-
-    # Output tensor
-    if len(output_td.device_coords) > 1 and _is_qfp8wt_tensor(output_td):
-        second_stick_vars = output_td.device_coords[-2].free_symbols
-        for var in second_stick_vars:
-            constraints[var] = 1
-
-    return constraints
 
 
 def adjust_it_space_for_sticks(
@@ -856,8 +722,20 @@ def enumerate_work_division_candidates(
     # device coordinates (mirrors prioritize_dimensions / splits_by_index_coeff).
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
-    mask_blocked = coordinate_mask_blocked_vars(reduction_vars, stick_vars, it_space)
-    mask_blocked |= conv_spatial_blocked_vars(op, it_space_adjusted)
+    constraint_result = collect_work_division_constraints(
+        WorkDivConstraintContext(
+            op=op,
+            it_space=it_space,
+            it_space_adjusted=it_space_adjusted,
+            output_td=output_td,
+            input_tds=input_tds,
+            stick_vars=stick_vars,
+            reduction_vars=reduction_vars,
+            committed_splits={},
+        )
+    )
+    blocked = constraint_result.blocked
+    pinned = constraint_result.pinned
 
     # Per-dim candidate factors, mirroring must_split_vars.valid_splits but with
     # no ``>= current_min`` floor (we want the full set, including 1).
@@ -884,7 +762,11 @@ def enumerate_work_division_candidates(
         ):
             return False
         if any(  # a coordinate-masked dim cannot be split across cores
-            splits[v] > 1 for v in mask_blocked
+            splits[v] > 1 for v in blocked
+        ):
+            return False
+        if any(  # a pinned dim's split must equal exactly its pinned value
+            splits[v] != pin for v, pin in pinned.items()
         ):
             return False
         return True
@@ -936,9 +818,13 @@ def _apply_user_hint(
     it_space_adjusted: dict[Symbol, Expr],
     output_td: TensorDep,
     max_cores: int,
+    blocked: set[Symbol] | None = None,
+    pinned: dict[Symbol, int] | None = None,
 ) -> dict[Symbol, int]:
     """Apply splits in insertion order, pruning lower-priority overflows."""
     op_name = op.get_name()
+    blocked = blocked or set()
+    pinned = pinned or {}
 
     splits: dict[Symbol, int] = {}
     cores_used = 1
@@ -960,6 +846,15 @@ def _apply_user_hint(
             raise Unsupported(
                 f"work_division_hint: {op_name} dim {sym} is not in the "
                 f"work-division iteration space."
+            )
+        if split > 1 and sym in blocked:
+            raise Unsupported(
+                f"work_division_hint: {op_name} cannot split constrained dim {sym}."
+            )
+        if sym in pinned and split != pinned[sym]:
+            raise Unsupported(
+                f"work_division_hint: {op_name} dim {sym} is pinned to split="
+                f"{pinned[sym]}."
             )
 
         next_cores = cores_used * split
@@ -994,6 +889,15 @@ def _apply_user_hint(
             f"work_division_hint: {op_name} splits "
             f"{len(reduction_vars_to_split)} reduction dimensions "
             f"({reduction_vars_to_split}), but the backend supports at most 1."
+        )
+
+    conflicting_pins = {
+        sym: split for sym, split in pinned.items() if splits.get(sym, 1) != split
+    }
+    if conflicting_pins:
+        raise Unsupported(
+            f"work_division_hint: {op_name} conflicts with pinned splits "
+            f"{conflicting_pins}."
         )
 
     return splits
@@ -1037,16 +941,25 @@ def span_reduction_pass(
         all_tds, it_space, it_space_adjusted, stick_vars, max_cores, symbol_meta
     )
 
-    # For matmul ops with QFP8WT kernels, enforce split constraints
-    if isinstance(op.data, Reduction) and op.data.reduction_type in (
-        BATCH_MATMUL_OP,
-        BATCH_MATMUL_FP8_OP,
-    ):
-        qfp8_constraints = _get_qfp8wt_split_constraints(input_tds, output_td)
-        min_splits.update(qfp8_constraints)
-
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
-    reduction_vars_to_split = set(min_splits) - coord_vars
+    reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
+    constraint_result = collect_work_division_constraints(
+        WorkDivConstraintContext(
+            op=op,
+            it_space=it_space,
+            it_space_adjusted=it_space_adjusted,
+            output_td=output_td,
+            input_tds=input_tds,
+            stick_vars=stick_vars,
+            reduction_vars=reduction_vars,
+            committed_splits=min_splits,
+        )
+    )
+    min_splits.update(constraint_result.pinned)
+
+    reduction_vars_to_split = {
+        v for v, split in min_splits.items() if split > 1 and v not in coord_vars
+    }
     # Each entry in Reduction.reduction_ranges maps to at most one Symbol via
     # index_vars_squeeze (size-1 entries are squeezed away). So len > 1 means
     # genuinely distinct reduction dimensions, not multiple symbols from one dim.
@@ -1098,11 +1011,6 @@ def _default_split(
     it_space_remaining = {
         s: e for s, e in it_space_adjusted.items() if s not in committed_splits
     }
-    if len(output_td.device_coords) >= 2 and _is_qfp8wt_tensor(output_td):
-        stick_coord_vars = set(output_td.device_coords[-2].free_symbols)
-        it_space_remaining = {
-            s: e for s, e in it_space_remaining.items() if s not in stick_coord_vars
-        }
     output_dims, reduction_dims = prioritize_dimensions(
         output_td, it_space_remaining, symbol_meta
     )
@@ -1113,12 +1021,10 @@ def _default_split(
     if any(v not in coord_vars for v in committed_splits):
         reduction_dims = []
 
-    # Drop dims the backend compiler can't split across cores before the greedy
-    # distributor commits them. Output dims are filtered too: coordinate masking
-    # only blocks reduction dims, but conv2d spatial blocking applies to output
-    # dims, and the distributor must not hand cores to either.
-    reduction_dims = [v for v in reduction_dims if v not in blocked]
+    # Drop blocked dims before the greedy distributor commits them. Coordinate
+    # masking only blocks reduction dims; strided conv also blocks output dims.
     output_dims = [v for v in output_dims if v not in blocked]
+    reduction_dims = [v for v in reduction_dims if v not in blocked]
 
     # Pass max_cores, not remaining_cores: multi_dim_iteration_space_split
     # accounts for committed_splits in its first pass, consuming those cores
@@ -1170,18 +1076,34 @@ def work_distribution_pass(
     # dims with actual committed splits so they don't overlap with priorities.
     committed_splits = {s: v for s, v in min_splits.items() if v > 1}
 
-    # For matmul ops with QFP8WT kernels, enforce split constraints
-    qfp8_constraints = _get_qfp8wt_split_constraints(input_tds, output_td)
-    for var, split_val in qfp8_constraints.items():
-        if var in committed_splits:
-            del committed_splits[var]
-        min_splits[var] = split_val
+    coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
+    reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
+    constraint_result = collect_work_division_constraints(
+        WorkDivConstraintContext(
+            op=op,
+            it_space=it_space,
+            it_space_adjusted=it_space_adjusted,
+            output_td=output_td,
+            input_tds=input_tds,
+            stick_vars=stick_vars,
+            reduction_vars=reduction_vars,
+            committed_splits=committed_splits,
+        )
+    )
+    blocked = constraint_result.blocked
+    committed_splits.update(constraint_result.pinned)
 
     if not config.ignore_work_division_hints:
         user_splits = _resolve_work_div_hint(op, it_space_adjusted)
         if user_splits is not None:
             user_splits = _apply_user_hint(
-                op, user_splits, it_space_adjusted, output_td, max_cores
+                op,
+                user_splits,
+                it_space_adjusted,
+                output_td,
+                max_cores,
+                blocked,
+                constraint_result.pinned,
             )
             dropped = {
                 s: v for s, v in committed_splits.items() if user_splits.get(s, 1) < v
@@ -1211,17 +1133,9 @@ def work_distribution_pass(
             )
             return
 
-    coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
-    reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
-    blocked = coordinate_mask_blocked_vars(reduction_vars, stick_vars, it_space)
-    blocked |= conv_spatial_blocked_vars(op, it_space_adjusted, committed_splits)
     splits, output_dims, reduction_dims = _default_split(
         it_space_adjusted, output_td, committed_splits, max_cores, symbol_meta, blocked
     )
-
-    # Enforce QFP8WT split constraints on the final split
-    qfp8_constraints = _get_qfp8wt_split_constraints(input_tds, output_td)
-    splits.update(qfp8_constraints)
 
     apply_splits(op, splits, output_td)
 
@@ -1525,7 +1439,7 @@ def _cost_model_matmul_planner(
     k_divs = [int(d) for d in divisors(k_sticks)]
 
     # For batchmatmulfp8 with QFP8WT kernels, do not split K
-    if _has_qfp8wt_tensor(input_tds + [output_td]):
+    if has_qfp8wt_tensor(input_tds + [output_td]):
         k_divs = [1]
 
     best = None
@@ -1562,7 +1476,7 @@ def _cost_model_matmul_planner(
 
     # Never trade down to fewer cores than the default distributor already found.
     if math.prod(new_splits.values()) < math.prod(splits.values()):
-        if not _has_qfp8wt_tensor(input_tds + [output_td]):
+        if not has_qfp8wt_tensor(input_tds + [output_td]):
             return splits
         # For QFP8WT, force k_dim = 1 regardless of core count
         new_splits[k_dim] = 1
@@ -1753,7 +1667,20 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
 
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
-    blocked = coordinate_mask_blocked_vars(reduction_vars, stick_vars, it_space)
+    constraint_result = collect_work_division_constraints(
+        WorkDivConstraintContext(
+            op=op,
+            it_space=it_space,
+            it_space_adjusted=it_space_adjusted,
+            output_td=output_td,
+            input_tds=input_tds,
+            stick_vars=stick_vars,
+            reduction_vars=reduction_vars,
+            committed_splits=committed_splits,
+        )
+    )
+    blocked = constraint_result.blocked
+    committed_splits.update(constraint_result.pinned)
     default_splits, _, _ = _default_split(
         it_space_adjusted, output_td, committed_splits, max_cores, symbol_meta, blocked
     )

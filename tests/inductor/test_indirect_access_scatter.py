@@ -276,6 +276,35 @@ class TestScatter(IndirectAccessTestCase):
             kernel, inp, mask, src, expect=GATHER_OP_SPEC, expect_close=True
         )
 
+    def test_masked_scatter_unexpanded_row_broadcast(self):
+        """torch.masked_scatter with a row mask left in its UN-EXPANDED form:
+        a literal size-1 last dim [B, S, 1] (stride(-1) == 1), not broadcast up
+        to [B, S, C]. This is what real models hand us (e.g. Mistral-Small-3.2's
+        `inputs_embeds.masked_scatter(special_image_mask, image_features)` with
+        mask [1, 855, 1] into self [1, 855, 5120]).
+
+        It is the same whole-row selection as the expanded form -- mask[..., 0]
+        collapses either spelling to one bool per row -- so it must also lower to
+        a gather.
+        """
+        ROWS, COLS, SRC_ROWS, N_TRUE = 855, 5120, 266, 266
+        inp = torch.rand(1, ROWS, COLS, dtype=torch.float16).to("spyre")
+        src = torch.rand(SRC_ROWS, COLS, dtype=torch.float16).to("spyre")
+        # Un-expanded: [1, ROWS, 1], NOT .expand()-ed to [1, ROWS, COLS].
+        mask_1d = torch.zeros(1, ROWS, dtype=torch.bool)
+        mask_1d[0, torch.randperm(ROWS)[:N_TRUE]] = True
+        mask = mask_1d.unsqueeze(-1).to("spyre")  # shape [1, ROWS, 1]
+        self.assertEqual(tuple(mask.shape), (1, ROWS, 1))
+        self.name_dims(inp, {"B": 1, "ROWS": ROWS, "COLS": COLS})
+        self.name_dims(src, {"SRC_ROWS": SRC_ROWS, "COLS": COLS})
+
+        def kernel(inp, mask, src):
+            return torch.masked_scatter(inp, mask, src)
+
+        self._stage_and_e2e(
+            kernel, inp, mask, src, expect=GATHER_OP_SPEC, expect_close=True
+        )
+
     def _row_broadcast_operands(self, shape, src_rows, n_true):
         """Supported masked_scatter operands: `self` of `shape`, a mask broadcast
         along the last dim (stride(-1) == 0) with `n_true` selected rows, and a

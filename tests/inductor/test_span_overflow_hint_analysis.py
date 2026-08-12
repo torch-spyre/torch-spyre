@@ -186,6 +186,32 @@ def _out_coords_for_symbolic_bhld(_op):
     ]
 
 
+def _out_coords_distinct_producer_consumer(op):
+    """Different output loop symbols for 'buf0' than for every other op.
+
+    ``_out_coords_for_bhld`` returns identical coordinates for every op, so a
+    test asserting that each group member resolved *its own* ``loop_var``
+    passes vacuously under it.  A real Reduction producer and its Pointwise
+    consumer describe their outputs with different symbols, so the
+    Reduction-rooted group tests use this instead: 'buf0' (the producer) tiles
+    ``m`` while its consumer tiles ``h`` at the same host_dim, which makes a
+    loop_var copied from the wrong op observable.
+    """
+    if op.get_name() == "buf0":
+        return [
+            sympy.Integer(0),
+            sympy.Symbol("m"),
+            sympy.Symbol("n"),
+            sympy.Symbol("k"),
+        ]
+    return [
+        sympy.Integer(0),
+        sympy.Symbol("h"),
+        sympy.Symbol("l"),
+        sympy.Symbol("d"),
+    ]
+
+
 def _apply_span_overflow(graph):
     """Run span_overflow_groups and apply its dim_hints assignments.
 
@@ -400,6 +426,156 @@ class TestSpanOverflowGroups(InductorTestCase):
             reason="output span overflow",
         )
 
+    @staticmethod
+    def _fake_multi_level_plan(*levels):
+        """A plan with several tile levels, as ``(host_dim, split_count)`` pairs.
+
+        The real planner emits one level per output dim it must tile, ordered
+        by host dim (see ``plan_span_overflow_tile``).  Levels are paired by
+        position downstream -- split counts are compared positionally and
+        ``_dims_to_hints`` zips levels to hint_ids in the same order -- which
+        is what the per-level correspondence tests below exercise.
+        """
+        return SpanOverflowTilePlan(
+            levels=tuple(
+                SpanOverflowTileLevel(
+                    selected_host_dim=host_dim, split_count=split_count
+                )
+                for host_dim, split_count in levels
+            ),
+            chunking_infos=tuple(
+                ChunkingInfo(
+                    total_bytes=1,
+                    per_core_span=1,
+                    core_split_estimate=1,
+                    selected_device_dim_size=split_count,
+                    selected_device_span_stride_elems=1,
+                    selected_host_dim=host_dim,
+                    stick_elems=64,
+                    reason="output span overflow",
+                )
+                for host_dim, split_count in levels
+            ),
+            reason="output span overflow",
+        )
+
+    def _multi_level_producer_and_reduction(self):
+        """A Pointwise 'buf0' read by a Reduction 'buf1', both two-level tiled.
+
+        Both sides plan levels ``[(host_dim=1, split=5), (host_dim=2, split=7)]``
+        so the split-count lists match positionally and the join hinges purely
+        on the loop-var correspondence the callers then check.
+        """
+        producer = _pointwise_op(_E2E_SHAPE, name="buf0")
+        reduction = _reduction_op(
+            _E2E_SHAPE, name="buf1", reduction_type=BATCH_MATMUL_OP
+        )
+        reduction.get_read_writes = MagicMock(
+            return_value=SimpleNamespace(
+                reads={
+                    MemoryDep(
+                        "buf0",
+                        sympy.Symbol("h"),
+                        (sympy.Symbol("h"),),
+                        (8195,),
+                    )
+                },
+                writes=_default_read_writes_for_output(
+                    "buf1", _E2E_SHAPE, reduction.layout
+                ).writes,
+            )
+        )
+        return producer, reduction
+
+    def _run_multi_level_join(self, producer_coords):
+        """Plan both ops two-level and run the pass with ``producer_coords``.
+
+        ``producer_coords`` is what the producer's tiled dims look like *through
+        the consumer's read*; the consumer's own coordinates stay ``[b, h, l, d]``,
+        so its level 0 (host_dim=1) tiles ``h`` and its level 1 (host_dim=2)
+        tiles ``l``.
+        """
+        producer, reduction = self._multi_level_producer_and_reduction()
+
+        def fake_plan(_op, _max_cores):
+            return self._fake_multi_level_plan((1, 5), (2, 7))
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+                fake_plan,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
+                _out_coords_for_symbolic_bhld,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.host_coordinates",
+                lambda layout, dep, indirect: list(producer_coords),
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.indirect_sizes_from_op",
+                lambda op: {},
+            ),
+            config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
+        ):
+            return _apply_span_overflow(_graph([producer, reduction])), (
+                producer,
+                reduction,
+            )
+
+    def test_multi_level_join_rejected_when_levels_correspond_crosswise(self):
+        """A cross-level symbol match must not license a multi-level join.
+
+        The consumer tiles ``h`` at level 0 and ``l`` at level 1.  Here the
+        producer's level-0 dim (host_dim=1) is indexed by ``l`` and its level-1
+        dim (host_dim=2) by ``h`` -- every producer level matches *some*
+        consumer level, but never the level it will actually share a loop with.
+        Unioning the consumer's tiled symbols across levels would accept this;
+        the per-level check in ``_consumer_shares_group_tiled_dim`` rejects it,
+        which is the point: level 0 of the shared loop nest would step ``h`` on
+        one side and ``l`` on the other.
+        """
+        with self.assertRaisesRegex(
+            Unsupported,
+            "reads auto-tiled producer.*cannot join them.*same shared "
+            "output dimension at the same split count",
+        ):
+            self._run_multi_level_join(
+                [
+                    sympy.Symbol("b"),
+                    sympy.Symbol("l"),
+                    sympy.Symbol("h"),
+                    sympy.Symbol("d"),
+                ]
+            )
+
+    def test_multi_level_join_accepted_when_levels_correspond_per_level(self):
+        """The per-level check still accepts a genuinely corresponding join.
+
+        Same two-level shape as the crosswise test, but the producer's level-0
+        dim is indexed by ``h`` and its level-1 dim by ``l`` -- matching the
+        consumer level for level.  Load-bearing as the counterpart to that
+        test: without it, a per-level check that rejected *every* multi-level
+        pair would look correct.
+        """
+        groups, (producer, reduction) = self._run_multi_level_join(
+            [
+                sympy.Symbol("b"),
+                sympy.Symbol("h"),
+                sympy.Symbol("l"),
+                sympy.Symbol("d"),
+            ]
+        )
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0][0], [producer, reduction])
+        self.assertEqual([hint.split_count for hint in producer.dim_hints], [5, 7])
+        self.assertEqual(
+            [hint.hint_id for hint in producer.dim_hints],
+            [hint.hint_id for hint in reduction.dim_hints],
+        )
+
     def test_chained_pointwise_ops_conform_to_producer_split(self):
         """op1's own search disagrees with op0's, but op0's split is also
         legal and sufficient for op1 (identical shape/layout) -- op1 should
@@ -550,8 +726,8 @@ class TestSpanOverflowGroups(InductorTestCase):
         ):
             with self.assertRaisesRegex(
                 Unsupported,
-                "already auto-tiled producer.*grouping currently only synchronizes "
-                "compatible contiguous pointwise ops",
+                "reads auto-tiled producer.*cannot join them.*same shared "
+                "output dimension at the same split count",
             ):
                 _apply_span_overflow(_graph([producer, matmul]))
 
@@ -621,7 +797,7 @@ class TestSpanOverflowGroups(InductorTestCase):
         self.assertEqual(reduction.dim_hints[0].loop_var, sympy.Symbol("l"))
 
     def test_non_matmul_reduction_join_rejected_when_tiled_dim_not_shared(self):
-        """The shared-dim verification (``_reduction_shares_group_tiled_dim``)
+        """The shared-dim verification (``_consumer_shares_group_tiled_dim``)
         still applies regardless of reduction type: matching split counts are
         not enough if the reduction's tiled loop var does not actually index
         the producer's tiled dim through the read.  Compare with
@@ -676,10 +852,734 @@ class TestSpanOverflowGroups(InductorTestCase):
         ):
             with self.assertRaisesRegex(
                 Unsupported,
-                "already auto-tiled producer.*grouping currently only synchronizes "
-                "compatible contiguous pointwise ops",
+                "reads auto-tiled producer.*cannot join them.*same shared "
+                "output dimension at the same split count",
             ):
                 _apply_span_overflow(_graph([producer, reduction]))
+
+    def _reduction_producer_pointwise_consumer(
+        self, reduction_type=BATCH_MATMUL_OP, consumer_shape=_E2E_SHAPE
+    ):
+        """A Reduction producer ('buf0') read by a Pointwise consumer ('buf1')."""
+        producer = _reduction_op(_E2E_SHAPE, name="buf0", reduction_type=reduction_type)
+        consumer = _pointwise_op(consumer_shape, name="buf1")
+        consumer.get_read_writes = MagicMock(
+            return_value=SimpleNamespace(
+                reads={
+                    MemoryDep(
+                        "buf0",
+                        sympy.Symbol("h"),
+                        (sympy.Symbol("h"),),
+                        (8195,),
+                    )
+                },
+                writes=_default_read_writes_for_output(
+                    "buf1", consumer_shape, consumer.layout
+                ).writes,
+            )
+        )
+        return producer, consumer
+
+    def test_bmm_producer_groups_with_pointwise_consumer(self):
+        """A Reduction that starts a run (rather than being emitted as a closed
+        singleton) lets a directly-connected Pointwise consumer fuse into its
+        loop -- the BMM -> PW direction, mirroring the already-supported
+        PW -> BMM join.  Tile t of the BMM's *output* dim is self-contained, so
+        the producer's per-tile slice feeds the consumer in the same iteration
+        instead of being materialized as a full buffer for a second loop nest.
+
+        The producer and consumer describe their outputs with different loop
+        symbols (see ``_out_coords_distinct_producer_consumer``), so the
+        per-op loop_var assertions below would catch a hint copied from the
+        wrong op rather than resolved against each op's own coordinates."""
+        producer, consumer = self._reduction_producer_pointwise_consumer()
+
+        def fake_plan(op, _max_cores):
+            # Both tile host_dim=1 at split 5 -> exact-signature join path.
+            return self._fake_plan(1, 5)
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+                fake_plan,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
+                _out_coords_distinct_producer_consumer,
+            ),
+            # Through the read, the consumer's tiled symbol (h) indexes the
+            # producer's tiled dim (host_dim=1) -> same logical dim -> join.
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.host_coordinates",
+                lambda layout, dep, indirect: [
+                    sympy.Symbol("b"),
+                    sympy.Symbol("h"),
+                    sympy.Symbol("x"),
+                    sympy.Symbol("y"),
+                ],
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.indirect_sizes_from_op",
+                lambda op: {},
+            ),
+            config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
+        ):
+            groups = _apply_span_overflow(_graph([producer, consumer]))
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0][0], [producer, consumer])
+        # Synchronized: shared hint_id and split, each on its own loop_var.
+        self.assertEqual(producer.dim_hints[0].hint_id, consumer.dim_hints[0].hint_id)
+        self.assertEqual(producer.dim_hints[0].split_count, 5)
+        self.assertEqual(consumer.dim_hints[0].split_count, 5)
+        self.assertEqual(producer.dim_hints[0].loop_var, sympy.Symbol("m"))
+        self.assertEqual(consumer.dim_hints[0].loop_var, sympy.Symbol("h"))
+
+    def test_pointwise_consumer_conforms_to_bmm_producer_split(self):
+        """The conform path works against a Reduction-rooted run too: the
+        consumer's own search picks 11, the BMM producer's run says 5, and 5 is
+        also legal and sufficient for the consumer -- so it adopts 5 rather
+        than opening a second, unsynchronized loop over the BMM's output."""
+        producer, consumer = self._reduction_producer_pointwise_consumer()
+
+        def fake_plan(op, _max_cores):
+            return self._fake_plan(1, 5 if op.get_name() == "buf0" else 11)
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+                fake_plan,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
+                _out_coords_distinct_producer_consumer,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.host_coordinates",
+                lambda layout, dep, indirect: [
+                    sympy.Symbol("b"),
+                    sympy.Symbol("h"),
+                    sympy.Symbol("x"),
+                    sympy.Symbol("y"),
+                ],
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.indirect_sizes_from_op",
+                lambda op: {},
+            ),
+            config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
+        ):
+            groups = _apply_span_overflow(_graph([producer, consumer]))
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0][0], [producer, consumer])
+        self.assertEqual(producer.dim_hints[0].hint_id, consumer.dim_hints[0].hint_id)
+        # Consumer adopted the run's split (5), not its own search's (11).
+        self.assertEqual(producer.dim_hints[0].split_count, 5)
+        self.assertEqual(consumer.dim_hints[0].split_count, 5)
+
+    def test_bmm_producer_pointwise_consumer_rejected_when_dim_not_shared(self):
+        """Widening *who* may join a Reduction-rooted run must not widen *when*
+        it is safe.  A Reduction producer's output dims need not sit at the same
+        positions as its Pointwise consumer's, and the consumer inherits the
+        run's host_dim positionally -- so if the consumer's tiled loop var does
+        not actually index the producer's tiled dim through the read, both the
+        exact-signature join and the conform path must refuse and fall back to
+        the Unsupported conflict path.  Without that check the consumer could
+        conform against the wrong dim, pass by coincidence, and be stamped with
+        a loop_var that desynchronizes the shared loop nest."""
+        producer, consumer = self._reduction_producer_pointwise_consumer()
+
+        def fake_plan(op, _max_cores):
+            return self._fake_plan(1, 5)
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+                fake_plan,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
+                _out_coords_distinct_producer_consumer,
+            ),
+            # Producer's tiled dim (host_dim=1) is indexed by 'z', NOT the
+            # consumer's tiled symbol 'h' -> unrelated dims -> must not join.
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.host_coordinates",
+                lambda layout, dep, indirect: [
+                    sympy.Symbol("b"),
+                    sympy.Symbol("z"),
+                    sympy.Symbol("x"),
+                    sympy.Symbol("y"),
+                ],
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.indirect_sizes_from_op",
+                lambda op: {},
+            ),
+            config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
+        ):
+            with self.assertRaisesRegex(
+                Unsupported,
+                "reads auto-tiled producer.*buf0.*cannot join them.*same "
+                "shared output dimension at the same split count",
+            ):
+                _apply_span_overflow(_graph([producer, consumer]))
+
+    def test_pointwise_not_reading_bmm_run_does_not_join_it(self):
+        """Matching signatures alone justify a Pointwise-to-Pointwise join
+        (identical iteration spaces), but not a join into a Reduction-rooted
+        run: there the run's host_dim numbering is the *Reduction's*, so an
+        unrelated neighbour that merely agrees numerically is not tiling the
+        same logical dim.  A real read edge is required, and without one the
+        two ops get separate groups rather than being silently fused."""
+        producer = _reduction_op(
+            _E2E_SHAPE, name="buf0", reduction_type=BATCH_MATMUL_OP
+        )
+        # Default read_writes: no reads, so no producer-consumer edge.
+        neighbour = _pointwise_op(_E2E_SHAPE, name="buf1")
+
+        def fake_plan(op, _max_cores):
+            return self._fake_plan(1, 5)
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+                fake_plan,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
+                _out_coords_distinct_producer_consumer,
+            ),
+            config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
+        ):
+            groups = _apply_span_overflow(_graph([producer, neighbour]))
+
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(groups[0][0], [producer])
+        self.assertEqual(groups[1][0], [neighbour])
+        self.assertNotEqual(
+            producer.dim_hints[0].hint_id, neighbour.dim_hints[0].hint_id
+        )
+
+    def _reduction_producer_reduction_consumer(
+        self,
+        producer_type=BATCH_MATMUL_OP,
+        consumer_type=BATCH_MATMUL_OP,
+    ):
+        """A Reduction producer ('buf0') read by a Reduction consumer ('buf1')."""
+        producer = _reduction_op(_E2E_SHAPE, name="buf0", reduction_type=producer_type)
+        consumer = _reduction_op(_E2E_SHAPE, name="buf1", reduction_type=consumer_type)
+        consumer.get_read_writes = MagicMock(
+            return_value=SimpleNamespace(
+                reads={
+                    MemoryDep(
+                        "buf0",
+                        sympy.Symbol("h"),
+                        (sympy.Symbol("h"),),
+                        (8195,),
+                    )
+                },
+                writes=_default_read_writes_for_output(
+                    "buf1", _E2E_SHAPE, consumer.layout
+                ).writes,
+            )
+        )
+        return producer, consumer
+
+    def test_bmm_producer_groups_with_bmm_consumer(self):
+        """Reduction -> Reduction: a second matmul reading the first's tiled
+        output joins its run.  What licenses the join is the shared *output*-
+        range tile, not either op's type -- tile t of the producer's output dim
+        is self-contained, so it feeds the consumer's tile t in the same
+        iteration exactly as a Pointwise producer's would.
+
+        The shared dim sits at different output positions in the two ops
+        (producer host_dim=1, consumer host_dim=2), so the join matches on
+        split_count and each op keeps its own loop_var."""
+        producer, consumer = self._reduction_producer_reduction_consumer()
+
+        def fake_plan(op, _max_cores):
+            return self._fake_plan(1 if op.get_name() == "buf0" else 2, 5)
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+                fake_plan,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
+                _out_coords_for_bhld,
+            ),
+            # Through the read, the consumer's tiled symbol (l) indexes the
+            # producer's tiled dim (host_dim=1) -> same logical dim -> join.
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.host_coordinates",
+                lambda layout, dep, indirect: [
+                    sympy.Symbol("b"),
+                    sympy.Symbol("l"),
+                    sympy.Symbol("x"),
+                    sympy.Symbol("y"),
+                ],
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.indirect_sizes_from_op",
+                lambda op: {},
+            ),
+            config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
+        ):
+            groups = _apply_span_overflow(_graph([producer, consumer]))
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0][0], [producer, consumer])
+        self.assertEqual(producer.dim_hints[0].hint_id, consumer.dim_hints[0].hint_id)
+        self.assertEqual(producer.dim_hints[0].split_count, 5)
+        self.assertEqual(consumer.dim_hints[0].split_count, 5)
+        self.assertEqual(producer.dim_hints[0].loop_var, sympy.Symbol("h"))
+        self.assertEqual(consumer.dim_hints[0].loop_var, sympy.Symbol("l"))
+
+    def test_bmm_producer_groups_with_non_matmul_reduction_consumer(self):
+        """Reduction -> Reduction is type-agnostic on both sides: a plain
+        ``sum`` reading a tiled BMM producer joins just as another matmul
+        would.  Compare with ``test_bmm_producer_groups_with_bmm_consumer``:
+        the *only* difference is the consumer's ``reduction_type``."""
+        producer, consumer = self._reduction_producer_reduction_consumer(
+            consumer_type="sum"
+        )
+
+        def fake_plan(op, _max_cores):
+            return self._fake_plan(1 if op.get_name() == "buf0" else 2, 5)
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+                fake_plan,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
+                _out_coords_for_bhld,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.host_coordinates",
+                lambda layout, dep, indirect: [
+                    sympy.Symbol("b"),
+                    sympy.Symbol("l"),
+                    sympy.Symbol("x"),
+                    sympy.Symbol("y"),
+                ],
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.indirect_sizes_from_op",
+                lambda op: {},
+            ),
+            config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
+        ):
+            groups = _apply_span_overflow(_graph([producer, consumer]))
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0][0], [producer, consumer])
+        self.assertEqual(producer.dim_hints[0].hint_id, consumer.dim_hints[0].hint_id)
+        self.assertEqual(consumer.dim_hints[0].split_count, 5)
+
+    def test_bmm_producer_chain_through_pointwise_to_bmm_consumer(self):
+        """A three-op chain lands in ONE group: bmm -> pointwise -> bmm.
+
+        The two-op tests each cover a single join.  This covers the property
+        that makes those joins useful together: a Reduction-rooted run is not
+        closed by a Pointwise member, so the run survives 'buf1' and is still
+        open when the second matmul arrives.  That is the shape attention has
+        (matmul -> softmax -> matmul), and without it a chain could only ever
+        fuse two ops.
+
+        Also pins where the run *does* close: 'buf2' is a Reduction consumer,
+        so it joins and flushes.  Anything after it would be rejected, which
+        ``test_reduction_consumer_still_terminates_its_group`` covers.
+        """
+        producer = _reduction_op(
+            _E2E_SHAPE, name="buf0", reduction_type=BATCH_MATMUL_OP
+        )
+        middle = _pointwise_op(_E2E_SHAPE, name="buf1")
+        consumer = _reduction_op(
+            _E2E_SHAPE, name="buf2", reduction_type=BATCH_MATMUL_OP
+        )
+
+        def _reads(buf_name, sym):
+            return MagicMock(
+                return_value=SimpleNamespace(
+                    reads={MemoryDep(buf_name, sym, (sym,), (8195,))},
+                    writes=_default_read_writes_for_output(
+                        "buf1" if buf_name == "buf0" else "buf2",
+                        _E2E_SHAPE,
+                        middle.layout,
+                    ).writes,
+                )
+            )
+
+        middle.get_read_writes = _reads("buf0", sympy.Symbol("h"))
+        consumer.get_read_writes = _reads("buf1", sympy.Symbol("h"))
+
+        def fake_plan(op, _max_cores):
+            # buf0/buf1 tile host_dim=1 (h); buf2 tiles host_dim=2 (l).  The
+            # pointwise joins on an exact signature match, the matmul on the
+            # shared split count across differing positions.
+            return self._fake_plan(2 if op.get_name() == "buf2" else 1, 5)
+
+        def host_coords(layout, dep, indirect):
+            # Each read's producer must be indexed by the symbol tiling the
+            # consumer's own output dim: buf1 tiles h and reads buf0, buf2
+            # tiles l and reads buf1.
+            sym = sympy.Symbol("h") if dep.name == "buf0" else sympy.Symbol("l")
+            return [sympy.Symbol("b"), sym, sympy.Symbol("x"), sympy.Symbol("y")]
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+                fake_plan,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
+                _out_coords_for_bhld,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.host_coordinates",
+                host_coords,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.indirect_sizes_from_op",
+                lambda op: {},
+            ),
+            config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
+        ):
+            groups = _apply_span_overflow(_graph([producer, middle, consumer]))
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0][0], [producer, middle, consumer])
+        shared_hint = producer.dim_hints[0].hint_id
+        for op in (producer, middle, consumer):
+            self.assertEqual(op.dim_hints[0].hint_id, shared_hint)
+            self.assertEqual(op.dim_hints[0].split_count, 5)
+        # Each op still resolves its own loop_var: buf0/buf1 tile h, buf2 l.
+        self.assertEqual(producer.dim_hints[0].loop_var, sympy.Symbol("h"))
+        self.assertEqual(middle.dim_hints[0].loop_var, sympy.Symbol("h"))
+        self.assertEqual(consumer.dim_hints[0].loop_var, sympy.Symbol("l"))
+
+    def _assert_joins_on_shared_dim(
+        self, producer, consumer, producer_host_dim=1, consumer_host_dim=2, split=5
+    ):
+        """Run the pass on a pair that should join, and assert it did.
+
+        Shared by the Reduction-producer matrix tests below.  The pass branches
+        on ``isinstance(op.data, Reduction)`` and never inspects
+        ``reduction_type``, so those tests vary only the two op types and reuse
+        one scenario rather than restating the patch stack each time.
+
+        ``host_coordinates`` is patched so the producer's tiled coordinate is
+        indexed by whichever symbol tiles the consumer's output dim -- i.e. the
+        correspondence holds and the join is licensed.
+        """
+        consumer_sym = _out_coords_for_bhld(None)[consumer_host_dim]
+
+        def fake_plan(op, _max_cores):
+            return self._fake_plan(
+                producer_host_dim if op.get_name() == "buf0" else consumer_host_dim,
+                split,
+            )
+
+        def host_coords(layout, dep, indirect):
+            coords = [sympy.Symbol(f"p{i}") for i in range(4)]
+            coords[producer_host_dim] = consumer_sym
+            return coords
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+                fake_plan,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
+                _out_coords_for_bhld,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.host_coordinates",
+                host_coords,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.indirect_sizes_from_op",
+                lambda op: {},
+            ),
+            config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
+        ):
+            groups = _apply_span_overflow(_graph([producer, consumer]))
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0][0], [producer, consumer])
+        self.assertEqual(producer.dim_hints[0].hint_id, consumer.dim_hints[0].hint_id)
+        self.assertEqual(producer.dim_hints[0].split_count, split)
+        self.assertEqual(consumer.dim_hints[0].split_count, split)
+        return groups
+
+    def test_non_matmul_reduction_producer_groups_with_pointwise_consumer(self):
+        """A plain ``sum`` **producer** opens a run its Pointwise consumer joins.
+
+        The sibling tests all use a batch-matmul producer.  Nothing in the pass
+        inspects ``reduction_type`` -- a run is opened by any op whose data is a
+        Reduction -- so a ``sum`` producer is supported by construction.  This
+        pins that, so the support is a tested claim rather than an inference
+        from the type check.
+        """
+        producer, consumer = self._reduction_producer_pointwise_consumer(
+            reduction_type="sum"
+        )
+        # Pointwise consumers join on an exact signature match, so both tile the
+        # same host_dim here (unlike the Reduction-consumer cases, which match on
+        # split count across differing positions).
+        self._assert_joins_on_shared_dim(
+            producer, consumer, producer_host_dim=1, consumer_host_dim=1
+        )
+        self.assertEqual(producer.dim_hints[0].loop_var, sympy.Symbol("h"))
+        self.assertEqual(consumer.dim_hints[0].loop_var, sympy.Symbol("h"))
+
+    def test_non_matmul_reduction_producer_groups_with_reduction_consumer(self):
+        """Reduction -> Reduction with **neither** side a matmul (``sum`` ->
+        ``sum``).  Completes the producer/consumer type matrix: the join is
+        licensed by the shared output-range tile, not by either op being a
+        batch-matmul."""
+        producer, consumer = self._reduction_producer_reduction_consumer(
+            producer_type="sum", consumer_type="sum"
+        )
+        self._assert_joins_on_shared_dim(producer, consumer)
+        self.assertEqual(producer.dim_hints[0].loop_var, sympy.Symbol("h"))
+        self.assertEqual(consumer.dim_hints[0].loop_var, sympy.Symbol("l"))
+
+    def test_non_matmul_reduction_producer_groups_with_bmm_consumer(self):
+        """A plain ``sum`` producer read by a matmul consumer -- the remaining
+        cell of the producer/consumer type matrix, and the mirror of
+        ``test_bmm_producer_groups_with_non_matmul_reduction_consumer``."""
+        producer, consumer = self._reduction_producer_reduction_consumer(
+            producer_type="sum", consumer_type=BATCH_MATMUL_OP
+        )
+        self._assert_joins_on_shared_dim(producer, consumer)
+
+    def test_bmm_to_bmm_rejected_when_producer_tiles_consumer_reduction_dim(self):
+        """The wrong-answer case Reduction -> Reduction grouping makes
+        reachable, and the reason the correspondence check is load-bearing
+        rather than a formality.
+
+        In ``bmm(bmm(q, k), v)`` the producer may tile its N dim while the
+        consumer reads that buffer as its A operand -- so the producer's N *is*
+        the consumer's K.  Tile t of the producer is then a partial slice of the
+        consumer's *reduction* range, and pairing them per-iteration would
+        compute a partial sum and call it a finished result.  Split counts match
+        and there is a genuine read edge, so nothing else on the join branch
+        objects.
+
+        K never appears in the consumer's output coordinates, so the tiled-symbol
+        intersection is empty and the join is refused -- modelled here by the
+        producer's tiled dim being indexed by 'k', a symbol absent from the
+        consumer's output coords."""
+        producer, consumer = self._reduction_producer_reduction_consumer()
+
+        def fake_plan(op, _max_cores):
+            return self._fake_plan(1 if op.get_name() == "buf0" else 2, 5)
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+                fake_plan,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
+                _out_coords_for_bhld,
+            ),
+            # Producer's tiled dim (host_dim=1) is indexed by the consumer's
+            # reduction symbol 'k', which is not among its output coords
+            # (b/h/l/d) -> partial-result slice -> must not join.
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.host_coordinates",
+                lambda layout, dep, indirect: [
+                    sympy.Symbol("b"),
+                    sympy.Symbol("k"),
+                    sympy.Symbol("x"),
+                    sympy.Symbol("y"),
+                ],
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.indirect_sizes_from_op",
+                lambda op: {},
+            ),
+            config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
+        ):
+            with self.assertRaisesRegex(
+                Unsupported,
+                "reads auto-tiled producer.*buf0.*cannot join them.*same "
+                "shared output dimension at the same split count",
+            ):
+                _apply_span_overflow(_graph([producer, consumer]))
+
+    def test_join_rejected_when_only_one_of_two_reads_corresponds(self):
+        """A consumer can read the same tiled producer through more than one
+        dep -- a matmul taking it as both operands (``x @ x.T``).  Every dep
+        must correspond, not just one: verifying a single access pattern and
+        ignoring the rest would let a partial-result read through whenever it
+        happened to be paired with a safe one.
+
+        Here the first read corresponds (tiled dim indexed by 'l') and the
+        second does not (indexed by 'k', the consumer's reduction symbol), so
+        the join must be refused."""
+        producer = _reduction_op(
+            _E2E_SHAPE, name="buf0", reduction_type=BATCH_MATMUL_OP
+        )
+        consumer = _reduction_op(
+            _E2E_SHAPE, name="buf1", reduction_type=BATCH_MATMUL_OP
+        )
+        consumer.get_read_writes = MagicMock(
+            return_value=SimpleNamespace(
+                reads={
+                    MemoryDep("buf0", sympy.Symbol("h"), (sympy.Symbol("h"),), (8195,)),
+                    MemoryDep("buf0", sympy.Symbol("l"), (sympy.Symbol("l"),), (8195,)),
+                },
+                writes=_default_read_writes_for_output(
+                    "buf1", _E2E_SHAPE, consumer.layout
+                ).writes,
+            )
+        )
+
+        def fake_plan(op, _max_cores):
+            return self._fake_plan(1 if op.get_name() == "buf0" else 2, 5)
+
+        def host_coords(layout, dep, indirect):
+            # Correspondence depends on which dep is being checked: the 'h'
+            # read pairs correctly, the 'l' read lands on the consumer's K.
+            corresponds = dep.index == sympy.Symbol("h")
+            return [
+                sympy.Symbol("b"),
+                sympy.Symbol("l") if corresponds else sympy.Symbol("k"),
+                sympy.Symbol("x"),
+                sympy.Symbol("y"),
+            ]
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+                fake_plan,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
+                _out_coords_for_bhld,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.host_coordinates",
+                host_coords,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.indirect_sizes_from_op",
+                lambda op: {},
+            ),
+            config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
+        ):
+            with self.assertRaisesRegex(
+                Unsupported,
+                "reads auto-tiled producer.*buf0.*cannot join them.*same "
+                "shared output dimension at the same split count",
+            ):
+                _apply_span_overflow(_graph([producer, consumer]))
+
+    def test_reduction_consumer_still_terminates_its_group(self):
+        """A Reduction consumer joining flushes the group immediately, so it
+        remains the last member and each auto-tiled producer still feeds at most
+        one reduction consumer.  Allowing Reduction -> Reduction did not relax
+        that: a second matmul reading the same producer is still rejected, with
+        the distinct multi-consumer message."""
+        producer = _reduction_op(
+            _E2E_SHAPE, name="buf0", reduction_type=BATCH_MATMUL_OP
+        )
+        consumer1 = _reduction_op(
+            _E2E_SHAPE, name="buf1", reduction_type=BATCH_MATMUL_OP
+        )
+        consumer2 = _reduction_op(
+            _E2E_SHAPE, name="buf2", reduction_type=BATCH_MATMUL_OP
+        )
+        for mm in (consumer1, consumer2):
+            mm.get_read_writes = MagicMock(
+                return_value=SimpleNamespace(
+                    reads={
+                        MemoryDep(
+                            "buf0",
+                            sympy.Symbol("h"),
+                            (sympy.Symbol("h"),),
+                            (8195,),
+                        )
+                    },
+                    writes=_default_read_writes_for_output(
+                        mm.get_name(), _E2E_SHAPE, mm.layout
+                    ).writes,
+                )
+            )
+
+        def fake_plan(op, _max_cores):
+            return self._fake_plan(1 if op.get_name() == "buf0" else 2, 5)
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+                fake_plan,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
+                _out_coords_for_bhld,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.host_coordinates",
+                lambda layout, dep, indirect: [
+                    sympy.Symbol("b"),
+                    sympy.Symbol("l"),
+                    sympy.Symbol("x"),
+                    sympy.Symbol("y"),
+                ],
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.indirect_sizes_from_op",
+                lambda op: {},
+            ),
+            config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
+        ):
+            with self.assertRaisesRegex(
+                Unsupported,
+                "already auto-tiled and joined by another reduction consumer.*"
+                "multiple consumers sharing one auto-tiled producer is not yet "
+                "supported",
+            ):
+                _apply_span_overflow(_graph([producer, consumer1, consumer2]))
+
+    def test_two_independent_reductions_still_produce_separate_groups(self):
+        """Letting a Reduction open a run must not merge unrelated neighbours.
+        With no read edge between them, two Reductions still land in their own
+        groups with distinct hint_ids, exactly as when each was emitted as a
+        closed singleton."""
+        red0 = _reduction_op(_E2E_SHAPE, name="buf0", reduction_type=BATCH_MATMUL_OP)
+        red1 = _reduction_op(_E2E_SHAPE, name="buf1", reduction_type="sum")
+
+        def fake_plan(op, _max_cores):
+            return self._fake_plan(1, 5)
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+                fake_plan,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
+                _out_coords_for_bhld,
+            ),
+            config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
+        ):
+            groups = _apply_span_overflow(_graph([red0, red1]))
+
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(groups[0][0], [red0])
+        self.assertEqual(groups[1][0], [red1])
+        self.assertEqual(groups[0][1][0][0], _SPAN_OVERFLOW_HINT_ID)
+        self.assertEqual(groups[1][1][0][0], _SPAN_OVERFLOW_HINT_ID + 1)
 
     def test_reduction_range_tile_never_joins(self):
         """A reduction that tiles its *reduction* range (``is_reduction=True``)
@@ -689,7 +1589,7 @@ class TestSpanOverflowGroups(InductorTestCase):
         sharing a per-tile loop nest would be wrong.  This is a batch-matmul
         (so it passes the matmul gate) identical to the passing matmul-join
         case except its plan is flagged ``is_reduction=True`` -- the
-        ``is_reduction`` guard in ``_reduction_shares_group_tiled_dim`` alone
+        ``is_reduction`` guard in ``_consumer_shares_group_tiled_dim`` alone
         must flip join -> reject (#3217).  The auto planner never emits such a
         plan today (``SpanOverflowTileLevel.is_reduction`` is always False), so
         this guard is belt-and-suspenders against a future planner change."""
@@ -768,8 +1668,8 @@ class TestSpanOverflowGroups(InductorTestCase):
         ):
             with self.assertRaisesRegex(
                 Unsupported,
-                "already auto-tiled producer.*grouping currently only synchronizes "
-                "compatible contiguous pointwise ops",
+                "reads auto-tiled producer.*cannot join them.*same shared "
+                "output dimension at the same split count",
             ):
                 _apply_span_overflow(_graph([producer, reduction]))
 
@@ -858,8 +1758,8 @@ class TestSpanOverflowGroups(InductorTestCase):
         ):
             with self.assertRaisesRegex(
                 Unsupported,
-                "already auto-tiled producer.*buf0.*grouping currently only "
-                "synchronizes compatible contiguous pointwise ops",
+                "reads auto-tiled producer.*buf0.*cannot join them.*same "
+                "shared output dimension at the same split count",
             ):
                 _apply_span_overflow(_graph([op0, op1]))
 
@@ -994,8 +1894,7 @@ class TestSpanOverflowGroups(InductorTestCase):
         ):
             with self.assertRaisesRegex(
                 Unsupported,
-                "already auto-tiled producer.*grouping currently only synchronizes "
-                "compatible contiguous pointwise ops",
+                "already-tiled producer.*not in an open group this op can join",
             ):
                 _apply_span_overflow(_graph([producer, consumer]))
 
@@ -2201,8 +3100,339 @@ class TestSpanOverflowLargeShapeContract(InductorTestCase):
         self.assertEqual(auto_wrapped[0].loop_count, manual_wrapped[0].loop_count)
 
 
+def _forced_span_plan_on_dim1(split_count, expect_size):
+    """Force every op whose output dim 1 is ``expect_size`` onto one plan.
+
+    Keys on output shape rather than buffer name: a Reduction graph lowers to
+    more buffers than a two-op pointwise one, and their names are not knowable
+    without first running it.  Anything not carrying the shared tiled dim falls
+    back to the real planner rather than being handed a nonsensical tile.
+
+    Forcing is necessary rather than convenient: two ops' independent span
+    searches do not land on the same split for a toy shape (see
+    ``test_pointwise_to_non_matmul_reduction_join_numeric``, whose earlier
+    organic-plan version failed on hardware for exactly that reason), so
+    without this the join under test would never form.
+
+    Divisibility is checked here rather than left to ``coarse_tile``, so a bad
+    ``split_count`` fails as a plain assertion in the test setup instead of as
+    an ``Unsupported`` from deep in the pass.
+    """
+    real_plan = plan_span_overflow_tile
+    assert expect_size % split_count == 0
+
+    def forced(op, max_cores):
+        ranges = list(getattr(op.data, "ranges", None) or [])
+        try:
+            shares_tiled_dim = len(ranges) >= 2 and int(ranges[1]) == expect_size
+        except (TypeError, ValueError):
+            shares_tiled_dim = False
+        if not shares_tiled_dim:
+            return real_plan(op, max_cores)
+        return SpanOverflowTilePlan(
+            levels=(
+                SpanOverflowTileLevel(selected_host_dim=1, split_count=split_count),
+            ),
+            chunking_infos=(
+                ChunkingInfo(
+                    total_bytes=1,
+                    per_core_span=1,
+                    core_split_estimate=1,
+                    selected_device_dim_size=split_count,
+                    selected_device_span_stride_elems=1,
+                    selected_host_dim=1,
+                    stick_elems=64,
+                    reason="forced for join validation",
+                ),
+            ),
+            reason="forced for join validation",
+        )
+
+    return forced
+
+
 class TestSpanOverflowPointwiseCodegen(InductorTestCase):
     """Small codegen test for scheduler/codegen LoopSpec emission."""
+
+    _PLAN_PATCH = (
+        "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile"
+    )
+
+    def _assert_one_loop_spec(self, fn, *args, expect_ops=()):
+        """Compile ``fn`` for real and assert its group emits ONE LoopSpec.
+
+        Kernel launch/compile are mocked, so this stops at generated source --
+        one layer deeper than the grouping unit tests (which end at the group
+        decision) and one layer shallower than
+        ``TestSpanOverflowNumericValidation`` (which executes).  It proves the
+        group survives ``coarse_tile`` and reaches codegen as a single shared
+        loop, which the grouping tests alone cannot show.
+        """
+        with (
+            patch(self._PLAN_PATCH, _forced_span_plan_on_dim1(5, 20)),
+            patch(_LAUNCH_JOBPLAN),
+            patch(_PREPARE_KERNEL),
+            patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *args)
+        self.assertTrue(source_codes)
+        src = source_codes[0]
+        self.assertEqual(
+            src.count("LoopSpec("),
+            1,
+            "producer and consumer should share ONE LoopSpec -- source:\n" + src,
+        )
+        self.assertIn("count=sympify('5')", src)
+        for op_name in expect_ops:
+            self.assertIn(f"op='{op_name}'", src)
+        return src
+
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_reduction_producer_to_pointwise_codegen_shares_one_loop_spec(self):
+        """Reduction producer -> Pointwise consumer reaches codegen as one loop.
+
+        The grouping tests prove the pass *decides* to group these; this proves
+        the decision survives ``coarse_tile`` and is emitted as a single shared
+        ``LoopSpec`` rather than two loops or none.
+
+        The matmul equivalents cannot be covered this way yet: any auto-tiled
+        group containing a matmul is stopped in ``_insert_read_copy_ops`` before
+        codegen (the #3293 regression -- see
+        ``test_bmm_to_pointwise_join_numeric``). That blocks #3218's already
+        shipped `pw -> bmm` case too, not just the ones added here.
+        """
+        x = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
+        self._assert_one_loop_spec(
+            lambda x: x.sum(dim=2) * 2.0, x, expect_ops=("sum", "mul")
+        )
+
+    # TODO(copy-out-writer-advance): this is a KNOWN WRONG WRITE, not an
+    # unexplained failure, and must not be un-xfailed without a fix.
+    #
+    # validate_writer_tile_advance (#3678) rejects this group with
+    #   "writer-advance check failed for 'coarse_tile_copy_buf1' -- level 0
+    #    tiles output dims [1] but output_tiled_dims has no extents for that
+    #    level, so its write pointer would not advance there."
+    # and it is right to.  _insert_copy_op keys the synthesized copy-out
+    # writer's per-level extents by RAW dim index, while _tiled_dims_for_dep
+    # matches those keys against the SQUEEZED dN symbols of dep.index.  This
+    # group's terminal reduction has output [1, 20] -> divided [1, 4]; the
+    # leading unit dim is squeezed away, so the raw key 1 matches no symbol,
+    # output_tiled_dims comes back empty, and every tile is written on top of
+    # tile 0.
+    #
+    # Not gated in the pass, because there is no clean predicate: a Reduction
+    # consumer joining a Reduction-rooted run is the same code path for
+    # Reduction -> Reduction and for Reduction -> matmul, and the latter works
+    # (test_reduction_producer_to_bmm_codegen_shares_one_loop_spec, and its
+    # on-device counterpart).  What separates them here is output shape, not
+    # direction.  Gating the path disabled ten working tests.
+    #
+    # A first attempt at the real fix -- keying by squeezed position, the same
+    # mapping _insert_read_copy_ops already builds -- fixed this test and two
+    # numeric xfails (test_lm_head_matmul_join_numeric went from 48727/49152
+    # (99.14%) mismatches to 999/49152 (2.03%) against a 1.59% untiled
+    # baseline), but regressed test_hint_flash_attention_v2_divide_in_scope to
+    # 86.2% wrong.  So the two conventions are reconciled somewhere further
+    # down and a correct fix needs that path understood, not just this keying
+    # changed.
+    @unittest.expectedFailure
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_reduction_producer_to_reduction_codegen_shares_one_loop_spec(self):
+        """Reduction producer -> Reduction consumer reaches codegen as one loop.
+
+        Neither side is a matmul, so this exercises the Reduction-to-Reduction
+        join end of the grouping change at codegen depth.  The group is flushed
+        as soon as the second reduction joins, so one LoopSpec is also the
+        assertion that nothing further was folded in.
+
+        Currently xfailed on a known wrong write -- see the TODO above.  The
+        grouping decision this test exists to cover is still pinned at
+        decision depth by test_non_matmul_reduction_producer_groups_with_
+        reduction_consumer, which does not go through codegen.
+        """
+        x = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
+        self._assert_one_loop_spec(
+            lambda x: x.sum(dim=2).sum(dim=-1), x, expect_ops=("sum",)
+        )
+
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_pointwise_producer_to_pointwise_codegen_shares_one_loop_spec(self):
+        """Pointwise -> Pointwise, the oldest supported direction (#3058).
+
+        ``test_codegen_contains_auto_span_overflow_loop_spec`` covers a *single*
+        tiled op; this covers a two-op producer/consumer group, so the matrix
+        below has a baseline that predates this branch.
+        """
+        x = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
+        y = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
+        self._assert_one_loop_spec(
+            lambda x, y: (x + y) * 2.0, x, y, expect_ops=("add", "mul")
+        )
+
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_pointwise_producer_to_reduction_codegen_shares_one_loop_spec(self):
+        """Pointwise -> Reduction (#3270), at codegen depth.
+
+        Its on-device counterpart
+        (``test_pointwise_to_non_matmul_reduction_join_numeric``) already
+        passes; this pins the same direction one layer earlier so a codegen
+        regression is distinguishable from an execution one.
+        """
+        x = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
+        y = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
+        self._assert_one_loop_spec(
+            lambda x, y: (x + y).sum(dim=2), x, y, expect_ops=("add", "sum")
+        )
+
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_reduction_producer_to_bmm_codegen_shares_one_loop_spec(self):
+        """Reduction -> matmul reaches codegen -- the one matmul direction that
+        currently can.
+
+        Worth pinning precisely because it is the exception.  Every other
+        matmul direction is stopped in ``_insert_read_copy_ops`` (see the
+        xfailed tests below).  This one survives only because ``keepdim=True``
+        leaves M=1, which is squeezed out of the iteration space and happens to
+        make the ranks line up again -- so it is a shape coincidence, not
+        matmul support.  If the read-copy limitation is ever fixed, this should
+        keep passing; if this starts failing, the squeeze behaviour changed.
+        """
+        x = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
+        b = torch.randn(1, 20, 64, 32, dtype=torch.float16).to("spyre")
+        self._assert_one_loop_spec(
+            lambda x, b: torch.matmul(x.sum(dim=2, keepdim=True), b),
+            x,
+            b,
+            expect_ops=("sum", BATCH_MATMUL_OP),
+        )
+
+    # The three matmul directions below are all stopped in
+    # _insert_read_copy_ops before codegen -- a matmul operand does not use
+    # every loop variable, so the iteration space cannot be walked onto its
+    # dimensions (see the TODO there).  They are xfailed rather than omitted so
+    # the matrix is complete and they flip green on their own once that is
+    # fixed.
+    #
+    # Note the first one is #3218's already-shipped pointwise -> matmul case,
+    # not a direction this branch adds: test_lm_head_matmul_join_numeric passed
+    # when #3270 added it and was xfailed by #3293. So the blocker predates and
+    # outlives this change.
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_pointwise_producer_to_bmm_codegen_shares_one_loop_spec(self):
+        """Pointwise -> matmul (#3218's shipped direction).
+
+        Was xfailed as TODO(span-overflow-read-copy): a tiled matmul could not
+        read a full-size buffer, because the iteration space was walked onto
+        the input's dimensions positionally and a matmul operand does not use
+        every loop variable (A has no N).  #3612 ("coarse tiling: optional read
+        copy") reworked that path and the direction now reaches codegen, so the
+        xfail is removed rather than re-explained.
+
+        Kept for the history it records: this was a REGRESSION, not a missing
+        feature.  Its on-device counterpart test_lm_head_matmul_join_numeric
+        passed when #3270 added it (21 Jul) and was marked expectedFailure by
+        #3293 (28 Jul) with no stated cause -- #3293's own note called the
+        xfails "a deliberate decision to unblock the merge, not a claim about a
+        specific bisected root cause".  If this starts failing again, that is
+        the history to read first.
+        """
+        a = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
+        b = torch.randn(1, 20, 64, 32, dtype=torch.float16).to("spyre")
+        self._assert_one_loop_spec(
+            lambda a, b: torch.matmul(a * 2.0, b),
+            a,
+            b,
+            expect_ops=("mul", BATCH_MATMUL_OP),
+        )
+
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_bmm_producer_to_pointwise_codegen_shares_one_loop_spec(self):
+        """matmul -> Pointwise, added by this branch.
+
+        Was xfailed as TODO(span-overflow-read-copy) for the same reason as the
+        direction above, and unblocked by the same change (#3612).
+        """
+        a = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
+        b = torch.randn(1, 20, 64, 32, dtype=torch.float16).to("spyre")
+        self._assert_one_loop_spec(
+            lambda a, b: torch.matmul(a, b) * 2.0,
+            a,
+            b,
+            expect_ops=(BATCH_MATMUL_OP, "mul"),
+        )
+
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_bmm_producer_to_reduction_codegen_shares_one_loop_spec(self):
+        """matmul -> Reduction, added by this branch.
+
+        Was xfailed as TODO(span-overflow-read-copy) with the two directions
+        above -- same cause, and unblocked by the same change (#3612).
+        """
+        a = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
+        b = torch.randn(1, 20, 64, 32, dtype=torch.float16).to("spyre")
+        self._assert_one_loop_spec(
+            lambda a, b: torch.matmul(a, b).sum(dim=2),
+            a,
+            b,
+            expect_ops=(BATCH_MATMUL_OP, "sum"),
+        )
 
     @patch("torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES", 8192)
     @config.patch(
@@ -2246,6 +3476,9 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
     def test_reduction_input_span_codegen_contains_auto_loop_spec(self):
         """Decision xfail: failing in CI (Actions run 30385154736, job
         90362759197) on PR #3293. We've decided to xfail the coarse tiling
+
+        TODO(3293-decision-xfail): investigate and un-xfail; no root cause
+        was bisected when this was marked.
         tests to allow us to merge to main -- deliberate decision to unblock
         the merge, not a claim about a specific bisected root cause. Un-xfail
         once the underlying regression is investigated and fixed.
@@ -2360,6 +3593,9 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
     def test_auto_span_overflow_matches_equivalent_spyre_hint_loop_spec(self):
         """Decision xfail: failing in CI (Actions run 30385154736, job
         90362759197) on PR #3293. We've decided to xfail the coarse tiling
+
+        TODO(3293-decision-xfail): investigate and un-xfail; no root cause
+        was bisected when this was marked.
         tests to allow us to merge to main -- deliberate decision to unblock
         the merge, not a claim about a specific bisected root cause. Un-xfail
         once the underlying regression is investigated and fixed.
@@ -2542,6 +3778,457 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
                 rtol=0.05,
             )
 
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_pointwise_to_pointwise_join_numeric(self):
+        """Pointwise -> Pointwise executed for real against a CPU reference.
+
+        This is the oldest automatic direction (#3058) and the only one whose
+        numbers had never been checked: the pointwise coverage was codegen-only
+        (kernel launch mocked, source text asserted), and the sole on-device
+        test in this class covered Pointwise -> Reduction.  So a group whose
+        members are all pointwise was verified to be *decided* and *emitted*
+        correctly, never to compute correctly.
+
+        Not a direction this branch adds -- included because the gap is only
+        visible once the matrix is written out, and this path is not blocked by
+        the read-copy limitation that xfails the matmul ones.
+
+        The plan is forced so both ops tile host_dim=1 at split 5; without it
+        their independent span searches need not agree on a toy shape and the
+        join under test would not form.  Kernel launch is NOT mocked.
+        """
+        torch.manual_seed(0xAFFE)
+        shape = (1, 20, 16, 64)
+        x = torch.randn(shape, dtype=torch.float16)
+        y = torch.randn(shape, dtype=torch.float16)
+
+        def fn(x, y):
+            return (x + y) * 2.0
+
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+            _forced_span_plan_on_dim1(5, 20),
+        ):
+            compare_with_cpu(
+                fn,
+                x,
+                y,
+                run_compile=True,
+                run_eager=False,
+                source_check=self._assert_single_loop_spec("add", "mul"),
+                atol=0.05,
+                rtol=0.05,
+            )
+
+    # The three Reduction-producer directions below execute a group whose
+    # PRODUCER is a tiled reduction reading a full-size buffer (a graph input).
+    #
+    # All three used to die in dxp_standalone.  After #3612 ("coarse tiling:
+    # optional read copy") reworked the read-copy path, Reduction -> Pointwise
+    # and Reduction -> matmul both execute correctly and are no longer xfailed;
+    # only Reduction -> Reduction still aborts.  That is worth noting rather
+    # than quietly deleting: the diagnosis recorded below blamed the backend's
+    # DDL conversion, and two thirds of it turned out to be reachable from the
+    # read-copy path instead.  Whether the surviving case has the same cause or
+    # a genuinely different one has not been re-established.
+    #
+    # The evidence below is kept as originally captured, and describes the
+    # pre-#3612 state.  Isolated to the read-copy path, not to grouping:
+    #
+    #   lone sum, NO tiling                PASS
+    #   lone sum, TILED (no group at all)  dxp_standalone SIGABRT
+    #   sum -> pw, NO tiling               PASS
+    #   sum -> pw, TILED (grouped)         dxp_standalone SIGABRT
+    #
+    # A single tiled sum with no consumer fails identically, so the group is
+    # irrelevant.  What matters is what the tiled reduction reads:
+    # test_pointwise_to_non_matmul_reduction_join_numeric passes with a tiled
+    # sum too, but there the sum reads its in-group producer rather than a
+    # full-size buffer.
+    #
+    # Same root as the matmul xfails, one stage later:
+    # _insert_read_copy_ops handles a tiled *Pointwise* reading a full buffer
+    # (test_pointwise_to_pointwise_join_numeric passes, and its add reads graph
+    # inputs) but not a tiled *Reduction*.  A matmul trips the rank assert; a
+    # sum clears it and yields a kernel the backend rejects.
+    #
+    # The backend's own diagnostic, captured by re-running its command:
+    #
+    #   terminate called after throwing an instance of 'DtException'
+    #     what():  DtException: Could not find any suitable dimension mapping,
+    #              file /project_src/deeptools/ddc/ddl/ddl_conversion.cpp line 2497
+    #
+    # So deeptools cannot map the tiled reduction's dimensions during DDL
+    # conversion, throws, and nobody catches it -- hence SIGABRT rather than a
+    # diagnosable error.  This is NOT #3414, which is a different failure in a
+    # different place ("Immediate value out of boundary ... L3_ADDEARIMM").
+    #
+    # Codegen depth for all three passes -- see
+    # TestSpanOverflowPointwiseCodegen -- so these isolate execution alone.
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_reduction_to_pointwise_join_numeric(self):
+        """Reduction -> Pointwise executed for real, against a CPU reference.
+
+        Was xfailed as TODO(deeptools-ddl-dim-mapping): codegen succeeded and
+        deeptools then threw DtException "Could not find any suitable dimension
+        mapping" (ddl_conversion.cpp:2497), uncaught, so the process aborted.
+        #3612 reworked the read-copy path and this now executes and matches CPU
+        -- so the abort was reachable from read-copy construction rather than
+        being purely a backend limitation, whatever remains true of the
+        Reduction -> Reduction case below.
+        """
+        torch.manual_seed(0xAFFE)
+        x = torch.randn(1, 20, 16, 64, dtype=torch.float16)
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+            _forced_span_plan_on_dim1(5, 20),
+        ):
+            compare_with_cpu(
+                lambda x: x.sum(dim=2) * 2.0,
+                x,
+                run_compile=True,
+                run_eager=False,
+                atol=0.05,
+                rtol=0.05,
+            )
+
+    @unittest.expectedFailure
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_reduction_to_reduction_join_numeric(self):
+        """Reduction -> Reduction executed for real. Blocked in dxp_standalone.
+
+        TODO(deeptools-ddl-dim-mapping): un-xfail with the direction above --
+        same DtException from the same place.
+        """
+        torch.manual_seed(0xAFFE)
+        x = torch.randn(1, 20, 16, 64, dtype=torch.float16)
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+            _forced_span_plan_on_dim1(5, 20),
+        ):
+            compare_with_cpu(
+                lambda x: x.sum(dim=2).sum(dim=-1),
+                x,
+                run_compile=True,
+                run_eager=False,
+                atol=0.05,
+                rtol=0.05,
+            )
+
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_reduction_to_bmm_join_numeric(self):
+        """Reduction -> matmul executed for real, against a CPU reference.
+
+        Was xfailed as TODO(deeptools-ddl-dim-mapping) with the same
+        DtException as the other Reduction-producer directions; #3612 unblocked
+        it.
+
+        Note this shape reached codegen even before #3612 (keepdim=True leaves
+        M=1, which squeezes out and realigns the ranks -- see
+        ``test_reduction_producer_to_bmm_codegen_shares_one_loop_spec``), so it
+        was the only matmul cell where execution was reachable at all.  It now
+        matches CPU, so the realignment produces correct numbers and not merely
+        a kernel.
+        """
+        torch.manual_seed(0xAFFE)
+        x = torch.randn(1, 20, 16, 64, dtype=torch.float16) * 0.1
+        b = torch.randn(1, 20, 64, 32, dtype=torch.float16) * 0.1
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+            _forced_span_plan_on_dim1(5, 20),
+        ):
+            compare_with_cpu(
+                lambda x, b: torch.matmul(x.sum(dim=2, keepdim=True), b),
+                x,
+                b,
+                run_compile=True,
+                run_eager=False,
+                atol=0.05,
+                rtol=0.05,
+            )
+
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_bmm_to_pointwise_join_numeric_via_manual_hint(self):
+        """The BMM -> PW group this branch builds automatically, executed for
+        real -- but requested with a manual ``spyre_hint`` instead.
+
+        Same shapes, same tiled dim, same resulting group as
+        ``test_bmm_to_pointwise_join_numeric``; only *who asks for the tile*
+        differs.  This passes, which localizes the gap precisely: grouping a
+        BMM producer with a pointwise consumer, the shared loop nest, and the
+        per-tile addressing are all correct on hardware for this exact case.
+
+        The automatic version is xfailed because the two callers reach
+        different code: ``_maybe_coarse_tile_hints`` runs PRE-stickification,
+        so the operands still carry a plain ``FixedLayout`` and
+        ``_insert_read_copy_ops`` takes its ``else`` branch, while
+        ``_maybe_coarse_tile_span_overflow`` runs POST-stickification, hits the
+        ``FixedTiledLayout`` branch, and cannot map a bmm's iteration space
+        onto an operand's dimensions (see the TODO there).
+
+        Kept here rather than in ``test_coarse_tile_e2e.py`` because its value
+        is as the control for the two xfailed tests above -- it is what they
+        should look like once that branch is fixed.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        torch.manual_seed(0xAFFE)
+        B, H, M, K, N = 1, 20, 16, 64, 32
+        a = torch.randn(B, H, M, K, dtype=torch.float16) * 0.1
+        b = torch.randn(B, H, K, N, dtype=torch.float16) * 0.1
+        for dim_name, size in (("B", B), ("H", H), ("M", M), ("K", K), ("N", N)):
+            _pnd.declare_tensor_dim(dim_name, size)
+
+        def fn(a, b):
+            _pnd.name_tensor_dims(a, ["B", "H", "M", "K"])
+            _pnd.name_tensor_dims(b, ["B", "H", "K", "N"])
+            with spyre_hint(num_tiles_per_dim={"H": 5}):
+                return torch.matmul(a, b) * 2.0
+
+        compare_with_cpu(
+            fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
+        )
+
+    def _assert_single_loop_spec(self, *expected_ops):
+        """Return a source_check asserting one shared LoopSpec over the ops.
+
+        Load-bearing: without it these pass even if the join never happened
+        and each op got its own loop (or tiling was skipped entirely), which
+        is exactly the failure mode they exist to catch.
+        """
+
+        def check(src):
+            loop_spec_count = src.count("LoopSpec(")
+            present = {name: (f"op='{name}'" in src) for name in expected_ops}
+            print(
+                f"[join evidence] LoopSpec count={loop_spec_count}; "
+                + "; ".join(f"op='{k}' present={v}" for k, v in present.items())
+            )
+            self.assertEqual(
+                loop_spec_count,
+                1,
+                "expected producer and consumer to share one LoopSpec (a real "
+                "join), since plan_span_overflow_tile was forced to agree for "
+                "both ops -- source:\n" + src,
+            )
+            for name, found in present.items():
+                self.assertTrue(found, f"expected op='{name}' in source:\n{src}")
+
+        return check
+
+    # TODO(span-overflow-read-copy): the FAILURE MODE CHANGED with #3612
+    # ("coarse tiling: optional read copy").  The codegen half of this
+    # direction, in TestSpanOverflowPointwiseCodegen, now passes and is no
+    # longer xfailed -- the read copy gets built.  What remains is worse than
+    # the old loud failure: the kernel compiles, executes, and returns WRONG
+    # NUMBERS (compiled-spyre vs CPU mismatch), so this xfail is now masking a
+    # silent wrong-answer path rather than a refusal to compile.
+    #
+    # Most likely cause is the positional walk described below, which is still
+    # present: it pairs each of the buffer's non-unit dims with the next
+    # iteration extent by position.  Instrumenting _resize_device_layout on
+    # this shape shows it handed tile_size=[1,4,32,64] for a buffer of
+    # [1,20,64,32] -- the trailing dims transposed -- so the layout it builds
+    # does not describe the data.  Verify that before assuming a backend bug.
+    #
+    # Blocked by a pre-existing coarse_tile.py defect, not by the grouping this
+    # branch adds: _insert_read_copy_ops cannot build a copy-buffer layout for a
+    # tiled *Reduction* that reads a full-size buffer from outside its loop
+    # group.  It aligns dep.size (the ITERATION space -- for a BMM that is
+    # H/M/N/K) positionally against the input buffer's non-unit dims, which only
+    # coincide for Pointwise ops.  For arg0_1 [1,20,16,64] read as
+    # 1024*d0 + 64*d1 + d3, tile_ranges=[4,16,32,64] has four entries for three
+    # non-unit buffer dims and it asserts.
+    #
+    # Verified pre-existing two ways: a LONE tiled BMM with no consumer at all
+    # (no grouping possible) raises the same assert, and the #3218-era
+    # test_lm_head_matmul_join_numeric below -- already expectedFailure before
+    # this branch -- fails with the identical message.  So automatic
+    # span-overflow tiling of a BMM reading graph inputs has never worked,
+    # grouped or not.
+    #
+    # The grouping decision these validate is fully covered and passing in
+    # TestSpanOverflowGroups; only on-device execution is blocked.  Remove both
+    # decorators once _insert_read_copy_ops handles Reduction iteration spaces.
+    @unittest.expectedFailure
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_bmm_to_pointwise_join_numeric(self):
+        """A BMM producer whose Pointwise consumer joins its group -- the
+        BMM -> PW direction -- executed for real and compared against a CPU
+        reference.
+
+        Every other BMM -> PW test mocks kernel launch and inspects the
+        grouping decision only.  A group can be structurally perfect and still
+        compute wrong values: the producer's per-tile output becomes
+        loop-internal scratch that the consumer reads in the same iteration,
+        and nothing but a real run proves that per-tile addressing pairs the
+        right slices.
+
+        The plan is forced so both ops tile host_dim=1 at split 5 (the
+        technique the sibling pointwise test settled on after an organic-plan
+        version failed on hardware, because the two ops' independent span
+        searches do not land on the same split for a toy shape).  Kernel
+        launch is NOT mocked, so the forced plan still runs for real.
+        """
+        torch.manual_seed(0xAFFE)
+        H = 20
+        a = torch.randn(1, H, 16, 64, dtype=torch.float16)
+        b = torch.randn(1, H, 64, 32, dtype=torch.float16)
+
+        def fn(a, b):
+            return torch.matmul(a, b) * 2.0
+
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+            _forced_span_plan_on_dim1(5, H),
+        ):
+            compare_with_cpu(
+                fn,
+                a,
+                b,
+                run_compile=True,
+                run_eager=False,
+                source_check=self._assert_single_loop_spec(BATCH_MATMUL_OP, "mul"),
+                atol=0.05,
+                rtol=0.05,
+            )
+
+    # TODO(span-overflow-read-copy): the FAILURE MODE CHANGED with #3612
+    # ("coarse tiling: optional read copy").  The codegen half of this
+    # direction, in TestSpanOverflowPointwiseCodegen, now passes and is no
+    # longer xfailed -- the read copy gets built.  What remains is worse than
+    # the old loud failure: the kernel compiles, executes, and returns WRONG
+    # NUMBERS (compiled-spyre vs CPU mismatch), so this xfail is now masking a
+    # silent wrong-answer path rather than a refusal to compile.
+    #
+    # Most likely cause is the positional walk described below, which is still
+    # present: it pairs each of the buffer's non-unit dims with the next
+    # iteration extent by position.  Instrumenting _resize_device_layout on
+    # this shape shows it handed tile_size=[1,4,32,64] for a buffer of
+    # [1,20,64,32] -- the trailing dims transposed -- so the layout it builds
+    # does not describe the data.  Verify that before assuming a backend bug.
+    #
+    # Blocked by a pre-existing coarse_tile.py defect, not by the grouping this
+    # branch adds: _insert_read_copy_ops cannot build a copy-buffer layout for a
+    # tiled *Reduction* that reads a full-size buffer from outside its loop
+    # group.  It aligns dep.size (the ITERATION space -- for a BMM that is
+    # H/M/N/K) positionally against the input buffer's non-unit dims, which only
+    # coincide for Pointwise ops.  For arg0_1 [1,20,16,64] read as
+    # 1024*d0 + 64*d1 + d3, tile_ranges=[4,16,32,64] has four entries for three
+    # non-unit buffer dims and it asserts.
+    #
+    # Verified pre-existing two ways: a LONE tiled BMM with no consumer at all
+    # (no grouping possible) raises the same assert, and the #3218-era
+    # test_lm_head_matmul_join_numeric below -- already expectedFailure before
+    # this branch -- fails with the identical message.  So automatic
+    # span-overflow tiling of a BMM reading graph inputs has never worked,
+    # grouped or not.
+    #
+    # The grouping decision these validate is fully covered and passing in
+    # TestSpanOverflowGroups; only on-device execution is blocked.  Remove both
+    # decorators once _insert_read_copy_ops handles Reduction iteration spaces.
+    @unittest.expectedFailure
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_bmm_to_reduction_join_numeric(self):
+        """A BMM producer whose Reduction consumer joins its group -- the
+        BMM -> Reduction direction -- executed for real.
+
+        This is the direction with the most room to go silently wrong: a
+        Reduction consumer paired against the wrong producer slice does not
+        crash, it computes a partial sum and returns it.  A CPU comparison is
+        the only thing that distinguishes that from a correct result, which is
+        why this test exists rather than relying on the grouping unit tests.
+
+        ``sum(dim=2)`` reduces a dim that is neither op's tiled dim, so the
+        tiled dim stays an output range for both -- the case the join is
+        licensed for.  The complementary illegal case (producer tiling a dim
+        that is the consumer's reduction range) is covered structurally by
+        ``test_bmm_to_bmm_rejected_when_producer_tiles_consumer_reduction_dim``,
+        which asserts it is refused rather than executed.
+        """
+        torch.manual_seed(0xAFFE)
+        H = 20
+        a = torch.randn(1, H, 16, 64, dtype=torch.float16)
+        b = torch.randn(1, H, 64, 32, dtype=torch.float16)
+
+        def fn(a, b):
+            return torch.matmul(a, b).sum(dim=2)
+
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+            _forced_span_plan_on_dim1(5, H),
+        ):
+            compare_with_cpu(
+                fn,
+                a,
+                b,
+                run_compile=True,
+                run_eager=False,
+                source_check=self._assert_single_loop_spec(BATCH_MATMUL_OP, "sum"),
+                atol=0.05,
+                rtol=0.05,
+            )
+
+    # TODO(span-overflow-read-copy): the on-device half of
+    # test_pointwise_producer_to_bmm_codegen_shares_one_loop_spec, whose
+    # codegen half now passes after #3612 and is no longer xfailed.
+    #
+    # Added PASSING by #3270 on 21 Jul; marked expectedFailure by #3293 on
+    # 28 Jul with no stated cause.  Before #3612 it failed in the read-copy
+    # path before codegen -- the same rank assert as the codegen xfails, and
+    # explicitly "not a numeric problem".  That is no longer true: it now
+    # compiles, runs, and is numerically wrong, at
+    # tiled mismatches=48727/49152 (99.14%) against untiled 781/49152 (1.59%)
+    # on the same reference.  A ~99% mismatch is not accumulation noise; the
+    # transposed tile layout described above is the first thing to rule out.
     @unittest.expectedFailure
     def test_lm_head_matmul_join_numeric(self):
         """F.linear with an oversized vocab-dim weight: the restickified

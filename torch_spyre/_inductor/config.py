@@ -97,14 +97,17 @@ core_id_k_fast_emission: bool = (
     os.environ.get("SPYRE_CORE_ID_K_FAST_EMISSION", "1") == "1"
 )
 
-# Disable splitting on spatial image dimensions (i, j) for conv2d operations when stride > 1.
-# When enabled (default True), splits are disabled only for strided convolutions to prevent
-# DSM/strided memory access complexity that degrades correctness. For stride=1 convolutions,
-# splitting may still occur unless the backend heuristics choose not to split.
-# Set SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT=0 to allow splitting on i/j dims regardless of stride.
+# Strided conv spatial splits produce incorrect per-core DSM addressing.
+# Set SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT=0 to permit them.
 disable_conv2d_spatial_split: bool = (
     os.environ.get("SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT", "1") == "1"
 )
+
+# When True, disable PyTorch's remove_noop_ops elimination of aten.copy.default.
+# Required for WSR variants that intentionally insert copies (e.g. flash_v2)
+# inside WSR loops. Off by default — enabling this for models that don't need
+# it may prevent harmless copy removal and hurt performance.
+disable_copy_opt: bool = os.environ.get("DISABLE_COPY_OPT", "0") == "1"
 
 # When True (default), HBM tensor addresses are emitted as runtime symbols
 # with !sdscbundle.input_arg<index> parameters and input_arg_extract ops

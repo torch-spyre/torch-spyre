@@ -273,8 +273,6 @@ _CONV2D_PAD_DIM_J = CONV2D_DIM_LABELS[3]
 _CONV2D_WINDOW_DIM_I = CONV2D_DIM_LABELS[-2]
 _CONV2D_WINDOW_DIM_J = CONV2D_DIM_LABELS[-1]
 
-_CONV2D_SPATIAL_DIM_NAMES = (_CONV2D_PAD_DIM_I, _CONV2D_PAD_DIM_J)
-
 
 def _is_conv2d_kernel_tensor(arg: TensorArg, tensor_position: int | None) -> bool:
     """Check if a tensor is a kernel tensor for conv2d ops.
@@ -1146,16 +1144,12 @@ def _create_sdsc_tensors(
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 offsets[dim] = dim_offset * dim_device_stride
                 # conv2d addresses the difference between device and iteration space sizes
-                # in its spatial dims (i, j) through the
-                # window/padding machinery in _conv2d_sdsc_fields, which already
+                # through the window/padding machinery in _conv2d_sdsc_fields, which already
                 # accounts for the gap between the device extent and the
-                # iteration extent. Emitting a backGap for them double-counts
+                # iteration extent. Emitting a backGap for a conv op double-counts
                 # that gap and corrupts the generated addressing.
                 #
-                if (
-                    not _is_conv(op_spec.op)
-                    and str(dim) not in _CONV2D_SPATIAL_DIM_NAMES
-                ):
+                if not _is_conv(op_spec.op):
                     backGap[dim] = dev_dim_size - it_dim_size
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 

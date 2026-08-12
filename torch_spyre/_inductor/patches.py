@@ -21,6 +21,8 @@ from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
 
+import torch_spyre._inductor.config as spyre_config
+
 
 @contextmanager
 def spyre_data_types():
@@ -140,9 +142,15 @@ def enable_spyre_context(example_inputs: list[InputType]):
     # Prevent remove_noop_ops from eliminating aten.copy.default nodes.
     # That pass treats copy.default as an alias no-op and replaces copy(dst, src)
     # with src, discarding the copy before it reaches lowering.
+    # Guarded by DISABLE_COPY_OPT so models that don't need preserved copies
+    # (e.g. granite) are not affected.
     from torch._inductor.fx_passes.post_grad import noop_registry
 
-    _saved_copy_noop = noop_registry.pop(torch.ops.aten.copy.default, None)
+    _saved_copy_noop = (
+        noop_registry.pop(torch.ops.aten.copy.default, None)
+        if spyre_config.disable_copy_opt
+        else None
+    )
 
     with (
         spyre_data_types(),

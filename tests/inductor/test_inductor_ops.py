@@ -4885,6 +4885,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_conv2d", "test_conv2d_cpu"): {
             "param_sets": {
+                # Patch-embed conv with bias: stride-16 kernel gives a sub-stick
+                # spatial output (W_out == 8 < 64) whose flat H_out*W_out == 64 is
+                # stick-aligned. Regression for the bias broadcast layout bug --
+                # every other case below uses bias=None.
+                "1x6x128_patch16_bias": (
+                    cached_randn((1, 6, 128, 128)),
+                    cached_randn((64, 6, 16, 16)),
+                    cached_randn((64,)),
+                    (0, 0),
+                    (16, 16),
+                    1,
+                ),
                 "1x3x32_ksize3_no_pad": (
                     cached_randn((1, 3, 32, 32)),
                     cached_randn((16, 3, 3, 3)),

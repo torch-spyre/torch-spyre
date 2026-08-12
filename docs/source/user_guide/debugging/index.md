@@ -56,11 +56,31 @@ The following environment variables control the level of diagnostic output:
 | `TORCHINDUCTOR_FORCE_DISABLE_CACHES=1` | Forces full recompilation on every run; ensures you see fresh artifacts, not cached ones |
 | `TORCH_SPYRE_DEBUG=1` | Logs all CPU↔Spyre data transfers, including tensor shapes, layouts, and raw values |
 | `TORCH_COMPILE_DEBUG=1` | Writes intermediate compiler artifacts to a local directory for offline inspection |
-| `SPYRE_INDUCTOR_LOG=1` | *Deprecated.* Use `TORCH_LOGS="spyre.inductor:INFO"` instead |
-| `SPYRE_INDUCTOR_LOG_LEVEL=DEBUG` | *Deprecated.* Use `TORCH_LOGS="spyre.inductor:DEBUG"` instead |
+| `SPYRE_INDUCTOR_LOG=1` | *Deprecated.* Use `TORCH_LOGS="torch_spyre.inductor"` instead (INFO level) |
+| `SPYRE_INDUCTOR_LOG_LEVEL=DEBUG` | *Deprecated.* Use `TORCH_LOGS="+torch_spyre.inductor"` instead (DEBUG level) |
 | `SPYRE_LOG_FILE=path/to/file.log` | Redirect Spyre Inductor log output to a file |
 | `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 warnings |
 | `TORCH_LOGS="+inductor"` | PyTorch provided tool to selectively enable Inductor or other parts of the `torch.compile` to the log |
+
+### Programmatic Logging Control
+
+For log levels not supported by `TORCH_LOGS` (WARNING, CRITICAL, DISABLED) or
+for runtime control, use the programmatic API:
+
+```python
+from torch_spyre import logging_config
+
+# Set specific log levels
+logging_config.set_log_level('spyre.inductor', 'WARNING')
+logging_config.set_log_level('spyre.runtime', 'CRITICAL')
+
+# Per-pass DEBUG logging (for compiler pipeline debugging)
+logging_config.set_log_level('spyre.inductor.passes', 'DEBUG')
+logging_config.set_log_passes('all')  # or specific passes
+```
+
+See [Programmatic Configuration](../profiling/environment_variables.md#programmatic-configuration)
+for complete API documentation.
 
 Run your reproducer with all three enabled:
 
