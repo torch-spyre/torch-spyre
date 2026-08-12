@@ -224,9 +224,20 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
         cls.GLOBAL_DTYPE_FORCE_XFAIL = (
             config.global_config.resolved_supported_dtypes_force_xfail()
         )
-        cls.TEST_SUITE_LABELS = list(config.test_suite_config.labels)
 
         file_entry: FileEntry = resolve_current_file(config, path)
+
+        # Prefer file_entry.labels: for a multi-config directory run,
+        # merge_yaml_configs() threads each source config's own
+        # test_suite_config.labels onto its file entries (the merged
+        # document has no single top-level labels field that could
+        # represent per-file provenance once files from different configs
+        # are combined). Empty there means a single-config run (the source
+        # YAML never sets per-file labels), so fall back to the top-level
+        # field, which correctly applies to every file in that one config.
+        cls.TEST_SUITE_LABELS = list(
+            file_entry.labels or config.test_suite_config.labels
+        )
 
         # Build the exact-name lookup map and the regex-pattern list.
         # Regex patterns (names containing regex metacharacters) go into
