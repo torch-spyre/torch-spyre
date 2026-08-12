@@ -2508,9 +2508,19 @@ for i in "${!RUN_FILES[@]}"; do
     # so conftest.py files are discovered correctly.
     #
     # If the probe finds 0 matching tests (exit code 5) the -m flag is stripped
-    # from _FILE_PYTEST_ARGS so the file's tests all run normally. 
+    # from _FILE_PYTEST_ARGS so the file's tests all run normally --
     # the marker filter applies to files that USE that marker
-    # family; files that don't use it are unaffected.
+    # family; files that don't use it are unaffected. This fallback is for
+    # op__/dtype__/module__/platform__-style tags, where a per-file 0-match
+    # just means "this marker family isn't used here". It does NOT apply to
+    # testtype__<label> (see _OOTTestTypeMarkerPatcher): that tag is a
+    # whole-file inclusion marker driven by the config's
+    # test_suite_config.labels, so a 0-match genuinely means this file's
+    # config doesn't carry the requested label and the file must stay
+    # excluded, not fall back to running unfiltered. -m is left in place for
+    # that case; the real run below will also report 0 collected (exit 5),
+    # which the exit-code handling further down already treats as
+    # NOTEST/warning-only, not a failure.
     #
     # ---------------------------------------------------------------------------
     _HAS_M=0
@@ -2541,7 +2551,9 @@ for i in "${!RUN_FILES[@]}"; do
         (cd "$run_dir" && python3 -m pytest "$run_basename" \
             "${_PROBE_ARGS[@]}" --collect-only -q 2>/dev/null) || _probe_exit=$?
 
-        if [[ $_probe_exit -eq 5 ]]; then
+        if [[ $_probe_exit -eq 5 && "${_PROBE_ARGS[*]}" == *"testtype__"* ]]; then
+            echo "[torch_oot_device_tests_run] -m filter matched 0 tests in $(basename "$original_file") (testtype__ label not present) -- file excluded" >&2
+        elif [[ $_probe_exit -eq 5 ]]; then
             # 0 tests match this marker in this file — strip -m from args.
             echo "[torch_oot_device_tests_run] -m filter matched 0 tests in $(basename "$original_file"), running without -m" >&2
             _ARGS_NO_M=()

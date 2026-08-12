@@ -48,6 +48,7 @@ from oot_framework.oot_upstream_patcher import (
     _OOTCpuMovePatcher,
     _OOTNoGradPatcher,
     _OOTPlatformMarkerPatcher,
+    _OOTTestTypeMarkerPatcher,
 )
 from oot_framework.oot_test_config_models import (
     OOTTestConfig,
@@ -143,6 +144,10 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
     GLOBAL_DTYPE_PRECISION: Dict[torch.dtype, "Precision"] = {}
     GLOBAL_DTYPE_FORCE_XFAIL: Set[torch.dtype] = set()
 
+    # test_suite_config.labels from the YAML, e.g. ["unit", "regression", "trunk"].
+    # Drives the testtype__<label> pytest markers (see _OOTTestTypeMarkerPatcher).
+    TEST_SUITE_LABELS: List[str] = []
+
     # File-level module filtering (populated during config load)
     # Use None as sentinel to indicate not yet initialized, avoiding shared mutable default
     _FILE_LEVEL_INCLUDED_MODULES: Optional[Set[str]] = None
@@ -219,6 +224,7 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
         cls.GLOBAL_DTYPE_FORCE_XFAIL = (
             config.global_config.resolved_supported_dtypes_force_xfail()
         )
+        cls.TEST_SUITE_LABELS = list(config.test_suite_config.labels)
 
         file_entry: FileEntry = resolve_current_file(config, path)
 
@@ -697,6 +703,10 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
 
         # Attaches platform__<arch> marker
         _OOTPlatformMarkerPatcher(test).patch()
+
+        # Attaches testtype__<label> marker(s) from this config's
+        # test_suite_config.labels
+        _OOTTestTypeMarkerPatcher(test, cls.TEST_SUITE_LABELS).patch()
 
         existing_methods = set(cls.__dict__.keys())
         super().instantiate_test(name, test, generic_cls=generic_cls)
