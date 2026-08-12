@@ -5228,7 +5228,18 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             " divide Lq ranges on each op using that op's own dim role",
         )
 
-    def _run_kv_chunked_flash(self, h_tiles, n_chunks=2):
+    def _run_kv_chunked_flash(
+        self,
+        *,
+        h_tiles=4,
+        lq_tiles=2,
+        B=1,
+        H=8,
+        Lq=256,
+        Lk=256,
+        D=64,
+        kv_block=128,
+    ):
         """Flash attention with K/V chunking in PYTHON and WSR tiling only H/Lq.
 
         Shared by the two tests below so the h_tiles == H degenerate-tile case
@@ -5277,9 +5288,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         """
         from torch_spyre._inductor import spyre_hint
 
-        B, H, Lq, Lk, D = 1, 8, 256, 256, 64
-        kv_block = Lk // n_chunks
-        lq_tiles = 2
+        n_chunks = Lk // kv_block
+        self.assertEqual(Lk % kv_block, 0, "chunks must divide Lk")
         scale = 1.0 / math.sqrt(math.sqrt(D))
 
         torch.manual_seed(42)
@@ -5301,29 +5311,44 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 ).amax(dim=-1)
             with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
                 acc = torch.zeros_like(queries)
-            out = None
+
+            def sweep(running_max, denom, acc):
+                """The unrolled K/V sweep.
+
+                Carries are parameters so they can be rebound locally without a
+                nonlocal declaration.
+                """
+                out = None
+                for kb in range(n_chunks):  # unrolled into the graph
+                    k_c, v_c = k_chunks[kb], v_chunks[kb]
+                    keys_T = (k_c * scale).transpose(-1, -2).contiguous()
+                    # A matmul output inherits no names from its inputs, so both
+                    # matmuls need an explicit named_dims hint.
+                    with spyre_hint(named_dims=["B", "H", "Lq", "Lkc"]):
+                        scores = torch.matmul(queries * scale, keys_T)
+                    block_max = torch.amax(scores, dim=-1)
+                    new_max = torch.maximum(running_max, block_max)
+                    correction = torch.exp(running_max - new_max)
+                    exp_scores = torch.exp(scores - new_max.unsqueeze(-1))
+                    new_denom = denom * correction + exp_scores.sum(dim=-1)
+                    with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
+                        weighted = torch.matmul(exp_scores, v_c)
+                    new_acc = acc * correction.unsqueeze(-1) + weighted
+                    if kb == n_chunks - 1:
+                        out = new_acc / new_denom.unsqueeze(-1)
+                    else:
+                        running_max, denom, acc = new_max, new_denom, new_acc
+                return out
+
+            # Lq cannot be tiled at Lq == 1 (decode), so that hint is optional.
+            # Written as two branches rather than a stand-in context manager: a
+            # contextlib.nullcontext() inside a traced function has previously
+            # produced spurious dynamo errors in this suite.
             with spyre_hint(num_tiles_per_dim={"H": h_tiles}):
-                with spyre_hint(num_tiles_per_dim={"Lq": lq_tiles}):
-                    for kb in range(n_chunks):  # unrolled into the graph
-                        k_c, v_c = k_chunks[kb], v_chunks[kb]
-                        keys_T = (k_c * scale).transpose(-1, -2).contiguous()
-                        # A matmul output inherits no names from its inputs, so
-                        # both matmuls need an explicit named_dims hint.
-                        with spyre_hint(named_dims=["B", "H", "Lq", "Lkc"]):
-                            scores = torch.matmul(queries * scale, keys_T)
-                        block_max = torch.amax(scores, dim=-1)
-                        new_max = torch.maximum(running_max, block_max)
-                        correction = torch.exp(running_max - new_max)
-                        exp_scores = torch.exp(scores - new_max.unsqueeze(-1))
-                        new_denom = denom * correction + exp_scores.sum(dim=-1)
-                        with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
-                            weighted = torch.matmul(exp_scores, v_c)
-                        new_acc = acc * correction.unsqueeze(-1) + weighted
-                        if kb == n_chunks - 1:
-                            out = new_acc / new_denom.unsqueeze(-1)
-                        else:
-                            running_max, denom, acc = new_max, new_denom, new_acc
-            return out
+                if lq_tiles:
+                    with spyre_hint(num_tiles_per_dim={"Lq": lq_tiles}):
+                        return sweep(running_max, denom, acc)
+                return sweep(running_max, denom, acc)
 
         def chunk(t):
             return [
@@ -5361,18 +5386,56 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         )
         src = source_codes[0]
         self.assertIn("LoopSpec(", src, "expected coarse tiling to survive codegen")
+        self.assertEqual(
+            src.count("LoopSpec("),
+            2 if lq_tiles else 1,
+            "expected one loop level per tiled dim (H, plus Lq when tiled)",
+        )
         self.assertIn(
             f"count=sympify('{h_tiles}')",
             src,
             f"expected the H loop count (h_tiles={h_tiles})",
         )
-        self.assertIn(
-            "count=sympify('2')", src, "expected the Lq loop count (lq_tiles=2)"
-        )
+        if lq_tiles:
+            self.assertIn(
+                f"count=sympify('{lq_tiles}')",
+                src,
+                f"expected the Lq loop count (lq_tiles={lq_tiles})",
+            )
 
     def test_hint_flash_attention_kv_chunked_python_loop(self):
         """K/V chunked in Python, WSR tiling H (4) and Lq (2). See impl docstring."""
-        self._run_kv_chunked_flash(h_tiles=4)
+        self._run_kv_chunked_flash(h_tiles=4, lq_tiles=2)
+
+    def test_hint_flash_attention_kv_chunked_prefill_8k(self):
+        """Chunked prefill: a 512-token query block against an 8k K/V cache.
+
+        This is the production shape -- vLLM-style chunked prefill -- not a
+        scaled-down proxy.  Both H and Lq are WSR-tiled; Lk is not hinted.
+
+        kv_block is 2048 (4 chunks) rather than 512 (16) because layout solving
+        fails past ~6 unrolled chunks; see the docstring on
+        test_hint_flash_attention_kv_chunked_chunk_ceiling.  Lq stays at the
+        query-block size deliberately: the same 4-chunk graph at Lq=8192
+        compiled for over two hours without finishing, while at Lq=512 it takes
+        well under a minute, so compile cost is driven by Lq extent rather than
+        by chunk count or cache length.
+        """
+        self._run_kv_chunked_flash(
+            h_tiles=4, lq_tiles=2, B=1, H=8, Lq=512, Lk=8192, D=128, kv_block=2048
+        )
+
+    def test_hint_flash_attention_kv_chunked_decode_8k(self):
+        """Decode: one query token, batch 4, against a full 8k K/V cache.
+
+        Lq == 1 cannot be tiled, so H tiling is the only level and there is a
+        single LoopSpec.  A full cache means every key is valid, so no mask is
+        needed and the fully-masked-chunk case (block_max == -inf, making
+        exp(-inf - -inf) NaN) does not arise here -- that remains untested.
+        """
+        self._run_kv_chunked_flash(
+            h_tiles=4, lq_tiles=None, B=4, H=8, Lq=1, Lk=8192, D=128, kv_block=2048
+        )
 
     @pytest.mark.xfail(
         strict=True,
@@ -5387,7 +5450,28 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     )
     def test_hint_flash_attention_kv_chunked_unit_h_tile(self):
         """h_tiles == H (one head per tile) crashes in read-copy insertion."""
-        self._run_kv_chunked_flash(h_tiles=8)
+        self._run_kv_chunked_flash(h_tiles=8, lq_tiles=2)
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "Layout solving fails past ~6 unrolled K/V chunks: 4 and 6 chunks "
+            "compile and are exact, 8/10/12/16 all fail _no_feasible_layout_error "
+            "with the failing buffer at a fixed ~81% of the graph, i.e. always "
+            "around the 6th-7th chunk. NOT a graph-size limit -- dropping the "
+            "running-max carry yields MORE buffers (128 vs the failing 112) and "
+            "compiles. Every single ablation (either matmul, any one of the three "
+            "carries, the reductions) restores feasibility, so it is the "
+            "conjunction of constraints that becomes infeasible. Invariant to Lq "
+            "(256/512/8192), Lq tiling, D, and kv_block. This is what forces "
+            "kv_block=2048 for 8k instead of the 512 a memory budget would pick."
+        ),
+    )
+    def test_hint_flash_attention_kv_chunked_chunk_ceiling(self):
+        """8 unrolled K/V chunks exceed what layout solving can satisfy."""
+        self._run_kv_chunked_flash(
+            h_tiles=4, lq_tiles=None, B=1, H=8, Lq=256, Lk=4096, D=128, kv_block=512
+        )
 
     def test_hint_h_tiling_elementwise(self):
         """spyre_hint(num_tiles_per_dim={"H": 2}) tiles elementwise multiply over the H dimension.
