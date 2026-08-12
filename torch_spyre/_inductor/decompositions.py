@@ -695,9 +695,9 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
 #: Largest kernel tap (per spatial axis) the direct conv2d path accepts. A
 #: dense (groups==1) conv contracts over C_in*kH*kW; that per-output-channel
 #: weight working set grows with k**2 and, at k>3 with a stick-aligned C_in>=64,
-#: exceeds the SuperDSC initial-chunk LX budget -- the backend aborts in
-#: L3DlOpsScheduler.cpp ("initial chunk parameters must fit in LX") because the
-#: kernel taps are pinned no-split (ki/kj=1) and C_out=64 is a single stick, so
+#: exceeds the initial-chunk LX budget -- the backend aborts (the initial
+#: chunk must fit in LX) because the kernel taps are pinned no-split
+#: (ki/kj=1) and C_out=64 is a single stick, so
 #: there is nothing left to tile. Depthwise conv escapes this (its contraction
 #: is kH*kW only, no C_in), which is why depthwise supports k up to 9 and dense
 #: does not. Until the backend can tile the C_in*kH*kW contraction for dense
@@ -740,7 +740,7 @@ def _is_direct_conv_supported(
       = 64) would need contraction-dim padding the direct path does not emit
       (known-broken), so it stays on the im2col+matmul path;
     - kernel tap > _CONV_MAX_KERNEL (3): the dense C_in*kH*kW contraction working
-      set overflows the SuperDSC LX budget in the backend for k>3 and cannot be tiled
+      set overflows the LX budget in the backend for k>3 and cannot be tiled
       (see _CONV_MAX_KERNEL), so it stays on the im2col+matmul path;
     - ragged input width under stride: when the strided windows do not exactly
       cover the input width -- (W_in - kW) % sW != 0 -- the fp16 conv opfunc's

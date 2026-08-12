@@ -4974,7 +4974,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # Caveat, measured: xfail asserts only *that* the case fails, not
             # that padding is the reason.  Removing just the lowering guard does
             # not make it XPASS -- the compile then reaches the backend and
-            # dxp_standalone aborts (SIGABRT), which is the runtime support the
+            # aborts (SIGABRT), which is the runtime support the
             # guard's own message refers to.  So this entry tracks "depthwise +
             # padding does not work end to end"; a message-asserting negative
             # test would additionally pin *where* it is rejected.
@@ -5108,7 +5108,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # conv2d exercising the native conv2d SDSC path (lower_convolution) with
         # the direct-lowering flag on (config.conv2d_direct_lowering). Only a
         # true 1x1 kernel falls back: it has size-1 window taps on *both* axes,
-        # so the SDSC carries no window dim and DDC's conv path rejects it. A
+        # so the SDSC carries no window dim and the backend rejects it. A
         # 1xN / Nx1 kernel keeps one window dim and direct-lowers (see the k1x3
         # / k3x1 cases below) -- 1x1 is covered by the ("test_conv2d", ...) case
         # "2x3x32_ksize1" above (with NCHW input), so it is intentionally not
@@ -5157,7 +5157,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
                 # 1xN kernel (kH==1, kW==3): a 1-D conv along width. The kH tap
                 # is size-1 and squeezed out, so the SDSC carries only the kW
-                # window dim -- DDC's conv path accepts a single window dim, so
+                # window dim -- the backend accepts a single window dim, so
                 # this direct-lowers (a 1-D conv) rather than falling back.
                 "1x64x8x8_k1x3": (
                     cached_randn((1, 64, 8, 8)),
@@ -7455,7 +7455,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         #  - C_in not a multiple of the fp16 stick width (the direct SDSC
         #    contracts over C_in with no partial-stick handling);
         #  - kernel tap > 3 (the dense C_in*kH*kW contraction overflows the
-        #    SuperDSC LX budget in DDC);
+        #    LX scratchpad budget);
         #  - ragged input width under stride, (W_in - kW) % sW != 0 (the fp16
         #    opfunc tiles the output width and mis-accumulates the dangling
         #    column; a ragged height is untiled and harmless).

@@ -22,7 +22,6 @@ from torch._inductor.virtualized import V
 
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor import config as _spyre_config
-from torch_spyre._inductor.config import disable_conv2d_spatial_split
 from torch_spyre._C import ElementArrangement
 from torch_spyre._inductor.constants import (
     CONV2D_DIM_LABELS,
@@ -1919,27 +1918,22 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                 dim_splits[_k_sym] = 1
                 work_slices[_k_sym] = 1
 
-        if op_spec.op == CONV2D_FWD_OP:
-            # Forward conv2d (#3284): with stride>1 the per-core output
-            # coordinates no longer map to a contiguous input span, so a spatial
-            # (i/j) split shuffles the result. Clamp i/j inline; batch /
-            # out-channel / in-channel still absorb the split.
-            _conv_params = (op_spec.op_info or {}).get("conv_params", {})
-            _sH = _try_static_int(_conv_params.get("stride_h", 1))
-            _sW = _try_static_int(_conv_params.get("stride_w", 1))
-            _strided = (_sH is not None and _sH > 1) or (_sW is not None and _sW > 1)
-            if _spyre_config.disable_conv2d_spatial_split and _strided:
-                for _sp_sym in (Symbol("i"), Symbol("j")):
-                    if _sp_sym in dim_splits:
-                        dim_splits[_sp_sym] = 1
-                        work_slices[_sp_sym] = 1
-        elif disable_conv2d_spatial_split:
-            # Depthwise conv2d (#3510): the strided-spatial split is blocked
-            # upstream by ``conv_spatial_blocked_vars`` in work_division.py, so
-            # those cores are reassigned to absorbable dims rather than dropped
-            # here. Span reduction outranks the flag: if the hardware span limit
-            # forced a spatial split, work division kept it -- warn if so.
-            if conv_params.get("stride_i", 1) > 1 or conv_params.get("stride_j", 1) > 1:
+        if _spyre_config.disable_conv2d_spatial_split:
+            # Strided convs cannot split the output spatial dims (i/j): a strided
+            # window's per-core output coordinates do not map to a contiguous
+            # input span, so a spatial split shuffles the result. That constraint
+            # is enforced during the work-split pass -- conv_spatial_blocked_vars
+            # in work_division_constraints.py, for both the forward (#3284) and
+            # depthwise (#3510) paths -- so it is NOT overridden here. Span
+            # reduction outranks the flag: if the hardware span limit forced a
+            # spatial split, work division kept it -- warn if so.
+            _sI = _try_static_int(
+                conv_params.get("stride_i", conv_params.get("stride_h", 1))
+            )
+            _sJ = _try_static_int(
+                conv_params.get("stride_j", conv_params.get("stride_w", 1))
+            )
+            if (_sI or 1) > 1 or (_sJ or 1) > 1:
                 for _spatial_sym in (Symbol("i"), Symbol("j")):
                     if dim_splits.get(_spatial_sym, 1) > 1:
                         logger.warning(
