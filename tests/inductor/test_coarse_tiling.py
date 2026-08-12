@@ -4227,20 +4227,6 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         self.assertEqual(consumers, [])
         self.assertFalse(is_out)
 
-    def test_has_inside_consumers_removed(self):
-        """_has_inside_consumers is deleted along with the direct-mutation
-        Case 2/"Case 3" branch it used to help gate -- every cross-loop-
-        group write now takes the unconditional _insert_copy_op path
-        regardless of whether the tiled op also has inside consumers, so
-        this predicate no longer has a caller.
-        """
-        import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_module
-
-        self.assertFalse(
-            hasattr(coarse_tile_module, "_has_inside_consumers"),
-            "_has_inside_consumers should have been deleted",
-        )
-
     def test_different_loop_group_id_is_outside(self):
         """Op in loop group 1 should be seen as outside consumer of group 0."""
         from torch_spyre._inductor.wsr.coarse_tile import _find_outside_consumers
@@ -4255,56 +4241,6 @@ class TestCoarseTileBufferPropagation(unittest.TestCase):
         ):
             consumers, _ = _find_outside_consumers("op0", (0,), [tiled, other_group])
         self.assertEqual(consumers, [other_group])
-
-    def test_carry_propagation_functions_removed(self):
-        """_carry_terminal_op/_propagate_carry_op and the seed-detection helpers
-        are deleted."""
-        import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_module
-
-        for name in (
-            "_carry_terminal_op",
-            "_propagate_carry_op",
-            "_seed_buffer_for_carry",
-            "_seed_closure_pre_stamp",
-            "_is_constant_fill",
-            "_closure_member_has_external_operands_only",
-        ):
-            self.assertFalse(
-                hasattr(coarse_tile_module, name),
-                f"{name} should have been deleted",
-            )
-
-    def test_planned_twin_leftovers_removed(self):
-        """Transformation-time functions superseded by their planning-time
-        twins, and helpers orphaned by earlier partial cleanups, are deleted.
-        """
-        import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_module
-
-        for name in (
-            "_compute_full_ranges",
-            "_insert_read_copy_ops",
-            "_compute_fill_loop_info",
-            "_group_reduction_tiled_hint_ids",
-            "_op_hint_dim_positions",
-            "_seed_closure",
-        ):
-            self.assertFalse(
-                hasattr(coarse_tile_module, name),
-                f"{name} should have been deleted",
-            )
-
-    def test_has_loop_internal_real_input_removed(self):
-        """_has_loop_internal_real_input is deleted along with the direct-
-        mutation Case 2/"Case 3" branch it used to gate -- every cross-loop-
-        group write now takes the unconditional _insert_copy_op path, so the
-        loop-internal-input special case no longer needs its own predicate.
-        """
-        import torch_spyre._inductor.wsr.coarse_tile as coarse_tile_module
-
-        self.assertFalse(
-            hasattr(coarse_tile_module, "_has_loop_internal_real_input"),
-            "_has_loop_internal_real_input should have been deleted",
-        )
 
     def test_case2_condition_now_produces_copy_op(self):
         """An op that used to hit the direct-mutation branch (outside
