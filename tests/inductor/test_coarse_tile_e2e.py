@@ -5891,6 +5891,42 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             self.assertIn(f"del {var_name}", src)
 
     @config.patch({"lx_planning": False})
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_no_python_side_pool_tensor_allocated(self):
+        """No bundle allocates a Python-side _pool_<name> tensor any more --
+        pool allocation is now entirely inside the generated MLIR."""
+
+        def fn(t):
+            a = torch.exp(t) * 2
+            b = torch.sin(a)  # fallback op -- forces a bundle boundary
+            c = torch.exp(b) * 2
+            return c
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+            pytest.warns(UserWarning),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), x)
+        src = source_codes[0]
+
+        # No Python-side pool tensor allocation (uint8 SpyreTensorLayout) --
+        # ordinary output buffers still legitimately use
+        # spyre_empty_with_layout, so distinguish pool allocs by their
+        # telltale uint8 dtype, same as
+        # test_pool_alloc_scoped_per_bundle_across_fallback_boundary above.
+        pool_alloc_lines = [
+            line
+            for line in src.splitlines()
+            if "spyre_empty_with_layout" in line and "uint8" in line
+        ]
+        self.assertEqual(pool_alloc_lines, [])
+        self.assertNotIn("_pool_", src)
+
+    @config.patch({"lx_planning": False})
     def test_pool_size_kwarg_in_generated_sdsc_call(self):
         """define_kernel() must append pool_size=<N> to the generated
         async_compile.sdsc(...) call text for a kernel whose pool_size > 0,
