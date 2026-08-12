@@ -5890,6 +5890,33 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         for var_name in pool_var_names:
             self.assertIn(f"del {var_name}", src)
 
+    @config.patch({"lx_planning": False})
+    def test_pool_size_kwarg_in_generated_sdsc_call(self):
+        """define_kernel() must append pool_size=<N> to the generated
+        async_compile.sdsc(...) call text for a kernel whose pool_size > 0,
+        and omit the kwarg entirely for a kernel with no pool usage."""
+
+        def fn(x, y):
+            a = x + y
+            b = a * 2
+            return b - x
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+        y = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), x, y)
+        src = source_codes[0]
+
+        self.assertIn("pool_size=", src)
+        # Every async_compile.sdsc( call either has no pool_size kwarg, or a
+        # positive one -- pool_size=0 must never be emitted explicitly.
+        self.assertNotIn("pool_size=0", src)
+
 
 class TestNamedDimsHint(InductorTestCase):
     """Tests for propagate_named_dims handling of ops with a named_dims hint.
