@@ -1793,6 +1793,7 @@ def test_copy_rmw_correction_512x256_A4_B4():
 # copies sparse reduction result into a dense buffer
 
 
+@config.patch({"disable_copy_opt": True})
 def test_copy_not_deleted():
     """Regression: copy_ must not be eliminated by noop_registry removal.
 
@@ -1815,6 +1816,7 @@ def test_copy_not_deleted():
         run_coarse_tile_test(fn, inputs)
 
 
+@config.patch({"disable_copy_opt": True})
 def test_copy_after_reduction_512x256_A4():
     """out.copy_(x.amin(dim=0)) on [512,256] tiled A÷4 must be rejected."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -1851,6 +1853,7 @@ def test_copy_after_reduction_512x256_B4():
     run_coarse_tile_test(fn, inputs, correctness=False)
 
 
+@config.patch({"disable_copy_opt": True})
 def test_copy_after_reduction_512x256_A4_B4():
     """out.copy_(x.amin(dim=0)) on [512,256] tiled A÷4 B÷4 must be rejected."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -2248,6 +2251,7 @@ def test_outside_consumer_two_accum_512x256_A4():
     run_coarse_tile_test(fn, inputs)
 
 
+@config.patch({"disable_copy_opt": True})
 def test_outside_consumer_two_accum_512x256_B4():
     """Flash-style: out=zeros, denom=zeros; tiled copy_; return out/denom — B÷4 must be rejected."""
     inputs = [

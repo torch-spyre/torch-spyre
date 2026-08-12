@@ -2417,6 +2417,94 @@ def _insert_one_read_copy(
         # full_layout.size squeezed out, undoing the same squeeze
         # applied to sizing_op's own ranges elsewhere in this function
         # (see squeeze_pos below).
+        # Count the non-unit dims and check the pairing *before* walking,
+        # not after.  The walk consumes one tile_ranges entry per non-unit
+        # dim, so a check placed after it only catches the direction where
+        # entries are left over.  The opposite direction -- more non-unit
+        # buffer dims than iteration extents -- would run off the end of
+        # tile_ranges inside the loop and raise IndexError, which is the
+        # same "error from deep inside a pass" this guard exists to
+        # replace, just wearing a different exception type.
+        non_unit_dims = sum(1 for s in full_size_ints if s != 1)
+        if non_unit_dims != len(tile_ranges):
+            # TODO(span-overflow-read-copy): support tiled ops whose
+            # iteration space does not map one-to-one onto an input's
+            # dimensions.  Replace this marker with the tracking issue
+            # number once filed; the three xfailed tests named at the
+            # bottom of this comment are the ones it unblocks.
+            #
+            # The walk below pairs each of full_buf's non-unit dims with
+            # the next entry of tile_ranges (== dep.size, the op's
+            # iteration extents), assuming the two have the same number of
+            # non-unit entries.  That holds only when every input has the
+            # output's shape.  Three ways it breaks, all the same failure:
+            #
+            #   * broadcast input of lower rank -- an rmsnorm weight
+            #     (16384,) against an iteration space [16, 1000, 16384]:
+            #     one buffer dim, three extents.  Note the walk does not
+            #     merely run out, it pairs the 16384 dim with extent 16, so
+            #     without this check it would build a wrong buffer rather
+            #     than fail;
+            #   * broadcast input with leading unit dims -- a rope cos
+            #     (1, 1, 2048, 2048) against [32, 16, 1024, 2048]: the two
+            #     1s are skipped, leaving two extents unconsumed;
+            #   * a reduction whose input does not use every loop var --
+            #     out[b, m, n] = sum_k A[b, m, k] * B[b, k, n] carries
+            #     b/m/n/k while A has no n dimension at all.  B is worse
+            #     still: its dims run b/k/n against a b/m/n/k loop, so even
+            #     after dropping the unused var the orders disagree and a
+            #     positional walk would hand k's extent to n's dimension.
+            #
+            # Both need dimension matching via dep.index's coefficients
+            # rather than by position.  That was attempted and reverted:
+            # it clears this check and compiles, but the results are still
+            # numerically wrong, so a second positional assumption remains
+            # further down (most likely in how the per-iteration address
+            # advance is derived).  Reverted rather than shipped half-done.
+            #
+            # Only the POST-stickify caller reaches here -- manual
+            # spyre_hint runs pre-stickify, gets a plain FixedLayout, and
+            # takes the else branch below.  Manual tiling of this exact
+            # 4-D bmm batch-dim case is verified working end to end
+            # (test_bmm_to_pointwise_join_numeric_via_manual_hint), so what
+            # is missing is this branch, not the tiling machinery.
+            #
+            # #3293 moved the hint path pre-stickify specifically so
+            # stickification builds the layout from already-divided ranges,
+            # "eliminating _resize_device_layout" -- and noted the
+            # span-overflow path "retains the FixedTiledLayout construction
+            # with _resize_device_layout as before".  Span-overflow cannot
+            # follow: it needs device_layout to measure spans at all, so it
+            # cannot run pre-stickify.  It is therefore the last caller on
+            # that path, which is likely why this gap survived.  Worth
+            # settling whether the fix is to repair the resize or to have
+            # stickification supply this layout, before investing in the
+            # former.
+            #
+            # Blocks: test_bmm_to_pointwise_join_numeric,
+            # test_bmm_to_reduction_join_numeric (this branch), and
+            # test_lm_head_matmul_join_numeric (xfailed since #3218 with
+            # the identical failure).
+            #
+            # Raise Unsupported rather than letting the bare assert fire:
+            # this is a known gap reachable from ordinary user code, so it
+            # should surface as a clean backend limitation, not an
+            # AssertionError from deep inside a pass.
+            raise Unsupported(
+                f"coarse_tile: cannot build a tile-sized read copy of "
+                f"{dep.name!r} for {sizing_op.get_name()!r}: its iteration "
+                f"extents {list(tile_ranges)} do not map one-to-one onto "
+                f"the buffer's dimensions {full_size_ints}. Automatic "
+                "span-overflow tiling is not yet supported for inputs "
+                "that do not share the output's shape — a broadcast input "
+                "(lower rank, or leading unit dims), or a reduction input "
+                "that does not use every loop variable such as a "
+                "batch-tiled bmm operand."
+            )
+        # Reinsert a 1 at each raw position full_layout.size squeezed out.
+        # The guard above has established that the non-unit dims and
+        # tile_ranges are the same length, so this walk cannot run off the
+        # end.
         tile_size_ints = []
         it_idx = 0
         for s in full_size_ints:
@@ -2425,11 +2513,6 @@ def _insert_one_read_copy(
             else:
                 tile_size_ints.append(int(tile_ranges[it_idx]))
                 it_idx += 1
-        assert it_idx == len(tile_ranges), (
-            f"_insert_one_read_copy: could not align squeezed tile_ranges="
-            f"{tile_ranges} to full_size_ints={full_size_ints} for "
-            f"{dep.name!r}"
-        )
         # Authoritative stick host dim from coordinate identity (issue
         # #3116); None falls back to size-based inference inside
         # _resize_device_layout.
