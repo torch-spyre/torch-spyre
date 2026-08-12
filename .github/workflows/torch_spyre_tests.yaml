@@ -90,6 +90,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code_changed: ${{ steps.filter.outputs.code_changed }}
+      integration_labeled: ${{ steps.label.outputs.labeled }}
     steps:
       - name: Checkout composite actions
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -101,18 +102,27 @@ jobs:
         id: filter
         uses: ./.github/actions/detect-doc-only-change
 
+      - name: Check for the integration-test label
+        id: label
+        uses: ./.github/actions/detect-integration-test-label
+
   # ---------------------------------------------------------------------------
   # Job 2: delegate to the shared test matrix
   #
   # Only runs when `changes.code_changed == 'true'`. For docs-only PRs the
   # reusable workflow is never invoked — no hardware runners are consumed.
-  # Also skipped when `integration-test` is labeled -- spyre-framework handles it
+  # Also skipped when `integration-test` is labeled -- spyre-frameworks' Jenkins
+  # integration run owns this commit's testing instead. Read via the composite
+  # action, NOT `github.event.pull_request.labels`: a merge_group payload has no
+  # pull_request object, so the inline expression is always false in the queue and
+  # the whole suite re-ran there -- on one measured merge-queue commit that was
+  # 815 GHA check-runs / ~21 h of runner time re-testing what the PR just passed.
   # ---------------------------------------------------------------------------
   run-tests:
     needs: changes
     if: |
       needs.changes.outputs.code_changed == 'true' &&
-      !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'integration-test'))
+      needs.changes.outputs.integration_labeled != 'true'
     uses: ./.github/workflows/_test_matrix.yaml
     with:
       runner_label: linux
@@ -146,9 +156,12 @@ jobs:
     name: Run Spyre unit tests
     runs-on: ubuntu-latest
     needs: [changes, run-tests]
+    # Same label gate as run-tests: this job publishes the aggregate check, so
+    # leaving it enabled while run-tests is skipped would report a verdict for a
+    # suite that never ran.
     if: |
       always() &&
-      !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'integration-test'))
+      needs.changes.outputs.integration_labeled != 'true'
     steps:
       - name: Evaluate test results
         run: |-
