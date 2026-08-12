@@ -5848,10 +5848,11 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_pool_alloc_scoped_per_bundle_across_fallback_boundary(self):
         """A CPU-fallback op (torch.sin) splits the graph into multiple
-        bundles. Each bundle's pool tensor (if any) is allocated right
-        before its own .run() call and freed right after -- there is no
-        single graph-global "_pool" shared across bundles, and the
-        intermediate crossing the fallback boundary is not pool-allocated."""
+        bundles. Each bundle's pool (if any) is allocated inside that
+        bundle's own generated MLIR via sdscbundle.device_mem_allocate --
+        there is no Python-side pool tensor, and no bundle's MLIR references
+        another bundle's pool."""
+        from torch_spyre.execution import async_compile as async_compile_mod
 
         def fn(t):
             a = torch.exp(t) * 2  # compiled bundle 1; `a` crosses the
@@ -5861,34 +5862,64 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
 
+        # get_output_dir() mints a fresh random tempdir on every call (see
+        # its uuid4()-based implementation), so it cannot be re-invoked from
+        # the test to recover the directory sdsc() actually used to write
+        # bundle.mlir. Wrap it to record kernel_name -> output_dir while
+        # still delegating to the real implementation.
+        real_get_output_dir = async_compile_mod.get_output_dir
+        output_dirs_by_kernel = {}
+
+        def _recording_get_output_dir(kernel_name):
+            output_dir = real_get_output_dir(kernel_name)
+            output_dirs_by_kernel[kernel_name] = output_dir
+            return output_dir
+
         with (
             mock_patch(_LAUNCH_JOBPLAN),
             mock_patch(_PREPARE_KERNEL),
             mock_patch("subprocess.run"),
+            mock_patch.object(
+                async_compile_mod, "get_output_dir", _recording_get_output_dir
+            ),
             pytest.warns(UserWarning),
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), x)
         src = source_codes[0]
 
-        # No single graph-global "_pool = " assignment (the old scheme).
-        self.assertNotIn("_pool = spyre_empty_with_layout", src)
-        # Any pool tensor that does appear is kernel-scoped
-        # ("_pool_<kernel_name> = ..."), never the bare literal "_pool".
+        # No Python-side pool tensor of any kind remains in the wrapper.
+        # Ordinary output buffers legitimately use spyre_empty_with_layout,
+        # so distinguish pool allocs by their telltale uint8 dtype, same as
+        # test_no_python_side_pool_tensor_allocated below.
         pool_alloc_lines = [
             line
             for line in src.splitlines()
             if "spyre_empty_with_layout" in line and "uint8" in line
         ]
-        for line in pool_alloc_lines:
-            self.assertRegex(line.strip(), r"^_pool_\S+\s*=")
-        # Each pool alloc line's variable is del'd, and each .run( call that
-        # uses a pool passes that same per-kernel variable, not a shared name.
-        pool_var_names = [
-            line.strip().split("=", 1)[0].strip() for line in pool_alloc_lines
-        ]
-        self.assertEqual(len(pool_var_names), len(set(pool_var_names)))
-        for var_name in pool_var_names:
-            self.assertIn(f"del {var_name}", src)
+        self.assertEqual(pool_alloc_lines, [])
+        self.assertNotIn("_pool_", src)
+
+        # Each kernel name mentioned in an async_compile.sdsc(...) call gets
+        # its own bundle.mlir; any that uses a pool must self-allocate it via
+        # device_mem_allocate, never via a %pool_base_addr parameter.
+        kernel_names = re.findall(r"async_compile\.sdsc\('(\w+)'", src)
+        self.assertTrue(kernel_names)
+        saw_pool_allocate = False
+        for kernel_name in kernel_names:
+            self.assertIn(kernel_name, output_dirs_by_kernel)
+            bundle_path = os.path.join(
+                output_dirs_by_kernel[kernel_name], "bundle.mlir"
+            )
+            with open(bundle_path) as f:
+                bundle_text = f.read()
+            self.assertNotIn("%pool_base_addr", bundle_text)
+            if "device_mem_allocate" in bundle_text:
+                saw_pool_allocate = True
+        self.assertTrue(
+            saw_pool_allocate,
+            f"expected at least one bundle to use device_mem_allocate, "
+            f"kernels were {kernel_names}",
+        )
 
     @config.patch({"lx_planning": False})
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
