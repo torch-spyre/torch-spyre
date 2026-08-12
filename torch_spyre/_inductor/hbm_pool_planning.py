@@ -242,10 +242,17 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
     }
 
     # Build per-buffer writer-bundle / reader-bundles maps by walking each
-    # top-level bundle's own flattened node list once.  A buffer has exactly
-    # one writer (bundle); it may have readers in zero, one, or several
-    # bundles.
+    # top-level bundle's own flattened node list once.  A buffer normally has
+    # exactly one writer (bundle), tracked in buffer_writer_bundle; it may
+    # have readers in zero, one, or several bundles.  buffer_writer_bundles
+    # additionally accumulates *every* bundle that ever wrote a given name,
+    # so a buffer written by more than one bundle (e.g. a loop-carried
+    # accumulator whose in-place update is mutation-renamed by Inductor's
+    # scheduler to the same name as its initializer in an earlier bundle) can
+    # be detected even though buffer_writer_bundle itself only ever retains
+    # the last writer.
     buffer_writer_bundle: dict[str, str] = {}
+    buffer_writer_bundles: dict[str, set[str]] = {}
     buffer_reader_bundles: dict[str, set[str]] = {}
 
     for bundle in nodes:
@@ -258,6 +265,7 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
             for dep in node.read_writes.writes:
                 if dep.name not in graph_outputs:
                     buffer_writer_bundle[dep.name] = bundle_name
+                    buffer_writer_bundles.setdefault(dep.name, set()).add(bundle_name)
             for dep in node.read_writes.reads:
                 if dep.name not in graph_inputs:
                     buffer_reader_bundles.setdefault(dep.name, set()).add(bundle_name)
@@ -274,11 +282,22 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
                 and node.node.get_name() not in graph_outputs
             ):
                 buffer_writer_bundle[node.node.get_name()] = bundle_name
+                buffer_writer_bundles.setdefault(node.node.get_name(), set()).add(
+                    bundle_name
+                )
 
     written = set(buffer_writer_bundle)
     read = set(buffer_reader_bundles)
 
     def _is_cross_bundle(name: str) -> bool:
+        if len(buffer_writer_bundles.get(name, set())) > 1:
+            logger.debug(
+                "hbm_pool_planning: %s written by multiple bundles %s -- "
+                "excluding from pool eligibility",
+                name,
+                sorted(buffer_writer_bundles[name]),
+            )
+            return True
         readers = buffer_reader_bundles.get(name, set())
         writer = buffer_writer_bundle.get(name)
         return bool(readers - {writer})

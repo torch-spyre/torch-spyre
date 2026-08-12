@@ -53,6 +53,12 @@ This means:
   sequential kernel invocations and no pool-scoped storage can persist
   between them. Such buffers fall back to standalone HBM allocation, the same
   as any other non-pool-eligible intermediate today.
+- A buffer written by more than one bundle -- for example, a loop-carried
+  accumulator whose in-place update in a later bundle is renamed by
+  Inductor's scheduler (`mutation_renames`) to the same buffer name as its
+  initializer in an earlier bundle -- is never pool-eligible in any bundle,
+  regardless of where it is read. This exclusion is unconditional and
+  independent of the read-based cross-bundle check above.
 
 This design enables bundle-local pool lifetimes, which reduces peak HBM
 pressure: instead of allocating pools for all bundles up front and keeping
@@ -119,6 +125,11 @@ For each top-level entry (bundle) in the post-fusion node list:
    - Not already claimed by LX planning.
    - Not read by CPU-fallback nodes.
    - Fully contained within the bundle (same bundle writes and reads them).
+   - Written by exactly one bundle. A buffer written by two or more bundles
+     (e.g. an in-place accumulator update that Inductor's `mutation_renames`
+     maps to the same buffer name as an earlier initializing write) is
+     excluded unconditionally, even if all its reads happen to lie within
+     the last-writing bundle.
 3. For each bundle's local candidate set, compute live ranges: a buffer's
    live range is the interval from its producer op to its last consumer op
    within that bundle.

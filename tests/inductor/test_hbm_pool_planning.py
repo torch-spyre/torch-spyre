@@ -323,6 +323,56 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
             other_buf.get_layout().allocation["hbm_pool"],
         )
 
+    def test_buffer_written_in_two_bundles_with_inplace_rewrite_is_not_pool_eligible(
+        self,
+    ):
+        """A buffer written once in bundle A (an initializer) and then
+        read-and-rewritten in place in bundle B (an accumulate step, where
+        mutation_renames makes the write dep name identical to the read dep
+        name) must NOT be pool-eligible in either bundle.
+
+        Regression test for buffer_writer_bundle[name] = bundle_name being a
+        plain dict overwrite: bundle B's own read of "accum" is only visible
+        within bundle B, so the old _is_cross_bundle reader check
+        (readers - {writer}) sees writer == bundle_b, readers == {bundle_b},
+        and wrongly treats "accum" as bundle-B-local -- even though bundle A
+        also wrote it and needs a stable address for its own write.
+        """
+        _make_ftl_buffer("accum")
+        init = _make_snode_with_rw("init", writes=["accum"], reads=[])
+        accumulate = _make_snode_with_rw(
+            "accumulate", writes=["accum"], reads=["accum"]
+        )
+        bundle_a = FusedSchedulerNode(MagicMock(), [init])
+        bundle_b = FusedSchedulerNode(MagicMock(), [accumulate])
+
+        hbm_pool_planning([bundle_a, bundle_b])
+
+        buf = V.graph.get_buffer("accum")
+        self.assertNotIn("hbm_pool", buf.get_layout().allocation)
+
+    def test_buffer_written_in_two_bundles_with_only_same_bundle_reader_is_not_pool_eligible(
+        self,
+    ):
+        """A buffer written in bundle A and written again in bundle B, where
+        the only read anywhere is inside bundle B -- so buffer_reader_bundles
+        alone would say "reader set == {writer}", i.e. not cross-bundle by
+        the reader-only check -- must still be excluded because it has two
+        distinct writer bundles. This isolates the multi-writer signal from
+        the reader-based signal entirely: no read in bundle A at all.
+        """
+        _make_ftl_buffer("accum")
+        write_a = _make_snode_with_rw("write_a", writes=["accum"], reads=[])
+        write_b = _make_snode_with_rw("write_b", writes=["accum"], reads=[])
+        read_b = _make_snode_with_rw("read_b", writes=[], reads=["accum"])
+        bundle_a = FusedSchedulerNode(MagicMock(), [write_a])
+        bundle_b = FusedSchedulerNode(MagicMock(), [write_b, read_b])
+
+        hbm_pool_planning([bundle_a, bundle_b])
+
+        buf = V.graph.get_buffer("accum")
+        self.assertNotIn("hbm_pool", buf.get_layout().allocation)
+
 
 if __name__ == "__main__":
     unittest.main()
