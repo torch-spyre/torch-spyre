@@ -73,7 +73,7 @@ on:
         description: |
           Per-PR ephemeral runner-set IMAGE label
           (image_spyre_backend_pr_<component>_<sha12>).
-          Leave empty to use the standing image_spyre_backend set.
+          Leave empty to use the standing image_spyre_backend_shadow set.
         required: false
         type: string
         default: ''
@@ -144,7 +144,7 @@ jobs:
     uses: ./.github/workflows/_test_matrix.yaml
     with:
       runner_label: linux
-      image_label: ${{ inputs.runner_label || 'image_spyre_backend' }}
+      image_label: ${{ inputs.runner_label || 'image_spyre_backend_shadow' }}
       extra_test_flags: -v
       checkout_pytorch: false
       ref: ${{ inputs.ref || '' }}

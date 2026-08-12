@@ -120,7 +120,7 @@ jobs:
       - x86_64
       - spyre_pf_x1
       - linux
-      - image_spyre_backend
+      - image_spyre_backend_shadow
     timeout-minutes: 60
     env:
       # The CI env var is very important.

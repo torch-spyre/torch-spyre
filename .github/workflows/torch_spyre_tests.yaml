@@ -49,7 +49,7 @@ on:
         description: |
           Per-PR ephemeral runner-set IMAGE label to select
           (image_spyre_backend_pr_<component>_<sha12>, e.g. image_spyre_backend_pr_flex_8ddcf3e155e9).
-          Empty = use the standing image_spyre_backend set (the RPM is then installed at
+          Empty = use the standing image_spyre_backend_shadow set (the RPM is then installed at
           runtime via rpm_names; the ephemeral flow leaves this set and rpm_names empty).
         required: false
         type: string
@@ -117,7 +117,7 @@ jobs:
     with:
       runner_label: linux
       # Per-PR ephemeral image label when provided, else the standing set.
-      image_label: ${{ inputs.runner_label || 'image_spyre_backend' }}
+      image_label: ${{ inputs.runner_label || 'image_spyre_backend_shadow' }}
       extra_test_flags: -v -m "not xfail"
       extra_test_flags_multi_spyre: -v
       checkout_pytorch: false
