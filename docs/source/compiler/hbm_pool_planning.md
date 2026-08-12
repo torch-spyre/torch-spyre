@@ -39,9 +39,9 @@ call in the generated wrapper code.
 
 The fundamental constraint is:
 
-> A buffer's pool allocation is scoped to a single bundle. The pool tensor
-> is allocated immediately before that bundle's `.run()` call and freed
-> immediately after. Separate bundles do not share a pool.
+> A buffer's pool allocation is scoped to a single bundle: the pool is
+> allocated inside that bundle's own generated MLIR and its lifetime is that
+> bundle's execution. Separate bundles do not share a pool.
 
 This means:
 
@@ -144,8 +144,8 @@ For each top-level entry (bundle) in the post-fusion node list:
    `V.graph.hbm_pool_sizes[bundle_name]`.
 
 Only bundles with at least one pool-eligible buffer get an entry in
-`V.graph.hbm_pool_sizes`; bundles with no pool candidates get no pool tensor
-and no allocation overhead.
+`V.graph.hbm_pool_sizes`; bundles with no pool candidates get no pool
+allocation and no allocation overhead.
 
 ## Integration with code generation
 
