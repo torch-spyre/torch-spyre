@@ -1,0 +1,364 @@
+# Copyright 2026 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import dataclasses
+import math
+from collections.abc import Sequence
+from typing import cast
+
+import sympy
+from torch._inductor.dependencies import MemoryDep
+from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import (
+    ComputedBuffer,
+    MutationLayoutSHOULDREMOVE,
+    Operation,
+    Pointwise,
+)
+
+from . import config
+from .ir import FixedTiledLayout
+from .logging_utils import get_inductor_logger
+from .op_spec import TensorWorkDivision
+from .pass_utils import (
+    PerCoreView,
+    _is_matmul_op,
+    _per_core_view_on_buf,
+    iteration_space_from_op,
+    op_short_name,
+    op_read_writes,
+    try_device_coordinates,
+)
+from .scratchpad.utils import _op_num_cores
+
+logger = get_inductor_logger("lx_relayout")
+_DESTINATION_PREFIX = "__spyre_lx_relayout__"
+_REGISTRY = "_spyre_lx_relayout_copies"
+
+
+@dataclasses.dataclass(frozen=True)
+class LXRelayoutPlan:
+    source_name: str
+    consumer_name: str
+    source_view: PerCoreView
+    destination_view: PerCoreView
+    num_cores: int
+    source_address: int | None = None
+    destination_address: int | None = None
+
+    @property
+    def destination_name(self) -> str:
+        return f"{_DESTINATION_PREFIX}:{self.source_name}:{self.consumer_name}"
+
+    @property
+    def edge(self) -> tuple[str, str]:
+        return self.source_name, self.consumer_name
+
+
+def work_division_from_view(
+    view: PerCoreView | None,
+    device_coordinates: Sequence[sympy.Expr],
+    iteration_symbols: Sequence[sympy.Symbol],
+) -> TensorWorkDivision | None:
+    """Project physical per-core ownership into operation-loop symbols."""
+
+    if view is None:
+        return None
+    loop_symbols = set(iteration_symbols)
+    splits: dict[sympy.Symbol, int] = {}
+    core_map: dict[sympy.Symbol, sympy.Expr] = {}
+    slots = dict(view.core_to_slot)
+    for device_dim, split in view.work_slice_dims:
+        if device_dim >= len(device_coordinates):
+            raise ValueError(f"missing device coordinate {device_dim}")
+        matches = device_coordinates[device_dim].free_symbols & loop_symbols
+        if len(matches) != 1:
+            raise ValueError(f"cannot map device dimension {device_dim} to one loop")
+        dim = next(iter(matches))
+        slot = sympy.sympify(slots[device_dim])
+        if dim in splits and (splits[dim], core_map[dim]) != (split, slot):
+            raise ValueError(f"conflicting ownership for loop {dim}")
+        splits[dim] = split
+        core_map[dim] = slot
+    return TensorWorkDivision(splits, core_map)
+
+
+def materialized_lx_relayouts(
+    graph: GraphLowering,
+) -> dict[tuple[str, str], tuple[str, LXRelayoutPlan]]:
+    return getattr(graph, _REGISTRY, {})
+
+
+def _discard_lx_relayout_group(graph: GraphLowering, source_name: str) -> set[str]:
+    copies = materialized_lx_relayouts(graph)
+    removed = set()
+    for edge, (copy_name, _) in list(copies.items()):
+        if edge[0] == source_name:
+            removed.add(copy_name)
+            del copies[edge]
+    return removed
+
+
+def _clear_lx_state(layout: FixedTiledLayout) -> None:
+    """Clear an LX buffer's placement and physical ownership."""
+
+    layout.allocation.pop("lx", None)
+    layout.lx_view = None
+
+
+def demote_lx_relayout_group(
+    graph: GraphLowering, source_name: str, reason: str
+) -> None:
+    """Remove one relayout group from LX and its materialization registry."""
+
+    names = {source_name, *_discard_lx_relayout_group(graph, source_name)}
+    for name in names:
+        buffer = graph.try_get_buffer(name)
+        if buffer is None:
+            continue
+        layout = buffer.get_layout()
+        if isinstance(layout, FixedTiledLayout):
+            _clear_lx_state(layout)
+    logger.info("demoted %s out of LX: %s", ", ".join(sorted(names)), reason)
+
+
+def _core_slices(view: PerCoreView, num_cores: int) -> dict[int, dict[int, int]]:
+    core_id = sympy.Symbol("core_id")
+    splits = dict(view.work_slice_dims)
+    slots = dict(view.core_to_slot)
+    result = {}
+    for core in range(num_cores):
+        row = {}
+        for dim, split in splits.items():
+            value = sympy.sympify(slots[dim]).subs(core_id, core)
+            assert not value.free_symbols, f"non-concrete owner slot {value}"
+            slot = int(value)
+            assert 0 <= slot < split, f"owner slot {slot} outside split {split}"
+            row[dim] = slot
+        result[core] = row
+    return result
+
+
+def _overlap(a: int, an: int, b: int, bn: int) -> bool:
+    return a * bn < (b + 1) * an and b * an < (a + 1) * bn
+
+
+def _compatible_partitions(
+    source: PerCoreView, destination: PerCoreView, num_cores: int
+) -> bool:
+    source_map = _core_slices(source, num_cores)
+    destination_map = _core_slices(destination, num_cores)
+    source_splits = dict(source.work_slice_dims)
+    destination_splits = dict(destination.work_slice_dims)
+    dims = set(source_splits) | set(destination_splits)
+    edges = {
+        (s_core, d_core)
+        for s_core, s_slice in source_map.items()
+        for d_core, d_slice in destination_map.items()
+        if all(
+            _overlap(
+                s_slice.get(dim, 0),
+                source_splits.get(dim, 1),
+                d_slice.get(dim, 0),
+                destination_splits.get(dim, 1),
+            )
+            for dim in dims
+        )
+    }
+    fanout = [sum(src == core for src, _ in edges) for core in range(num_cores)]
+    fanin = [sum(dst == core for _, dst in edges) for core in range(num_cores)]
+    return bool(edges) and all(
+        (
+            len(set(fanout)) == 1,
+            len(set(fanin)) == 1,
+            len({tuple(sorted(row.items())) for row in source_map.values()})
+            == num_cores,
+            len({tuple(sorted(row.items())) for row in destination_map.values()})
+            == num_cores,
+            math.prod(source_splits.values()) == num_cores,
+            math.prod(destination_splits.values()) == num_cores,
+        )
+    )
+
+
+def _single_write(op: ComputedBuffer, name: str) -> MemoryDep | None:
+    writes = [
+        dep
+        for dep in op_read_writes(op).writes
+        if isinstance(dep, MemoryDep) and dep.name == name
+    ]
+    if len(writes) != 1 or writes[0].is_indirect():
+        return None
+    return writes[0]
+
+
+def _is_activation_source(operations: dict[str, Operation], op: Operation) -> bool:
+    """Exclude restickified graph inputs and weights from activation relayout."""
+
+    return op_short_name(op) != "restickify" or any(
+        isinstance(operations.get(dep.name), ComputedBuffer)
+        for dep in op_read_writes(op).reads
+        if isinstance(dep, MemoryDep)
+    )
+
+
+def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
+    if not config.lx_planner_relayout or config.ktir_emitter:
+        return []
+    assert not materialized_lx_relayouts(graph), (
+        "LX relayout planning requires an unmaterialized graph"
+    )
+
+    cache: dict = {}
+    operations = {op.get_name(): op for op in graph.operations}
+    reads: dict[str, list[tuple[Operation, MemoryDep]]] = {}
+    for consumer in graph.operations:
+        deps = [d for d in op_read_writes(consumer).reads if isinstance(d, MemoryDep)]
+        for dep in deps:
+            reads.setdefault(dep.name, []).append((consumer, dep))
+
+    result = []
+    for source_name, consumer_reads in reads.items():
+        producer = operations.get(source_name)
+        if (
+            not isinstance(producer, ComputedBuffer)
+            or not isinstance(producer.layout, FixedTiledLayout)
+            or (write := _single_write(producer, source_name)) is None
+        ):
+            continue
+        source_view, partial, representable = _per_core_view_on_buf(
+            producer, write, source_name, cache
+        )
+        num_cores = _op_num_cores(producer)
+        if partial or not representable:
+            continue
+
+        # Activation eligibility belongs to the producer, not to an individual
+        # edge. Never relayout a restickified graph input or weight.
+        if not _is_activation_source(operations, producer):
+            continue
+
+        producer_coordinates = try_device_coordinates(
+            producer.layout.device_layout, write, None
+        )
+        if producer_coordinates is None:
+            continue
+        try:
+            work_division_from_view(
+                source_view,
+                producer_coordinates,
+                tuple(iteration_space_from_op(producer)),
+            )
+        except ValueError:
+            continue
+
+        source_plans = []
+        seen_consumers = set()
+        for consumer, dep in consumer_reads:
+            consumer_name = consumer.get_name()
+            if (
+                consumer_name in seen_consumers
+                or not isinstance(consumer, ComputedBuffer)
+                or isinstance(consumer.layout, MutationLayoutSHOULDREMOVE)
+            ):
+                break
+            seen_consumers.add(consumer_name)
+            deps = [
+                d for d in op_read_writes(consumer).reads if isinstance(d, MemoryDep)
+            ]
+            if any(d.is_indirect() for d in deps):
+                break
+            view, consumer_partial, representable = _per_core_view_on_buf(
+                consumer, dep, source_name, cache
+            )
+            if (
+                consumer_partial
+                or not representable
+                or _op_num_cores(consumer) != num_cores
+            ):
+                break
+            consumer_coordinates = try_device_coordinates(
+                producer.layout.device_layout, dep, None
+            )
+            if consumer_coordinates is None:
+                break
+            consumer_symbols = tuple(iteration_space_from_op(consumer))
+            try:
+                work_division_from_view(
+                    source_view, consumer_coordinates, consumer_symbols
+                )
+            except ValueError:
+                break
+            if view == source_view:
+                continue
+            is_matmul = _is_matmul_op(consumer)
+            if is_matmul and len(deps) != 2:
+                break
+            if not is_matmul and not isinstance(consumer.data, Pointwise):
+                break
+            if not _compatible_partitions(source_view, view, num_cores):
+                break
+            try:
+                work_division_from_view(view, consumer_coordinates, consumer_symbols)
+            except ValueError:
+                break
+            source_plans.append(
+                LXRelayoutPlan(
+                    source_name,
+                    consumer_name,
+                    source_view,
+                    view,
+                    num_cores,
+                )
+            )
+        else:
+            result.extend(source_plans)
+    return result
+
+
+def materialize_lx_relayouts(graph: GraphLowering, plans: list[LXRelayoutPlan]) -> None:
+    if not plans:
+        assert not materialized_lx_relayouts(graph)
+        return
+    from .scratchpad.graph_editor import GraphEditor
+
+    copies = materialized_lx_relayouts(graph)
+    assert not copies, "LX relayouts were already materialized"
+    editor = GraphEditor(graph)
+    setattr(graph, _REGISTRY, copies)
+    for plan in plans:
+        source = cast(ComputedBuffer, graph.get_buffer(plan.source_name))
+        consumer = cast(ComputedBuffer, graph.get_buffer(plan.consumer_name))
+        copy = editor.insert_clone_before_consumer(source, consumer)
+        copies[plan.edge] = (copy.get_name(), plan)
+
+        assert plan.source_address is not None and plan.destination_address is not None
+        assert plan.source_view != plan.destination_view
+        source_layout = cast(FixedTiledLayout, source.layout)
+        copy_layout = cast(FixedTiledLayout, copy.layout)
+        source_layout.allocation["lx"] = plan.source_address
+        copy_layout.allocation["lx"] = plan.destination_address
+        source_layout.lx_view = plan.source_view
+        copy_layout.lx_view = plan.destination_view
+        logger.debug(
+            "accepted LX relayout %s -> %s: source=%s@%d destination=%s@%d",
+            source.get_name(),
+            copy.get_name(),
+            plan.source_view,
+            plan.source_address,
+            plan.destination_view,
+            plan.destination_address,
+        )

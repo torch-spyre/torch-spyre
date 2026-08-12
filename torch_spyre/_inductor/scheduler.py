@@ -34,12 +34,47 @@ from torch._inductor.codecache import code_hash
 from torch.utils._ordered_set import OrderedSet
 
 from .spyre_kernel import SpyreKernel
-from .pass_utils import iteration_space, per_core_view_scheduled
+from .ir import FixedTiledLayout
+from .pass_utils import (
+    PerCoreView,
+    iteration_space,
+    per_core_view_scheduled,
+    try_device_coordinates,
+)
 from .logging_utils import get_inductor_logger
+from .lx_relayout import (
+    demote_lx_relayout_group,
+    materialized_lx_relayouts,
+    work_division_from_view,
+)
 from .op_spec import LoopSpec
 from . import config as _spyre_config
 
 logger = get_inductor_logger("scheduler")
+
+
+def _ownership_projectable(
+    node: SchedulerNode,
+    dep: MemoryDep,
+    name: str,
+    view: PerCoreView,
+) -> bool:
+    """Whether final scheduled coordinates can carry ``view`` into codegen."""
+
+    buffer = V.graph.try_get_buffer(name)
+    if buffer is None:
+        return False
+    layout = buffer.get_layout()
+    if not isinstance(layout, FixedTiledLayout):
+        return False
+    coordinates = try_device_coordinates(layout.device_layout, dep, None)
+    if coordinates is None:
+        return False
+    try:
+        work_division_from_view(view, coordinates, tuple(iteration_space(node)))
+    except ValueError:
+        return False
+    return True
 
 
 class CountedLoopSchedulerNode(FusedSchedulerNode):
@@ -321,6 +356,18 @@ def _lx_resident(node: SchedulerNode) -> bool:
     return allocation is not None and "lx" in allocation
 
 
+def _lx_view(name: str):
+    buffer = V.graph.try_get_buffer(name)
+    if buffer is None:
+        return None
+    layout = buffer.get_layout()
+    if not isinstance(layout, FixedTiledLayout):
+        return None
+    if "lx" not in layout.allocation:
+        return None
+    return layout.lx_view
+
+
 def align_lx_producer_loop_order(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
@@ -354,7 +401,7 @@ def align_lx_producer_loop_order(
     for node in nodes:
         if isinstance(node, SchedulerNode) and _lx_resident(node):
             for dep in node.read_writes.writes:
-                if isinstance(dep, MemoryDep):
+                if isinstance(dep, MemoryDep) and _lx_view(dep.name) is None:
                     producers[dep.name] = node
 
     if not producers:
@@ -433,32 +480,107 @@ def demote_incoherent_lx_buffers(
     if not _spyre_config.lx_planning:
         return nodes
 
-    # dep is needed per (node, buffer): a node reading and writing the same
-    # buffer contributes one entry per access, so an in-place op whose read and
-    # write views diverge is caught too.
+    # dep is needed per (node, buffer), including in-place read/write pairs.
     users: dict[str, list[tuple[SchedulerNode, MemoryDep]]] = {}
     lx_names: OrderedSet[str] = OrderedSet()
-    for node in nodes:
-        for inner in node.get_nodes():
-            if not isinstance(inner, SchedulerNode):
-                continue
-            if _lx_resident(inner):
-                for dep in inner.read_writes.writes:
-                    if isinstance(dep, MemoryDep):
-                        lx_names.add(dep.name)
-            rw = inner.read_writes
-            for dep in list(rw.reads) + list(rw.writes):
+    scheduled = [
+        inner
+        for node in nodes
+        for inner in node.get_nodes()
+        if isinstance(inner, SchedulerNode)
+    ]
+    plans_by_copy = {
+        copy_name: plan
+        for copy_name, plan in materialized_lx_relayouts(V.graph).values()
+    }
+    source_by_copy = {
+        copy_name: plan.source_name for copy_name, plan in plans_by_copy.items()
+    }
+    relayout_sources = set(source_by_copy.values())
+
+    copy_reads = set()
+    invalid_sources = {}
+    seen_copies = set()
+    for node in scheduled:
+        if _lx_resident(node):
+            for dep in node.read_writes.writes:
                 if isinstance(dep, MemoryDep):
-                    users.setdefault(dep.name, []).append((inner, dep))
+                    lx_names.add(dep.name)
+        rw = node.read_writes
+        reads = [dep for dep in rw.reads if isinstance(dep, MemoryDep)]
+        writes = [dep for dep in rw.writes if isinstance(dep, MemoryDep)]
+        for dep in [*reads, *writes]:
+            users.setdefault(dep.name, []).append((node, dep))
+        copies = [dep for dep in writes if dep.name in plans_by_copy]
+        if not copies:
+            continue
+        for dep in copies:
+            seen_copies.add(dep.name)
+            plan = plans_by_copy[dep.name]
+            source_view = _lx_view(plan.source_name)
+            destination_view = _lx_view(dep.name)
+            if (
+                source_view is None
+                or destination_view is None
+                or source_view == destination_view
+                or len(reads) != 1
+                or len(writes) != 1
+                or reads[0].name != plan.source_name
+                or not _ownership_projectable(
+                    node, reads[0], plan.source_name, source_view
+                )
+                or not _ownership_projectable(node, dep, dep.name, destination_view)
+            ):
+                invalid_sources[plan.source_name] = f"invalid relayout copy {dep.name}"
+            else:
+                copy_reads.add((node.get_name(), plan.source_name))
+    for copy_name, plan in plans_by_copy.items():
+        if copy_name not in seen_copies:
+            invalid_sources[plan.source_name] = f"missing relayout copy {copy_name}"
+
+    demoted = set()
+
+    def demote(source_name: str, reason: str) -> None:
+        if source_name in demoted:
+            return
+        demoted.add(source_name)
+        if source_name in relayout_sources:
+            # Scheduling supplies the final ownership verdict; the relayout
+            # layer owns atomic group fallback and registry cleanup.
+            demote_lx_relayout_group(V.graph, source_name, reason)
+            return
+        buffer = V.graph.try_get_buffer(source_name)
+        if buffer is not None:
+            layout = buffer.get_layout()
+            if isinstance(layout, FixedTiledLayout):
+                layout.allocation.pop("lx", None)
+                layout.lx_view = None
+        logger.info("demoted %s out of LX: %s", source_name, reason)
+
+    for source_name, reason in invalid_sources.items():
+        demote(source_name, reason)
 
     for name in lx_names:
         ref = None
         culprit = None
+        expected = _lx_view(name)
         for node, dep in users.get(name, []):
+            # The copy executes with its destination division; the source map is
+            # carried by its input tensor and validated at the producer.
+            if (node.get_name(), name) in copy_reads:
+                continue
             view, _, representable = per_core_view_scheduled(node, dep, name)
             if not representable:
                 culprit = f"{node.get_name()} view unrepresentable"
                 break
+            if expected is not None:
+                if view != expected:
+                    culprit = f"{node.get_name()} view {view} != {expected}"
+                    break
+                if not _ownership_projectable(node, dep, name, expected):
+                    culprit = f"{node.get_name()} ownership unprojectable"
+                    break
+                continue
             if ref is None:
                 ref = view
             elif view != ref:
@@ -466,12 +588,7 @@ def demote_incoherent_lx_buffers(
                 break
         if culprit is None:
             continue
-        buf = V.graph.try_get_buffer(name)
-        layout = getattr(buf, "layout", None)
-        allocation = getattr(layout, "allocation", None)
-        if allocation is not None:
-            allocation.pop("lx", None)
-        logger.info("demoted %s out of LX: %s", name, culprit)
+        demote(source_by_copy.get(name, name), culprit)
 
     return nodes
 

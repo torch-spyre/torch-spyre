@@ -20,6 +20,7 @@ from sympy import Symbol
 from torch_spyre._C import DataFormats, encode_constant
 from torch_spyre._inductor.constants import CONV2D_DIM_LABELS, DEPTHWISE_CONV2D_OP
 from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.pass_utils import coeff_through_floor
 
 
@@ -690,6 +691,13 @@ def generate_sdsc(
         }
         for c in range(sdsc_spec.num_cores)
     }
+    operation_work_division = TensorWorkDivision(
+        {dim: int(split) for dim, split in sdsc_spec.work_slices.items()},
+        {dim: sdsc_spec.core_id_to_work_slice[dim] for dim in sdsc_spec.work_slices},
+    )
+    for tensor in sdsc_spec.args:
+        if tensor.work_division is None:
+            tensor.work_division = operation_work_division
     symbolic_dims = sdsc_spec.symbolic_dims or {}
 
     # Register dimension symbols BEFORE address symbols so their IDs never collide.
@@ -1179,7 +1187,7 @@ def generate_sdsc(
             dim_str = str(dim)
             scale = tensor.scales[dim]
             is_tiled = scale == 1
-            nsplits = sdsc_spec.work_slices[dim] if is_tiled else 1
+            nsplits = tensor.work_division.work_slices[dim] if is_tiled else 1
             # dim_size feeds get_conv_params (#3510). size uses #3284's
             # _coord_per_core_size, a safe superset: it returns the windowed
             # span only for forward conv2d (opfunc=="conv2d") and otherwise
@@ -1568,7 +1576,14 @@ def generate_sdsc(
                                         "coordInfo": _build_coord_info(
                                             sdsc_spec.opfunc, tensor, i
                                         ),
-                                        "coreIdToWkSlice_": {},
+                                        "coreIdToWkSlice_": (
+                                            tensor.work_division.to_core_slices(
+                                                sdsc_spec.num_cores
+                                            )
+                                            if sdsc_spec.opfunc == "shuffle"
+                                            and tensor.work_division is not None
+                                            else {}
+                                        ),
                                     },
                                 }
                                 for i, tensor in enumerate(sdsc_spec.args)
