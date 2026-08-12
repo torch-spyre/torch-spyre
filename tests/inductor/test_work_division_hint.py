@@ -224,6 +224,20 @@ class TestNamedWorkDivisionHint(InductorTestCase):
                 max_cores=32,
             )
 
+    def test_apply_work_div_hint_rejects_pinned_split(self):
+        m = Symbol("M")
+        op = self._fake_op({m: ["M"]})
+
+        with self.assertRaisesRegex(Exception, "pinned to split=1"):
+            _wd._apply_user_hint(
+                op,
+                {m: 2},
+                {m: 64},
+                self._fake_output_td([m]),
+                max_cores=32,
+                pinned={m: 1},
+            )
+
     @config.patch({"sencores": 8})
     def test_pointwise_work_div_hint_applied(self):
         M, N = 128, 64
