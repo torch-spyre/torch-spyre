@@ -388,6 +388,10 @@ class JobPlanStepCompute final : public JobPlanStep {
         bootstrap_offset_(bootstrap_offset),
         name_(std::move(name)) {}
 
+  const std::string& getName() const {
+    return name_;
+  }
+
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
   void write(std::ostream& os) const override;

@@ -5,10 +5,14 @@ pytorch_ci_dispatches row's `completed` stage report (see
 ingest_pytorch_dispatch.py --result-payload-file).
 
 Merges: the test-counts JSON produced by parse_junit_xml_counts.py, the
-job's conclusion, and any number of stage durations computed from pairs of
-Unix-epoch-second environment variables written earlier in the job via
-`echo "VAR=$(date +%s)" >> "$GITHUB_ENV"`. A duration is omitted (null) if
-either boundary env var is unset, e.g. because that stage never ran.
+job's conclusion, and any number of stage durations either (a) computed from
+pairs of Unix-epoch-second environment variables written earlier in the job
+via `echo "VAR=$(date +%s)" >> "$GITHUB_ENV"`, or (b) passed as a literal
+value already computed elsewhere (e.g. in a different job — GITHUB_ENV
+timestamps don't cross job boundaries, so a duration computed in an upstream
+job's output has to be threaded through as a literal). A --duration is
+omitted (null) if either boundary env var is unset, e.g. because that stage
+never ran.
 
 Usage (called by the GHA workflow):
     python3 build_stage_result_payload.py \
@@ -16,7 +20,7 @@ Usage (called by the GHA workflow):
         --conclusion success \
         --duration pytorch_build_seconds=T_TORCH_BUILD_START:T_TORCH_SPYRE_BUILD_START \
         --duration torch_spyre_build_seconds=T_TORCH_SPYRE_BUILD_START:T_RUNNING_TESTS_START \
-        --duration tests_seconds=T_RUNNING_TESTS_START:T_RUNNING_TESTS_END \
+        --duration-value tests_seconds=42 \
         --output-file result_payload.json
 """
 
@@ -44,6 +48,21 @@ def elapsed_seconds(start_env: str, end_env: str) -> int | None:
     return int(end) - int(start)
 
 
+def parse_duration_value_spec(spec: str) -> tuple[str, int]:
+    """Parse "name=SECONDS" into (name, seconds)."""
+    name, _, value = spec.partition("=")
+    if not name or not value:
+        raise argparse.ArgumentTypeError(
+            f"--duration-value must look like 'name=SECONDS', got: {spec!r}"
+        )
+    try:
+        return name, int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--duration-value seconds must be an integer, got: {spec!r}"
+        ) from exc
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -66,6 +85,19 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--duration-value",
+        action="append",
+        default=[],
+        type=parse_duration_value_spec,
+        metavar="NAME=SECONDS",
+        help=(
+            "Repeatable. Adds payload[NAME] = int(SECONDS) verbatim — for "
+            "durations already computed elsewhere (e.g. a prior job's "
+            "output), where the GITHUB_ENV timestamp pair --duration expects "
+            "isn't available."
+        ),
+    )
+    parser.add_argument(
         "--output-file", required=True, help="Path to write the merged JSON payload to"
     )
     args = parser.parse_args()
@@ -79,6 +111,8 @@ def main() -> None:
     payload["conclusion"] = args.conclusion
     for name, start_env, end_env in args.duration:
         payload[name] = elapsed_seconds(start_env, end_env)
+    for name, seconds in args.duration_value:
+        payload[name] = seconds
 
     with open(args.output_file, "w") as f:
         json.dump(payload, f)
