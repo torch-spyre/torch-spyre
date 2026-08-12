@@ -157,7 +157,7 @@ generated `async_compile.sdsc(...)` call, and from there into
 `generate_bundle()`, which emits the pool allocation as a single MLIR op
 inside the bundle's own function body:
 
-```mlir
+```none
 %pool = sdscbundle.device_mem_allocate {pool_size_bytes} bytes : index
 ```
 
