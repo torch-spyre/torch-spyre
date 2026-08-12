@@ -738,9 +738,7 @@ def _is_direct_conv_supported(
       the conv SDSC contracts over C_in with no partial-stick handling. A C_in
       that is not a whole multiple of the fp16 stick width (get_elem_in_stick,
       = 64) would need contraction-dim padding the direct path does not emit
-      (known-broken), so it stays on the im2col+matmul path.  This also makes
-      C_in == kH / kW impossible (kernels are small), which keeps the size-based
-      reduction-group label matching in codegen unambiguous;
+      (known-broken), so it stays on the im2col+matmul path;
     - kernel tap > _CONV_MAX_KERNEL (3): the dense C_in*kH*kW contraction working
       set overflows the SuperDSC LX budget in the backend for k>3 and cannot be tiled
       (see _CONV_MAX_KERNEL), so it stays on the im2col+matmul path;

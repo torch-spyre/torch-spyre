@@ -241,12 +241,6 @@ class OpSpec:
     # these live ranges rather than a lowering-time size snapshot.  None when the
     # node exposes no data.ranges.
     node_output_ranges: tuple[Expr, ...] | None = None
-    # Full logical reduction ranges of the reduction node, including unit dims.
-    # For conv these are [C_in, kH, kW]: conv sources its reduction-axis dim
-    # sizes (in_channel, win_h, win_w) from these live ranges rather than a
-    # lowering-time size snapshot, mirroring node_output_ranges for the output
-    # axes.  None when the node exposes no data.reduction_ranges.
-    node_reduction_ranges: tuple[Expr, ...] | None = None
     debug_handle: DebugHandle | None = None
 
 

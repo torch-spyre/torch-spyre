@@ -1023,12 +1023,12 @@ def lower_convolution(
             "dil_h": dilH,
             "dil_w": dilW,
         },
-        # NOTE: conv iteration-space dim sizes are NOT snapshotted here.  Codegen
-        # derives each dim role's size from the node's live IR ranges instead
-        # (output NCHW ranges + reduction ranges; see _conv2d_role_sizes /
-        # _align_conv_dim_labels in codegen/superdsc.py), so views and
-        # device-layout assignment stay authoritative -- mirroring the avgpool
-        # move off op_info["pool_dim_sizes"] to OpSpec.node_output_ranges.
+        # NOTE: conv iteration-space dim roles are NOT snapshotted here.  Codegen
+        # recovers each dim's role (channel / in_channel / win_h / win_w /
+        # out_h / out_w / batch) structurally from the args' access expressions
+        # -- set membership and co-occurrence in device_coordinates, never sizes
+        # or positions (see _match_labels_by_structure in codegen/superdsc.py) --
+        # so views and device-layout assignment stay authoritative.
     }
 
     def inner_fn(index, reduction_index):

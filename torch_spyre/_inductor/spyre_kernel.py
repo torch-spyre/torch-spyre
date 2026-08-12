@@ -941,20 +941,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             and hasattr(ir_node.data, "ranges")
             else None
         )
-        # Conv additionally carries its reduction ranges ([C_in, kH, kW], incl.
-        # unit dims) so codegen sources its reduction-axis dim sizes (in_channel,
-        # win_h, win_w) from live IR too — completing the move off the
-        # lowering-time conv_dim_sizes snapshot.  Pools reduce over the same
-        # window their output ranges already describe, so they need no separate
-        # reduction-range carry.
-        node_reduction_ranges = (
-            tuple(ir_node.data.reduction_ranges)
-            if op in CONV_OPS
-            and hasattr(ir_node, "data")
-            and hasattr(ir_node.data, "reduction_ranges")
-            else None
-        )
-
         return OpSpec(
             op,
             is_reduction,
@@ -965,7 +951,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             tiled_symbol_trip_counts=tiled_symbol_trip_counts,
             symbolic_dim_bounds=symbolic_dim_bounds,
             node_output_ranges=node_output_ranges,
-            node_reduction_ranges=node_reduction_ranges,
             debug_handle=debug_handle,
         )
 
@@ -1448,16 +1433,6 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                         "node_output_ranges=("
                         + "".join(
                             sympy_str(r) + ", " for r in op_spec.node_output_ranges
-                        )
-                        + "),"
-                    )
-                if op_spec.node_reduction_ranges is not None:
-                    # Same round-trip as node_output_ranges: conv codegen reads
-                    # these to source its reduction-axis dim sizes.
-                    buf.writeline(
-                        "node_reduction_ranges=("
-                        + "".join(
-                            sympy_str(r) + ", " for r in op_spec.node_reduction_ranges
                         )
                         + "),"
                     )

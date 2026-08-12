@@ -463,9 +463,9 @@ _POOL_ROLE_LABELS = list(
 
 # Canonical conv2d iteration-space order -> SDSC labels, mirroring
 # _POOL_ROLE_LABELS.  Conv adds the ``in_channel`` contraction role between the
-# output channel and the kernel taps.  Codegen owns these strings; per-role
-# sizes are sourced from the node's live IR ranges (see _conv2d_role_sizes).
-# Order matches CONV_DIM_LABELS.
+# output channel and the kernel taps.  Codegen owns these strings; each role is
+# recovered structurally from the args' access expressions (see
+# _match_labels_by_structure), never from sizes.  Order matches CONV_DIM_LABELS.
 _CONV_ROLE_LABELS = list(
     zip(
         ["batch", "out_h", "out_w", "channel", "in_channel", "win_h", "win_w"],
@@ -528,122 +528,126 @@ def _align_pool_dim_labels(node_output_ranges, ndim: int) -> list[str]:
     return labels
 
 
-def _conv2d_role_sizes(op: str, node_output_ranges, node_reduction_ranges) -> dict:
-    """Map each conv2d dim role to its live size from the node's IR ranges.
+def _arg_stick_symbol(arg) -> Symbol | None:
+    """The iteration symbol on ``arg``'s stick (innermost) device coordinate.
 
-    Specific to standard conv2d: it assumes the node's NCHW output ranges
-    ``[N, C_out, H_out, W_out]`` and reduction ranges ``[C_in, kH, kW]`` layout,
-    so the caller must guard on the op (``_is_conv``) — this helper re-checks it
-    rather than trusting the caller.
-
-    Replaces the lowering-time ``conv_dim_sizes`` snapshot: the output roles come
-    from the node's NCHW output ranges and the reduction roles from its reduction
-    ranges — both tracked by the compiler (views, device-layout assignment)
-    rather than frozen at lowering.  Sourcing sizes from live IR keeps label
-    alignment robust when the compiler rewrites shapes before codegen.
+    Spyre lays the stick dim last, so ``device_coordinates[-1]`` is the stick
+    lane (e.g. ``Mod(c3, 64)``).  Returns its single free symbol, or ``None``
+    when the arg has no coordinates or the stick coordinate is not driven by
+    exactly one symbol (so callers can bail to a positional mapping).  Mirrors
+    the stick-var read in ``spyre_kernel.create_op_spec``.
     """
-    if not _is_conv(op):
-        raise ValueError(
-            f"_conv2d_role_sizes is specific to standard conv2d but was called "
-            f"for op {op!r} (not in CONV_OPS)"
-        )
-    return {
-        "batch": node_output_ranges[0],
-        "channel": node_output_ranges[1],
-        "out_h": node_output_ranges[2],
-        "out_w": node_output_ranges[3],
-        "in_channel": node_reduction_ranges[0],
-        "win_h": node_reduction_ranges[1],
-        "win_w": node_reduction_ranges[2],
-    }
+    if not arg.device_coordinates:
+        return None
+    free = arg.device_coordinates[-1].free_symbols
+    return next(iter(free)) if len(free) == 1 else None
 
 
-def _align_conv_dim_labels(role_sizes: dict, ndim: int) -> list[str]:
-    """Return the conv dim labels aligned to the (possibly squeezed) iteration space.
+def _ordered_arg_symbols(arg, exclude: tuple = ()) -> list[Symbol]:
+    """Free symbols across ``arg``'s device coordinates, first-appearance order.
 
-    ``role_sizes`` maps each conv-domain dim role (batch, out_h, out_w, channel,
-    in_channel, win_h, win_w) to its live size, sourced from the node's IR ranges
-    (see ``_conv2d_role_sizes``).  Codegen owns the SDSC label for each role
-    (``_CONV_ROLE_LABELS``).  The pipeline drops statically size-1 dims (e.g.
-    batch N=1, or ki/kj for a 1x1 kernel) before parse_op_spec runs, so a role
-    whose size is 1 has no surviving dim and its label is filtered out here.
-    Keeps labels aligned to the real iteration space without inferring dim roles
-    from sizes.
+    Deduplicates and skips ``exclude``; within a single coordinate the symbols
+    are ordered by name so the walk is deterministic (conv coordinates carry at
+    most one free symbol each, so this only matters defensively).
     """
-    labels = [
-        label
-        for role, label in _CONV_ROLE_LABELS
-        if not _is_static_one(role_sizes.get(role))
-    ]
-    if len(labels) != ndim:
-        raise ValueError(
-            f"conv dim label count {len(labels)} ({labels}) does not match "
-            f"iteration-space rank {ndim}; conv IR ranges are out of sync with "
-            "the emitted iteration space"
-        )
-    return labels
+    seen, ordered = set(exclude), []
+    for coord in arg.device_coordinates:
+        for sym in sorted(coord.free_symbols, key=str):
+            if sym not in seen:
+                seen.add(sym)
+                ordered.append(sym)
+    return ordered
 
 
-def _match_labels_by_size(
-    iteration_space: dict, dim_labels: list[str], dim_label_sizes: list
-) -> dict | None:
-    """Map each iteration-space symbol to a dim label by matching sizes.
+def _match_labels_by_structure(op_spec: "OpSpec") -> dict | None:
+    """Map each conv2d iteration symbol to its SDSC dim label, structurally.
 
-    A Reduction's iteration space appends its reduction axes in read-dep access
-    order (see iteration_space() in pass_utils), which is data-dependent -- for
-    conv2d the contraction dim (in) can land after the kernel taps (ki/kj)
-    instead of before them.  A purely positional label assignment then mislabels
-    dims (e.g. C_in -> kj, kernel width -> in), scrambling the SDSC.
+    A Reduction's iteration space appends its reduction axes in data-dependent
+    read-dep access order (see ``iteration_space`` in pass_utils), so the
+    contraction dim (``in``) and the kernel taps (``ki``/``kj``) cannot be told
+    apart positionally.  Rather than reconstruct the canonical ordering from a
+    carried size snapshot, recover each role from what the args' access
+    expressions already encode -- set membership and co-occurrence, never sizes
+    or positions:
 
-    Match by size instead, consuming the canonical labels in order so ties
-    (i==j, out==in, square kernels ki==kj) stay assigned in canonical order --
-    the output dims always precede the reduction dims in the iteration space, so
-    equal-sized output/reduction dims (e.g. out==in) resolve correctly, and the
-    kernel taps keep their canonical relative order.  ``dim_label_sizes`` are the
-    raw (pre-stick-padding) sizes, which is exactly what the iteration space
-    carries, so the comparison is exact.
+      * ``out`` (C_out): the *output* arg's stick symbol -- also the weight's
+        stick symbol, which is how the weight input is told from the activation.
+      * ``in`` (C_in, contraction): the *activation's* stick symbol.  Reading
+        only the two inputs' stick symbols (never the weight's permuted
+        non-stick dim order) keeps this robust to the weight's channel-last
+        layout.
+      * ``i``/``j``/``mb`` (out_h/out_w/batch): the output arg's non-stick
+        symbols in device-coordinate order -- batch trails the spatial dims.
+      * ``ki``/``kj`` (win_h/win_w): the weight's symbols other than its stick
+        and the contraction, paired to a spatial axis by adjacency in the
+        activation window (a tap immediately follows its output-spatial dim).
 
-    Reduction-group invariant (conv). The reduction axes ``[in, ki, kj]`` are
-    the group this reordering actually threatens, and size-matching keeps them
-    correct under two facts:
-      * ``in`` (contraction / C_in) vs the kernel taps ``ki``/``kj``: these must
-        not share a size, or ``in`` could be matched to a window label.  The
-        stick-aligned C_in guard in ``_is_direct_conv_supported`` forces C_in to
-        a multiple of 64 while kernel taps stay small, so the sizes cannot
-        collide.  ``parse_op_spec`` asserts this at the conv call site so any
-        future loosening of that guard fails loudly here rather than silently
-        mislabeling.
-      * ``ki`` vs ``kj`` (square kernel ki==kj): a genuine tie, resolved by
-        canonical order -- win_h precedes win_w in the label list, and the
-        windowed-input SDSC treats the two spatial axes symmetrically, so the
-        assignment is correct either way.
-    Squeezed size-1 taps (1xN / Nx1) never reach here as a window label: their
-    role is dropped upstream by ``_align_conv_dim_labels``.
+    Squeezed size-1 dims (batch N=1, a 1xN / Nx1 kernel's collapsed tap) simply
+    never appear as a symbol, so they drop out for free -- no per-role size-1
+    filtering and no ``C_in`` vs tap size-collision guard are needed.
 
-    Returns None (caller falls back to positional) if any size is non-static or
-    unmatched, so dynamic-shape ops keep their previous behaviour.
+    Returns ``None`` (caller falls back to a positional mapping) whenever the
+    arg structure is not the expected two-input reduction, so nothing else is
+    affected.  Unlike the former size-matching this has no static-shape
+    requirement, so dynamic spatial dims are handled too.
     """
-    canonical: list[tuple[str, int]] = []
-    for lbl, sz in zip(dim_labels, dim_label_sizes):
-        try:
-            canonical.append((lbl, int(sz)))
-        except (TypeError, ValueError):
-            return None  # symbolic/dynamic dim -> fall back to positional
-    used = [False] * len(canonical)
-    mapping: dict = {}
-    for sym, raw in iteration_space.items():
-        size = raw[0] if isinstance(raw, tuple) else raw
-        try:
-            isize = int(size)
-        except (TypeError, ValueError):
+    role_label = dict(_CONV_ROLE_LABELS)
+    inputs = [a for a in op_spec.args if a.is_input]
+    outputs = [a for a in op_spec.args if not a.is_input]
+    if len(inputs) != 2 or len(outputs) != 1:
+        return None
+    out_arg = outputs[0]
+    channel = _arg_stick_symbol(out_arg)
+    if channel is None:
+        return None
+    weight = next((a for a in inputs if _arg_stick_symbol(a) == channel), None)
+    activation = next((a for a in inputs if a is not weight), None)
+    if weight is None or activation is None:
+        return None
+    contraction = _arg_stick_symbol(activation)
+    if contraction is None or contraction == channel:
+        return None
+
+    # Output roles: non-stick output symbols in coordinate order are
+    # [out_h, out_w, batch] (batch trails the spatial dims in the output layout).
+    out_spatial = _ordered_arg_symbols(out_arg, exclude=(channel,))
+    spatial_roles = ["out_h", "out_w", "batch"]
+    if len(out_spatial) > len(spatial_roles):
+        return None
+    role_of = dict(zip(out_spatial, spatial_roles))
+
+    # Taps are the weight's symbols other than its stick (channel) and the
+    # contraction; pair each to a spatial axis by activation-window adjacency.
+    act_order = _ordered_arg_symbols(activation)
+    tap_role = {}
+    for tap in _ordered_arg_symbols(weight, exclude=(channel, contraction)):
+        if tap not in act_order:
             return None
-        for k, (lbl, sz) in enumerate(canonical):
-            if not used[k] and sz == isize:
-                used[k] = True
-                mapping[sym] = Symbol(lbl)
-                break
-        else:
-            return None  # no matching label -> fall back
+        i = act_order.index(tap)
+        prev_spatial = next(
+            (
+                act_order[k]
+                for k in range(i - 1, -1, -1)
+                if role_of.get(act_order[k]) in ("out_h", "out_w")
+            ),
+            None,
+        )
+        if prev_spatial is None:
+            return None
+        tap_role[tap] = "win_h" if role_of[prev_spatial] == "out_h" else "win_w"
+
+    mapping = {
+        channel: Symbol(role_label["channel"]),
+        contraction: Symbol(role_label["in_channel"]),
+    }
+    for sym, role in role_of.items():
+        mapping[sym] = Symbol(role_label[role])
+    for sym, role in tap_role.items():
+        mapping[sym] = Symbol(role_label[role])
+    # Every iteration symbol must have received a label; otherwise fall back so
+    # the positional path assigns a complete mapping.
+    if any(sym not in mapping for sym in op_spec.iteration_space):
+        return None
     return mapping
 
 
@@ -1614,48 +1618,18 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     has_indirect_access = bool(index_tensor_indices)
 
     symbol_mapping = None
-    if (
-        op_spec.op == CONV2D_FWD_OP
-        and op_spec.node_output_ranges is not None
-        and op_spec.node_reduction_ranges is not None
-    ):
-        # Forward conv2d (#3284) sources its dim-role sizes from the node's live
-        # IR ranges (NCHW
-        # output ranges + reduction ranges) rather than a lowering-time size
-        # snapshot, so views / device-layout assignment stay authoritative.
-        # Codegen owns the labels (_CONV_ROLE_LABELS) and drops squeezed size-1
-        # roles.  Unlike pool, conv is a Reduction whose iteration space appends
-        # its reduction axes (in/ki/kj) in data-dependent read-dep access order,
-        # so the contraction dim (in) can land after the kernel taps (ki/kj) and
-        # a positional label assignment mislabels dims.  Assign conv labels by
-        # matching each dim's raw (pre-padding) size, which the iteration space
-        # carries exactly; falls back to positional when sizes are non-static or
-        # unmatched.
-        role_sizes = _conv2d_role_sizes(
-            op_spec.op, op_spec.node_output_ranges, op_spec.node_reduction_ranges
-        )
-        # Reduction-group safety (see _match_labels_by_size): size-based matching
-        # can only disambiguate the data-dependent reduction axes (in / ki / kj)
-        # if the contraction dim does not share a size with a kernel tap. The
-        # stick-aligned C_in guard makes that impossible (C_in is a multiple of
-        # 64, taps stay small); assert it so a future loosening of that guard
-        # fails loudly here instead of silently mislabeling 'in' as a window dim.
-        _in = _try_static_int(role_sizes.get("in_channel"))
-        for _krole in ("win_h", "win_w"):
-            _k = _try_static_int(role_sizes.get(_krole))
-            if _in is not None and _k is not None and _k != 1:
-                assert _in != _k, (
-                    f"conv reduction-group size tie: in_channel={_in} == "
-                    f"{_krole}={_k}; size-based label matching cannot separate "
-                    "the contraction dim from a kernel tap (is the C_in "
-                    "stick-alignment guard in _is_direct_conv_supported intact?)"
-                )
-        dim_labels = _align_conv_dim_labels(role_sizes, ndim)
-        symbol_mapping = _match_labels_by_size(
-            op_spec.iteration_space,
-            [label for _role, label in _CONV_ROLE_LABELS],
-            [role_sizes.get(role) for role, _label in _CONV_ROLE_LABELS],
-        )
+    if op_spec.op == CONV2D_FWD_OP:
+        # Forward conv2d (#3284) is a Reduction whose iteration space appends its
+        # reduction axes (in/ki/kj) in data-dependent read-dep access order, so
+        # the contraction dim and the kernel taps cannot be told apart
+        # positionally.  Recover each dim's role from what the args' access
+        # expressions already carry -- set membership and co-occurrence
+        # (_match_labels_by_structure) -- rather than from a size snapshot.  This
+        # needs no live IR ranges, drops squeezed size-1 dims for free, and has
+        # no C_in-vs-tap size-collision constraint.  Falls back to the positional
+        # mapping below only if the arg structure is unexpected.
+        dim_labels = [label for _role, label in _CONV_ROLE_LABELS][-ndim:]
+        symbol_mapping = _match_labels_by_structure(op_spec)
     elif is_pool:
         # Pool survival is read from the node's live output ranges (NCHW); the
         # lowering supplies no size snapshot.  Positional mapping (below) is
@@ -1674,7 +1648,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             and "conv_params" in op_spec.op_info
         ):
             symbol_mapping = _build_conv2d_symbol_mapping(op_spec, dim_labels)
-    # Forward conv (role-size matching) and depthwise (above) may already have
+    # Forward conv (structural recovery) and depthwise (above) may already have
     # set symbol_mapping; everything else gets a positional mapping.
     if symbol_mapping is None:
         symbol_mapping = {
