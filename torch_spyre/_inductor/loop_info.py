@@ -50,7 +50,7 @@ class ReductionPlan:
     is_nested:
         True when an outer level tiles an output dim and an inner level
         tiles a reduction dim, requiring separate tile-sized and full-sized
-        accumulators (see ``_compute_fill_loop_info``). False for a flat
+        accumulators (see ``_compute_fill_loop_info_planned``). False for a flat
         (reduction-dim-only) tiling.
     full_output_ranges:
         Full (pre-division) output shape for the accumulation buffer --
@@ -62,7 +62,8 @@ class ReductionPlan:
         ``_divide_ranges`` performs later, in place, during transformation).
     outer_fill_loop_info:
         ``CoarseTileInfo`` covering only the outer output-dim levels, to
-        stamp on the fill op for a nested tiling (``_compute_fill_loop_info``).
+        stamp on the fill op for a nested tiling
+        (``_compute_fill_loop_info_planned``).
         ``None`` for a flat tiling, where the fill runs once before all loops.
         Its ``loop_group_id`` is planning-time, pre-offset numbering --
         transformation must re-slice it from the op's own real, stamped
@@ -127,7 +128,7 @@ class ReadCopyEntry:
         The canonical MemoryDep (buffer name + index + var_names + size)
         every equivalent read in the group shares -- the same object one of
         the consuming ops' own full_deps produced, used to size/index the
-        copy exactly as _insert_read_copy_ops does today.
+        copy exactly as _insert_all_read_copy_ops does today.
     insert_before_op_name:
         get_operation_name() of the first (operations order) consuming op
         in the group -- where the copy is inserted.

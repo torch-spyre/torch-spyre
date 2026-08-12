@@ -1984,7 +1984,10 @@ def test_copy_accum_with_reduction_512x256_A4():
 
 
 @pytest.mark.skip(
-    reason="IndexError: _insert_read_copy_ops fails when tiling B with unit-size B dim in scale"
+    reason=(
+        "IndexError: _insert_all_read_copy_ops fails when tiling B with "
+        "unit-size B dim in scale"
+    )
 )
 def test_copy_accum_with_reduction_512x256_B4():
     """acc.copy_(acc * scale + x.amin(dim=1,keepdim=True)) tiled B÷4."""
@@ -2006,7 +2009,10 @@ def test_copy_accum_with_reduction_512x256_B4():
 
 
 @pytest.mark.skip(
-    reason="IndexError: _insert_read_copy_ops fails when tiling B with unit-size B dim in scale"
+    reason=(
+        "IndexError: _insert_all_read_copy_ops fails when tiling B with "
+        "unit-size B dim in scale"
+    )
 )
 def test_copy_accum_with_reduction_512x256_A4_B4():
     """acc.copy_(acc * scale + x.amin(dim=1,keepdim=True)) tiled A÷4 B÷4."""
@@ -5363,7 +5369,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         rather than the 1st (H), producing wrong per-tile stride advances.
 
         Previously also broken for the copy ops inserted by
-        _insert_read_copy_ops: their tiled_dims_per_read/output_tiled_dims
+        _insert_all_read_copy_ops: their tiled_dims_per_read/output_tiled_dims
         dicts were keyed by tiled_op's raw (unsqueezed) host-range indices
         but read against copy_ranges (== dep.size, already squeezed) --
         fixed by mapping tiled_op's raw dim index to its squeezed position
