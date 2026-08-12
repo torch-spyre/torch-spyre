@@ -365,14 +365,12 @@ def _find_outside_consumers_planned(
 def _compute_full_ranges_planned(
     op: ComputedBuffer, info: CoarseTileInfo
 ) -> list[Expr]:
-    """Planning-time analog of _compute_full_ranges.
+    """Compute op's full (pre-division) output ranges without mutating.
 
-    _compute_full_ranges reconstructs the pre-division ranges from op.data
-    .ranges, which by the time transformation calls it has already been
-    divided by _divide_ranges. Planning runs *before* _apply_plan/
-    _divide_ranges, so op.data.ranges is already the undivided, full shape
-    here -- return it unchanged rather than multiplying by loop_count again
-    (which would double the extent of every tiled dim).
+    Planning runs *before* _apply_plan/_divide_ranges, so op.data.ranges is
+    already the undivided, full shape here -- return it unchanged rather
+    than multiplying by loop_count again (which would double the extent of
+    every tiled dim).
     """
     return list(op.data.ranges)
 
@@ -409,9 +407,7 @@ def _compute_per_tile_ranges_planned(
 def _compute_fill_loop_info_planned(
     info: CoarseTileInfo,
 ) -> CoarseTileInfo | None:
-    """Planning-time analog of _compute_fill_loop_info.
-
-    Same computation, but takes op's planned CoarseTileInfo directly.
+    """Compute the fill op's trimmed loop_info from op's planned CoarseTileInfo.
 
     For a flat tiling (no output-dim levels, or every reduction-dim level is
     outer to every output-dim level) the fill has no loop_info — it runs once
@@ -926,46 +922,6 @@ def _group_reduction_tiled_levels_in_group(
     return reduction_levels
 
 
-def _group_reduction_tiled_hint_ids(
-    group_ops: list[Operation], levels: list[tuple]
-) -> set[int]:
-    """Return hint_ids among ``levels`` that tile a reduction dim for some
-    Reduction op in group_ops."""
-    reduction_hint_ids: set[int] = set()
-    for hint_id, _count in levels:
-        for op in group_ops:
-            if not isinstance(op, ComputedBuffer) or not isinstance(op.data, Reduction):
-                continue
-            _, has_reduction_pos = _op_hint_dim_positions(op, hint_id)
-            if has_reduction_pos:
-                reduction_hint_ids.add(hint_id)
-                break
-    return reduction_hint_ids
-
-
-def _op_hint_dim_positions(op: ComputedBuffer, hint_id: int) -> tuple[bool, bool]:
-    """Return (has_output_pos, has_reduction_pos) for op at the given hint_id.
-
-    has_output_pos: op's own output ranges contain a dim driven by this hint.
-    has_reduction_pos: op is a Reduction whose reduction_ranges contain a dim
-    driven by this hint.  This is the hint-to-position lookup used to decide
-    which of op's own dims a given hint_id tiles.
-    """
-    dim_hint = next(
-        (h for h in getattr(op, "dim_hints", []) if h.hint_id == hint_id), None
-    )
-    if dim_hint is None or dim_hint.loop_var is None:
-        return False, False
-    if dim_hint.is_reduction:
-        if not isinstance(op.data, Reduction):
-            return False, False
-        pos = _loop_var_to_reduction_ranges_pos(op, dim_hint.loop_var)
-        return False, pos is not None
-    op_out = op_out_coords(op)
-    pos = _loop_var_to_ranges_pos(op_out, dim_hint.loop_var)
-    return pos is not None, False
-
-
 def _reads_incomplete_reduction(
     op: ComputedBuffer,
     group_op_names: set[str],
@@ -1007,38 +963,6 @@ def _plan_is_loop_invariant_at_reduction_levels(
     if not group_reduction_tiled_levels:
         return False
     return all(not op_tiled_dims[i] for i in group_reduction_tiled_levels)
-
-
-def _seed_closure(
-    seed_name: str, loop_group_id: tuple, operations: list[Operation]
-) -> set[str]:
-    """Return the closure of seed_name within its outer loop group.
-
-    The closure is every op in the same outer loop group that reads
-    seed_name *directly* — e.g. both `max_running = maximum(M, block_max)`
-    and `correction = exp(M - max_running)` read `M` directly, so both are
-    in `M`'s closure. This is intentionally NOT transitive: an op that reads
-    a closure member but not the seed itself (e.g.
-    `denominator = denominator * correction + ...`, which reads `correction`
-    but not `M`) is an ordinary downstream consumer, not part of the seed's
-    closure — including it would pull in the whole downstream dependency
-    cone, which is a different (much larger, wrong) set.
-
-    Restricted to ops stamped with loop_info in the same outer group (i.e.
-    after _apply_plan has stamped loop_info; see _seed_closure_pre_stamp for
-    the pre-stamp equivalent used during planning).
-    """
-    outer_key = loop_group_id[0]
-    closure: set[str] = set()
-    for o in operations:
-        if not isinstance(o, ComputedBuffer):
-            continue
-        li = getattr(o, "loop_info", None)
-        if li is None or li.loop_group_id[0] != outer_key:
-            continue
-        if seed_name in _op_reads(o):
-            closure.add(o.get_name())
-    return closure
 
 
 def _op_reads(op: ComputedBuffer) -> set[str]:
@@ -1947,7 +1871,7 @@ def _full_buffer_read_deps(op: ComputedBuffer) -> list[MemoryDep]:
     against a full-size buffer -- the same indexing bug _insert_copy_op's
     write side had before that fix, just on the read side and against an
     external buffer instead of a freshly allocated one. See
-    _insert_read_copy_ops and _find_outside_consumers (same outer-key
+    _insert_all_read_copy_ops and _find_outside_consumers (same outer-key
     comparison, mirrored here on the read side).
     """
     from ..ir import SpyreEmptyFallback  # deferred: avoids circular import
@@ -1989,22 +1913,6 @@ def _graph_output_names() -> set[str]:
 # ---------------------------------------------------------------------------
 # Full-buffer allocation
 # ---------------------------------------------------------------------------
-
-
-def _compute_full_ranges(op: ComputedBuffer) -> list[Expr]:
-    """Compute the original (pre-division) iteration ranges of op.
-
-    op.data.ranges holds the already-divided ranges.  Reconstruct the full
-    ranges by multiplying each tiled dimension back by its loop_count.
-    """
-    full_ranges = list(op.data.ranges)
-    loop_count: list[Expr] = op.loop_info.loop_count
-    loop_tiled_dims: list[list[int]] = op.loop_info.loop_tiled_dims
-    for count, dims in zip(loop_count, loop_tiled_dims):
-        for d in dims:
-            if 0 <= d < len(full_ranges):
-                full_ranges[d] = sympy.simplify(full_ranges[d] * count)
-    return full_ranges
 
 
 def _allocate_full_buffer(
@@ -2113,7 +2021,7 @@ def _allocate_full_buffer(
         # never read by stickification -- generic_layout builds
         # SpyreTensorLayout from .size alone), but it cannot be written that
         # way: full_buf gets read (via name-swapped consumer inner_fns,
-        # e.g. _insert_read_copy_ops) before stickification runs, and
+        # e.g. _insert_all_read_copy_ops) before stickification runs, and
         # split_multi_ops traces those inner_fns by calling make_loader()/
         # make_indexer() on full_buf. Inductor's Layout.make_indexer()
         # (torch/_inductor/ir.py) asserts FlexibleLayout.allow_indexing --
@@ -2252,7 +2160,7 @@ class _NameSwapHandler(WrapperHandler):
 
     Unlike insert_restickify's version, entries here also carry the
     full-buffer and tile-local strides for the swapped name (see
-    _insert_read_copy_ops): the copy buffer being swapped in is physically
+    _insert_all_read_copy_ops): the copy buffer being swapped in is physically
     smaller than the full buffer it replaces, so tiled_op's original index
     (affine in its own loop vars, using full_buf's stride coefficients) no
     longer resolves to a valid offset into it.
@@ -2263,7 +2171,7 @@ class _NameSwapHandler(WrapperHandler):
     times (e.g. by scheduler fusion checks) with a *different* dummy
     variable each time (d0, i0, q0, ... have all been observed for the same
     load site), so a single precomputed replacement expression captured at
-    _insert_read_copy_ops time would be wrong on every trace that doesn't
+    _insert_all_read_copy_ops time would be wrong on every trace that doesn't
     happen to reuse those exact symbols. Instead, `index` is rescaled at
     call time: each additive term's coefficient is matched (by value) against
     full_strides to find its dimension, then replaced by that dimension's
@@ -2927,44 +2835,6 @@ def _insert_all_read_copy_ops(
                 )
 
 
-def _insert_read_copy_ops(
-    tiled_op: ComputedBuffer,
-    full_deps: list[MemoryDep],
-    operations: list[Operation],
-) -> ComputedBuffer:
-    """Single-op convenience wrapper: one copy per unique dep name, one
-    consumer (tiled_op itself). Equivalent to a one-entry, one-consumer
-    ReadCopyPlan for tiled_op's own dedup case -- see _plan_read_copies for
-    the cross-op generalization used by production code."""
-    deduped_deps: dict[str, MemoryDep] = {}
-    for dep in full_deps:
-        if dep.name in deduped_deps:
-            prior = deduped_deps[dep.name]
-            assert prior.var_names == dep.var_names and prior.index == dep.index, (
-                f"_insert_read_copy_ops: {dep.name!r} is read via two "
-                "MemoryDeps with different index expressions "
-                f"({prior.index} vs {dep.index}); a single copy op keyed by "
-                "buffer name cannot serve both."
-            )
-            continue
-        deduped_deps[dep.name] = dep
-
-    for dep in deduped_deps.values():
-        copy_name = V.graph.qualify_name(
-            f"coarse_tile_read_copy_{tiled_op.get_name()}_{dep.name}"
-        )
-        new_copy_name = _insert_one_read_copy(
-            tiled_op, dep, copy_name, operations, insert_before_op=tiled_op
-        )
-        _patch_consumer_to_read_copy(tiled_op, dep, new_copy_name, operations)
-        tiled_op = next(
-            o
-            for o in operations
-            if isinstance(o, ComputedBuffer) and o.get_name() == tiled_op.get_name()
-        )
-    return tiled_op
-
-
 # ---------------------------------------------------------------------------
 # Case: reduction-dim tiling — combine op insertion
 # ---------------------------------------------------------------------------
@@ -3152,45 +3022,6 @@ def _insert_reduction_copy_op(
         else:
             insert_idx = operations.index(tiled_op) + 1
     operations.insert(insert_idx, copy_buf)
-
-
-def _compute_fill_loop_info(op: ComputedBuffer) -> "CoarseTileInfo | None":
-    """Return the loop_info to stamp on the fill op for a nested tiled reduction.
-
-    For a flat (pure reduction) tiling the fill has no loop_info — it runs
-    once before all loops.  Returns None.
-
-    For a nested tiling where outer level(s) tile output dims and the inner
-    level tiles a reduction dim, the fill must run inside the outer loop (once
-    per outer tile) so the accumulator is per-outer-tile sized.  Returns a
-    CoarseTileInfo covering only the outer output-dim levels.
-    """
-    loop_info = op.loop_info
-    tiled_rdims = getattr(loop_info, "loop_tiled_reduction_dims", [])
-
-    outer_counts: list[sympy.Expr] = []
-    outer_tiled_dims: list[list[int]] = []
-    outer_tiled_rdims: list[list[int]] = []
-    for dims, rdims, count in zip(
-        loop_info.loop_tiled_dims, tiled_rdims, loop_info.loop_count
-    ):
-        if dims:  # non-empty output-dim list → this is an output-dim level
-            outer_counts.append(count)
-            outer_tiled_dims.append(dims)
-            outer_tiled_rdims.append([])
-
-    if not outer_counts:
-        return None  # flat: fill runs before all loops
-
-    outer_gid = loop_info.loop_group_id[: len(outer_counts)]
-    return CoarseTileInfo(
-        loop_group_id=outer_gid,
-        loop_count=outer_counts,
-        loop_tiled_dims=outer_tiled_dims,
-        loop_tiled_reduction_dims=outer_tiled_rdims,
-        tiled_dims_per_read=[],
-        output_tiled_dims=[],
-    )
 
 
 def _insert_all_reduction_ops(operations: list[Operation]) -> None:
