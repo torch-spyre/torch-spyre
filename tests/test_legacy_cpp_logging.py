@@ -75,7 +75,7 @@ class TestLegacyEnvVarEnablesDebug:
 
 
 class TestTorchLogsEnablesRuntimeDebug:
-    """Verify TORCH_LOGS=spyre.runtime:DEBUG enables C++ debug output."""
+    """Verify TORCH_LOGS=+torch_spyre.runtime enables C++ debug output."""
 
     def test_torch_logs_enables_runtime_debug(self):
         """TORCH_LOGS configures spyre.runtime at DEBUG without deprecation."""
@@ -96,7 +96,7 @@ class TestTorchLogsEnablesRuntimeDebug:
             print(f"LEVEL={level.name}")
             print(f"SOURCE={source}")
         """
-        result = _run_subprocess(script, {"TORCH_LOGS": "spyre.runtime:DEBUG"})
+        result = _run_subprocess(script, {"TORCH_LOGS": "+torch_spyre.runtime"})
         assert result.returncode == 0, f"Subprocess failed: {result.stderr}"
         assert "LEVEL=DEBUG" in result.stdout
         assert "SOURCE=TORCH_LOGS" in result.stdout
@@ -122,7 +122,7 @@ class TestTorchLogsEnablesRuntimeDebug:
             )
             print(f"CPP_ENABLED={enabled}")
         """
-        result = _run_subprocess(script, {"TORCH_LOGS": "spyre.runtime:DEBUG"})
+        result = _run_subprocess(script, {"TORCH_LOGS": "+torch_spyre.runtime"})
         assert result.returncode == 0, f"Subprocess failed: {result.stderr}"
         assert "CPP_ENABLED=True" in result.stdout
 
@@ -131,7 +131,7 @@ class TestTorchLogsPriorityOverLegacy:
     """Verify TORCH_LOGS takes precedence over legacy env vars."""
 
     def test_torch_logs_takes_priority_over_legacy(self):
-        """TORCH_LOGS=WARNING overrides TORCH_SPYRE_DEBUG=1 (would be DEBUG)."""
+        """TORCH_LOGS (no prefix = INFO) overrides TORCH_SPYRE_DEBUG=1 (would be DEBUG)."""
         script = """
             import os
             import warnings
@@ -153,11 +153,11 @@ class TestTorchLogsPriorityOverLegacy:
             script,
             {
                 "TORCH_SPYRE_DEBUG": "1",
-                "TORCH_LOGS": "spyre.runtime:WARNING",
+                "TORCH_LOGS": "torch_spyre.runtime",  # No prefix = INFO, overrides DEBUG from TORCH_SPYRE_DEBUG
             },
         )
         assert result.returncode == 0, f"Subprocess failed: {result.stderr}"
-        assert "LEVEL=WARNING" in result.stdout
+        assert "LEVEL=INFO" in result.stdout
         assert "SOURCE=TORCH_LOGS" in result.stdout
 
 
@@ -186,7 +186,7 @@ class TestOutputFormatMatchesSpec:
             level_str = cpp_logging.log_level_to_string(level)
             print(f"LEVEL_STR={level_str}")
         """
-        result = _run_subprocess(script, {"TORCH_LOGS": "spyre.runtime:DEBUG"})
+        result = _run_subprocess(script, {"TORCH_LOGS": "+torch_spyre.runtime"})
         assert result.returncode == 0, f"Subprocess failed: {result.stderr}"
         assert "ENABLED=True" in result.stdout
         assert "LEVEL_STR=DEBUG" in result.stdout
@@ -201,7 +201,7 @@ class TestOutputFormatMatchesSpec:
                 os.environ["TORCH_LOGS"] = _saved
             import torch_spyre  # noqa: F401
         """
-        result = _run_subprocess(script, {"TORCH_LOGS": "spyre.runtime:DEBUG"})
+        result = _run_subprocess(script, {"TORCH_LOGS": "+torch_spyre.runtime"})
         assert result.returncode == 0, f"Subprocess failed: {result.stderr}"
         pattern = re.compile(
             r"\[(DEBUG|INFO|WARNING|ERROR|CRITICAL)\] "

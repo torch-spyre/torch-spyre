@@ -276,8 +276,6 @@ _CONV2D_PAD_DIM_J = CONV2D_DIM_LABELS[3]
 _CONV2D_WINDOW_DIM_I = CONV2D_DIM_LABELS[-2]
 _CONV2D_WINDOW_DIM_J = CONV2D_DIM_LABELS[-1]
 
-_CONV2D_SPATIAL_DIM_NAMES = (_CONV2D_PAD_DIM_I, _CONV2D_PAD_DIM_J)
-
 
 def _is_conv2d_kernel_tensor(arg: TensorArg, tensor_position: int | None) -> bool:
     """Check if a tensor is a kernel tensor for conv2d ops.
@@ -1287,21 +1285,6 @@ def _create_sdsc_tensors(
             else:
                 max_dim_sizes[dim] = -1
 
-            # For a conv windowed input spatial dim (i/j, whose reduction window
-            # ki/kj is in the iteration space), dev_dim_size (the padded input
-            # extent) legitimately exceeds it_dim_size (the output count) by the
-            # window overlap.  That difference is already covered by the fullspan
-            # window read, so a backGap here is double-counting: the backend
-            # adds the gap to the input buffer size (getBufferCapacityForNodePerDim
-            # -> dimSize + gap), inflating the row stride by (kW-1) and mis-striding
-            # every ki>0 window tap.  Keep the offset/stride handling (needed for
-            # correct per-output-position stepping) but skip the backGap.
-            _window_of = {"i": "ki", "j": "kj"}
-            is_conv_windowed_spatial = (
-                _is_conv(op_spec.op)
-                and str(dim) in _window_of
-                and Symbol(_window_of[str(dim)]) in iteration_space
-            )
             # Same out-of-range case as the device_size lookup above: such a dim
             # has no device coordinate either, and this subscript would raise
             # before the size comparison below could skip it.
@@ -1318,20 +1301,13 @@ def _create_sdsc_tensors(
             ):
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 offsets[dim] = dim_offset * dim_device_stride
-                # Suppress backGap where the window/padding machinery already
-                # accounts for the device-vs-iteration-space gap; emitting one
-                # there double-counts and corrupts addressing.
-                #   - forward conv2d (#3284): only the windowed spatial dims
-                #     (i/j); other roles (out, in) still emit backGap.
-                #   - depthwise conv2d + pool (#3510): any conv dim, and any
-                #     op's spatial i/j, via _conv2d_sdsc_fields / avgpool fields.
-                if op_spec.op == CONV2D_FWD_OP:
-                    _suppress_backgap = is_conv_windowed_spatial
-                else:
-                    _suppress_backgap = (
-                        _is_conv(op_spec.op) or str(dim) in _CONV2D_SPATIAL_DIM_NAMES
-                    )
-                if not _suppress_backgap:
+                # conv2d addresses the difference between device and iteration space sizes
+                # through the window/padding machinery in _conv2d_sdsc_fields, which already
+                # accounts for the gap between the device extent and the
+                # iteration extent. Emitting a backGap for a conv op double-counts
+                # that gap and corrupts the generated addressing.
+                #
+                if not _is_conv(op_spec.op):
                     backGap[dim] = dev_dim_size - it_dim_size
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 

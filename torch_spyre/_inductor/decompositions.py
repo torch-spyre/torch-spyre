@@ -922,13 +922,18 @@ def conv2d_via_bmm_decomp(
         )
         output = output.reshape(N, C_out, H_out * W_out)
 
-    output = output.reshape(N, C_out, H_out, W_out)
-
     if bias is not None:
-        # To ensure stick compatibility: reshape bias via reshape_via_cpu to (1, C_out, 1, 1).
-        # The resulting tensor has a layout compatible with broadcasting to (N, C_out, H_out, W_out).
-        bias_shaped = torch.ops.spyre.reshape_via_cpu(bias, (1, C_out, 1, 1))
+        # Add bias while the output is still (N, C_out, H_out * W_out): the
+        # matmul lays the trailing H_out*W_out dim on the stick, and for a
+        # patch-embed conv (e.g. Prithvi's stride-16 kernel) that flat length
+        # is a multiple of 64 even when H_out/W_out individually are not. If we
+        # instead reshaped to (N, C_out, H_out, W_out) first and broadcast the
+        # bias over a sub-stick spatial width (e.g. W_out == 32), the layout
+        # solver rejects the resulting `w + 32*Mod(row, 2)` stick expression.
+        bias_shaped = torch.ops.spyre.reshape_via_cpu(bias, (1, C_out, 1))
         output = output + bias_shaped
+
+    output = output.reshape(N, C_out, H_out, W_out)
 
     return output
 
