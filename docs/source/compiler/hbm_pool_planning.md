@@ -150,19 +150,22 @@ and no allocation overhead.
 ## Integration with code generation
 
 During code generation, the scheduler looks up each bundle's pool size from
-`V.graph.hbm_pool_sizes` and passes it to `SpyreKernel`'s constructor. The
-kernel then emits pool allocation and deallocation code around its own
-`.run()` call:
+`V.graph.hbm_pool_sizes` and passes it to `SpyreKernel`'s constructor. Unlike
+LX scratchpad buffers, the pool is never materialized as a Python-side
+tensor: `pool_size` is threaded through `define_kernel()` into the
+generated `async_compile.sdsc(...)` call, and from there into
+`generate_bundle()`, which emits the pool allocation as a single MLIR op
+inside the bundle's own function body:
 
-```python
-_pool_{bundle_name} = spyre_empty_with_layout((pool_size_bytes,), (1,), torch.uint8, ...)
-sdsc_fused__{bundle_name}.run(_pool_{bundle_name}, ...)
-del _pool_{bundle_name}
+```mlir
+%pool = sdscbundle.device_mem_allocate {pool_size_bytes} bytes : index
 ```
 
-This per-bundle scoping ensures that the pool tensor's lifetime is limited to
-the bundle's own kernel invocation, minimizing peak HBM usage across the
-entire graph execution.
+Every pool-allocated buffer's address is then computed relative to `%pool`
+via `arith.addi`, deduplicated by offset (unchanged from before). Because
+the allocation is a single MLIR op scoped to the bundle's own function body,
+its lifetime is implicitly limited to that bundle's execution -- there is no
+explicit free op, and no Python-side tensor to allocate or delete.
 
 ## Configuration and limitations
 
