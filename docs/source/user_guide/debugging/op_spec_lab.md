@@ -66,6 +66,11 @@ announces that on stderr every run, and it is expected, not a problem:
 UserWarning: dynamo_pgo force disabled by torch.compiler.config.force_disable_caches
 ```
 
+If the target raises partway through, `capture.py` prints the traceback and
+still writes the kernels compiled before it, telling you the later ones are
+missing. So a program that crashes on the kernel you are chasing is still
+capturable.
+
 ### 2. Read it
 
 Every emitted file opens with provenance and a decoded explanation of its own
@@ -119,6 +124,11 @@ The `Environment` line reports the config in force when the *spec was built*,
 not when the file was written — a program that builds its specs inside a
 `config.patch` is reported as it really compiled.
 
+`bundle_symbolic_args` is also *pinned*, as `BUNDLE_SYMBOLIC_ARGS`: the spec's
+allocations were baked under it, so a replay under a different value would
+silently bundle mismatched addresses. If your environment disagrees, the script
+says so and uses the captured value.
+
 ### 3. Run it
 
 ```bash
@@ -170,6 +180,10 @@ Without it, `--explain` says so and carries on. That split is deliberate:
 `--stage run` must never depend on a repo import, whereas `--explain` is a
 convenience that is allowed to degrade.
 
+The two views differ in one place: host shapes and dtypes were observed at
+capture time, so `KERNEL ARGS` shows them in the frozen header but not under
+`--explain`.
+
 ---
 
 ## Field reference
@@ -191,7 +205,7 @@ convenience that is allowed to degrade.
 | Field | Meaning |
 |---|---|
 | `is_input` | Read or written by *this op*. The same `arg_index` can be both across a kernel. |
-| `arg_index` | Position in `.run()`'s argument list. Negative means it is not a kernel arg. |
+| `arg_index` | Position in the kernel's argument list. Negative means it is not a kernel arg. Not the `.run()` position when there is a pool: the pool is prepended and uncounted, so `arg0` is `.run()`'s second argument. |
 | `device_dtype` | On-device format, e.g. `SEN169_FP16`. This is what sets the stick size. |
 | `device_size` | The tiled device shape, `[..., sticks, rows, elems_per_stick]`. The last dim is always elements per stick. |
 | `device_coordinates` | One sympy expression per device dim, mapping an iteration point to a position. An `IndirectAccess` here means the coordinate is a runtime-loaded value. |

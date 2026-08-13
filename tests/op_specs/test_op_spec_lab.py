@@ -23,19 +23,25 @@ import ast
 import builtins
 import os
 import sys
+import types
+from unittest.mock import patch
 
+import pytest
 from sympy import sympify
 
 import torch
 
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
+from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.op_spec import (
     DebugHandle,
     LoopSpec,
     OpSpec,
     SourceLoc,
     TensorArg,
+    UnimplementedOp,
 )
+from torch_spyre.execution.async_compile import SpyreAsyncCompile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -69,6 +75,59 @@ def _add_op(debug_handle=None):
             for i in range(3)
         ],
     )
+
+
+def _pool_op():
+    """An add whose output spilled to the HBM pool, so .run() gets a pool first."""
+    op = _add_op()
+    op.args[2].allocation = {"hbm_pool": 0}
+    return op
+
+
+class _FakeLayout:
+    """The subset of SpyreTensorLayout that _record_args reads."""
+
+    def __init__(self):
+        self.device_size = [4, 128, 64]
+        self.stride_map = [64, 256, 1]
+        self.device_dtype = DataFormats.SEN169_FP16
+        self.element_arrangement = ElementArrangement.STANDARD
+
+
+class _FakeTensor:
+    """A stand-in for a device tensor, counting the .cpu() calls it receives.
+
+    The pool must never get one: per _record_args, ``pool.cpu()`` on the flat
+    SENINT8 pool aborts the process, so "was .cpu() called" is the assertion that
+    matters and a real tensor could not make it.
+    """
+
+    def __init__(self, shape=(128, 256), dtype=torch.float16, numel=32768):
+        self.shape = shape
+        self.dtype = dtype
+        self._numel = numel
+        self.cpu_calls = 0
+
+    def numel(self):
+        return self._numel
+
+    def device_tensor_layout(self):
+        return _FakeLayout()
+
+    def cpu(self):
+        self.cpu_calls += 1
+        return self
+
+
+class _FakeRunner:
+    """A kernel runner that records its launches instead of performing them."""
+
+    def __init__(self):
+        self.code_dir = "/tmp/fake_code_dir"
+        self.launches = []
+
+    def run(self, *args, **kwargs):
+        self.launches.append(args)
 
 
 def _record(name="sdsc_add_0", pool_bytes=0):
@@ -111,6 +170,69 @@ def test_render_decodes_every_section():
     assert "hbm @ 0" in row
     assert "L0" in row  # layout class, from the resolved view
     assert "mb=" in row  # scales and strides, in renamed dim labels
+
+    # Sections that return [] on an internal miss rather than raising, so the
+    # "section failed" assertion above cannot see them go quiet.
+    assert "elems/stick at SEN169_FP16" in out
+    assert "stick dim c1 = 256 -> ceil(256/64)" in out
+    assert "c0 -> mb" in out
+
+
+def test_render_discloses_that_a_layout_label_is_not_a_role():
+    """Trap 2 from explain.py's docstring, and the reason the file exists.
+
+    All three args of a flat add share one layout, so its raw label is
+    LAYOUT_LABELS[0] -- the string "OUTPUT" -- on two inputs. Leaving that
+    unexplained is what sends readers hunting for a nonexistent bug.
+    """
+    out = explain.render([_add_op()], kernel_name="k")
+    assert 'raw SDSC label "OUTPUT"' in out
+    assert "NOT an input/output role" in out
+
+
+def test_render_reports_the_pool_it_was_given():
+    out = explain.render([_add_op()], kernel_name="k", pool_bytes=32768)
+    assert "32768-byte pool" in out  # title
+    assert "32768 bytes (uint8) -- passed first to .run()" in out
+    assert "no pool" in explain.render([_add_op()], kernel_name="k")
+
+
+def test_render_names_an_unimplemented_op_instead_of_skipping_it():
+    """An UnimplementedOp reaches sdsc(), so the view has to account for it."""
+    out = explain.render([UnimplementedOp(op="sin"), _add_op()], kernel_name="k")
+    assert "UNIMPLEMENTED  sin" in out
+    assert "OP 1/1  add" in out  # the count covers OpSpecs only
+
+
+def test_scale_decode_explains_a_stick_dim_reduction():
+    """Where a reduction's meaning lives, per example 02 of the guide.
+
+    Driven off a stub resolved view rather than a real reduction OpSpec: the
+    mapping from negative scale to prose is the whole content of this section.
+    """
+    args = [
+        types.SimpleNamespace(scales={sympify("out"): -2, sympify("mb"): 1}),
+        types.SimpleNamespace(scales={sympify("kj"): -1}),
+    ]
+    lines = explain._scale_decode(types.SimpleNamespace(args=args))
+
+    assert any("out=-2 -> reduced along the stick dim" in ln for ln in lines)
+    assert any("kj=-1 -> reduced dimension" in ln for ln in lines)
+    assert not any("mb=" in ln for ln in lines)  # positive scales say nothing
+
+
+def test_table_header_does_not_repeat_a_spilled_column_name():
+    """A spilled cell names its column, except on the header row where it is one.
+
+    Every cell is padded to the shared widths, so the header line is exactly as
+    wide as the widest row and spills whenever any row does.
+    """
+    rows = [["0", "input", "hbm_pool @ 1048576", "L0", "mb=1 in=1 out=1", "x" * 30]]
+    headers = ["#", "role", "alloc", "layout", "scales", "strides"]
+    lines = explain._table(rows, headers, "    ")
+
+    assert not any("strides strides" in ln for ln in lines)
+    assert any("strides " + "x" * 30 in ln for ln in lines)  # rows still self-label
 
 
 def test_comment_block_is_valid_python():
@@ -160,6 +282,9 @@ def test_hostile_names_stay_within_width():
     ]
     assert not overflows, overflows
     assert long_kernel in out  # printed whole, never truncated
+    # The tiled section wraps rather than truncating, and an identifier split
+    # across lines no longer names anything.
+    assert "_tile_adv_coarse_tile_read_copy_buf0_arg0_1_lvl1" in out
 
 
 def test_emitted_script_executes_its_definitions():
@@ -230,6 +355,130 @@ def test_write_kernel_disambiguates_script_and_pt_together(tmp_path):
     assert os.path.basename(second) == "dup_1.py"
     for path in (first, second):
         assert os.path.exists(os.path.splitext(path)[0] + ".inputs.pt")
+
+
+def test_record_args_pops_the_pool_and_never_reads_it():
+    """The pool is .run()'s first argument, identified by the shared predicate.
+
+    ``uses_hbm_pool`` is what ``call_kernel`` used to prepend the pool, so
+    _record_args has to reach the same verdict. Getting it wrong is not a bad
+    label: it means calling .cpu() on the flat pool tensor, which aborts the
+    process rather than failing an assertion.
+    """
+    rec = capture.KernelRecord(
+        name="k", specs=[_pool_op()], index=0, sencores=32, bundle_symbolic_args=True
+    )
+    pool = _FakeTensor(shape=(32768,), dtype=torch.uint8, numel=32768)
+    args = (pool, _FakeTensor(), _FakeTensor(), _FakeTensor())
+
+    capture._record_args(rec, args, save_inputs=True)
+
+    assert rec.pool_bytes == 32768
+    assert len(rec.args) == 3
+    assert pool.cpu_calls == 0
+    assert all(a.values is not None for a in rec.args)
+
+
+def test_record_args_keeps_every_arg_when_there_is_no_pool():
+    """Nothing is popped for a pool-free kernel, so arg0 stays arg0."""
+    rec = capture.KernelRecord(
+        name="k", specs=[_add_op()], index=0, sencores=32, bundle_symbolic_args=True
+    )
+    capture._record_args(rec, tuple(_FakeTensor() for _ in range(3)), save_inputs=False)
+
+    assert rec.pool_bytes == 0
+    assert len(rec.args) == 3
+    assert rec.args[0].device_dtype_name == "SEN169_FP16"
+    assert rec.args[0].element_arrangement_name == "STANDARD"
+    assert all(a.values is None for a in rec.args)
+
+
+def test_run_recorder_records_the_first_launch_only():
+    """A graph invoked repeatedly must not have its recorded inputs overwritten."""
+    rec = capture.KernelRecord(
+        name="k", specs=[_add_op()], index=0, sencores=32, bundle_symbolic_args=True
+    )
+    inner = _FakeRunner()
+    proxy = capture._RunRecorder(inner, rec, save_inputs=False)
+
+    proxy.run(*[_FakeTensor() for _ in range(3)])
+    proxy.run(*[_FakeTensor() for _ in range(3)])
+
+    assert rec.observed_run
+    assert len(rec.args) == 3  # not 6
+    assert len(inner.launches) == 2  # both still reached the real runner
+    assert proxy.code_dir == inner.code_dir  # unknown attributes forward
+
+
+def _stub_sdsc_program(tmp_path, body):
+    """Write a target program that compiles ``n`` kernels, then runs ``body``."""
+    program = tmp_path / "prog.py"
+    program.write_text(
+        "from torch_spyre.execution.async_compile import SpyreAsyncCompile\n" + body
+    )
+    return program
+
+
+def test_capture_writes_what_it_recorded_before_the_target_crashed(tmp_path, capsys):
+    """A program that raises is this tool's normal input, not a reason to abort.
+
+    The kernels compiled before the failure are already complete reproducers --
+    and for a kernel holding an UnimplementedOp the launch raises every time, so
+    aborting would make those uncapturable.
+    """
+    program = _stub_sdsc_program(
+        tmp_path,
+        "SpyreAsyncCompile().sdsc('sdsc_stub_0', [])\nraise RuntimeError('boom')\n",
+    )
+    out_dir = tmp_path / "captured"
+
+    with patch.object(SpyreAsyncCompile, "sdsc", lambda self, n, s: _FakeRunner()):
+        assert capture.main([str(program), "--out", str(out_dir)]) == 0
+
+    assert (out_dir / "sdsc_stub_0.py").exists()
+    # The traceback itself goes to stderr; the note that says why is on stdout.
+    assert "raised RuntimeError" in capsys.readouterr().out
+
+
+def test_capture_blames_the_crash_when_nothing_compiled(tmp_path):
+    """Otherwise the "check the script calls torch.compile" hint misleads."""
+    program = _stub_sdsc_program(tmp_path, "raise RuntimeError('boom')\n")
+
+    with pytest.raises(SystemExit) as exc:
+        capture.main([str(program), "--out", str(tmp_path / "captured")])
+
+    assert "RuntimeError" in str(exc.value)
+    assert "torch.compile" not in str(exc.value)
+
+
+def test_emitted_script_pins_bundle_symbolic_args():
+    """The spec's hbm allocations were baked under this flag.
+
+    ``generate_bundle`` re-reads it at call time, so leaving the ambient
+    BUNDLE_SYMBOLIC_ARGS to differ produces a bundle whose addresses do not match
+    the spec -- silently, which is the one failure a bisection tool must not have.
+    """
+    rec = _record()
+    rec.bundle_symbolic_args = False
+    namespace: dict = {"__file__": "/tmp/captured/sdsc_add_0.py"}
+    src = capture.emit_script(rec, "prog.py", 1, False)
+    exec(compile(src, "<emitted>", "exec"), namespace)  # noqa: S102
+
+    assert namespace["BUNDLE_SYMBOLIC_ARGS"] is False
+    assert "bundle_symbolic_args=BUNDLE_SYMBOLIC_ARGS" in src
+
+
+def test_pin_bundle_symbolic_args_overrides_the_ambient_flag():
+    with spyre_config.patch(bundle_symbolic_args=True):  # type: ignore[attr-defined]
+        runner.pin_bundle_symbolic_args(False)
+        assert spyre_config.bundle_symbolic_args is False
+
+
+def test_pin_bundle_symbolic_args_ignores_an_unrecorded_value():
+    """None means "not recorded" -- a hand-written PROGRAM dict -- not False."""
+    with spyre_config.patch(bundle_symbolic_args=True):  # type: ignore[attr-defined]
+        runner.pin_bundle_symbolic_args(None)
+        assert spyre_config.bundle_symbolic_args is True
 
 
 def test_dedup_ignores_provenance_only_differences():

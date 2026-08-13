@@ -46,6 +46,7 @@ import dataclasses
 import os
 import runpy
 import sys
+import traceback
 from unittest.mock import patch
 
 import torch
@@ -56,12 +57,16 @@ from torch._inductor.utils import IndentedBuffer
 import torch_spyre  # noqa: F401  -- registers the "spyre" device
 from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.op_spec import IndirectAccess, TensorArg
-from torch_spyre._inductor.spyre_kernel import _codegen_op_spec_list, _iter_op_specs
+from torch_spyre._inductor.spyre_kernel import (
+    _codegen_op_spec_list,
+    _iter_op_specs,
+    uses_hbm_pool,
+)
 from torch_spyre.execution.async_compile import SpyreAsyncCompile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from explain import render_comment_block  # noqa: E402
+from explain import _enum_name, render_comment_block  # noqa: E402
 from runner import TEMPLATE_IMPORTS, runner_template  # noqa: E402
 
 # Mock targets for --no-execute, matching docs/tools/capture_coarse_tile_ir.py.
@@ -112,7 +117,9 @@ class KernelRecord:
 
     ``sencores`` and ``bundle_symbolic_args`` are snapshotted at spec-build time,
     not at write time: a program may build its specs inside a ``config.patch``
-    that has already exited.  Neither affects replay.
+    that has already exited.  ``sencores`` is provenance only -- work division is
+    already baked into ``iteration_space``.  ``bundle_symbolic_args`` is not, and
+    the emitted script pins it: see ``pin_bundle_symbolic_args`` in runner.py.
     """
 
     name: str
@@ -125,30 +132,6 @@ class KernelRecord:
     observed_run: bool = False
 
 
-def _uses_pool(specs: list) -> bool:
-    """True if any TensorArg in specs is hbm_pool-allocated.
-
-    When it holds, ``call_kernel`` passes the pool ahead of the kernel args, so
-    the first recorded .run() argument is the pool rather than arg_index 0.
-    """
-    return any(
-        "hbm_pool" in arg.allocation
-        for op in _iter_op_specs(specs)
-        for arg in op.args
-        if isinstance(arg, TensorArg)
-    )
-
-
-def _enum_name(value) -> str:
-    """Bare member name of a pybind enum, e.g. "SEN169_FP16".
-
-    Falls back to parsing ``str()`` so a binding change degrades rather than
-    raising mid-capture.
-    """
-    name = getattr(value, "name", None)
-    return name if name is not None else str(value).rsplit(".", 1)[-1]
-
-
 def _record_args(rec: KernelRecord, args: tuple, save_inputs: bool) -> None:
     """Record shape/dtype/device-layout for each .run() argument.
 
@@ -156,9 +139,13 @@ def _record_args(rec: KernelRecord, args: tuple, save_inputs: bool) -> None:
     ``save_inputs``: ``pool.cpu()`` on the flat SENINT8 pool tensor corrupts the
     heap and aborts the process, which no try/except can catch.  Replays get an
     uninitialized pool, as production does for a graph's first kernel.
+
+    So the pool must be identified by the same predicate ``call_kernel`` used to
+    prepend it -- ``uses_hbm_pool``, shared rather than reimplemented, because a
+    copy that drifted would mean calling ``.cpu()`` on the pool.
     """
     remaining = list(args)
-    if _uses_pool(rec.specs) and remaining:
+    if uses_hbm_pool(rec.specs) and remaining:
         pool = remaining.pop(0)
         rec.pool_bytes = int(pool.numel())
     for tensor in remaining:
@@ -184,19 +171,19 @@ class _RunRecorder:
     """
 
     def __init__(self, inner, rec: KernelRecord, save_inputs: bool):
-        self.__dict__["_inner"] = inner
-        self.__dict__["_rec"] = rec
-        self.__dict__["_save_inputs"] = save_inputs
+        self._inner = inner
+        self._rec = rec
+        self._save_inputs = save_inputs
 
     def __getattr__(self, name):
-        return getattr(self.__dict__["_inner"], name)
+        # Only reached for names the proxy itself does not define.
+        return getattr(self._inner, name)
 
     def run(self, *args, **kwargs):
-        rec = self.__dict__["_rec"]
-        if not rec.observed_run:
-            _record_args(rec, args, self.__dict__["_save_inputs"])
-            rec.observed_run = True
-        return self.__dict__["_inner"].run(*args, **kwargs)
+        if not self._rec.observed_run:
+            _record_args(self._rec, args, self._save_inputs)
+            self._rec.observed_run = True
+        return self._inner.run(*args, **kwargs)
 
 
 @contextlib.contextmanager
@@ -404,6 +391,7 @@ from torch_spyre._inductor.op_spec import (
 
 KERNEL_NAME = "{rec.name}"
 POOL_BYTES = {rec.pool_bytes}
+BUNDLE_SYMBOLIC_ARGS = {rec.bundle_symbolic_args}
 # Named after this file, not the kernel: two graphs can share a fused kernel
 # name, and write_kernel disambiguates the scripts (name_1.py) -- so a
 # kernel-keyed .pt would be shared and the second capture would clobber the first.
@@ -454,6 +442,7 @@ if __name__ == "__main__":
         layouts=LAYOUTS,
         pool_bytes=POOL_BYTES,
         pool_contents=pool_contents,
+        bundle_symbolic_args=BUNDLE_SYMBOLIC_ARGS,
     )
 '''
 
@@ -514,10 +503,19 @@ def main(argv=None) -> int:
     if not os.path.exists(script):
         raise SystemExit(f"no such script: {script}")
 
+    failure = None
     with capture_kernels(args.save_inputs, args.no_execute) as records:
         # Run as if invoked directly, so the target's __main__ block still fires.
         sys.argv = [script]
-        runpy.run_path(script, run_name="__main__")
+        try:
+            runpy.run_path(script, run_name="__main__")
+        except Exception as exc:  # noqa: BLE001 -- a crash is a capture, not a stop
+            # The programs worth capturing are the ones that misbehave, and a
+            # kernel holding an UnimplementedOp raises on every launch. Whatever
+            # was recorded before the failure is still a valid reproducer, so
+            # write it out and report the exception at the end.
+            failure = exc
+            traceback.print_exc()
 
     if args.no_execute:
         # Said here as well as in the emitted header: by the time anyone reads
@@ -528,6 +526,11 @@ def main(argv=None) -> int:
         )
 
     if not records:
+        if failure is not None:
+            raise SystemExit(
+                f"no kernels captured: {script} raised "
+                f"{type(failure).__name__} before compiling anything (traceback above)."
+            )
         raise SystemExit(
             f"no kernels captured from {script}.\n"
             "Nothing was compiled for Spyre: check the script calls torch.compile "
@@ -575,6 +578,13 @@ def main(argv=None) -> int:
 
     if written == 0:
         raise SystemExit("nothing written")
+    if failure is not None:
+        print(
+            f"\nnote: {os.path.basename(script)} raised"
+            f" {type(failure).__name__} partway through (traceback above)."
+            "\n      The scripts above cover the kernels compiled before that"
+            "\n      point; later kernels never reached sdsc() and are missing."
+        )
     return 0
 
 

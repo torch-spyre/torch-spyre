@@ -39,6 +39,7 @@ import textwrap
 
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 from torch_spyre._inductor.codegen.superdsc import parse_op_spec
+from torch_spyre._inductor.spyre_kernel import _iter_op_specs
 
 WIDTH = 78
 
@@ -80,22 +81,13 @@ def _kernel_arg_roles(specs) -> dict:
     computed over all ops rather than taken from the first one seen.
     """
     seen: dict = {}
-    for op in _iter_ops(specs):
+    for op in _iter_op_specs(specs):
         for arg in op.args:
             if isinstance(arg, TensorArg) and arg.arg_index >= 0:
                 prev = seen.get(arg.arg_index)
                 role = _role(arg)
                 seen[arg.arg_index] = "in+out" if prev and prev != role else role
     return seen
-
-
-def _iter_ops(specs):
-    """Yield every OpSpec in a possibly-nested spec list, depth first."""
-    for item in specs:
-        if isinstance(item, LoopSpec):
-            yield from _iter_ops(item.body)
-        elif isinstance(item, OpSpec):
-            yield item
 
 
 def _labelled(label: str, parts: list, pad: str = "", joiner: str = "   ") -> list:
@@ -149,6 +141,19 @@ def _wrapped(head: str, body: str, pad: str = "") -> list:
     ]
 
 
+def _fit(label: str, body: str, pad: str = "") -> list:
+    """A ``label`` + ``body`` row under the same 14-column gutter, wrapped if long.
+
+    Rows that fit are emitted byte for byte: the aligned columns in the iteration
+    and sticks sections carry meaning, and ``textwrap`` would collapse the runs of
+    spaces that produce them.  Only an overflowing row gets rewrapped.
+    """
+    head = f"  {label}".ljust(14)
+    if len(pad) + len(head) + len(body) <= WIDTH:
+        return [head + body]
+    return _wrapped(head, body, pad)
+
+
 def _table(rows: list, headers: list, indent: str, pad: str = "") -> list:
     """Render an aligned table, spilling wide trailing cells onto their own line.
 
@@ -162,20 +167,24 @@ def _table(rows: list, headers: list, indent: str, pad: str = "") -> list:
         max(len(str(r[i])) for r in [headers] + rows) for i in range(len(headers))
     ]
 
-    def build(cells):
+    def build(cells, is_header=False):
         out, spill, budget = [], [], WIDTH - len(indent) - len(pad)
         for i, cell in enumerate(cells):
             piece = str(cell).ljust(widths[i])
             # Once one column spills, every later one must too, or a narrow
             # trailing cell lands under the wrong header.
             if out and (spill or len(" ".join(out + [piece])) > budget):
-                spill.append(f"{headers[i]} {cell}".strip())
+                # A spilled cell names its own column, except on the header row,
+                # where the cell already *is* the column name ("scales scales").
+                # Every cell is padded to the shared widths, so the header line is
+                # exactly as wide as the widest row and spills whenever one does.
+                spill.append(str(cell) if is_header else f"{headers[i]} {cell}".strip())
             else:
                 out.append(piece)
         line = indent + " ".join(out).rstrip()
         return [line] + ([indent + "    " + "  ".join(spill)] if spill else [])
 
-    lines = build(headers)
+    lines = build(headers, is_header=True)
     for row in rows:
         lines += build(row)
     return lines
@@ -187,7 +196,7 @@ def _table(rows: list, headers: list, indent: str, pad: str = "") -> list:
 
 
 def _title(kernel_name, specs, args, pool_bytes) -> list:
-    n_ops = sum(1 for _ in _iter_ops(specs))
+    n_ops = sum(1 for _ in _iter_op_specs(specs))
     n_args = len(args) if args else len(_kernel_arg_roles(specs))
     facts = f"{n_ops} OpSpec{'s' if n_ops != 1 else ''} - {n_args} kernel args"
     facts += " - no pool" if not pool_bytes else f" - {pool_bytes}-byte pool"
@@ -224,7 +233,7 @@ def _kernel_args_section(specs, args, pool_bytes) -> list:
 
     # Fall back to the TensorArgs when no observed-launch info was supplied.
     by_index: dict = {}
-    for op in _iter_ops(specs):
+    for op in _iter_op_specs(specs):
         for arg in op.args:
             if isinstance(arg, TensorArg) and arg.arg_index >= 0:
                 by_index.setdefault(arg.arg_index, arg)
@@ -281,11 +290,10 @@ def _origin(op_spec, pad: str = "") -> list:
     return []
 
 
-def _iteration(op_spec, cores) -> list:
+def _iteration(op_spec, cores, pad: str = "") -> list:
     """Per-dim extent and how it is divided across cores."""
     lines = []
     for i, (sym, (extent, wd)) in enumerate(op_spec.iteration_space.items()):
-        label = "  iteration   " if i == 0 else "              "
         note = "not split"
         if wd and wd > 1:
             try:
@@ -296,9 +304,11 @@ def _iteration(op_spec, cores) -> list:
                     note += " (uneven)"
             except (TypeError, ValueError):
                 note = f"split over {wd} cores"
-        lines.append(f"{label}{sym} = {_num(extent):>6}    {note}")
+        lines += _fit(
+            "iteration" if i == 0 else "", f"{sym} = {_num(extent):>6}    {note}", pad
+        )
     if cores:
-        lines.append(f"              kernel uses {cores} core(s)")
+        lines += _fit("", f"kernel uses {cores} core(s)", pad)
     return lines
 
 
@@ -317,17 +327,19 @@ def _dim_labels(symbol_mapping, pad: str = "") -> list:
     ]
 
 
-def _sticks(op_spec, sdsc_spec, symbol_mapping) -> list:
-    """Explain how the logical extent turns into sticks for the output arg."""
+def _sticks(op_spec, sdsc_spec, symbol_mapping, pad: str = "") -> list:
+    """Explain how the logical extent turns into sticks for the output arg.
+
+    Deliberately does not guard ``elems_per_stick()``: swallowing that would make
+    the whole section vanish silently, where letting it raise gets it reported as
+    a ``!!`` line by the section wrapper in :func:`_op_block`.
+    """
     out = next((a for a in op_spec.args if not a.is_input), None)
     if out is None or not out.device_size:
         return []
-    try:
-        eps = out.device_dtype.elems_per_stick()
-    except Exception:
-        return []
+    eps = out.device_dtype.elems_per_stick()
     fmt = _enum_name(out.device_dtype)
-    lines = [f"  sticks      {eps} elems/stick at {fmt} (128-byte sticks)"]
+    lines = _fit("sticks", f"{eps} elems/stick at {fmt} (128-byte sticks)", pad)
 
     # Reverse the rename so the stick dim is named in the user's own symbols.
     reverse = {v: k for k, v in (symbol_mapping or {}).items()}
@@ -351,33 +363,32 @@ def _sticks(op_spec, sdsc_spec, symbol_mapping) -> list:
             count = -(-extent // eps)
         except (TypeError, ValueError, KeyError):
             continue
-        lines.append(
-            f"              stick dim {own} = {extent}"
-            f" -> ceil({extent}/{eps}) = {count} stick(s)"
+        lines += _fit(
+            "",
+            f"stick dim {own} = {extent} -> ceil({extent}/{eps}) = {count} stick(s)",
+            pad,
         )
-    lines.append(
-        f"              device_size {out.device_size}; last dim is always elems/stick"
+    lines += _fit(
+        "", f"device_size {out.device_size}; last dim is always elems/stick", pad
     )
     return lines
 
 
-def _tiled(op_spec) -> list:
+def _tiled(op_spec, pad: str = "") -> list:
     """Loop-tiling symbols and trip counts, innermost level first."""
     if not op_spec.tiled_symbols:
         return []
-    parts = []
+    lines = []
     for level, syms in enumerate(op_spec.tiled_symbols):
         if not syms:
-            parts.append(f"lvl{level}: (loop-invariant)")
-            continue
-        named = ", ".join(
-            f"{s} (x{op_spec.tiled_symbol_trip_counts.get(s, '?')})" for s in syms
-        )
-        parts.append(f"lvl{level}: {named}")
-    return [
-        f"  tiled       {p}" if i == 0 else f"              {p}"
-        for i, p in enumerate(parts)
-    ]
+            body = f"lvl{level}: (loop-invariant)"
+        else:
+            named = ", ".join(
+                f"{s} (x{op_spec.tiled_symbol_trip_counts.get(s, '?')})" for s in syms
+            )
+            body = f"lvl{level}: {named}"
+        lines += _fit("tiled" if level == 0 else "", body, pad)
+    return lines
 
 
 def _args_table(op_spec, sdsc_spec, layout_names, pad: str = "") -> list:
@@ -514,10 +525,10 @@ def _op_block(op_spec, op_idx, n_ops, depth, verbose) -> list:
     _cores = getattr(sdsc_spec, "num_cores", None)
     sections = (
         ("origin", lambda: _origin(op_spec, pad)),
-        ("iteration", lambda: _iteration(op_spec, _cores)),
+        ("iteration", lambda: _iteration(op_spec, _cores, pad)),
         ("dim labels", lambda: _dim_labels(symbol_mapping, pad)),
-        ("sticks", lambda: _sticks(op_spec, sdsc_spec, symbol_mapping)),
-        ("tiled", lambda: _tiled(op_spec)),
+        ("sticks", lambda: _sticks(op_spec, sdsc_spec, symbol_mapping, pad)),
+        ("tiled", lambda: _tiled(op_spec, pad)),
         ("args", lambda: _args_table(op_spec, sdsc_spec, layout_names, pad)),
         ("layouts", lambda: _layout_footnotes(op_spec, sdsc_spec, layout_names)),
         ("scales", lambda: _scale_decode(sdsc_spec)),
@@ -562,7 +573,7 @@ def render(specs, *, kernel_name=None, args=None, pool_bytes=0, verbose=False) -
     ``dtype``, ``device_size``, ``device_dtype_name``).
     """
     specs = list(specs)
-    n_ops = sum(1 for _ in _iter_ops(specs))
+    n_ops = sum(1 for _ in _iter_op_specs(specs))
     lines = _title(kernel_name, specs, args, pool_bytes)
     lines += _kernel_args_section(specs, args, pool_bytes)
     # 1-based: "OP 0/7" against an "of 7" denominator reads as an off-by-one.

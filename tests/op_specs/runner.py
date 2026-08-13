@@ -29,6 +29,7 @@ import sys
 import torch
 
 from torch_spyre._C import DataFormats, SpyreTensorLayout, spyre_empty_with_layout
+from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.codegen.bundle import generate_bundle
 from torch_spyre.execution.async_compile import SpyreAsyncCompile
 
@@ -46,6 +47,26 @@ def ensure_runtime() -> None:
     Without this they fail on a fresh process with ContextNotCreated.
     """
     torch.empty(1, dtype=torch.float16).to(torch.device("spyre"))
+
+
+def pin_bundle_symbolic_args(value) -> None:
+    """Force ``config.bundle_symbolic_args`` back to its capture-time value.
+
+    A spec's ``allocation["hbm"]`` is baked when the spec is built -- the
+    arg_index itself under True, a real segment address under False -- but
+    ``generate_bundle`` reads the flag again at call time.  Left to the ambient
+    ``BUNDLE_SYMBOLIC_ARGS`` the two can disagree and the bundle gets addresses
+    that do not match the spec, silently.  ``None`` means "no recorded value",
+    as for a hand-written PROGRAM dict.
+    """
+    if value is None:
+        return
+    if spyre_config.bundle_symbolic_args != value:
+        print(
+            f"note: pinning bundle_symbolic_args={value} from the capture;"
+            f" ambient config said {spyre_config.bundle_symbolic_args}"
+        )
+    spyre_config.bundle_symbolic_args = value
 
 
 def make_pool(pool_bytes: int, contents=None) -> torch.Tensor:
@@ -136,6 +157,7 @@ def main(
     layouts=None,
     pool_bytes=0,
     pool_contents=None,
+    bundle_symbolic_args=None,
     argv=None,
 ):
     """Tiny CLI shared by this module and every captured script.
@@ -143,6 +165,7 @@ def main(
     ``--stage bundle`` stops after writing the SDSC/MLIR artifacts, which needs
     no hardware; ``--stage run`` (the default) goes all the way to a launch.
     """
+    pin_bundle_symbolic_args(bundle_symbolic_args)
     parser = argparse.ArgumentParser(description=f"Run OpSpec kernel {name!r}.")
     parser.add_argument(
         "--stage",
@@ -224,12 +247,14 @@ import os
 import torch
 
 from torch_spyre._C import DataFormats, SpyreTensorLayout, spyre_empty_with_layout
+from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.codegen.bundle import generate_bundle
 from torch_spyre.execution.async_compile import SpyreAsyncCompile
 """
 
 _TEMPLATE_FUNCS = (
     ensure_runtime,
+    pin_bundle_symbolic_args,
     make_pool,
     to_device,
     bundle_op_specs,
