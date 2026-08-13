@@ -198,9 +198,7 @@ class ScratchpadAllocator:
         buffers = self._prepare_buffers(graph)
         solver = self._build_solver(buffers)
         allocation = self._solve(solver)
-        solver, allocation = self._finalize_lx_relayout_allocation(
-            graph, solver, allocation
-        )
+        self._finalize_lx_relayout_allocation(allocation)
         self._post_solve(graph, allocation)
         reasons = self._get_spill_reasons(solver, allocation)
         self._push_allocation(graph, allocation)
@@ -216,6 +214,10 @@ class ScratchpadAllocator:
 
     def _prepare_buffers(self, graph: GraphLowering) -> Sequence[Any]:
         """Buffers to hand the solver. Base: fixed-division LifetimeBoundBuffers."""
+        assert self.layout_planning is not None
+        if not getattr(self.layout_planning, "supports_paired_buffers", False):
+            self._lx_relayout_plans = {}
+            return self._generate_buffers(graph)
         self._lx_relayout_plans = {
             plan.edge: plan for plan in collect_lx_relayout_plans(graph)
         }
@@ -229,14 +231,12 @@ class ScratchpadAllocator:
 
     def _finalize_lx_relayout_allocation(
         self,
-        graph: GraphLowering,
-        solver: MemoryPlanSolver,
         allocation: Sequence[LifetimeBoundBuffer],
-    ) -> tuple[MemoryPlanSolver, Sequence[LifetimeBoundBuffer]]:
+    ) -> None:
         if not self._lx_relayout_plans:
             self._accepted_lx_relayouts = []
-            return solver, allocation
-        complete = self._complete_lx_relayout_sources(allocation)
+            return
+        complete = self._allocated_lx_relayout_sources(allocation)
         rejected = {
             plan.source_name for plan in self._lx_relayout_plans.values()
         } - complete
@@ -260,16 +260,7 @@ class ScratchpadAllocator:
                     allocations,
                 )
             self._clear_lx_relayout_groups(allocation, rejected)
-        if not complete:
-            logger.debug(
-                "no LX relayout groups survived allocation; retrying stock LX placement"
-            )
-            self._lx_relayout_plans = {}
-            stock = self._generate_buffers(graph)
-            solver = self._build_solver(stock)
-            allocation = self._solve(solver)
         self._accepted_lx_relayouts = self._accepted_plans(allocation)
-        return solver, allocation
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
         """Hook run after the solve, before reasons/push. Base: nothing to commit."""
@@ -883,12 +874,12 @@ class ScratchpadAllocator:
         invalid = set()
         for plan in self._lx_relayout_plans.values():
             source = by_name[plan.source_name]
-            consumer_tick = op_index[plan.consumer_name]
-            assert consumer_tick in source.uses
+            consumer_ticks = [op_index[name] for name in plan.consumer_names]
+            assert all(tick in source.uses for tick in consumer_ticks)
             if source.residency_reason is not None:
                 invalid.add(plan.source_name)
             else:
-                entries.append((source, plan, consumer_tick))
+                entries.append((source, plan, consumer_ticks))
         if invalid:
             entries = [entry for entry in entries if entry[0].name not in invalid]
             self._clear_lx_relayout_groups(buffers, invalid)
@@ -908,20 +899,22 @@ class ScratchpadAllocator:
 
         # Adjacent half-ticks rely on DSCs within a bundle executing serially;
         # otherwise the allocator's lifetime reuse is unsound beyond relayout too.
-        for source, plan, original_tick in entries:
-            consumer_tick = 2 * original_tick + 1
-            transfer_tick = consumer_tick - 1
+        for source, plan, original_ticks in entries:
+            consumer_ticks = [2 * tick + 1 for tick in original_ticks]
+            transfer_tick = consumer_ticks[0] - 1
             source.uses = sorted(
-                {use for use in source.uses if use != consumer_tick} | {transfer_tick}
+                {use for use in source.uses if use not in consumer_ticks}
+                | {transfer_tick}
             )
             destination = LifetimeBoundBuffer(
                 plan.destination_name,
                 round_up_to_alignment(source.size, _LX_ALLOCATION_GRANULARITY_BYTES),
-                [transfer_tick, consumer_tick],
+                [transfer_tick, *consumer_ticks],
             )
             buffers.insert(buffers.index(source), destination)
+            source.paired_with.append(destination)
 
-    def _complete_lx_relayout_sources(
+    def _allocated_lx_relayout_sources(
         self, allocation: Sequence[LifetimeBoundBuffer]
     ) -> set[str]:
         by_name = {buffer.name: buffer for buffer in allocation}
@@ -931,17 +924,25 @@ class ScratchpadAllocator:
         complete = set()
         for source_name, plans in groups.items():
             source = by_name[source_name]
-            if source.address is None:
+            destinations = [by_name[plan.destination_name] for plan in plans]
+            allocated = [
+                buffer.address is not None for buffer in (source, *destinations)
+            ]
+            assert all(allocated) or not any(allocated), (
+                f"paired-buffer group for {source_name} was only partially allocated"
+            )
+            if not allocated[0]:
                 continue
-            if all(
-                (destination := by_name[plan.destination_name]).address is not None
+            assert source.address is not None
+            assert all(
+                destination.address is not None
                 and not (
                     source.address < destination.address + destination.size
                     and destination.address < source.address + source.size
                 )
-                for plan in plans
-            ):
-                complete.add(source_name)
+                for destination in destinations
+            ), f"paired-buffer group for {source_name} has overlapping placements"
+            complete.add(source_name)
         return complete
 
     def _clear_lx_relayout_groups(

@@ -52,7 +52,7 @@ _REGISTRY = "_spyre_lx_relayout_copies"
 @dataclasses.dataclass(frozen=True)
 class LXRelayoutPlan:
     source_name: str
-    consumer_name: str
+    consumer_names: tuple[str, ...]
     source_view: PerCoreView
     destination_view: PerCoreView
     num_cores: int
@@ -61,11 +61,11 @@ class LXRelayoutPlan:
 
     @property
     def destination_name(self) -> str:
-        return f"{_DESTINATION_PREFIX}:{self.source_name}:{self.consumer_name}"
+        return f"{_DESTINATION_PREFIX}:{self.source_name}:{self.consumer_names[0]}"
 
     @property
     def edge(self) -> tuple[str, str]:
-        return self.source_name, self.consumer_name
+        return self.source_name, self.destination_name
 
 
 def work_division_from_view(
@@ -230,7 +230,7 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
         for dep in deps:
             reads.setdefault(dep.name, []).append((consumer, dep))
 
-    result = []
+    result: list[LXRelayoutPlan] = []
     for source_name, consumer_reads in reads.items():
         producer = operations.get(source_name)
         if (
@@ -265,7 +265,7 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
         except ValueError:
             continue
 
-        source_plans = []
+        consumers_by_view: dict[PerCoreView, list[str]] = {}
         seen_consumers = set()
         for consumer, dep in consumer_reads:
             consumer_name = consumer.get_name()
@@ -315,17 +315,18 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                 work_division_from_view(view, consumer_coordinates, consumer_symbols)
             except ValueError:
                 break
-            source_plans.append(
+            consumers_by_view.setdefault(view, []).append(consumer_name)
+        else:
+            result.extend(
                 LXRelayoutPlan(
                     source_name,
-                    consumer_name,
+                    tuple(consumer_names),
                     source_view,
-                    view,
+                    destination_view,
                     num_cores,
                 )
+                for destination_view, consumer_names in consumers_by_view.items()
             )
-        else:
-            result.extend(source_plans)
     return result
 
 
@@ -341,8 +342,10 @@ def materialize_lx_relayouts(graph: GraphLowering, plans: list[LXRelayoutPlan]) 
     setattr(graph, _REGISTRY, copies)
     for plan in plans:
         source = cast(ComputedBuffer, graph.get_buffer(plan.source_name))
-        consumer = cast(ComputedBuffer, graph.get_buffer(plan.consumer_name))
-        copy = editor.insert_clone_before_consumer(source, consumer)
+        consumers = [
+            cast(ComputedBuffer, graph.get_buffer(name)) for name in plan.consumer_names
+        ]
+        copy = editor.insert_clone_before_consumers(source, consumers)
         copies[plan.edge] = (copy.get_name(), plan)
 
         assert plan.source_address is not None and plan.destination_address is not None

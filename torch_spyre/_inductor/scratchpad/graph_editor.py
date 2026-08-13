@@ -139,10 +139,13 @@ class GraphEditor:
         buf_fx = list(buffer.origins)[0]  # .origin_node may not exist
         old_users = list(buf_fx.users.keys())
         if private:
-            consumer_fx = getattr(buffer_users[0], "origin_node", None) or next(
-                iter(buffer_users[0].origins)
+            old_users = list(
+                dict.fromkeys(
+                    getattr(consumer, "origin_node", None)
+                    or next(iter(consumer.origins))
+                    for consumer in buffer_users
+                )
             )
-            old_users = [consumer_fx]
         self.fx_graph.inserting_after(buf_fx)
         new_fx_node = self.fx_graph.create_node(
             "call_function", self.clone_aten_op, (buf_fx,)
@@ -195,6 +198,7 @@ class GraphEditor:
         if input:
             source_users = []
             clone_users = []
+            private_user_names = {user.get_name() for user in buffer_users}
             for node in self.lowering.name_to_users[buf_name]:
                 while not isinstance(node, Buffer):
                     assert hasattr(node, "data"), (
@@ -202,7 +206,7 @@ class GraphEditor:
                     )
                     node = node.data
                 keep_source = node.name in [buf_name, new_buf_name] or (
-                    private and node.name != buffer_users[0].get_name()
+                    private and node.name not in private_user_names
                 )
                 if keep_source:
                     source_users.append(node)
@@ -226,13 +230,13 @@ class GraphEditor:
 
         return new_com_buf
 
-    def insert_clone_before_consumer(
+    def insert_clone_before_consumers(
         self,
         buffer: ComputedBuffer,
-        consumer: ComputedBuffer,
+        consumers: list[ComputedBuffer],
     ) -> ComputedBuffer:
         return self.push_allocation_with_clone(
-            buffer, [consumer], input=True, private=True
+            buffer, consumers, input=True, private=True
         )
 
     @staticmethod

@@ -51,6 +51,7 @@ from torch_spyre._inductor.lx_relayout import (
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg, TensorWorkDivision
 from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 from torch_spyre._inductor.spyre_kernel import _remap_work_division, simplify_op_spec
 
@@ -560,8 +561,10 @@ _SOURCE_VIEW = PerCoreView(
 _DESTINATION_VIEW = PerCoreView(((0, 8),), ((0, _CORE_ID),))
 
 
-def _relayout_plan(source="source", consumer="consumer"):
-    return LXRelayoutPlan(source, consumer, _SOURCE_VIEW, _DESTINATION_VIEW, 8)
+def _relayout_plan(source="source", consumers="consumer"):
+    if isinstance(consumers, str):
+        consumers = (consumers,)
+    return LXRelayoutPlan(source, consumers, _SOURCE_VIEW, _DESTINATION_VIEW, 8)
 
 
 def test_lx_relayout_activation_policy_is_source_wide():
@@ -661,7 +664,7 @@ def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc():
     }
 )
 @pytest.mark.parametrize("second_consumer", ["pointwise", "matmul_lhs", "matmul_rhs"])
-def test_lx_relayout_two_private_consumers_are_numerically_correct(second_consumer):
+def test_lx_relayout_consumers_share_destination_view(second_consumer):
     torch.manual_seed(0)
     m_size = 64 if second_consumer == "matmul_rhs" else 32
     x = torch.randn(8, m_size, 64, dtype=torch.float16)
@@ -675,12 +678,15 @@ def test_lx_relayout_two_private_consumers_are_numerically_correct(second_consum
     ):
         _declare_tensor_dim(name, size)
 
+    shares_destination = second_consumer in ("pointwise", "matmul_lhs")
+
     def fn(x, weight):
         with spyre_hint(work_div={"B": 4, "M": 2}):
             hidden = torch.neg(x)
         with spyre_hint(work_div={"B": 2, "M": 4}):
             pointwise = torch.relu(hidden)
-        with spyre_hint(work_div={"B": 8}):
+        second_work_div = {"B": 2, "M": 4} if shares_destination else {"B": 8}
+        with spyre_hint(work_div=second_work_div):
             if second_consumer == "matmul_lhs":
                 second = torch.bmm(hidden, weight)
             elif second_consumer == "matmul_rhs":
@@ -721,105 +727,62 @@ def test_lx_relayout_two_private_consumers_are_numerically_correct(second_consum
         re.findall(r"TensorWorkDivision\(work_slices=\{([^}]*)", block)
         for block in identities
     ]
-    assert len(divisions) == 2 and all(len(pair) == 2 for pair in divisions)
-    assert {divisions[0][0], divisions[1][0]} == {"sympify('c1'): 2, sympify('c0'): 4"}
-    assert {divisions[0][1], divisions[1][1]} == {
-        "sympify('c1'): 4, sympify('c0'): 2",
-        "sympify('c0'): 8",
-    }
+    expected_copies = 1 if shares_destination else 2
+    assert len(divisions) == expected_copies
+    assert all(len(pair) == 2 for pair in divisions)
+    assert {pair[0] for pair in divisions} == {"sympify('c1'): 2, sympify('c0'): 4"}
+    expected_destinations = {"sympify('c1'): 4, sympify('c0'): 2"}
+    if not shares_destination:
+        expected_destinations.add("sympify('c0'): 8")
+    assert {pair[1] for pair in divisions} == expected_destinations
 
 
-def test_lx_relayout_allocation_is_atomic_and_retries_stock_once(caplog):
-    complete = [_relayout_plan("complete", name) for name in ("a", "b")]
-    incomplete = [_relayout_plan("incomplete", name) for name in ("c", "d")]
-
-    class Solver:
-        calls = 0
-
-        def __init__(self, buffers, _size):
-            self.buffers = buffers
-
-        def plan_layout(self, log_lx_usage=False):
-            Solver.calls += 1
-            addresses = (
-                {
-                    "complete": 0,
-                    complete[0].destination_name: 256,
-                    complete[1].destination_name: 512,
-                    "incomplete": 768,
-                    incomplete[0].destination_name: 1024,
-                }
-                if Solver.calls == 1
-                else {"incomplete": 0}
-            )
-            for buffer in self.buffers:
-                buffer.address = addresses.get(buffer.name)
-            return list(self.buffers)
-
-    def solve(allocator, buffers, graph):
-        solver = allocator._build_solver(buffers)
-        return allocator._finalize_lx_relayout_allocation(
-            graph, solver, allocator._solve(solver)
-        )[1]
-
-    allocator = ScratchpadAllocator(Solver, 2048)
-    plans = [*complete, *incomplete]
+def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
+    alternate_view = PerCoreView(((1, 8),), ((1, _CORE_ID),))
+    plans = [
+        _relayout_plan("source", ("consumer_a", "consumer_b")),
+        LXRelayoutPlan(
+            "source",
+            ("consumer_c",),
+            _SOURCE_VIEW,
+            alternate_view,
+            8,
+        ),
+    ]
+    allocator = ScratchpadAllocator(GreedyLayoutSolver, 256)
     allocator._lx_relayout_plans = {plan.edge: plan for plan in plans}
     graph = SimpleNamespace(
         operations=[
             SimpleNamespace(get_name=lambda name=name: name)
-            for name in ("a", "b", "c", "d")
+            for name in (
+                "producer",
+                "consumer_a",
+                "consumer_b",
+                "consumer_c",
+                "ordinary_consumer",
+            )
         ]
     )
-    buffers = [
-        LifetimeBoundBuffer("complete", 128, [0, 1]),
-        LifetimeBoundBuffer("incomplete", 128, [2, 3]),
-    ]
+    source = LifetimeBoundBuffer("source", 128, [0, 1, 2, 3])
+    ordinary = LifetimeBoundBuffer("ordinary", 128, [0, 4])
+    buffers = [source, ordinary]
     allocator._append_lx_relayout_destinations(graph, buffers)
-    assert next(buffer for buffer in buffers if buffer.name == "complete").uses == [
-        0,
-        2,
-    ]
-    with caplog.at_level(logging.DEBUG, logger="spyre.inductor.scratchpad.allocator"):
-        allocation = solve(allocator, buffers, graph)
-    by_name = {buffer.name: buffer for buffer in allocation}
-    assert by_name["complete"].address == 0
-    assert [by_name[plan.destination_name].uses for plan in complete] == [
-        [0, 1],
-        [2, 3],
-    ]
-    assert [by_name[plan.destination_name].address for plan in complete] == [256, 512]
-    assert by_name["incomplete"].address is None
-    assert all(by_name[plan.destination_name].address is None for plan in incomplete)
-    assert allocator._lx_relayout_plans == {plan.edge: plan for plan in complete}
-    assert any(
-        "rejected LX relayout group source=incomplete" in record.message
-        and incomplete[1].destination_name in record.message
-        and "None" in record.message
-        for record in caplog.records
-    )
 
-    Solver.calls = 0
-    caplog.clear()
-    allocator = ScratchpadAllocator(Solver, 1024)
-    allocator._lx_relayout_plans = {plan.edge: plan for plan in incomplete}
-    graph = SimpleNamespace(
-        operations=[
-            SimpleNamespace(get_name=lambda name=name: name) for name in ("c", "d")
-        ]
-    )
-    buffers = [LifetimeBoundBuffer("incomplete", 128, [0, 1])]
-    allocator._append_lx_relayout_destinations(graph, buffers)
-    allocator._generate_buffers = lambda _graph: [
-        LifetimeBoundBuffer("incomplete", 128, [2, 3])
-    ]
+    assert source.uses == [1, 2, 6]
+    assert [buffer.uses for buffer in source.paired_with] == [[2, 3, 5], [6, 7]]
+
+    solver = allocator._build_solver(buffers)
     with caplog.at_level(logging.DEBUG, logger="spyre.inductor.scratchpad.allocator"):
-        fallback = solve(allocator, buffers, graph)
-    assert [(buffer.name, buffer.address) for buffer in fallback] == [("incomplete", 0)]
-    assert Solver.calls == 2
+        allocation = allocator._solve(solver)
+        allocator._finalize_lx_relayout_allocation(allocation)
+
+    by_name = {buffer.name: buffer for buffer in allocation}
+    assert by_name["ordinary"].address == 0
+    assert by_name["source"].address is None
+    assert all(by_name[plan.destination_name].address is None for plan in plans)
+    assert allocator._lx_relayout_plans == {}
     assert any(
-        "no LX relayout groups survived allocation; retrying stock LX placement"
-        in record.message
+        "rejected LX relayout group source=source" in record.message
         for record in caplog.records
     )
 
