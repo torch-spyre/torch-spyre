@@ -381,8 +381,7 @@ def _single_arg_op_layout(
     c_stride = [concretize_expr(s) for s in output.stride]
 
     if isinstance(data, Reduction):
-        # A bool result's physical format matches its operand's, not
-        # get_elem_in_stick(torch.bool)'s hardcoded SEN169_FP16.
+        # Bool physical format resolution: see bool_layout_dtype's docstring.
         out_dtype_for_layout = (
             bool_layout_dtype(stl.device_dtype)
             if output.dtype == torch.bool
@@ -561,8 +560,6 @@ def _single_arg_op_layout(
     ):
         # Input and output tensors are being accessed identically and elem size is the same.
         # We can simply propagate the device_layout including ElementArrangement.
-        # out_device_dtype resolves the correct physical format for bool outputs
-        # (get_device_dtype(bool) would hardcode SEN169_FP16).
         stl = SpyreTensorLayout(
             stl.device_size,
             stl.stride_map,
@@ -943,8 +940,7 @@ def _multi_arg_pointwise_layouts(
         if dc is not None
     }
 
-    # A bool output reuses its operands' physical format (resolved from args);
-    # get_device_dtype(torch.bool) would hardcode SEN169_FP16.
+    # Bool physical format resolution: see resolve_output_formats's docstring.
     bool_device_dtype = (
         infer_bool_device_dtype(args) if output.dtype == torch.bool else None
     )
@@ -1330,8 +1326,8 @@ def _find_alt_target_stl(
     or raises Unsupported if no valid alternative exists.
     """
     # A bool target's stick size comes from the format it is physically stored
-    # in (target_stl), not from target_layout.dtype -- get_elem_in_stick(bool)
-    # would assume SEN169_FP16's 64 even for a target held in IEEE_FP32.
+    # in (target_stl), not from target_layout.dtype -- see bool_layout_dtype's
+    # docstring.
     dtype_for_layout = (
         bool_layout_dtype(target_stl.device_dtype, "mutation target")
         if target_layout.dtype == torch.bool
