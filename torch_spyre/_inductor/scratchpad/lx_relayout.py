@@ -29,11 +29,11 @@ from torch._inductor.ir import (
     Pointwise,
 )
 
-from . import config
-from .ir import FixedTiledLayout
-from .logging_utils import get_inductor_logger
-from .op_spec import TensorWorkDivision
-from .pass_utils import (
+from .. import config
+from ..ir import FixedTiledLayout
+from ..logging_utils import get_inductor_logger
+from ..op_spec import TensorWorkDivision
+from ..pass_utils import (
     PerCoreView,
     _is_matmul_op,
     _per_core_view_on_buf,
@@ -42,7 +42,7 @@ from .pass_utils import (
     op_read_writes,
     try_device_coordinates,
 )
-from .scratchpad.utils import _op_num_cores
+from .utils import _op_num_cores
 
 logger = get_inductor_logger("lx_relayout")
 _DESTINATION_PREFIX = "__spyre_lx_relayout__"
@@ -334,7 +334,7 @@ def materialize_lx_relayouts(graph: GraphLowering, plans: list[LXRelayoutPlan]) 
     if not plans:
         assert not materialized_lx_relayouts(graph)
         return
-    from .scratchpad.graph_editor import GraphEditor
+    from .graph_editor import GraphEditor
 
     copies = materialized_lx_relayouts(graph)
     assert not copies, "LX relayouts were already materialized"

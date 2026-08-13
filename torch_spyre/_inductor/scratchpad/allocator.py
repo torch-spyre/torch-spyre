@@ -88,7 +88,7 @@ from torch_spyre._inductor.ir import FixedTiledLayout
 
 from torch_spyre._inductor import config
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from torch_spyre._inductor.lx_relayout import (
+from torch_spyre._inductor.scratchpad.lx_relayout import (
     LXRelayoutPlan,
     collect_lx_relayout_plans,
     materialize_lx_relayouts,

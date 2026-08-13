@@ -37,14 +37,14 @@ from torch._inductor.utils import run_and_get_code, InputType
 
 
 from torch_spyre._inductor import config, spyre_hint
-import torch_spyre._inductor.lx_relayout as lx_relayout_module
+import torch_spyre._inductor.scratchpad.lx_relayout as lx_relayout_module
 import torch_spyre._inductor.scheduler as scheduler_module
 import torch_spyre._inductor.work_division as _wd
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec, parse_op_spec
 from torch_spyre._inductor.constants import IDENTITY_OP
-from torch_spyre._inductor.lx_relayout import (
+from torch_spyre._inductor.scratchpad.lx_relayout import (
     LXRelayoutPlan,
     work_division_from_view,
 )

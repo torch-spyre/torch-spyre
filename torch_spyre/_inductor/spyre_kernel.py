@@ -48,7 +48,7 @@ from .constants import (
 from . import config as _spyre_config
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .lx_relayout import work_division_from_view
+from .scratchpad.lx_relayout import work_division_from_view
 from .pass_utils import (
     concretize_expr,
     concretize_index,

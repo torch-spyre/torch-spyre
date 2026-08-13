@@ -42,7 +42,7 @@ from .pass_utils import (
     try_device_coordinates,
 )
 from .logging_utils import get_inductor_logger
-from .lx_relayout import (
+from .scratchpad.lx_relayout import (
     demote_lx_relayout_group,
     materialized_lx_relayouts,
     work_division_from_view,
