@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import torch
-from torch_spyre._C import fill_tensor, copy_tensor
+from torch_spyre._C import fill_tensor, copy_tensor, SpyreTensorLayout
 import torch_spyre.ops.fallbacks  # noqa: F401
 from .fallbacks import _get_op_overloads
 import warnings
@@ -23,6 +23,19 @@ import operator
 
 
 aten = torch.ops.aten
+
+# A d2d re-tiling copy that the Spyre lowering cannot express surfaces either as
+# the bare NotImplementedError or wrapped by Inductor; import the wrapper lazily
+# so this module stays importable without _inductor.
+try:
+    from torch._inductor.exc import InductorError as _InductorError
+
+    _RETILE_INFEASIBLE: tuple[type[BaseException], ...] = (
+        NotImplementedError,
+        _InductorError,
+    )
+except ImportError:  # pragma: no cover
+    _RETILE_INFEASIBLE = (NotImplementedError,)
 
 
 # Decorator to keep track of compiled variant
@@ -89,6 +102,28 @@ def _materialize_offset_view(x):
     return x
 
 
+def _normalize_result_layout(x):
+    """Return a copy of a Spyre tensor whose device layout is the *canonical* one
+    for its logical shape."""
+
+    if not isinstance(x, torch.Tensor) or x.device.type != "spyre":
+        return x
+    try:
+        assumed = SpyreTensorLayout([int(s) for s in x.shape], x.dtype)
+        if x.device_tensor_layout() == assumed:
+            return x
+    except Exception:
+        # No layout to compare (or an unrepresentable one): leave it alone
+        # rather than force a copy on a tensor we cannot reason about.
+        return x
+    out = torch.zeros(x.shape, dtype=x.dtype, device=x.device)
+    try:
+        out.copy_(x)
+    except _RETILE_INFEASIBLE:
+        out.copy_(x.to("cpu"))
+    return out
+
+
 def _write_arg_slots(op):
     """Positions and names of an op's mutated (write-aliased) arguments.
 
@@ -136,10 +171,16 @@ def _make_offset_safe_dispatch(op):
     - Write (mutated) args: read-modify-write. Clone the offset view to an
       offset-0 buffer, run the kernel against the clone, then ``copy_`` the
       result back into the caller's view.
+    - Results: rebuild any output whose device tiling is not the canonical one
+      for its shape (``_normalize_result_layout``), since a compiled graph
+      consuming this op as a fallback will assume the canonical tiling.
 
-    Everything is a no-op for the common offset-0 case.
+    Everything is a no-op for the common offset-0, canonical-layout case.
     """
     write_positions, write_names = _write_arg_slots(op)
+    # In-place/out variants return the caller's own buffer; rebuilding it would
+    # break the aliasing the schema promises, so leave their results alone.
+    normalize_results = not (write_positions or write_names)
 
     def dispatch(*args, compiled=None, **kwargs):
         write_back = []  # (clone, original) for each substituted write view
@@ -165,6 +206,16 @@ def _make_offset_safe_dispatch(op):
         }
 
         result = compiled(*args, **kwargs)
+
+        if normalize_results:
+            if isinstance(result, torch.Tensor):
+                result = _normalize_result_layout(result)
+            elif isinstance(result, (list, tuple)):
+                mapped = [_normalize_result_layout(r) for r in result]
+                if hasattr(type(result), "_make"):  # namedtuple / structseq
+                    result = type(result)._make(mapped)
+                else:
+                    result = type(result)(mapped)
 
         if write_back:
             for local, original in write_back:
