@@ -152,7 +152,22 @@ c10::DeviceCapability SpyreGuardImpl::getDeviceCapability(
   return cap;
 }
 
-thread_local c10::DeviceIndex SpyreGuardImpl::tls_idx = parse_local_rank();
+// Safe seed for the thread_local initializer.
+// parse_local_rank() can throw (malformed / out-of-range LOCAL_RANK).  A
+// thread_local dynamic initializer has no surrounding try/catch on worker
+// threads, so an exception there calls std::terminate.  Return 0 on any
+// error; _startRuntime re-calls parse_local_rank() on the guarded path and
+// will surface the error as a catchable exception.
+static c10::DeviceIndex parse_local_rank_safe() noexcept {
+  try {
+    return parse_local_rank();
+  }
+  catch (...) {
+    return 0;
+  }
+}
+
+thread_local c10::DeviceIndex SpyreGuardImpl::tls_idx = parse_local_rank_safe();
 
 // Registration — runs when _C.so is loaded.
 // Loading _C.so does NOT trigger device initialization; that only
