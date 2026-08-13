@@ -35,6 +35,8 @@ from .constants import (
     SPYRE_FP32_OPS,
     BATCH_MATMUL_OP,
     BATCH_MATMUL_FP8_OP,
+    CONV2D_FWD_OP,
+    CONV_OPS,
     IDENTITY_OP,
     POOL_OPS,
     RESTICKIFY_OP,
@@ -927,21 +929,19 @@ class SpyreKernel(Kernel[CSEVariable]):
                 )
             )
 
-        # Carry the pool/conv node's full logical output ranges (NCHW, incl.
-        # unit dims) so codegen can derive surviving dim roles and the channel
-        # count from live IR instead of a lowering-time size snapshot.  Store raw
-        # ranges (no int(): ranges may be symbolic); consumers convert only
-        # static dims.  Populated only for the ops that consume it (pools and
-        # depthwise conv2d) so other kernels' generated source is unchanged.
-        #
+        # Carry the node's full logical output ranges (NCHW, incl. unit dims)
+        # so codegen can derive surviving dim roles and the channel count from
+        # live IR instead of a lowering-time size snapshot.  Store raw ranges
+        # (no int(): ranges may be symbolic); consumers convert only static
+        # dims.  Populated for pools and convs (forward + depthwise) — the only
+        # consumers — so other kernels' generated source is unchanged.
         node_output_ranges = (
             tuple(ir_node.data.ranges)
-            if (op in POOL_OPS or op == DEPTHWISE_CONV2D_OP)
+            if op in POOL_OPS | CONV_OPS
             and hasattr(ir_node, "data")
             and hasattr(ir_node.data, "ranges")
             else None
         )
-
         return OpSpec(
             op,
             is_reduction,
@@ -1157,7 +1157,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                 f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
             )
 
-        if value.op in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP]:
+        if value.op in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP, CONV2D_FWD_OP]:
+            # Two-input reductions: matmul (activation @ weight) and conv2d
+            # (activation * weight, reduced over in/ki/kj). Both build
+            # [input, weight, output] tensor args.
             if (
                 len(value.arguments) != 2
                 or (not isinstance(value.arguments[0], TensorAccess))
@@ -1440,8 +1443,8 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                 )
                 if op_spec.node_output_ranges is not None:
                     # Must survive the OpSpec -> generated-source -> exec
-                    # round-trip: pool codegen reads it to align dim labels and
-                    # the channel-count fallback.  Ranges are sympy Exprs;
+                    # round-trip: pool/conv codegen reads it to align dim labels
+                    # and the channel-count fallback.  Ranges are sympy Exprs;
                     # sympy_str emits eval-able sympify(...) calls.
                     buf.writeline(
                         "node_output_ranges=("

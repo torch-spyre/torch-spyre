@@ -162,7 +162,12 @@ def conv_spatial_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult
     conv_params = op_info.get("conv_params")
     if not isinstance(conv_params, dict):
         return ConstraintResult()
-    if conv_params.get("stride_i", 1) <= 1 and conv_params.get("stride_j", 1) <= 1:
+    # Depthwise conv2d (#3510) records stride as stride_i/stride_j; forward
+    # conv2d (#3284) records it as stride_h/stride_w. Accept either spelling so
+    # the strided-spatial-split block covers both direct-conv paths.
+    stride_i = conv_params.get("stride_i", conv_params.get("stride_h", 1))
+    stride_j = conv_params.get("stride_j", conv_params.get("stride_w", 1))
+    if (stride_i or 1) <= 1 and (stride_j or 1) <= 1:
         return ConstraintResult()
 
     write_ranges = list(next(iter(op_read_writes(ctx.op).writes)).ranges)

@@ -61,7 +61,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from collections import Counter
 from typing import NamedTuple
 
 import sympy
@@ -105,7 +104,7 @@ from ..loop_info import (
 )
 from ..pass_utils import op_out_coords, host_coordinates, indirect_sizes_from_op
 from ..ir import FixedTiledLayout, SpyreConstantFallback, _resize_device_layout
-from .tile import compute_tile_stride
+from .tile import compute_tile_index, compute_tile_stride
 
 logger = get_inductor_logger("coarse_tile")
 
@@ -115,6 +114,7 @@ class _RetiledBufferInfo(NamedTuple):
 
     old_stride: tuple[Expr, ...]
     new_stride: tuple[Expr, ...]
+    old_size: tuple[Expr, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +562,14 @@ def _plan_tiling_propagation(
                 per_tile_ranges = _compute_per_tile_ranges_planned(op, info)
                 full_output_ranges = _compute_full_ranges_planned(op, info)
                 outer_fill_loop_info = _compute_fill_loop_info_planned(info)
+                full_output_strides = tuple(op.layout.stride)
+                per_tile_strides = tuple(
+                    compute_tile_stride(
+                        list(full_output_ranges),
+                        list(full_output_strides),
+                        list(per_tile_ranges),
+                    )
+                )
                 reduction_plan = ReductionPlan(
                     reduction_type=reduction_type,
                     identity=identity,
@@ -569,6 +577,8 @@ def _plan_tiling_propagation(
                     full_output_ranges=full_output_ranges,
                     per_tile_ranges=per_tile_ranges,
                     outer_fill_loop_info=outer_fill_loop_info,
+                    full_output_strides=full_output_strides,
+                    per_tile_strides=per_tile_strides,
                 )
                 buf_name = op.get_name()
                 consumer_names, is_graph_output = _find_outside_consumers_planned(
@@ -598,6 +608,7 @@ def _plan_tiling_propagation(
             info.propagation = PropagationPlan(
                 kind="copy_out",
                 full_ranges=full_ranges,
+                full_strides=tuple(op.layout.stride),
                 outside_consumer_names=tuple(consumer_names),
                 is_graph_output=is_graph_output,
             )
@@ -1130,6 +1141,7 @@ def _divide_ranges(
         return None
 
     old_stride = tuple(layout.stride)
+    old_size = tuple(layout.size)
     new_size = list(layout.size)
     for i in tiled_dims:
         new_size[i] = ranges[i]
@@ -1143,7 +1155,7 @@ def _divide_ranges(
     _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
     _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
     retiled_info = (
-        _RetiledBufferInfo(old_stride, tuple(layout.stride))
+        _RetiledBufferInfo(old_stride, tuple(layout.stride), old_size)
         if tiled_dims and old_stride != tuple(layout.stride)
         else None
     )
@@ -1260,7 +1272,9 @@ def _apply_plan(
                 name = op.get_name()
                 prior = retiled_infos.get(name)
                 retiled_infos[name] = (
-                    _RetiledBufferInfo(prior.old_stride, retiled_info.new_stride)
+                    _RetiledBufferInfo(
+                        prior.old_stride, retiled_info.new_stride, prior.old_size
+                    )
                     if prior is not None
                     else retiled_info
                 )
@@ -1741,6 +1755,8 @@ def _propagate_tiled_op(
 
     full_ranges = propagation.full_ranges
     assert full_ranges is not None, "full_ranges must be planned for copy_out ops"
+    full_strides = propagation.full_strides
+    assert full_strides is not None, "full_strides must be planned for copy_out ops"
 
     # Insert the full buffer before the first op in the same outermost
     # loop group so it doesn't split the group's contiguous run in the
@@ -1753,10 +1769,13 @@ def _propagate_tiled_op(
         and getattr(getattr(o, "loop_info", None), "loop_group_id", (None,))[0]
         == outer_key
     )
-    full_buf = _allocate_full_buffer(op, full_ranges, operations, group_start_idx)
+    full_buf = _allocate_full_buffer(
+        op, full_ranges, full_strides, operations, group_start_idx
+    )
 
     # Capture before _insert_copy_op overwrites op.layout.
     old_stride = tuple(op.layout.stride)
+    old_size = tuple(op.layout.size)
 
     # Every cross-loop-group write always takes the copy-op path: the real
     # compute op keeps its own natural, input-derived, tile-sized layout,
@@ -1776,7 +1795,9 @@ def _propagate_tiled_op(
 
     # Patch outside consumers and graph outputs to read full_buf.
     full_name = full_buf.get_name()
-    retile_info = _RetiledBufferInfo(old_stride, tuple(full_buf.layout.stride))
+    retile_info = _RetiledBufferInfo(
+        old_stride, tuple(full_buf.layout.stride), old_size
+    )
     _patch_consumers(outside_consumers, buf_name, full_name, operations, retile_info)
     if is_graph_output:
         _patch_graph_outputs(buf_name, full_buf)
@@ -1918,6 +1939,7 @@ def _graph_output_names() -> set[str]:
 def _allocate_full_buffer(
     tiled_op: ComputedBuffer,
     full_ranges: list[Expr],
+    full_strides: tuple[Expr, ...],
     operations: list[Operation],
     insert_at_idx: int,
 ) -> ComputedBuffer:
@@ -1960,12 +1982,7 @@ def _allocate_full_buffer(
     # FixedLayout (stickification assigns the device layout later); post-stickify
     # we must build a FixedTiledLayout because stickification has already run.
     orig_layout = tiled_op.layout
-    # Recompute strides for the full size (contiguous row-major).
-    strides: list[Expr] = []
-    stride: Expr = sympy.Integer(1)
-    for s in reversed(full_ranges):
-        strides.insert(0, stride)
-        stride = stride * s
+    strides: list[Expr] = list(full_strides)
 
     if isinstance(orig_layout, FixedTiledLayout):
         # Post-stickify path (span-overflow groups): stickification has already
@@ -2362,17 +2379,35 @@ def _insert_one_read_copy(
         full_buf = full_buf.data
 
     tile_ranges = list(dep.size)
-    # Fresh contiguous row-major strides for the copy buffer's own
-    # tile-sized shape (mirrors _allocate_full_buffer's strides loop) --
-    # NOT dep.index's own coefficients, which are strides into full_buf's
-    # full-sized layout (e.g. a row stride of the full row width) and
-    # would describe the freshly allocated, tile-sized copy buffer as if
-    # it shared the full buffer's physical layout.
-    tile_strides: list[Expr] = []
-    stride: Expr = sympy.Integer(1)
-    for s in reversed(tile_ranges):
-        tile_strides.insert(0, stride)
-        stride = stride * s
+    # Derive copy buffer strides using compute_tile_stride.
+    # dep.size is the full loop iteration space (output + reduction dims) and
+    # may have higher rank than the tensor (e.g. for a Reduction reading
+    # a[M,K], dep.size=[M,N,K_tile] while the tensor has rank 2).
+    # Use dep.index.coeff(v) to identify active dims (non-zero coeff) vs
+    # broadcast/absent dims (zero coeff, e.g. N above).  dep.size[i] is the
+    # full range for each active dim — the correct size to pass to
+    # compute_tile_stride without any lookup into full_buf's layout.
+    full_coeff = [dep.index.coeff(v) for v in dep.var_names]
+    # Positions with non-zero coeff are active tensor dims; zero coeff means
+    # broadcast/absent (e.g. the N dim in a Reduction reading a[M,K]).
+    active_idx = [i for i, c in enumerate(full_coeff) if c != 0]
+
+    tile_strides: list[Expr]
+    if not active_idx:
+        tile_strides = [sympy.Integer(0)] * len(tile_ranges)
+    else:
+        active_full_sizes = [dep.size[i] for i in active_idx]
+        active_full_strides = [full_coeff[i] for i in active_idx]
+        active_tile_ranges = [tile_ranges[i] for i in active_idx]
+        active_tile_strides = compute_tile_stride(
+            active_full_sizes, active_full_strides, active_tile_ranges
+        )
+        # active_tile_strides[i] corresponds to active_idx[i]: both are indexed
+        # by position in the compressed active-dims space, so zip pairs each
+        # full dep.var_names position with its computed tile stride correctly.
+        tile_strides = [sympy.Integer(0)] * len(tile_ranges)
+        for pos, ts in zip(active_idx, active_tile_strides):
+            tile_strides[pos] = ts
 
     def _copy_inner_fn(idx, _dep=dep, _full_name=full_buf.get_name()):
         subs = dict(zip(_dep.var_names, idx))
@@ -3162,6 +3197,7 @@ def _propagate_tiled_reduction_op(
     loop_group_id = loop_info.loop_group_id
     reduction_plan = loop_info.propagation.reduction
     identity = reduction_plan.identity
+    op_size = tuple(op.layout.size)
 
     # Per-outer-tile output shape (ranges after any outer tiling divided them).
     per_tile_ranges = reduction_plan.per_tile_ranges
@@ -3208,18 +3244,30 @@ def _propagate_tiled_reduction_op(
         # from their own loop_info, so accum_tile itself needs no flag);
         # accum_full accumulates across outer B-tiles via a copy op.
         accum_full = _allocate_full_buffer(
-            op, full_output_ranges, operations, group_start_idx
+            op,
+            full_output_ranges,
+            reduction_plan.full_output_strides,
+            operations,
+            group_start_idx,
         )
         group_start_idx_after_full = operations.index(accum_full) + 1
         accum_tile = _allocate_full_buffer(
-            op, per_tile_ranges, operations, group_start_idx_after_full
+            op,
+            per_tile_ranges,
+            reduction_plan.per_tile_strides,
+            operations,
+            group_start_idx_after_full,
         )
         fill_target = accum_tile
         combine_target = accum_tile
     else:
-        # Flat case: single full-sized buffer (unchanged behaviour).
+        # Flat case: single full-sized buffer.
         accum_full = _allocate_full_buffer(
-            op, full_output_ranges, operations, group_start_idx
+            op,
+            full_output_ranges,
+            reduction_plan.full_output_strides,
+            operations,
+            group_start_idx,
         )
         fill_target = accum_full
         combine_target = accum_full
@@ -3356,7 +3404,9 @@ def _propagate_tiled_reduction_op(
     all_consumers = outside_consumers + inside_consumers
     accum_name = accum_full.get_name()
     retile_info = _RetiledBufferInfo(
-        tuple(op.layout.stride), tuple(accum_full.layout.stride)
+        tuple(op.layout.stride),
+        tuple(accum_full.layout.stride),
+        op_size,
     )
     _patch_consumers(all_consumers, buf_name, accum_name, operations, retile_info)
     if is_graph_output:
@@ -3405,7 +3455,9 @@ def _patch_consumers(
     from ..pass_utils import replace_computed_buffer_body
 
     name_map = {old_name: new_name}
-    rewrites = _stride_rewrite_map(retile_info) if retile_info is not None else {}
+    has_retile = (
+        retile_info is not None and retile_info.old_stride != retile_info.new_stride
+    )
 
     for consumer in consumers:
         orig_inner = consumer.data.inner_fn
@@ -3413,11 +3465,11 @@ def _patch_consumers(
         def new_inner_fn(
             *args,
             _map=name_map,
-            _rewrites_by_old_name={old_name: rewrites} if rewrites else {},
+            _info=retile_info if has_retile else None,
             _orig=orig_inner,
         ):
-            if _rewrites_by_old_name:
-                handler = _NameAndIndexSwapHandler(V.ops, _map, _rewrites_by_old_name)
+            if _info is not None:
+                handler = _NameAndIndexSwapHandler(V.ops, _map, {old_name: _info})
             else:
                 handler = NameSwapHandler(V.ops, _map)
             with V.set_ops_handler(handler):
@@ -3441,128 +3493,96 @@ def _patch_consumers(
         ]
 
 
-def _stride_rewrite_map(info: _RetiledBufferInfo) -> dict[Expr, Expr]:
-    """Map unique stale stride coefficients to their retiled coefficients."""
-
-    old_counts = Counter(sympy.simplify(s) for s in info.old_stride)
-    rewrites: dict[Expr, Expr] = {}
-    for old, new in zip(info.old_stride, info.new_stride):
-        old = sympy.simplify(old)
-        new = sympy.simplify(new)
-        if old_counts[old] == 1 and sympy.simplify(old - new) != 0:
-            rewrites[old] = new
-    return rewrites
-
-
-def _retile_load_index_from_strides(
+def _retile_load_index(
     buf_name: str,
     index: Expr,
-    rewrites: dict[Expr, Expr],
+    info: _RetiledBufferInfo,
 ) -> Expr:
-    """Rewrite separable affine load-index terms from full strides to tile strides."""
+    """Rewrite a load index using compute_tile_index.  Raises Unsupported if
+    the index cannot be decomposed (non-affine, or stride not in info.old_stride).
 
-    if not rewrites:
+    Used by _RetileLoadIndexHandler and _NameAndIndexSwapHandler during real
+    codegen.  In both cases the incoming index has coefficients equal to
+    info.old_stride and the call rewrites them to info.new_stride.
+
+    The two handlers run in opposite directions:
+    - _RetileLoadIndexHandler: full→tile (old_stride are the full strides,
+      new_stride are the smaller tile strides).
+    - _NameAndIndexSwapHandler: tile→full (old_stride are the tile strides,
+      new_stride are the larger full strides).
+
+    compute_tile_index is valid for both directions.  Its core,
+    compute_tile_offset, does divmod(coeff, s) for each paired stride s in
+    decreasing order.  Each atom's coefficient IS one of the old strides, so
+    each divmod is exact (remainder zero).  Potential ambiguity from duplicate
+    stride values is prevented by compute_tile_index's irregular-dimension
+    filter: size==1 and stride==0 dimensions are excluded before pairing, and
+    those are the only source of duplicate strides in a valid tensor layout.
+
+    compute_tile_index uses var_ranges only as a key-set to distinguish loop
+    variables from shape symbols.  We derive it from index.free_symbols so the
+    call site never needs to know which prefix convention the calling inner_fn
+    uses for its loop variables.
+    """
+
+    loop_syms = index.free_symbols
+    if not loop_syms:
         return index
 
-    loop_vars = index.free_symbols
-    if not loop_vars:
-        return index
-
-    replacements = {var: sympy.S.Zero for var in loop_vars}
-    offset = index.xreplace(replacements)
-    projection_terms: dict[sympy.Symbol, Expr] = {}
-    for var in sorted(loop_vars, key=str):
-        other_vars = {other: sympy.S.Zero for other in loop_vars if other != var}
-        projection_terms[var] = sympy.expand(index.xreplace(other_vars) - offset)
-
-    residual = sympy.simplify(index - offset - sum(projection_terms.values()))
-    if residual != 0:
-        logger.warning(
-            "coarse_tile: refusing to retile load index for %s: index=%s has "
-            "mixed loop-variable residual %s",
-            buf_name,
-            index,
-            residual,
-        )
-        return index
-
-    adjusted_index = offset
-    changed = False
-    for var in sorted(loop_vars, key=str):
-        term = projection_terms[var]
-        coeff = term.coeff(var)
-        remainder = sympy.simplify(term - coeff * var)
-        if remainder != 0:
-            logger.warning(
-                "coarse_tile: refusing to retile load index for %s: projection "
-                "for %s is non-affine in index=%s: %s",
-                buf_name,
-                var,
-                index,
-                term,
-            )
-            return index
-
-        matches = [
-            new_coeff
-            for old_coeff, new_coeff in rewrites.items()
-            if sympy.simplify(coeff - old_coeff) == 0
-        ]
-        if len(matches) == 1:
-            adjusted_index += matches[0] * var
-            changed = True
-        else:
-            adjusted_index += term
-
-    if changed:
-        logger.debug(
-            "coarse_tile: retiled load index for %s: %s -> %s",
-            buf_name,
-            index,
-            adjusted_index,
-        )
-        return sympy.simplify(adjusted_index)
-    return index
+    new_index = compute_tile_index(
+        index,
+        {sym: 1 for sym in loop_syms},
+        info.old_size,
+        info.old_stride,
+        info.new_stride,
+    )
+    logger.debug(
+        "coarse_tile: retiled load index for %s: %s -> %s",
+        buf_name,
+        index,
+        new_index,
+    )
+    return new_index
 
 
 class _RetileLoadIndexHandler(WrapperHandler):
-    """Ops handler that retiles loads from buffers whose host strides changed."""
+    """Ops handler that retiles loads from buffers whose host strides changed.
 
-    def __init__(self, inner, rewrites_by_name: dict[str, dict[Expr, Expr]]):
+    Used during real codegen — calls _retile_load_index, which raises
+    Unsupported if an index cannot be retiled.
+    """
+
+    def __init__(self, inner, infos_by_name: dict[str, _RetiledBufferInfo]):
         super().__init__(inner)
-        self._rewrites_by_name = rewrites_by_name
+        self._infos_by_name = infos_by_name
 
     def load(self, name, index):
-        if name in self._rewrites_by_name:
-            index = _retile_load_index_from_strides(
-                name, index, self._rewrites_by_name[name]
-            )
+        if name in self._infos_by_name:
+            index = _retile_load_index(name, index, self._infos_by_name[name])
         return super().load(name, index)
 
 
 class _NameAndIndexSwapHandler(WrapperHandler):
     """Redirect ops.load(name, index) to a new name and rewrite its index.
 
-    Rewrites index while `name` is still the old name (its coefficients are
-    in the old buffer's strides), then swaps the name. Reuses
-    _retile_load_index_from_strides.
+    Rewrites the index while `name` is still the old name (its coefficients
+    are info.old_stride), then swaps the name.  Calls _retile_load_index,
+    which raises Unsupported if the index cannot be retiled.
     """
 
     def __init__(
         self,
         inner,
         name_map: dict[str, str],
-        rewrites_by_old_name: dict[str, dict[Expr, Expr]],
+        infos_by_old_name: dict[str, _RetiledBufferInfo],
     ):
         super().__init__(inner)
         self._name_map = name_map
-        self._rewrites_by_old_name = rewrites_by_old_name
+        self._infos_by_old_name = infos_by_old_name
 
     def load(self, name, index):
-        if name in self._rewrites_by_old_name:
-            index = _retile_load_index_from_strides(
-                name, index, self._rewrites_by_old_name[name]
-            )
+        if name in self._infos_by_old_name:
+            index = _retile_load_index(name, index, self._infos_by_old_name[name])
         return super().load(self._name_map.get(name, name), index)
 
 
@@ -3600,12 +3620,12 @@ def _patch_retiled_load_indexes(
     operations: list[Operation],
 ) -> None:
     """Rewrite stale load indexes for consumers of buffers retiled by coarse tiling."""
-    rewrites_by_name = {
-        name: rewrites
+    infos_by_name = {
+        name: info
         for name, info in retiled_infos.items()
-        if (rewrites := _stride_rewrite_map(info))
+        if info.old_stride != info.new_stride
     }
-    if not rewrites_by_name:
+    if not infos_by_name:
         return
 
     from ..pass_utils import replace_computed_buffer_body
@@ -3616,15 +3636,19 @@ def _patch_retiled_load_indexes(
     # buffer's already-updated layout directly, so rewriting them here would
     # double-apply the stride correction (see issue found while fixing
     # test_hint_restickify_stays_in_group).
-    retiled_names = set(rewrites_by_name)
+    retiled_names = set(infos_by_name)
     for op in list(group_ops):
         if not _should_patch_retiled_load_indexes(op, group_id, retiled_names):
             continue
 
         orig_inner = op.data.inner_fn
 
-        def new_inner_fn(*args, _rewrites=rewrites_by_name, _orig=orig_inner):
-            with V.set_ops_handler(_RetileLoadIndexHandler(V.ops, _rewrites)):
+        def new_inner_fn(
+            *args,
+            _infos=infos_by_name,
+            _orig=orig_inner,
+        ):
+            with V.set_ops_handler(_RetileLoadIndexHandler(V.ops, _infos)):
                 return _orig(*args)
 
         object.__setattr__(op.data, "inner_fn", new_inner_fn)

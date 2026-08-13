@@ -68,6 +68,12 @@ class ReductionPlan:
         Its ``loop_group_id`` is planning-time, pre-offset numbering --
         transformation must re-slice it from the op's own real, stamped
         ``loop_group_id`` before use (see ``_propagate_tiled_reduction_op``).
+    full_output_strides:
+        Host strides of the full-sized accumulation buffer, captured from
+        ``op.layout.stride`` at planning time (before ``_divide_ranges`` runs).
+    per_tile_strides:
+        Host strides of the per-outer-tile accumulation buffer, derived from
+        ``full_output_strides`` via ``compute_tile_stride`` at planning time.
     """
 
     reduction_type: str
@@ -76,6 +82,8 @@ class ReductionPlan:
     full_output_ranges: list[sympy.Expr]
     per_tile_ranges: list[sympy.Expr]
     outer_fill_loop_info: "CoarseTileInfo | None"
+    full_output_strides: tuple[sympy.Expr, ...]
+    per_tile_strides: tuple[sympy.Expr, ...]
 
 
 @dataclass(frozen=True)
@@ -98,6 +106,10 @@ class PropagationPlan:
     full_ranges:
         Full (pre-division) iteration ranges for the copy-out's full buffer.
         Only set when ``kind == "copy_out"``.
+    full_strides:
+        Original (pre-division) strides of the tiled op's layout, captured at
+        planning time before ``_divide_ranges`` mutates the op.  Only set when
+        ``kind == "copy_out"``.
     reduction:
         Shape/identity/nesting decisions for the reduction machinery. Only
         set when ``kind == "reduction"``.
@@ -111,6 +123,7 @@ class PropagationPlan:
 
     kind: Literal["loop_internal", "copy_out", "reduction"]
     full_ranges: list[sympy.Expr] | None = None
+    full_strides: tuple[sympy.Expr, ...] | None = None
     reduction: ReductionPlan | None = None
     outside_consumer_names: tuple[str, ...] = ()
     is_graph_output: bool = False

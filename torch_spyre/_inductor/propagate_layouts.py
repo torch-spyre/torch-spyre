@@ -56,6 +56,7 @@ from .errors import Unsupported
 from .constants import (
     BATCH_MATMUL_OP,
     BATCH_MATMUL_FP8_OP,
+    CONV2D_FWD_OP,
     COPY_BACK_CANDIDATE_ATTR,
     DEVICE_NAME,
     ELIDED_COPY_BACK_ATTR,
@@ -874,6 +875,94 @@ def _matmul_layouts(
     return [out_stl]
 
 
+def _conv_reduction_var(x: PropArg, reduction_candidates: set) -> sympy.Symbol | None:
+    """Pick conv's contraction var (`in`) from the reduction candidates.
+
+    A conv reduces over three loop vars -- the input channel `in` and the two
+    kernel taps `ki`/`kj` -- so find_reduction_var (which requires exactly one)
+    does not apply.  The layout-relevant contraction is `in`: it is the input
+    channel and the activation's stick dim.  `ki`/`kj` are windowed reductions
+    folded into the activation's spatial coordinates, never its stick.  So `in`
+    is the reduction candidate that appears on the stick of some candidate
+    activation layout (NHWC: stick = Mod(in, 64)).
+    """
+    for stl in x.layouts:
+        stick_syms = device_coordinates(stl, x.dep, None)[-1].free_symbols
+        hit = reduction_candidates & stick_syms
+        if hit:
+            return next(iter(hit))
+    return None
+
+
+def _conv_layouts(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[PropArg],
+) -> list[SpyreTensorLayout]:
+    """Layout propagation for the two-input conv2d reduction.
+
+    conv2d has the same input/output stick structure as matmul -- activation
+    (x) sticks on the contraction var, weight (y) and output stick on the
+    generated var (out-channel) -- so this mirrors _matmul_layouts.  The one
+    difference is the contraction var: conv reduces over {in, ki, kj}, and the
+    stick-relevant one is `in` (see _conv_reduction_var).
+    """
+    data = op.data
+    _check_supported_input_sticks(args, data.reduction_type)
+    out_coords = host_coordinates(output, output_dep, None)
+
+    x_dep, y_dep = identify_matmul_inputs([a.dep for a in args], output_dep)
+    if x_dep is None or y_dep is None:
+        raise Unsupported(
+            f"{data.reduction_type}: could not identify activation/weight"
+        )
+    if x_dep is args[0].dep:
+        x, y = args[0], args[1]
+    else:
+        x, y = args[1], args[0]
+
+    reduction_candidates = x.dep.index.free_symbols - output_dep.index.free_symbols
+    reduction_var = _conv_reduction_var(x, reduction_candidates)
+    if reduction_var is None:
+        raise Unsupported(
+            f"{data.reduction_type}: could not identify the input-channel "
+            f"contraction var among {reduction_candidates}"
+        )
+    generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep)
+
+    x_req_stl = find_stick_compatible_input_layout(
+        x, reduction_var, data.reduction_type, "x"
+    )
+    y_req_stl = find_stick_compatible_input_layout(
+        y, generated_var, data.reduction_type, "y"
+    )
+
+    out_stick_dim = next(
+        (i for i, c in enumerate(out_coords) if generated_var in c.free_symbols),
+        None,
+    )
+    if out_stick_dim is None:
+        raise Unsupported(
+            f"{data.reduction_type}: generated_var={generated_var} not found in "
+            f"output coords {out_coords}"
+        )
+
+    # The output must stick on generated_var (out-channel). Unlike matmul, whose
+    # N dim is always in the last two positions, conv's out-channel can sit
+    # anywhere (index 1 for an NCHW [mb, out, i, j] output), so move it to the
+    # stick (innermost) position explicitly and keep the other dims' order.
+    out_dims = len(output.size)
+    out_dim_order = [d for d in range(out_dims) if d != out_stick_dim] + [out_stick_dim]
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+    out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+    op.restick_cost_fn = FixedInOutNode.from_args(
+        [x, y], out_stl, [x_req_stl, y_req_stl], op
+    )
+    return [out_stl]
+
+
 def _multi_arg_pointwise_layouts(
     op: Operation,
     output: FixedLayout,
@@ -1240,6 +1329,9 @@ def compute_layouts(
         BATCH_MATMUL_FP8_OP,
     ]:
         return _matmul_layouts(op, output, output_dep, args)
+
+    if isinstance(data, Reduction) and data.reduction_type == CONV2D_FWD_OP:
+        return _conv_layouts(op, output, output_dep, args)
 
     if isinstance(data, Reduction) and data.reduction_type == "exx2":
         return _exx2_layout(op, output, output_dep, args)
