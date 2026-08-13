@@ -706,8 +706,9 @@ _CONV_MAX_KERNEL = 3
 
 
 def _is_direct_conv_supported(
-    input: torch.Tensor,
-    weight: torch.Tensor,
+    input_shape: Sequence[int],
+    input_dtype: torch.dtype,
+    weight_shape: Sequence[int],
     stride: list[int],
     transposed: bool,
     output_padding: list[int],
@@ -791,8 +792,8 @@ def _is_direct_conv_supported(
     the im2col+matmul fallback branch is gone (see above) -- a mismatch surfaces
     downstream as a hard Unsupported, not silent wrong numerics.
     """
-    kH, kW = weight.shape[-2], weight.shape[-1]
-    C_in = input.shape[1]
+    kH, kW = weight_shape[-2], weight_shape[-1]
+    C_in = input_shape[1]
     eps = get_elem_in_stick(torch.float16)
     supported = (
         not transposed
@@ -800,8 +801,8 @@ def _is_direct_conv_supported(
         and all(p == 0 for p in padding)
         and all(d == 1 for d in dilation)
         and groups == 1
-        and input.dim() == 4
-        and input.dtype == torch.float16
+        and len(input_shape) == 4
+        and input_dtype == torch.float16
         and not (kH == 1 and kW == 1)
         # Dense conv k>3 overflows the LX contraction budget in the backend.
         and kH <= _CONV_MAX_KERNEL
@@ -821,11 +822,46 @@ def _is_direct_conv_supported(
     # and mis-accumulates the dangling column when (W_in - kW) % sW != 0. Only
     # decidable for a static width; a dynamic (SymInt) width stays on the direct
     # path rather than adding a symbolic-remainder shape guard.
-    W_in = input.shape[-1]
+    W_in = input_shape[-1]
     sW = stride[-1]
     if isinstance(W_in, int) and (W_in - kW) % sW != 0:
         return False
     return True
+
+
+def _will_lower_conv2d_direct(
+    input_shape: Sequence[int],
+    input_dtype: torch.dtype,
+    weight_shape: Sequence[int],
+    stride: list[int],
+    transposed: bool,
+    output_padding: list[int],
+    padding: list[int],
+    dilation: list[int],
+    groups: int,
+) -> bool:
+    """Single source of truth for whether conv2d_via_bmm_decomp defers a 4D conv.
+
+    True iff the decomposition will decline (return NotImplemented) and leave
+    aten.convolution for the native direct SDSC lowering, rather than expand into
+    im2col+matmul. Decides purely from shapes/dtype, so both callers pass shapes
+    directly: the 4D gate its own input/weight shapes, and the 3D->2D fold the
+    *folded* 4D shapes (it must pick a physical layout matching the path the
+    recursive 4D conv will actually take -- channel-last for direct, row-major for
+    im2col). Sharing this one decision is what keeps the fold's layout choice from
+    ever diverging from the routing the recursion makes.
+    """
+    return config.conv2d_direct_lowering and _is_direct_conv_supported(
+        input_shape,
+        input_dtype,
+        weight_shape,
+        stride,
+        transposed,
+        output_padding,
+        padding,
+        dilation,
+        groups,
+    )
 
 
 @register_spyre_decompositions([torch.ops.aten.convolution.default])
@@ -853,8 +889,16 @@ def conv2d_via_bmm_decomp(
     # non-fp16) fall through and decompose to im2col+matmul as before. This is
     # the compile-path target; the flag defaults off so eager and default
     # compile behavior are unchanged.
-    if config.conv2d_direct_lowering and _is_direct_conv_supported(
-        input, weight, stride, transposed, output_padding, padding, dilation, groups
+    if _will_lower_conv2d_direct(
+        input.shape,
+        input.dtype,
+        weight.shape,
+        stride,
+        transposed,
+        output_padding,
+        padding,
+        dilation,
+        groups,
     ):
         return NotImplemented
 
@@ -894,6 +938,19 @@ def conv2d_via_bmm_decomp(
                 f"padding and unit depth dilation (got kD={K_d}, "
                 f"stride_d={stride[0]}, pad_d={padding[0]}, dil_d={dilation[0]})"
             )
+        # A grouped/depthwise fold is out of scope: will_direct is binary
+        # (direct vs im2col), but the 4D body has a third exit -- the
+        # C_in == groups == C_out depthwise branch (spyre.conv2d_with_bias),
+        # which needs C on the stick. A depthwise conv3d predicts
+        # will_direct=False (the direct predicate requires groups==1) -> folds
+        # row-major -> lands in that channel-last branch with the wrong layout
+        # and fails obscurely downstream. Reject it here instead, so the binary
+        # layout decision below is exactly the routing the recursion will take.
+        if groups != 1:
+            raise Unsupported(
+                "conv2d_via_bmm: grouped/depthwise temporal-1 Conv3D is not "
+                f"supported (got groups={groups})"
+            )
 
         conv2d_stride = [stride[1], stride[2]]
         conv2d_padding = [padding[1], padding[2]]
@@ -906,13 +963,14 @@ def conv2d_via_bmm_decomp(
         # default row-major layout (W on the stick). Get it wrong and the conv
         # layout pass rejects the activation with an unrepresentable stick
         # expression -- a channel-last activation into im2col yields `2*d1 + d2`,
-        # a row-major one into the direct path yields `d3 + d6`. Decide up front
-        # with the SAME predicate the recursion will evaluate on the folded 4D
-        # op (it reads only shapes/dtype, so probe it with empty tensors of the
-        # folded shapes), keeping the two decisions in lock-step.
-        will_direct = config.conv2d_direct_lowering and _is_direct_conv_supported(
-            input.new_empty((N * D, C_in, H_in, W_in)),
-            weight.new_empty((C_out, C_in_per_group, K_h, K_w)),
+        # a row-major one into the direct path yields `d3 + d6`. Call the SAME
+        # decision the recursion will make (_will_lower_conv2d_direct), passing the
+        # *folded* 4D shapes it will see: not a copy of the predicate, the predicate
+        # itself, so the fold and the 4D gate can never disagree.
+        will_direct = _will_lower_conv2d_direct(
+            (N * D, C_in, H_in, W_in),
+            input.dtype,
+            (C_out, C_in_per_group, K_h, K_w),
             conv2d_stride,
             transposed,
             [output_padding[1], output_padding[2]],

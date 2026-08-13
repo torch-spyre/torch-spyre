@@ -7617,9 +7617,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         from torch_spyre._inductor.decompositions import conv2d_via_bmm_decomp
         from torch_spyre._inductor.errors import Unsupported
 
-        def _call(kD=1, stride_d=1, pad_d=0, dil_d=1):
+        def _call(kD=1, stride_d=1, pad_d=0, dil_d=1, groups=1):
             x = torch.zeros(1, 64, 2, 8, 8, dtype=torch.float16)
-            w = torch.zeros(64, 64, kD, 3, 3, dtype=torch.float16)
+            w = torch.zeros(64, 64 // groups, kD, 3, 3, dtype=torch.float16)
             return conv2d_via_bmm_decomp(
                 x,
                 w,
@@ -7629,7 +7629,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 [dil_d, 1, 1],
                 False,
                 [0, 0, 0],
-                1,
+                groups,
             )
 
         # The temporal gate holds regardless of the direct-lowering flag.
@@ -7644,6 +7644,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     _call(pad_d=1)
                 with self.assertRaises(Unsupported):
                     _call(dil_d=2)
+                # Grouped/depthwise fold is out of scope: will_direct is binary
+                # (direct vs im2col) and cannot express the 4D depthwise exit,
+                # so a temporal-1 conv3d with groups != 1 must be rejected here
+                # rather than mis-folded into the wrong layout.
+                with self.assertRaises(Unsupported):
+                    _call(groups=2)
+                with self.assertRaises(Unsupported):
+                    _call(groups=64)  # depthwise
 
                 # Temporal-1 passes the gate: it must NOT raise Unsupported. It
                 # proceeds into the fold, whose reshape_via_cpu has no CPU kernel
@@ -7683,9 +7691,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
 
         def _supported(c_in, k=3, hw=8, **overrides):
-            x = torch.zeros(1, c_in, hw, hw, dtype=torch.float16)
-            w = torch.zeros(eps, c_in, k, k, dtype=torch.float16)
-            return _is_direct_conv_supported(x, w, **{**common, **overrides})
+            return _is_direct_conv_supported(
+                (1, c_in, hw, hw),
+                torch.float16,
+                (eps, c_in, k, k),
+                **{**common, **overrides},
+            )
 
         # C_in stick alignment.
         self.assertTrue(_supported(eps), f"C_in={eps} should direct-lower")
