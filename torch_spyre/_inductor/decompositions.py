@@ -864,6 +864,126 @@ def conv2d_via_bmm_decomp(
     if any(op != 0 for op in output_padding):
         raise Unsupported("conv2d_via_bmm: output_padding not supported")
 
+    if input.dim() == 5:
+        # A Conv3D with a unit temporal (depth) kernel is a *batched* Conv2d:
+        # with kD == 1 (and unit depth stride, zero depth pad, unit depth
+        # dilation) every depth slice is convolved independently with the same
+        # [C_out, C_in, kH, kW] weight. So fold D into the batch dim, run the
+        # ordinary 2D conv, and unfold:
+        #     (N, C, D, H, W) -> (N*D, C, H, W) -> conv2d -> unfold back.
+        # The folded op is a plain aten.convolution.default that the
+        # decomposition table re-processes exactly like any 2D conv: with the
+        # direct-lowering flag on and a supported case it declines to the native
+        # conv2d SDSC (lower_convolution / _is_direct_conv_supported); otherwise
+        # -- the flag is off, or the case is outside the SDSC envelope, e.g. a
+        # ViT patch-embed kernel (kH/kW > 3) or a non-stick-aligned C_in as in
+        # Prithvi-EO-2.0's Conv3d(6->1024, kernel (1,16,16)) -- it decomposes to
+        # im2col+matmul. Conv3D thus rides whichever 2D path fits, with no new
+        # lowering, and the dim() == 5 guard means the folded 4D op never
+        # re-triggers this branch (no infinite recursion).
+        #
+        # A non-temporal-1 Conv3D (kD > 1, or a non-trivial depth
+        # stride/pad/dilation) is genuinely 3-D and out of scope here -- it
+        # stays Unsupported.
+        N, C_in, D, H_in, W_in = input.shape
+        C_out, C_in_per_group, K_d, K_h, K_w = weight.shape
+        if not (K_d == 1 and stride[0] == 1 and padding[0] == 0 and dilation[0] == 1):
+            raise Unsupported(
+                "conv2d_via_bmm: 3D convolution is only supported when the "
+                "temporal (depth) kernel is 1 with unit depth stride, zero depth "
+                f"padding and unit depth dilation (got kD={K_d}, "
+                f"stride_d={stride[0]}, pad_d={padding[0]}, dil_d={dilation[0]})"
+            )
+
+        conv2d_stride = [stride[1], stride[2]]
+        conv2d_padding = [padding[1], padding[2]]
+        conv2d_dilation = [dilation[1], dilation[2]]
+
+        # The two inner 2D paths want OPPOSITE activation layouts, so the fold
+        # must lay the data out for whichever one the recursive 4D conv will
+        # take. The direct conv2d SDSC contracts over C_in and needs C_in on the
+        # Spyre stick (channel-last fold); the im2col+matmul path needs the
+        # default row-major layout (W on the stick). Get it wrong and the conv
+        # layout pass rejects the activation with an unrepresentable stick
+        # expression -- a channel-last activation into im2col yields `2*d1 + d2`,
+        # a row-major one into the direct path yields `d3 + d6`. Decide up front
+        # with the SAME predicate the recursion will evaluate on the folded 4D
+        # op (it reads only shapes/dtype, so probe it with empty tensors of the
+        # folded shapes), keeping the two decisions in lock-step.
+        will_direct = config.conv2d_direct_lowering and _is_direct_conv_supported(
+            input.new_empty((N * D, C_in, H_in, W_in)),
+            weight.new_empty((C_out, C_in_per_group, K_h, K_w)),
+            conv2d_stride,
+            transposed,
+            [output_padding[1], output_padding[2]],
+            conv2d_padding,
+            conv2d_dilation,
+            groups,
+        )
+
+        if will_direct:
+            # Channel-last fold: reshape_via_cpu returns default row-major
+            # layout, so the *innermost logical* dim lands on the stick. Reshape
+            # in channel-last order (C innermost) and expose the logical NCHW /
+            # [C_out, C_in, kH, kW] shape with a permute VIEW -- exactly the form
+            # the 4D direct path receives its inputs (NHWC-contiguous viewed as
+            # NCHW), so C_in / C_out stay on the stick.
+            # activation (N,C,D,H,W) -> view (N,D,H,W,C) -> (N*D,H,W,C)
+            #            -> view (N*D,C,H,W).
+            x_cl = torch.permute(input, (0, 2, 3, 4, 1)).contiguous()
+            x_cl = torch.ops.spyre.reshape_via_cpu(x_cl, (N * D, H_in, W_in, C_in))
+            x4 = torch.permute(x_cl, (0, 3, 1, 2))
+            # weight (C_out,C_in,1,kH,kW) -> view (C_in,1,kH,kW,C_out)
+            #        -> (C_in,kH,kW,C_out) -> view (C_out,C_in,kH,kW). This also
+            # squeezes the unit depth tap.
+            w_cl = torch.permute(weight, (1, 2, 3, 4, 0)).contiguous()
+            w_cl = torch.ops.spyre.reshape_via_cpu(
+                w_cl, (C_in_per_group, K_h, K_w, C_out)
+            )
+            w4 = torch.permute(w_cl, (3, 0, 1, 2))
+        else:
+            # Default row-major fold (W on the stick), the layout the im2col path
+            # accepts. Permute D next to N and squeeze it into the batch; the
+            # weight's unit depth tap is a pure reshape.
+            # activation (N,C,D,H,W) -> view (N,D,C,H,W) -> (N*D,C,H,W).
+            x_dchw = torch.permute(input, (0, 2, 1, 3, 4)).contiguous()
+            x4 = torch.ops.spyre.reshape_via_cpu(x_dchw, (N * D, C_in, H_in, W_in))
+            # weight (C_out,C_in,1,kH,kW) -> (C_out,C_in,kH,kW).
+            w4 = torch.ops.spyre.reshape_via_cpu(
+                weight, (C_out, C_in_per_group, K_h, K_w)
+            )
+
+        # Recurse into the 4D conv path; bias is added once, on the C_out dim,
+        # inside the inner conv (folding D into the batch leaves C_out intact),
+        # so it must NOT be re-added here.
+        out4 = torch.ops.aten.convolution.default(
+            x4,
+            w4,
+            bias,
+            conv2d_stride,
+            conv2d_padding,
+            conv2d_dilation,
+            False,
+            [0, 0],
+            groups,
+        )
+        # out4 is (N*D, C_out, H_out, W_out); read H_out/W_out back rather than
+        # recomputing them from the conv geometry, then unfold in the matching
+        # layout so the returned logical NCDHW tensor is correct either way.
+        _, C_out_o, H_out, W_out = out4.shape
+        if will_direct:
+            # view (N*D,H_out,W_out,C_out) -> (N,D,H_out,W_out,C_out)
+            # -> view (N,C_out,D,H_out,W_out).
+            out_cl = torch.permute(out4, (0, 2, 3, 1)).contiguous()
+            out_cl = torch.ops.spyre.reshape_via_cpu(
+                out_cl, (N, D, H_out, W_out, C_out_o)
+            )
+            return torch.permute(out_cl, (0, 4, 1, 2, 3))
+        # Row-major: view (N*D,C_out,H_out,W_out) -> (N,D,C_out,H_out,W_out)
+        # -> view (N,C_out,D,H_out,W_out).
+        out5 = torch.ops.spyre.reshape_via_cpu(out4, (N, D, C_out_o, H_out, W_out))
+        return torch.permute(out5, (0, 2, 1, 3, 4))
+
     if input.dim() != 4:
         raise Unsupported(f"conv2d_via_bmm: expected 4D input, got {input.dim()}D")
 
