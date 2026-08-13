@@ -17,6 +17,7 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 import functools
 import itertools
+from types import SimpleNamespace
 from typing import Callable, TypeVarTuple, Unpack, Optional, override
 
 import unittest
@@ -30,6 +31,7 @@ from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor.pass_utils import op_read_writes
+from torch_spyre._inductor.patches import enable_spyre_context
 from torch_spyre._inductor.scratchpad.utils import calculate_liveness
 
 try:
@@ -47,6 +49,25 @@ Ts = TypeVarTuple("Ts")
 # where each split list is a sorted tuple of (iteration_space_stride, factor).
 _Splits = tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]
 _AllocEntry = tuple[str, int, _Splits]
+
+
+def test_nested_spyre_context_runs_pre_scheduling_once():
+    calls = []
+
+    class CountingPreSchedulingPasses:
+        def __call__(self, graph):
+            calls.append(graph)
+
+    graph = SimpleNamespace()
+    with (
+        patch.object(passes, "CustomPreSchedulingPasses", CountingPreSchedulingPasses),
+        patch.object(GraphLowering, "_update_scheduler", lambda _self: None),
+        enable_spyre_context([]),
+        enable_spyre_context([]),
+    ):
+        GraphLowering._update_scheduler(graph)
+
+    assert calls == [graph]
 
 
 class CustomPreSchedulingPassesWithOurPasses(CustomPreSchedulingPasses):

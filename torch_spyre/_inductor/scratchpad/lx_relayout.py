@@ -267,19 +267,23 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
 
         consumers_by_view: dict[PerCoreView, list[str]] = {}
         seen_consumers = set()
+        rejection_reason = None
         for consumer, dep in consumer_reads:
             consumer_name = consumer.get_name()
-            if (
-                consumer_name in seen_consumers
-                or not isinstance(consumer, ComputedBuffer)
-                or isinstance(consumer.layout, MutationLayoutSHOULDREMOVE)
+            if consumer_name in seen_consumers:
+                rejection_reason = "consumer reads the source more than once"
+                break
+            if not isinstance(consumer, ComputedBuffer) or isinstance(
+                consumer.layout, MutationLayoutSHOULDREMOVE
             ):
+                rejection_reason = "consumer is not a supported computed buffer"
                 break
             seen_consumers.add(consumer_name)
             deps = [
                 d for d in op_read_writes(consumer).reads if isinstance(d, MemoryDep)
             ]
             if any(d.is_indirect() for d in deps):
+                rejection_reason = "consumer uses indirect access"
                 break
             view, consumer_partial, representable = _per_core_view_on_buf(
                 consumer, dep, source_name, cache
@@ -289,11 +293,16 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                 or not representable
                 or _op_num_cores(consumer) != num_cores
             ):
+                rejection_reason = (
+                    "consumer ownership is partial, unrepresentable, or uses a "
+                    "different core count"
+                )
                 break
             consumer_coordinates = try_device_coordinates(
                 producer.layout.device_layout, dep, None
             )
             if consumer_coordinates is None:
+                rejection_reason = "consumer coordinates are unavailable"
                 break
             consumer_symbols = tuple(iteration_space_from_op(consumer))
             try:
@@ -301,19 +310,26 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                     source_view, consumer_coordinates, consumer_symbols
                 )
             except ValueError:
+                rejection_reason = "source ownership cannot be projected to consumer"
                 break
             if view == source_view:
                 continue
             is_matmul = _is_matmul_op(consumer)
             if is_matmul and len(deps) != 2:
+                rejection_reason = "matmul consumer does not have two inputs"
                 break
             if not is_matmul and not isinstance(consumer.data, Pointwise):
+                rejection_reason = "consumer is neither pointwise nor matmul"
                 break
             if not _compatible_partitions(source_view, view, num_cores):
+                rejection_reason = "source and destination partitions are incompatible"
                 break
             try:
                 work_division_from_view(view, consumer_coordinates, consumer_symbols)
             except ValueError:
+                rejection_reason = (
+                    "destination ownership cannot be projected to consumer"
+                )
                 break
             consumers_by_view.setdefault(view, []).append(consumer_name)
         else:
@@ -326,6 +342,13 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                     num_cores,
                 )
                 for destination_view, consumer_names in consumers_by_view.items()
+            )
+        if rejection_reason is not None:
+            logger.debug(
+                "rejected LX relayout candidate source=%s consumer=%s: %s",
+                source_name,
+                consumer_name,
+                rejection_reason,
             )
     return result
 

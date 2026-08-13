@@ -16,7 +16,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 import logging
 import logging.handlers
-import re
+import regex as re
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch as mock_patch
@@ -599,8 +599,14 @@ def _compile_spec(spec, normalize=True):
 
 def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc():
     m, n = Symbol("m"), Symbol("n")
-    source_view = PerCoreView(((1, 8),), ((1, _CORE_ID),))
-    destination_view = PerCoreView(((1, 8),), ((1, 7 - _CORE_ID),))
+    source_view = PerCoreView(
+        ((1, 4), (2, 2)),
+        ((1, floor(_CORE_ID / 2)), (2, Mod(_CORE_ID, 2))),
+    )
+    destination_view = PerCoreView(
+        ((1, 2), (2, 4)),
+        ((1, Mod(_CORE_ID, 2)), (2, floor(_CORE_ID / 2))),
+    )
     coordinates = [Mod(n, 32), floor(n / 32), Mod(m, 64)]
     base = TensorArg(
         True, -1, DataFormats.SEN169_FP16, [32, 8, 64], coordinates, {"lx": 0}
@@ -624,10 +630,19 @@ def test_lx_relayout_normalizes_ownership_and_lowers_only_in_superdsc():
     assert spec.op == IDENTITY_OP
     assert set(root["dscs_"][0]) == {"shuffle"}
     assert root["dscs_"][0]["shuffle"]["labeledDs_"][0]["dsType_"] == "OUTPUT"
-    assert all(arg.work_division.work_slices == {Symbol("z0"): 8} for arg in spec.args)
+    assert [arg.work_division.work_slices for arg in spec.args] == [
+        {Symbol("z0"): 4, m: 2},
+        {Symbol("z0"): 2, m: 4},
+    ]
+    assert root["numWkSlicesPerDim_"] == {"mb": 1, "x": 8, "out": 1}
     maps = [node["coordinates_"]["coreIdToWkSlice_"] for node in allocations]
-    assert [maps[0][str(i)]["x"] for i in range(8)] == list(range(8))
-    assert [maps[1][str(i)]["x"] for i in range(8)] == list(reversed(range(8)))
+    assert [maps[0][str(i)]["x"] for i in range(8)] == [i // 2 for i in range(8)]
+    assert [maps[0][str(i)]["out"] for i in range(8)] == [i % 2 for i in range(8)]
+    assert [maps[1][str(i)]["x"] for i in range(8)] == [i % 2 for i in range(8)]
+    assert [maps[1][str(i)]["out"] for i in range(8)] == [i // 2 for i in range(8)]
+    coord_info = [node["coordinates_"]["coordInfo"] for node in allocations]
+    assert coord_info[0]["x"]["folds"]["dim_prop_func"][0]["Affine"]["alpha_"] == 2
+    assert coord_info[1]["x"]["folds"]["dim_prop_func"][0]["Affine"]["alpha_"] == 4
     with pytest.raises(ValueError, match="cannot map device dimension"):
         work_division_from_view(source_view, [Integer(0), m + n, Integer(0)], (m, n))
 

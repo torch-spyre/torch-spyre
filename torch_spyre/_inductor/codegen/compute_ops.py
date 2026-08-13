@@ -1194,7 +1194,7 @@ def generate_sdsc(
             # falls back to dim_size // nsplits -- identical to #3510's path for
             # depthwise and every other op.
             dim_size = _coord_size(dim_str, sdsc_spec.iteration_space[dim], is_input)
-            size = _coord_per_core_size(dim, is_input) if is_tiled else 1
+            size = _coord_per_core_size(dim, is_input, nsplits) if is_tiled else 1
             is_fp8, _, st_idx = _compute_fp8_coord_params(tensor, dim, sdsc_spec)
             conv_params = (
                 get_conv_params(
@@ -1224,7 +1224,9 @@ def generate_sdsc(
                 # (#3284) is non-None only for forward-conv windowed dims. Each
                 # is inert for the other op, so both are always passed.
                 conv_params=conv_params,
-                core_stride=_coord_core_stride(dim, is_input) if is_tiled else None,
+                core_stride=(
+                    _coord_core_stride(dim, is_input, nsplits) if is_tiled else None
+                ),
             )
         return result
 
@@ -1278,7 +1280,7 @@ def generate_sdsc(
             return sdsc_spec.input_coord_sizes.get(str(dim), default)
         return default
 
-    def _coord_per_core_size(dim, is_input: bool) -> int:
+    def _coord_per_core_size(dim, is_input: bool, nsplits: int) -> int:
         """Per-core coordinate size for a tensor dim.
 
         For a windowed conv input spatial dim (i/j, present in padding_sizes) the
@@ -1291,17 +1293,18 @@ def generate_sdsc(
         has nothing to distribute.  Conv-only: avgpool keeps the plain path (for
         its non-overlapping stride==kernel windows the two coincide anyway).
         """
-        ws = sdsc_spec.work_slices.get(dim, 1)
         ps = sdsc_spec.padding_sizes.get(str(dim)) if is_input else None
         if sdsc_spec.opfunc == "conv2d" and ps is not None and "windowDim_" in ps:
-            out_per_core = sdsc_spec.iteration_space[dim] // ws
+            out_per_core = sdsc_spec.iteration_space[dim] // nsplits
             stride = int(ps.get("stride_", 1))
             dilation = int(ps.get("dilation_", 1))
             k = int(sdsc_spec.iteration_space.get(Symbol(ps["windowDim_"]), 1))
             return (out_per_core - 1) * stride + dilation * (k - 1) + 1
-        return _coord_size(str(dim), sdsc_spec.iteration_space[dim], is_input) // ws
+        return (
+            _coord_size(str(dim), sdsc_spec.iteration_space[dim], is_input) // nsplits
+        )
 
-    def _coord_core_stride(dim, is_input: bool) -> int | None:
+    def _coord_core_stride(dim, is_input: bool, nsplits: int) -> int | None:
         """Core-fold stride (advance per core) for a windowed input spatial dim.
 
         Returns ``out_per_core * stride`` -- how far the input window origin moves
@@ -1313,8 +1316,7 @@ def generate_sdsc(
         """
         ps = sdsc_spec.padding_sizes.get(str(dim)) if is_input else None
         if sdsc_spec.opfunc == "conv2d" and ps is not None and "windowDim_" in ps:
-            ws = sdsc_spec.work_slices.get(dim, 1)
-            out_per_core = sdsc_spec.iteration_space[dim] // ws
+            out_per_core = sdsc_spec.iteration_space[dim] // nsplits
             return out_per_core * int(ps.get("stride_", 1))
         return None
 
@@ -1362,6 +1364,9 @@ def generate_sdsc(
                 "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
                 "numCoresUsed_": sdsc_spec.num_cores,
                 "coreIdToDsc_": {str(c): 0 for c in range(sdsc_spec.num_cores)},
+                # The top-level map is the operation schedule. Each shuffle
+                # tensor's physical owners are carried separately on its
+                # allocation coordinates below.
                 "numWkSlicesPerDim_": {
                     str(dim): num_wk_slices
                     for dim, num_wk_slices in sdsc_spec.work_slices.items()
