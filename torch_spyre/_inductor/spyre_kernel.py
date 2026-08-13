@@ -1520,7 +1520,7 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
             buf.writeline("),")
 
 
-def _remap_work_division(arg: TensorArg, iteration_remap) -> None:
+def _remap_work_division(arg: TensorArg, work_division_remap) -> None:
     """Carry tensor ownership through iteration-space normalization."""
 
     if arg.work_division is None:
@@ -1528,7 +1528,7 @@ def _remap_work_division(arg: TensorArg, iteration_remap) -> None:
     new_splits: dict[sympy.Symbol, int] = {}
     new_core_map: dict[sympy.Symbol, sympy.Expr] = {}
     for old_dim, split in arg.work_division.work_slices.items():
-        new_dims = iteration_remap[old_dim]
+        new_dims = work_division_remap[old_dim]
         remaining_split = int(split)
         split_factors = []
         if len(new_dims) == 1:
@@ -1565,7 +1565,7 @@ def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
     # decomposes symbols in align_tensors; indirect_access_subs replaces them with IndirectAccess.
     it_space = op_spec.iteration_space
 
-    new_op_space_splits, new_tensors, iteration_remap = align_tensors(
+    new_op_space_splits, new_tensors, work_division_remap = align_tensors(
         it_space,
         [
             {"size": arg.device_size, "coordinates": arg.device_coordinates}
@@ -1576,7 +1576,7 @@ def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
     op_spec.iteration_space = new_op_space_splits
 
     for arg, t in zip(op_spec.args, new_tensors):
-        _remap_work_division(arg, iteration_remap)
+        _remap_work_division(arg, work_division_remap)
         arg.device_size = t["size"]
         arg.device_coordinates = t["coordinates"]
 

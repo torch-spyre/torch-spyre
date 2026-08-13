@@ -729,7 +729,7 @@ def test_lx_relayout_two_private_consumers_are_numerically_correct(second_consum
     }
 
 
-def test_lx_relayout_allocation_is_atomic_and_retries_stock_once():
+def test_lx_relayout_allocation_is_atomic_and_retries_stock_once(caplog):
     complete = [_relayout_plan("complete", name) for name in ("a", "b")]
     incomplete = [_relayout_plan("incomplete", name) for name in ("c", "d")]
 
@@ -780,7 +780,8 @@ def test_lx_relayout_allocation_is_atomic_and_retries_stock_once():
         0,
         2,
     ]
-    allocation = solve(allocator, buffers, graph)
+    with caplog.at_level(logging.DEBUG, logger="spyre.inductor.scratchpad.allocator"):
+        allocation = solve(allocator, buffers, graph)
     by_name = {buffer.name: buffer for buffer in allocation}
     assert by_name["complete"].address == 0
     assert [by_name[plan.destination_name].uses for plan in complete] == [
@@ -791,8 +792,15 @@ def test_lx_relayout_allocation_is_atomic_and_retries_stock_once():
     assert by_name["incomplete"].address is None
     assert all(by_name[plan.destination_name].address is None for plan in incomplete)
     assert allocator._lx_relayout_plans == {plan.edge: plan for plan in complete}
+    assert any(
+        "rejected LX relayout group source=incomplete" in record.message
+        and incomplete[1].destination_name in record.message
+        and "None" in record.message
+        for record in caplog.records
+    )
 
     Solver.calls = 0
+    caplog.clear()
     allocator = ScratchpadAllocator(Solver, 1024)
     allocator._lx_relayout_plans = {plan.edge: plan for plan in incomplete}
     graph = SimpleNamespace(
@@ -805,9 +813,15 @@ def test_lx_relayout_allocation_is_atomic_and_retries_stock_once():
     allocator._generate_buffers = lambda _graph: [
         LifetimeBoundBuffer("incomplete", 128, [2, 3])
     ]
-    fallback = solve(allocator, buffers, graph)
+    with caplog.at_level(logging.DEBUG, logger="spyre.inductor.scratchpad.allocator"):
+        fallback = solve(allocator, buffers, graph)
     assert [(buffer.name, buffer.address) for buffer in fallback] == [("incomplete", 0)]
     assert Solver.calls == 2
+    assert any(
+        "no LX relayout groups survived allocation; retrying stock LX placement"
+        in record.message
+        for record in caplog.records
+    )
 
 
 class _RelayoutNode:

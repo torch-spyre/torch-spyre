@@ -658,7 +658,7 @@ def align_tensors(
     new_var_ranges = {}
     new_op_it_space_splits = {}
     remap = {}  # map old var to new vars in splits order
-    ownership_remap = {}
+    work_division_remap = {}
     for var, split in splits.items():
         div = op_it_space_splits[var] if var in op_it_space_splits else 1
         if len(split) > 1:
@@ -686,7 +686,7 @@ def align_tensors(
                 bases[v] = int(basis)
                 new_op_it_space_splits[v] = math.gcd(div, basis)
                 div //= new_op_it_space_splits[v]
-            ownership_remap[var] = tuple((v, bases[v]) for v in remap[var])
+            work_division_remap[var] = tuple((v, bases[v]) for v in remap[var])
         else:
             # no splits keep existing var, range, and work division
             # may happen with a single stick since the stick size is omitted
@@ -710,7 +710,7 @@ def align_tensors(
             new_op_it_space_splits[var] = (
                 op_it_space_splits[var] if var in op_it_space_splits else 1
             )
-            ownership_remap[var] = ((var, 1),)
+            work_division_remap[var] = ((var, 1),)
     # create new tensors with new sizes and coordinate expressions matching new vars
     new_tensors = []
     for j, terms in enumerate(all_terms):
@@ -829,7 +829,7 @@ def align_tensors(
         if k not in indirect_syms
     }
 
-    return new_iteration_space, new_tensors, ownership_remap
+    return new_iteration_space, new_tensors, work_division_remap
 
 
 def tiling_expr_to_device_expr(

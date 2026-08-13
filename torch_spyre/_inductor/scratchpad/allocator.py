@@ -241,8 +241,29 @@ class ScratchpadAllocator:
             plan.source_name for plan in self._lx_relayout_plans.values()
         } - complete
         if rejected:
+            by_name = {buffer.name: buffer for buffer in allocation}
+            for source_name in sorted(rejected):
+                destinations = sorted(
+                    plan.destination_name
+                    for plan in self._lx_relayout_plans.values()
+                    if plan.source_name == source_name
+                )
+                allocations = {
+                    name: (by_name[name].address, by_name[name].size)
+                    for name in (source_name, *destinations)
+                }
+                logger.debug(
+                    "rejected LX relayout group source=%s allocations=%s; "
+                    "every member must be allocated and destinations must not "
+                    "overlap the source",
+                    source_name,
+                    allocations,
+                )
             self._clear_lx_relayout_groups(allocation, rejected)
         if not complete:
+            logger.debug(
+                "no LX relayout groups survived allocation; retrying stock LX placement"
+            )
             self._lx_relayout_plans = {}
             stock = self._generate_buffers(graph)
             solver = self._build_solver(stock)
