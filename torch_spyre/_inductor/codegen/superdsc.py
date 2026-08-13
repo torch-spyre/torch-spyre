@@ -536,10 +536,13 @@ def _create_sdsc_tensors(
     iteration_space: dict,
     op_dim_order: list[Symbol],
     op_stick_dim: Symbol | None,
-    mb_sym: Symbol | None = None,
     gather_mb_injected: bool = False,
+    injected_dims: dict[str, Any] | None = None,
 ) -> tuple[list[SDSCArgs], dict, Symbol | None]:
     dims = list(iteration_space.keys())
+    if injected_dims is None:
+        injected_dims = {}
+    mb_sym = injected_dims.get("mb_sym")
     layouts: dict = {}
     use_op_dims = not _is_matmul(op_spec.op)
 
@@ -726,6 +729,17 @@ def _create_sdsc_tensors(
                 max_dim_sizes[mb_sym] = 1
             else:
                 max_dim_sizes[mb_sym] = -1
+
+        # For topk: inject topk_missing_dim only into output tensor's dim_order.
+        topk_missing_dim = injected_dims.get("topk_missing_dim")
+        if topk_missing_dim is not None and i == len(op_spec.args) - 1:
+            dim_order = dim_order + [topk_missing_dim]
+            scales[topk_missing_dim] = 1
+            strides[topk_missing_dim] = _calculate_device_stride(
+                len(dim_order) - 1, arg.device_size
+            )
+            offsets[topk_missing_dim] = 0
+            max_dim_sizes[topk_missing_dim] = -1
 
         effective_stick = [op_stick_dim if stick_dim is None else stick_dim]
         layout_labels = MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS
@@ -1083,14 +1097,33 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     if is_matmul:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
+    # For topk: if all output dims are in the input, add a missing dimension.
+    injected_dims = {"mb_sym": mb_sym} if mb_sym else {}
+    if _is_topk(op_spec.op) and len(op_spec.args) >= 2:
+        input_arg = op_spec.args[0]
+        output_arg = op_spec.args[-1]
+        input_dim_order, _ = _get_device_dim_order(input_arg, symbol_mapping, op_spec)
+        output_dim_order, _ = _get_device_dim_order(output_arg, symbol_mapping, op_spec)
+        output_only_dims = [d for d in output_dim_order if d not in input_dim_order]
+        if not output_only_dims:
+            # No new output dimension; add one to the iteration space with size 1.
+            idx = len(sdsc_iteration_space)
+            if idx < len(INPUT_DIM_LABELS):
+                missing_dim_label = INPUT_DIM_LABELS[idx]
+                topk_missing_dim = Symbol(missing_dim_label)
+                sdsc_iteration_space[topk_missing_dim] = 1
+                dim_splits[topk_missing_dim] = 1
+                work_slices[topk_missing_dim] = 1
+                injected_dims["topk_missing_dim"] = topk_missing_dim
+
     args, layouts, missing_dim = _create_sdsc_tensors(
         op_spec,
         symbol_mapping,
         sdsc_iteration_space,
         op_dim_order,
         op_stick_dim,
-        mb_sym,
         gather_mb_injected=gather_mb_injected,
+        injected_dims=injected_dims,
     )
     if missing_dim is not None:
         # A dimension was added to the iteration space, update splits and work slices
