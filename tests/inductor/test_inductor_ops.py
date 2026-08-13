@@ -6004,6 +6004,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             lambda x: torch.topk(x, k, dim=dim)[0], x, run_eager=False
         )
 
+    def test_topk_largest_false_rejected(self):
+        # largest=False cannot be served by the topkvalue/topkindex reduction
+        # (it always returns the largest elements), so compile must raise.
+        x = unique_randn_along_dim((64, 256), dim=0)
+        with pytest.raises(Exception, match="Unsupported"):
+            _compile_and_run(
+                lambda x: torch.topk(x, 4, dim=0, largest=False)[0],
+                [x],
+                "spyre",
+            )
+
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
         self.compare_with_cpu(
