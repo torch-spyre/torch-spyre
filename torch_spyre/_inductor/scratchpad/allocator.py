@@ -216,6 +216,16 @@ class ScratchpadAllocator:
         """Buffers to hand the solver. Base: fixed-division LifetimeBoundBuffers."""
         assert self.layout_planning is not None
         if not getattr(self.layout_planning, "supports_paired_buffers", False):
+            if config.lx_planner_relayout:
+                solver_name = getattr(
+                    self.layout_planning,
+                    "__name__",
+                    type(self.layout_planning).__name__,
+                )
+                logger.warning(
+                    "LX relayout is not supported by %s; continuing without relayout",
+                    solver_name,
+                )
             self._lx_relayout_plans = {}
             return self._generate_buffers(graph)
         self._lx_relayout_plans = {

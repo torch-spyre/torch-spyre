@@ -787,6 +787,21 @@ def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
     )
 
 
+@config.patch({"lx_planner_relayout": True})
+def test_lx_relayout_warns_for_unsupported_solver(caplog):
+    class UnsupportedSolver:
+        pass
+
+    allocator = ScratchpadAllocator(UnsupportedSolver, 256)
+    allocator._generate_buffers = lambda _graph: []
+    with caplog.at_level(logging.WARNING, logger="spyre.inductor.scratchpad.allocator"):
+        assert allocator._prepare_buffers(SimpleNamespace()) == []
+    assert any(
+        "LX relayout is not supported by UnsupportedSolver" in record.message
+        for record in caplog.records
+    )
+
+
 class _RelayoutNode:
     def __init__(self, name, reads=(), writes=(), layout=None):
         self.name = name
