@@ -20,7 +20,6 @@ from typing import Any
 
 import sympy
 
-from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, format_op_spec_list
@@ -57,25 +56,17 @@ def generate_bundle(
     kernel_name: str,
     output_dir: str,
     specs: Sequence,
-    use_symbols: bool | None = None,
 ):
     """Output the SDSC Bundle for the OpSpecs in output_dir.
 
     ``specs`` is a list of ``OpSpec | LoopSpec`` entries (nested ``LoopSpec``
     entries are supported).
 
-    ``use_symbols`` controls whether HBM tensor addresses are emitted as
-    runtime symbols (``%sym_N`` constants) in ``bundle.mlir``.
-    When ``None`` (the default) the value is
-    read from ``config.bundle_symbolic_args``.
-
-     Dimension symbols (from ``mark_dynamic``) always produce
-    ``!sdscbundle.input_arg<index, granularity=G, max_value=M>`` parameters
-    independent of ``use_symbols``.
+    HBM tensor addresses are emitted as runtime symbols (``%sym_N``
+    constants) in ``bundle.mlir``. Dimension symbols (from ``mark_dynamic``)
+    always produce
+    ``!sdscbundle.input_arg<index, granularity=G, max_value=M>`` parameters.
     """
-    if use_symbols is None:
-        use_symbols = _spyre_config.bundle_symbolic_args
-
     specs_list: list = list(specs)
 
     if logger.isEnabledFor(logging.INFO):
@@ -102,7 +93,6 @@ def generate_bundle(
         sdsc_counter,
         symbol_id_offset_counter,
         output_dir,
-        use_symbols=use_symbols,
     )
 
     # -----------------------------------------------------------------------
@@ -147,15 +137,10 @@ def generate_bundle(
                     sdsc_idx,
                     local_dim_ordinal,
                 )
-            elif not use_symbols:
-                raise AssertionError(
-                    "use_symbols=False but compute_op_spec registered a "
-                    f"non-dimension SymbolKind ({lk.kind!r}); address-symbol."
-                )
             symbol_kinds.append(lk)
 
     # Determine whether a pool parameter is needed (any pool symbol present).
-    has_pool = use_symbols and any(sk.is_pool for sk in symbol_kinds)
+    has_pool = any(sk.is_pool for sk in symbol_kinds)
     # Indices of kernel-base symbols that become input_arg parameters.
     # Deduplicated by arg_index: multiple SDSCs operating on different slices of
     # the same logical tensor arg share one function parameter (the first-seen
@@ -166,22 +151,21 @@ def generate_bundle(
     # kernel_dup_canonical: maps duplicate kernel sym_idx → canonical sym_idx.
     kernel_arg_sym_indices: list[int] = []
     kernel_dup_canonical: dict[int, int] = {}  # duplicate sym_idx → canonical sym_idx
-    if use_symbols:
-        seen_kernel_arg_index: dict[int, int] = {}  # arg_index → canonical sym_idx
-        for i, kind_i in enumerate(symbol_kinds):
-            if kind_i.kind == "kernel":
-                ai = kind_i.arg_index
-                if ai not in seen_kernel_arg_index:
-                    seen_kernel_arg_index[ai] = i
-                    kernel_arg_sym_indices.append(i)
-                else:
-                    kernel_dup_canonical[i] = seen_kernel_arg_index[ai]
-        # Sort by arg_index so the function signature matches the positional order
-        # that call_kernel passes tensors to .run().
-        kernel_arg_sym_indices.sort(key=lambda idx: symbol_kinds[idx].arg_index)
+    seen_kernel_arg_index: dict[int, int] = {}  # arg_index → canonical sym_idx
+    for i, kind_i in enumerate(symbol_kinds):
+        if kind_i.kind == "kernel":
+            ai = kind_i.arg_index
+            if ai not in seen_kernel_arg_index:
+                seen_kernel_arg_index[ai] = i
+                kernel_arg_sym_indices.append(i)
+            else:
+                kernel_dup_canonical[i] = seen_kernel_arg_index[ai]
+    # Sort by arg_index so the function signature matches the positional order
+    # that call_kernel passes tensors to .run().
+    kernel_arg_sym_indices.sort(key=lambda idx: symbol_kinds[idx].arg_index)
 
     # Deduplicate dimension symbols by pytorch_sym (same shape var may appear
-    # in every SDSC with a different local ID). Runs regardless of use_symbols.
+    # in every SDSC with a different local ID).
     dimension_sym_indices: list[int] = []
     dimension_dup_canonical: dict[int, int] = {}  # dup sym_idx → canonical sym_idx
     seen_dim_sym: dict[str, int] = {}  # pytorch_sym → canonical sym_idx
@@ -218,13 +202,10 @@ def generate_bundle(
 
         # Function signature:
         #   - optional leading %pool_base_addr param for pool-allocated tensors
-        #     (only when use_symbols=True)
         #   - one !sdscbundle.input_arg<index> param per kernel tensor arg
-        #     (only when use_symbols=True)
         #   - one !sdscbundle.input_arg<index, granularity=G, max_value=M> param
         #     per unique dynamic-shape (mark_dynamic) symbol; emitted whenever
-        #     present, independent of use_symbols (which only governs the
-        #     pool/kernel-address params above).
+        #     present.
         if has_pool or kernel_arg_sym_indices or dimension_sym_indices:
             params = []
             if has_pool:
@@ -266,7 +247,7 @@ def generate_bundle(
             for lb_idx, lb in enumerate(loop_bounds):
                 f.write(f"\t\t%loop_bound_{lb_idx} = {_mlir_count_value(lb)}\n")
 
-        # Emit one declaration per symbol (use_symbols path):
+        # Emit one declaration per symbol:
         #   - "kernel"          → skipped; already a function param + extract op above
         #   - "kernel_slice"    → arith.addi %arg_{arg_index}, <slice_offset_bytes>
         #                         deduped by (arg_index, slice_offset) pair;
@@ -397,7 +378,6 @@ def generate_bundle(
             [],
             f,
             indent=2,
-            use_symbols=use_symbols,
             kernel_sym_to_arg_idx=kernel_sym_to_arg_idx,
             sym_canonical=sym_canonical,
         )
@@ -419,7 +399,6 @@ def _compile_specs(
     sdsc_counter: list,
     symbol_id_offset_counter: list,
     output_dir: str,
-    use_symbols: bool = False,
 ) -> None:
     """Recursively compile all OpSpecs in specs depth-first."""
     for entry in specs:
@@ -431,7 +410,6 @@ def _compile_specs(
                 sdsc_counter,
                 symbol_id_offset_counter,
                 output_dir,
-                use_symbols=use_symbols,
             )
         elif isinstance(entry, OpSpec):
             idx = sdsc_counter[0]
@@ -442,7 +420,6 @@ def _compile_specs(
                     entry,
                     symbols,
                     symbol_id_offset_counter[0],
-                    use_symbols=use_symbols,
                 )
             )
             symbol_id_offset_counter[0] += len(local_sym_values)
@@ -571,7 +548,6 @@ def _emit_specs(
     loop_vars: list,
     f,
     indent: int,
-    use_symbols: bool = False,
     kernel_sym_to_arg_idx: dict | None = None,
     sym_canonical: dict | None = None,
 ) -> None:
@@ -617,7 +593,6 @@ def _emit_specs(
                 loop_vars + [loop_var],
                 f,
                 indent + 1,
-                use_symbols=use_symbols,
                 kernel_sym_to_arg_idx=kernel_sym_to_arg_idx,
                 sym_canonical=sym_canonical,
             )
