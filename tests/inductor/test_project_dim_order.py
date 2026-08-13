@@ -28,15 +28,12 @@ from torch_spyre._inductor.propagate_layouts import project_dim_order
 def _assert_layout_invariant(dim_order, rank):
     """Mirror the TORCH_CHECK in SpyreTensorLayout::init."""
     sparse = len(dim_order) > 0 and dim_order[-1] == -1
-    assert len(dim_order) == rank or (sparse and len(dim_order) == rank + 1), (
-        f"dim_order {dim_order} (len {len(dim_order)}) is incompatible with "
-        f"rank {rank}"
-    )
+    length_ok = len(dim_order) == rank or (sparse and len(dim_order) == rank + 1)
+    assert length_ok, f"{dim_order} incompatible with rank {rank}"
     # The non-stick entries must be a permutation of the operand's dims.
     core = dim_order[:-1] if sparse else dim_order
-    assert sorted(core) == list(range(rank)), (
-        f"dim_order {dim_order} is not a permutation of range({rank})"
-    )
+    expected = list(range(rank))
+    assert sorted(core) == expected, f"{dim_order} core is not {expected}"
 
 
 class TestBroadcast:
