@@ -1184,6 +1184,46 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     4,
                     -1,
                 ),
+                "3d_k1_dim0": (
+                    unique_randn_along_dim((64, 71, 256), dim=0),
+                    1,
+                    0,
+                ),
+                "3d_k2_dim1": (
+                    unique_randn_along_dim((64, 71, 256), dim=1),
+                    2,
+                    1,
+                ),
+                "3d_k3_dim1": (
+                    unique_randn_along_dim((67, 71, 256), dim=1),
+                    3,
+                    1,
+                ),
+                "3d_k4_dim0": (
+                    unique_randn_along_dim((67, 71, 256), dim=0),
+                    4,
+                    0,
+                ),
+                "4d_k1_dim0": (
+                    unique_randn_along_dim((6, 17, 7, 64), dim=0),
+                    1,
+                    0,
+                ),
+                "4d_k2_dim1": (
+                    unique_randn_along_dim((6, 17, 7, 64), dim=1),
+                    2,
+                    1,
+                ),
+                "4d_k3_dim2": (
+                    unique_randn_along_dim((6, 17, 7, 64), dim=2),
+                    3,
+                    2,
+                ),
+                "4d_k4_dim0": (
+                    unique_randn_along_dim((6, 17, 7, 64), dim=0),
+                    4,
+                    0,
+                ),
                 # "2d_k4_dim0_lessthanstick": (unique_randn_along_dim((8, 32), dim=0), 4, 0),
                 # "2d_k4_dim_minusone_lessthanstick": (unique_randn_along_dim((1, 32), dim=-1), 4, -1),
             },
