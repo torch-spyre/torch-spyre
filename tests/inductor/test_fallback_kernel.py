@@ -516,5 +516,46 @@ class TestFallbackResultNonCanonicalTiling(unittest.TestCase):
         torch.testing.assert_close(out.cpu().float(), expected, atol=5e-2, rtol=5e-2)
 
 
+class TestPermutedEagerResultNotNormalized(unittest.TestCase):
+    """A permuted eager result must be left alone, not forced to dense tiling.
+
+    `_normalize_result_layout` compares against `SpyreTensorLayout(size, dtype)`,
+    which synthesizes *dense row-major* strides. That is only the layout a
+    consumer would assume for a tensor that is itself dense row-major. A permuted
+    result is not: TensorIterator propagates its inputs' strides through
+    elementwise ops, so adding two permuted views yields a permuted output whose
+    real tiling legitimately differs from the size-only one. Normalizing it
+    rewrites a buffer that was already self-consistent, corrupting it.
+
+    These ran green before the normalization existed and regressed the moment it
+    was added without a contiguity gate (six `permute` cases in
+    `test_inductor_ops_lx_planning.py`); they are duplicated here, in the suite
+    that owns the fix, so a future change to the predicate fails locally rather
+    than only in CI.
+    """
+
+    # (base shape, permutation) -- the permuted result is non-contiguous, and its
+    # real device tiling differs from the size-only layout for its logical shape.
+    CASES = (
+        ((2, 1024, 844), (0, 2, 1)),
+        ((64, 128, 256), (2, 0, 1)),
+        ((2, 7, 11, 13), (0, 2, 1, 3)),
+    )
+
+    def test_permuted_addition_is_not_corrupted(self):
+        for base, perm in self.CASES:
+            with self.subTest(base=base, perm=perm):
+                a = torch.randn(base, dtype=DTYPE)
+                b = torch.randn(base, dtype=DTYPE)
+                av, bv = a.permute(*perm), b.permute(*perm)
+                self.assertFalse(av.is_contiguous())
+
+                expected = av.float() + bv.float()
+                out = a.to(DEVICE).permute(*perm) + b.to(DEVICE).permute(*perm)
+                torch.testing.assert_close(
+                    out.cpu().float(), expected, atol=5e-2, rtol=5e-2
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

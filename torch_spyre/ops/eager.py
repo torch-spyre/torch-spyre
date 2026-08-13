@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import torch
-from torch._inductor.exc import InductorError
 from torch_spyre._C import fill_tensor, copy_tensor, SpyreTensorLayout
 import torch_spyre.ops.fallbacks  # noqa: F401
 from .fallbacks import _get_op_overloads
@@ -96,6 +95,8 @@ def _normalize_result_layout(x):
 
     if not isinstance(x, torch.Tensor) or x.device.type != "spyre":
         return x
+    if not x.is_contiguous():
+        return x
     try:
         assumed = SpyreTensorLayout([int(s) for s in x.shape], x.dtype)
         if x.device_tensor_layout() == assumed:
@@ -104,11 +105,10 @@ def _normalize_result_layout(x):
         # No layout to compare (or an unrepresentable one): leave it alone
         # rather than force a copy on a tensor we cannot reason about.
         return x
+    # The host round-trip reads the source by its own real layout and writes the
+    # destination by the canonical one, which is the re-tiling we want.
     out = torch.zeros(x.shape, dtype=x.dtype, device=x.device)
-    try:
-        out.copy_(x)
-    except InductorError:
-        out.copy_(x.to("cpu"))
+    out.copy_(x.to("cpu"))
     return out
 
 
