@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+from torch._inductor.exc import InductorError
 from torch_spyre._C import fill_tensor, copy_tensor, SpyreTensorLayout
 import torch_spyre.ops.fallbacks  # noqa: F401
 from .fallbacks import _get_op_overloads
@@ -23,19 +24,6 @@ import operator
 
 
 aten = torch.ops.aten
-
-# A d2d re-tiling copy that the Spyre lowering cannot express surfaces either as
-# the bare NotImplementedError or wrapped by Inductor; import the wrapper lazily
-# so this module stays importable without _inductor.
-try:
-    from torch._inductor.exc import InductorError as _InductorError
-
-    _RETILE_INFEASIBLE: tuple[type[BaseException], ...] = (
-        NotImplementedError,
-        _InductorError,
-    )
-except ImportError:  # pragma: no cover
-    _RETILE_INFEASIBLE = (NotImplementedError,)
 
 
 # Decorator to keep track of compiled variant
@@ -119,7 +107,7 @@ def _normalize_result_layout(x):
     out = torch.zeros(x.shape, dtype=x.dtype, device=x.device)
     try:
         out.copy_(x)
-    except _RETILE_INFEASIBLE:
+    except InductorError:
         out.copy_(x.to("cpu"))
     return out
 
