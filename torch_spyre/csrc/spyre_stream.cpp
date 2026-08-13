@@ -71,6 +71,9 @@ struct StreamPool {
 
   // Per-device initialization flags
   std::unordered_map<c10::DeviceIndex, std::once_flag> device_init_flags;
+
+  // Tracks the device_index parameter used during initializeStreamPoolImpl
+  c10::DeviceIndex initialized_device_index = -1;
 };
 
 StreamPool& getStreamPool() {
@@ -290,6 +293,14 @@ void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
   auto& pool = getStreamPool();
   std::unique_lock<std::shared_mutex> lock(pool.mutex);
 
+  // Check that this is the first and only device initialization
+  TORCH_CHECK(pool.initialized_device_index == -1,
+              "initializeStreamPoolImpl already called with device_index ",
+              static_cast<int>(pool.initialized_device_index),
+              "; cannot reinitialize with device_index ",
+              static_cast<int>(device_index));
+  pool.initialized_device_index = device_index;
+
   // Initialize mapping from StreamId → RuntimeStream*.
   // RuntimeStream instances are owned by GlobalRuntime.
   // StreamPool only stores non-owning pointers for lookup.
@@ -311,7 +322,8 @@ void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
         pool.stream_handle_map.find(sid) == pool.stream_handle_map.end(),
         "Host compute stream id ", sid,
         " is already registered; only one Spyre device per process is "
-        "supported");
+        "supported. Device ID ",
+        static_cast<int>(pool.initialized_device_index));
     pool.stream_handle_map[sid] =
         runtime->createStream(flex::RuntimeStreamPriority::NORMAL);
     pool.host_compute_streams[device_index].push_back(sid);

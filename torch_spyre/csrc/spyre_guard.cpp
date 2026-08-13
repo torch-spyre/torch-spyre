@@ -18,6 +18,9 @@
 
 #include <ATen/core/op_registration/adaption.h>
 
+#include <cstdint>
+#include <cstdlib>
+
 #include "module.h"
 #include "spyre_device_enum.h"
 #include "spyre_stream.h"
@@ -113,7 +116,19 @@ c10::DeviceCapability SpyreGuardImpl::getDeviceCapability(
   return cap;
 }
 
-thread_local c10::DeviceIndex SpyreGuardImpl::tls_idx = 0;
+static c10::DeviceIndex default_device_index() {
+  const char* env = std::getenv("LOCAL_RANK");
+  if (env) {
+    char* end;
+    int64_t val = std::strtoll(env, &end, 10);
+    if (end != env) {
+      return static_cast<c10::DeviceIndex>(val);
+    }
+  }
+  return 0;
+}
+
+thread_local c10::DeviceIndex SpyreGuardImpl::tls_idx = default_device_index();
 
 // Registration — runs when _C.so is loaded.
 // Loading _C.so does NOT trigger device initialization; that only
