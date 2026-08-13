@@ -1,21 +1,33 @@
 name: build-test-pytorch-source
 
 # ---------------------------------------------------------------------------
-# Reusable workflow — not triggered directly. Called by the
-# `gate_and_build`/`build_and_test` jobs in
-# push-pytorch-dispatch-to-clickhouse.yaml once a repository_dispatch from
-# pytorch/pytorch has been gated and a commit SHA extracted.
+# Reusable workflow. Normally called by the `gate_and_build`/`build_and_test`
+# jobs in push-pytorch-dispatch-to-clickhouse.yaml once a repository_dispatch
+# from pytorch/pytorch has been gated and a commit SHA extracted. Can also be
+# triggered directly (workflow_dispatch) from the Actions UI to build/test a
+# specific pytorch/pytorch commit on demand.
 #
-# Builds that exact PyTorch commit from source, builds torch-spyre against
-# it (editable, --local-pytorch style), and runs the upstream test suite.
-# Reports its lifecycle (torch_build -> torch_spyre_build -> running_tests
-# -> completed) and final test-result counts back into the same ClickHouse
-# row the caller's `ingest` job created, keyed on
-# github.event.client_payload.delivery_id (shared across the whole
-# workflow_call, since the github context always reflects the caller).
+# Builds that exact PyTorch commit from source (once), builds torch-spyre
+# against it (editable, --local-pytorch style), packages BOTH as wheels, and
+# hands them to the shared _upstream_tests_beta_matrix.yaml reusable workflow
+# to run every upstream-beta suite against them -- the PyTorch wheel is
+# required so the test job installs the exact PyTorch build torch-spyre's
+# _C.so is ABI-bound to, not the pinned pytorch-cpu wheel the matrix's normal
+# (upstream_tests_beta.yaml) path installs. Reports its lifecycle
+# (torch_build -> torch_spyre_build -> running_tests -> completed) and final
+# test-result counts back into the same ClickHouse row the caller's `ingest`
+# job created, keyed on github.event.client_payload.delivery_id (shared
+# across the whole workflow_call, since the github context always reflects
+# the caller).
 # ---------------------------------------------------------------------------
 on:
   workflow_call:
+    inputs:
+      pytorch_sha:
+        description: Exact pytorch/pytorch commit SHA to build
+        required: true
+        type: string
+  workflow_dispatch:
     inputs:
       pytorch_sha:
         description: Exact pytorch/pytorch commit SHA to build
@@ -27,8 +39,8 @@ defaults:
     shell: bash
 
 jobs:
-  build_and_test:
-    name: Build PyTorch@${{ inputs.pytorch_sha }} + torch-spyre, run upstream tests
+  build:
+    name: Build PyTorch@${{ inputs.pytorch_sha }} + torch-spyre
     runs-on:
       - x86_64
       - spyre_pf_x1
@@ -48,6 +60,9 @@ jobs:
       CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER_DEV }}
       CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS_DEV }}
       CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB_DEV }}
+    outputs:
+      pytorch_build_seconds: ${{ steps.compute_durations.outputs.pytorch_build_seconds }}
+      torch_spyre_build_seconds: ${{ steps.compute_durations.outputs.torch_spyre_build_seconds }}
     steps:
       - name: Checkout composite actions
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -75,8 +90,17 @@ jobs:
       - name: Write dispatch payload to file
         env:
           PAYLOAD_JSON: ${{ toJSON(github.event.client_payload) }}
+          # workflow_dispatch (manual UI run) has no client_payload, so the
+          # ingest script would find an empty delivery_id and refuse to
+          # ingest — synthesize one keyed on this run instead.
+          MANUAL_DELIVERY_ID: manual-${{ github.run_id }}
         run: |
-          printf '%s' "$PAYLOAD_JSON" > payload.json
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            printf '{"delivery_id":"%s","event_type":"workflow_dispatch","payload":{"action":"manual_dispatch"}}' \
+              "$MANUAL_DELIVERY_ID" > payload.json
+          else
+            printf '%s' "$PAYLOAD_JSON" > payload.json
+          fi
 
 
       - name: 'Report stage: torch_build'
@@ -97,6 +121,14 @@ jobs:
       - name: Build PyTorch from source
         uses: ./.github/actions/build-pytorch-from-source
 
+      - name: Upload PyTorch wheel
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pytorch-wheel-${{ inputs.pytorch_sha }}
+          path: pytorch/dist/*.whl
+          if-no-files-found: error
+          retention-days: 5
+
       - name: 'Report stage: torch_spyre_build'
         run: |
           echo "T_TORCH_SPYRE_BUILD_START=$(date +%s)" >> "$GITHUB_ENV"
@@ -115,15 +147,29 @@ jobs:
       - name: Build torch-spyre against local PyTorch
         uses: ./.github/actions/build-torch-spyre-local-pytorch
 
+      - name: Upload torch-spyre wheel
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: torch-spyre-wheel-${{ inputs.pytorch_sha }}
+          path: torch-spyre/dist/*.whl
+          if-no-files-found: error
+          retention-days: 5
+
       # - name: Report CI started to pytorch/pytorch
       #   continue-on-error: true
       #   uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
       #   with:
       #     status: in_progress
 
+      - name: Compute build durations
+        id: compute_durations
+        run: |
+          NOW="$(date +%s)"
+          echo "pytorch_build_seconds=$(( T_TORCH_SPYRE_BUILD_START - T_TORCH_BUILD_START ))" >> "$GITHUB_OUTPUT"
+          echo "torch_spyre_build_seconds=$(( NOW - T_TORCH_SPYRE_BUILD_START ))" >> "$GITHUB_OUTPUT"
+
       - name: 'Report stage: running_tests'
         run: |
-          echo "T_RUNNING_TESTS_START=$(date +%s)" >> "$GITHUB_ENV"
           uv run --with clickhouse-connect --with regex \
             torch-spyre/.github/scripts/ingest_pytorch_dispatch.py \
             --payload-file payload.json \
@@ -136,46 +182,103 @@ jobs:
             --pytorch-sha "${{ inputs.pytorch_sha }}" \
             --torch-spyre-sha "${{ github.sha }}"
 
-      - name: Derive report paths (Upstream Beta)
-        run: |
-          REPORT_NAME="test_upstream_beta_config.xml"
-          echo "REPORT_NAME_UPSTREAM_BETA=${REPORT_NAME}" >> "$GITHUB_ENV"
-          echo "REPORT_PATH_UPSTREAM_BETA=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+  # ---------------------------------------------------------------------------
+  # Run every upstream-beta suite (as a per-suite matrix, with retry/stall-
+  # watching/JUnit-XML reporting) against the wheel `build` just packaged.
+  # Shared with upstream_tests_beta.yaml so the suite list has a single
+  # source of truth.
+  # ---------------------------------------------------------------------------
+  test:
+    needs: build
+    uses: ./.github/workflows/_upstream_tests_beta_matrix.yaml
+    with:
+      artifact_name: torch-spyre-wheel-${{ inputs.pytorch_sha }}
+      pytorch_sha: ${{ inputs.pytorch_sha }}
+      pytorch_wheel_artifact_name: pytorch-wheel-${{ inputs.pytorch_sha }}
 
-      - name: Run Upstream Beta tests
-        uses: ./.github/actions/run-test-suite
+  # ---------------------------------------------------------------------------
+  # Aggregate the per-suite JUnit XMLs the `test` matrix uploaded (one per
+  # suite, instead of the single combined report this job used to produce
+  # inline) and report final counts + timings back into ClickHouse. Runs on
+  # ubuntu-latest -- pure API/aggregation work, no Spyre hardware needed.
+  # ---------------------------------------------------------------------------
+  report:
+    name: Report results
+    needs: [build, test]
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
+      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER_DEV }}
+      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS_DEV }}
+      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB_DEV }}
+    steps:
+      - name: Checkout torch-spyre
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          suite_name: Upstream Beta
-          config: tests/configs/upstream_tests_beta
-          extra_test_flags: -v
-          junit_xml_path: ${{ env.REPORT_PATH_UPSTREAM_BETA }}
-          report_name: ${{ env.REPORT_NAME_UPSTREAM_BETA }}
+          path: torch-spyre
 
-      - name: Record stage timings
-        if: always()
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+      - name: Write dispatch payload to file
+        env:
+          PAYLOAD_JSON: ${{ toJSON(github.event.client_payload) }}
         run: |
-          echo "T_RUNNING_TESTS_END=$(date +%s)" >> "$GITHUB_ENV"
+          printf '%s' "$PAYLOAD_JSON" > payload.json
+
+      - name: Download all JUnit XML artifacts from the test matrix
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 torch-spyre/.github/scripts/download_run_xml_artifacts.py \
+            --repo "${{ github.repository }}" \
+            --run-id "${{ github.run_id }}" \
+            --output-dir xml_artifacts
 
       - name: Parse test results (counts)
         id: test_results
-        if: always()
         run: |
+          shopt -s nullglob globstar
+          xml_files=(xml_artifacts/**/*.xml)
+          args=()
+          for f in "${xml_files[@]}"; do
+            args+=(--junit-xml "$f")
+          done
           python3 torch-spyre/.github/scripts/parse_junit_xml_counts.py \
-            --junit-xml "${REPORT_PATH_UPSTREAM_BETA}" \
+            "${args[@]}" \
             --summary-title "Upstream Beta test results"
 
+      - name: Upload merged JUnit XML reports
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: upstream-beta-reports-${{ inputs.pytorch_sha }}
+          path: xml_artifacts/**/*.xml
+          if-no-files-found: warn
+          retention-days: 30
+
       - name: 'Report stage: completed'
-        if: always()
         env:
           TEST_RESULTS_JSON: ${{ steps.test_results.outputs.test_results_json }}
-          CONCLUSION: ${{ job.status == 'success' && 'success' || 'failure' }}
+          MAX_DURATION_SECONDS: ${{ steps.test_results.outputs.max_duration_seconds }}
+          CONCLUSION: ${{ (needs.build.result == 'success' && needs.test.result == 'success') && 'success' || 'failure' }}
+          # Empty whenever `build` failed before reaching compute_durations
+          # (e.g. the PyTorch/torch-spyre build itself failed) — omitted
+          # below rather than passed through, since build_stage_result_payload.py
+          # rejects an empty --duration-value.
+          PYTORCH_BUILD_SECONDS: ${{ needs.build.outputs.pytorch_build_seconds }}
+          TORCH_SPYRE_BUILD_SECONDS: ${{ needs.build.outputs.torch_spyre_build_seconds }}
         run: |
+          args=()
+          [[ -n "$PYTORCH_BUILD_SECONDS" ]] && args+=(--duration-value "pytorch_build_seconds=${PYTORCH_BUILD_SECONDS}")
+          [[ -n "$TORCH_SPYRE_BUILD_SECONDS" ]] && args+=(--duration-value "torch_spyre_build_seconds=${TORCH_SPYRE_BUILD_SECONDS}")
+          [[ -n "$MAX_DURATION_SECONDS" ]] && args+=(--duration-value "tests_seconds=${MAX_DURATION_SECONDS}")
+
           python3 torch-spyre/.github/scripts/build_stage_result_payload.py \
             --test-results-json "${TEST_RESULTS_JSON}" \
             --conclusion "${CONCLUSION}" \
-            --duration pytorch_build_seconds=T_TORCH_BUILD_START:T_TORCH_SPYRE_BUILD_START \
-            --duration torch_spyre_build_seconds=T_TORCH_SPYRE_BUILD_START:T_RUNNING_TESTS_START \
-            --duration tests_seconds=T_RUNNING_TESTS_START:T_RUNNING_TESTS_END \
+            "${args[@]}" \
             --output-file result_payload.json
           uv run --with clickhouse-connect --with regex \
             torch-spyre/.github/scripts/ingest_pytorch_dispatch.py \
@@ -196,15 +299,5 @@ jobs:
       #   uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
       #   with:
       #     status: completed
-      #     conclusion: ${{ job.status == 'success' && 'success' || 'failure' }}
+      #     conclusion: ${{ (needs.build.result == 'success' && needs.test.result == 'success') && 'success' || 'failure' }}
       #     test-results: ${{ steps.test_results.outputs.test_results_json }}
-
-      - name: Upload JUnit XML reports
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: upstream-beta-reports-${{ inputs.pytorch_sha }}
-          path: |
-            ${{ env.REPORT_PATH_UPSTREAM_BETA }}
-          if-no-files-found: warn
-          retention-days: 30

@@ -576,17 +576,16 @@ Environment Variables
      - Purpose
    * - ``TORCH_SPYRE_DEBUG=1``
      - Build-time: enable C++ debug logging and ``-O0`` builds.
-       Runtime: deprecated, use ``TORCH_LOGS='spyre:DEBUG'`` instead
+       Runtime: deprecated, use ``TORCH_LOGS='+torch_spyre'`` instead
        (see ``torch_spyre.logging_config``)
    * - ``TORCH_SPYRE_DOWNCAST_WARN=0``
      - Suppress int64 → int32 downcast warnings
    * - ``SPYRE_INDUCTOR_LOG=1``
-     - *Deprecated*. Use ``TORCH_LOGS='spyre.inductor:INFO'``. Enables Spyre
-       Inductor logging
+     - *Deprecated*. Use ``TORCH_LOGS='torch_spyre.inductor'``. Enables Spyre
+       Inductor logging (INFO level)
    * - ``SPYRE_INDUCTOR_LOG_LEVEL=DEBUG``
-     - *Deprecated*. Set the level in ``TORCH_LOGS`` (e.g.
-       ``spyre.inductor:DEBUG``). Sets Spyre Inductor log verbosity (DEBUG,
-       INFO, WARNING, ERROR)
+     - *Deprecated*. Use ``TORCH_LOGS='+torch_spyre.inductor'`` (DEBUG level).
+       Sets Spyre Inductor log verbosity
    * - ``SPYRE_LOG_FILE=path``
      - *Deprecated*. Mapped to the top-level ``spyre`` logger file handler.
        Redirects Spyre Inductor logs to a file

@@ -27,6 +27,36 @@ hbm_pool_planning: bool = _get_env_bool("HBM_POOL_PLANNING", True)
 
 global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == "1"
 
+# Emit a native conv2d SDSC (opFuncName="conv2d" on the "pt" unit) instead of
+# the im2col+matmul decomposition (conv2d_via_bmm_decomp). Off by default: the
+# decomposition remains the default path and the fallback for cases the direct
+# lowering does not yet support (grouped/transposed/non-fp16).
+conv2d_direct_lowering: bool = os.environ.get("SPYRE_CONV2D_DIRECT", "0") == "1"
+
+# For a strided (stride>1) direct-lowered conv2d, forbid splitting the output
+# spatial dims (i/j) across cores. A strided conv's output coordinates do not
+# map to a contiguous input span per core, so a spatial split shuffles the
+# result (same failure and fix as the depthwise conv work). Forcing
+# dim_splits[i]=dim_splits[j]=1 keeps each core computing whole spatial rows/
+# cols. Defaults on; set SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT=0 to opt
+# out (e.g. to measure the shuffle or once the planner models strided spans).
+disable_conv2d_spatial_split: bool = (
+    os.environ.get("SPYRE_INDUCTOR_DISABLE_CONV2D_SPATIAL_SPLIT", "1") == "1"
+)
+
+# Opt-in OpSpec->KTIR emitter (experimental, #3380). When enabled the scheduler
+# emits ``async_compile.ktir(...)`` instead of the SDSC bundle, and
+# ``create_tensor_arg`` populates the op-spec buffer name so the emitter has a
+# stable per-buffer identity. Inert by default: the SDSC/flex path is unchanged.
+ktir_emitter: bool = os.environ.get("TORCH_SPYRE_KTIR", "0") == "1"
+
+# Settings for device execution over the KTIR path. What is required is checked
+# upfront by ``_check_ktir_device_prerequisites`` in ``execution/async_compile``,
+# which names anything missing.
+
+# A .mlir declaring the target device, passed to the backend compiler.
+ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR", "")
+
 allow_all_ops_in_lx_planning: bool = False
 
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
@@ -90,6 +120,12 @@ enable_reduction_tiling: bool = (
 core_id_k_fast_emission: bool = (
     os.environ.get("SPYRE_CORE_ID_K_FAST_EMISSION", "1") == "1"
 )
+
+# When True, disable PyTorch's remove_noop_ops elimination of aten.copy.default.
+# Required for WSR variants that intentionally insert copies (e.g. flash_v2)
+# inside WSR loops. Off by default — enabling this for models that don't need
+# it may prevent harmless copy removal and hurt performance.
+disable_copy_opt: bool = os.environ.get("DISABLE_COPY_OPT", "0") == "1"
 
 # When True (default), HBM tensor addresses are emitted as runtime symbols
 # with !sdscbundle.input_arg<index> parameters and input_arg_extract ops

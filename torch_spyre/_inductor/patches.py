@@ -21,6 +21,8 @@ from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
 
+import torch_spyre._inductor.config as spyre_config
+
 
 @contextmanager
 def spyre_data_types():
@@ -137,6 +139,19 @@ def enable_spyre_context(example_inputs: list[InputType]):
 
     SchedulerNode.has_side_effects = _spyre_scheduler_node_has_side_effects  # type: ignore[method-assign]
 
+    # Prevent remove_noop_ops from eliminating aten.copy.default nodes.
+    # That pass treats copy.default as an alias no-op and replaces copy(dst, src)
+    # with src, discarding the copy before it reaches lowering.
+    # Guarded by DISABLE_COPY_OPT so models that don't need preserved copies
+    # (e.g. granite) are not affected.
+    from torch._inductor.fx_passes.post_grad import noop_registry
+
+    _saved_copy_noop = (
+        noop_registry.pop(torch.ops.aten.copy.default, None)
+        if spyre_config.disable_copy_opt
+        else None
+    )
+
     with (
         spyre_data_types(),
         enable_spyre_lowerings(),
@@ -151,6 +166,8 @@ def enable_spyre_context(example_inputs: list[InputType]):
             Loops.has_large_inner_fn = old_loop
             GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]
             SchedulerNode.has_side_effects = old_scheduler_node_has_side_effects  # type: ignore[method-assign]
+            if _saved_copy_noop is not None:
+                noop_registry[torch.ops.aten.copy.default] = _saved_copy_noop
 
 
 OBSERVER_HOOKS_KEY = "__spyre_hooks_meta"

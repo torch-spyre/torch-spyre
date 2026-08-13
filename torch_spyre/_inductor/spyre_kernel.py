@@ -35,10 +35,13 @@ from .constants import (
     SPYRE_FP32_OPS,
     BATCH_MATMUL_OP,
     BATCH_MATMUL_FP8_OP,
+    CONV2D_FWD_OP,
+    CONV_OPS,
     IDENTITY_OP,
     POOL_OPS,
     RESTICKIFY_OP,
     SEGMENT_OFFSETS,
+    DEPTHWISE_CONV2D_OP,
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
 from . import config as _spyre_config
@@ -545,7 +548,7 @@ def _tile_advance_expr_from_dep(
 class SpyreKernel(Kernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
 
-    def __init__(self) -> None:
+    def __init__(self, pool_size: int = 0) -> None:
         super().__init__()
         self.op_specs: list[OpSpec | UnimplementedOp | LoopSpec] = []
         self.spyre_kernel_args: list[Tuple[str, TensorArg]] = []
@@ -554,6 +557,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         self._indirect_var_count: int = 0
         self._general_tile_advance_seen: dict[str, int] = {}
         self._tile_advance_symbols: dict[int, sympy.Symbol] = {}
+        self.pool_size: int = pool_size
 
     def indirect_var_names(self) -> "frozenset[str] | None":
         if not self.indirect_vars:
@@ -743,6 +747,16 @@ class SpyreKernel(Kernel[CSEVariable]):
         tensor: TensorAccess,
         opspec_name: "str | None" = None,
     ) -> TensorArg:
+        # OpSpec->KTIR needs a stable per-buffer identity for register-threaded
+        # fused intermediates (all arg_index == -1): _buf_id keys on TensorArg.name,
+        # which is serialized into the emitted op-spec literal and read back by
+        # generate_ktir.  The SDSC/flex literal identifies buffers by arg_index +
+        # allocation address and only needs name for gather indices, so populate it
+        # from the buffer name only when the KTIR emitter is enabled
+        # (config.ktir_emitter, i.e. TORCH_SPYRE_KTIR=1) -- leaving the default
+        # SDSC literal byte-identical.
+        if opspec_name is None and _spyre_config.ktir_emitter:
+            opspec_name = name
         it_space = iteration_space(self.current_node)
         # With dynamic=True the host index may contain symbolic strides
         # (e.g. x0*s1+x1).  Concretize size symbols so normalize_coordinates
@@ -925,20 +939,19 @@ class SpyreKernel(Kernel[CSEVariable]):
                 )
             )
 
-        # Carry the pool node's full logical output ranges (NCHW, incl. unit
-        # dims) so codegen can derive surviving dim roles and the channel count
-        # from live IR instead of a lowering-time size snapshot.  Store raw
-        # ranges (no int(): ranges may be symbolic); consumers convert only
-        # static dims.  Populated only for pools — the only consumer — so
-        # non-pool kernels' generated source is unchanged.
+        # Carry the node's full logical output ranges (NCHW, incl. unit dims)
+        # so codegen can derive surviving dim roles and the channel count from
+        # live IR instead of a lowering-time size snapshot.  Store raw ranges
+        # (no int(): ranges may be symbolic); consumers convert only static
+        # dims.  Populated for pools and convs (forward + depthwise) — the only
+        # consumers — so other kernels' generated source is unchanged.
         node_output_ranges = (
             tuple(ir_node.data.ranges)
-            if op in POOL_OPS
+            if op in POOL_OPS | CONV_OPS
             and hasattr(ir_node, "data")
             and hasattr(ir_node.data, "ranges")
             else None
         )
-
         return OpSpec(
             op,
             is_reduction,
@@ -1154,7 +1167,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                 f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
             )
 
-        if value.op in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP]:
+        if value.op in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP, CONV2D_FWD_OP]:
+            # Two-input reductions: matmul (activation @ weight) and conv2d
+            # (activation * weight, reduced over in/ki/kj). Both build
+            # [input, weight, output] tensor args.
             if (
                 len(value.arguments) != 2
                 or (not isinstance(value.arguments[0], TensorAccess))
@@ -1166,6 +1182,23 @@ class SpyreKernel(Kernel[CSEVariable]):
             args = [
                 self.create_tensor_arg(True, x.name, x),
                 self.create_tensor_arg(True, y.name, y),
+                self.create_tensor_arg(False, real_dst_name, dst),
+            ]
+            self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
+        elif value.op == DEPTHWISE_CONV2D_OP:
+            if (
+                len(value.arguments) < 2
+                or (not isinstance(value.arguments[0], TensorAccess))
+                or (not isinstance(value.arguments[1], TensorAccess))
+            ):
+                raise Unsupported(
+                    f"invalid depthwiseconv2dnative arguments {value.arguments}"
+                )
+            x = value.arguments[0]
+            w = value.arguments[1]
+            args = [
+                self.create_tensor_arg(True, x.name, x),
+                self.create_tensor_arg(True, w.name, w),
                 self.create_tensor_arg(False, real_dst_name, dst),
             ]
             self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
@@ -1219,8 +1252,7 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices
         actuals = self.args.python_argdefs()[1]
-        hbm_pool_size = getattr(V.graph, "hbm_pool_size", 0)
-        has_pool_allocations = hbm_pool_size > 0
+        has_pool_allocations = self.pool_size > 0
 
         for name, tensor_arg in self.spyre_kernel_args:
             tensor_arg.arg_index = actuals.index(name)
@@ -1257,12 +1289,27 @@ class SpyreKernel(Kernel[CSEVariable]):
         )
 
     def call_kernel(self, name: str, node=None):
-        """Codegen a call to this kernel"""
+        """Codegen a call to this kernel, allocating/freeing this kernel's
+        own pool tensor (if any) scoped tightly around the .run() call."""
         wrapper = V.graph.wrapper_code
         call_args = []
 
-        if self._kernel_uses_hbm_pool():
-            call_args.append("_pool")
+        uses_pool = self._kernel_uses_hbm_pool()
+        # `name` is this kernel's own wrapper-module variable name (e.g.
+        # "sdsc_fused__buf12"), already guaranteed unique across kernels by
+        # Inductor's wrapper codegen -- two kernels sharing a Python
+        # identifier in the same generated module would already break
+        # `{name}.run(...)` codegen independent of pool allocation. Deriving
+        # the pool variable's name from it is therefore also collision-free.
+        pool_var_name = f"_pool_{name}"
+        if uses_pool:
+            wrapper.writeline(
+                f"{pool_var_name} = spyre_empty_with_layout("
+                f"({self.pool_size},), (1,), torch.uint8, "
+                f"SpyreTensorLayout(device_size=[{self.pool_size}], "
+                f"stride_map=[1], device_dtype=DataFormats.SENINT8))"
+            )
+            call_args.append(pool_var_name)
 
         # Add remaining kernel arguments, deduplicating tensors that appear as
         # both input and output (e.g. in-place ops like x *= 2).  With symbolic
@@ -1277,6 +1324,8 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
+        if uses_pool:
+            wrapper.writeline(f"del {pool_var_name}")
 
     def emit_layout_restores(self, restores) -> None:
         """Emit set_spyre_tensor_layout wrapper calls after this kernel's run.
@@ -1404,8 +1453,8 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                 )
                 if op_spec.node_output_ranges is not None:
                     # Must survive the OpSpec -> generated-source -> exec
-                    # round-trip: pool codegen reads it to align dim labels and
-                    # the channel-count fallback.  Ranges are sympy Exprs;
+                    # round-trip: pool/conv codegen reads it to align dim labels
+                    # and the channel-count fallback.  Ranges are sympy Exprs;
                     # sympy_str emits eval-able sympify(...) calls.
                     buf.writeline(
                         "node_output_ranges=("

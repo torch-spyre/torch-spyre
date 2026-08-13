@@ -54,6 +54,10 @@ TESTS_DIR="${REPO_ROOT}/tests"
 # (e.g. shared test harness helpers, not standalone test suites).
 IGNORED_TEST_FILES=(
   "models/test_model_ops.py"   # base class / helper — not a standalone test suite
+  # Golden IR suite: requires the dialect-packaged mlir_ktdp build, which no CI
+  # lane provides, so it is skip-only in CI. Revisit when a KTIR/mlir_ktdp lane
+  # exists.
+  "inductor/test_ktir_emitter.py"
 )
 
 # ── Ignore list: config files ─────────────────────────────────────────────────

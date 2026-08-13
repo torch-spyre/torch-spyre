@@ -9,7 +9,7 @@
 # directory and launches them with: torchrun --nproc-per-node $AIU_WORLD_SIZE
 
 test_suite_config:
-  labels: [full]
+  labels: [regression, trunk, integration]
   files:
     # Barrier Tests
     - path: ${TORCH_DEVICE_ROOT}/tests/distributed/test_barrier.py

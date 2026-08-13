@@ -86,10 +86,21 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
     at which that buffer is accessed (read or written).  Graph inputs are seeded with
     an empty list; unused inputs remain empty.
 
+    Indices are *distinct*: one entry per accessing operation, not per access.
+    ``rw.reads | rw.writes`` is a set of dependencies rather than of names, so an
+    op that touches one buffer through two different index expressions -- e.g. the
+    fused ``x[:, 0:512] + x[:, 512:1024]``, which reads ``arg0_1`` at
+    ``1024*d0 + d1`` and at ``1024*d0 + d1 + 512`` -- contributes two deps naming
+    it, and appending per dep would repeat that op's index.  A repeat is not
+    meaningful here (``start_time``/``end_time`` bracket the list and cannot see
+    it) and it inflates ``read_count``, so it is dropped.  This is what lets
+    :class:`~torch_spyre._inductor.scratchpad.plan_solver.LifetimeBoundBuffer`
+    require strictly increasing ``uses``, and makes ``read_count == 0`` mean
+    exactly "written but never read" for a computed buffer.
+
     Note: previously, unused graph inputs did not appear in the returned dict at
-    all.  Now they appear with an empty list.  Callers that skip buffers with
-    ``len(uses) <= 1`` (e.g. ``_build_bound_buffers``) will still skip unused inputs
-    correctly, since ``len([]) == 0 <= 1``."""
+    all.  Now they appear with an empty list, and ``_build_bound_buffers`` skips
+    them on ``not uses``."""
     liveness: dict[str, list[int]] = {}
     for input_name in graph.graph_input_names:
         liveness[input_name] = []
@@ -97,9 +108,10 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
         rw = op_read_writes(op)
         for mem_dep in rw.reads | rw.writes:
             buf_name = mem_dep.name
-            if buf_name not in liveness:
-                liveness[buf_name] = []
-            liveness[buf_name].append(i)
+            uses = liveness.setdefault(buf_name, [])
+            # Ops are walked in order, so only the tail can repeat i.
+            if not uses or uses[-1] != i:
+                uses.append(i)
     return liveness
 
 

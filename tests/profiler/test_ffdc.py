@@ -377,6 +377,11 @@ class TestFfdcAsyncCompile:
             UnimplementedOp=object,
             find_unimplemented=lambda specs: None,
         )
+        _stub_module(
+            monkeypatch,
+            "torch_spyre._inductor.kernel_provenance",
+            build_kernel_provenance_descriptor=lambda specs: None,
+        )
         codegen = _stub_module(monkeypatch, "torch_spyre._inductor.codegen")
         codegen.__path__ = []
         _stub_module(
@@ -390,12 +395,14 @@ class TestFfdcAsyncCompile:
                 "torch_spyre._C",
                 launch_jobplan=lambda *a, **k: None,
                 prepare_kernel=lambda *a, **k: None,
+                register_kernel_provenance=lambda *a, **k: True,
             )
 
         class _Runner:
-            def __init__(self, name, code_dir):
+            def __init__(self, name, code_dir, kernel_provenance=None):
                 self.kernel_name = name
                 self.code_dir = code_dir
+                self.kernel_provenance = kernel_provenance
 
         _stub_module(
             monkeypatch,
@@ -486,6 +493,7 @@ class TestFfdcKernelRunner:
                 "torch_spyre._C",
                 launch_jobplan=_launch,
                 prepare_kernel=lambda path: "fake_jobplan",
+                register_kernel_provenance=lambda *a, **k: True,
             )
         if "torch_spyre._inductor" not in sys.modules:
             inductor = _stub_module(monkeypatch, "torch_spyre._inductor")
@@ -496,10 +504,23 @@ class TestFfdcKernelRunner:
                 "torch_spyre._inductor.logging_utils",
                 get_inductor_logger=lambda name: logging.getLogger(name),
             )
+        if "torch_spyre._inductor.kernel_provenance" not in sys.modules:
+            _stub_module(
+                monkeypatch,
+                "torch_spyre._inductor.kernel_provenance",
+                KernelProvenanceDescriptor=object,
+            )
+        if "torch_spyre._inductor.profiler_event" not in sys.modules:
+            _stub_module(
+                monkeypatch,
+                "torch_spyre._inductor.profiler_event",
+                format_kernel_provenance_event_name=lambda descriptor: "event_name",
+            )
 
         mod = _reimport(monkeypatch, "torch_spyre.execution.kernel_runner")
         monkeypatch.setattr(mod, "launch_jobplan", _launch)
         monkeypatch.setattr(mod, "prepare_kernel", lambda path: "fake_jobplan")
+        monkeypatch.setattr(mod, "register_kernel_provenance", lambda *a, **k: True)
         return mod
 
     def test_unimplemented_preserves_error_when_ffdc_raises(self, monkeypatch):

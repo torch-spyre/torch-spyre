@@ -1357,6 +1357,14 @@ class FileEntry(BaseModel):
 
     path: str
     unlisted_test_mode: str = MODE_XFAIL
+    # Not a real YAML field -- never set by a hand-written config. Populated
+    # by merge_yaml_configs() with the origin config's test_suite_config.labels
+    # so per-file labels survive a multi-config merge (which drops the
+    # top-level labels field, since it can't represent per-file provenance
+    # once files from different configs are combined). See
+    # OOTTestBase._load_test_suite_config(), which prefers this over
+    # test_suite_config.labels when non-empty.
+    labels: List[str] = []
     tests: List[TestEntry] = []
 
     @field_validator("unlisted_test_mode")
@@ -1568,7 +1576,7 @@ class TestsBlock(BaseModel):
 
     files: List[FileEntry]
     global_config: GlobalConfig = GlobalConfig()
-    labels: List[str] = ["full"]
+    labels: List[str] = []
 
     @model_validator(mode="before")
     @classmethod

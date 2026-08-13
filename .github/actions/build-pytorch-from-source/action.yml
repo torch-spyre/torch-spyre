@@ -17,10 +17,16 @@ inputs:
     type: string
     default: pytorch
 
+outputs:
+  wheel_name:
+    description: Basename of the built PyTorch wheel (found under <pytorch_dir>/dist).
+    value: ${{ steps.build.outputs.wheel_name }}
+
 runs:
   using: composite
   steps:
     - name: Build and install PyTorch (from source)
+      id: build
       shell: bash
       env:
         TORCH_SPYRE_DIR: ${{ inputs.torch_spyre_dir }}
@@ -78,3 +84,18 @@ runs:
         CFLAGS=" -Wno-error=maybe-uninitialized -Wno-error=uninitialized -Wno-error=restrict" \
         CXXFLAGS=" -Wno-error=maybe-uninitialized -Wno-error=uninitialized -Wno-error=restrict" \
         uv pip install --no-build-isolation -v .
+
+        # Package a wheel too, reusing this same build/ dir's already-compiled
+        # objects (same pattern as build-torch-spyre-local-pytorch) -- so the
+        # test matrix job can install this EXACT PyTorch build instead of the
+        # pinned pytorch-cpu wheel torch-spyre's pyproject.toml normally
+        # resolves. Without this, torch-spyre's _C.so (compiled against this
+        # build) would end up loaded alongside a different PyTorch's ABI.
+        uv build --wheel --no-build-isolation --out-dir dist
+        WHEEL="$(ls -1 dist/*.whl | head -1)"
+        if [[ -z "$WHEEL" ]]; then
+          echo "::error::No PyTorch wheel produced under ${PYTORCH_DIR}/dist" >&2
+          exit 1
+        fi
+        echo "Built PyTorch wheel: $WHEEL"
+        echo "wheel_name=$(basename "$WHEEL")" >> "$GITHUB_OUTPUT"

@@ -102,7 +102,8 @@ def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
     """Return the loop_count for ``depth`` from the ir.Operation inside node.
 
     ``loop_count`` on the ir.Operation is a list of trip counts, one per
-    nesting level from outermost to innermost (stamped by coarse_tile()).
+    nesting level from outermost to innermost (stamped by
+    coarse_tile_pre_stickify()/coarse_tile_post_stickify()).
     ``depth`` is the absolute nesting depth being queried (0 = outermost).
 
     For a flat (depth-1) op, ``loop_count = [K]`` and only depth 0 is valid.
@@ -575,7 +576,8 @@ class SuperDSCScheduling(BaseScheduling):
         if len(nodes) == 0:
             return
 
-        kernel = SpyreKernel()
+        pool_sizes = getattr(V.graph, "hbm_pool_sizes", {})
+        kernel = SpyreKernel(pool_size=pool_sizes.get(node.get_name(), 0))
         all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
             self._codegen_into_kernel(nodes, kernel, all_schedule_nodes)
@@ -610,7 +612,8 @@ class SuperDSCScheduling(BaseScheduling):
         if len(inner_nodes) == 0:
             return
 
-        kernel = SpyreKernel()
+        pool_sizes = getattr(V.graph, "hbm_pool_sizes", {})
+        kernel = SpyreKernel(pool_size=pool_sizes.get(node.get_name(), 0))
         all_schedule_nodes: list[SchedulerNode] = []
         with kernel:
             self._codegen_into_kernel(inner_nodes, kernel, all_schedule_nodes)
@@ -712,10 +715,11 @@ class SuperDSCScheduling(BaseScheduling):
             kernel_name = wrapper.src_to_kernel[src_code]
         else:
             fused_name = get_fused_kernel_name(node_schedule, "original_aten")
-            kernel_name = "_".join(["sdsc", fused_name, wrapper.next_kernel_suffix()])
+            method = "ktir" if _spyre_config.ktir_emitter else "sdsc"
+            kernel_name = "_".join([method, fused_name, wrapper.next_kernel_suffix()])
             wrapper.src_to_kernel[src_code] = kernel_name
             buf = IndentedBuffer()
-            buf.writeline(f"async_compile.sdsc('{kernel_name}',")
+            buf.writeline(f"async_compile.{method}('{kernel_name}',")
             with buf.indent():
                 buf.splice(f"{src_code}")
             buf.writeline(")")

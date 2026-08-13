@@ -127,6 +127,9 @@ CREATE TABLE IF NOT EXISTS model_ops_variants
     input_strides   String DEFAULT '[]',
     input_dtypes    String DEFAULT '[]',
 
+    -- Test tags from [TAGS = …] annotation in the GHA log
+    tags            String DEFAULT '',
+
     -- Timestamps
     triggered_at    DateTime64(3, 'UTC'),
     ingested_at     DateTime64(3, 'UTC')
@@ -213,17 +216,30 @@ def _make_id(*parts: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# ALTER statements to add new columns to existing tables (idempotent)
+_ALTER_VARIANTS_ADD_TAGS = """
+ALTER TABLE model_ops_variants
+    ADD COLUMN IF NOT EXISTS tags String DEFAULT ''
+"""
+
+
 def ensure_tables(client) -> None:
     """
     Create both tables if they do not yet exist (idempotent).
     Existing tables — and their historical data — are left untouched so
     the dashboard can show regression trends across nightly builds.
+    Also runs idempotent ALTER TABLE migrations to add new columns.
     """
     print("[info] Ensuring tables exist (CREATE TABLE IF NOT EXISTS) ...")
     client.command(_CREATE_SUITES_SQL)
     print("[info]   model_ops_suites    — ok")
     client.command(_CREATE_VARIANTS_SQL)
     print("[info]   model_ops_variants  — ok")
+
+    # Migrations: add new columns to pre-existing tables (safe to run repeatedly)
+    print("[info] Running column migrations ...")
+    client.command(_ALTER_VARIANTS_ADD_TAGS)
+    print("[info]   model_ops_variants.tags — ok")
     print()
 
 
@@ -278,6 +294,7 @@ VARIANT_COLS = [
     "input_shapes",
     "input_strides",
     "input_dtypes",
+    "tags",
     "triggered_at",
     "ingested_at",
 ]
@@ -384,6 +401,7 @@ def _build_variant_rows(
                 _jstr(v.get("input_shapes", [])),
                 _jstr(v.get("input_strides", [])),
                 _jstr(v.get("input_dtypes", [])),
+                _str(v.get("tags", "")),
                 triggered_at,
                 now,
             ]
