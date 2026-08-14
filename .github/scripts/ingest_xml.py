@@ -62,9 +62,13 @@ def _opt_float(d: dict, key: str):
 #  BENCHMARK XML detection & parsing
 # ---------------------------------------------------------------------------
 
-# Pattern:  perf_{op_name}_{metric}_ms_{input_shapes}
+# Pattern:  perf_{op_name}_{metric}_{ms|MB}_{input_shapes}
+# `compiler?` accepts both spellings the perf suite emits: op reports label the
+# row "compiler_ms", Granite reports "compile_ms".
 _PERF_NAME_RE = re.compile(
-    r"^perf_(?P<op>.+?)_(?P<metric>wall_clock|cpu|spyre|kernel|memory_transfer)_ms(?:_(?P<shapes>.+))?$"
+    r"^perf_(?P<op>.+?)"
+    r"_(?P<metric>wall_clock|cpu|spyre|kernel|memory_transfer|runtime|compiler?|mem_size)"
+    r"_(?:ms|MB)(?:_(?P<shapes>.+))?$"
 )
 
 _GRANITE_CONFIG_RE = re.compile(r"bs(?P<batch_size>\d+)(?:_pl(?P<prompt_length>\d+))?")
@@ -127,6 +131,8 @@ def parse_benchmark_xml(
             continue
         op = m.group("op")
         metric = m.group("metric")
+        if metric == "compiler":  # normalise the op-report spelling to Granite's
+            metric = "compile"
         shapes = m.group("shapes") or ""
         groups[(op, shapes)][metric] = tc
 
@@ -159,6 +165,20 @@ def parse_benchmark_xml(
         mem_ms = None
         if "memory_transfer" in metric_cases:
             mem_ms = float(metric_cases["memory_transfer"].get("time", 0) or 0)
+
+        compile_ms = None
+        if "compile" in metric_cases:
+            compile_ms = float(metric_cases["compile"].get("time", 0) or 0)
+
+        runtime_ms = None
+        if "runtime" in metric_cases:
+            runtime_ms = float(metric_cases["runtime"].get("time", 0) or 0)
+
+        # mem_size is a footprint in MB, not a duration, but it still travels in
+        # the testcase `time` attribute like every other metric.
+        mem_size_mb = None
+        if "mem_size" in metric_cases:
+            mem_size_mb = float(metric_cases["mem_size"].get("time", 0) or 0)
 
         # torch_spyre_ms lives in tags of individual cases
         torch_spyre_ms = _opt_float(tags, "torch_spyre_ms")
@@ -207,6 +227,9 @@ def parse_benchmark_xml(
                 "spyre_ms": spyre_ms,
                 "kernel_mean_ms": kernel_ms,
                 "memory_transfer_mean_ms": mem_ms,
+                "compile_ms": compile_ms,
+                "runtime_ms": runtime_ms,
+                "mem_size_mb": mem_size_mb,
                 "pt_util_percent": pt_util,
                 "num_runs": num_runs_int,
                 "custom_op_file": None,
@@ -282,6 +305,9 @@ def insert_perf_benchmarks(client, run_id: int, benchmarks: list[dict]) -> None:
                 b["spyre_ms"],
                 b["kernel_mean_ms"],
                 b["memory_transfer_mean_ms"],
+                b["compile_ms"],
+                b["runtime_ms"],
+                b["mem_size_mb"],
                 b["pt_util_percent"],
                 b["num_runs"],
                 b["custom_op_file"],
@@ -305,6 +331,9 @@ def insert_perf_benchmarks(client, run_id: int, benchmarks: list[dict]) -> None:
             "spyre_ms",
             "kernel_mean_ms",
             "memory_transfer_mean_ms",
+            "compile_ms",
+            "runtime_ms",
+            "mem_size_mb",
             "pt_util_percent",
             "num_runs",
             "custom_op_file",
@@ -669,6 +698,15 @@ def main():
     )
     client.command(
         "ALTER TABLE benchmark_runs ADD COLUMN IF NOT EXISTS platform String DEFAULT ''"
+    )
+    client.command(
+        "ALTER TABLE perf_benchmarks ADD COLUMN IF NOT EXISTS compile_ms Nullable(Float64)"
+    )
+    client.command(
+        "ALTER TABLE perf_benchmarks ADD COLUMN IF NOT EXISTS runtime_ms Nullable(Float64)"
+    )
+    client.command(
+        "ALTER TABLE perf_benchmarks ADD COLUMN IF NOT EXISTS mem_size_mb Nullable(Float64)"
     )
 
     total_cases = 0
