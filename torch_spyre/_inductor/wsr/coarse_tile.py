@@ -835,6 +835,34 @@ def _fixed_level_extents(loop_tiled_dims: list[list[int]]) -> list[dict[int, Exp
     return [{} for _ in loop_tiled_dims]
 
 
+def _advancing_level_extents(
+    loop_tiled_dims: list[list[int]],
+    loop_count: list[int],
+    ranges: list[Expr],
+) -> list[dict[int, Expr]]:
+    """Per-level extents for a dep that DOES advance across tiled levels.
+
+    For each dim tiled at one or more levels, the innermost tiling level's
+    extent is the dim's own (already-divided) range; each level further out
+    multiplies by the next-inner level's trip count. This is the same
+    per-level formula _planned_tile_extents_per_level's _per_level_extent_for
+    uses at planning time, and what _insert_copy_op's write side (which
+    targets full_buf, a real full-sized buffer that must advance a whole
+    tile per iteration -- see its comment) computes inline. Use this
+    whenever a dep addresses a full-sized (not per-tile-scratch) buffer
+    whose own dims are loop_tiled_dims; use _fixed_level_extents instead for
+    dims/deps that are genuine per-tile scratch reused in place.
+    """
+    extents: list[dict[int, Expr]] = [{} for _ in loop_tiled_dims]
+    for d in {d for level in loop_tiled_dims for d in level}:
+        levels_tiling_d = [i for i, dims in enumerate(loop_tiled_dims) if d in dims]
+        running = sympy.sympify(ranges[d])
+        for level_idx in reversed(levels_tiling_d):
+            extents[level_idx][d] = running
+            running = running * loop_count[level_idx]
+    return extents
+
+
 def _tiled_dims_for_dep(
     dep: MemoryDep,
     per_level_extents: list[dict[int, Expr]],
@@ -2962,6 +2990,7 @@ def _insert_combine_op(
     tiled_op: ComputedBuffer,
     accum_buf: ComputedBuffer,
     operations: list[Operation],
+    is_nested: bool,
 ) -> str:
     """Insert a pointwise combine op that accumulates tiled_op into accum_buf.
 
@@ -2972,12 +3001,34 @@ def _insert_combine_op(
     places it inside the same CountedLoopSchedulerNode), but its own
     freshly-derived tiled_dims_per_read/output_tiled_dims -- combine_buf's
     two reads and one write don't correspond positionally to tiled_op's own
-    reads/write, and both accum_buf and tiled_op's output are scratch that
-    never advances across the inner tiled loop, so reusing tiled_op.loop_info
-    wholesale attributed tiled_op's own output-tiling shape to accum_buf's
-    mutation-write instead (this previously surfaced as a spurious
-    advancing-lx NotImplementedError once a since-removed per-buffer
-    per_tile_fixed flag that had been masking it was taken away).
+    reads/write.
+
+    tiled_op's own partial output is per-tile scratch reused in place every
+    inner iteration, so the combine's read of it must not advance (see
+    _fixed_level_extents).
+
+    accum_buf's own reads/write depend on is_nested, because _caller_ passes a
+    different buffer for each case (see _propagate_tiled_reduction_op):
+
+    - Nested (is_nested=True): accum_buf is accum_tile, a per-outer-tile
+      scratch buffer that a separate reduce-copy op drains into accum_full at
+      the outer loop boundary -- accum_tile itself must not advance at any
+      level, same as tiled_op's partial (_fixed_level_extents).
+    - Flat (is_nested=False): accum_buf is accum_full itself, the real
+      persistent output-shaped buffer with no separate copy op -- when a kept
+      (non-reduction) output dim is tiled at some level, accum_full
+      legitimately advances at that level so each iteration combines into the
+      correct slice, exactly like _insert_copy_op's write side into full_buf
+      (see _advancing_level_extents).
+
+    Using _fixed_level_extents for accum_buf's reads/write unconditionally in
+    both cases (as an earlier version of this function did) always pinned the
+    flat case's mutation-write to the first slice, leaving every other slice
+    stuck at the fill/identity value -- this previously surfaced as a
+    spurious advancing-lx NotImplementedError once a since-removed per-buffer
+    per_tile_fixed flag that had been masking it was taken away, and after
+    that flag's removal regressed into silent wrong numerics instead
+    (test_min_2d_512x256_reduce_dim0_A4_B4).
     """
     from torch._inductor.virtualized import ops as vops
 
@@ -3022,12 +3073,21 @@ def _insert_combine_op(
     combine_buf.origins = tiled_op.origins
     combine_buf.operation_name = combine_name
 
-    # Both reads (tiled_op's partial output, accum_buf itself) and the
-    # mutation-write (into accum_buf) are per-tile-fixed scratch that never
-    # advances across the inner tiled loop -- all-empty per-level extents at
-    # every level, same convention _insert_copy_op's read side uses.
+    # tiled_op's own partial output is per-tile-fixed scratch that never
+    # advances across the inner tiled loop (all-empty per-level extents, same
+    # convention _insert_copy_op's read side uses). accum_buf's own extents
+    # depend on is_nested -- see this function's docstring.
     tiled_op_info = tiled_op.loop_info  # type: ignore[attr-defined]
     fixed_level_extents = _fixed_level_extents(tiled_op_info.loop_tiled_dims)
+    accum_level_extents = (
+        fixed_level_extents
+        if is_nested
+        else _advancing_level_extents(
+            tiled_op_info.loop_tiled_dims,
+            tiled_op_info.loop_count,
+            list(combine_data.ranges),
+        )
+    )
     combine_reads = [
         dep for dep in combine_buf.get_read_writes().reads if isinstance(dep, MemoryDep)
     ]
@@ -3037,10 +3097,16 @@ def _insert_combine_op(
         if isinstance(dep, MemoryDep)
     ]
     tiled_dims_per_read = [
-        _tiled_dims_for_dep(dep, fixed_level_extents) for dep in combine_reads
+        _tiled_dims_for_dep(
+            dep,
+            fixed_level_extents
+            if dep.name == tiled_op.get_name()
+            else accum_level_extents,
+        )
+        for dep in combine_reads
     ]
     output_tiled_dims = (
-        _tiled_dims_for_dep(combine_writes[0], fixed_level_extents)
+        _tiled_dims_for_dep(combine_writes[0], accum_level_extents)
         if combine_writes
         else []
     )
@@ -3053,6 +3119,16 @@ def _insert_combine_op(
 
     tiled_idx = operations.index(tiled_op)
     operations.insert(tiled_idx + 1, combine_buf)
+
+    logger.debug(
+        "coarse_tile: combine %s accum_buf=%s is_nested=%s "
+        "tiled_dims_per_read=%s output_tiled_dims=%s",
+        combine_name,
+        accum_buf.get_name(),
+        is_nested,
+        tiled_dims_per_read,
+        output_tiled_dims,
+    )
     return combine_name
 
 
@@ -3331,7 +3407,7 @@ def _propagate_tiled_reduction_op(
     operations.insert(fill_target_idx + 2, fill_buf)
 
     # Insert combine op after the tiled reduction op (inside the loop).
-    combine_name = _insert_combine_op(op, combine_target, operations)
+    combine_name = _insert_combine_op(op, combine_target, operations, is_nested)
 
     # For nested case, insert a copy op at the outer loop level that writes
     # accum_tile → accum_full, advancing accum_full across outer output tiles.
