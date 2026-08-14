@@ -385,7 +385,9 @@ def normalize_coordinates(
 
     Split dimension into n dimensions if expression has n>1 terms.
     Split dim_size into n according to iteration range of each term.
-    Fuse contiguous dimensions if corresponding terms can be fused.
+    Fuse contiguous dimensions if corresponding terms can be fused.  Size-1
+    device dims with a constant zero coordinate are dropped, and do not stop
+    the dims on either side of them from fusing.
     """
     # terms in non-increasing stride order
     terms = []
@@ -504,11 +506,43 @@ def normalize_coordinates(
     # never fuse last dimension = stick dimension!
     fused_terms = []
     fused_term = terms[0]
+    # Whether a transparent placeholder term was skipped since ``fused_term``
+    # was last (re)set.  A placeholder is a size-1 device dim with a constant
+    # zero coordinate, e.g. the squeezed ``seq`` dim that
+    # ``get_generic_stick_layout`` puts *between* ``H`` and the non-stick half
+    # of ``D`` for a ``[B, H, 1, D]`` attention output.  It occupies no space
+    # and is discarded by the flush guards below, but because this scan only
+    # compares neighbouring list entries it would flush the pending term and
+    # break a fusion run between two dims that ``compute_coordinates`` already
+    # treats as stride-adjacent (``next_stride`` ignores ``size == 1`` dims).
+    # Splitting an otherwise contiguous axis that way makes ``align_tensors``
+    # mint an extra loop variable for it, and for a matmul that produces a
+    # second reduction dim, which the backend cannot schedule (a bmm contracts
+    # exactly one dim; deeptools aborts with ``out_reuse_dim.size() == 1``).
+    skipped_placeholder = False
     for term in terms[1:-1]:
+        if term.var is None and term.dim_size == 1 and term.offset == 0:
+            skipped_placeholder = True
+            continue
         if (
             fused_term.num == 1
             and fused_term.var == term.var
             and fused_term.den == term.mod
+            # Fusing *across* a placeholder must not change the address that
+            # any (dim, coordinate) pair encodes.  It provably does not when
+            # the pair is densely packed (``den == term.den * term.dim_size``),
+            # the inner term skips no elements (``num == 1``), and the outer
+            # term carries no offset -- the outer offset counts in units of the
+            # outer ``den`` and is not rescaled when ``den`` shrinks on fusion.
+            # Adjacent terms keep the historical predicate unchanged.
+            and (
+                not skipped_placeholder
+                or (
+                    term.num == 1
+                    and fused_term.offset == 0
+                    and fused_term.den == term.den * term.dim_size
+                )
+            )
         ):
             # fuse terms
             fused_term.num = term.num
@@ -519,6 +553,7 @@ def normalize_coordinates(
             if fused_term.dim_size > 1 or fused_term.var is not None:
                 fused_terms.append(fused_term)
             fused_term = term
+        skipped_placeholder = False
     if fused_term.dim_size > 1 or fused_term.var is not None:
         fused_terms.append(fused_term)
     # add term for stick dimension
