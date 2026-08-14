@@ -1,6 +1,6 @@
 # End-to-End Example: Profiling a Granite Model on Spyre via FMS
 
-**Stack:** Torch-Spyre (new, Inductor-based).
+**Stack:** torch-spyre (new, Inductor-based).
 
 This page shows how to capture a `torch.profiler` trace of a
 Granite-class model running on Spyre, paired with `aiu-smi` device
@@ -36,7 +36,6 @@ Ensure that you have access a pod with spyre accelerator and torch spyre and spy
 | `aiu-fms-testing-utils` | [github.com/foundation-model-stack/aiu-fms-testing-utils][aiu-fms] (`eager_spyre` branch) | `git clone -b eager_spyre <repo>.git && uv pip install -e ./aiu-fms-testing-utils` |
 | `kineto-spyre` (not required for torch >= 2.13)| [github.com/IBM/kineto-spyre][kineto-spyre] | `uv pip install --no-deps <release-wheel-url-matching-your-pytorch>` (see [releases page][kineto-spyre-releases]) |
 | `aiu-trace-analyzer` (optional) | [github.com/IBM/aiu-trace-analyzer][ata] | `pip install aiu-trace-analyzer` |
-| Granite checkpoint | [huggingface.co/ibm-granite/granite-3.3-8b-instruct](https://huggingface.co/ibm-granite/granite-3.3-8b-instruct) | `hf download ibm-granite/granite-3.3-8b-instruct --local-dir /tmp/models/granite-3.3-8b-instruct` |
 | Granite checkpoint | [huggingface.co/ibm-granite/granite-3.3-8b-instruct](https://huggingface.co/ibm-granite/granite-3.3-8b-instruct) | `hf download ibm-granite/granite-3.3-8b-instruct --local-dir /tmp/models/granite-3.3-8b-instruct` |
 
 The sample commands above are starting points; each upstream README is
@@ -149,7 +148,6 @@ print("=" * 42)
 print("Starting Inferencing".center(42))
 print("=" * 42)
 
-
 # 4. Profile a steady-state forward pass.
 N_RUNS = 5
 wall_clock_ms = []
@@ -175,9 +173,7 @@ cpu_per_run_ms = sum(e.self_cpu_time_total for e in prof.events()) / 1000 / N_RU
 print("=" * 42)
 print("Profiling Granite Running on Spyre".center(42))
 print("=" * 42)
-print("=" * 42)
-print("Profiling Granite Running on Spyre".center(42))
-print("=" * 42)
+
 print(prof.key_averages().table(sort_by="device_time_total", row_limit=10))
 print(f"wall-clock ms: mean={mean(wall_clock_ms):.3f} median={median(wall_clock_ms):.3f}")
 print(f"profiler-derived CPU ms (per run): {cpu_per_run_ms:.3f}")
