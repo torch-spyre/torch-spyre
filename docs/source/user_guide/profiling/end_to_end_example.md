@@ -1,6 +1,6 @@
-# End-to-End Example: Profiling a Granite Model on Spyre
+# End-to-End Example: Profiling a Granite Model on Spyre via FMS
 
-**Stack:** torch-spyre (new, Inductor-based).
+**Stack:** Torch-Spyre (new, Inductor-based).
 
 This page shows how to capture a `torch.profiler` trace of a
 Granite-class model running on Spyre, paired with `aiu-smi` device
