@@ -412,19 +412,19 @@ def get_per_core_span(
     return itemsize
 
 
-def warn_if_per_core_overflow(
+def raise_if_per_core_overflow(
     tensor_deps: list[TensorDep],
     it_space_orig: dict[Symbol, Expr],
     splits: dict[Symbol, int],
     op_name: str,
     symbol_meta: SymbolMeta,
 ) -> None:
-    """Log CRITICAL if any tensor's per-core memory span exceeds MAX_SPAN_BYTES."""
+    """Raise Unsupported if any tensor's per-core memory span exceeds MAX_SPAN_BYTES."""
     for td in tensor_deps:
         per_core_span = get_per_core_span(td, splits, it_space_orig, symbol_meta)
         if per_core_span > MAX_SPAN_BYTES:
             dl = td.layout.device_layout
-            logger.critical(
+            raise Unsupported(
                 f"{op_name}: per-core tensor span "
                 f"{per_core_span / (1024 * 1024):.3f} MB "
                 f"(shape={list(td.layout.size)}, dtype={td.layout.dtype}, "
@@ -1128,7 +1128,7 @@ def work_distribution_pass(
                     f"min_splits={committed_splits}, user_splits={user_splits}, "
                     f"op_it_space_splits={op_splits}"
                 )
-            warn_if_per_core_overflow(
+            raise_if_per_core_overflow(
                 all_tds, it_space, user_splits, op.get_name(), symbol_meta
             )
             return
@@ -1155,7 +1155,7 @@ def work_distribution_pass(
             f"op_it_space_splits={op.op_it_space_splits}"
         )
 
-    warn_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
+    raise_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
 
 
 _PT_ROWS = 8  # PT block rows per corelet
@@ -1698,7 +1698,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
         return False
 
     apply_splits(op, splits, output_td)
-    warn_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
+    raise_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
 
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
