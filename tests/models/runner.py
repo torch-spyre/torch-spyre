@@ -21,6 +21,9 @@ from torch.testing._internal.opinfo.core import (  # noqa: F401
     SampleInput,
 )
 
+from oot_framework.fallback_utils import assert_no_cpu_fallback, capture_cpu_fallbacks
+from oot_framework.tensor_layout_utils import apply_layout
+
 from .op_registry import OP_REGISTRY
 
 DTYPE_MAP = {
@@ -117,7 +120,10 @@ def make_tensor_from_conf(
         else:
             raise ValueError(f"Unknown init: {init}")
 
-    return t
+    # Honor the captured memory layout (stride/storage_offset) using the seeded
+    # values, so v1 exercises the same real, non-contiguous layouts as the v2
+    # framework instead of an always-contiguous tensor. See apply_layout.
+    return apply_layout(t, tconf.get("stride"), tconf.get("storage_offset", 0))
 
 
 def confirm_device(x: Any, expected_device: torch.device) -> bool:
@@ -352,19 +358,21 @@ def run_test(
         test_sample = adapter.pre(test_sample)
 
     # Run
-    with torch.no_grad():
-        ref_out = op(cpu_sample.input, *cpu_sample.args, **cpu_sample.kwargs)
-        test_out = _maybe_compile_call(
-            op,
-            test_sample,
-            device,
-            compile_backend,
-        )
+    fell_back: list = []
+    with capture_cpu_fallbacks(fell_back):
+        with torch.no_grad():
+            ref_out = op(cpu_sample.input, *cpu_sample.args, **cpu_sample.kwargs)
+            test_out = _maybe_compile_call(
+                op,
+                test_sample,
+                device,
+                compile_backend,
+            )
 
-        if adapter.is_inplace:
-            # compare mutated arg0
-            ref_out = cpu_sample.input
-            test_out = test_sample.input
+            if adapter.is_inplace:
+                # compare mutated arg0
+                ref_out = cpu_sample.input
+                test_out = test_sample.input
 
     ref_out_cpu = to_device(ref_out, torch.device("cpu"))
 
@@ -416,6 +424,11 @@ def run_test(
         )
     else:
         assert confirm_device(test_out, device), "this result must be on spyre"
+
+    # A silent CPU fallback means the op did not run on the device path this
+    # test claims to exercise; treat it as a failure before the numeric check
+    # (which would otherwise pass on the CPU result).
+    assert_no_cpu_fallback(case_name, fell_back)
 
     test_out_cpu = to_device(test_out, torch.device("cpu"))
     _assert_same(

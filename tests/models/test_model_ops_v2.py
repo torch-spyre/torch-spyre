@@ -37,6 +37,7 @@ from oot_framework.oot_test_config_models import (
     OpsNamedItem,
     TestEntry,
 )
+from oot_framework.fallback_utils import assert_no_cpu_fallback, capture_cpu_fallbacks
 from oot_framework.oot_test_constants import ENV_TEST_CONFIG
 from oot_framework.oot_test_parsing import load_yaml_config, resolve_current_file
 from oot_framework.oot_test_utilities import (
@@ -405,8 +406,22 @@ class TestSpyreModelOps(TestCase):
             _dtype_prec.rtol if _dtype_prec and _dtype_prec.rtol is not None else 5e-3
         )
 
-        # Build CPU SampleInput — all construction delegated to spyre_test_config_models
+        # Reference sample, built on CPU: a true CPU baseline whose tensors are
+        # INDEPENDENT from the device tensors under test. Building the reference
+        # on-device would make test_sample alias it (``.to(device)`` on an
+        # already-on-device tensor returns the same object), so for in-place ops
+        # -- whose result IS the input -- ref_out and test_out would be the same
+        # buffer and the comparison would be a vacuous self-check. Built with the
+        # same seed as the device sample below, so their values match exactly.
         cpu_sample: SampleInput = ops_item.build_sample_input(
+            seed=seed,
+            test_device=None,
+            SampleInput=SampleInput,
+        )
+        # Device sample, built with test_device so device kwargs / device_layout
+        # resolve correctly; its tensors are placed on-device (layout-aware) by
+        # _to_target_device below to form test_sample.
+        device_sample: SampleInput = ops_item.build_sample_input(
             seed=seed,
             test_device=None if device_replace_disabled else test_device,
             SampleInput=SampleInput,
@@ -459,11 +474,11 @@ class TestSpyreModelOps(TestCase):
 
             return x
 
-        # Build test_sample with per-tensor layout awareness
+        # Build test_sample from the device sample, with per-tensor layout awareness
         test_args = []
         for i, (cpu_arg, spec_arg) in enumerate(
             zip(
-                [cpu_sample.input] + list(cpu_sample.args),
+                [device_sample.input] + list(device_sample.args),
                 ops_item.sample_inputs_func.args,
             )
         ):
@@ -478,10 +493,12 @@ class TestSpyreModelOps(TestCase):
                 # resolved_kwargs() will raise if one ever tries to. If that changes,
                 # this needs the same arg_spec-based layout lookup as _to_target_device
                 # uses for positional args above.
-                kwargs={k: _to_target_device(v) for k, v in cpu_sample.kwargs.items()},
+                kwargs={
+                    k: _to_target_device(v) for k, v in device_sample.kwargs.items()
+                },
             )
         else:
-            test_sample = cpu_sample.transform(lambda x: _to_target_device(x))
+            test_sample = device_sample.transform(lambda x: _to_target_device(x))
 
         # Adapter pre-hook (e.g. dropout sets training=False)
         if adapter.pre is not None:
@@ -490,13 +507,17 @@ class TestSpyreModelOps(TestCase):
 
         # Run
         fn = adapter.fn
+        fell_back: List[str] = []
         try:
-            with torch.no_grad():
-                ref_out = fn(cpu_sample.input, *cpu_sample.args, **cpu_sample.kwargs)
-                test_out = _run_op(fn, test_sample, test_device, compile_backend)
-                if adapter.is_inplace:
-                    ref_out = cpu_sample.input
-                    test_out = test_sample.input
+            with capture_cpu_fallbacks(fell_back):
+                with torch.no_grad():
+                    ref_out = fn(
+                        cpu_sample.input, *cpu_sample.args, **cpu_sample.kwargs
+                    )
+                    test_out = _run_op(fn, test_sample, test_device, compile_backend)
+                    if adapter.is_inplace:
+                        ref_out = cpu_sample.input
+                        test_out = test_sample.input
 
             expected_device = (
                 torch.device("cpu")
@@ -506,6 +527,11 @@ class TestSpyreModelOps(TestCase):
             assert _confirm_device(test_out, expected_device), (
                 f"Output must be on {expected_device}"
             )
+
+            # A silent CPU fallback means the op did not run on the device path
+            # this test claims to exercise; treat it as a failure before the
+            # numeric check (which would otherwise pass on the CPU result).
+            assert_no_cpu_fallback(method_name, fell_back)
 
             _assert_close(
                 self,

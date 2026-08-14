@@ -27,6 +27,7 @@ from .oot_test_constants import (
     _VALID_UNLISTED_MODES,
 )
 from .oot_test_matching import parse_dtype
+from .tensor_layout_utils import apply_layout
 from .oot_test_utilities import (
     _eval_py_literal,
     _resolve_dtype_str,
@@ -332,39 +333,12 @@ class InputTensorSpec(BaseModel):
             else:
                 raise ValueError(f"Unknown init strategy: {init!r}")
 
-        # Handle custom stride/storage_offset
-        # if self.stride is not None or self.storage_offset != 0:
-        #     stride = self.stride if self.stride is not None else list(t.stride())
-        #     offset = self.storage_offset
-        #     needed = offset + (
-        #         sum((s - 1) * st for s, st in zip(shape, stride)) + 1 if shape else 1
-        #     )
-        #     backing = torch.empty(needed, dtype=dtype)
-        #     t = torch.as_strided(backing, shape, stride, offset)
-        if self.stride is not None or self.storage_offset != 0:
-            stride = self.stride if self.stride is not None else list(t.stride())
-            offset = self.storage_offset
-            needed = offset + (
-                sum((s - 1) * st for s, st in zip(shape, stride)) + 1 if shape else 1
-            )
-            backing = torch.empty(needed, dtype=dtype)
-            with torch.no_grad():
-                if init == "rand":
-                    backing.copy_(  # fill flat backing, no aliasing
-                        make_tensor(
-                            needed, dtype=dtype, device="cpu", low=0.0, high=1.0
-                        )
-                    )
-                elif init == "randn":
-                    # See note above: make_tensor is uniform, not normal.
-                    backing.copy_(torch.randn(needed, dtype=dtype))
-                elif init == "randint":
-                    backing.copy_(
-                        make_tensor(
-                            needed, dtype=dtype, device="cpu", low=ia.low, high=ia.high
-                        )
-                    )
-            t = torch.as_strided(backing, shape, stride, offset)  # view created after
+        # Reproduce the captured memory layout (stride/storage_offset) using the
+        # seeded values built above. The layout must be applied to the *seeded*
+        # tensor -- re-drawing here would silently discard the seed, making the
+        # case non-reproducible and diverging from the v1 framework (which builds
+        # the same seeded values). See tensor_layout_utils.apply_layout.
+        t = apply_layout(t, self.stride, self.storage_offset)
 
         return t
 
@@ -402,20 +376,8 @@ class InputTensorSpec(BaseModel):
             else:
                 raise ValueError(f"Unknown init strategy: {init!r}")
 
-        if self.stride is not None or self.storage_offset != 0:
-            stride = self.stride if self.stride is not None else list(t.stride())
-            offset = self.storage_offset
-            needed = offset + (
-                sum((s - 1) * st for s, st in zip(shape, stride)) + 1 if shape else 1
-            )
-            backing = torch.empty(needed, dtype=dtype)
-            with torch.no_grad():
-                if init == "rand":
-                    backing.copy_(torch.rand(needed, dtype=dtype))
-                elif init == "randn":
-                    backing.copy_(torch.randn(needed, dtype=dtype))
-                elif init == "randint":
-                    backing.copy_(torch.randint(ia.low, ia.high, [needed], dtype=dtype))
+        # Reproduce the captured layout from the seeded values (see build()).
+        t = apply_layout(t, self.stride, self.storage_offset)
 
         return t
 
