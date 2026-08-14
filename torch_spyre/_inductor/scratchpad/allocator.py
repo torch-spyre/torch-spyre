@@ -114,6 +114,33 @@ _LX_TRACKER_CAPACITY_BYTES = (
 )
 _LX_ALLOCATION_GRANULARITY_BYTES = 128
 
+
+def _extern_kernel_in_live_range(graph: GraphLowering, uses: list[int]) -> bool:
+    """True if an opaque extern kernel runs at any point while the buffer is live.
+
+    The LX scratchpad is a fixed per-core resource shared by *every* compiled
+    Spyre program, and it is not threaded through the generated wrapper as a
+    tensor -- a resident buffer is handed from one kernel launch to the next by
+    its LX offset alone. An extern kernel is opaque: its body can launch other
+    compiled programs (a nested ``torch.compile``, or any eager op, which
+    torch-spyre compiles standalone via ``compile_once``), and those programs
+    allocate the same LX offsets. A buffer left resident across such a call is
+    therefore silently overwritten, and its consumer reads the other program's
+    data.
+
+    Being *accessed by* the extern kernel is the narrow case (already fatal,
+    since the value must be a real HBM tensor to be passed to it); merely being
+    live *across* one is equally fatal and is not visible from ``uses``
+    membership alone.
+    """
+    if not uses:
+        return False
+    return any(
+        isinstance(graph.operations[i], ExternKernel)
+        for i in range(min(uses), max(uses) + 1)
+    )
+
+
 # A ``MemoryPlanSolver`` is single-use (buffers are required at construction),
 # so the allocators hold a factory -- how to build a solver for a given buffer
 # set -- rather than a live instance, and build a fresh one per solve.
@@ -417,8 +444,8 @@ class ScratchpadAllocator:
         restickify = self._restickify_barrier(graph, name, uses)
         if restickify is not None:
             return restickify
-        if any(isinstance(graph.operations[u], ExternKernel) for u in uses):
-            return "extern kernel user"
+        if _extern_kernel_in_live_range(graph, uses):
+            return "extern kernel user or live across extern kernel"
         if self._is_index_or_indirectly_accessed(graph, name, uses, op):
             # Index tensors and the value tensors they index into are read via
             # data-dependent (indirect) addressing, must stay in hbm.
@@ -476,6 +503,8 @@ class ScratchpadAllocator:
             return "no consumer reads it from LX"
         if self._is_index_or_indirectly_accessed(graph, name, uses, None):
             return "index tensor or indirectly accessed"
+        if _extern_kernel_in_live_range(graph, uses):
+            return "extern kernel user or live across extern kernel"
         if not GraphEditor.all_uses_are_rewritable(graph, uses):
             return "use is not rewritable to the clone"
         if buffer_not_read_in_full(graph, name):
