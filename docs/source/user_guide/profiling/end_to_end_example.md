@@ -30,10 +30,6 @@ shrink. This page will be revised to the in-tree API once it ships.
 
 Ensure that you have access a pod with spyre accelerator and torch spyre and spyre software stack installed.
 
-**Prerequisites Step**
-
-Ensure that you have access a pod with spyre accelerator and torch spyre and spyre software stack installed.
-
 | Piece | Source | Sample install (verify against the upstream README) |
 |---|---|---|
 | `foundation-model-stack` (`fms`) | [github.com/foundation-model-stack/foundation-model-stack][fms] (`eager_spyre` branch) | `git clone -b eager_spyre <repo>.git && uv pip install -e ./foundation-model-stack` |
