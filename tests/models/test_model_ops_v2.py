@@ -43,6 +43,7 @@ from oot_framework.oot_test_utilities import (
     print_test_tags_oot,
     _format_input_args_shapes,
     _RUNTIME_SHAPES,
+    skip_unconditionally,
 )
 from op_registry import OP_REGISTRY, OpAdapter
 import shared_config
@@ -355,6 +356,9 @@ class TestSpyreModelOps(TestCase):
         device_replace_disabled: bool = bool(
             pytestconfig.getoption("--no-device-replace", default=False)
         )
+        include_cpu_tensor_tests: bool = bool(
+            pytestconfig.getoption("--include-cpu-tensor-tests", default=False)
+        )
 
         method_name = self._testMethodName
         ops_item: OpsNamedItem = op.ops_item
@@ -370,7 +374,20 @@ class TestSpyreModelOps(TestCase):
             if not any(n in method_name for n in allowed_test_names):
                 pytest.skip("Filtered by --test-name")
 
-        # 3) Cross-op dedupe
+        # 3) Skip cases whose YAML pins any input tensor to CPU — those exercise
+        # the op on CPU rather than on the device under test. `-m tensorsoncpu`
+        # still selects them, and --include-cpu-tensor-tests runs them anyway.
+        if (
+            not include_cpu_tensor_tests
+            and ops_item.sample_inputs_func.has_cpu_tensor()
+        ):
+            skip_unconditionally(
+                # pytest.skip(
+                "Skipped since one or more input tensors are on cpu "
+                "(--include-cpu-tensor-tests to run anyway)"
+            )
+
+        # 4) Cross-op dedupe
         if dedupe_enabled:
             global seen_case_keys
             dedup_key = (

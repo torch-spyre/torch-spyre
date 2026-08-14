@@ -137,6 +137,9 @@ class TestSpyreModelOps(TestCase):
         device_replace_disabled = bool(
             pytestconfig.getoption("--no-device-replace", default=False)
         )
+        include_cpu_tensor_tests = bool(
+            pytestconfig.getoption("--include-cpu-tensor-tests", default=False)
+        )
 
         method_name = self._testMethodName
 
@@ -176,7 +179,24 @@ class TestSpyreModelOps(TestCase):
             if not compiled_expr.evaluate(lambda m: m in case_marks):
                 pytest.skip(f"Skipped by marker expression: {mark_expr}")
 
-        # 4) Optional cross-model dedupe (do NOT dedupe at collection time!)
+        # 4) check whether tensor's device is cpu
+        if not include_cpu_tensor_tests:
+            tensor_on_cpu = False
+            for inp in case.get("inputs", []):
+                if "tensor" in inp:
+                    tensor_conf = inp["tensor"]
+                    tensor_device = tensor_conf.get("device", "")
+                    if tensor_device == "cpu":
+                        tensor_on_cpu = True
+                elif "tensor_list" in inp:
+                    for t in inp["tensor_list"]:
+                        tensor_device = t.get("device", "")
+                        if tensor_device == "cpu":
+                            tensor_on_cpu = True
+            if tensor_on_cpu:
+                pytest.skip("Skipped since input tensors on cpu")
+
+        # 5) Optional cross-model dedupe (do NOT dedupe at collection time!)
         if dedupe_enabled:
             global seen_case_keys
             k = case_key(case, defaults)

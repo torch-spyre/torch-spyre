@@ -12,13 +12,14 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, NoReturn, Optional, Sequence, Set, Tuple
 import regex as re
 import torch
 
 from .oot_test_constants import (
     DTYPE_STR_MAP,
     REL_PATH_TOKENS,
+    SKIP_BYPASSES_XFAIL_ATTR,
 )
 from .oot_test_matching import parse_dtype
 
@@ -39,6 +40,22 @@ _OOT_PLATFORM_ARCH: str = (
     re.sub(r"[^a-zA-Z0-9_]", "_", _platform.machine() or "unknown").strip("_")
     or "unknown"
 )
+
+
+def skip_unconditionally(reason: str) -> NoReturn:
+    """Skip the current test even when it carries an xfail mark.
+
+    The xfail wrapper installed by ``oot_test_base_common`` rewrites an
+    ordinary ``pytest.skip()`` into an ``AssertionError`` so an xfail-marked
+    test cannot mask a capability gap as a skip. Use this helper instead for
+    *selection* decisions — the case was filtered out by an option and never
+    executed, so reporting it as XFAIL would be misleading.
+    """
+    import pytest
+
+    exc = pytest.skip.Exception(reason, _use_item_location=True)
+    setattr(exc, SKIP_BYPASSES_XFAIL_ATTR, True)
+    raise exc
 
 
 def _extract_base_module_name(name: str) -> str:

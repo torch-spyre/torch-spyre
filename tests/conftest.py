@@ -19,6 +19,7 @@ import pytest
 import regex as re
 
 import shared_config
+from oot_framework.oot_test_constants import SKIP_BYPASSES_XFAIL_ATTR
 from oot_framework.oot_test_utilities import _RUNTIME_TAGS, _RUNTIME_SHAPES
 
 
@@ -98,7 +99,15 @@ def pytest_runtest_makereport(item, call):
             (m for m in getattr(fn, "pytestmark", []) if m.name == "xfail"),
             None,
         )
-        if xfail_mark is not None:
+        # A skip raised via skip_unconditionally() is a selection decision — the
+        # case was filtered out by an option and never ran — so it must stay a
+        # genuine SKIP instead of being rewritten to XFAIL below.
+        _exc = getattr(call, "excinfo", None)
+        _bypass_xfail = _exc is not None and getattr(
+            _exc.value, SKIP_BYPASSES_XFAIL_ATTR, False
+        )
+
+        if xfail_mark is not None and not _bypass_xfail:
             strict = xfail_mark.kwargs.get("strict", False)
             if rep.skipped or rep.failed:
                 reason = _extract_failure_message(rep)
@@ -254,7 +263,16 @@ def pytest_addoption(parser):
     parser.addoption(
         "--no-device-replace",
         action="store_true",
-        help="Disable cuda device replacement in kwargs.",
+        help="Disable cuda device replacement in kwargs or tensor.to().",
+    )
+    parser.addoption(
+        "--include-cpu-tensor-tests",
+        action="store_true",
+        default=False,
+        help=(
+            "Also run cases whose YAML declares any input tensor on 'cpu'. "
+            "By default such cases are skipped."
+        ),
     )
 
     # NEW: inventory modes

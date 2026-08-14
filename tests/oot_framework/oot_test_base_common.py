@@ -21,6 +21,7 @@ from oot_framework.oot_test_constants import (
     MODE_SKIP,
     MODE_XFAIL,
     MODE_XFAIL_STRICT,
+    SKIP_BYPASSES_XFAIL_ATTR,
     UNLISTED_MODE_XFAIL,
 )
 from oot_framework.oot_test_matching import (
@@ -862,12 +863,19 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
                             try:
                                 fn(self, *args, **kwargs)
                             except BaseException as e:
-                                if isinstance(e, pytest.skip.Exception):
+                                if isinstance(e, pytest.skip.Exception) and not getattr(
+                                    e, SKIP_BYPASSES_XFAIL_ATTR, False
+                                ):
                                     # pytest.skip() raised inside the test body (or by
                                     # PyTorch's test_wrapper infrastructure) is caught by
                                     # the unittest runner and reported as SKIPPED, completely
                                     # bypassing the xfail mark. Convert it to AssertionError
                                     # so the xfail mark sees a real failure instead.
+                                    #
+                                    # Skips raised via skip_unconditionally() carry
+                                    # SKIP_BYPASSES_XFAIL_ATTR: those are selection
+                                    # decisions (the case was filtered out and never
+                                    # ran), so they propagate as genuine SKIPs.
                                     raise AssertionError(
                                         f"xfail: converted skip to failure: {e}"
                                     ) from e

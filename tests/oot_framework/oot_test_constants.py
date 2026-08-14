@@ -21,6 +21,15 @@ MODE_SKIP = "skip"
 
 MODE_DEFAULT_TEST = "mandatory_success"
 
+# Marker attribute set on a pytest.skip exception to declare the skip a
+# *selection* decision (the case was filtered out and never ran) rather than a
+# capability gap discovered mid-test. The xfail wrapper in
+# oot_test_base_common.py converts ordinary skips into failures so the xfail
+# mark still applies; a skip carrying this attribute is re-raised untouched and
+# reported as a genuine SKIP. Set it via
+# oot_test_utilities.skip_unconditionally().
+SKIP_BYPASSES_XFAIL_ATTR = "_oot_skip_bypasses_xfail"
+
 UNLISTED_MODE_SKIP = "skip"
 UNLISTED_MODE_XFAIL = "xfail"
 UNLISTED_MODE_XFAIL_STRICT = "xfail_strict"

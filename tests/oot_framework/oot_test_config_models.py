@@ -903,6 +903,40 @@ class InputsEdits(BaseModel):
     def has_inputs(self) -> bool:
         return bool(self.args) or bool(self.kwargs)
 
+    def has_cpu_tensor(self) -> bool:
+        """True if any declared input tensor spec pins ``device: cpu``.
+
+        Covers positional ``tensor`` / ``tensor_list`` args as well as kwargs
+        carrying a tensor spec (see :meth:`resolved_kwargs`). Such a case
+        exercises the op on CPU rather than on the device under test, so the
+        runner skips it unless ``--include-cpu-tensor-tests`` is given.
+        """
+
+        def _is_cpu(spec: "InputTensorSpec") -> bool:
+            # String compare rather than torch.device(): the default spec
+            # device is "privateuse1", which torch.device() rejects outright.
+            return spec.device.split(":", 1)[0].strip() == "cpu"
+
+        def _arg_has_cpu(arg: Any) -> bool:
+            if isinstance(arg, InputArgTensor):
+                return _is_cpu(arg.tensor)
+            if isinstance(arg, InputArgTensorList):
+                return any(_is_cpu(spec) for spec in arg.tensor_list)
+            return False
+
+        if any(_arg_has_cpu(arg) for arg in self.args):
+            return True
+
+        for v in self.kwargs.values():
+            if isinstance(v, dict) and (v.keys() & {"tensor", "tensor_list"}):
+                try:
+                    parsed = _parse_input_arg(v)
+                except Exception:
+                    continue
+                if _arg_has_cpu(parsed):
+                    return True
+        return False
+
     def build_cpu_args(
         self,
         *,
