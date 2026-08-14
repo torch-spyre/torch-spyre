@@ -977,7 +977,7 @@ def generate_sdsc(
         # detects directly.
         per_level_strides: list[dict] = []
         any_tiled = False
-        for level_idx, level_syms in enumerate(tiled_symbols):
+        for level_syms in tiled_symbols:
             tensor_tiled_at_level = [
                 s for s in level_syms if _tensor_tiled_by_symbol(tensor, s)
             ]

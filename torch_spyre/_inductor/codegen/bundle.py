@@ -20,6 +20,7 @@ from typing import Any
 
 import sympy
 
+from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, format_op_spec_list
@@ -66,7 +67,24 @@ def generate_bundle(
     constants) in ``bundle.mlir``. Dimension symbols (from ``mark_dynamic``)
     always produce
     ``!sdscbundle.input_arg<index, granularity=G, max_value=M>`` parameters.
+
+    Requires ``config.bundle_symbolic_args`` to be True: the SDSC path
+    (this function) unconditionally emits symbolic addresses, but
+    ``spyre_kernel.py``/``hbm_pool_planning.py`` still bake absolute
+    addresses into tensor allocations when the flag is False (reserved for
+    the KTIR emitter path, which is gated separately). Running this
+    function with the flag off would silently miscompile addresses rather
+    than error, so it's rejected up front instead.
     """
+    if not _spyre_config.bundle_symbolic_args:
+        raise AssertionError(
+            "generate_bundle() requires config.bundle_symbolic_args=True "
+            "(BUNDLE_SYMBOLIC_ARGS=1). The SDSC bundle path always emits "
+            "symbolic HBM addresses; baked absolute addresses "
+            "(bundle_symbolic_args=False) are only supported on the KTIR "
+            "emitter path (config.ktir_emitter=True)."
+        )
+
     specs_list: list = list(specs)
 
     if logger.isEnabledFor(logging.INFO):

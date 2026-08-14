@@ -6132,6 +6132,33 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         self.assertEqual(execute_lines[2].split("(")[1].split(")")[0], "%pool_addr_0")
 
 
+class TestGenerateBundleRequiresSymbolicArgs(unittest.TestCase):
+    """generate_bundle must fail fast when bundle_symbolic_args is False.
+
+    The SDSC path always emits symbolic HBM addresses; baked addressing is
+    only meaningful on the (separately-gated) KTIR emitter path. Without
+    this guard, disabling the flag on the default path would silently
+    miscompile addresses instead of erroring.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_raises_when_bundle_symbolic_args_false(self):
+        a = _make_minimal_op_spec("a")
+        with patch(
+            "torch_spyre._inductor.codegen.bundle._spyre_config.bundle_symbolic_args",
+            False,
+        ):
+            with self.assertRaises(AssertionError):
+                generate_bundle("test_kernel", self.tmpdir, [a])
+
+
 class TestSymbolKind(unittest.TestCase):
     """Unit tests for the SymbolKind dataclass."""
 
