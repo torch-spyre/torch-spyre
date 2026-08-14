@@ -51,7 +51,7 @@ DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
 C10D_BACKEND = "spyreccl"
 
 
-class TestAllGather(TestCase):
+class TestAllReduce(TestCase):
     @classmethod
     def setUpClass(cls):
         """Set up the distributed environment once for all tests."""
@@ -74,9 +74,9 @@ class TestAllGather(TestCase):
         if dist.is_initialized():
             dist.destroy_process_group()
 
-    def _test_allgather_helper(self, shape, dtype, async_op=False):
+    def _test_allreduce_helper(self, shape, dtype, async_op=False):
         """
-        Helper method to test allgather with specific parameters.
+        Helper method to test allreduce with specific parameters.
 
         Args:
             shape: Tensor shape
@@ -87,23 +87,22 @@ class TestAllGather(TestCase):
         # Calculate total number of elements in the tensor
         num_elements = torch.tensor(shape).prod().item()
 
-        if dtype == torch.float16:
-            assert self.comm_size * num_elements <= 1024, (
-                f"float16 exact-integer range exceeded: rank {self.comm_rank}"
+        if num_elements > 256:
+            self.skipTest(
+                f"AllReduce test case is not designed for more than 256 elements, got {num_elements}"
             )
 
-        # Create contiguous range for this rank: rank 0 gets [0..num_elements-1],
-        # rank 1 gets [num_elements..2*num_elements-1], etc.
-        start_value = self.comm_rank * num_elements
-        end_value = start_value + num_elements
-
-        # Create tensor with contiguous values for this rank
-        input_tensor = torch.arange(start_value, end_value, dtype=dtype).reshape(shape)
+        # Create bounded float16 values for this rank to avoid overflow during SUM.
+        start_value = self.comm_rank + 1
+        input_tensor = (
+            (torch.arange(num_elements, dtype=torch.float32).div(10.0).add(start_value))
+            .to(dtype)
+            .reshape(shape)
+        )
         input_device = input_tensor.to(DEVICE)
 
-        output_list = [torch.zeros_like(input_device) for _ in range(self.comm_size)]
-
-        work = dist.all_gather(output_list, input_device, async_op=async_op)
+        # Allreduce with SUM operation — all ranks receive the result
+        work = dist.all_reduce(input_device, op=dist.ReduceOp.SUM, async_op=async_op)
 
         if async_op:
             self.assertIsNotNone(work, "async_op=True must return a Work handle")
@@ -112,61 +111,44 @@ class TestAllGather(TestCase):
         else:
             self.assertIsNone(work, "async_op=False must return None")
 
-        # Build all expected slices at once and compare in bulk.
-        # All ranks contribute contiguous blocks: rank r owns [r*N .. (r+1)*N - 1],
-        # so the full expected output is simply arange(comm_size * N) reshaped.
-        all_results = torch.stack(
-            [output_list[r].to("cpu") for r in range(self.comm_size)]
+        result = input_device.to("cpu")
+
+        # Expected result: comm_size * (i / 10.0) + sum_{r=1..comm_size}(r)
+        offset = self.comm_size * (self.comm_size + 1) / 2
+        expected = (
+            (
+                torch.arange(num_elements, dtype=torch.float32)
+                .div(10.0)
+                .mul(self.comm_size)
+                .add(offset)
+            )
+            .to(dtype)
+            .reshape(shape)
         )
-        all_expected = torch.arange(self.comm_size * num_elements, dtype=dtype).reshape(
-            self.comm_size, *shape
-        )
+
         _assert_tensor_equal(
-            all_results,
-            all_expected,
+            result,
+            expected,
             dtype,
-            f"Rank {self.comm_rank}: allgather result incorrect",
+            f"Rank {self.comm_rank}: allreduce result incorrect",
+            atol=0.2,
         )
 
-    def test_allgather_float16(self):
-        """Test allgather with float16 tensors."""
-        self._test_allgather_helper(shape=(128,), dtype=torch.float16)
+    def test_allreduce_float16(self):
+        """Test allreduce with float16 tensors."""
+        self._test_allreduce_helper(shape=(128,), dtype=torch.float16)
 
-    def test_allgather_float32(self):
-        """Test allgather with float32 tensors."""
-        self._test_allgather_helper(shape=(256,), dtype=torch.float32)
+    def test_allreduce_2d_tensor_float16(self):
+        """Test allreduce with 2D tensor shapes using float16."""
+        self._test_allreduce_helper(shape=(4, 64), dtype=torch.float16)
 
-    def test_allgather_int32(self):
-        """Test allgather with int32 tensors."""
-        self._test_allgather_helper(shape=(192,), dtype=torch.int32)
+    def test_allreduce_float16_async(self):
+        """Test allreduce with float16 tensors using async_op=True."""
+        self._test_allreduce_helper(shape=(128,), dtype=torch.float16, async_op=True)
 
-    def test_allgather_2d_tensor_float16(self):
-        """Test allgather with 2D tensor shapes using float16."""
-        self._test_allgather_helper(shape=(4, 64), dtype=torch.float16)
-
-    def test_allgather_2d_tensor_float32(self):
-        """Test allgather with 2D tensor shapes using float32."""
-        self._test_allgather_helper(shape=(4, 64), dtype=torch.float32)
-
-    def test_allgather_2d_tensor_int32(self):
-        """Test allgather with 2D tensor shapes using int32."""
-        self._test_allgather_helper(shape=(4, 64), dtype=torch.int32)
-
-    def test_allgather_float16_async(self):
-        """Test allgather with float16 tensors using async_op=True."""
-        self._test_allgather_helper(shape=(128,), dtype=torch.float16, async_op=True)
-
-    def test_allgather_float32_async(self):
-        """Test allgather with float32 tensors using async_op=True."""
-        self._test_allgather_helper(shape=(256,), dtype=torch.float32, async_op=True)
-
-    def test_allgather_int32_async(self):
-        """Test allgather with int32 tensors using async_op=True."""
-        self._test_allgather_helper(shape=(192,), dtype=torch.int32, async_op=True)
-
-    def test_allgather_2d_tensor_float16_async(self):
-        """Test allgather with 2D float16 tensors using async_op=True."""
-        self._test_allgather_helper(shape=(4, 64), dtype=torch.float16, async_op=True)
+    def test_allreduce_2d_tensor_float16_async(self):
+        """Test allreduce with 2D tensor shapes using float16 and async_op=True."""
+        self._test_allreduce_helper(shape=(4, 64), dtype=torch.float16, async_op=True)
 
 
 if __name__ == "__main__":
