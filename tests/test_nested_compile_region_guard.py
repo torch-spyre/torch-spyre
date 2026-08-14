@@ -77,17 +77,13 @@ def _region_block(block):
 class TestNestedCompileRegionGuard(unittest.TestCase):
     def test_patch_is_installed(self):
         # Sanity: the Spyre guard patch is active in this process.
-        self.assertEqual(
-            GuardBuilder.TENSOR_MATCH.__name__, "_spyre_TENSOR_MATCH"
-        )
+        self.assertEqual(GuardBuilder.TENSOR_MATCH.__name__, "_spyre_TENSOR_MATCH")
 
     def test_spyre_guard_registered_for_subgraph_reuse(self):
         # The fix: _spyre_TENSOR_MATCH must be dispatchable during subgraph
         # reuse. Guard.create_fn_name() reports create_fn.__name__, so the
         # registry key is exactly this string.
-        self.assertIn(
-            "_spyre_TENSOR_MATCH", _dynamo_guards.GUARD_VALUE_DISPATCH
-        )
+        self.assertIn("_spyre_TENSOR_MATCH", _dynamo_guards.GUARD_VALUE_DISPATCH)
         self.assertTrue(hasattr(GuardBuilder.TENSOR_MATCH, "guard_check_spec"))
 
     def test_region_block_reused_across_layers_cpu(self):
