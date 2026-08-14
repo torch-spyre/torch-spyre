@@ -110,6 +110,17 @@ def op_read_writes(op: Operation) -> ReadWrites:
     return rw
 
 
+def op_short_name(op: Operation) -> str:
+    """Resolve an operation's short name, including fused FX origins."""
+
+    for fx_node in (getattr(op, "origin_node", None), *getattr(op, "origins", ())):
+        target = getattr(fx_node, "target", None)
+        for attr in ("_opname", "__name__", "name"):
+            if name := getattr(target, attr, None):
+                return str(name)
+    return "None"
+
+
 def invalidate_op_read_writes(op: Operation) -> None:
     """Drop any memoized :func:`op_read_writes` result for ``op``.
 
@@ -1670,7 +1681,7 @@ def _per_core_view_from_prep(
         if prep.is_matmul and config.core_id_k_fast_emission
         else None
     )
-    core_to_slot_by_name = core_to_slice_mapping(
+    core_to_slot = core_to_slice_mapping(
         iter_symbols,
         dim_splits,
         num_cores,
@@ -1681,9 +1692,7 @@ def _per_core_view_from_prep(
     # compare equal even if they name their iter axes differently.
     pruned_core_to_slot: list[tuple[int, "Expr"]] = []
     for sym, dev_dim in sym_to_device_dim.items():
-        expr = core_to_slot_by_name.get(str(sym))
-        if expr is not None:
-            pruned_core_to_slot.append((dev_dim, expr))
+        pruned_core_to_slot.append((dev_dim, core_to_slot[sym]))
     pruned_core_to_slot.sort(key=lambda x: x[0])
 
     view = PerCoreView(

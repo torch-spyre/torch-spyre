@@ -36,12 +36,18 @@ from collections.abc import Iterator, Mapping, Sequence
 
 import sympy
 
-from torch_spyre._inductor.op_spec import DebugHandle, LoopSpec, OpSpec, TensorArg
+from torch_spyre._inductor.op_spec import (
+    DebugHandle,
+    LoopSpec,
+    OpSpec,
+    TensorArg,
+    TensorWorkDivision,
+)
 
 
-# Version 1 defines the first public finalized-bundle fingerprint as an
-# 80-bit digest prefix. Once published, any canonicalization or width change
-# must bump this version so persisted sidecars are never reinterpreted.
+# Bump this only when existing v1 identities would be reinterpreted, or when the
+# key width changes. New optional fields may extend identity without a bump when
+# they are omitted for all previously representable bundles.
 _KERNEL_BUNDLE_KEY_DOMAIN = "spyre-kernel-bundle"
 KERNEL_PROVENANCE_KEY_VERSION = 1
 KERNEL_PROVENANCE_KEY_BASE32_WIDTH = 16
@@ -65,10 +71,15 @@ _EXPECTED_TENSOR_ARG_SCHEMA = {
     "device_dtype": "DataFormats",
     "device_size": "list[int]",
     "device_coordinates": "list[Expr]",
-    "allocation": "Any",
+    "allocation": "dict[str, Any]",
     "name": "str | None",
     "device_tile_advance_expr": "Expr | None",
     "element_arrangement": "ElementArrangement",
+    "work_division": "TensorWorkDivision | None",
+}
+_EXPECTED_TENSOR_WORK_DIVISION_SCHEMA = {
+    "work_slices": "dict[Symbol, int]",
+    "core_id_to_work_slice": "dict[Symbol, Expr]",
 }
 _EXPECTED_LOOP_SPEC_SCHEMA = {
     "count": "Expr",
@@ -175,8 +186,8 @@ def _kernel_bundle_key(specs: Sequence[OpSpec | LoopSpec]) -> str:
     The canonical payload contains execution-relevant OpSpec/LoopSpec structure
     and the directly attached handle ID at every OpSpec position. It excludes
     Python identities, temporary output paths, generated kernel counters, and
-    runtime launch state. Any canonicalization change requires a visible format
-    version bump.
+    runtime launch state. Changes that reinterpret existing canonical payloads
+    require a visible format version bump.
     """
     payload = {
         "domain": _KERNEL_BUNDLE_KEY_DOMAIN,
@@ -196,6 +207,7 @@ def _validate_finalized_schema() -> None:
     schemas = (
         (OpSpec, _EXPECTED_OP_SPEC_SCHEMA),
         (TensorArg, _EXPECTED_TENSOR_ARG_SCHEMA),
+        (TensorWorkDivision, _EXPECTED_TENSOR_WORK_DIVISION_SCHEMA),
         (LoopSpec, _EXPECTED_LOOP_SPEC_SCHEMA),
     )
     for schema, expected_schema in schemas:
@@ -258,7 +270,7 @@ def _canonical_spec(spec: object) -> object:
 
 
 def _canonical_tensor_arg(arg: TensorArg) -> object:
-    return {
+    result = {
         "is_input": arg.is_input,
         "arg_index": arg.arg_index,
         "device_dtype": str(arg.device_dtype),
@@ -269,6 +281,16 @@ def _canonical_tensor_arg(arg: TensorArg) -> object:
         "device_tile_advance_expr": _canonical_value(arg.device_tile_advance_expr),
         "element_arrangement": arg.element_arrangement.name,
     }
+    # Preserve existing v1 identities for ordinary tensors. Ownership changes
+    # execution only when a relayout tensor carries an explicit override.
+    if arg.work_division is not None:
+        result["work_division"] = {
+            "work_slices": _canonical_value(arg.work_division.work_slices),
+            "core_id_to_work_slice": _canonical_value(
+                arg.work_division.core_id_to_work_slice
+            ),
+        }
+    return result
 
 
 def _canonical_value(value: object) -> object:
