@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .pass_utils import PerCoreView
 
 from sympy import Expr
 import torch
@@ -99,6 +102,7 @@ class FixedTiledLayout(FixedLayout):
         super().__init__(device, dtype, size, stride, offset)
         self.device_layout: SpyreTensorLayout = device_layout
         self.allocation: dict[str, Any] = {}
+        self.lx_view: Optional["PerCoreView"] = None
 
     def __str__(self) -> str:
         device_index_str = "" if self.device.index is None else f":{self.device.index}"

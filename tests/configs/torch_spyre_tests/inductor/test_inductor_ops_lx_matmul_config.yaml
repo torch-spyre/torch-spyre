@@ -27,10 +27,23 @@ test_suite_config:
             - LxPlanning.*::test_mm_mm_55x2_2x99_lx_planning_pointwise
             - LxPlanning.*::test_addmm_1152_10x1152_1152x1152_lx_planning_reduction
             - LxPlanning.*::test_addmm_out_basic_lx_planning_reduction
-            - LxPlanning.*::test_large_matmul_matmul_2d_M2048_K2048_N65536_lx_planning_reduction
-            - LxPlanning.*::test_large_matmul_matmul_4d_B2_H2_M2048_K2048_N65536_lx_planning_pointwise
             - LxPlanning.*::test_fp8_scaled_mm_128x128x128_1.0_1.0_0.0_lx_planning_(pointwise|reduction)
           mode: xfail
+        # Known LX-planning failures for the large-matmul variants. Kept in a
+        # separate xfail entry so they carry the slow__plat_* tags: a variant
+        # resolves to exactly one entry, so the slow tags MUST live on the
+        # entry the variant selects (the first matching entry, which for these
+        # tagless names is this xfail entry) or --skip-slow cannot deselect
+        # them. Without the tags here, --skip-slow left these ~1 hour tests
+        # running on ppc64le and s390x.
+        - names:
+            - LxPlanning.*::test_large_matmul_matmul_2d_M2048_K2048_N65536_lx_planning_reduction
+            - LxPlanning.*::test_large_matmul_matmul_4d_B2_H2_M2048_K2048_N65536_lx_planning_pointwise
+          mode: xfail
+          tags:
+            - ops__inductor-matmul
+            - slow__plat_ppc64
+            - slow__plat_s390x
         - names:
             - LxPlanning.*::test_(addmm|mm|bmm|einsum|matmul|linear).*_lx_planning_(pointwise|reduction)
           mode: mandatory_success

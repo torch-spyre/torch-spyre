@@ -21,6 +21,7 @@
 #include <pybind11/native_enum.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <spyrecode-host-functions/sendataconvert/sen_data_convert.h>
 #include <util/sendefs/sendefs.h>
 
@@ -29,10 +30,12 @@
 #include <flex/flex.hpp>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "job_plan.h"
+#include "kernel_provenance_registry.h"
 
 #ifdef USE_SPYRE_CCL
 #include <pybind11/chrono.h>
@@ -196,6 +199,36 @@ PYBIND11_MODULE(_C, m) {
   }
 
   m.doc() = "Spyre C++ bindings";
+  m.attr("AIUPTI_ACTIVITY_NAME_MAX_BYTES") =
+      py::int_(spyre::kAIUptiActivityNameMaxBytes);
+  m.def("register_kernel_provenance", &spyre::registerKernelProvenance,
+        py::arg("event_base_name"), py::arg("debug_handle_ids"),
+        "Register direct debug-handle IDs for a provenance-aware event name");
+  m.def(
+      "lookup_kernel_provenance",
+      [](const std::string& key) -> py::object {
+        const auto ids = spyre::lookupKernelProvenance(key);
+        if (ids == nullptr) {
+          return py::none();
+        }
+        return py::cast(*ids);
+      },
+      py::arg("key"), "Return registered debug-handle IDs without mutation");
+  m.def(
+      "kernel_provenance_registry_stats",
+      []() {
+        const auto stats = spyre::kernelProvenanceRegistryStats();
+        py::dict result;
+        result["entries"] = stats.entries;
+        result["hits"] = stats.hits;
+        result["misses"] = stats.misses;
+        result["conflicts"] = stats.conflicts;
+        return result;
+      },
+      "Return process-lifetime kernel provenance registry counters");
+  m.def("extract_kernel_provenance_key", &spyre::extractKernelProvenanceKey,
+        py::arg("event_name"),
+        "Extract a canonical bundle key from a Spyre profiler event name");
   m.def("start_runtime", &spyre::startRuntime);
   m.def("free_runtime", &spyre::freeRuntime);
   m.def("device_count", &spyre::getVisibleDeviceCount);
@@ -453,6 +486,21 @@ PYBIND11_MODULE(_C, m) {
           },
           py::arg("idx"),
           "Get the pipeline_barrier flag for the step at the given index")
+      .def(
+          "get_step_name",
+          [](const spyre::JobPlan& plan,
+             size_t idx) -> std::optional<std::string> {
+            TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");
+            const auto* compute =
+                dynamic_cast<const spyre::JobPlanStepCompute*>(
+                    plan.steps[idx].get());
+            if (compute == nullptr) {
+              return std::nullopt;
+            }
+            return compute->getName();
+          },
+          py::arg("idx"),
+          "Get the profiler-visible name for a compute step, or None")
       .def("__repr__", [](const spyre::JobPlan& plan) {
         return "<JobPlan steps=" + std::to_string(plan.steps.size()) +
                " job_allocation_size=" +
@@ -463,13 +511,15 @@ PYBIND11_MODULE(_C, m) {
                ">";
       });
   m.def("prepare_kernel", &spyre::prepareKernel, py::arg("spyrecode_dir"),
-        py::arg("stream") = nullptr,
+        py::arg("stream") = nullptr, py::arg("profiler_name") = std::nullopt,
         "Prepare a kernel from a SpyreCode directory and return a JobPlan.\n\n"
         "Args:\n"
         "    spyrecode_dir (str): Path to the SpyreCode directory\n"
         "    stream (SpyreStream, optional): Stream to use for initialization "
         "transfers.\n"
         "        If None, uses the current stream. Defaults to None.\n\n"
+        "    profiler_name (str, optional): Bounded base name for "
+        "profiler-visible compute events. Defaults to None.\n\n"
         "Returns:\n"
         "    Prepared JobPlan ready for execution");
   // Bind the current-stream overload (resolves the current stream internally).

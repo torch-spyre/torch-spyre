@@ -14,7 +14,9 @@
 
 """Tests for PrepareKernel Python bindings and JobPlan verification."""
 
+import base64
 import copy
+import hashlib
 import json
 import os
 import tempfile
@@ -24,7 +26,7 @@ import torch
 import torch_spyre
 
 
-@pytest.fixture(scope="module", autouse=True)
+@pytest.fixture(scope="module")
 def initialize_runtime():
     """Initialize Spyre runtime before running tests."""
     # Initialize torch with spyre device to start runtime
@@ -33,6 +35,61 @@ def initialize_runtime():
     # Runtime cleanup happens automatically
 
 
+@pytest.fixture
+def registry_key(request):
+    """Derive a reproducible canonical key from the current test node."""
+    digest = hashlib.sha256(request.node.nodeid.encode("utf-8")).digest()[:10]
+    return base64.b32encode(digest).decode("ascii").lower()
+
+
+def _registry_event_name(key):
+    return f"spyre_kernel_v1_registry_test_{key}"
+
+
+def test_kernel_provenance_registry_insert_and_duplicate(registry_key):
+    event_name = _registry_event_name(registry_key)
+    before = torch_spyre._C.kernel_provenance_registry_stats()
+
+    assert torch_spyre._C.register_kernel_provenance(event_name, ["11", "12"])
+    after_insert = torch_spyre._C.kernel_provenance_registry_stats()
+    assert after_insert["entries"] == before["entries"] + 1
+
+    assert torch_spyre._C.register_kernel_provenance(event_name, ["11", "12"])
+    after_duplicate = torch_spyre._C.kernel_provenance_registry_stats()
+    assert after_duplicate["entries"] == after_insert["entries"]
+    assert after_duplicate["conflicts"] == after_insert["conflicts"]
+    before_lookup = torch_spyre._C.kernel_provenance_registry_stats()
+    assert torch_spyre._C.lookup_kernel_provenance(registry_key) == ["11", "12"]
+    after_lookup = torch_spyre._C.kernel_provenance_registry_stats()
+    assert after_lookup["hits"] == before_lookup["hits"] + 1
+
+
+def test_kernel_provenance_registry_rejects_conflict_without_overwrite(registry_key):
+    event_name = _registry_event_name(registry_key)
+    assert torch_spyre._C.register_kernel_provenance(event_name, ["21"])
+    before = torch_spyre._C.kernel_provenance_registry_stats()
+
+    assert not torch_spyre._C.register_kernel_provenance(event_name, ["22"])
+
+    after = torch_spyre._C.kernel_provenance_registry_stats()
+    assert after["entries"] == before["entries"]
+    assert after["conflicts"] == before["conflicts"] + 1
+    assert torch_spyre._C.lookup_kernel_provenance(registry_key) == ["21"]
+
+
+def test_kernel_provenance_registry_miss_and_unparseable_name(registry_key):
+    before = torch_spyre._C.kernel_provenance_registry_stats()
+    assert torch_spyre._C.lookup_kernel_provenance(registry_key) is None
+    after_miss = torch_spyre._C.kernel_provenance_registry_stats()
+    assert after_miss["misses"] == before["misses"] + 1
+
+    assert not torch_spyre._C.register_kernel_provenance("not_an_event", ["31"])
+    after_invalid = torch_spyre._C.kernel_provenance_registry_stats()
+    assert after_invalid["entries"] == after_miss["entries"]
+    assert after_invalid["conflicts"] == after_miss["conflicts"]
+
+
+@pytest.mark.usefixtures("initialize_runtime")
 class TestPrepareKernel:
     """Test suite for PrepareKernel and JobPlan bindings."""
 
@@ -161,6 +218,130 @@ class TestPrepareKernel:
 
             # First step should be ComputeSpecialize
             assert job_plan.get_step_type(0) == "Compute"
+
+    def test_profiler_name_overrides_spyrecode_name_and_adds_step_suffix(self):
+        """Compiler provenance name identifies every device-compute step."""
+        profiler_name = "spyre_kernel_v1_fused_mm_" + "a" * 16
+        job_exec_plan = [
+            {
+                "command": "ComputeOnDevice",
+                "properties": {
+                    "job_bin_ptr": "120259084288",
+                    "name": "legacy_name",
+                },
+            },
+            {
+                "command": "ComputeOnDevice",
+                "properties": {"job_bin_ptr": "120259084288"},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, job_exec_plan=job_exec_plan
+            )
+
+            job_plan = torch_spyre._C.prepare_kernel(
+                spyrecode_dir,
+                profiler_name=profiler_name,
+            )
+
+            assert job_plan.get_step_name(0) == f"{profiler_name}#0"
+            assert job_plan.get_step_name(1) == f"{profiler_name}#1"
+
+    def test_profiler_name_accepts_exact_aiupti_limit(self):
+        """The finalized name may fill the AIUPTI buffer through byte 127."""
+        suffix = "#0"
+        profiler_name = "p" * (
+            torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES - len(suffix)
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+
+            job_plan = torch_spyre._C.prepare_kernel(
+                spyrecode_dir,
+                profiler_name=profiler_name,
+            )
+
+            assert job_plan.get_step_name(0) == profiler_name + suffix
+
+    def test_profiler_name_rejects_final_name_over_aiupti_limit(self):
+        """The C++ boundary checks the name after adding the step suffix."""
+        suffix = "#0"
+        profiler_name = "p" * (
+            torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES - len(suffix) + 1
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+
+            with pytest.raises(
+                RuntimeError,
+                match="profiler-visible compute name exceeds AIUPTI limit",
+            ):
+                torch_spyre._C.prepare_kernel(
+                    spyrecode_dir,
+                    profiler_name=profiler_name,
+                )
+
+    def test_spyrecode_compute_name_is_preserved_without_profiler_name(self):
+        """Existing named SpyreCode plans retain their current behavior."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir,
+                exec_properties={
+                    "job_bin_ptr": "120259084288",
+                    "name": "legacy_name",
+                },
+            )
+
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            assert job_plan.get_step_name(0) == "legacy_name"
+
+    def test_overlong_spyrecode_compute_name_remains_backend_controlled(self):
+        """A backend label over the provenance limit must not fail preparation."""
+        backend_name = "b" * (torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES + 1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir,
+                exec_properties={
+                    "job_bin_ptr": "120259084288",
+                    "name": backend_name,
+                },
+            )
+
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            assert job_plan.get_step_name(0) == backend_name
+
+    def test_overlong_directory_compute_name_fallback_does_not_fail(self):
+        """Graceful provenance fallback must not make preparation fatal."""
+        prefix = "k" * torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES
+        with tempfile.TemporaryDirectory(prefix=prefix) as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            expected = os.path.join(
+                os.path.basename(tmpdir),
+                "spyreCodeDir",
+                "bundle.mlir#0",
+            )
+            assert len(expected) > torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES
+            assert job_plan.get_step_name(0) == expected
+
+    def test_directory_compute_name_fallback_is_preserved(self):
+        """Older unnamed plans retain the directory-derived fallback."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            expected = os.path.join(
+                os.path.basename(tmpdir),
+                "spyreCodeDir",
+                "bundle.mlir#0",
+            )
+            assert job_plan.get_step_name(0) == expected
 
     def test_prepare_kernel_invalid_directory(self):
         """Test PrepareKernel with invalid directory."""

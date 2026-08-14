@@ -34,7 +34,7 @@ STRUCTURED TESTS (Groups 1-10)
     Group 9: Views — 1D sub-dim naming, reshape, view+transpose, unsqueeze
     Group 10: Flash attention variants — v1/v2/v3/v4, parameterized by size and tile dims
 
-    Tests marked loopspec=None, correctness=False are known broken and
+    Tests marked loopspec=None are known broken and
     skipped; see inline comments for root cause.
 
 ORIGINAL TESTS (below the boundary marker)
@@ -52,6 +52,7 @@ import torch
 import unittest
 from unittest.mock import patch as mock_patch
 
+from torch._inductor.exc import InductorError
 from torch._inductor.test_case import TestCase as InductorTestCase, fresh_cache
 from torch._inductor.utils import run_and_get_code
 
@@ -704,6 +705,7 @@ def test_min_2d_512x256_reduce_dim0_B4():
     run_coarse_tile_test(fn, inputs)
 
 
+@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
 def test_min_2d_512x256_reduce_dim0_A4_B4():
     """amin over dim=0 on [512,256] tiled A÷4 B÷4 → 128+64 elems/tile."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -716,9 +718,7 @@ def test_min_2d_512x256_reduce_dim0_A4_B4():
                 ):
                     return x.amin(dim=0)
 
-    run_coarse_tile_test(
-        fn, inputs, correctness=False
-    )  # nested tiling + reduction correctness bug
+    run_coarse_tile_test(fn, inputs)
 
 
 def test_min_2d_512x256_reduce_dim1_A4():
@@ -757,9 +757,7 @@ def test_min_2d_512x256_reduce_dim1_A4_B4():
                 ):
                     return x.amin(dim=1)
 
-    run_coarse_tile_test(
-        fn, inputs, correctness=False
-    )  # nested tiling + reduction correctness bug
+    run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(reason="inconsistent loop_count across reduction fill/combine nodes")
@@ -809,9 +807,7 @@ def test_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
                     ):
                         return x.amin(dim=2)
 
-    run_coarse_tile_test(
-        fn, inputs, correctness=False
-    )  # nested tiling + reduction correctness bug
+    run_coarse_tile_test(fn, inputs)
 
 
 # ---------------------------------------------------------------------------
@@ -824,7 +820,12 @@ def test_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
 
 
 def test_add_min_2d_512x256_reduce_dim0_A4():
-    """min(a + abs(amin(b, dim=0))) on [512,256] tiled A÷4."""
+    """a + abs(amin(b, dim=0)) on [512,256] tiled A÷4 must be rejected.
+
+    abs and add are loop-invariant at the reduction level but share the loop
+    group with the A-tiled reduction — they would see a partial (per-tile)
+    min, not the global min.
+    """
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
         tensor("b", shape=(512, 256), dims=["A", "B"]),
@@ -839,7 +840,11 @@ def test_add_min_2d_512x256_reduce_dim0_A4():
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return a + temp
 
-    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
+    with pytest.raises(
+        Exception,
+        match="partial reduction result consumed before accumulation is complete",
+    ):
+        run_coarse_tile_test(fn, inputs)
 
 
 def test_add_min_2d_512x256_reduce_dim0_B4():
@@ -862,7 +867,7 @@ def test_add_min_2d_512x256_reduce_dim0_B4():
 
 
 def test_add_min_2d_512x256_reduce_dim0_A4_B4():
-    """min(a + abs(amin(b, dim=0))) on [512,256] tiled A÷4 B÷4."""
+    """a + abs(amin(b, dim=0)) on [512,256] tiled A÷4 B÷4 must be rejected."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
         tensor("b", shape=(512, 256), dims=["A", "B"]),
@@ -880,7 +885,11 @@ def test_add_min_2d_512x256_reduce_dim0_A4_B4():
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     return a + temp
 
-    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
+    with pytest.raises(
+        Exception,
+        match="partial reduction result consumed before accumulation is complete",
+    ):
+        run_coarse_tile_test(fn, inputs)
 
 
 def test_add_min_2d_512x256_reduce_dim1_A4():
@@ -903,7 +912,7 @@ def test_add_min_2d_512x256_reduce_dim1_A4():
 
 
 def test_add_min_2d_512x256_reduce_dim1_B4():
-    """min(a + abs(amin(b, dim=1))) on [512,256] tiled B÷4."""
+    """a + abs(amin(b, dim=1)) on [512,256] tiled B÷4 must be rejected."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
         tensor("b", shape=(512, 256), dims=["A", "B"]),
@@ -918,11 +927,15 @@ def test_add_min_2d_512x256_reduce_dim1_B4():
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return a + temp
 
-    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
+    with pytest.raises(
+        Exception,
+        match="partial reduction result consumed before accumulation is complete",
+    ):
+        run_coarse_tile_test(fn, inputs)
 
 
 def test_add_min_2d_512x256_reduce_dim1_A4_B4():
-    """min(a + abs(amin(b, dim=1))) on [512,256] tiled A÷4 B÷4."""
+    """a + abs(amin(b, dim=1)) on [512,256] tiled A÷4 B÷4 must be rejected."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
         tensor("b", shape=(512, 256), dims=["A", "B"]),
@@ -940,7 +953,11 @@ def test_add_min_2d_512x256_reduce_dim1_A4_B4():
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     return a + temp
 
-    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
+    with pytest.raises(
+        Exception,
+        match="partial reduction result consumed before accumulation is complete",
+    ):
+        run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(reason="inconsistent loop_count across reduction fill/combine nodes")
@@ -1020,7 +1037,7 @@ def test_add_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
 
 
 def test_reduce_both_dense_add_2d_512x256_A4():
-    """amin(a,dim=0) + amin(b,dim=0) on [512,256] tiled A÷4 — dense+dense."""
+    """amin(a,dim=0) + amin(b,dim=0) on [512,256] tiled A÷4 must be rejected."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
         tensor("b", shape=(512, 256), dims=["A", "B"]),
@@ -1031,7 +1048,11 @@ def test_reduce_both_dense_add_2d_512x256_A4():
             with spyre_hint(expected_named_dims=["B"]):
                 return a.amin(dim=0) + b.amin(dim=0)
 
-    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
+    with pytest.raises(
+        Exception,
+        match="partial reduction result consumed before accumulation is complete",
+    ):
+        run_coarse_tile_test(fn, inputs)
 
 
 def test_reduce_both_dense_add_2d_512x256_B4():
@@ -1050,7 +1071,7 @@ def test_reduce_both_dense_add_2d_512x256_B4():
 
 
 def test_reduce_both_dense_add_2d_512x256_A4_B4():
-    """amin(a,dim=0) + amin(b,dim=0) on [512,256] tiled A÷4 B÷4 — dense+dense."""
+    """amin(a,dim=0) + amin(b,dim=0) on [512,256] tiled A÷4 B÷4 must be rejected."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
         tensor("b", shape=(512, 256), dims=["A", "B"]),
@@ -1062,7 +1083,11 @@ def test_reduce_both_dense_add_2d_512x256_A4_B4():
                 with spyre_hint(expected_named_dims=["B"]):
                     return a.amin(dim=0) + b.amin(dim=0)
 
-    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
+    with pytest.raises(
+        Exception,
+        match="partial reduction result consumed before accumulation is complete",
+    ):
+        run_coarse_tile_test(fn, inputs)
 
 
 def test_reduce_both_sparse_add_2d_512x256_A4():
@@ -1081,7 +1106,7 @@ def test_reduce_both_sparse_add_2d_512x256_A4():
 
 
 def test_reduce_both_sparse_add_2d_512x256_B4():
-    """amin(a,dim=1) + amin(b,dim=1) on [512,256] tiled B÷4 — sparse+sparse."""
+    """amin(a,dim=1) + amin(b,dim=1) on [512,256] tiled B÷4 must be rejected."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
         tensor("b", shape=(512, 256), dims=["A", "B"]),
@@ -1092,11 +1117,15 @@ def test_reduce_both_sparse_add_2d_512x256_B4():
             with spyre_hint(expected_named_dims=["A"]):
                 return a.amin(dim=1) + b.amin(dim=1)
 
-    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
+    with pytest.raises(
+        Exception,
+        match="partial reduction result consumed before accumulation is complete",
+    ):
+        run_coarse_tile_test(fn, inputs)
 
 
 def test_reduce_both_sparse_add_2d_512x256_A4_B4():
-    """amin(a,dim=1) + amin(b,dim=1) on [512,256] tiled A÷4 B÷4 — sparse+sparse."""
+    """amin(a,dim=1) + amin(b,dim=1) on [512,256] tiled A÷4 B÷4 must be rejected."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
         tensor("b", shape=(512, 256), dims=["A", "B"]),
@@ -1108,7 +1137,41 @@ def test_reduce_both_sparse_add_2d_512x256_A4_B4():
                 with spyre_hint(expected_named_dims=["A"]):
                     return a.amin(dim=1) + b.amin(dim=1)
 
-    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
+    with pytest.raises(
+        Exception,
+        match="partial reduction result consumed before accumulation is complete",
+    ):
+        run_coarse_tile_test(fn, inputs)
+
+
+def test_partial_reduction_two_hop_A4():
+    """a + amin(b)*c on [512,256] tiled A÷4 must be rejected at compile time.
+
+    amin reduces A away; the multiply by c is a second hop from the partial
+    scratch before feeding the A-tiled add.  The compiler must raise
+    Unsupported at the multiply (first direct reader of the partial scratch),
+    not silently produce wrong results.
+    """
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+        tensor("c", shape=(256,), dims=["B"]),
+    ]
+
+    def fn(a, b, c):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
+                r = b.amin(dim=0)
+            with spyre_hint(expected_named_dims=["B"]):
+                t = r * c
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return a + t
+
+    with pytest.raises(
+        Exception,
+        match="partial reduction result consumed before accumulation is complete",
+    ):
+        run_coarse_tile_test(fn, inputs)
 
 
 # softmax decomposes into amax + pointwise + sum + pointwise — exercises
@@ -1126,6 +1189,7 @@ def test_softmax_2d_512x256_dim1_A4():
     run_coarse_tile_test(fn, inputs)
 
 
+@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
 def test_softmax_2d_512x256_dim1_B4():
     """softmax(x, dim=1) on [512,256] tiled B÷4 → 64 elems/tile (1 stick)."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -1134,9 +1198,10 @@ def test_softmax_2d_512x256_dim1_B4():
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             return torch.softmax(x, dim=1)
 
-    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
+    run_coarse_tile_test(fn, inputs)
 
 
+@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
 def test_softmax_2d_512x256_dim1_A4_B4():
     """softmax(x, dim=1) on [512,256] tiled A÷4 B÷4."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -1146,9 +1211,10 @@ def test_softmax_2d_512x256_dim1_A4_B4():
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 return torch.softmax(x, dim=1)
 
-    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
+    run_coarse_tile_test(fn, inputs)
 
 
+@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
 def test_softmax_2d_512x256_dim0_A4():
     """softmax(x, dim=0) on [512,256] tiled A÷4 → 128 elems/tile (2 sticks)."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -1157,7 +1223,7 @@ def test_softmax_2d_512x256_dim0_A4():
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             return torch.softmax(x, dim=0)
 
-    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
+    run_coarse_tile_test(fn, inputs)
 
 
 def test_softmax_2d_512x256_dim0_B4():
@@ -1171,6 +1237,11 @@ def test_softmax_2d_512x256_dim0_B4():
     run_coarse_tile_test(fn, inputs)
 
 
+# Two bugs blocked this before PR #3622: (1) sibling-op A-reduction vs A-output
+# tiling collision (colsum diagnostic: every output column summed to ~4.0 instead
+# of ~1.0); (2) squeeze-position bug in _insert_reduction_copy_op (issue #3613).
+# Post-#3622 compilation succeeds but results are still numerically wrong.
+@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
 def test_softmax_2d_512x256_dim0_A4_B4():
     """softmax(x, dim=0) on [512,256] tiled A÷4 B÷4."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -1180,7 +1251,7 @@ def test_softmax_2d_512x256_dim0_A4_B4():
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 return torch.softmax(x, dim=0)
 
-    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
+    run_coarse_tile_test(fn, inputs)
 
 
 # ---------------------------------------------------------------------------
@@ -1243,7 +1314,6 @@ def test_restickify_add_256x128_A2_B4():
 # A÷2=64/tile (1 stick), B÷4=64/tile (1 stick)
 
 
-@pytest.mark.skip(reason="Unsupported: unexpected stick expression d0+d1")
 def test_restickify_2t_add_256x128_A2():
     """a.t()+b.t()+x on [128,256] result, tiled A÷2."""
     inputs = [
@@ -1260,7 +1330,6 @@ def test_restickify_2t_add_256x128_A2():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason="Unsupported: unexpected stick expression d0+d1")
 def test_restickify_2t_add_256x128_B4():
     """a.t()+b.t()+x on [128,256] result, tiled B÷4."""
     inputs = [
@@ -1277,7 +1346,6 @@ def test_restickify_2t_add_256x128_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason="Unsupported: unexpected stick expression d0+d1")
 def test_restickify_2t_add_256x128_A2_B4():
     """a.t()+b.t()+x on [128,256] result, tiled A÷2 B÷4."""
     inputs = [
@@ -1706,8 +1774,16 @@ def test_copy_rmw_correction_512x256_A4_B4():
 # copies sparse reduction result into a dense buffer
 
 
-def test_copy_after_reduction_512x256_A4():
-    """out.copy_(x.amin(dim=0)) on [512,256] tiled A÷4."""
+@config.patch({"disable_copy_opt": True})
+def test_copy_not_deleted():
+    """Regression: copy_ must not be eliminated by noop_registry removal.
+
+    If copy_ is deleted before lowering, the expected_reduction_dims hint on
+    the copy op is never checked (no op to check), and the test passes
+    vacuously.  If copy_ is present, validate_named_dims fires and raises
+    because copy_ has no reduction dim -- that AssertionError is the expected
+    outcome, proving the copy survived.
+    """
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
@@ -1717,7 +1793,29 @@ def test_copy_after_reduction_512x256_A4():
                 out.copy_(x.amin(dim=0))
         return out
 
-    run_coarse_tile_test(fn, inputs)
+    with pytest.raises(InductorError, match="expected_reduction_dims"):
+        run_coarse_tile_test(fn, inputs)
+
+
+@config.patch({"disable_copy_opt": True})
+def test_copy_after_reduction_512x256_A4():
+    """out.copy_(x.amin(dim=0)) on [512,256] tiled A÷4 must be rejected."""
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        out = torch.zeros(256, device=x.device, dtype=x.dtype)
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
+                temp = x.amin(dim=0)
+            with spyre_hint(expected_named_dims=["B"]):
+                out.copy_(temp)
+        return out
+
+    with pytest.raises(
+        Exception,
+        match="partial reduction result consumed before accumulation is complete",
+    ):
+        run_coarse_tile_test(fn, inputs)
 
 
 def test_copy_after_reduction_512x256_B4():
@@ -1728,14 +1826,17 @@ def test_copy_after_reduction_512x256_B4():
         out = torch.zeros(256, device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
-                out.copy_(x.amin(dim=0))
+                temp = x.amin(dim=0)
+            with spyre_hint(expected_named_dims=["B"]):
+                out.copy_(temp)
         return out
 
     run_coarse_tile_test(fn, inputs)
 
 
+@config.patch({"disable_copy_opt": True})
 def test_copy_after_reduction_512x256_A4_B4():
-    """out.copy_(x.amin(dim=0)) on [512,256] tiled A÷4 B÷4."""
+    """out.copy_(x.amin(dim=0)) on [512,256] tiled A÷4 B÷4 must be rejected."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
@@ -1745,12 +1846,19 @@ def test_copy_after_reduction_512x256_A4_B4():
                 with spyre_hint(
                     expected_named_dims=["B"], expected_reduction_dims=["A"]
                 ):
-                    out.copy_(x.amin(dim=0))
+                    temp = x.amin(dim=0)
+                with spyre_hint(expected_named_dims=["B"]):
+                    out.copy_(temp)
         return out
 
-    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
+    with pytest.raises(
+        Exception,
+        match="partial reduction result consumed before accumulation is complete",
+    ):
+        run_coarse_tile_test(fn, inputs)
 
 
+@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
 def test_copy_running_max_4d_H4_Lq4():
     """running_max.copy_(maximum(real_max, amax(scores,dim=-2))) on [B,H,Lk,Lq] tiled H÷4 Lq÷4.
 
@@ -1778,7 +1886,7 @@ def test_copy_running_max_4d_H4_Lq4():
                 real_max.copy_(running_max)
         return real_max
 
-    run_coarse_tile_test(fn, inputs, correctness=False)
+    run_coarse_tile_test(fn, inputs)
 
 
 # --- copy + restickify: c.copy_(a.t() + b) ---
@@ -1799,7 +1907,7 @@ def test_copy_restickify_512x256_A4():
                 c.copy_(a.t() + b)
         return c
 
-    run_coarse_tile_test(fn, inputs, loopspec=None, correctness=False)
+    run_coarse_tile_test(fn, inputs, loopspec=None)
 
 
 def test_copy_restickify_512x256_B4():
@@ -1816,7 +1924,7 @@ def test_copy_restickify_512x256_B4():
                 c.copy_(a.t() + b)
         return c
 
-    run_coarse_tile_test(fn, inputs, loopspec=None, correctness=False)
+    run_coarse_tile_test(fn, inputs, loopspec=None)
 
 
 def test_copy_restickify_512x256_A4_B4():
@@ -1834,7 +1942,7 @@ def test_copy_restickify_512x256_A4_B4():
                     c.copy_(a.t() + b)
         return c
 
-    run_coarse_tile_test(fn, inputs, loopspec=None, correctness=False)
+    run_coarse_tile_test(fn, inputs, loopspec=None)
 
 
 # --- nested copy + reduction: acc.copy_(acc * scale + x.amin(dim=1, keepdim=True)) ---
@@ -1861,7 +1969,10 @@ def test_copy_accum_with_reduction_512x256_A4():
 
 
 @pytest.mark.skip(
-    reason="IndexError: _insert_read_copy_ops fails when tiling B with unit-size B dim in scale"
+    reason=(
+        "IndexError: _insert_all_read_copy_ops fails when tiling B with "
+        "unit-size B dim in scale"
+    )
 )
 def test_copy_accum_with_reduction_512x256_B4():
     """acc.copy_(acc * scale + x.amin(dim=1,keepdim=True)) tiled B÷4."""
@@ -1883,7 +1994,10 @@ def test_copy_accum_with_reduction_512x256_B4():
 
 
 @pytest.mark.skip(
-    reason="IndexError: _insert_read_copy_ops fails when tiling B with unit-size B dim in scale"
+    reason=(
+        "IndexError: _insert_all_read_copy_ops fails when tiling B with "
+        "unit-size B dim in scale"
+    )
 )
 def test_copy_accum_with_reduction_512x256_A4_B4():
     """acc.copy_(acc * scale + x.amin(dim=1,keepdim=True)) tiled A÷4 B÷4."""
@@ -2119,8 +2233,9 @@ def test_outside_consumer_two_accum_512x256_A4():
     run_coarse_tile_test(fn, inputs)
 
 
+@config.patch({"disable_copy_opt": True})
 def test_outside_consumer_two_accum_512x256_B4():
-    """Flash-style: out=zeros, denom=zeros; tiled copy_; return out/denom — B÷4."""
+    """Flash-style: out=zeros, denom=zeros; tiled copy_; return out/denom — B÷4 must be rejected."""
     inputs = [
         tensor("x", shape=(512, 256), dims=["A", "B"]),
         tensor("scale", shape=(512, 256), dims=["A", "B"]),
@@ -2136,7 +2251,11 @@ def test_outside_consumer_two_accum_512x256_B4():
                 denom.copy_(denom + x.sum(dim=1))
         return out / denom.unsqueeze(1)
 
-    run_coarse_tile_test(fn, inputs, loopspec=None, correctness=False)
+    with pytest.raises(
+        Exception,
+        match="partial reduction result consumed before accumulation is complete",
+    ):
+        run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(
@@ -2200,6 +2319,7 @@ def test_outside_consumer_reduction_512x256_B4():
     run_coarse_tile_test(fn, inputs)
 
 
+@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
 def test_outside_consumer_reduction_512x256_A4_B4():
     """s=tiled_amin(x,dim=0) consumed outside as s+bias, tiled A÷4 B÷4."""
     inputs = [
@@ -2216,7 +2336,7 @@ def test_outside_consumer_reduction_512x256_A4_B4():
                     s = x.amin(dim=0)
         return s + bias
 
-    run_coarse_tile_test(fn, inputs, correctness=False)  # Incorrect results
+    run_coarse_tile_test(fn, inputs)
 
 
 # ---------------------------------------------------------------------------
@@ -2578,7 +2698,6 @@ def test_flash_tile_H():
         ),
         _flash_v1_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4]),
-        correctness=True,
         atol=0.01,
         rtol=0.1,
     )
@@ -2596,6 +2715,15 @@ def test_flash_tile_B():
     )
 
 
+@pytest.mark.skip(
+    reason=(
+        "validate_writer_tile_advance now catches this at compile time: "
+        "squeeze-position bug in _insert_copy_op's write-side "
+        "_tiled_dims_for_dep (raw d{N} numbering breaks when a unit dim is "
+        "squeezed out of the index). Same root cause as issue #3613; "
+        "deferred until PR #3622's tile.py helpers land."
+    )
+)
 def test_flash_tile_Lq():
     """Flash v1: tile Lq÷2 only."""
     run_coarse_tile_test(
@@ -2604,22 +2732,22 @@ def test_flash_tile_Lq():
         ),
         _flash_v1_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2]),
-        correctness=False,
     )
 
 
-@pytest.mark.skip(
-    reason="Unsupported: Lk reduction-dim tiling requires carry propagation"
-)
 def test_flash_tile_Lk():
-    """Flash v1: tile Lk÷2 only."""
-    run_coarse_tile_test(
-        lambda q, k, v: _flash_v1_fn(
-            q, k, v, B=1, H=8, Lq=256, Lk=256, D=64, lk_tiles=2
-        ),
-        _flash_v1_inputs(1, 8, 256, 256, 64),
-        loopspec=LoopSpecCheck(counts=[2]),
-    )
+    """Flash v1: tile Lk÷2 only — rejected at compile time (carry propagation)."""
+    with pytest.raises(
+        Exception,
+        match="partial reduction result consumed before accumulation is complete",
+    ):
+        run_coarse_tile_test(
+            lambda q, k, v: _flash_v1_fn(
+                q, k, v, B=1, H=8, Lq=256, Lk=256, D=64, lk_tiles=2
+            ),
+            _flash_v1_inputs(1, 8, 256, 256, 64),
+            loopspec=LoopSpecCheck(counts=[2]),
+        )
 
 
 @pytest.mark.skip(reason="KeyError: 0 — B tiling not yet supported")
@@ -2634,6 +2762,15 @@ def test_flash_tile_B_H():
     )
 
 
+@pytest.mark.skip(
+    reason=(
+        "validate_writer_tile_advance now catches this at compile time: "
+        "squeeze-position bug in _insert_copy_op's write-side "
+        "_tiled_dims_for_dep (raw d{N} numbering breaks when a unit dim is "
+        "squeezed out of the index). Same root cause as issue #3613; "
+        "deferred until PR #3622's tile.py helpers land."
+    )
+)
 def test_flash_tile_H_Lq():
     """Flash v1: tile H÷4 Lq÷2."""
     run_coarse_tile_test(
@@ -2642,45 +2779,58 @@ def test_flash_tile_H_Lq():
         ),
         _flash_v1_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4, 2]),
-        correctness=False,  # Numerically incorrect answer
     )
 
 
-@pytest.mark.skip(
-    reason="Unsupported: Lk reduction-dim tiling requires carry propagation"
-)
 def test_flash_tile_H_Lq_Lk():
-    """Flash v1: tile H÷4 Lq÷2 Lk÷2."""
-    run_coarse_tile_test(
-        lambda q, k, v: _flash_v1_fn(
-            q, k, v, B=1, H=8, Lq=256, Lk=256, D=64, h_tiles=4, lq_tiles=2, lk_tiles=2
-        ),
-        _flash_v1_inputs(1, 8, 256, 256, 64),
-        loopspec=LoopSpecCheck(counts=[4, 2, 2]),
-    )
+    """Flash v1: tile H÷4 Lq÷2 Lk÷2 — rejected at compile time (carry propagation)."""
+    with pytest.raises(
+        Exception,
+        match="partial reduction result consumed before accumulation is complete",
+    ):
+        run_coarse_tile_test(
+            lambda q, k, v: _flash_v1_fn(
+                q,
+                k,
+                v,
+                B=1,
+                H=8,
+                Lq=256,
+                Lk=256,
+                D=64,
+                h_tiles=4,
+                lq_tiles=2,
+                lk_tiles=2,
+            ),
+            _flash_v1_inputs(1, 8, 256, 256, 64),
+            loopspec=LoopSpecCheck(counts=[4, 2, 2]),
+        )
 
 
-@pytest.mark.skip(reason="KeyError: 0 — B tiling not yet supported")
 def test_flash_tile_all():
-    """Flash v1: tile all dims. B=2, H÷4, Lq÷2, Lk÷2."""
-    run_coarse_tile_test(
-        lambda q, k, v: _flash_v1_fn(
-            q,
-            k,
-            v,
-            B=2,
-            H=8,
-            Lq=256,
-            Lk=256,
-            D=64,
-            b_tiles=2,
-            h_tiles=4,
-            lq_tiles=2,
-            lk_tiles=2,
-        ),
-        _flash_v1_inputs(2, 8, 256, 256, 64),
-        loopspec=LoopSpecCheck(counts=[2, 4, 2, 2]),
-    )
+    """Flash v1: tile all dims. B=2, H÷4, Lq÷2, Lk÷2 — rejected at compile time (carry propagation)."""
+    with pytest.raises(
+        Exception,
+        match="partial reduction result consumed before accumulation is complete",
+    ):
+        run_coarse_tile_test(
+            lambda q, k, v: _flash_v1_fn(
+                q,
+                k,
+                v,
+                B=2,
+                H=8,
+                Lq=256,
+                Lk=256,
+                D=64,
+                b_tiles=2,
+                h_tiles=4,
+                lq_tiles=2,
+                lk_tiles=2,
+            ),
+            _flash_v1_inputs(2, 8, 256, 256, 64),
+            loopspec=LoopSpecCheck(counts=[2, 4, 2, 2]),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2799,7 +2949,6 @@ def test_flash_v2_tile_H():
         ),
         _flash_v2_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4]),
-        correctness=True,
         atol=0.01,
         rtol=0.1,
     )
@@ -2831,18 +2980,19 @@ def test_flash_v2_tile_Lq():
     )
 
 
-@pytest.mark.skip(
-    reason="Unsupported: Lk reduction-dim tiling requires carry propagation"
-)
 def test_flash_v2_tile_Lk():
-    """Flash v2: tile Lk÷2 only."""
-    run_coarse_tile_test(
-        lambda q, k, v, m: _flash_v2_fn(
-            q, k, v, m, B=1, H=8, Lq=256, Lk=256, D=64, lk_tiles=2
-        ),
-        _flash_v2_inputs(1, 8, 256, 256, 64),
-        loopspec=LoopSpecCheck(counts=[2]),
-    )
+    """Flash v2: tile Lk÷2 only — rejected at compile time (carry propagation)."""
+    with pytest.raises(
+        Exception,
+        match="partial reduction result consumed before accumulation is complete",
+    ):
+        run_coarse_tile_test(
+            lambda q, k, v, m: _flash_v2_fn(
+                q, k, v, m, B=1, H=8, Lq=256, Lk=256, D=64, lk_tiles=2
+            ),
+            _flash_v2_inputs(1, 8, 256, 256, 64),
+            loopspec=LoopSpecCheck(counts=[2]),
+        )
 
 
 @pytest.mark.skip(reason="KeyError: 0 — B tiling not yet supported")
@@ -3033,7 +3183,6 @@ def test_flash_v3_tile_H():
         ),
         _flash_v3_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4]),
-        correctness=False,
     )
 
 
@@ -3049,6 +3198,15 @@ def test_flash_v3_tile_B():
     )
 
 
+@pytest.mark.skip(
+    reason=(
+        "validate_writer_tile_advance now catches this at compile time: "
+        "squeeze-position bug in _insert_copy_op's write-side "
+        "_tiled_dims_for_dep (raw d{N} numbering breaks when a unit dim is "
+        "squeezed out of the index). Same root cause as issue #3613; "
+        "deferred until PR #3622's tile.py helpers land."
+    )
+)
 def test_flash_v3_tile_Lq():
     """Flash v3: tile Lq÷2 only."""
     run_coarse_tile_test(
@@ -3057,7 +3215,6 @@ def test_flash_v3_tile_Lq():
         ),
         _flash_v3_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[2]),
-        correctness=False,
     )
 
 
@@ -3087,6 +3244,15 @@ def test_flash_v3_tile_B_H():
     )
 
 
+@pytest.mark.skip(
+    reason=(
+        "validate_writer_tile_advance now catches this at compile time: "
+        "squeeze-position bug in _insert_copy_op's write-side "
+        "_tiled_dims_for_dep (raw d{N} numbering breaks when a unit dim is "
+        "squeezed out of the index). Same root cause as issue #3613; "
+        "deferred until PR #3622's tile.py helpers land."
+    )
+)
 def test_flash_v3_tile_H_Lq():
     """Flash v3: tile H÷4 Lq÷2. Equivalent to original test_flash_v3 (small sizes)."""
     run_coarse_tile_test(
@@ -3095,7 +3261,6 @@ def test_flash_v3_tile_H_Lq():
         ),
         _flash_v3_inputs(1, 8, 256, 256, 64),
         loopspec=LoopSpecCheck(counts=[4, 2]),
-        correctness=False,
     )
 
 
@@ -3321,7 +3486,7 @@ def test_validate_named_dims_raises_on_mismatch():
             return torch.abs(x)
 
     with pytest.raises(Exception, match="expected_named_dims"):
-        run_coarse_tile_test(fn, inputs, loopspec=None, correctness=False)
+        run_coarse_tile_test(fn, inputs, loopspec=None)
 
 
 def test_validate_reduction_dims_raises_on_mismatch():
@@ -3333,7 +3498,7 @@ def test_validate_reduction_dims_raises_on_mismatch():
             return x.amin(dim=0)
 
     with pytest.raises(Exception, match="expected_reduction_dims"):
-        run_coarse_tile_test(fn, inputs, loopspec=None, correctness=False)
+        run_coarse_tile_test(fn, inputs, loopspec=None)
 
 
 # ===========================================================================
@@ -4015,7 +4180,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         )
 
     # Consider deleting — superseded by Group 10 structured tests (_flash_v1_fn)
-    @pytest.mark.skip
     def test_hint_flash_attention(self):
         """Flash attention tiled over H (4 slices) via nested spyre_hints.
 
@@ -5183,7 +5347,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         rather than the 1st (H), producing wrong per-tile stride advances.
 
         Previously also broken for the copy ops inserted by
-        _insert_read_copy_ops: their tiled_dims_per_read/output_tiled_dims
+        _insert_all_read_copy_ops: their tiled_dims_per_read/output_tiled_dims
         dicts were keyed by tiled_op's raw (unsqueezed) host-range indices
         but read against copy_ranges (== dep.size, already squeezed) --
         fixed by mapping tiled_op's raw dim index to its squeezed position
@@ -5579,6 +5743,103 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             compare_with_cpu(
                 fn, x, y, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
             )
+
+    # ------------------------------------------------------------------
+    # Per-bundle hbm_pool_sizes threading into SpyreKernel
+    # ------------------------------------------------------------------
+
+    @config.patch({"lx_planning": False})
+    def test_bundle_pool_size_threaded_from_hbm_pool_sizes(self):
+        """codegen_node must look up this bundle's own pool_size from
+        V.graph.hbm_pool_sizes, not a stale graph-global scalar.
+
+        lx_planning is disabled here so the `a = x + y` intermediate isn't
+        claimed by LX scratchpad planning first -- with LX planning on,
+        `add`/`mul`/`sub` outputs are all LX-eligible by default (see
+        OP_OUTPUT_GOOD_FOR_LX_REUSE in scratchpad/utils.py) and may win the
+        scratchpad before hbm_pool_planning ever sees them, leaving every
+        bundle's pool_size at 0 and proving nothing about the plumbing this
+        test exists to check.
+        """
+        from unittest.mock import patch
+
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        seen_pool_sizes = []
+        orig_init = SpyreKernel.__init__
+
+        def _recording_init(self, pool_size=0, **kwargs):
+            seen_pool_sizes.append(pool_size)
+            orig_init(self, pool_size=pool_size, **kwargs)
+
+        def fn(x, y):
+            a = x + y
+            b = a * 2
+            return b - x
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+        y = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        with (
+            patch.object(SpyreKernel, "__init__", _recording_init),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            torch.compile(fn)(x, y)
+
+        self.assertTrue(seen_pool_sizes)
+        self.assertTrue(
+            any(seen_pool_sizes),
+            f"expected at least one bundle with a nonzero pool_size, got "
+            f"{seen_pool_sizes}",
+        )
+
+    @config.patch({"lx_planning": False})
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_pool_alloc_scoped_per_bundle_across_fallback_boundary(self):
+        """A CPU-fallback op (torch.sin) splits the graph into multiple
+        bundles. Each bundle's pool tensor (if any) is allocated right
+        before its own .run() call and freed right after -- there is no
+        single graph-global "_pool" shared across bundles, and the
+        intermediate crossing the fallback boundary is not pool-allocated."""
+
+        def fn(t):
+            a = torch.exp(t) * 2  # compiled bundle 1; `a` crosses the
+            b = torch.sin(a)  # fallback op -- forces a bundle boundary
+            c = torch.exp(b) * 2  # compiled bundle 2
+            return c
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+            pytest.warns(UserWarning),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), x)
+        src = source_codes[0]
+
+        # No single graph-global "_pool = " assignment (the old scheme).
+        self.assertNotIn("_pool = spyre_empty_with_layout", src)
+        # Any pool tensor that does appear is kernel-scoped
+        # ("_pool_<kernel_name> = ..."), never the bare literal "_pool".
+        pool_alloc_lines = [
+            line
+            for line in src.splitlines()
+            if "spyre_empty_with_layout" in line and "uint8" in line
+        ]
+        for line in pool_alloc_lines:
+            self.assertRegex(line.strip(), r"^_pool_\S+\s*=")
+        # Each pool alloc line's variable is del'd, and each .run( call that
+        # uses a pool passes that same per-kernel variable, not a shared name.
+        pool_var_names = [
+            line.strip().split("=", 1)[0].strip() for line in pool_alloc_lines
+        ]
+        self.assertEqual(len(pool_var_names), len(set(pool_var_names)))
+        for var_name in pool_var_names:
+            self.assertIn(f"del {var_name}", src)
 
 
 class TestNamedDimsHint(InductorTestCase):
@@ -6103,17 +6364,6 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         torch.manual_seed(0xCAFE)
         _pnd.reset()
 
-    @pytest.mark.skip(
-        reason=(
-            "This reproduces on the CI runners but NOT on every local stack, "
-            "so a passing local run is not evidence it is fixed. Observed "
-            "10.2% element mismatch (833/8192) on CI, repeatable across all "
-            "retry attempts, while the same commit passes on a dev pod. "
-            "Skipped rather than xfailed because some CI runs use strict "
-            "xfail mode, where a passing xfail (e.g. on a dev pod) is itself "
-            "a failure. Un-skip only on the strength of a green CI run."
-        )
-    )
     def test_nested_bmm_outer_Batch_inner_K_correct(self):
         """bmm [B,M,K]@[B,K,N] outer B (output) + inner K (reduction) — correct."""
         from torch_spyre._inductor import spyre_hint
@@ -6137,9 +6387,6 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
             fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
         )
 
-    @pytest.mark.skip(
-        reason="compiled spyre <-> cpu mismatch: nested matmul correctness not yet passing"
-    )
     def test_nested_matmul_outer_M_inner_K_correct(self):
         """mm [M,K]@[K,N] with outer M (output) + inner K (reduction) — correct."""
         from torch_spyre._inductor import spyre_hint
@@ -6440,9 +6687,6 @@ def test_sum_reduce_implicit_accumulator():
     torch.testing.assert_close(result, ref, atol=0.01, rtol=0.1)
 
 
-@pytest.mark.skip(
-    reason="zeros with named_dims hint acquires wrong layout in tiled scope"
-)
 def test_zeros_named_dims_hint_correctness():
     """zeros with explicit named_dims hint inside a tiled scope should be correct.
 

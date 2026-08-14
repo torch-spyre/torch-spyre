@@ -17,12 +17,14 @@
  */
 #include <libaiupti/aiupti_runtime_cbid.h>
 
+#include <nlohmann/json.hpp>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "AiuptiActivityProfiler.h"
+#include "kernel_provenance_registry.h"
 
 namespace KINETO_NAMESPACE {
 
@@ -264,6 +266,13 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
   kernel_activity->addMetadataQuoted("context",
                                      std::to_string(activity->context_id));
   kernel_activity->addMetadata("correlation", activity->correlation_id);
+  if (const auto key = spyre::extractKernelProvenanceKey(activity->name)) {
+    kernel_activity->addMetadataQuoted("provenance_key", *key);
+    if (const auto ids = spyre::lookupKernelProvenance(*key)) {
+      kernel_activity->addMetadata("debug_handles",
+                                   nlohmann::json(*ids).dump());
+    }
+  }
 
   recordStream(kernel_activity->device, kernel_activity->resource);
 
