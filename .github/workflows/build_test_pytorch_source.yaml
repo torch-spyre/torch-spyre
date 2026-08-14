@@ -1,11 +1,14 @@
 name: build-test-pytorch-source
 
 # ---------------------------------------------------------------------------
-# Reusable workflow. Normally called by the `gate_and_build`/`build_and_test`
-# jobs in push-pytorch-dispatch-to-clickhouse.yaml once a repository_dispatch
-# from pytorch/pytorch has been gated and a commit SHA extracted. Can also be
-# triggered directly (workflow_dispatch) from the Actions UI to build/test a
-# specific pytorch/pytorch commit on demand.
+# Reusable workflow. Only called via workflow_call, by the
+# `gate_and_build`/`build_and_test` jobs in
+# push-pytorch-dispatch-to-clickhouse.yaml -- once a repository_dispatch from
+# pytorch/pytorch has been gated and a commit SHA extracted, or (on
+# schedule/workflow_dispatch) once that workflow has resolved a nightly SHA
+# or been given an explicit one. Manual on-demand builds of a specific
+# pytorch/pytorch commit go through that workflow's workflow_dispatch (with
+# a pytorch_sha input) rather than dispatching this one directly.
 #
 # Builds that exact PyTorch commit from source (once), builds torch-spyre
 # against it (editable, --local-pytorch style), packages BOTH as wheels, and
@@ -22,12 +25,6 @@ name: build-test-pytorch-source
 # ---------------------------------------------------------------------------
 on:
   workflow_call:
-    inputs:
-      pytorch_sha:
-        description: Exact pytorch/pytorch commit SHA to build
-        required: true
-        type: string
-  workflow_dispatch:
     inputs:
       pytorch_sha:
         description: Exact pytorch/pytorch commit SHA to build
@@ -51,9 +48,12 @@ jobs:
       # GitHub Actions sets CI=true which causes pytest inductor tests to fail.
       CI: ''
       # Consumed by the "Report stage: ..." steps below, which write dispatch
-      # lifecycle updates into the same ClickHouse row that
-      # push-pytorch-dispatch-to-clickhouse.yaml's `ingest` job created.
-      # Available because the caller invokes this reusable workflow with
+      # lifecycle updates into ClickHouse -- for repository_dispatch runs,
+      # into the same row push-pytorch-dispatch-to-clickhouse.yaml's
+      # `ingest` job already created; for schedule/workflow_dispatch
+      # (nightly) runs, which skip `ingest` entirely, the first "Report
+      # stage: torch_build" write below is what creates the row. Available
+      # because the caller invokes this reusable workflow with
       # `secrets: inherit`.
       CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
       CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
@@ -90,14 +90,16 @@ jobs:
       - name: Write dispatch payload to file
         env:
           PAYLOAD_JSON: ${{ toJSON(github.event.client_payload) }}
-          # workflow_dispatch (manual UI run) has no client_payload, so the
-          # ingest script would find an empty delivery_id and refuse to
-          # ingest — synthesize one keyed on this run instead.
-          MANUAL_DELIVERY_ID: manual-${{ github.run_id }}
+          # workflow_dispatch (manual UI run) and schedule (nightly cron,
+          # relayed here from push-pytorch-dispatch-to-clickhouse.yaml) have
+          # no client_payload, so the ingest script would find an empty
+          # delivery_id and refuse to ingest — synthesize one keyed on this
+          # run instead.
+          SYNTHETIC_DELIVERY_ID: ${{ github.event_name }}-${{ github.run_id }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            printf '{"delivery_id":"%s","event_type":"workflow_dispatch","payload":{"action":"manual_dispatch"}}' \
-              "$MANUAL_DELIVERY_ID" > payload.json
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "schedule" ]; then
+            printf '{"delivery_id":"%s","event_type":"%s","payload":{"action":"manual_dispatch"}}' \
+              "$SYNTHETIC_DELIVERY_ID" "${{ github.event_name }}" > payload.json
           else
             printf '%s' "$PAYLOAD_JSON" > payload.json
           fi
@@ -195,6 +197,7 @@ jobs:
       artifact_name: torch-spyre-wheel-${{ inputs.pytorch_sha }}
       pytorch_sha: ${{ inputs.pytorch_sha }}
       pytorch_wheel_artifact_name: pytorch-wheel-${{ inputs.pytorch_sha }}
+      mode: validate
 
   # ---------------------------------------------------------------------------
   # Aggregate the per-suite JUnit XMLs the `test` matrix uploaded (one per
@@ -225,8 +228,19 @@ jobs:
       - name: Write dispatch payload to file
         env:
           PAYLOAD_JSON: ${{ toJSON(github.event.client_payload) }}
+          # Must match the `build` job's synthetic delivery_id exactly (same
+          # github.event_name + github.run_id) so this job's "completed"
+          # stage row replaces the same ClickHouse row -- not a new one --
+          # for workflow_dispatch/schedule (nightly) runs, which have no
+          # client_payload to read a delivery_id from.
+          SYNTHETIC_DELIVERY_ID: ${{ github.event_name }}-${{ github.run_id }}
         run: |
-          printf '%s' "$PAYLOAD_JSON" > payload.json
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "schedule" ]; then
+            printf '{"delivery_id":"%s","event_type":"%s","payload":{"action":"manual_dispatch"}}' \
+              "$SYNTHETIC_DELIVERY_ID" "${{ github.event_name }}" > payload.json
+          else
+            printf '%s' "$PAYLOAD_JSON" > payload.json
+          fi
 
       - name: Download all JUnit XML artifacts from the test matrix
         env:

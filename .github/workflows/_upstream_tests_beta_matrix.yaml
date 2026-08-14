@@ -39,6 +39,14 @@ on:
         required: false
         type: string
         default: ''
+      mode:
+        description: >-
+          Forwarded to run_test.sh as --mode. 'gating' (default) fails the
+          job on test failures; 'validate' still records failures in the
+          summary/JUnit XML but does not fail the job on them.
+        required: false
+        type: string
+        default: gating
 
 defaults:
   run:
@@ -230,7 +238,7 @@ jobs:
         with:
           suite_name: ${{ matrix.suite.name }}
           config: tests/configs/upstream_tests_beta/${{ matrix.suite.config }}
-          extra_test_flags: -v -m "not xfail"
+          extra_test_flags: -v -m "not xfail" --mode=${{ inputs.mode }}
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
 

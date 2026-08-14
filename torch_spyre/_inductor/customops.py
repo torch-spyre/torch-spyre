@@ -130,15 +130,11 @@ def _(
 
 @torch.library.custom_op("spyre::topkvalue", mutates_args=(), device_types="spyre")
 def topkvalue(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
-    if len(x.size()) != 2:
-        raise Unsupported("topk only implemented for 2-D tensors")
     pass
 
 
 @topkvalue.register_fake
 def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
-    if len(x.size()) != 2:
-        raise Unsupported("topk only implemented for 2-D tensors")
     norm_dim = dim % len(x.size())
     out_size = list(x.size())
     out_size[norm_dim] = k
@@ -147,15 +143,11 @@ def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
 
 @torch.library.custom_op("spyre::topkindex", mutates_args=(), device_types="spyre")
 def topkindex(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
-    if len(x.size()) != 2:
-        raise Unsupported("topk only implemented for 2-D tensors")
     pass
 
 
 @topkindex.register_fake
 def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
-    if len(x.size()) != 2:
-        raise Unsupported("topk only implemented for 2-D tensors")
     norm_dim = dim % len(x.size())
     out_size = list(x.size())
     out_size[norm_dim] = k

@@ -332,9 +332,17 @@ def spyre_topk(
     input: torch.Tensor,
     k: int,
     dim: Optional[int] = -1,
+    largest: bool = True,
+    sorted: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if k > 4:
         raise Unsupported("Topk is not supported for this config")
+    if not largest:
+        raise Unsupported("topk with largest=False")
+    # sorted=False only relaxes the ordering guarantee (any order of the top-k
+    # elements is a valid answer); our topkvalue/topkindex reduction always
+    # returns sorted output, which satisfies that relaxed contract, so
+    # sorted=False can be served as a no-op.
     return torch.ops.spyre.topkvalue(input, k, dim), torch.ops.spyre.topkindex(
         input, k, dim
     )

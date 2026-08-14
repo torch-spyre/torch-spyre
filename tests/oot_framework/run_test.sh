@@ -98,24 +98,51 @@ fi
 #                  (comma count + 1) or torch.spyre.device_count() as fallback.
 #                  Falls back to serial execution when only one card is found.
 #
+# --mode=<gating|validate>
+#                  Mode of running this script
+#                    gating   (default) -- current behaviour: failed tests
+#                              propagates to a non-zero exit code (e.g. for CI jobs
+#                              that needing gating on all tests passed).
+#                    validate -- test failures are recorded in the printed
+#                              summary as usual but won't gate a CI job. 
+#                              All other non-zero exits are captured anyway.
+#
 # Usage:
 #   run_test.sh config.yaml                 # default: all tests run serially
 #   run_test.sh config.yaml --include-slow  # same, explicit
 #   run_test.sh config.yaml --skip-slow     # skip slow tests on this platform
 #   run_test.sh config.yaml --parallel      # parallelize tests across all Spyre cards
+#   run_test.sh config.yaml --mode=validate # test failures don't fail the script
 # ------------------------------------------------------------------------------------
 _SKIP_SLOW=0
 _PARALLEL=0
+_MODE="gating"
 _FILTERED_ARGS=()
+_take_next_mode=0
 for _arg in "$@"; do
+    if [[ $_take_next_mode -eq 1 ]]; then
+        _MODE="$_arg"
+        _take_next_mode=0
+        continue
+    fi
     case "$_arg" in
         --skip-slow)    _SKIP_SLOW=1 ;;
         --include-slow) _SKIP_SLOW=0 ;;
         --parallel)     _PARALLEL=1 ;;
+        --mode=*)       _MODE="${_arg#--mode=}" ;;
+        --mode)         _take_next_mode=1 ;;
         *)              _FILTERED_ARGS+=("$_arg") ;;
     esac
 done
 set -- "${_FILTERED_ARGS[@]+"${_FILTERED_ARGS[@]}"}"
+
+case "$_MODE" in
+    gating|validate) ;;
+    *)
+        echo "ERROR: --mode must be 'gating' or 'validate' (got: '$_MODE')" >&2
+        exit 1
+        ;;
+esac
 # ---------------------------------------------------------------------------
 # Multi-config support
 #
@@ -1827,9 +1854,13 @@ _run_xdist_fallback() {
     fi
     rm -f "$_xdist_out_tmp"
 
-    # Propagate test failures from the xdist fallback run.
+    # Propagate test failures from the xdist fallback run. As above, in
+    # --mode=validate a test-failure exit (1) is recorded in the summary but
+    # does not fail the script; other non-zero exits are unaffected by mode.
     if [[ $_xexit -eq 1 ]]; then
-        [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+        if [[ "$_MODE" != "validate" ]]; then
+            [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+        fi
     elif [[ $_xexit -ne 0 && $_xexit -ne 5 ]]; then
         OVERALL_EXIT=$_xexit
     fi
@@ -2284,7 +2315,13 @@ _run_parallel_across_cards() {
                 # Exit-code handling.
                 case $_exit in
                     0) ;;
-                    1)  [[ $_card_overall -eq 0 ]] && _card_overall=1 ;;
+                    1)
+                        # Test failure — masked in --mode=validate (see serial
+                        # loop above for the equivalent, non-parallel path).
+                        if [[ "$_MODE" != "validate" ]]; then
+                            [[ $_card_overall -eq 0 ]] && _card_overall=1
+                        fi
+                        ;;
                     5)  echo "[torch_oot_device_tests_run] WARNING: no tests collected for card ${_subshell_card} slice of $(basename "$original_file")" >&2 ;;
                     127)
                         echo "[torch_oot_device_tests_run_err] FATAL: python3/pytest not found for $original_file" >&2
@@ -2307,7 +2344,14 @@ _run_parallel_across_cards() {
                             ) || true
                             if [[ -f "$_exit_tmp" ]]; then
                                 local _xexit; _xexit=$(< "$_exit_tmp"); rm -f "$_exit_tmp"
-                                [[ $_xexit -ne 0 && $_xexit -ne 5 && $_card_overall -eq 0 ]] && _card_overall=$_xexit
+                                if [[ $_xexit -eq 1 ]]; then
+                                    # Test failure on retry — masked in --mode=validate.
+                                    if [[ "$_MODE" != "validate" ]]; then
+                                        [[ $_card_overall -eq 0 ]] && _card_overall=1
+                                    fi
+                                elif [[ $_xexit -ne 0 && $_xexit -ne 5 ]]; then
+                                    [[ $_card_overall -eq 0 ]] && _card_overall=$_xexit
+                                fi
                                 if [[ -n "$_shard_xml" && -f "$_shard_xml" ]]; then
                                     python3 -c "$_XML_INJECT_PY" "$_shard_xml" "$YAML_CONFIG" || true
                                 fi
@@ -2650,8 +2694,12 @@ for i in "${!RUN_FILES[@]}"; do
         1)
             # Some tests failed or errored — pytest already reported them.
             # Propagate so CI marks the job as failed when mandatory_success
-            # tests do not pass.
-            [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+            # tests do not pass. In --mode=validate this is intentionally not
+            # propagated: the failure is still visible in the printed
+            # summary, but the script itself exits 0 for this case.
+            if [[ "$_MODE" != "validate" ]]; then
+                [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+            fi
             ;;
         5)
             # No tests collected — warn but do not fail the overall run.

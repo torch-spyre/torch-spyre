@@ -59,6 +59,8 @@ from torch_spyre._inductor.op_spec import (
     IndirectAccess,
     OpSpec,
     TensorArg,
+    TensorWorkDivision,
+    is_lx_relayout_identity,
 )
 from torch_spyre._inductor.pass_utils import coeff_through_floor
 
@@ -79,6 +81,7 @@ class SDSCArgs:
     allocation: dict[str, Any]
     start_address: int | Symbol
     backGap: dict[Symbol, int]
+    work_division: TensorWorkDivision | None = None
     arg_index: int = -1
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
@@ -104,6 +107,7 @@ class SDSCArgs:
             f"  backGap={self.backGap}\n"
             f"  is_index_tensor={self.is_index_tensor}\n"
             f"  related_value_tensor_idx={self.related_value_tensor_idx}\n"
+            f"  work_division={self.work_division}\n"
             f")"
         )
 
@@ -1094,16 +1098,18 @@ def _create_sdsc_tensors(
     iteration_space: dict,
     op_dim_order: list[Symbol],
     op_stick_dim: Symbol | None,
-    mb_sym: Symbol | None = None,
     gather_mb_injected: bool = False,
+    injected_dims: dict[str, Any] | None = None,
 ) -> tuple[list[SDSCArgs], dict, Symbol | None]:
     dims = list(iteration_space.keys())
+    if injected_dims is None:
+        injected_dims = {}
+    mb_sym = injected_dims.get("mb_sym")
     layouts: dict = {}
     # matmul and conv share the two-input tensor treatment: each arg keeps its
     # own natural (per-tensor) dim order and the weight gets the KERNEL layout
     # label. Reduced-dim appending (below) is a single-input-reduction concern.
     use_op_dims = not (_is_matmul(op_spec.op) or _is_conv(op_spec.op))
-
     # Detect indirect access from device_coordinates: index tensors are those
     # whose name is referenced by an IndirectAccess in another tensor's coordinates,
     # and value tensors are those that contain IndirectAccess in their coordinates.
@@ -1326,6 +1332,17 @@ def _create_sdsc_tensors(
             else:
                 max_dim_sizes[mb_sym] = -1
 
+        # For topk: inject topk_missing_dim only into output tensor's dim_order.
+        topk_missing_dim = injected_dims.get("topk_missing_dim")
+        if topk_missing_dim is not None and i == len(op_spec.args) - 1:
+            dim_order = dim_order + [topk_missing_dim]
+            scales[topk_missing_dim] = 1
+            strides[topk_missing_dim] = _calculate_device_stride(
+                len(dim_order) - 1, arg.device_size
+            )
+            offsets[topk_missing_dim] = 0
+            max_dim_sizes[topk_missing_dim] = -1
+
         effective_stick = [op_stick_dim if stick_dim is None else stick_dim]
         layout_labels = _get_tensor_layout_labels(use_op_dims, op_spec.op)
 
@@ -1383,24 +1400,25 @@ def _create_sdsc_tensors(
             get_value_tensor_idx_for_index(op_spec, i) if is_idx_tensor else -1
         )
 
-        sdsc_args.append(
-            SDSCArgs(
-                layout=label,
-                dim_order=dim_order,
-                data_format=arg_data_format,
-                scales=scales,
-                strides=strides,
-                offsets=offsets,
-                max_dim_sizes=max_dim_sizes,
-                allocation=arg.allocation,
-                start_address=start_addr,
-                backGap=backGap,
-                arg_index=arg.arg_index,
-                is_index_tensor=is_idx_tensor,
-                related_value_tensor_idx=related_val_idx,
-                device_tile_advance_expr=arg.device_tile_advance_expr,
-            )
+        sdsc_arg = SDSCArgs(
+            layout=label,
+            dim_order=dim_order,
+            data_format=arg_data_format,
+            scales=scales,
+            strides=strides,
+            offsets=offsets,
+            max_dim_sizes=max_dim_sizes,
+            allocation=arg.allocation,
+            start_address=start_addr,
+            backGap=backGap,
+            arg_index=arg.arg_index,
+            is_index_tensor=is_idx_tensor,
+            related_value_tensor_idx=related_val_idx,
+            device_tile_advance_expr=arg.device_tile_advance_expr,
         )
+        if arg.work_division is not None:
+            sdsc_arg.work_division = arg.work_division.remap_symbols(symbol_mapping)
+        sdsc_args.append(sdsc_arg)
 
     return sdsc_args, layouts, missing_dim
 
@@ -1578,9 +1596,49 @@ def _inject_implicit_conv_kernel_dims(
         work_slices[kj_sym] = 1
 
 
+def _finalize_tensor_work_divisions(
+    args: list[SDSCArgs],
+    mapping_dims: tuple[Symbol, ...],
+    work_slices: dict[Symbol, Any],
+    core_map: dict[Symbol, Expr],
+    num_cores: int,
+    is_lx_relayout: bool,
+) -> None:
+    """Give every tensor one effective ownership after SDSC normalization."""
+
+    operation_work_division = TensorWorkDivision(
+        {dim: work_slices[dim] for dim in mapping_dims},
+        {dim: core_map[dim] for dim in mapping_dims},
+    )
+    assert is_lx_relayout or all(arg.work_division is None for arg in args), (
+        "per-tensor ownership is supported only for LX relayout identities"
+    )
+    for arg in args:
+        override = arg.work_division
+        # A relayout tensor can override the operation-wide split on selected
+        # dimensions; unsplit dimensions inherit one slice owned by core zero.
+        effective = (
+            operation_work_division
+            if override is None
+            else TensorWorkDivision(
+                {dim: int(override.work_slices.get(dim, 1)) for dim in mapping_dims},
+                {
+                    dim: override.core_id_to_work_slice.get(dim, Integer(0))
+                    for dim in mapping_dims
+                },
+            )
+        )
+        if math.prod(effective.work_slices.values()) != num_cores:
+            raise ValueError(
+                f"tensor ownership uses {effective.work_slices}, expected {num_cores} cores"
+            )
+        arg.work_division = effective
+
+
 def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
     is_conv2d = _is_conv(op_spec.op)
+    is_relayout = is_lx_relayout_identity(op_spec.op, op_spec.args)
     is_pool = _is_pool(op_spec.op)
     is_conv = _is_conv(op_spec.op)
     ndim = len(op_spec.iteration_space)
@@ -1790,14 +1848,33 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     if is_matmul:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
+    # For topk: if all output dims are in the input, add a missing dimension.
+    injected_dims = {"mb_sym": mb_sym} if mb_sym else {}
+    if _is_topk(op_spec.op) and len(op_spec.args) >= 2:
+        input_arg = op_spec.args[0]
+        output_arg = op_spec.args[-1]
+        input_dim_order, _ = _get_device_dim_order(input_arg, symbol_mapping, op_spec)
+        output_dim_order, _ = _get_device_dim_order(output_arg, symbol_mapping, op_spec)
+        output_only_dims = [d for d in output_dim_order if d not in input_dim_order]
+        if not output_only_dims:
+            # No new output dimension; add one to the iteration space with size 1.
+            idx = len(sdsc_iteration_space)
+            if idx < len(INPUT_DIM_LABELS):
+                missing_dim_label = INPUT_DIM_LABELS[idx]
+                topk_missing_dim = Symbol(missing_dim_label)
+                sdsc_iteration_space[topk_missing_dim] = 1
+                dim_splits[topk_missing_dim] = 1
+                work_slices[topk_missing_dim] = 1
+                injected_dims["topk_missing_dim"] = topk_missing_dim
+
     args, layouts, missing_dim = _create_sdsc_tensors(
         op_spec,
         symbol_mapping,
         sdsc_iteration_space,
         op_dim_order,
         op_stick_dim,
-        mb_sym,
         gather_mb_injected=gather_mb_injected,
+        injected_dims=injected_dims,
     )
     if missing_dim is not None:
         # A dimension was added to the iteration space, update splits and work slices
@@ -1978,7 +2055,14 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         num_cores,
         contiguous_dim=contiguous_dim,
     )
-
+    _finalize_tensor_work_divisions(
+        args,
+        mapping_dims,
+        work_slices,
+        core_id_to_work_slice,
+        num_cores,
+        is_relayout,
+    )
     # Collect index tensor indices for indirect access
     indirect_access_indices = [
         i for i, arg in enumerate(op_spec.args) if is_index_tensor(arg, op_spec)
@@ -1995,7 +2079,11 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     return (
         SDSCSpec(
-            opfunc=_get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales),
+            opfunc=(
+                "shuffle"
+                if is_relayout
+                else _get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales)
+            ),
             # Forward conv2d (#3284) is a native "pt" (processing-tile) op like
             # matmul; depthwise conv2d (#3510) runs on the "sfp" unit. `is_conv`
             # matches both, so dispatch forward explicitly and leave depthwise
