@@ -26,6 +26,7 @@ import torch._dynamo
 import torch_spyre
 
 from torch_spyre._inductor import config as _spyre_config
+from torch_spyre.execution import kernel_runner
 from test_prepare_kernel import TestPrepareKernel as tpk
 
 
@@ -143,6 +144,111 @@ class TestLaunchJobPlan(TestCase):
             with stream:
                 with pytest.raises(RuntimeError, match="Expect one DCI"):
                     torch_spyre._C.launch_jobplan(job_plan, [])
+
+
+class TestCorrectionBufferWarBarrier(TestCase):
+    """Regression guard for the reused correction-buffer WAR pipeline barrier.
+
+    The program-correction path emits a HostCompute step that writes a pinned
+    "correction" buffer, followed by an H2D that reads it. The JobPlan (and thus
+    the pinned buffer) is built once and reused across every launch of a compiled
+    op. Because flex dispatches the HostCompute callback INLINE on the caller
+    thread, the HostCompute step must carry ``pipeline_barrier=True`` so a later
+    launch's callback waits for the prior launch's H2D to finish reading the
+    buffer before overwriting it (cross-launch write-after-read; see flex #1479
+    and the ``JobPlanStepHostCompute`` constructor in job_plan.h).
+
+    This complements the mock-based ``test_pipeline_barrier_correction_sequence``
+    in test_prepare_kernel.py, which never compiles a real op and never exercises
+    reuse. Here we:
+
+      1. Compile a REAL correction-path op (BUNDLE_SYMBOLIC_ARGS=1, the process
+         default), so the JobPlan comes from the real compile -> prepare_kernel
+         path rather than a hand-built mock.
+      2. Launch it MORE THAN ONCE, so the same JobPlan and pinned correction
+         buffer are genuinely reused across iterations (the cross-launch reuse
+         the barrier protects).
+      3. Assert, on the JobPlan that is actually launched each iteration, that
+         the HostCompute step carries ``pipeline_barrier=True``.
+
+    Polarity as a regression guard: this PASSES on current (correct) code and
+    fails deterministically if a future change drops the barrier line
+    (job_plan.h:449) or stops emitting the HostCompute step. It does not depend
+    on reproducing the underlying data race numerically -- that race is timing
+    dependent and cannot be triggered reliably on real hardware, so a numeric
+    assertion would be a false guard (green even when the barrier is dropped).
+    """
+
+    NUM_ITERATIONS = 3
+
+    def test_reused_correction_buffer_keeps_barrier_across_launches(self):
+        torch._dynamo.reset()
+
+        captured = []
+        orig_launch = kernel_runner.launch_jobplan
+
+        def _spy(job_plan, args):
+            captured.append(job_plan)
+            return orig_launch(job_plan, args)
+
+        old_sym = os.environ.get("BUNDLE_SYMBOLIC_ARGS")
+        os.environ["BUNDLE_SYMBOLIC_ARGS"] = "1"
+        kernel_runner.launch_jobplan = _spy
+        try:
+            with _spyre_config.patch(bundle_symbolic_args=True):  # type: ignore[attr-defined]
+                torch.manual_seed(42)
+                compiled_fn = torch.compile(torch.abs, backend="inductor")
+                # Launch the SAME compiled fn multiple times so the JobPlan (and
+                # its pinned correction buffer) is reused across iterations.
+                for _ in range(self.NUM_ITERATIONS):
+                    x = torch.randn(64, dtype=torch.float16).to("spyre")
+                    compiled_fn(x).cpu()
+        finally:
+            kernel_runner.launch_jobplan = orig_launch
+            if old_sym is None:
+                os.environ.pop("BUNDLE_SYMBOLIC_ARGS", None)
+            else:
+                os.environ["BUNDLE_SYMBOLIC_ARGS"] = old_sym
+
+        # The compiled op must have launched on every iteration.
+        assert len(captured) >= self.NUM_ITERATIONS, (
+            f"expected >= {self.NUM_ITERATIONS} launches, got {len(captured)}"
+        )
+
+        # The correction path must reuse a single JobPlan across launches; that
+        # reuse is the whole reason the WAR barrier is needed. If each launch
+        # rebuilt the JobPlan (and buffer), there would be no cross-iteration
+        # hazard and this guard would be testing the wrong thing.
+        assert len({id(jp) for jp in captured}) == 1, (
+            "expected one reused JobPlan across launches, got "
+            f"{len({id(jp) for jp in captured})} distinct JobPlans; the "
+            "correction buffer is no longer reused, so the cross-iteration WAR "
+            "this test guards is not being exercised"
+        )
+
+        hostcompute_seen = 0
+        for job_plan in captured:
+            for idx in range(job_plan.num_steps()):
+                if job_plan.get_step_type(idx) != "HostCompute":
+                    continue
+                hostcompute_seen += 1
+                assert job_plan.get_step_pipeline_barrier(idx) is True, (
+                    f"HostCompute step {idx} must carry pipeline_barrier=True to "
+                    "close the cross-launch WAR on the reused pinned correction "
+                    "buffer (flex #1479). With the barrier dropped, flex runs the "
+                    "next launch's inline host callback while the prior launch's "
+                    "H2D is still reading the shared buffer, corrupting the "
+                    "correction data"
+                )
+
+        # Fail loudly rather than pass vacuously if the correction path stopped
+        # emitting a HostCompute step (e.g. a compiler change): then the barrier
+        # this test guards would silently no longer exist.
+        assert hostcompute_seen >= self.NUM_ITERATIONS, (
+            "no HostCompute step found on every launched JobPlan; the "
+            "program-correction path did not run, so the WAR barrier guard was "
+            "not exercised"
+        )
 
 
 def _build_d2h_jobplan(tmpdir: str, dev_ptr: int, size_bytes: int):

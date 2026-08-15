@@ -256,8 +256,8 @@ class JobPlanStep {
 
  protected:
   // true by default: every step is a potential consumer that should wait for
-  // prior ops. Steps that are genuinely overlap-eligible (HostCompute) opt out
-  // explicitly.
+  // prior ops. A step opts out explicitly only when it is genuinely
+  // overlap-eligible.
   bool pipeline_barrier_ = true;
 };
 
@@ -282,8 +282,10 @@ inline std::ostream& operator<<(std::ostream& os, const JobPlanStep& step) {
  * When used for correction tensor DMA, the host_address points into a pinned
  * host buffer allocated during PrepareKernel and shared with the
  * JobPlanStepHostCompute that writes into it. The buffer is allocated once and
- * reused across launches — FIFO ordering within a stream guarantees the
- * HostCompute callback writes the buffer before the H2D reads it.
+ * reused across launches. Within an iteration the HostCompute callback
+ * completes (inline, on the caller thread) before its H2D is enqueued, so the
+ * forward write-before-read holds; the cross-iteration WAR on the reused
+ * buffer is closed by HostCompute's pipeline barrier (see flex #1479).
  */
 class JobPlanStepH2D final : public JobPlanStep {
  public:
@@ -417,9 +419,9 @@ class JobPlanStepCompute final : public JobPlanStep {
  * the buffer, and produces a RuntimeOperationHostCallback.
  *
  * The shared buffer is allocated once during PrepareKernel and reused across
- * launches. For tiled execution, the same buffer is reused across iterations —
- * FIFO ordering guarantees each iteration's H2D consumes the buffer before the
- * next iteration's HostCompute overwrites it.
+ * launches and across tiled iterations; the cross-iteration WAR on the reused
+ * buffer is closed by this step's pipeline barrier, not by FIFO (see flex
+ * #1479).
  */
 class JobPlanStepHostCompute final : public JobPlanStep {
  public:
@@ -438,7 +440,17 @@ class JobPlanStepHostCompute final : public JobPlanStep {
         output_buffer_(output_buffer),
         input_buffer_(input_buffer),
         ishape_(ishape) {
-    pipeline_barrier_ = false;  // host callbacks are overlap-eligible
+    // Gate on prior-stream completion: the shared pinned buffer is reused
+    // across tiled iterations, so this write must wait for the previous
+    // iteration's H2D to finish reading it (WAR). Under inline host dispatch,
+    // pipeline_barrier=false is unsafe. See flex #1479.
+    //
+    // Precondition: this barrier closes the WAR only because HostCompute and
+    // its H2D share a stream today. The barrier drains the whole stream (all
+    // prior ops, including in-flight Compute), not just the prior H2D — correct
+    // and safe, just coarser than needed, at the cost of some HC/compute
+    // overlap. TODO: replace with a per-buffer dependency once available.
+    pipeline_barrier_ = true;
   }
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
