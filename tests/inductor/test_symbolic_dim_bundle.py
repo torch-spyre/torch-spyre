@@ -28,6 +28,7 @@ from torch_spyre._inductor.codegen.bundle import (
     generate_bundle,
 )
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
+from torch_spyre._inductor.constants import MAX_POOL_SIZE
 from torch_spyre._inductor.op_spec import OpSpec
 
 
@@ -357,3 +358,30 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
             "%pool = sdscbundle.device_mem_allocate 4096 bytes : index",
             bundle,
         )
+
+    def test_pool_size_zero_with_pool_symbol_raises(self):
+        """A pool symbol with pool_size=0 must fail loudly rather than emit a
+        useless zero-byte device_mem_allocate."""
+        pool_kind = SymbolKind.pool()
+        entry = (
+            _make_sdsc_json(hbm_sym_ids_per_core={"[0, 0, 0]": -1}),
+            [0],
+            [],
+            [pool_kind],
+        )
+
+        with self.assertRaises(AssertionError):
+            self._run_bundle([entry], pool_size=0)
+
+    def test_pool_size_at_or_above_max_raises(self):
+        """A pool symbol with pool_size >= MAX_POOL_SIZE must fail loudly."""
+        pool_kind = SymbolKind.pool()
+        entry = (
+            _make_sdsc_json(hbm_sym_ids_per_core={"[0, 0, 0]": -1}),
+            [0],
+            [],
+            [pool_kind],
+        )
+
+        with self.assertRaises(AssertionError):
+            self._run_bundle([entry], pool_size=MAX_POOL_SIZE)
