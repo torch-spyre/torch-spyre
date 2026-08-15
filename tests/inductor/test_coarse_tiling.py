@@ -632,7 +632,6 @@ def _fake_compile_op_spec(
     op_spec: OpSpec,
     symbols: list,
     symbol_id_offset: int = 0,
-    use_symbols: bool = False,
 ):
     """Stub that returns (json, [], [], []) — no real SDSC compilation."""
     return {f"{idx}_{op_spec.op}": {"op": op_spec.op}}, [], [], []
@@ -2299,7 +2298,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[[s]],
-            use_symbols=True,
         )
         # affine_strides[tensor_idx] is list[dict] (per level, outermost first).
         # With one tiling level, affine_strides[0] = [{s: stride}].
@@ -2318,7 +2316,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[[s]],
-            use_symbols=True,
         )
         self.assertEqual(len(affine_strides), 1)
         self.assertIn(s, affine_strides[0][0])
@@ -2336,7 +2333,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[[s]],
-            use_symbols=True,
         )
         self.assertEqual(len(symbols), 1)
         self.assertEqual(symbols[0], 0)  # kernel sentinel = arg_index = 0
@@ -2351,7 +2347,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[[s]],
-            use_symbols=True,
         )
         top_val = next(iter(sdsc_json.values()))
         node = top_val["dscs_"][0]["add"]["scheduleTree_"][0]
@@ -2401,7 +2396,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=5,
             tiled_symbols=[[s]],
-            use_symbols=True,
         )
         top_val = next(iter(sdsc_json.values()))
         node = top_val["dscs_"][0]["add"]["scheduleTree_"][0]
@@ -2458,7 +2452,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[[s]],
-            use_symbols=True,
         )
         self.assertEqual(len(symbols), 2)
         self.assertEqual(symbols[0], 0)  # kernel sentinel = arg_index = 0
@@ -2522,7 +2515,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[[lvl0], [lvl1]],
-            use_symbols=True,
         )
         self.assertEqual(len(affine_strides), 1)
         per_level = affine_strides[0]
@@ -2584,7 +2576,6 @@ class TestGenerateSdscTiledSymbols(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[[lvl0]],
-            use_symbols=True,
         )
         self.assertEqual(len(affine_strides), 1)
         per_level = affine_strides[0]
@@ -2652,7 +2643,7 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
     def test_two_tiled_symbols_produce_two_stride_entries(self):
         op_spec = self._make_3d_op_spec()
         symbols: list[int] = []
-        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols)
         # affine_strides[tensor_idx] = list[dict] (per level, outermost first).
         # Both tensors have one tiling level with two symbols.
         # Find tensors with non-empty strides at any level.
@@ -2669,7 +2660,7 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
     def test_two_tiled_symbols_strides_are_positive(self):
         op_spec = self._make_3d_op_spec()
         symbols: list[int] = []
-        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols)
         for per_level in affine_strides:
             for level_strides in per_level:
                 for sym, stride in level_strides.items():
@@ -2683,7 +2674,7 @@ class TestCompileOpSpecTwoTiledSymbols(unittest.TestCase):
         # tiling level.
         op_spec = self._make_3d_op_spec()
         symbols: list[int] = []
-        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols)
         mb = Symbol("mb")
         x = Symbol("x")
         self.assertEqual(len(affine_strides), 2)
@@ -2698,7 +2689,7 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
     def test_affine_strides_non_empty_for_tiled_op(self):
         op_spec = _make_tiled_op_spec()
         symbols: list[int] = []
-        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols)
         # affine_strides[tensor_idx] = list[dict] (per level, outermost first).
         has_strides = any(
             any(len(level_d) > 0 for level_d in per_level)
@@ -2713,7 +2704,7 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
         op_spec = _make_tiled_op_spec()
         loop = LoopSpec(count=Integer(4), body=[op_spec])
         tmpdir = tempfile.mkdtemp()
-        generate_bundle("test_kernel", tmpdir, [loop], use_symbols=True)
+        generate_bundle("test_kernel", tmpdir, [loop])
 
         with open(os.path.join(tmpdir, "bundle.mlir")) as f:
             mlir = f.read()
@@ -2752,7 +2743,7 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
         # minted symbol too (as an identity mapping -- Site 1's fix), not
         # just parse_op_spec's returned symbol_mapping dict in isolation.
         symbols: list[int] = []
-        compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        compile_op_spec(0, op_spec, symbols)
         tiled_symbols_per_level = [
             [symbol_mapping[s] for s in level if s in symbol_mapping]
             for level in reversed(op_spec.tiled_symbols)
@@ -2782,7 +2773,7 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
                 arg.device_tile_advance_expr = sympy.floor(64 * minted)
         symbols: list[int] = []
         # Must not raise, and must not silently produce empty affine_strides.
-        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        _, _, affine_strides, _ = compile_op_spec(0, op_spec, symbols)
         has_strides = any(
             any(len(level_d) > 0 for level_d in per_level)
             for per_level in affine_strides
@@ -2837,7 +2828,7 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
             if arg.device_tile_advance_expr is not None:
                 arg.device_tile_advance_expr = sympy.floor(64 * out)
         symbols: list[int] = []
-        sdsc_json, _, _, _ = compile_op_spec(0, op_spec, symbols, use_symbols=True)
+        sdsc_json, _, _, _ = compile_op_spec(0, op_spec, symbols)
         found_backgap = False
         for entry in sdsc_json.values():
             for dsc in entry.get("dscs_", []):
@@ -2923,7 +2914,6 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
                 symbols,
                 symbol_id_offset=0,
                 tiled_symbols=[[minted]],
-                use_symbols=True,
             )
 
     def test_tiled_on_split_dim_detects_floor_wrapped_minted_symbol(self):
@@ -2992,7 +2982,6 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
                 symbols,
                 symbol_id_offset=0,
                 tiled_symbols=[[minted]],
-                use_symbols=True,
             )
 
     def test_minted_symbol_tiled_on_different_dim_does_not_raise_unsupported(self):
@@ -3063,7 +3052,6 @@ class TestCompileOpSpecSymbolMapping(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[[minted]],
-            use_symbols=True,
         )
 
 
@@ -3444,7 +3432,6 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
                 "test_kernel",
                 self.tmpdir,
                 specs,
-                use_symbols=True,
             )
         return _read_mlir(self.tmpdir)
 
@@ -3452,7 +3439,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         s = self._s
         stride = 16384
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
             # affine_strides: list[list[dict]] — one tensor, one level, one stride.
@@ -3473,7 +3460,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         self.assertIn('"symbol_ids"=[-1]', mlir)
 
     def test_non_tiled_tensor_in_loop_no_affine_apply(self):
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x2000)
             return _make_tiled_json(idx, sym_id), [0x2000], [[{}]], []
@@ -3491,7 +3478,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         s = self._s
         stride = 8192
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x3000)
             return _make_tiled_json(idx, sym_id), [0x3000], [[{s: stride}]], []
@@ -3508,7 +3495,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
     def test_affine_apply_inside_scf_for(self):
         s = self._s
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x4000)
             return _make_tiled_json(idx, sym_id), [0x4000], [[{s: 512}]], []
@@ -3527,7 +3514,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
     def test_tiled_snapshot(self):
         s = self._s
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
             return _make_tiled_json(idx, sym_id), [0x1000], [[{s: 256}]], []
@@ -3591,7 +3578,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
             tiled_symbol_trip_counts={c0: 128},
         )
         loop = LoopSpec(count=Integer(4), body=[op])
-        generate_bundle("test_kernel", self.tmpdir, [loop], use_symbols=True)
+        generate_bundle("test_kernel", self.tmpdir, [loop])
         mlir = _read_mlir(self.tmpdir)
 
         expected = (
@@ -3634,14 +3621,13 @@ class TestGenerateBundleNestedTiling(unittest.TestCase):
                 "test_kernel",
                 self.tmpdir,
                 specs,
-                use_symbols=True,
             )
         return _read_mlir(self.tmpdir)
 
     def _fake_compile_two_strides(self, outer_stride, inner_stride):
         s0, s1 = self.s0, self.s1
 
-        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake_compile(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
             # per_level_strides: outermost-first. Level 0 (outer) has s0 stride,
@@ -3741,7 +3727,6 @@ class TestGenerateBundleAffineLoopPath(unittest.TestCase):
                 "test_kernel",
                 self.tmpdir,
                 specs,
-                use_symbols=True,
             )
         return _read_mlir(self.tmpdir)
 
@@ -3750,7 +3735,7 @@ class TestGenerateBundleAffineLoopPath(unittest.TestCase):
     def test_flat_loop_tiled_tensor_emits_affine_apply(self):
         s = self._s
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
             # One tensor, one level (the enclosing loop), one stride.
@@ -3765,7 +3750,7 @@ class TestGenerateBundleAffineLoopPath(unittest.TestCase):
         self.assertIn("256", mlir)
 
     def test_flat_loop_non_tiled_tensor_no_affine_apply(self):
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x2000)
             return _make_tiled_json(idx, sym_id), [0x2000], [[{}]], []
@@ -3781,7 +3766,7 @@ class TestGenerateBundleAffineLoopPath(unittest.TestCase):
     def test_flat_loop_snapshot(self):
         s = self._s
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(0x1000)
             return _make_tiled_json(idx, sym_id), [0x1000], [[{s: 256}]], []
@@ -3825,7 +3810,7 @@ class TestGenerateBundleAffineLoopPath(unittest.TestCase):
         c_k = self._c_k
         call_count = [0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             i = call_count[0]
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
@@ -3926,7 +3911,7 @@ class TestGenerateBundleAffineLoopPath(unittest.TestCase):
         c_k, c_b = self._c_k, self._c_b
         call_count = [0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             i = call_count[0]
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
@@ -4064,7 +4049,7 @@ class TestGenerateBundleAffineLoopPath(unittest.TestCase):
                 }
             }
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             sid0 = -(symbol_id_offset + 1)
             sid1 = -(symbol_id_offset + 2)
             symbols.append(0x1000)
@@ -5831,7 +5816,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
 
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def _bundle(self, specs, use_symbols=False, fake_compile=None):
+    def _bundle(self, specs, fake_compile=None):
         if fake_compile is None:
             fake_compile = _fake_compile_op_spec
         with patch(
@@ -5842,7 +5827,6 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 "test_kernel",
                 self.tmpdir,
                 specs,
-                use_symbols=use_symbols,
             )
         return _read_mlir(self.tmpdir)
 
@@ -5868,15 +5852,10 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
             op_info={},
         )
 
-    def test_signature_accepts_symbolic_args_param(self):
-        a = _make_minimal_op_spec("a")
-        mlir = self._bundle([a], use_symbols=False)
-        self.assertIn("sdsc_execute", mlir)
-
     def test_func_signature_has_params_for_tensor_args(self):
         a = self._make_op_spec_with_hbm_args("a", [0, 1])
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             for i, arg in enumerate(op_spec.args):
                 symbols.append(arg.allocation["hbm"])
             ids = [-(symbol_id_offset + i + 1) for i in range(len(op_spec.args))]
@@ -5907,7 +5886,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 [SymbolKind.kernel(arg.arg_index) for arg in op_spec.args],
             )
 
-        mlir = self._bundle([a], use_symbols=True, fake_compile=fake)
+        mlir = self._bundle([a], fake_compile=fake)
 
         self.assertIn(
             "func.func @sdsc_bundle("
@@ -5931,7 +5910,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
     def test_sdsc_execute_uses_extracted_names(self):
         a = self._make_op_spec_with_hbm_args("a", [0])
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             sym_id = -(symbol_id_offset + 1)
             symbols.append(op_spec.args[0].allocation["hbm"])
             return (
@@ -5941,7 +5920,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 [SymbolKind.kernel(0)],
             )
 
-        mlir = self._bundle([a], use_symbols=True, fake_compile=fake)
+        mlir = self._bundle([a], fake_compile=fake)
 
         self.assertIn("sdscbundle.sdsc_execute (%arg_0)", mlir)
         self.assertNotIn("sdsc_execute (%sym_0_1)", mlir)
@@ -5970,7 +5949,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         call_count = [0]
         values = [0x400000000, 0x0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             i = call_count[0]
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
@@ -5980,7 +5959,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
             )  # op_b has pool allocation
             return _make_tiled_json(idx, sym_id), [values[i]], [{}], [kind]
 
-        mlir = self._bundle([op_a, op_b], use_symbols=True, fake_compile=fake)
+        mlir = self._bundle([op_a, op_b], fake_compile=fake)
 
         # First sym → parameter (kernel tensor arg)
         self.assertIn("%arg_0_base_addr: !sdscbundle.input_arg<index>", mlir)
@@ -5988,16 +5967,6 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         # Second sym → pool: arith.addi %pool, <offset>
         self.assertIn("%pool_base_addr: !sdscbundle.input_arg<index>", mlir)
         self.assertIn("%pool_addr_0 = arith.addi %pool", mlir)
-
-    def test_symbolic_args_false_no_params(self):
-        a = self._make_op_spec_with_hbm_args("a", [0])
-        # When use_symbols=False: no symbols registered,
-        # sdsc_execute has no operands.
-        mlir = self._bundle([a], use_symbols=False)
-        self.assertIn("func.func @sdsc_bundle()", mlir)
-        self.assertNotIn("input_arg", mlir)
-        self.assertNotIn("%sym_", mlir)
-        self.assertIn("sdsc_execute () {sdsc_filename=", mlir)
 
     def test_multi_sdsc_two_tensor_args_snapshot(self):
         """Two tensor args shared across multiple SDSCs emit exactly two input_arg params.
@@ -6019,7 +5988,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
             (0x400040000, 0x800040000),
         ]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             i = call_count[0]
             call_count[0] += 1
             a0, a1 = sdsc_addr_pairs[i]
@@ -6050,7 +6019,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
             kinds = [SymbolKind.kernel(0), SymbolKind.kernel(1)]
             return json_out, [a0, a1], [{}, {}], kinds
 
-        mlir = self._bundle([op0] + ops_rest, use_symbols=True, fake_compile=fake)
+        mlir = self._bundle([op0] + ops_rest, fake_compile=fake)
 
         # 10 symbols across 5 SDSCs but only 2 unique arg_indices → 2 params
         self.assertIn("%arg_0_base_addr: !sdscbundle.input_arg<index>", mlir)
@@ -6068,13 +6037,13 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         base = 0x400000000  # SEGMENT_OFFSETS[1], arg_index=0
         call_count = [0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
             symbols.append(base)
             return _make_tiled_json(idx, sym_id), [base], [{}], [SymbolKind.kernel(0)]
 
-        mlir = self._bundle([a, b], use_symbols=True, fake_compile=fake)
+        mlir = self._bundle([a, b], fake_compile=fake)
 
         # Only one input_arg param (deduped cross-SDSC)
         self.assertIn("%arg_0_base_addr: !sdscbundle.input_arg<index>", mlir)
@@ -6098,7 +6067,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         addrs = [addr0, addr1]
         call_count = [0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             i = call_count[0]
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
@@ -6110,7 +6079,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 [SymbolKind.kernel(0)],
             )
 
-        mlir = self._bundle([a, b], use_symbols=True, fake_compile=fake)
+        mlir = self._bundle([a, b], fake_compile=fake)
 
         # Only one input_arg param — no duplicate %arg_0_base_addr
         self.assertEqual(
@@ -6134,7 +6103,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
         call_count = [0]
         pool_values = [0, 2048, 0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             i = call_count[0]
             call_count[0] += 1
             sym_id = -(symbol_id_offset + 1)
@@ -6146,7 +6115,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 [SymbolKind.pool()],
             )
 
-        mlir = self._bundle([a, b, c], use_symbols=True, fake_compile=fake)
+        mlir = self._bundle([a, b, c], fake_compile=fake)
 
         # Exactly two arith.constant / arith.addi pairs (offsets 0 and 2048)
         self.assertEqual(mlir.count("arith.constant 0 : index"), 1)
@@ -6161,6 +6130,33 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
             execute_lines[1].split("(")[1].split(")")[0], "%pool_addr_2048"
         )
         self.assertEqual(execute_lines[2].split("(")[1].split(")")[0], "%pool_addr_0")
+
+
+class TestGenerateBundleRequiresSymbolicArgs(unittest.TestCase):
+    """generate_bundle must fail fast when bundle_symbolic_args is False.
+
+    The SDSC path always emits symbolic HBM addresses; baked addressing is
+    only meaningful on the (separately-gated) KTIR emitter path. Without
+    this guard, disabling the flag on the default path would silently
+    miscompile addresses instead of erroring.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_raises_when_bundle_symbolic_args_false(self):
+        a = _make_minimal_op_spec("a")
+        with patch(
+            "torch_spyre._inductor.codegen.bundle._spyre_config.bundle_symbolic_args",
+            False,
+        ):
+            with self.assertRaises(AssertionError):
+                generate_bundle("test_kernel", self.tmpdir, [a])
 
 
 class TestSymbolKind(unittest.TestCase):
@@ -6246,7 +6242,6 @@ class TestSymbolKind(unittest.TestCase):
             symbols,
             symbol_id_offset=0,
             tiled_symbols=[[s]],
-            use_symbols=True,
         )
         self.assertEqual(len(kinds), 2)
         self.assertIsInstance(kinds[0], SymbolKind)
@@ -6264,7 +6259,7 @@ class TestSymbolKind(unittest.TestCase):
 
         call_count = [0]
 
-        def fake(idx, op_spec, symbols, symbol_id_offset=0, use_symbols=False):
+        def fake(idx, op_spec, symbols, symbol_id_offset=0):
             i = call_count[0]
             call_count[0] += 1
             base = 0x400000000
@@ -6291,7 +6286,6 @@ class TestSymbolKind(unittest.TestCase):
                 "test_kernel",
                 self.tmpdir,
                 [a, b],
-                use_symbols=True,
             )
         mlir = _read_mlir(self.tmpdir)
 

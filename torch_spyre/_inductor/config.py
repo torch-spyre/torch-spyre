@@ -148,8 +148,9 @@ disable_copy_opt: bool = os.environ.get("DISABLE_COPY_OPT", "0") == "1"
 # When True (default), HBM tensor addresses are emitted as runtime symbols
 # with !sdscbundle.input_arg<index> parameters and input_arg_extract ops
 # in the bundle.mlir.
-# When False, HBM tensor addresses are baked as concrete integers
-# into the SDSC JSON and bundle.mlir emits sdsc_execute with no operands.
+# When False, HBM tensor addresses are baked as concrete integers.
+# (SDSC path always symbolic as of #3741; baked mode only via the KTIR
+# emitter, i.e. also requires ktir_emitter=True / TORCH_SPYRE_KTIR=1.)
 bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 
 # Layout solver class used by default in scratchpad.allocator.ScratchpadAllocator.
