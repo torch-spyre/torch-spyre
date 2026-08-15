@@ -170,6 +170,20 @@ jobs:
           else
             pip install pyyaml --quiet
           fi
+
+          # perf is NOT an OOT pytest-config suite: it is a benchmark mode of
+          # `make tests` (TEST_TYPE=perf shells out to spyre-perf-suite; see the
+          # Makefile `ifeq ($(TEST_TYPE),perf)` branch). It carries no
+          # test_suite_config.labels, so the config filter below would always
+          # return an empty matrix. Route it to the dedicated `perf` job instead:
+          # emit an empty matrix (the `test` matrix job is then skipped) and pin
+          # resolved_test_type=perf so the downstream perf gate fires.
+          if [ "${RAW_TEST_TYPE}" = "perf" ]; then
+            echo "matrix={\"suite\":[]}" >> "$GITHUB_OUTPUT"
+            echo "resolved_test_type=perf" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
             --config-dir tests/configs/torch_spyre_tests \
             --test-type "${RAW_TEST_TYPE}" \
@@ -368,6 +382,105 @@ jobs:
           path: ${{ env.REPORT_PATH }}
           if-no-files-found: warn
           retention-days: 10
+
+  # ---------------------------------------------------------------------------
+  # Job 1b: perf benchmark  (test_type=perf only, never per-PR)
+  #
+  # perf is a benchmark MODE of `make tests`, not an OOT pytest-config suite, so
+  # it never appears in the config-driven `test` matrix above (generate_matrix
+  # emits an empty matrix for perf). `make tests TEST_TYPE=perf` shells out to
+  # the spyre-perf-suite console script baked into the dev image and writes
+  # report.xml into RESULTS_DIR. This job runs that single benchmark step on a
+  # card runner. The reports are not uploaded as artifacts; the results are
+  # consumed only by the ClickHouse ingest path.
+  #
+  # POLICY: perf is a weekly-only suite -- it must NEVER run on a per-PR trigger
+  # (it is expensive and holds a scarce card runner). The `github.event_name !=
+  # pull_request` guard below is the hard stop: even if a pull_request path
+  # forwarded test_type=perf, this job stays skipped. The weekly/scheduled and
+  # orchestrator paths reach here via workflow_dispatch/schedule, not
+  # pull_request, so they are unaffected.
+  # ---------------------------------------------------------------------------
+  perf:
+    name: Perf benchmark
+    needs: [generate_matrix, build_torch_spyre]
+    if: >-
+      !cancelled() &&
+      github.event_name != 'pull_request' &&
+      needs.generate_matrix.outputs.resolved_test_type == 'perf' &&
+      (needs.build_torch_spyre.result == 'success' ||
+       needs.build_torch_spyre.result == 'skipped')
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - ${{ inputs.runner_label }}
+      - ${{ inputs.image_label }}
+    timeout-minutes: 120
+    env:
+      # Flat results dir, matching the Makefile default and PR #3452. The suite
+      # writes both report.txt and report.xml here.
+      RESULTS_DIR: ${{ github.workspace }}/perf-results
+    steps:
+      - name: Checkout composite actions
+        if: ${{ !inputs.prebaked_image }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - name: Expose baked composite actions in the workspace
+        if: ${{ inputs.prebaked_image }}
+        run: ln -sfn "${PREBAKED_TORCH_SPYRE_DIR}/.github" "${GITHUB_WORKSPACE}/.github"
+
+      - if: ${{ !inputs.prebaked_image }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: torch-spyre
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
+
+      - uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
+          torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
+
+      - name: Install prebuilt torch-spyre
+        if: ${{ !inputs.prebaked_image && needs.build_torch_spyre.result == 'success' }}
+        uses: ./.github/actions/install-prebuilt-torch-spyre
+
+      - name: Run perf benchmark (make tests TEST_TYPE=perf)
+        run: |
+          # Prebaked: run FROM the baked source dir + its SHARED venv at
+          # $HOME/.venv; normal: the checkout ('torch-spyre') + local '.venv'.
+          if [ "${{ inputs.prebaked_image }}" = "true" ]; then
+            SRC_DIR="${PREBAKED_TORCH_SPYRE_DIR}"
+            VENV="${PREBAKED_VENV_PATH}"
+          else
+            SRC_DIR="torch-spyre"
+            VENV="torch-spyre/.venv"
+          fi
+          mkdir -p "${RESULTS_DIR}"
+          # Refresh AIU setup so the benchmark sees the card topology, mirroring
+          # the matrix suites' pre_run. set +u because the script reads unset
+          # vars; a failed refresh must abort before the benchmark runs.
+          set +u
+          unset _IBM_AIU_SETUP
+          rm -rf /tmp/etc/ibm/spyre/topo.json
+          source /etc/profile.d/ibm-aiu-setup.sh || exit 1
+          set -u
+          # shellcheck disable=SC1091
+          source "${VENV}/bin/activate"
+          make -C "${SRC_DIR}" tests TEST_TYPE=perf RESULTS_DIR="${RESULTS_DIR}"
+
+      # The benchmark reports are not uploaded as workflow artifacts; the
+      # results are consumed only by the ClickHouse ingest path.
+      - name: Confirm perf report was produced
+        run: |
+          # Fail if the benchmark did not write its report. Do not echo the
+          # report contents to the build log.
+          test -f "${RESULTS_DIR}/report.xml" \
+            || { echo "::error::perf run did not produce report.xml"; exit 1; }
+          echo "perf report written to \${RESULTS_DIR} (not uploaded)"
 
   # ---------------------------------------------------------------------------
   # Job 2: Multi-Spyre test matrix
