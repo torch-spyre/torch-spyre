@@ -547,7 +547,13 @@ def _plan_tiling_propagation(
         if info is not None:
             name_to_group_outer_key[op.get_name()] = info.loop_group_id[0]
 
-    for group_ops, _levels in groups:
+    for group_ops, levels in groups:
+        group_op_names: set[str] = {
+            o.get_name() for o in group_ops if isinstance(o, ComputedBuffer)
+        }
+        group_reduction_tiled_levels = _group_reduction_tiled_levels_in_group(
+            group_ops, levels
+        )
         for op in group_ops:
             if not isinstance(op, ComputedBuffer):
                 continue
@@ -600,7 +606,20 @@ def _plan_tiling_propagation(
             consumer_names, is_graph_output = _find_outside_consumers_planned(
                 buf_name, info.loop_group_id, operations, name_to_group_outer_key
             )
-            if not consumer_names and not is_graph_output:
+            # A same-outer-group consumer that itself reads an unaccumulated
+            # reduction sibling (e.g. softmax's div, reading sum) is deferred
+            # to a separate loop nest after the reduction completes -- it
+            # does not actually run in the same tile iteration as buf_name's
+            # producer despite sharing loop_group_id[0]. Route buf_name to
+            # copy_out for it exactly as if it were a genuine cross-group
+            # consumer; see _consumers_reading_incomplete_reduction.
+            reduction_consumer_names = _consumers_reading_incomplete_reduction(
+                buf_name, group_ops, group_op_names, plan, group_reduction_tiled_levels
+            )
+            all_consumer_names = list(consumer_names) + [
+                n for n in reduction_consumer_names if n not in consumer_names
+            ]
+            if not all_consumer_names and not is_graph_output:
                 info.propagation = PropagationPlan(kind="loop_internal")
                 continue
 
@@ -609,7 +628,7 @@ def _plan_tiling_propagation(
                 kind="copy_out",
                 full_ranges=full_ranges,
                 full_strides=tuple(op.layout.stride),
-                outside_consumer_names=tuple(consumer_names),
+                outside_consumer_names=tuple(all_consumer_names),
                 is_graph_output=is_graph_output,
             )
 
@@ -986,6 +1005,40 @@ def _reads_incomplete_reduction(
         ):
             return True
     return False
+
+
+def _consumers_reading_incomplete_reduction(
+    buf_name: str,
+    group_ops: list,
+    group_op_names: set[str],
+    plan: dict,
+    group_reduction_tiled_levels: set[int],
+) -> list[str]:
+    """Same-group consumers of buf_name that themselves read an
+    unaccumulated reduction sibling.
+
+    Such a consumer (e.g. softmax's ``div``, which reads ``sum``'s still-
+    partial per-tile buffer) is necessarily deferred to a separate loop nest
+    that runs only after the reduction's own inner loop fully accumulates —
+    its read of the reduction gets redirected to accum_full by
+    _tile_reduction's inside_consumers handling. It therefore does NOT
+    actually execute in the same tile iteration as buf_name's producer, even
+    though both share the same outer loop_group_id — so it cannot safely
+    read buf_name as loop-internal (per-tile, overwritten-every-iteration)
+    scratch either; buf_name must be materialized to a full buffer just like
+    a genuine cross-group consumer. See _plan_tiling_propagation.
+    """
+    result = []
+    for o in group_ops:
+        if not isinstance(o, ComputedBuffer) or o.get_name() == buf_name:
+            continue
+        if not _reads_buffer(o, buf_name):
+            continue
+        if _reads_incomplete_reduction(
+            o, group_op_names, plan, group_reduction_tiled_levels
+        ):
+            result.append(o.get_name())
+    return result
 
 
 def _plan_is_loop_invariant_at_reduction_levels(
@@ -3552,21 +3605,85 @@ def _patch_consumers(
                 return _orig(*args)
 
         object.__setattr__(consumer.data, "inner_fn", new_inner_fn)
-        consumer = replace_computed_buffer_body(
+        new_consumer = replace_computed_buffer_body(
             consumer,
             consumer.data,
             operations,
             pass_name="coarse_tile",
             reason="redirect outside consumer to full-sized buffer",
         )
-        V.graph.name_to_buffer[consumer.get_name()] = operations[
+        V.graph.name_to_buffer[new_consumer.get_name()] = operations[
             next(
                 i
                 for i, op in enumerate(operations)
                 if isinstance(op, ComputedBuffer)
-                and op.get_name() == consumer.get_name()
+                and op.get_name() == new_consumer.get_name()
             )
         ]
+
+        # new_consumer.loop_info (copied verbatim from consumer by
+        # copy_op_metadata inside replace_computed_buffer_body) still carries
+        # tiled_dims_per_read as planned when this consumer's own read of
+        # old_name was tile-local scratch -- fixed/non-advancing at plan
+        # time (see _fixed_level_extents). But the read is now redirected to
+        # new_name, a real full-sized buffer that must advance across every
+        # loop_tiled_dims level that tiles its own dims, exactly like
+        # _insert_combine_op's flat-case accum_buf write (see
+        # _advancing_level_extents). Recompute just that read's entry so
+        # SpyreKernel._general_tile_advance (which matches tiled_dims_per_read
+        # to get_read_writes().reads purely positionally) does not silently
+        # treat the redirected read as loop-invariant.
+        #
+        # A consumer that was never planned into any coarse-tile group (e.g.
+        # a plain outside consumer of a copy_out buffer) never had
+        # loop_info stamped at all -- there is no tiled_dims_per_read to fix
+        # up, and this consumer isn't part of any loop group's
+        # _general_tile_advance machinery in the first place.
+        if not hasattr(new_consumer, "loop_info"):
+            continue
+        new_loop_info = new_consumer.loop_info  # type: ignore[attr-defined]
+        new_reads = [
+            r for r in new_consumer.get_read_writes().reads if isinstance(r, MemoryDep)
+        ]
+        if new_loop_info.tiled_dims_per_read:
+            assert len(new_reads) == len(new_loop_info.tiled_dims_per_read), (
+                "_patch_consumers: positional mismatch between "
+                f"new_consumer.get_read_writes().reads ({len(new_reads)} entries) "
+                "and new_loop_info.tiled_dims_per_read "
+                f"({len(new_loop_info.tiled_dims_per_read)} entries) -- "
+                "SpyreKernel._general_tile_advance matches these purely "
+                "positionally, so a length mismatch means silently wrong "
+                "tile-advance metadata rather than a loud failure."
+            )
+            advancing_level_extents = _advancing_level_extents(
+                new_loop_info.loop_tiled_dims,
+                new_loop_info.loop_count,
+                list(new_consumer.data.ranges),
+            )
+            new_tiled_dims_per_read = [
+                (
+                    _tiled_dims_for_dep(read_dep, advancing_level_extents)
+                    if read_dep.name == new_name
+                    else per_level
+                )
+                for read_dep, per_level in zip(
+                    new_reads, new_loop_info.tiled_dims_per_read
+                )
+            ]
+            new_consumer.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
+                new_loop_info, tiled_dims_per_read=new_tiled_dims_per_read
+            )
+            logger.debug(
+                "coarse_tile: patch_consumers %s old_name=%s new_name=%s "
+                "loop_tiled_dims=%s loop_count=%s before=%s after=%s",
+                new_consumer.get_name(),
+                old_name,
+                new_name,
+                new_loop_info.loop_tiled_dims,
+                new_loop_info.loop_count,
+                new_loop_info.tiled_dims_per_read,
+                new_tiled_dims_per_read,
+            )
 
 
 def _retile_load_index(
