@@ -22,7 +22,7 @@ from torch._inductor.scheduler import (
 )
 from torch._inductor.ir import FallbackKernel
 from torch._inductor.virtualized import V
-from .constants import SEGMENT_SIZE, INTERMEDIATES_SEGMENT
+from .constants import MAX_POOL_SIZE, INTERMEDIATES_SEGMENT
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .logging_utils import get_inductor_logger
 from .scheduler import CountedLoopSchedulerNode
@@ -48,33 +48,37 @@ class Allocator:
         self._currently_allocated: int = 0  # bytes in-use right now
         self._peak_usage: int = 0  # peak concurrent usage
 
-    def allocate(self, size: int) -> int:
+    def allocate(self, size: int) -> int | None:
         """Return a byte offset from INTERMEDIATES_SEGMENT for a block of
-        `size` bytes. Reuses an existing free block when possible."""
+        `size` bytes. Reuses an existing free block when possible.
+
+        Returns None, leaving all internal state untouched, if `size` would
+        push peak concurrent usage past the segment size limit -- callers
+        fall back to standalone HBM allocation for that buffer instead.
+        """
         for i, (blk_offset, blk_size) in enumerate(self._free):
             if blk_size >= size:
-                self._free.pop(i)
-                # Return any leftover fragment to the free list.
-                remainder = blk_size - size
-                if remainder > 0:
-                    self._free.append((blk_offset + size, remainder))
                 offset = blk_offset
+                new_pool_end = self._pool_end
                 break
         else:
             # No suitable free block — extend the pool.
             offset = self._pool_end
-            self._pool_end += size
+            new_pool_end = self._pool_end + size
+            i = None
 
-        self._currently_allocated += size
-        if self._currently_allocated > self._peak_usage:
-            self._peak_usage = self._currently_allocated
+        new_currently_allocated = self._currently_allocated + size
+        if new_currently_allocated > self._segment_size:
+            return None
 
-        if self._peak_usage > self._segment_size:
-            raise RuntimeError(
-                f"HBM intermediate pool peak usage ({self._peak_usage} bytes, "
-                f"{self._peak_usage / (1024**3):.2f} GB) exceeds segment size "
-                f"({self._segment_size} bytes, {self._segment_size / (1024**3):.2f} GB)"
-            )
+        if i is not None:
+            self._free.pop(i)
+            remainder = blk_size - size
+            if remainder > 0:
+                self._free.append((blk_offset + size, remainder))
+        self._pool_end = new_pool_end
+        self._currently_allocated = new_currently_allocated
+        self._peak_usage = max(self._currently_allocated, self._peak_usage)
 
         return offset
 
@@ -359,10 +363,11 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
         live_ranges = _compute_live_ranges(live_range_nodes, bundle_candidates)
         sorted_bufs = sorted(live_ranges.items(), key=_alloc_sort_key)
 
-        allocator = Allocator(SEGMENT_SIZE)
+        allocator = Allocator(MAX_POOL_SIZE)
 
         # Track (end_step, offset, size) so we can free blocks promptly.
         pending_frees: list[tuple[int, int, int]] = []
+        overflowed = 0
 
         for name, (start, end) in sorted_bufs:
             # Free any blocks whose live range ended before this start step.
@@ -377,6 +382,23 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
 
             size = _compute_size_bytes(name)
             offset = allocator.allocate(size)
+
+            if offset is None:
+                # Pool is full: leave this buffer on the standalone-HBM path
+                # (no "hbm_pool" key) rather than failing the whole bundle --
+                # it gets the same allocation graph inputs/outputs and
+                # cross-bundle buffers already use.
+                overflowed += 1
+                logger.debug(
+                    "hbm_pool_planning: bundle=%s  %s  live=[%d,%d]  size=%d  "
+                    "does not fit in pool -- falling back to standalone HBM",
+                    bundle_name,
+                    name,
+                    start,
+                    end,
+                    size,
+                )
+                continue
 
             # Assign pool offset directly to layout.allocation.
             buf = V.graph.get_buffer(name)
@@ -415,14 +437,22 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
 
         peak = allocator.get_peak_usage()
         pool_extent = allocator.get_pool_end()
+        if overflowed:
+            logger.warning(
+                "hbm_pool_planning: bundle=%s  %d intermediate(s) did not fit in "
+                "the %.2f GB pool budget and fell back to standalone HBM",
+                bundle_name,
+                overflowed,
+                MAX_POOL_SIZE / (1024**3),
+            )
         logger.info(
             "hbm_pool_planning: bundle=%s assigned %d intermediates, peak concurrent "
             "usage %.2f GB, pool extent %.2f GB / %.2f GB",
             bundle_name,
-            len(sorted_bufs),
+            len(sorted_bufs) - overflowed,
             peak / (1024**3),
             pool_extent / (1024**3),
-            SEGMENT_SIZE / (1024**3),
+            MAX_POOL_SIZE / (1024**3),
         )
         V.graph.hbm_pool_sizes[bundle_name] = pool_extent
 

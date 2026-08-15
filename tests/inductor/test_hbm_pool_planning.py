@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 from sympy import Integer
@@ -26,9 +26,66 @@ from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout
-from torch_spyre._inductor.hbm_pool_planning import hbm_pool_planning
+from torch_spyre._inductor.hbm_pool_planning import Allocator, hbm_pool_planning
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.scheduler import CountedLoopSchedulerNode
+
+
+class TestAllocator(unittest.TestCase):
+    """Unit tests for Allocator.allocate's overflow-fallback behavior."""
+
+    def test_allocate_within_budget_succeeds(self):
+        allocator = Allocator(100)
+        self.assertEqual(allocator.allocate(60), 0)
+
+    def test_allocate_past_budget_returns_none(self):
+        allocator = Allocator(100)
+        self.assertIsNone(allocator.allocate(101))
+
+    def test_failed_allocate_leaves_state_untouched(self):
+        """A rejected allocate() must not advance pool_end, bump
+        currently_allocated/peak_usage, or consume a free block -- the next
+        allocate() call sees exactly the state it would have without the
+        rejected call ever happening."""
+        allocator = Allocator(100)
+        first = allocator.allocate(50)
+        self.assertEqual(first, 0)
+
+        rejected = allocator.allocate(60)  # 50 + 60 > 100
+        self.assertIsNone(rejected)
+
+        # State is exactly as after the first allocate() alone: the next
+        # real allocation continues from pool_end=50, not from some
+        # partially-applied 110.
+        second = allocator.allocate(40)
+        self.assertEqual(second, 50)
+        self.assertEqual(allocator.get_peak_usage(), 90)
+        self.assertEqual(allocator.get_pool_end(), 90)
+
+    def test_failed_allocate_does_not_consume_free_block(self):
+        """A rejected allocate() that would have reused a free block must
+        leave that block in the free list for a later, smaller request."""
+        allocator = Allocator(100)
+        allocator.allocate(50)
+        allocator.free(0, 50)  # currently_allocated back to 0; free: [(0, 50)]
+
+        # allocate(60) finds no free block big enough (50 < 60), so it
+        # extends the pool instead, leaving (0, 50) untouched in the free
+        # list. currently_allocated is now 60.
+        grown = allocator.allocate(60)
+        self.assertEqual(grown, 50)
+
+        # Reusing (0, 50) would bring currently_allocated to 60 + 50 = 110,
+        # over budget -- rejected without consuming the free block.
+        rejected = allocator.allocate(50)
+        self.assertIsNone(rejected)
+
+        # Freeing the 60-byte block drops currently_allocated back to 0, so
+        # the same (0, 50) free block -- never consumed by the rejection --
+        # is still available and now fits.
+        allocator.free(50, 60)
+        fits = allocator.allocate(50)
+        self.assertEqual(fits, 0)
 
 
 def _make_ftl_buffer(name, host_size=(64,), dim_order=(0,)):
@@ -372,6 +429,82 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
 
         buf = V.graph.get_buffer("accum")
         self.assertNotIn("hbm_pool", buf.get_layout().allocation)
+
+    def test_buffer_that_overflows_pool_falls_back_to_standalone_hbm(self):
+        """When MAX_POOL_SIZE is too small to hold every pool-eligible
+        buffer, the ones that fit get an hbm_pool allocation and the
+        overflow buffer(s) fall back to standalone HBM (no hbm_pool key)
+        instead of raising.
+
+        buf0 (128 bytes) and buf1 (256 bytes) have non-overlapping live
+        ranges but the allocator restarts a fresh Allocator per bundle, so
+        with MAX_POOL_SIZE patched to 200 bytes, buf0 fits (128 <= 200) but
+        buf1 does not (256 > 200): the very first allocation call already
+        exceeds budget for buf1 regardless of live-range-driven reuse.
+        """
+        _make_ftl_buffer("buf0", host_size=(64,))
+        _make_ftl_buffer("buf1", host_size=(128,))
+        w0 = _make_snode_with_rw("w0", writes=["buf0"], reads=[])
+        r0 = _make_snode_with_rw("r0", writes=[], reads=["buf0"])
+        w1 = _make_snode_with_rw("w1", writes=["buf1"], reads=[])
+        r1 = _make_snode_with_rw("r1", writes=[], reads=["buf1"])
+        bundle = FusedSchedulerNode(MagicMock(), [w0, r0, w1, r1])
+
+        with patch("torch_spyre._inductor.hbm_pool_planning.MAX_POOL_SIZE", 200):
+            hbm_pool_planning([bundle])
+
+        buf0 = V.graph.get_buffer("buf0")
+        buf1 = V.graph.get_buffer("buf1")
+        self.assertIn("hbm_pool", buf0.get_layout().allocation)
+        self.assertNotIn("hbm_pool", buf1.get_layout().allocation)
+        # The bundle still gets a pool-size entry reflecting only what was
+        # actually placed in the pool (buf0), not the buffer that overflowed.
+        self.assertEqual(V.graph.hbm_pool_sizes[bundle.get_name()], 128)
+
+    def test_all_buffers_overflow_pool_produces_zero_size_pool(self):
+        """If MAX_POOL_SIZE is too small for even the first buffer, every
+        pool-eligible buffer in the bundle falls back to standalone HBM and
+        the bundle's recorded pool extent is 0 -- no RuntimeError."""
+        _make_ftl_buffer("buf0", host_size=(64,))
+        writer = _make_snode_with_rw("writer", writes=["buf0"], reads=[])
+        reader = _make_snode_with_rw("reader", writes=[], reads=["buf0"])
+        bundle = FusedSchedulerNode(MagicMock(), [writer, reader])
+
+        with patch("torch_spyre._inductor.hbm_pool_planning.MAX_POOL_SIZE", 1):
+            hbm_pool_planning([bundle])
+
+        buf0 = V.graph.get_buffer("buf0")
+        self.assertNotIn("hbm_pool", buf0.get_layout().allocation)
+        self.assertEqual(V.graph.hbm_pool_sizes[bundle.get_name()], 0)
+
+    def test_freed_space_is_reused_before_hitting_pool_budget(self):
+        """A buffer that fits only because an earlier buffer's live range
+        already ended (and its block was freed) must still get pool
+        allocated -- the fallback path must not trigger for buffers that
+        fit via reuse, only for genuine budget overflow."""
+        _make_ftl_buffer("buf0", host_size=(64,))  # 128 bytes
+        _make_ftl_buffer("buf1", host_size=(64,))  # 128 bytes
+        w0 = _make_snode_with_rw("w0", writes=["buf0"], reads=[])
+        r0 = _make_snode_with_rw("r0", writes=[], reads=["buf0"])
+        w1 = _make_snode_with_rw("w1", writes=["buf1"], reads=[])
+        r1 = _make_snode_with_rw("r1", writes=[], reads=["buf1"])
+        # buf0's live range [0, 1] ends before buf1's starts at [2, 3], so
+        # buf1 can reuse buf0's freed 128-byte block instead of needing a
+        # fresh 128 bytes on top -- a pool budget of 128 is only enough for
+        # one live buffer at a time, not both concurrently.
+        bundle = FusedSchedulerNode(MagicMock(), [w0, r0, w1, r1])
+
+        with patch("torch_spyre._inductor.hbm_pool_planning.MAX_POOL_SIZE", 128):
+            hbm_pool_planning([bundle])
+
+        buf0 = V.graph.get_buffer("buf0")
+        buf1 = V.graph.get_buffer("buf1")
+        self.assertIn("hbm_pool", buf0.get_layout().allocation)
+        self.assertIn("hbm_pool", buf1.get_layout().allocation)
+        self.assertEqual(
+            buf0.get_layout().allocation["hbm_pool"],
+            buf1.get_layout().allocation["hbm_pool"],
+        )
 
 
 if __name__ == "__main__":
