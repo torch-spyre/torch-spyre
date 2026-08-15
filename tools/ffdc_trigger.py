@@ -21,7 +21,7 @@ real exception paths so FFDC fires on a genuine traceback with real
 hardware state and compiler artifacts.
 
 Run from repo root with:
-    USE_SPYRE_PROFILER=1 TORCH_COMPILE_DEBUG=1 python3 tools/ffdc_trigger.py
+    TORCH_SPYRE_FFDC=1 TORCH_COMPILE_DEBUG=1 python3 tools/ffdc_trigger.py
 """
 
 import glob
@@ -60,7 +60,7 @@ def _print_collector_stats(collector: dict[str, Any]) -> None:
 def main():
     print("\n=== FFDC Real Trigger ===\n")
     reports = []
-    os.environ.setdefault("USE_SPYRE_PROFILER", "1")
+    os.environ.setdefault("TORCH_SPYRE_FFDC", "1")
 
     # ── Scenario A: runtime_launch failure ──────────────────────────────────────
     # SpyreSDSCKernelRunner.__init__ calls prepare_kernel(); with a fake code_dir

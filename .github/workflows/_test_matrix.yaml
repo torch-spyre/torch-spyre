@@ -429,8 +429,14 @@ jobs:
             config: distributed_tests/test_gather.yaml
           - name: Test Multi-Spyre Allgather
             config: distributed_tests/test_allgather.yaml
+          - name: Test Multi-Spyre Allreduce
+            config: distributed_tests/test_allreduce.yaml
+          - name: Test Multi-Spyre Reduce
+            config: distributed_tests/test_reduce.yaml
           - name: Test Multi-Spyre Broadcast Compiled
             config: distributed_tests/test_broadcast_compiled.yaml
+          - name: Test Multi-Spyre Allreduce Compiled
+            config: distributed_tests/test_allreduce_compiled.yaml
 
     steps:
       # See the `test` job above: prebaked path symlinks the baked .github into

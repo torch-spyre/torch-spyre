@@ -40,6 +40,7 @@ try:
     _HAS_ORTOOLS = True
 except ImportError:
     _HAS_ORTOOLS = False
+    CpSatLayoutSolver = None  # type: ignore[assignment,misc]
 
 
 Ts = TypeVarTuple("Ts")

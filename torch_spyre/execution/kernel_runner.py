@@ -71,7 +71,7 @@ class SpyreSDSCKernelRunner:
                 self.profiler_event_name,
                 list(kernel_provenance.debug_handle_ids),
             )
-            with torch.profiler.record_function(f"launch_jobplan:{self.kernel_name}"):
+            with torch.profiler.record_function(f"prepare_kernel:{self.kernel_name}"):
                 self.jobplan = prepare_kernel(
                     spyrecode_dir,
                     profiler_name=self.profiler_event_name,
