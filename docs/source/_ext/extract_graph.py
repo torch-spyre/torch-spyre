@@ -58,9 +58,27 @@ def _normalize_op_name(raw):
     return raw
 
 
-def _extract_list_ops(list_node):
-    """Extract op names from an ast.List of Attribute references."""
+def _module_list_bindings(tree):
+    """Map module-level ``NAME = [...]`` assignments to their ast.List node."""
+    bindings = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.List):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    bindings[target.id] = stmt.value
+    return bindings
+
+
+def _extract_list_ops(list_node, list_bindings=None):
+    """Extract op names from an ast.List of Attribute references.
+
+    ``list_bindings`` (from :func:`_module_list_bindings`) lets a bare name be
+    resolved, so ``register_torch_compile_kernel(COMPILED_OPS)`` is parsed the
+    same as an inline list literal.
+    """
     ops = []
+    if isinstance(list_node, ast.Name) and list_bindings:
+        list_node = list_bindings.get(list_node.id, list_node)
     if not isinstance(list_node, ast.List):
         return ops
     for elt in list_node.elts:
@@ -320,12 +338,13 @@ def extract_eager_kernels(filepath):
     source = Path(filepath).read_text()
     tree = ast.parse(source)
     rel_path = str(filepath)
+    list_bindings = _module_list_bindings(tree)
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             func_name = _resolve_attr(node.func)
             if func_name == "register_torch_compile_kernel" and node.args:
-                ops = _extract_list_ops(node.args[0])
+                ops = _extract_list_ops(node.args[0], list_bindings)
                 for op in ops:
                     eager_id = f"eager::{op}"
                     op_id = f"op::{op}"

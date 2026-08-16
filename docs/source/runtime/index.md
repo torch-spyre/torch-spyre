@@ -153,7 +153,9 @@ Physical-frame (PF) and virtual-frame (VF) execution are *not* allocator strateg
 
 Eager kernels reach the Spyre dispatch key from two Python sources.
 
-The first is manual registrations in [`torch_spyre/ops/eager.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/eager.py), which use `register_torch_compile_kernel` to register 45+ ops (arithmetic, comparison, reduction, activation, and view ops) for the PrivateUse1 dispatch key.
+The first is manual registrations in [`torch_spyre/ops/eager.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/eager.py), which use `register_torch_compile_kernel` to register the 45+ ops in `COMPILED_OPS` (arithmetic, comparison, reduction, activation, and view ops) for the PrivateUse1 dispatch key.
+
+In-place variants are *derived* from that same list by `register_inplace_kernels`, not listed separately: each `foo_` overload whose signature matches its functional `foo` sibling gets a kernel that computes functionally and writes back with `self.copy_()`. In-place ops must never be added to `COMPILED_OPS` directly — a standalone-compiled in-place kernel bakes its write-destination address at trace time and can clobber an unrelated live buffer, whereas `copy_` is addressed at runtime.
 
 The second is CPU fallbacks in [`torch_spyre/ops/fallbacks.py`](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/ops/fallbacks.py), registered through `@register_fallback` (or the `register_fallback_default` helper for plain pass-throughs). These cover the long tail: `arange`, `embedding`, `cumsum`, `tril`/`triu`, `isin`, `bitwise_xor`/`bitwise_or`, `argmax`, and similar.
 
