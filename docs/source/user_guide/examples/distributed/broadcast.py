@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import argparse
 import torch
 import torch.distributed as dist
 import os
@@ -19,13 +20,15 @@ DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
 C10D_BACKEND = "spyreccl"
 
 
-def run_test(shape, comm_rank, comm_size):
+def run_test(shape, comm_rank, comm_size, async_op=False):
     """Run a broadcast test with the given tensor shape.
 
     Args:
         shape: Either an integer (for 1D tensor) or tuple (for multi-dimensional tensor)
         comm_rank: Rank of the current process
         comm_size: Total number of processes
+        async_op: If True, launch the collective asynchronously and overlap CPU
+                  work with the hardware operation before calling work.wait().
     """
     global DEVICE
 
@@ -55,9 +58,24 @@ def run_test(shape, comm_rank, comm_size):
         print(f"[{comm_rank} of {comm_size}] {x.flatten()[:10]}")
     x_device = x.to(DEVICE)
 
-    # Broadcast with the collective library
-    print(f"[{comm_rank} of {comm_size}] Broadcast Tensor: Spyre")
-    dist.broadcast(x_device, 0)
+    # Expected result: root's original tensor
+    expected_tensor = torch.arange(0, num_elements, dtype=torch.float16).reshape(
+        tensor_shape
+    )
+
+    if async_op:
+        # Launch broadcast asynchronously — returns a Work handle immediately
+        print(f"[{comm_rank} of {comm_size}] Broadcast Tensor (async): Spyre")
+        work = dist.broadcast(x_device, src=0, async_op=True)
+
+        # Note: Opportunity for overlapping of host activities with asynchronous communication.
+
+        # Block until the async collective has completed
+        work.wait()
+    else:
+        # Broadcast with the collective library
+        print(f"[{comm_rank} of {comm_size}] Broadcast Tensor: Spyre")
+        dist.broadcast(x_device, 0)
 
     result = x_device.to("cpu")
     print(f"[{comm_rank} of {comm_size}] Tensor after collective")
@@ -69,9 +87,6 @@ def run_test(shape, comm_rank, comm_size):
         )
 
     # Check the result - should match root's original tensor
-    expected_tensor = torch.arange(0, num_elements, dtype=torch.float16).reshape(
-        tensor_shape
-    )
     if torch.allclose(result, expected_tensor):
         print(f"[{comm_rank} of {comm_size}] Tensor is correct")
     else:
@@ -82,6 +97,16 @@ def run_test(shape, comm_rank, comm_size):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Distributed broadcast example")
+    parser.add_argument(
+        "--async",
+        dest="async_op",
+        action="store_true",
+        default=False,
+        help="Launch broadcast asynchronously (async_op=True)",
+    )
+    args = parser.parse_args()
+
     # Check that the c10d backend was loaded properly
     if dist.distributed_c10d.is_backend_available(C10D_BACKEND) is False:
         raise RuntimeError(f"Error: Missing the C10 Backend {C10D_BACKEND}")
@@ -98,8 +123,6 @@ if __name__ == "__main__":
     comm_size = dist.get_world_size()
     comm_rank = dist.get_rank()
 
-    run_test(128, comm_rank, comm_size)
+    run_test(128, comm_rank, comm_size, async_op=args.async_op)
 
     dist.destroy_process_group()
-
-# Made with Bob

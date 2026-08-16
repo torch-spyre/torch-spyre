@@ -25,6 +25,7 @@ from torch.testing._internal.common_utils import (
 
 from torch_spyre.model_utils import (
     _dma_to_spyre_dim_order_swapped,
+    _dma_to_spyre_indirect_access,
     load_model_to_spyre,
     patch_module_to_for_spyre,
 )
@@ -54,6 +55,62 @@ class TestLoadModelToSpyre(TestCase):
         """The dim_order helper only accepts 2D weights."""
         with self.assertRaises(AssertionError):
             _dma_to_spyre_dim_order_swapped(torch.randn(4, dtype=torch.float16))
+
+    # ── embedding gather-optimal (indirect-access) layout ──────────
+
+    def test_embedding_has_indirect_access_layout(self):
+        """A 2D Embedding table gets device dims [rows, D // eps, eps] with the
+        vocab dim outermost. For a (1000, 256) fp16 table, eps=64, so the
+        device layout is [1000, 4, 64]."""
+        from torch_spyre._C import get_spyre_tensor_layout
+
+        w = torch.randn(1000, 256, dtype=torch.float16)
+        dev = _dma_to_spyre_indirect_access(w)
+        layout = get_spyre_tensor_layout(dev)
+        self.assertEqual(list(layout.device_size), [1000, 4, 64])
+
+    def test_embedding_stick_size_is_dtype_aware(self):
+        """elems_per_stick is 32 at fp32, so a (1000, 256) fp32 table splits
+        into 256/32 = 8 sticks, not 4."""
+        from torch_spyre._C import get_spyre_tensor_layout
+
+        w = torch.randn(1000, 256, dtype=torch.float32)
+        dev = _dma_to_spyre_indirect_access(w)
+        layout = get_spyre_tensor_layout(dev)
+        self.assertEqual(list(layout.device_size), [1000, 8, 32])
+
+    def test_embedding_non_tiling_hidden_dim_warns_and_falls_back(self):
+        """A hidden dim that isn't a multiple of the stick size warns and
+        returns None so the caller uses the default layout."""
+        w = torch.randn(1000, 100, dtype=torch.float16)  # 100 % 64 != 0
+        with self.assertWarns(UserWarning):
+            dev = _dma_to_spyre_indirect_access(w)
+        self.assertIsNone(dev)
+
+    def test_indirect_access_rejects_non_2d(self):
+        """The indirect-access helper only accepts 2D tables."""
+        with self.assertRaises(AssertionError):
+            _dma_to_spyre_indirect_access(torch.randn(4, dtype=torch.float16))
+
+    def test_load_model_routes_embedding_through_indirect_access(self):
+        """An nn.Embedding table lands on Spyre with the indirect-access layout
+        (vocab dim outermost), not the default layout."""
+        from torch_spyre._C import get_spyre_tensor_layout
+
+        model = nn.Embedding(1000, 256, dtype=torch.float16)
+        load_model_to_spyre(model)
+
+        self.assertEqual(model.weight.device.type, "spyre")
+        layout = get_spyre_tensor_layout(model.weight)
+        self.assertEqual(list(layout.device_size), [1000, 4, 64])
+
+    def test_load_model_embedding_non_tiling_falls_back(self):
+        """An embedding whose hidden dim doesn't tile still loads (default
+        layout) and warns."""
+        model = nn.Embedding(1000, 100, dtype=torch.float16)
+        with self.assertWarns(UserWarning):
+            load_model_to_spyre(model)
+        self.assertEqual(model.weight.device.type, "spyre")
 
     # ── routing ────────────────────────────────────────────────────
 

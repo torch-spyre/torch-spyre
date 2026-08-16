@@ -48,6 +48,7 @@ Test sub-suites:
 | `TORCH_LOGS="+inductor"` | Verbose Inductor logging |
 | `TORCH_COMPILE_DEBUG=1` | Dump Inductor debug artifacts |
 | `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 downcast warnings |
+| `SPYRE_DUMP_COST=1` | Predicted-runtime report after pre-scheduling |
 
 ## Spyre Hardware Basics
 

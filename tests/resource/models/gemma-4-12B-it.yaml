@@ -1,0 +1,3520 @@
+model: gemma-4-12B-it_old
+defaults:
+  dtype: fp16
+  seed: 123
+  atol: 0.005
+  rtol: 0.005
+cases:
+  - name: torch.eq.1
+    op: torch.eq
+    inputs:
+      - tensor:
+          shape: [1, 34]
+          stride: [34, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+      - value: 258880
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L975 in get_placeholder_mask,
+      code: special_image_mask = input_ids == self.config.image_token_id'
+    marks:
+      - constant
+      - tensorsoncpu
+  - name: torch.or_.1
+    op: torch.or_
+    inputs:
+      - tensor:
+          shape: [1, 34]
+          stride: [34, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda
+      - tensor:
+          shape: [1, 34]
+          stride: [34, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1034 in forward,
+      code: multimodal_mask = image_mask | video_mask | audio_mask'
+    marks: tensorsoncpu
+  - name: torch.clone.1
+    op: torch.clone
+    inputs:
+      - tensor:
+          shape: [1, 34]
+          stride: [34, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1039 in forward,
+      code: llm_input_ids = input_ids.clone()'
+    marks: tensorsoncpu
+  - name: torch.where.1
+    op: torch.where
+    inputs:
+      - tensor:
+          shape: [1, 34]
+          stride: [34, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda
+      - value: 0
+      - tensor:
+          shape: [1, 34]
+          stride: [34, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1040 in forward,
+      code: llm_input_ids = torch.where(multimodal_mask, self.config.text_config.pad_token_id, llm_input_ids)'
+    marks:
+      - constant
+      - tensorsoncpu
+  - name: torch.nn.functional.embedding.1
+    op: torch.nn.functional.embedding
+    inputs:
+      - tensor:
+          shape: [1, 34]
+          stride: [34, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+      - tensor:
+          shape: [262144, 3840]
+          stride: [3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: 0
+      - value: null
+      - value: 2.0
+      - value: false
+      - value: false
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L558 in forward,
+      code: return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.to.1
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: []
+          stride: []
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: torch.bfloat16
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L558 in forward,
+      code: return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)'
+    marks:
+      - constant
+      - tensorsoncpu
+  - name: torch.mul.1
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 34, 3840]
+          stride: [130560, 3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: []
+          stride: []
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L558 in forward,
+      code: return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.getitem.1
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [256]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - py: (None, slice(None, None, None), None)
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L273 in forward,
+      code: inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.float.1
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 256, 1]
+          stride: [256, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L273 in forward,
+      code: inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.Tensor.expand.1
+    op: torch.Tensor.expand
+    inputs:
+      - tensor:
+          shape: [1, 256, 1]
+          stride: [256, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 1
+      - value: -1
+      - value: 1
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L273 in forward,
+      code: inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.to.2
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [1, 256, 1]
+          stride: [256, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: cpu
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L273 in forward,
+      code: inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.getitem.2
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 34]
+          stride: [34, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+      - py: (slice(None, None, None), None, slice(None, None, None))
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L274 in forward,
+      code: position_ids_expanded = position_ids[:, None, :].float()'
+    marks:
+      - constant
+      - tensorsoncpu
+  - name: torch.float.2
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 1, 34]
+          stride: [34, 34, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L274 in forward,
+      code: position_ids_expanded = position_ids[:, None, :].float()'
+    marks: tensorsoncpu
+  - name: torch.float.3
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 1, 34]
+          stride: [34, 34, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L278 in forward,
+      code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.matmul.1
+    op: torch.matmul
+    inputs:
+      - tensor:
+          shape: [1, 256, 1]
+          stride: [256, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [1, 1, 34]
+          stride: [34, 34, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: xavier
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L278 in forward,
+      code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.transpose.1
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 256, 34]
+          stride: [8704, 34, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L278 in forward,
+      code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.cat.1
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [1, 34, 256]
+            stride: [8704, 1, 34]
+            storage_offset: 0
+            dtype: torch.float32
+            device: cuda
+            init: rand
+          - shape: [1, 34, 256]
+            stride: [8704, 1, 34]
+            storage_offset: 0
+            dtype: torch.float32
+            device: cuda
+            init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L279 in forward,
+      code: emb = torch.cat((freqs, freqs), dim=-1)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+    kwmap:
+      dim: -1
+  - name: torch.cos.1
+    op: torch.cos
+    inputs:
+      - tensor:
+          shape: [1, 34, 512]
+          stride: [17408, 512, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L280 in forward,
+      code: cos = emb.cos() * attention_scaling'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.mul.2
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 34, 512]
+          stride: [17408, 512, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 1.0
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L280 in forward,
+      code: cos = emb.cos() * attention_scaling'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.sin.1
+    op: torch.sin
+    inputs:
+      - tensor:
+          shape: [1, 34, 512]
+          stride: [17408, 512, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L281 in forward,
+      code: sin = emb.sin() * attention_scaling'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.to.3
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [1, 34, 512]
+          stride: [17408, 512, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L283 in forward,
+      code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+    kwmap:
+      dtype: torch.bfloat16
+  - name: torch.getitem.3
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [128]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - py: (None, slice(None, None, None), None)
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L273 in forward,
+      code: inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.float.4
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 128, 1]
+          stride: [128, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L273 in forward,
+      code: inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.Tensor.expand.2
+    op: torch.Tensor.expand
+    inputs:
+      - tensor:
+          shape: [1, 128, 1]
+          stride: [128, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 1
+      - value: -1
+      - value: 1
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L273 in forward,
+      code: inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.to.4
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [1, 128, 1]
+          stride: [128, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: cpu
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L273 in forward,
+      code: inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.matmul.2
+    op: torch.matmul
+    inputs:
+      - tensor:
+          shape: [1, 128, 1]
+          stride: [128, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [1, 1, 34]
+          stride: [34, 34, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: xavier
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L278 in forward,
+      code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.transpose.2
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 128, 34]
+          stride: [4352, 34, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L278 in forward,
+      code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.cat.2
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [1, 34, 128]
+            stride: [4352, 1, 34]
+            storage_offset: 0
+            dtype: torch.float32
+            device: cuda
+            init: rand
+          - shape: [1, 34, 128]
+            stride: [4352, 1, 34]
+            storage_offset: 0
+            dtype: torch.float32
+            device: cuda
+            init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L279 in forward,
+      code: emb = torch.cat((freqs, freqs), dim=-1)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+    kwmap:
+      dim: -1
+  - name: torch.cos.2
+    op: torch.cos
+    inputs:
+      - tensor:
+          shape: [1, 34, 256]
+          stride: [8704, 256, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L280 in forward,
+      code: cos = emb.cos() * attention_scaling'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.mul.3
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 34, 256]
+          stride: [8704, 256, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 1.0
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L280 in forward,
+      code: cos = emb.cos() * attention_scaling'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.sin.2
+    op: torch.sin
+    inputs:
+      - tensor:
+          shape: [1, 34, 256]
+          stride: [8704, 256, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L281 in forward,
+      code: sin = emb.sin() * attention_scaling'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.to.5
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [1, 34, 256]
+          stride: [8704, 256, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L283 in forward,
+      code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+    kwmap:
+      dtype: torch.bfloat16
+  - name: torch.float.5
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 34, 3840]
+          stride: [130560, 3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L190 in forward,
+      code: normed_output = self._norm(hidden_states.float())'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.pow.1
+    op: torch.pow
+    inputs:
+      - tensor:
+          shape: [1, 34, 3840]
+          stride: [130560, 3840, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L185 in _norm,
+      code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.mean.1
+    op: torch.mean
+    inputs:
+      - tensor:
+          shape: [1, 34, 3840]
+          stride: [130560, 3840, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: -1
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L185 in _norm,
+      code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+    kwmap:
+      keepdim: true
+  - name: torch.add.1
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [1, 34, 1]
+          stride: [34, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 1.0e-06
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L185 in _norm,
+      code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.pow.2
+    op: torch.pow
+    inputs:
+      - tensor:
+          shape: [1, 34, 1]
+          stride: [34, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: -0.5
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L187 in _norm,
+      code: return hidden_states * torch.pow(mean_squared, -0.5)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.mul.4
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 34, 3840]
+          stride: [130560, 3840, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 34, 1]
+          stride: [34, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L187 in _norm,
+      code: return hidden_states * torch.pow(mean_squared, -0.5)'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.float.6
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [3840]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L192 in forward,
+      code: normed_output = normed_output * self.weight.float()'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.mul.5
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 34, 3840]
+          stride: [130560, 3840, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [3840]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L192 in forward,
+      code: normed_output = normed_output * self.weight.float()'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.type_as.1
+    op: torch.type_as
+    inputs:
+      - tensor:
+          shape: [1, 34, 3840]
+          stride: [130560, 3840, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 34, 3840]
+          stride: [130560, 3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L193 in forward,
+      code: return normed_output.type_as(hidden_states)'
+    marks:
+      - fp32operation
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.nn.functional.linear.1
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 34, 3840]
+          stride: [130560, 3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [4096, 3840]
+          stride: [3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: xavier
+      - value: null
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L427 in forward,
+      code: query_states = self.q_proj(hidden_states).view(hidden_shape)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.Tensor.view.1
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [1, 34, 4096]
+          stride: [139264, 4096, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: (1, 34, -1, 256)
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L427 in forward,
+      code: query_states = self.q_proj(hidden_states).view(hidden_shape)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.float.7
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 256]
+          stride: [139264, 4096, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L190 in forward,
+      code: normed_output = self._norm(hidden_states.float())'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.pow.3
+    op: torch.pow
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 256]
+          stride: [139264, 4096, 256, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L185 in _norm,
+      code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.mean.2
+    op: torch.mean
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 256]
+          stride: [139264, 4096, 256, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: -1
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L185 in _norm,
+      code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+    kwmap:
+      keepdim: true
+  - name: torch.add.2
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 1]
+          stride: [544, 16, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 1.0e-06
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L185 in _norm,
+      code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.pow.4
+    op: torch.pow
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 1]
+          stride: [544, 16, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: -0.5
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L187 in _norm,
+      code: return hidden_states * torch.pow(mean_squared, -0.5)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.mul.6
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 256]
+          stride: [139264, 4096, 256, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 34, 16, 1]
+          stride: [544, 16, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L187 in _norm,
+      code: return hidden_states * torch.pow(mean_squared, -0.5)'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.float.8
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [256]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L192 in forward,
+      code: normed_output = normed_output * self.weight.float()'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.mul.7
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 256]
+          stride: [139264, 4096, 256, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [256]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L192 in forward,
+      code: normed_output = normed_output * self.weight.float()'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.type_as.2
+    op: torch.type_as
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 256]
+          stride: [139264, 4096, 256, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 34, 16, 256]
+          stride: [139264, 4096, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L193 in forward,
+      code: return normed_output.type_as(hidden_states)'
+    marks:
+      - fp32operation
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.unsqueeze.1
+    op: torch.unsqueeze
+    inputs:
+      - tensor:
+          shape: [1, 34, 256]
+          stride: [8704, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L310 in apply_rotary_pos_emb,
+      code: cos = cos.unsqueeze(unsqueeze_dim)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.mul.8
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 256]
+          stride: [139264, 4096, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 34, 1, 256]
+          stride: [8704, 256, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L312 in apply_rotary_pos_emb,
+      code: return (x * cos) + (rotate_half(x) * sin)'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.getitem.4
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 256]
+          stride: [139264, 4096, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - py: (Ellipsis, slice(None, 128, None))
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L288 in rotate_half,
+      code: x1 = x[..., : x.shape[-1] // 2]'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.neg.1
+    op: torch.neg
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 128]
+          stride: [139264, 4096, 256, 1]
+          storage_offset: 128
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L290 in rotate_half,
+      code: return torch.cat((-x2, x1), dim=-1)'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.cat.3
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [1, 34, 16, 128]
+            stride: [69632, 2048, 128, 1]
+            storage_offset: 0
+            dtype: torch.bfloat16
+            device: cuda
+            init: rand
+          - shape: [1, 34, 16, 128]
+            stride: [139264, 4096, 256, 1]
+            storage_offset: 0
+            dtype: torch.bfloat16
+            device: cuda
+            init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L290 in rotate_half,
+      code: return torch.cat((-x2, x1), dim=-1)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+    kwmap:
+      dim: -1
+  - name: torch.add.3
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 256]
+          stride: [139264, 4096, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 34, 16, 256]
+          stride: [139264, 4096, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L312 in apply_rotary_pos_emb,
+      code: return (x * cos) + (rotate_half(x) * sin)'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.transpose.3
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 256]
+          stride: [139264, 4096, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L430 in forward,
+      code: query_states = query_states.transpose(1, 2)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.nn.functional.linear.2
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 34, 3840]
+          stride: [130560, 3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [2048, 3840]
+          stride: [3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: xavier
+      - value: null
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L441 in forward,
+      code: key_states = self.k_proj(hidden_states).view(hidden_shape)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.Tensor.view.2
+    op: torch.Tensor.view
+    inputs:
+      - tensor:
+          shape: [1, 34, 2048]
+          stride: [69632, 2048, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: (1, 34, -1, 256)
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L441 in forward,
+      code: key_states = self.k_proj(hidden_states).view(hidden_shape)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.float.9
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 34, 8, 256]
+          stride: [69632, 2048, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L190 in forward,
+      code: normed_output = self._norm(hidden_states.float())'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.pow.5
+    op: torch.pow
+    inputs:
+      - tensor:
+          shape: [1, 34, 8, 256]
+          stride: [69632, 2048, 256, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L185 in _norm,
+      code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.mean.3
+    op: torch.mean
+    inputs:
+      - tensor:
+          shape: [1, 34, 8, 256]
+          stride: [69632, 2048, 256, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: -1
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L185 in _norm,
+      code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+    kwmap:
+      keepdim: true
+  - name: torch.add.4
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [1, 34, 8, 1]
+          stride: [272, 8, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 1.0e-06
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L185 in _norm,
+      code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.pow.6
+    op: torch.pow
+    inputs:
+      - tensor:
+          shape: [1, 34, 8, 1]
+          stride: [272, 8, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: -0.5
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L187 in _norm,
+      code: return hidden_states * torch.pow(mean_squared, -0.5)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.mul.9
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 34, 8, 256]
+          stride: [69632, 2048, 256, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 34, 8, 1]
+          stride: [272, 8, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L187 in _norm,
+      code: return hidden_states * torch.pow(mean_squared, -0.5)'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.mul.10
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 34, 8, 256]
+          stride: [69632, 2048, 256, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [256]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L192 in forward,
+      code: normed_output = normed_output * self.weight.float()'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.type_as.3
+    op: torch.type_as
+    inputs:
+      - tensor:
+          shape: [1, 34, 8, 256]
+          stride: [69632, 2048, 256, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 34, 8, 256]
+          stride: [69632, 2048, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L193 in forward,
+      code: return normed_output.type_as(hidden_states)'
+    marks:
+      - fp32operation
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.mul.11
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 34, 8, 256]
+          stride: [69632, 2048, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 34, 1, 256]
+          stride: [8704, 256, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L312 in apply_rotary_pos_emb,
+      code: return (x * cos) + (rotate_half(x) * sin)'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.getitem.5
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 34, 8, 256]
+          stride: [69632, 2048, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - py: (Ellipsis, slice(None, 128, None))
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L288 in rotate_half,
+      code: x1 = x[..., : x.shape[-1] // 2]'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.neg.2
+    op: torch.neg
+    inputs:
+      - tensor:
+          shape: [1, 34, 8, 128]
+          stride: [69632, 2048, 256, 1]
+          storage_offset: 128
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L290 in rotate_half,
+      code: return torch.cat((-x2, x1), dim=-1)'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.cat.4
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [1, 34, 8, 128]
+            stride: [34816, 1024, 128, 1]
+            storage_offset: 0
+            dtype: torch.bfloat16
+            device: cuda
+            init: rand
+          - shape: [1, 34, 8, 128]
+            stride: [69632, 2048, 256, 1]
+            storage_offset: 0
+            dtype: torch.bfloat16
+            device: cuda
+            init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L290 in rotate_half,
+      code: return torch.cat((-x2, x1), dim=-1)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+    kwmap:
+      dim: -1
+  - name: torch.add.5
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [1, 34, 8, 256]
+          stride: [69632, 2048, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 34, 8, 256]
+          stride: [69632, 2048, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L312 in apply_rotary_pos_emb,
+      code: return (x * cos) + (rotate_half(x) * sin)'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.transpose.4
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 34, 8, 256]
+          stride: [69632, 2048, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L446 in forward,
+      code: key_states = key_states.transpose(1, 2)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.zeros.1
+    op: torch.zeros
+    inputs:
+      - value: (1, 8, 1024, 256)
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L378 in lazy_initialization, code: self.keys
+      = torch.zeros('
+    marks:
+      - constant
+      - tensorsoncpu
+    kwmap:
+      dtype: torch.bfloat16
+      device: cpu
+  - name: torch.to.6
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: []
+          stride: []
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+      - value: cpu
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L388 in lazy_initialization, code: self.cumulative_length
+      = self.cumulative_length.to(self.device)'
+    marks:
+      - constant
+      - tensorsoncpu
+  - name: torch.arange.1
+    op: torch.arange
+    inputs:
+      - value: 34
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L529 in update, code: cache_position = torch.arange(kv_length,
+      device=self.device) + self.cumulative_length'
+    marks:
+      - constant
+      - tensorsoncpu
+    kwmap:
+      device: cpu
+  - name: torch.add.6
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [34]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+      - tensor:
+          shape: []
+          stride: []
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L529 in update, code: cache_position = torch.arange(kv_length,
+      device=self.device) + self.cumulative_length'
+    marks: tensorsoncpu
+  - name: torch.index_copy_.1
+    op: torch.index_copy_
+    inputs:
+      - tensor:
+          shape: [1, 8, 1024, 256]
+          stride: [2097152, 262144, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: 2
+      - tensor:
+          shape: [34]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1024
+      - tensor:
+          shape: [1, 8, 34, 256]
+          stride: [69632, 256, 2048, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L531 in update, code: self.keys.index_copy_(2,
+      cache_position, key_states)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.add_.1
+    op: torch.add_
+    inputs:
+      - tensor:
+          shape: []
+          stride: []
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+      - value: 34
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L539 in update, code: self.cumulative_length.add_(kv_length)'
+    marks:
+      - constant
+      - tensorsoncpu
+  - name: torch.getitem.6
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 8, 1024, 256]
+          stride: [2097152, 262144, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - py: (slice(None, None, None), slice(None, None, None), None, slice(None, None, None), slice(None, None, None))
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L24 in repeat_kv, code: hidden_states
+      = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.Tensor.expand.3
+    op: torch.Tensor.expand
+    inputs:
+      - tensor:
+          shape: [1, 8, 1, 1024, 256]
+          stride: [2097152, 262144, 262144, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: 1
+      - value: 8
+      - value: 2
+      - value: 1024
+      - value: 256
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L24 in repeat_kv, code: hidden_states
+      = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.reshape.1
+    op: torch.reshape
+    inputs:
+      - tensor:
+          shape: [1, 8, 2, 1024, 256]
+          stride: [2097152, 262144, 0, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: (1, 16, 1024, 256)
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L25 in repeat_kv, code: return
+      hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.nn.functional.scaled_dot_product_attention.1
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 16, 34, 256]
+          stride: [139264, 256, 4096, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 16, 1024, 256]
+          stride: [4194304, 262144, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 16, 1024, 256]
+          stride: [4194304, 262144, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
+      code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks:
+      - bf16operation
+      - tensorsoncpu
+    kwmap:
+      dropout_p: 0.0
+      scale: 1.0
+      is_causal: false
+  - name: torch.transpose.5
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 16, 34, 256]
+          stride: [139264, 8704, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L164 in sdpa_attention_forward,
+      code: attn_output = attn_output.transpose(1, 2).contiguous()'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.Tensor.contiguous.1
+    op: torch.Tensor.contiguous
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 256]
+          stride: [139264, 256, 8704, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L164 in sdpa_attention_forward,
+      code: attn_output = attn_output.transpose(1, 2).contiguous()'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.reshape.2
+    op: torch.reshape
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 256]
+          stride: [139264, 4096, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: (1, 34, -1)
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L472 in forward,
+      code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.Tensor.contiguous.2
+    op: torch.Tensor.contiguous
+    inputs:
+      - tensor:
+          shape: [1, 34, 4096]
+          stride: [139264, 4096, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L472 in forward,
+      code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.nn.functional.linear.3
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 34, 4096]
+          stride: [139264, 4096, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [3840, 4096]
+          stride: [4096, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: xavier
+      - value: null
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L473 in forward,
+      code: attn_output = self.o_proj(attn_output)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.add.7
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [1, 34, 3840]
+          stride: [130560, 3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 34, 3840]
+          stride: [130560, 3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L534 in forward,
+      code: hidden_states = residual + hidden_states'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.nn.functional.linear.4
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 34, 3840]
+          stride: [130560, 3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [15360, 3840]
+          stride: [3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: xavier
+      - value: null
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L492 in forward,
+      code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.nn.functional.gelu.1
+    op: torch.nn.functional.gelu
+    inputs:
+      - tensor:
+          shape: [1, 34, 15360]
+          stride: [522240, 15360, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/activations.py#L51 in forward, code: return self.act(input)'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+    kwmap:
+      approximate: tanh
+  - name: torch.mul.12
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 34, 15360]
+          stride: [522240, 15360, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 34, 15360]
+          stride: [522240, 15360, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L492 in forward,
+      code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.nn.functional.linear.5
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 34, 15360]
+          stride: [522240, 15360, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [3840, 15360]
+          stride: [15360, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: xavier
+      - value: null
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L492 in forward,
+      code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.Tensor.mul.1
+    op: torch.Tensor.mul
+    inputs:
+      - tensor:
+          shape: [1, 34, 3840]
+          stride: [130560, 3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L543 in forward,
+      code: hidden_states *= self.layer_scalar'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.nn.functional.scaled_dot_product_attention.2
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 16, 34, 256]
+          stride: [139264, 256, 4096, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 16, 1024, 256]
+          stride: [4194304, 262144, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 16, 1024, 256]
+          stride: [4194304, 262144, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
+      code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks:
+      - bf16operation
+      - tensorsoncpu
+    kwmap:
+      dropout_p: 0.0
+      scale: 1.0
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.3
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 16, 34, 256]
+          stride: [139264, 256, 4096, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 16, 1024, 256]
+          stride: [4194304, 262144, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 16, 1024, 256]
+          stride: [4194304, 262144, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
+      code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks:
+      - bf16operation
+      - tensorsoncpu
+    kwmap:
+      dropout_p: 0.0
+      scale: 1.0
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.4
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 16, 34, 256]
+          stride: [139264, 256, 4096, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 16, 1024, 256]
+          stride: [4194304, 262144, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 16, 1024, 256]
+          stride: [4194304, 262144, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
+      code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks:
+      - bf16operation
+      - tensorsoncpu
+    kwmap:
+      dropout_p: 0.0
+      scale: 1.0
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.5
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 16, 34, 256]
+          stride: [139264, 256, 4096, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 16, 1024, 256]
+          stride: [4194304, 262144, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 16, 1024, 256]
+          stride: [4194304, 262144, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
+      code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks:
+      - bf16operation
+      - tensorsoncpu
+    kwmap:
+      dropout_p: 0.0
+      scale: 1.0
+      is_causal: false
+  - name: torch.nn.functional.linear.6
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 34, 3840]
+          stride: [130560, 3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [8192, 3840]
+          stride: [3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: xavier
+      - value: null
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L427 in forward,
+      code: query_states = self.q_proj(hidden_states).view(hidden_shape)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.float.10
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 512]
+          stride: [278528, 8192, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L190 in forward,
+      code: normed_output = self._norm(hidden_states.float())'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.pow.7
+    op: torch.pow
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 512]
+          stride: [278528, 8192, 512, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L185 in _norm,
+      code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.mean.4
+    op: torch.mean
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 512]
+          stride: [278528, 8192, 512, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: -1
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L185 in _norm,
+      code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+    kwmap:
+      keepdim: true
+  - name: torch.mul.13
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 512]
+          stride: [278528, 8192, 512, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 34, 16, 1]
+          stride: [544, 16, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L187 in _norm,
+      code: return hidden_states * torch.pow(mean_squared, -0.5)'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.float.11
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [512]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L192 in forward,
+      code: normed_output = normed_output * self.weight.float()'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.mul.14
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 512]
+          stride: [278528, 8192, 512, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [512]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L192 in forward,
+      code: normed_output = normed_output * self.weight.float()'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.type_as.4
+    op: torch.type_as
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 512]
+          stride: [278528, 8192, 512, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 34, 16, 512]
+          stride: [278528, 8192, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L193 in forward,
+      code: return normed_output.type_as(hidden_states)'
+    marks:
+      - fp32operation
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.unsqueeze.2
+    op: torch.unsqueeze
+    inputs:
+      - tensor:
+          shape: [1, 34, 512]
+          stride: [17408, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L310 in apply_rotary_pos_emb,
+      code: cos = cos.unsqueeze(unsqueeze_dim)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.mul.15
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 512]
+          stride: [278528, 8192, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 34, 1, 512]
+          stride: [17408, 512, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L312 in apply_rotary_pos_emb,
+      code: return (x * cos) + (rotate_half(x) * sin)'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.getitem.7
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 512]
+          stride: [278528, 8192, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - py: (Ellipsis, slice(None, floordiv, None))
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L288 in rotate_half,
+      code: x1 = x[..., : x.shape[-1] // 2]'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.neg.3
+    op: torch.neg
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 256]
+          stride: [278528, 8192, 512, 1]
+          storage_offset: 256
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L290 in rotate_half,
+      code: return torch.cat((-x2, x1), dim=-1)'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.cat.5
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [1, 34, 16, 256]
+            stride: [139264, 4096, 256, 1]
+            storage_offset: 0
+            dtype: torch.bfloat16
+            device: cuda
+            init: rand
+          - shape: [1, 34, 16, 256]
+            stride: [278528, 8192, 512, 1]
+            storage_offset: 0
+            dtype: torch.bfloat16
+            device: cuda
+            init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L290 in rotate_half,
+      code: return torch.cat((-x2, x1), dim=-1)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+    kwmap:
+      dim: -1
+  - name: torch.add.8
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 512]
+          stride: [278528, 8192, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 34, 16, 512]
+          stride: [278528, 8192, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L312 in apply_rotary_pos_emb,
+      code: return (x * cos) + (rotate_half(x) * sin)'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.transpose.6
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 512]
+          stride: [278528, 8192, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L430 in forward,
+      code: query_states = query_states.transpose(1, 2)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.nn.functional.linear.7
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 34, 3840]
+          stride: [130560, 3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [512, 3840]
+          stride: [3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: xavier
+      - value: null
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L441 in forward,
+      code: key_states = self.k_proj(hidden_states).view(hidden_shape)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.float.12
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 34, 1, 512]
+          stride: [17408, 512, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L190 in forward,
+      code: normed_output = self._norm(hidden_states.float())'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.pow.8
+    op: torch.pow
+    inputs:
+      - tensor:
+          shape: [1, 34, 1, 512]
+          stride: [17408, 512, 512, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L185 in _norm,
+      code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.mean.5
+    op: torch.mean
+    inputs:
+      - tensor:
+          shape: [1, 34, 1, 512]
+          stride: [17408, 512, 512, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: -1
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L185 in _norm,
+      code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+    kwmap:
+      keepdim: true
+  - name: torch.add.9
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [1, 34, 1, 1]
+          stride: [34, 1, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 1.0e-06
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L185 in _norm,
+      code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.pow.9
+    op: torch.pow
+    inputs:
+      - tensor:
+          shape: [1, 34, 1, 1]
+          stride: [34, 1, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: -0.5
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L187 in _norm,
+      code: return hidden_states * torch.pow(mean_squared, -0.5)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.mul.16
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 34, 1, 512]
+          stride: [17408, 512, 512, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 34, 1, 1]
+          stride: [34, 1, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L187 in _norm,
+      code: return hidden_states * torch.pow(mean_squared, -0.5)'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.mul.17
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 34, 1, 512]
+          stride: [17408, 512, 512, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [512]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L192 in forward,
+      code: normed_output = normed_output * self.weight.float()'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.type_as.5
+    op: torch.type_as
+    inputs:
+      - tensor:
+          shape: [1, 34, 1, 512]
+          stride: [17408, 512, 512, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 34, 1, 512]
+          stride: [17408, 512, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L193 in forward,
+      code: return normed_output.type_as(hidden_states)'
+    marks:
+      - fp32operation
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.mul.18
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 34, 1, 512]
+          stride: [17408, 512, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 34, 1, 512]
+          stride: [17408, 512, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L312 in apply_rotary_pos_emb,
+      code: return (x * cos) + (rotate_half(x) * sin)'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.getitem.8
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 34, 1, 512]
+          stride: [17408, 512, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - py: (Ellipsis, slice(None, floordiv_2, None))
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L288 in rotate_half,
+      code: x1 = x[..., : x.shape[-1] // 2]'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.neg.4
+    op: torch.neg
+    inputs:
+      - tensor:
+          shape: [1, 34, 1, 256]
+          stride: [17408, 512, 512, 1]
+          storage_offset: 256
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L290 in rotate_half,
+      code: return torch.cat((-x2, x1), dim=-1)'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.cat.6
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [1, 34, 1, 256]
+            stride: [8704, 256, 256, 1]
+            storage_offset: 0
+            dtype: torch.bfloat16
+            device: cuda
+            init: rand
+          - shape: [1, 34, 1, 256]
+            stride: [17408, 512, 512, 1]
+            storage_offset: 0
+            dtype: torch.bfloat16
+            device: cuda
+            init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L290 in rotate_half,
+      code: return torch.cat((-x2, x1), dim=-1)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+    kwmap:
+      dim: -1
+  - name: torch.add.10
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [1, 34, 1, 512]
+          stride: [17408, 512, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 34, 1, 512]
+          stride: [17408, 512, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L312 in apply_rotary_pos_emb,
+      code: return (x * cos) + (rotate_half(x) * sin)'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.transpose.7
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 34, 1, 512]
+          stride: [17408, 512, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L446 in forward,
+      code: key_states = key_states.transpose(1, 2)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.index_copy_.2
+    op: torch.index_copy_
+    inputs:
+      - tensor:
+          shape: [1, 1, 2048, 512]
+          stride: [1048576, 1048576, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: 2
+      - tensor:
+          shape: [34]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 2048
+      - tensor:
+          shape: [1, 1, 34, 512]
+          stride: [17408, 512, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L426 in update, code: self.keys.index_copy_(2,
+      cache_position, key_states)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.getitem.9
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 1, 2048, 512]
+          stride: [1048576, 1048576, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - py: (slice(None, None, None), slice(None, None, None), None, slice(None, None, None), slice(None, None, None))
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L24 in repeat_kv, code: hidden_states
+      = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.getitem.10
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 16, 2048, 512]
+          stride: [1048576, 0, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - py: (slice(None, None, None), slice(None, None, None), slice(None, 34, None), slice(None, None, None))
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L142 in sdpa_attention_forward,
+      code: key = key[:, :, :q_length, :]'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.nn.functional.scaled_dot_product_attention.6
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 16, 34, 512]
+          stride: [278528, 512, 8192, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 16, 34, 512]
+          stride: [1048576, 0, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 16, 34, 512]
+          stride: [1048576, 0, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
+      code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks:
+      - bf16operation
+      - tensorsoncpu
+    kwmap:
+      dropout_p: 0.0
+      scale: 1.0
+      is_causal: true
+  - name: torch.transpose.8
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 16, 34, 512]
+          stride: [278528, 17408, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L164 in sdpa_attention_forward,
+      code: attn_output = attn_output.transpose(1, 2).contiguous()'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.Tensor.contiguous.3
+    op: torch.Tensor.contiguous
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 512]
+          stride: [278528, 512, 17408, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L164 in sdpa_attention_forward,
+      code: attn_output = attn_output.transpose(1, 2).contiguous()'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.reshape.3
+    op: torch.reshape
+    inputs:
+      - tensor:
+          shape: [1, 34, 16, 512]
+          stride: [278528, 8192, 512, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: (1, 34, -1)
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L472 in forward,
+      code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.Tensor.contiguous.4
+    op: torch.Tensor.contiguous
+    inputs:
+      - tensor:
+          shape: [1, 34, 8192]
+          stride: [278528, 8192, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L472 in forward,
+      code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.nn.functional.linear.8
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 34, 8192]
+          stride: [278528, 8192, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [3840, 8192]
+          stride: [8192, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: xavier
+      - value: null
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L473 in forward,
+      code: attn_output = self.o_proj(attn_output)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.nn.functional.scaled_dot_product_attention.7
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 16, 34, 256]
+          stride: [139264, 256, 4096, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 16, 1024, 256]
+          stride: [4194304, 262144, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 16, 1024, 256]
+          stride: [4194304, 262144, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
+      code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks:
+      - bf16operation
+      - tensorsoncpu
+    kwmap:
+      dropout_p: 0.0
+      scale: 1.0
+      is_causal: false
+  - name: torch.nn.functional.scaled_dot_product_attention.8
+    op: torch.nn.functional.scaled_dot_product_attention
+    inputs:
+      - tensor:
+          shape: [1, 16, 34, 256]
+          stride: [139264, 256, 4096, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 16, 1024, 256]
+          stride: [4194304, 262144, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 16, 1024, 256]
+          stride: [4194304, 262144, 256, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
+      code: attn_output = torch.nn.functional.scaled_dot_product_attention('
+    marks:
+      - bf16operation
+      - tensorsoncpu
+    kwmap:
+      dropout_p: 0.0
+      scale: 1.0
+      is_causal: false
+  - name: torch.getitem.11
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 34, 3840]
+          stride: [130560, 3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1335 in torch_dynamo_resume_in_forward_at_1313,
+      code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.nn.functional.linear.9
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 1, 3840]
+          stride: [130560, 3840, 1]
+          storage_offset: 126720
+          dtype: torch.bfloat16
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [262144, 3840]
+          stride: [3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: xavier
+      - value: null
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1335 in torch_dynamo_resume_in_forward_at_1313,
+      code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.truediv.1
+    op: torch.truediv
+    inputs:
+      - tensor:
+          shape: [1, 1, 262144]
+          stride: [262144, 262144, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: 30.0
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1337 in torch_dynamo_resume_in_forward_at_1313,
+      code: logits = logits / final_logit_softcapping'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.tanh.1
+    op: torch.tanh
+    inputs:
+      - tensor:
+          shape: [1, 1, 262144]
+          stride: [262144, 262144, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1338 in torch_dynamo_resume_in_forward_at_1313,
+      code: logits = torch.tanh(logits)'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.mul.19
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 1, 262144]
+          stride: [262144, 262144, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: 30.0
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1339 in torch_dynamo_resume_in_forward_at_1313,
+      code: logits = logits * final_logit_softcapping'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.eq.2
+    op: torch.eq
+    inputs:
+      - tensor:
+          shape: [1, 1]
+          stride: [1, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+      - value: 258880
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L975 in get_placeholder_mask,
+      code: special_image_mask = input_ids == self.config.image_token_id'
+    marks:
+      - constant
+      - tensorsoncpu
+  - name: torch.or_.2
+    op: torch.or_
+    inputs:
+      - tensor:
+          shape: [1, 1]
+          stride: [1, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda
+      - tensor:
+          shape: [1, 1]
+          stride: [1, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1034 in forward,
+      code: multimodal_mask = image_mask | video_mask | audio_mask'
+    marks: tensorsoncpu
+  - name: torch.clone.2
+    op: torch.clone
+    inputs:
+      - tensor:
+          shape: [1, 1]
+          stride: [1, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1039 in forward,
+      code: llm_input_ids = input_ids.clone()'
+    marks: tensorsoncpu
+  - name: torch.where.2
+    op: torch.where
+    inputs:
+      - tensor:
+          shape: [1, 1]
+          stride: [1, 1]
+          storage_offset: 0
+          dtype: torch.bool
+          device: cuda
+      - value: 0
+      - tensor:
+          shape: [1, 1]
+          stride: [1, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1040 in forward,
+      code: llm_input_ids = torch.where(multimodal_mask, self.config.text_config.pad_token_id, llm_input_ids)'
+    marks:
+      - constant
+      - tensorsoncpu
+  - name: torch.nn.functional.embedding.2
+    op: torch.nn.functional.embedding
+    inputs:
+      - tensor:
+          shape: [1, 1]
+          stride: [1, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+      - tensor:
+          shape: [262144, 3840]
+          stride: [3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - value: 0
+      - value: null
+      - value: 2.0
+      - value: false
+      - value: false
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L558 in forward,
+      code: return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.mul.20
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 1, 3840]
+          stride: [3840, 3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - tensor:
+          shape: []
+          stride: []
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L558 in forward,
+      code: return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.getitem.12
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 1]
+          stride: [1, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+      - py: (slice(None, None, None), None, slice(None, None, None))
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L274 in forward,
+      code: position_ids_expanded = position_ids[:, None, :].float()'
+    marks:
+      - constant
+      - tensorsoncpu
+  - name: torch.float.13
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 1, 1]
+          stride: [1, 1, 1]
+          storage_offset: 0
+          dtype: torch.int64
+          device: cuda
+          init: randint
+          init_args:
+            high: 1000
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L274 in forward,
+      code: position_ids_expanded = position_ids[:, None, :].float()'
+    marks: tensorsoncpu
+  - name: torch.float.14
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 1, 1]
+          stride: [1, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L278 in forward,
+      code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.matmul.3
+    op: torch.matmul
+    inputs:
+      - tensor:
+          shape: [1, 256, 1]
+          stride: [256, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [1, 1, 1]
+          stride: [1, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: xavier
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L278 in forward,
+      code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.transpose.9
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 256, 1]
+          stride: [256, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L278 in forward,
+      code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.cat.7
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [1, 1, 256]
+            stride: [256, 1, 1]
+            storage_offset: 0
+            dtype: torch.float32
+            device: cuda
+            init: rand
+          - shape: [1, 1, 256]
+            stride: [256, 1, 1]
+            storage_offset: 0
+            dtype: torch.float32
+            device: cuda
+            init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L279 in forward,
+      code: emb = torch.cat((freqs, freqs), dim=-1)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+    kwmap:
+      dim: -1
+  - name: torch.cos.3
+    op: torch.cos
+    inputs:
+      - tensor:
+          shape: [1, 1, 512]
+          stride: [512, 512, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L280 in forward,
+      code: cos = emb.cos() * attention_scaling'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.mul.21
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 1, 512]
+          stride: [512, 512, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 1.0
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L280 in forward,
+      code: cos = emb.cos() * attention_scaling'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.sin.3
+    op: torch.sin
+    inputs:
+      - tensor:
+          shape: [1, 1, 512]
+          stride: [512, 512, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L281 in forward,
+      code: sin = emb.sin() * attention_scaling'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.to.7
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [1, 1, 512]
+          stride: [512, 512, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L283 in forward,
+      code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+    kwmap:
+      dtype: torch.bfloat16
+  - name: torch.matmul.4
+    op: torch.matmul
+    inputs:
+      - tensor:
+          shape: [1, 128, 1]
+          stride: [128, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [1, 1, 1]
+          stride: [1, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: xavier
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L278 in forward,
+      code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.transpose.10
+    op: torch.transpose
+    inputs:
+      - tensor:
+          shape: [1, 128, 1]
+          stride: [128, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 1
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L278 in forward,
+      code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.cat.8
+    op: torch.cat
+    inputs:
+      - tensor_list:
+          - shape: [1, 1, 128]
+            stride: [128, 1, 1]
+            storage_offset: 0
+            dtype: torch.float32
+            device: cuda
+            init: rand
+          - shape: [1, 1, 128]
+            stride: [128, 1, 1]
+            storage_offset: 0
+            dtype: torch.float32
+            device: cuda
+            init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L279 in forward,
+      code: emb = torch.cat((freqs, freqs), dim=-1)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+    kwmap:
+      dim: -1
+  - name: torch.cos.4
+    op: torch.cos
+    inputs:
+      - tensor:
+          shape: [1, 1, 256]
+          stride: [256, 256, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L280 in forward,
+      code: cos = emb.cos() * attention_scaling'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.mul.22
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 1, 256]
+          stride: [256, 256, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 1.0
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L280 in forward,
+      code: cos = emb.cos() * attention_scaling'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.sin.4
+    op: torch.sin
+    inputs:
+      - tensor:
+          shape: [1, 1, 256]
+          stride: [256, 256, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L281 in forward,
+      code: sin = emb.sin() * attention_scaling'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.to.8
+    op: torch.to
+    inputs:
+      - tensor:
+          shape: [1, 1, 256]
+          stride: [256, 256, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L283 in forward,
+      code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+    kwmap:
+      dtype: torch.bfloat16
+  - name: torch.float.15
+    op: torch.float
+    inputs:
+      - tensor:
+          shape: [1, 1, 3840]
+          stride: [3840, 3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L190 in forward,
+      code: normed_output = self._norm(hidden_states.float())'
+    marks:
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.pow.10
+    op: torch.pow
+    inputs:
+      - tensor:
+          shape: [1, 1, 3840]
+          stride: [3840, 3840, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 2
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L185 in _norm,
+      code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.mean.6
+    op: torch.mean
+    inputs:
+      - tensor:
+          shape: [1, 1, 3840]
+          stride: [3840, 3840, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: -1
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L185 in _norm,
+      code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+    kwmap:
+      keepdim: true
+  - name: torch.add.11
+    op: torch.add
+    inputs:
+      - tensor:
+          shape: [1, 1, 1]
+          stride: [1, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: 1.0e-06
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L185 in _norm,
+      code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.pow.11
+    op: torch.pow
+    inputs:
+      - tensor:
+          shape: [1, 1, 1]
+          stride: [1, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - value: -0.5
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L187 in _norm,
+      code: return hidden_states * torch.pow(mean_squared, -0.5)'
+    marks:
+      - fp32operation
+      - constant
+      - tensorsoncpu
+  - name: torch.mul.23
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 1, 3840]
+          stride: [3840, 3840, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 1, 1]
+          stride: [1, 1, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L187 in _norm,
+      code: return hidden_states * torch.pow(mean_squared, -0.5)'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.mul.24
+    op: torch.mul
+    inputs:
+      - tensor:
+          shape: [1, 1, 3840]
+          stride: [3840, 3840, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [3840]
+          stride: [1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L192 in forward,
+      code: normed_output = normed_output * self.weight.float()'
+    marks:
+      - fp32operation
+      - tensorsoncpu
+  - name: torch.type_as.6
+    op: torch.type_as
+    inputs:
+      - tensor:
+          shape: [1, 1, 3840]
+          stride: [3840, 3840, 1]
+          storage_offset: 0
+          dtype: torch.float32
+          device: cuda
+          init: rand
+      - tensor:
+          shape: [1, 1, 3840]
+          stride: [3840, 3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L193 in forward,
+      code: return normed_output.type_as(hidden_states)'
+    marks:
+      - fp32operation
+      - bf16operation
+      - tensorsoncpu
+  - name: torch.getitem.13
+    op: torch.getitem
+    inputs:
+      - tensor:
+          shape: [1, 1, 3840]
+          stride: [3840, 3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: rand
+      - py: (slice(None, None, None), slice(-1, None, None), slice(None, None, None))
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1335 in torch_dynamo_resume_in_forward_at_1313,
+      code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu
+  - name: torch.nn.functional.linear.10
+    op: torch.nn.functional.linear
+    inputs:
+      - tensor:
+          shape: [1, 1, 3840]
+          stride: [3840, 3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: xavier
+      - tensor:
+          shape: [262144, 3840]
+          stride: [3840, 1]
+          storage_offset: 0
+          dtype: torch.bfloat16
+          device: cuda
+          init: xavier
+      - value: null
+    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1335 in torch_dynamo_resume_in_forward_at_1313,
+      code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
+    marks:
+      - bf16operation
+      - constant
+      - tensorsoncpu

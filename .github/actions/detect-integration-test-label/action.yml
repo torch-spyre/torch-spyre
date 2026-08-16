@@ -1,0 +1,73 @@
+name: Detect integration-test label
+description: |
+  Reports whether the PR behind the triggering event carries the
+  `integration-test` label, for both pull_request and merge_group events.
+
+  A merge_group payload has no pull_request object, so the label cannot be read
+  with `contains(github.event.pull_request.labels.*.name, ...)` the way it can on
+  a pull_request event. The queue's ref carries the originating PR number
+  (gh-readonly-queue/<base>/pr-<n>-<sha>), so that number is parsed out and the
+  PR queried -- labels remain readable after merge, so this stays correct for an
+  entry that merges while the queue is still running.
+
+outputs:
+  labeled:
+    description: >-
+      'true' if the originating PR has the `integration-test` label, meaning the
+      Jenkins integration run owns this commit's testing; 'false' otherwise
+      (including when no PR can be resolved, so tests run rather than silently
+      being skipped).
+    value: ${{ steps.detect.outputs.labeled }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve integration-test label
+      id: detect
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        EVENT_NAME: ${{ github.event_name }}
+        PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        MERGE_GROUP_REF: ${{ github.event.merge_group.head_ref }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -uo pipefail
+        labeled=false
+
+        if [ "$EVENT_NAME" = "pull_request" ]; then
+          # Labels are already in the payload -- no API call needed.
+          if printf '%s' "$PR_LABELS" | grep -q '"integration-test"'; then
+            labeled=true
+          fi
+        elif [ "$EVENT_NAME" = "merge_group" ]; then
+          # gh-readonly-queue/main/pr-3695-<sha> -> 3695. Bash parameter expansion
+          # rather than sed: `\+` is a GNU extension that yields an EMPTY match on BSD
+          # sed instead of erroring, so a regex that works on the runner can silently
+          # extract nothing elsewhere -- and "no PR number" reads as "unlabeled", which
+          # would quietly run the full suite on every queued entry.
+          pr=""
+          case "$MERGE_GROUP_REF" in
+            */pr-*-*)
+              pr="${MERGE_GROUP_REF##*/pr-}"   # 3695-<sha>
+              pr="${pr%%-*}"                    # 3695
+              case "$pr" in
+                ''|*[!0-9]*) pr="" ;;           # not all digits -> treat as unparseable
+              esac
+              ;;
+          esac
+          if [ -n "$pr" ]; then
+            # Fail OPEN: on any API error the label is treated as absent, so the
+            # tests run. A spurious run is recoverable; silently skipping the only
+            # gate on a commit entering main is not.
+            if gh api "repos/${REPO}/pulls/${pr}" --jq '.labels[].name' 2>/dev/null \
+                 | grep -qx 'integration-test'; then
+              labeled=true
+            fi
+          else
+            echo "could not parse a PR number from '${MERGE_GROUP_REF}' -- assuming unlabeled"
+          fi
+        fi
+
+        echo "event=${EVENT_NAME} integration-test labeled=${labeled}"
+        echo "labeled=${labeled}" >> "$GITHUB_OUTPUT"

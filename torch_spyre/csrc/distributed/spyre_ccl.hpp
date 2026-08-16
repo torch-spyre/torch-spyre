@@ -18,6 +18,8 @@
 #include <pybind11/chrono.h>
 #include <torch/python.h>
 
+#include <chrono>
+#include <exception>
 #include <spyre_comms.hpp>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
@@ -168,9 +170,18 @@ class SpyreCCLBackend : public c10d::Backend {
 
   /*
    * Shutdown
+   *
+   * shutdown() is a silent no-op: spyre_comms has no graceful-shutdown API,
+   * and the silent no-op matches the behaviour of the Gloo, MPI, and UCC
+   * backends. Finalization is handled by the SpyreCCLBackend destructor.
+   *
+   * abort() is not supported by the underlying spyre_comms library and will
+   * throw SpyreCCLNotSupportedException.
    */
-  void abort() {};
-  void shutdown() {};
+  void abort() override {
+    throw SpyreCCLNotSupportedException(getBackendName(), __func__);
+  }
+  void shutdown() override {}
 
   /*
    * Backend registration
@@ -208,6 +219,8 @@ class SpyreCCLWork : public Work {
  private:
   c10::intrusive_ptr<c10::ivalue::Future> future_;
   std::shared_ptr<spyre_comms::WorkSchedule> work_schedule_;
+  bool completed_ = false;
+  std::exception_ptr exception_ = nullptr;
 };
 
 }  // namespace c10d

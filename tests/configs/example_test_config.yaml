@@ -1,5 +1,6 @@
 ### This is just an example config ###
 test_suite_config:
+  labels: [regression]
   files:
     - path: ${TORCH_ROOT}/test/test_binary_ufuncs.py
       unlisted_test_mode: skip

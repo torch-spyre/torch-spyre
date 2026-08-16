@@ -710,6 +710,40 @@ class _OOTPlatformMarkerPatcher:
         )
 
 
+class _OOTTestTypeMarkerPatcher:
+    """Attaches a pytest marker ``testtype__<label>`` for every label the
+    config's ``test_suite_config.labels`` declares, applied like the
+    platform tag (uniform per file, patched onto the underlying function
+    before ``instantiate_test`` propagates it to every variant). Labels are
+    normalised to valid identifiers, enabling e.g.
+    ``bash run_test.sh tests/configs/torch_spyre_tests/ -m testtype__integration``.
+    """
+
+    def __init__(self, test: object, labels: Optional[List[str]]) -> None:
+        self._underlying_fn = (
+            test.__func__ if hasattr(test, "__func__") else test  # type: ignore[union-attr]
+        )
+        self._labels = labels or []
+
+    def patch(self) -> None:
+        if not self._labels:
+            return
+
+        marks = []
+        for label in self._labels:
+            label_safe = re.sub(r"[^a-zA-Z0-9_]", "_", label).strip("_")
+            if label_safe:
+                marks.append(pytest.mark.__getattr__(f"testtype__{label_safe}"))
+        if not marks:
+            return
+
+        if not hasattr(self._underlying_fn, "pytestmark"):
+            self._underlying_fn.pytestmark = []  # type: ignore[union-attr]
+        self._underlying_fn.pytestmark = (  # type: ignore[union-attr]
+            list(self._underlying_fn.pytestmark) + marks  # type: ignore[union-attr]
+        )
+
+
 class _OOTOpMarkerPatcher:
     """Patches @ops._parametrize_test to attach pytest markers directly on
     each test_wrapper as it is yielded, before super().instantiate_test()
