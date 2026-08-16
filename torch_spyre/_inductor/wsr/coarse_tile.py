@@ -285,7 +285,7 @@ def plan_coarse_tile_groups(
             if _plan_is_loop_invariant_at_reduction_levels(
                 op, op_tiled_dims, group_reduction_tiled_levels
             ) and _reads_incomplete_reduction(
-                op, group_op_names, plan, group_reduction_tiled_levels
+                op, group_ops, group_op_names, plan, group_reduction_tiled_levels
             ):
                 raise Unsupported(
                     f"partial reduction result consumed before accumulation "
@@ -982,16 +982,18 @@ def _group_reduction_tiled_levels_in_group(
 
 def _reads_incomplete_reduction(
     op: ComputedBuffer,
+    group_ops: list,
     group_op_names: set[str],
     plan: dict,
     group_reduction_tiled_levels: set[int],
 ) -> bool:
     """True if op reads a group-sibling whose result is still partial at any
     reduction-tiled level — i.e. the reduction hasn't accumulated yet when op runs."""
+    name_to_buf = {o.get_name(): o for o in group_ops if isinstance(o, ComputedBuffer)}
     for n in _op_reads(op):
         if n not in group_op_names:
             continue
-        buf = V.graph.get_buffer(n)
+        buf = name_to_buf.get(n)
         if not isinstance(buf, ComputedBuffer):
             continue
         # group_ops is topologically ordered, so any in-group sibling is
@@ -1035,7 +1037,7 @@ def _consumers_reading_incomplete_reduction(
         if not _reads_buffer(o, buf_name):
             continue
         if _reads_incomplete_reduction(
-            o, group_op_names, plan, group_reduction_tiled_levels
+            o, group_ops, group_op_names, plan, group_reduction_tiled_levels
         ):
             result.append(o.get_name())
     return result
