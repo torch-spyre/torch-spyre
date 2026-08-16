@@ -3,7 +3,7 @@ name: tests
 # One of torch-spyre's four "trunk" (push-to-main) workflows -- see
 # model_ops_tests.yaml, upstream_tests.yaml, upstream_tests_beta.yaml for the
 # others. A push run passes test_type: trunk (below) so it's distinguishable
-# from a manually-dispatched full run once tier-tagging reaches ClickHouse.
+# from a manually-dispatched regression run once tier-tagging reaches ClickHouse.
 on:
   push:
     branches: [main]
@@ -56,11 +56,13 @@ on:
         default: ''
       test_type:
         description: >-
-          Suite subset to run: smoke | core | full | suite_<group> | <label>.
-          Default: full (every config).
+          Suite subset to run: smoke | unit | integration | regression |
+          trunk | suite_<group> | <label>.
+          Default: regression (every config labeled for full functional
+          coverage).
         required: false
         type: string
-        default: full
+        default: regression
 
 concurrency:
   group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.html_url) || (github.event_name == 'workflow_dispatch'
@@ -88,6 +90,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code_changed: ${{ steps.filter.outputs.code_changed }}
+      integration_labeled: ${{ steps.label.outputs.labeled }}
     steps:
       - name: Checkout composite actions
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -99,18 +102,27 @@ jobs:
         id: filter
         uses: ./.github/actions/detect-doc-only-change
 
+      - name: Check for the integration-test label
+        id: label
+        uses: ./.github/actions/detect-integration-test-label
+
   # ---------------------------------------------------------------------------
   # Job 2: delegate to the shared test matrix
   #
   # Only runs when `changes.code_changed == 'true'`. For docs-only PRs the
   # reusable workflow is never invoked — no hardware runners are consumed.
-  # Also skipped when `integration-test` is labeled -- spyre-framework handles it
+  # Also skipped when `integration-test` is labeled -- spyre-frameworks' Jenkins
+  # integration run owns this commit's testing instead. Read via the composite
+  # action, NOT `github.event.pull_request.labels`: a merge_group payload has no
+  # pull_request object, so the inline expression is always false in the queue and
+  # the whole suite re-ran there -- on one measured merge-queue commit that was
+  # 815 GHA check-runs / ~21 h of runner time re-testing what the PR just passed.
   # ---------------------------------------------------------------------------
   run-tests:
     needs: changes
     if: |
       needs.changes.outputs.code_changed == 'true' &&
-      !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'integration-test'))
+      needs.changes.outputs.integration_labeled != 'true'
     uses: ./.github/workflows/_test_matrix.yaml
     with:
       runner_label: linux
@@ -124,7 +136,7 @@ jobs:
       rpm_location: ${{ inputs.rpm_location || '' }}
       rpm_names: ${{ inputs.rpm_names || '' }}
       build_torch_spyre: ${{ inputs.build_torch_spyre == true }}
-      test_type: ${{ inputs.test_type || (github.event_name == 'push' && 'trunk' || 'full') }}
+      test_type: ${{ inputs.test_type || (github.event_name == 'push' && 'trunk' || 'regression') }}
 
   # ---------------------------------------------------------------------------
   # Job 3: run-spyre-unit-tests (required check gate)
@@ -138,20 +150,29 @@ jobs:
   #   run-tests result = skipped -> docs-only PR, no tests -> green (instant)
   #   run-tests result = failure -> one or more suites bad -> red   (blocks merge)
   #
-  # For an `integration-test`-labeled PR this job doesn't run at all
+  # This job must ALWAYS run, including for an `integration-test`-labeled commit:
+  # it is a REQUIRED check, and a required check that is skipped is reported as
+  # MISSING rather than green, which blocks the merge queue outright. So when the
+  # label hands testing to Jenkins, run-tests is skipped but this gate still runs
+  # and reports green -- Jenkins publishes its own verdict separately.
   # ---------------------------------------------------------------------------
   run-spyre-unit-tests:
     name: Run Spyre unit tests
     runs-on: ubuntu-latest
     needs: [changes, run-tests]
-    if: |
-      always() &&
-      !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'integration-test'))
+    if: always()
     steps:
       - name: Evaluate test results
         run: |-
           RESULT="${{ needs.run-tests.result }}"
           echo "run-tests result: ${RESULT}"
+
+          if [[ "${{ needs.changes.outputs.integration_labeled }}" == "true" ]]; then
+            echo "integration-test label set -- the Jenkins integration run owns this"
+            echo "commit's testing and reports its own check. Passing this required"
+            echo "gate so the merge queue is not blocked by a missing check."
+            exit 0
+          fi
 
           if [[ "${RESULT}" == "success" ]]; then
             echo "All test suites passed."

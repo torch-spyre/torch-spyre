@@ -15,15 +15,12 @@
 """
 Spyre profiling package.
 
-This package provides the Python-side scaffolding for Spyre profiling
-integration. Public FFDC API is exposed as ``torch.spyre.get_diagnostic_report``
-(see ``make_spyre_module``); import ``torch_spyre.profiler._ffdc`` for internals.
+FFDC retrieval is the public API on this package
+(``get_diagnostic_report``, also bound as ``torch.spyre.get_diagnostic_report``).
+Device-side timing uses upstream ``torch.profiler``. Device presence is
+``torch.spyre.is_available()``, not a flag on this package.
 """
 
+from torch_spyre.profiler._ffdc import get_diagnostic_report
 
-def is_available() -> bool:
-    # more to be implemented later
-    return False
-
-
-__all__: list[str] = []
+__all__ = ["get_diagnostic_report"]

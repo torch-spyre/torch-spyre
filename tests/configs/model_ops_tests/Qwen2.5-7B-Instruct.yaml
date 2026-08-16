@@ -1,4 +1,5 @@
 test_suite_config:
+  labels: [trunk]
   global:
     supported_dtypes:
       - name: float16

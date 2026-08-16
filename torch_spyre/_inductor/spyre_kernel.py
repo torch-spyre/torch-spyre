@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+import math
 from typing import Any, Callable, Self, Sequence, Tuple, Union
 from abc import ABC
 
@@ -35,15 +36,19 @@ from .constants import (
     SPYRE_FP32_OPS,
     BATCH_MATMUL_OP,
     BATCH_MATMUL_FP8_OP,
+    CONV2D_FWD_OP,
+    CONV_OPS,
     IDENTITY_OP,
     POOL_OPS,
     RESTICKIFY_OP,
     SEGMENT_OFFSETS,
+    DEPTHWISE_CONV2D_OP,
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
 from . import config as _spyre_config
 from .errors import Unsupported
 from .ir import FixedTiledLayout
+from .scratchpad.lx_relayout import work_division_from_view
 from .pass_utils import (
     concretize_expr,
     concretize_index,
@@ -61,8 +66,10 @@ from .op_spec import (
     LoopSpec,
     OpSpec,
     TensorArg,
+    TensorWorkDivision,
     UnimplementedOp as OpSpecUnimplementedOp,
     format_op_spec_list,
+    is_lx_relayout_identity,
 )
 from torch_spyre._inductor.provenance import build_debug_handle
 import logging
@@ -535,7 +542,7 @@ def _tile_advance_expr_from_dep(
 class SpyreKernel(Kernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
 
-    def __init__(self) -> None:
+    def __init__(self, pool_size: int = 0) -> None:
         super().__init__()
         self.op_specs: list[OpSpec | UnimplementedOp | LoopSpec] = []
         self.spyre_kernel_args: list[Tuple[str, TensorArg]] = []
@@ -544,6 +551,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         self._indirect_var_count: int = 0
         self._general_tile_advance_seen: dict[str, int] = {}
         self._tile_advance_symbols: dict[int, sympy.Symbol] = {}
+        self.pool_size: int = pool_size
 
     def indirect_var_names(self) -> "frozenset[str] | None":
         if not self.indirect_vars:
@@ -764,6 +772,11 @@ class SpyreKernel(Kernel[CSEVariable]):
             index,
             self.indirect_sizes,
         )
+        work_division = work_division_from_view(
+            tensor.layout.lx_view if "lx" in tensor.layout.allocation else None,
+            device_coords,
+            tuple(it_space),
+        )
         device_tile_advance_expr = self._general_tile_advance(tensor, is_input, name)
         tensor_arg = TensorArg(
             is_input,
@@ -775,6 +788,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             element_arrangement=tensor.layout.device_layout.element_arrangement,
             name=opspec_name,
             device_tile_advance_expr=device_tile_advance_expr,
+            work_division=work_division,
         )
         if (
             "lx" not in tensor.layout.allocation
@@ -925,19 +939,22 @@ class SpyreKernel(Kernel[CSEVariable]):
                 )
             )
 
-        # Carry the pool node's full logical output ranges (NCHW, incl. unit
-        # dims) so codegen can derive surviving dim roles and the channel count
-        # from live IR instead of a lowering-time size snapshot.  Store raw
-        # ranges (no int(): ranges may be symbolic); consumers convert only
-        # static dims.  Populated only for pools — the only consumer — so
-        # non-pool kernels' generated source is unchanged.
+        # Carry the node's full logical output ranges (NCHW, incl. unit dims)
+        # so codegen can derive surviving dim roles and the channel count from
+        # live IR instead of a lowering-time size snapshot.  Store raw ranges
+        # (no int(): ranges may be symbolic); consumers convert only static
+        # dims.  Populated for pools and convs (forward + depthwise) — the only
+        # consumers — so other kernels' generated source is unchanged.
         node_output_ranges = (
             tuple(ir_node.data.ranges)
-            if op in POOL_OPS
+            if op in POOL_OPS | CONV_OPS
             and hasattr(ir_node, "data")
             and hasattr(ir_node.data, "ranges")
             else None
         )
+        if not is_lx_relayout_identity(op, args):
+            for arg in args:
+                arg.work_division = None
 
         return OpSpec(
             op,
@@ -1154,7 +1171,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                 f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
             )
 
-        if value.op in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP]:
+        if value.op in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP, CONV2D_FWD_OP]:
+            # Two-input reductions: matmul (activation @ weight) and conv2d
+            # (activation * weight, reduced over in/ki/kj). Both build
+            # [input, weight, output] tensor args.
             if (
                 len(value.arguments) != 2
                 or (not isinstance(value.arguments[0], TensorAccess))
@@ -1166,6 +1186,23 @@ class SpyreKernel(Kernel[CSEVariable]):
             args = [
                 self.create_tensor_arg(True, x.name, x),
                 self.create_tensor_arg(True, y.name, y),
+                self.create_tensor_arg(False, real_dst_name, dst),
+            ]
+            self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
+        elif value.op == DEPTHWISE_CONV2D_OP:
+            if (
+                len(value.arguments) < 2
+                or (not isinstance(value.arguments[0], TensorAccess))
+                or (not isinstance(value.arguments[1], TensorAccess))
+            ):
+                raise Unsupported(
+                    f"invalid depthwiseconv2dnative arguments {value.arguments}"
+                )
+            x = value.arguments[0]
+            w = value.arguments[1]
+            args = [
+                self.create_tensor_arg(True, x.name, x),
+                self.create_tensor_arg(True, w.name, w),
                 self.create_tensor_arg(False, real_dst_name, dst),
             ]
             self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
@@ -1219,8 +1256,7 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices
         actuals = self.args.python_argdefs()[1]
-        hbm_pool_size = getattr(V.graph, "hbm_pool_size", 0)
-        has_pool_allocations = hbm_pool_size > 0
+        has_pool_allocations = self.pool_size > 0
 
         for name, tensor_arg in self.spyre_kernel_args:
             tensor_arg.arg_index = actuals.index(name)
@@ -1257,12 +1293,27 @@ class SpyreKernel(Kernel[CSEVariable]):
         )
 
     def call_kernel(self, name: str, node=None):
-        """Codegen a call to this kernel"""
+        """Codegen a call to this kernel, allocating/freeing this kernel's
+        own pool tensor (if any) scoped tightly around the .run() call."""
         wrapper = V.graph.wrapper_code
         call_args = []
 
-        if self._kernel_uses_hbm_pool():
-            call_args.append("_pool")
+        uses_pool = self._kernel_uses_hbm_pool()
+        # `name` is this kernel's own wrapper-module variable name (e.g.
+        # "sdsc_fused__buf12"), already guaranteed unique across kernels by
+        # Inductor's wrapper codegen -- two kernels sharing a Python
+        # identifier in the same generated module would already break
+        # `{name}.run(...)` codegen independent of pool allocation. Deriving
+        # the pool variable's name from it is therefore also collision-free.
+        pool_var_name = f"_pool_{name}"
+        if uses_pool:
+            wrapper.writeline(
+                f"{pool_var_name} = spyre_empty_with_layout("
+                f"({self.pool_size},), (1,), torch.uint8, "
+                f"SpyreTensorLayout(device_size=[{self.pool_size}], "
+                f"stride_map=[1], device_dtype=DataFormats.SENINT8))"
+            )
+            call_args.append(pool_var_name)
 
         # Add remaining kernel arguments, deduplicating tensors that appear as
         # both input and output (e.g. in-place ops like x *= 2).  With symbolic
@@ -1277,6 +1328,8 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")
+        if uses_pool:
+            wrapper.writeline(f"del {pool_var_name}")
 
     def emit_layout_restores(self, restores) -> None:
         """Emit set_spyre_tensor_layout wrapper calls after this kernel's run.
@@ -1404,8 +1457,8 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                 )
                 if op_spec.node_output_ranges is not None:
                     # Must survive the OpSpec -> generated-source -> exec
-                    # round-trip: pool codegen reads it to align dim labels and
-                    # the channel-count fallback.  Ranges are sympy Exprs;
+                    # round-trip: pool/conv codegen reads it to align dim labels
+                    # and the channel-count fallback.  Ranges are sympy Exprs;
                     # sympy_str emits eval-able sympify(...) calls.
                     buf.writeline(
                         "node_output_ranges=("
@@ -1448,9 +1501,63 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 buf.writeline(
                                     f"element_arrangement={arg.element_arrangement},"
                                 )
+                            if arg.work_division is not None:
+                                splits = ", ".join(
+                                    f"{sympy_str(dim)}: {split}"
+                                    for dim, split in arg.work_division.work_slices.items()
+                                )
+                                core_map = ", ".join(
+                                    f"{sympy_str(dim)}: {sympy_str(slot)}"
+                                    for dim, slot in arg.work_division.core_id_to_work_slice.items()
+                                )
+                                buf.writeline(
+                                    "work_division=TensorWorkDivision("
+                                    f"work_slices={{{splits}}}, "
+                                    f"core_id_to_work_slice={{{core_map}}}),"
+                                )
                         buf.writeline("),")
                 buf.writeline("]")
             buf.writeline("),")
+
+
+def _remap_work_division(arg: TensorArg, work_division_remap) -> None:
+    """Carry tensor ownership through iteration-space normalization."""
+
+    if arg.work_division is None:
+        return
+    new_splits: dict[sympy.Symbol, int] = {}
+    new_core_map: dict[sympy.Symbol, sympy.Expr] = {}
+    for old_dim, split in arg.work_division.work_slices.items():
+        new_dims = work_division_remap[old_dim]
+        remaining_split = int(split)
+        split_factors = []
+        if len(new_dims) == 1:
+            split_factors = [(new_dims[0][0], remaining_split)]
+            remaining_split = 1
+        else:
+            for new_dim, basis in reversed(new_dims):
+                factor = math.gcd(remaining_split, basis)
+                split_factors.append((new_dim, factor))
+                remaining_split //= factor
+            split_factors.reverse()
+        if remaining_split != 1:
+            raise ValueError(f"cannot normalize {split}-way split on {old_dim}")
+
+        slot = arg.work_division.core_id_to_work_slice[old_dim]
+        slot_stride = 1
+        for new_dim, factor in split_factors:
+            if factor == 1:
+                continue
+            new_slot = sympy.Mod(sympy.floor(slot / slot_stride), factor)
+            if new_dim in new_splits and (
+                new_splits[new_dim],
+                new_core_map[new_dim],
+            ) != (factor, new_slot):
+                raise ValueError(f"conflicting normalized ownership on {new_dim}")
+            new_splits[new_dim] = factor
+            new_core_map[new_dim] = new_slot
+            slot_stride *= factor
+    arg.work_division = TensorWorkDivision(new_splits, new_core_map)
 
 
 def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
@@ -1458,7 +1565,7 @@ def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
     # decomposes symbols in align_tensors; indirect_access_subs replaces them with IndirectAccess.
     it_space = op_spec.iteration_space
 
-    new_op_space_splits, new_tensors = align_tensors(
+    new_op_space_splits, new_tensors, work_division_remap = align_tensors(
         it_space,
         [
             {"size": arg.device_size, "coordinates": arg.device_coordinates}
@@ -1469,6 +1576,7 @@ def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
     op_spec.iteration_space = new_op_space_splits
 
     for arg, t in zip(op_spec.args, new_tensors):
+        _remap_work_division(arg, work_division_remap)
         arg.device_size = t["size"]
         arg.device_coordinates = t["coordinates"]
 

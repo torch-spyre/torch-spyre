@@ -43,6 +43,11 @@ from indirect_access_common import (  # noqa: E402
     IndirectAccessTestCase,
 )
 
+from torch_spyre._C import (  # noqa: E402
+    SpyreTensorLayout,
+    get_device_dtype,
+    get_elem_in_stick,
+)
 from torch_spyre._inductor import config  # noqa: E402
 
 
@@ -54,17 +59,26 @@ class TestScatter(IndirectAccessTestCase):
         """Common row-store operands: out[M,N], src[P,N], 1-D idx[P], all named."""
         out = torch.zeros(M, N, dtype=torch.float16).to("spyre")
         src = torch.rand(P, N, dtype=torch.float16).to("spyre")
-        idx = torch.randint(0, M, (P,), dtype=dtype).to("spyre")
+        idx = torch.arange(P, dtype=dtype).to("spyre")
         self.name_dims(out, {"M": M, "N": N})
         self.name_dims(src, {"P": P, "N": N})
         self.name_dims(idx, {"P": P})
         return out, src, idx
 
     def _full_index_store(self, M=128, N=256, P=3, dtype=torch.int32):
-        """Operands for scatter with a full [P,N] index tensor: out[M,N], src[P,N]."""
+        """Operands for scatter with a full [P,N] index tensor: out[M,N], src[P,N].
+        Index is uniform per row (all N columns in a row scatter to the same target
+        row) to ensure collision-free unique indices; per-element variation within
+        a row is not exercised."""
         out = torch.zeros(M, N, dtype=torch.float16).to("spyre")
         src = torch.rand(P, N, dtype=torch.float16).to("spyre")
-        index = torch.randint(0, M, (P, N), dtype=dtype).to("spyre")
+        index = (
+            torch.randperm(M, dtype=dtype)[:P]
+            .unsqueeze(1)
+            .expand(P, N)
+            .contiguous()
+            .to("spyre")
+        )
         self.name_dims(out, {"M": M, "N": N})
         self.name_dims(src, {"P": P, "N": N})
         self.name_dims(index, {"P": P, "N": N})
@@ -152,6 +166,137 @@ class TestScatter(IndirectAccessTestCase):
             return torch.index_copy(out, 0, idx, src)
 
         self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC)
+
+    def _paged_cache_layout(self, L=576, H=8, D=128):
+        """The paged-KV-cache device layout for a [L, H, D] fp16 tensor: L
+        (the indirectly-accessed dim) outermost, then H, then D split into
+        (stick_count, elems_per_stick) -- mirroring the real paged-KV-cache
+        layout used by attention decode/prefill (see test_paged.py)."""
+        eps = get_elem_in_stick(torch.float16)
+        return SpyreTensorLayout(
+            device_size=[L, H, (D + eps - 1) // eps, eps],
+            stride_map=[H * D, D, eps, 1],
+            device_dtype=get_device_dtype(torch.float16),
+        )
+
+    def _paged_kv_cache_operands(self, L=576, H=8, D=128, P=3):
+        """A paged-KV-store-shaped scatter target: cache[L, H, D] on the paged
+        device layout, plus a matching src[P, H, D] and an int64 idx[P]."""
+        stl = self._paged_cache_layout(L=L, H=H, D=D)
+        cache = torch.rand(L, H, D, dtype=torch.float16)
+        src = torch.rand(P, H, D, dtype=torch.float16)
+        idx = torch.randperm(L, dtype=torch.int64)[:P]
+        cache_dev = cache.to("spyre", device_layout=stl)
+        src_dev = src.to("spyre")
+        idx_dev = idx.to("spyre")
+        return cache_dev, src_dev, idx_dev
+
+    def _assert_compiled_matches_cpu(self, kernel, *dev_args):
+        """Run `kernel` through torch.compile on device and require the result
+        to match the CPU eager reference -- a hard assertion, not an xfail.
+        Compute CPU reference from pristine inputs before compiled run to catch
+        mutations that corrupt non-indexed regions."""
+        cpu_args = [
+            a.cpu()
+            if isinstance(a, torch.Tensor) and a.device.type == "spyre"
+            else a.clone()
+            if isinstance(a, torch.Tensor)
+            else a
+            for a in dev_args
+        ]
+        reference = kernel(*cpu_args)
+        result = torch.compile(kernel, dynamic=False)(*dev_args)
+        torch.testing.assert_close(result.cpu(), reference)
+
+    def test_index_copy_e2e(self):
+        """torch.compile(index_copy) against a paged-KV-cache-shaped device
+        layout ([576, 8, 128]), run e2e and
+        require the result to match the CPU reference."""
+        cache, src, idx = self._paged_kv_cache_operands()
+
+        def kernel(c, s, i):
+            return c.index_copy(0, i, s)
+
+        self._assert_compiled_matches_cpu(kernel, cache, src, idx)
+
+    def test_index_copy_decode_e2e(self):
+        """Decode-shaped variant: a single-token write (P=1), the common
+        per-step KV-cache update pattern during autoregressive decode."""
+        cache, src, idx = self._paged_kv_cache_operands(P=1)
+
+        def kernel(c, s, i):
+            return c.index_copy(0, i, s)
+
+        self._assert_compiled_matches_cpu(kernel, cache, src, idx)
+
+    def test_index_put_e2e(self):
+        """y[idx] = src against a paged-KV-cache-shaped device layout --
+        index_put's simpler assignment form, run e2e against the CPU
+        reference (cf. test_index_put's default-layout version)."""
+        y, src, idx = self._paged_kv_cache_operands()
+
+        def kernel(y, src, idx):
+            y[idx] = src
+            return y
+
+        self._assert_compiled_matches_cpu(kernel, y, src, idx)
+
+    def test_index_put_second_target_e2e(self):
+        """z[idx] = src against a *second*, differently-shaped paged-cache
+        tensor (fewer, wider rows) -- pins that the paged-cache path isn't
+        special-cased to one shape."""
+        z, src, idx = self._paged_kv_cache_operands(L=288, H=4, D=128, P=5)
+
+        def kernel(z, src, idx):
+            z[idx] = src
+            return z
+
+        self._assert_compiled_matches_cpu(kernel, z, src, idx)
+
+    def test_index_put_two_targets_sum_e2e(self):
+        """z[j] = src_z; y[i] = src_y; return z + y -- two independent
+        indirect-output scatters into differently-shaped paged caches
+        combined by a direct pointwise op in the same compiled graph."""
+        y, src_y, idx_y = self._paged_kv_cache_operands(L=576, H=8, D=128)
+        z, src_z, idx_z = self._paged_kv_cache_operands(L=576, H=8, D=128)
+
+        def kernel(y, src_y, idx_y, z, src_z, idx_z):
+            y[idx_y] = src_y
+            z[idx_z] = src_z
+            return z + y
+
+        self._assert_compiled_matches_cpu(kernel, y, src_y, idx_y, z, src_z, idx_z)
+
+    def test_index_put_3d_scatter_dim1_e2e(self):
+        """3-D tensor [B, H, D] scatter on dim 1 (H): y[:, idx, :] = src.
+        Tests indirect access on a non-leading dimension, validating stride
+        handling for multi-dim indexing."""
+        B, H, D = 576, 8, 128
+        y = torch.rand(B, H, D, dtype=torch.float16).to("spyre")
+        P = 3
+        src = torch.rand(B, P, D, dtype=torch.float16).to("spyre")
+        idx = torch.randperm(H, dtype=torch.int64)[:P].to("spyre")
+
+        def kernel(y, src, idx):
+            y[:, idx, :] = src
+            return y
+
+        self._assert_compiled_matches_cpu(kernel, y, src, idx)
+
+    def test_index_put_4d_scatter_dim1_e2e(self):
+        """4-D tensor [B, L, H, D] scatter on dim 1 (L): y[:, idx, :, :] = src.
+        Tests indirect access on a mid-rank dimension."""
+        B, L, H, D = 2, 576, 8, 128
+        y = torch.rand(B, L, H, D, dtype=torch.float16).to("spyre")
+        P = 4
+        src = torch.rand(B, P, H, D, dtype=torch.float16).to("spyre")
+        idx = torch.randperm(L, dtype=torch.int64)[:P].to("spyre")
+
+        def kernel(y, src, idx):
+            y[:, idx, :, :] = src
+            return y
+
+        self._assert_compiled_matches_cpu(kernel, y, src, idx)
 
     def test_index_add(self):
         """out.index_add_(0, idx, src)"""
@@ -266,6 +411,35 @@ class TestScatter(IndirectAccessTestCase):
         mask_1d = torch.zeros(1, ROWS, dtype=torch.bool)
         mask_1d[0, torch.randperm(ROWS)[:N_TRUE]] = True
         mask = mask_1d.unsqueeze(-1).to("spyre").expand(1, ROWS, COLS)
+        self.name_dims(inp, {"B": 1, "ROWS": ROWS, "COLS": COLS})
+        self.name_dims(src, {"SRC_ROWS": SRC_ROWS, "COLS": COLS})
+
+        def kernel(inp, mask, src):
+            return torch.masked_scatter(inp, mask, src)
+
+        self._stage_and_e2e(
+            kernel, inp, mask, src, expect=GATHER_OP_SPEC, expect_close=True
+        )
+
+    def test_masked_scatter_unexpanded_row_broadcast(self):
+        """torch.masked_scatter with a row mask left in its UN-EXPANDED form:
+        a literal size-1 last dim [B, S, 1] (stride(-1) == 1), not broadcast up
+        to [B, S, C]. This is what real models hand us (e.g. Mistral-Small-3.2's
+        `inputs_embeds.masked_scatter(special_image_mask, image_features)` with
+        mask [1, 855, 1] into self [1, 855, 5120]).
+
+        It is the same whole-row selection as the expanded form -- mask[..., 0]
+        collapses either spelling to one bool per row -- so it must also lower to
+        a gather.
+        """
+        ROWS, COLS, SRC_ROWS, N_TRUE = 855, 5120, 266, 266
+        inp = torch.rand(1, ROWS, COLS, dtype=torch.float16).to("spyre")
+        src = torch.rand(SRC_ROWS, COLS, dtype=torch.float16).to("spyre")
+        # Un-expanded: [1, ROWS, 1], NOT .expand()-ed to [1, ROWS, COLS].
+        mask_1d = torch.zeros(1, ROWS, dtype=torch.bool)
+        mask_1d[0, torch.randperm(ROWS)[:N_TRUE]] = True
+        mask = mask_1d.unsqueeze(-1).to("spyre")  # shape [1, ROWS, 1]
+        self.assertEqual(tuple(mask.shape), (1, ROWS, 1))
         self.name_dims(inp, {"B": 1, "ROWS": ROWS, "COLS": COLS})
         self.name_dims(src, {"SRC_ROWS": SRC_ROWS, "COLS": COLS})
 
