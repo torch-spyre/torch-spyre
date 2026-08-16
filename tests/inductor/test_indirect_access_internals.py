@@ -27,6 +27,7 @@ import os
 import sys
 
 import sympy
+import torch
 
 sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
@@ -679,6 +680,73 @@ class TestIndirectSdscValidator(IndirectAccessTestCase):
         # Merge a direct op file with the gather op file (distinct filenames).
         merged = {**direct, **_gather_bundle()}
         self.assert_indirect_sdsc_fields(merged, "gather")
+
+
+# ===========================================================================
+# Layer 5: masked_scatter row-mask acceptance (pure shape/stride logic, no device)
+# ===========================================================================
+class TestMaskedScatterRejectReason(IndirectAccessTestCase):
+    """Directly exercise `_masked_scatter_reject_reason`: which masks the row-gather
+    decomposition accepts (returns None) vs rejects (returns a reason string).
+
+    Device-free -- the function only reads .dim()/.shape/.stride(), so CPU meta
+    tensors suffice. This pins the row-broadcast acceptance matrix, including the
+    un-expanded [B, S, 1] mask that regressed as Unsupported before the fix.
+    """
+
+    def _reason(self, self_shape, mask, source_shape):
+        from torch_spyre._inductor.decompositions import (
+            _masked_scatter_reject_reason,
+        )
+
+        s = torch.empty(self_shape, dtype=torch.float16)
+        src = torch.empty(source_shape, dtype=torch.float16)
+        return _masked_scatter_reject_reason(s, mask, src)
+
+    def test_unexpanded_size1_last_dim_accepted(self):
+        """The regression case: a literal [B, S, 1] mask (stride(-1) == 1) into
+        [B, S, C] is a per-row mask and must be accepted."""
+        mask = torch.empty(1, 855, 1, dtype=torch.bool)
+        self.assertEqual(mask.stride(-1), 1)  # NOT broadcast; size-1 last dim
+        self.assertIsNone(self._reason((1, 855, 5120), mask, (266, 5120)))
+
+    def test_expanded_broadcast_last_dim_accepted(self):
+        """The already-supported spelling: [B, S, 1] expanded to [B, S, C] with
+        stride(-1) == 0 stays accepted (no regression)."""
+        mask = torch.empty(1, 855, 1, dtype=torch.bool).expand(1, 855, 5120)
+        self.assertEqual(mask.stride(-1), 0)
+        self.assertIsNone(self._reason((1, 855, 5120), mask, (266, 5120)))
+
+    def test_per_element_mask_rejected(self):
+        """A genuine per-element mask (last dim == cols, stride(-1) != 0) is not
+        a per-row mask and must still be rejected."""
+        mask = torch.empty(1, 855, 5120, dtype=torch.bool)
+        self.assertNotEqual(mask.stride(-1), 0)
+        reason = self._reason((1, 855, 5120), mask, (266, 5120))
+        self.assertIsNotNone(reason)
+        self.assertIn("per-row", reason)
+
+    def test_leading_dim_mismatch_rejected(self):
+        """Leading (row) dims must match self exactly so mask[..., 0] yields one
+        bool per row; a leading-dim broadcast is rejected."""
+        mask = torch.empty(1, 1, 1, dtype=torch.bool)
+        reason = self._reason((1, 855, 5120), mask, (266, 5120))
+        self.assertIsNotNone(reason)
+        self.assertIn("leading", reason)
+
+    def test_degenerate_single_column_rejected(self):
+        """cols == 1 is a degenerate row (no block-per-row equivalence)."""
+        mask = torch.empty(8, 1, dtype=torch.bool)
+        reason = self._reason((8, 1), mask, (4, 1))
+        self.assertIsNotNone(reason)
+        self.assertIn("degenerate", reason)
+
+    def test_rank_mismatch_rejected(self):
+        """mask rank must equal self rank."""
+        mask = torch.empty(1, 855, dtype=torch.bool)
+        reason = self._reason((1, 855, 5120), mask, (266, 5120))
+        self.assertIsNotNone(reason)
+        self.assertIn("rank", reason)
 
 
 if __name__ == "__main__":

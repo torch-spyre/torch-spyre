@@ -21,6 +21,7 @@
 #include <pybind11/native_enum.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <spyrecode-host-functions/sendataconvert/sen_data_convert.h>
 #include <util/sendefs/sendefs.h>
 
@@ -29,10 +30,12 @@
 #include <flex/flex.hpp>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "job_plan.h"
+#include "kernel_provenance_registry.h"
 
 #ifdef USE_SPYRE_CCL
 #include <pybind11/chrono.h>
@@ -89,15 +92,25 @@ void _startRuntime() {
   //   1. tls_idx (non-zero) — set via explicit set_device() call
   //   2. LOCAL_RANK env var — set by torchrun per process
   //   3. 0 — single-device / non-torchrun default
+  //
+  // tls_idx is initialised to parse_local_rank() at thread-local init time
+  // in spyre_guard.cpp (covering cases 2 and 3 automatically). The if/else
+  // here only distinguishes "tls_idx is non-zero (either from TLS init or
+  // from a set_device() call)" from "tls_idx is zero". There is no way at
+  // this point to distinguish a set_device() call from a LOCAL_RANK-seeded
+  // TLS init.
   int logical_device_id = 0;
   int tls_idx = static_cast<int>(SpyreGuardImpl::tls_idx);
   if (tls_idx != 0) {
     logical_device_id = tls_idx;
-  } else if (const char* lr = std::getenv("LOCAL_RANK")) {
-    logical_device_id = std::atoi(lr);
+  } else {
+    // parse_local_rank() returns 0 when LOCAL_RANK is unset, and throws on
+    // invalid / out-of-range values.
+    const c10::DeviceIndex rank = parse_local_rank();
+    logical_device_id = static_cast<int>(rank);
     // Match the current (c10) device to the rank so unqualified stream/pool
     // lookups don't fall back to spyre:0.
-    SpyreGuardImpl::tls_idx = static_cast<c10::DeviceIndex>(logical_device_id);
+    SpyreGuardImpl::tls_idx = rank;
   }
 
   const int num_devices = getVisibleDeviceCount();
@@ -196,6 +209,36 @@ PYBIND11_MODULE(_C, m) {
   }
 
   m.doc() = "Spyre C++ bindings";
+  m.attr("AIUPTI_ACTIVITY_NAME_MAX_BYTES") =
+      py::int_(spyre::kAIUptiActivityNameMaxBytes);
+  m.def("register_kernel_provenance", &spyre::registerKernelProvenance,
+        py::arg("event_base_name"), py::arg("debug_handle_ids"),
+        "Register direct debug-handle IDs for a provenance-aware event name");
+  m.def(
+      "lookup_kernel_provenance",
+      [](const std::string& key) -> py::object {
+        const auto ids = spyre::lookupKernelProvenance(key);
+        if (ids == nullptr) {
+          return py::none();
+        }
+        return py::cast(*ids);
+      },
+      py::arg("key"), "Return registered debug-handle IDs without mutation");
+  m.def(
+      "kernel_provenance_registry_stats",
+      []() {
+        const auto stats = spyre::kernelProvenanceRegistryStats();
+        py::dict result;
+        result["entries"] = stats.entries;
+        result["hits"] = stats.hits;
+        result["misses"] = stats.misses;
+        result["conflicts"] = stats.conflicts;
+        return result;
+      },
+      "Return process-lifetime kernel provenance registry counters");
+  m.def("extract_kernel_provenance_key", &spyre::extractKernelProvenanceKey,
+        py::arg("event_name"),
+        "Extract a canonical bundle key from a Spyre profiler event name");
   m.def("start_runtime", &spyre::startRuntime);
   m.def("free_runtime", &spyre::freeRuntime);
   m.def("device_count", &spyre::getVisibleDeviceCount);
@@ -453,6 +496,21 @@ PYBIND11_MODULE(_C, m) {
           },
           py::arg("idx"),
           "Get the pipeline_barrier flag for the step at the given index")
+      .def(
+          "get_step_name",
+          [](const spyre::JobPlan& plan,
+             size_t idx) -> std::optional<std::string> {
+            TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");
+            const auto* compute =
+                dynamic_cast<const spyre::JobPlanStepCompute*>(
+                    plan.steps[idx].get());
+            if (compute == nullptr) {
+              return std::nullopt;
+            }
+            return compute->getName();
+          },
+          py::arg("idx"),
+          "Get the profiler-visible name for a compute step, or None")
       .def("__repr__", [](const spyre::JobPlan& plan) {
         return "<JobPlan steps=" + std::to_string(plan.steps.size()) +
                " job_allocation_size=" +
@@ -463,13 +521,15 @@ PYBIND11_MODULE(_C, m) {
                ">";
       });
   m.def("prepare_kernel", &spyre::prepareKernel, py::arg("spyrecode_dir"),
-        py::arg("stream") = nullptr,
+        py::arg("stream") = nullptr, py::arg("profiler_name") = std::nullopt,
         "Prepare a kernel from a SpyreCode directory and return a JobPlan.\n\n"
         "Args:\n"
         "    spyrecode_dir (str): Path to the SpyreCode directory\n"
         "    stream (SpyreStream, optional): Stream to use for initialization "
         "transfers.\n"
         "        If None, uses the current stream. Defaults to None.\n\n"
+        "    profiler_name (str, optional): Bounded base name for "
+        "profiler-visible compute events. Defaults to None.\n\n"
         "Returns:\n"
         "    Prepared JobPlan ready for execution");
   // Bind the current-stream overload (resolves the current stream internally).

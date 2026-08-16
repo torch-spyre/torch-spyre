@@ -34,11 +34,12 @@ import torch._decomp as decomp
 
 from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from .errors import Unsupported
+from . import config
 from .logging_utils import get_inductor_logger
 
 from . import customops  # noqa: F401
 from . import spyre_hint
-from torch_spyre._C import DataFormats, get_device_dtype
+from torch_spyre._C import DataFormats, get_device_dtype, get_elem_in_stick
 import torch_spyre._inductor.customops  # noqa: F401
 
 logger = get_inductor_logger("decompositions")
@@ -331,9 +332,17 @@ def spyre_topk(
     input: torch.Tensor,
     k: int,
     dim: Optional[int] = -1,
+    largest: bool = True,
+    sorted: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if k > 4:
         raise Unsupported("Topk is not supported for this config")
+    if not largest:
+        raise Unsupported("topk with largest=False")
+    # sorted=False only relaxes the ordering guarantee (any order of the top-k
+    # elements is a valid answer); our topkvalue/topkindex reduction always
+    # returns sorted output, which satisfies that relaxed contract, so
+    # sorted=False can be served as a no-op.
     return torch.ops.spyre.topkvalue(input, k, dim), torch.ops.spyre.topkindex(
         input, k, dim
     )
@@ -351,7 +360,15 @@ def spyre_gelu(
 def spyre_softplus(
     input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
 ) -> torch.Tensor:
-    return torch.ops.spyre.softplus(input, beta, threshold)
+    if beta == 1.0:
+        return torch.ops.spyre.softplus(input, beta, threshold)
+    # The runtime primitive drops the outer 1/beta factor, so beta == 1 is its
+    # only exact path. Scale into it and back out; the threshold branch stays
+    # exact because 1 * (beta * x) > threshold is PyTorch's beta * x > threshold.
+    # aten accepts beta == 0 and saturates every element to +-inf, so take the
+    # reciprocal under IEEE rules rather than letting Python raise here.
+    inv_beta = math.copysign(math.inf, beta) if beta == 0.0 else 1.0 / beta
+    return torch.ops.spyre.softplus(input * beta, 1.0, threshold) * inv_beta
 
 
 @register_spyre_decompositions([torch.ops.aten.linear.default])
@@ -683,6 +700,142 @@ def bitwise_and(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
         )
 
 
+#: Largest kernel tap (per spatial axis) the direct conv2d path accepts. A
+#: dense (groups==1) conv contracts over C_in*kH*kW; that per-output-channel
+#: weight working set grows with k**2 and, at k>3 with a stick-aligned C_in>=64,
+#: exceeds the initial-chunk LX budget -- the backend aborts (the initial
+#: chunk must fit in LX) because the kernel taps are pinned no-split
+#: (ki/kj=1) and C_out=64 is a single stick, so
+#: there is nothing left to tile. Depthwise conv escapes this (its contraction
+#: is kH*kW only, no C_in), which is why depthwise supports k up to 9 and dense
+#: does not. Until the backend can tile the C_in*kH*kW contraction for dense
+#: conv, k>3 stays on the im2col+matmul decomposition.
+_CONV_MAX_KERNEL = 3
+
+
+def _is_direct_conv_supported(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    stride: list[int],
+    transposed: bool,
+    output_padding: list[int],
+    padding: list[int],
+    dilation: list[int],
+    groups: int,
+) -> bool:
+    """Cases the native conv2d direct lowering (lower_convolution) handles.
+
+    Keep this in lock-step with the guards in lower_convolution so that whenever
+    the decomposition defers here, the lowering is guaranteed to accept the op.
+    Everything else stays on the im2col+matmul decomposition.  Excluded:
+    - 1x1 kernel: only the 1x1 case has size-1 kernel taps on *both* axes
+      (ki and kj), which the pipeline squeezes out so the emitted SDSC carries
+      no window dims at all -- and the backend's conv path expects at least one
+      windowed spatial dim, aborting in dimension-mapping (ddl_conversion.cpp
+      "Unknown primary dimension kind for a window dimension").  A 1x1 conv is
+      just a channel matmul, so it stays on the im2col+matmul path, which handles
+      it exactly.  A 1xN / Nx1 kernel squeezes only one tap and keeps the other
+      window dim, which the backend does accept (a 1-D conv) -- so those
+      direct-lower and are covered by the test_conv2d_direct k1x3 / k3x1 cases;
+    - non-zero padding: the backend zero-fill for a padded conv input is not wired
+      for regular conv2d, so pad>0 stays on the im2col+matmul path (which pads
+      correctly);
+    - dilated conv: the windowed-input SDSC fields reuse the avgpool builder,
+      which assumes dilation==1, so d>1 stays on the im2col+matmul path;
+    - C_in not stick-aligned: Spyre stores C as the innermost (stick) dim, and
+      the conv SDSC contracts over C_in with no partial-stick handling. A C_in
+      that is not a whole multiple of the fp16 stick width (get_elem_in_stick,
+      = 64) would need contraction-dim padding the direct path does not emit
+      (known-broken), so it stays on the im2col+matmul path;
+    - kernel tap > _CONV_MAX_KERNEL (3): the dense C_in*kH*kW contraction working
+      set overflows the LX budget in the backend for k>3 and cannot be tiled
+      (see _CONV_MAX_KERNEL), so it stays on the im2col+matmul path;
+    - ragged input width under stride: when the strided windows do not exactly
+      cover the input width -- (W_in - kW) % sW != 0 -- the fp16 conv opfunc's
+      width tiling mis-accumulates the dangling partial column, so such convs
+      stay on the im2col+matmul path. A ragged *height* is harmless (height is
+      untiled) and stride==1 is never ragged, so this only excludes strided
+      convs whose width does not divide evenly (all HW-verified).
+
+    Why these gates run here (decomposition/routing time) rather than in layout
+    propagation, where the device stick dim is actually assigned:
+
+    - Declining here is what preserves the fallback. conv2d_via_bmm_decomp either
+      defers (returns NotImplemented, leaving aten.convolution for
+      lower_convolution to direct-lower) or expands into im2col+matmul -- and once
+      it expands, the conv node is gone, replaced by a reshape+bmm subgraph.
+      Inductor lowering is a single forward pass with no backtracking, so there is
+      no way to un-decompose and re-route afterwards. By the time layout
+      propagation runs, the graph is already committed to the direct path; a
+      stick-alignment failure discovered there is a hard compile error, not a
+      graceful fallback. So the decision has to be made before the branch, i.e.
+      here.
+    - Making it this early is correct because the stick-alignment gate is
+      layout-invariant. C_in is logical dim 1 by the aten.convolution NCHW
+      contract (guarded by input.dim() == 4), and ``C_in % stick == 0`` is a
+      property of the channel *count*, which no layout choice changes -- layout
+      propagation picks stick *placement*, not size. We are not assuming which
+      host dim becomes the stick: the direct path itself forces channel-last (C on
+      the stick) to feed the PE-array contraction, so this validates a
+      precondition of the layout the path *will request*, not a guess about an
+      assignment the solver is free to make differently. The stick width is
+      get_elem_in_stick(torch.float16) == 64, derived from the dtype the fp16 gate
+      above already pins -- not a hardcoded dim assumption.
+
+    Assumption this routing decision rests on (documented, not enforced here):
+    the gate reads C_in from logical dim 1 (guaranteed by the aten.convolution
+    NCHW contract) and assumes the direct path will place C_in on the device
+    stick. That stick placement is NOT decided here -- it is requested by the
+    direct path and enforced downstream in propagate_layouts (_conv_layouts /
+    find_stick_compatible_input_layout), which restickify the activation onto
+    C_in or raise Unsupported if they cannot. So the ``C_in % stick == 0`` check
+    below is a precondition of the channel-last layout the path *will request*,
+    validated against the channel *count* (which no layout choice changes). The
+    assumption is only that C_in-on-stick keeps being the layout a direct-conv
+    node lands in; if that ever stops holding (e.g. a solver change assigns a
+    different stick dim to a direct-conv node), this gate would be checking the
+    wrong dimension and could route wrongly. It is documented here as an
+    assumption rather than re-checked after layout assignment because by then
+    the im2col+matmul fallback branch is gone (see above) -- a mismatch surfaces
+    downstream as a hard Unsupported, not silent wrong numerics.
+    """
+    kH, kW = weight.shape[-2], weight.shape[-1]
+    C_in = input.shape[1]
+    eps = get_elem_in_stick(torch.float16)
+    supported = (
+        not transposed
+        and all(op == 0 for op in output_padding)
+        and all(p == 0 for p in padding)
+        and all(d == 1 for d in dilation)
+        and groups == 1
+        and input.dim() == 4
+        and input.dtype == torch.float16
+        and not (kH == 1 and kW == 1)
+        # Dense conv k>3 overflows the LX contraction budget in the backend.
+        and kH <= _CONV_MAX_KERNEL
+        and kW <= _CONV_MAX_KERNEL
+        # isinstance guard: a dynamic-shape C_in (SymInt) is not statically known
+        # to be stick-aligned, so fall back to the decomposition rather than
+        # branching on a symbolic divisibility (which would add a shape guard).
+        and isinstance(C_in, int)
+        # Assumes the direct path lands C_in (logical dim 1) on the stick; that
+        # is requested by the path and enforced in propagate_layouts, not here.
+        # See the "Assumption this routing decision rests on" note above.
+        and C_in % eps == 0
+    )
+    if not supported:
+        return False
+    # Ragged input width (see docstring): the fp16 opfunc tiles the output width
+    # and mis-accumulates the dangling column when (W_in - kW) % sW != 0. Only
+    # decidable for a static width; a dynamic (SymInt) width stays on the direct
+    # path rather than adding a symbolic-remainder shape guard.
+    W_in = input.shape[-1]
+    sW = stride[-1]
+    if isinstance(W_in, int) and (W_in - kW) % sW != 0:
+        return False
+    return True
+
+
 @register_spyre_decompositions([torch.ops.aten.convolution.default])
 def conv2d_via_bmm_decomp(
     input: torch.Tensor,
@@ -699,7 +852,20 @@ def conv2d_via_bmm_decomp(
     Decompose 2D convolution into batch matrix multiplication using torch.nn.unfold.
     torch.nn.unfold directly returns (N, C_in * K_h * K_w, H_out * W_out), avoiding
     intermediate reshape/view/unsqueeze operations.
+    For depthwise convolutions (C_in = groups = C_out), invoke torch.spyre.conv2d directly.
     """
+    # When the direct-lowering flag is on and the case is supported, decline the
+    # decomposition (return NotImplemented) so aten.convolution.default survives
+    # in the FX/AOT graph and reaches the Spyre lowering (lower_convolution),
+    # which emits a native conv2d SDSC. Unsupported cases (grouped/transposed/
+    # non-fp16) fall through and decompose to im2col+matmul as before. This is
+    # the compile-path target; the flag defaults off so eager and default
+    # compile behavior are unchanged.
+    if config.conv2d_direct_lowering and _is_direct_conv_supported(
+        input, weight, stride, transposed, output_padding, padding, dilation, groups
+    ):
+        return NotImplemented
+
     if transposed:
         raise Unsupported("conv2d_via_bmm: transposed convolution not supported")
 
@@ -711,6 +877,12 @@ def conv2d_via_bmm_decomp(
 
     N, C_in, H_in, W_in = input.shape
     C_out, C_in_per_group, K_h, K_w = weight.shape
+
+    # For depthwise convolutions (C_in = groups = C_out), use torch.spyre.conv2d_with_bias
+    if C_in == groups == C_out:
+        return torch.ops.spyre.conv2d_with_bias(
+            input, weight, bias, stride, padding, dilation, groups
+        )
 
     stride_h, stride_w = stride[0], stride[1]
     pad_h, pad_w = padding[0], padding[1]
@@ -758,13 +930,51 @@ def conv2d_via_bmm_decomp(
         )
         output = output.reshape(N, C_out, H_out * W_out)
 
+    if bias is not None:
+        # Add bias while the output is still (N, C_out, H_out * W_out): the
+        # matmul lays the trailing H_out*W_out dim on the stick, and for a
+        # patch-embed conv (e.g. Prithvi's stride-16 kernel) that flat length
+        # is a multiple of 64 even when H_out/W_out individually are not. If we
+        # instead reshaped to (N, C_out, H_out, W_out) first and broadcast the
+        # bias over a sub-stick spatial width (e.g. W_out == 32), the layout
+        # solver rejects the resulting `w + 32*Mod(row, 2)` stick expression.
+        bias_shaped = torch.ops.spyre.reshape_via_cpu(bias, (1, C_out, 1))
+        output = output + bias_shaped
+
     output = output.reshape(N, C_out, H_out, W_out)
 
+    return output
+
+
+@register_spyre_decompositions([torch.ops.spyre.conv2d_with_bias.default])
+def spyre_conv2d_with_bias_decomp(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    groups: int,
+) -> torch.Tensor:
+    """
+    Decompose torch.ops.spyre.conv2d_with_bias into:
+      1. torch.ops.spyre.conv2d without bias
+      2. Expand bias to (N, C_out, H_out, W_out) for broadcasting
+      3. Add the bias to the output
+
+    This keeps the spyre.conv2d lowering simple while supporting conv2d with bias.
+    """
+    # Call spyre.conv2d without bias
+    output = torch.ops.spyre.conv2d(input, weight, stride, padding, dilation, groups)
+
+    # If bias is present, add it
     if bias is not None:
-        # To ensure stick compatibility: reshape bias via reshape_via_cpu to (1, C_out, 1, 1).
-        # The resulting tensor has a layout compatible with broadcasting to (N, C_out, H_out, W_out).
-        bias_shaped = torch.ops.spyre.reshape_via_cpu(bias, (1, C_out, 1, 1))
-        output = output + bias_shaped
+        # Get output shape
+        N, C_out, H_out, W_out = output.shape
+        # Reshape bias to (1, C_out, 1, 1) then expand to (N, C_out, H_out, W_out)
+        # This avoids stick layout issues by expanding before adding
+        bias_expanded = bias.reshape(1, C_out, 1, 1).expand(N, C_out, H_out, W_out)
+        output = output + bias_expanded
 
     return output
 
@@ -949,3 +1159,112 @@ def spyre_prod_dim_int(
         acc = acc.unsqueeze(dim)
 
     return acc
+
+
+def _masked_scatter_reject_reason(
+    self: torch.Tensor,
+    mask: torch.Tensor,
+    source: torch.Tensor,
+) -> Optional[str]:
+    """Why ``masked_scatter`` cannot use the row-level path here, or ``None`` if it can.
+
+    The mask must select whole rows: constant across the last (column) dim, with
+    every other dim matching ``self`` so there is exactly one mask bool per row.
+    That covers both spellings PyTorch may hand us for a row-broadcast mask, which
+    the body collapses identically via ``mask[..., 0]``:
+      * un-expanded -- the last dim is literally ``1`` (e.g. ``[B, S, 1]``); or
+      * expanded    -- the last dim is ``cols`` but broadcast (``stride(-1) == 0``).
+
+    Checks are ordered cheapest/most-general to most-specific:
+      1. Rank guards (no device_layout access needed).
+      2. Leading-dim equality (one mask entry per row).
+      3. Degenerate column guard (cols <= 1 is not a meaningful row).
+      4. Source column alignment.
+      5. Per-row last-dim check (the structural row-level requirement).
+    """
+    if self.dim() < 2 or source.dim() < 2 or mask.dim() != self.dim():
+        return f"rank: self={self.dim()} mask={mask.dim()} source={source.dim()}"
+    # One mask entry per row: every dim but the last must match self exactly, so
+    # mask[..., 0] has exactly `rows` elements. (The last dim may differ: it is
+    # either a literal 1 or a broadcast of cols -- checked below.)
+    if tuple(mask.shape[:-1]) != tuple(self.shape[:-1]):
+        return (
+            f"mask leading dims {tuple(mask.shape[:-1])} != self "
+            f"{tuple(self.shape[:-1])}"
+        )
+    cols = self.shape[-1]
+    # cols <= 1 is a degenerate row that offers no block-per-row equivalence.
+    if cols <= 1:
+        return f"degenerate last dim: cols={cols}"
+    if source.shape[-1] != cols:
+        return f"source last dim {source.shape[-1]} != self last dim {cols}"
+    # Per-row means the mask is constant across the last dim. Accept a literal
+    # size-1 last dim (un-expanded) or a broadcast last dim (stride 0); reject a
+    # genuinely per-element mask (last dim cols with a non-zero stride).
+    if mask.shape[-1] != 1 and mask.stride(-1) != 0:
+        return (
+            f"mask is not per-row in its last dim (shape {tuple(mask.shape)}, "
+            f"stride {tuple(mask.stride())})"
+        )
+    return None
+
+
+@register_spyre_decompositions([torch.ops.aten.masked_scatter.default])
+def spyre_masked_scatter(
+    self: torch.Tensor,
+    mask: torch.Tensor,
+    source: torch.Tensor,
+) -> torch.Tensor:
+    """`masked_scatter` for a mask that is broadcast along the last dim.
+
+    Such a mask (`stride(-1) == 0` -- e.g. an attention mask `[B, S]`
+    expanded to `[B, S, C]`) selects *whole rows*: row `i`, if selected,
+    consumes exactly one contiguous `C`-element block of `source`, i.e. one
+    whole row of `source.reshape(-1, C)`. The gather is then
+    `source_2d[row_idx]` -- a 1D index into the row dim of a 2D source, which
+    is a plain stick gather.
+
+    Any other mask makes this an element-level op, which Spyre cannot express:
+    the index would have to address an element inside a *packed* 1D source, and
+    a lane within a stick is not addressable. Exploding the source to one
+    element per stick does not help -- that splits every stick 64 ways, an
+    element scatter the backend cannot lower. So the generic form is rejected
+    here rather than emitting a gather that fails deeper in layout propagation.
+    """
+    reason = _masked_scatter_reject_reason(self, mask, source)
+    if reason is not None:
+        raise Unsupported(
+            f"masked_scatter needs a mask broadcast along the last dim so it "
+            f"selects whole rows ({reason}). An element-level masked_scatter "
+            f"would gather individual elements from a packed 1D source, and a "
+            f"lane within a stick is not addressable on Spyre."
+        )
+
+    cols = self.shape[-1]
+    rows = self.numel() // cols
+    # Collapse the broadcast dim: one bool per row.
+    mask_row = mask[..., 0].reshape(rows)
+    source_2d = source.reshape(-1, cols)
+    # masked_scatter requires source.numel() >= mask.sum(). For a whole-row
+    # mask, source_2d needs at least as many rows as there are selected rows.
+    torch._assert_async(
+        mask_row.sum() <= source_2d.shape[0],
+        "masked_scatter: source is too short -- it has fewer rows than the "
+        "number of selected (True) mask rows.",
+    )
+    # Row i reads source row (prefix-count of selected rows - 1). Unselected
+    # rows would get -1, so multiply by the mask to send them to row 0 instead
+    # (in bounds, and discarded by the where). Done in fp32: Spyre has no usable
+    # int `clip`, int32 sub/mul are unsupported, and fp16 loses large indices.
+    pos = mask_row.cumsum(0).to(torch.float32) - 1.0
+    row_idx = (pos * mask_row.to(torch.float32)).to(torch.int64)
+    # The gather stays 2D (its args are indirect, so the pointwise dim_order
+    # projection skips them), but the `where` must stay at `self`'s rank:
+    # that projection computes `rank_diff = len(output) - len(arg)` and only
+    # handles inputs of *lower* rank. A lower-rank output against the full-rank
+    # ND mask gives rank_diff < 0, which shifts dims the wrong way and builds a
+    # layout whose dim_order rank no longer matches host_size ("Incompatible
+    # host_size and dim_order"). Reshaping back to ND keeps every `where`
+    # input rank-aligned with the output.
+    gathered = source_2d[row_idx].reshape(self.shape)
+    return torch.where(mask, gathered, self)

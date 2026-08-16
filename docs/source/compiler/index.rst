@@ -19,11 +19,12 @@ The documentation is organized in four parts:
 * **Compilers** — deep dives on the Inductor front-end and the DeepTools
   back-end.
 * **Operations** — how to add new operations to the Spyre backend.
-* **Optimization passes** — the pre-scheduling transformations applied
-  by the front-end. These are presented in pipeline order: working set
+* **Optimization passes** — the transformations applied by the
+  front-end. These are presented in pipeline order: working set
   reduction first (the design concept), then coarse-tiling (the IR
   rewrite that implements it), then work-division across cores, then
-  scratchpad placement.
+  scratchpad placement (all pre-scheduling), then HBM pool planning
+  (post-fusion, after bundle boundaries are final).
 
 For the project workflow around enabling and triaging new ops (issues,
 test coverage, bug classification), see :doc:`/contributing/op_enablement`.
@@ -55,7 +56,9 @@ test coverage, bug classification), see :doc:`/contributing/op_enablement`.
    
    working_set_reduction
    coarse_tiling_loops
+   cost_model
    span_overflow_hint_analysis
    work_division_planning
    scratchpad_planning
    simulated_annealing_layout
+   hbm_pool_planning

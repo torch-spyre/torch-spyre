@@ -28,7 +28,7 @@ def core_to_slice_mapping(
     num_cores: int,
     *,
     contiguous_dim: int | None = None,
-) -> dict[str, Expr]:
+) -> dict[Symbol, Expr]:
     """Return the logical work slice assigned to each physical core.
 
     By default dimensions vary in iteration-space order. ``contiguous_dim``
@@ -54,7 +54,7 @@ def core_to_slice_mapping(
 
     core_id: Expr = Symbol("core_id")
     stride = Integer(1)
-    result: dict[str, Expr] = {}
+    result: dict[Symbol, Expr] = {}
     for dim in dim_order:
         split = Integer(splits[dim])
         if split == 1:
@@ -63,6 +63,6 @@ def core_to_slice_mapping(
             coordinate = Mod(core_id, split)
         else:
             coordinate = Mod(floor(core_id / stride), split)
-        result[str(dims[dim])] = coordinate
+        result[dims[dim]] = coordinate
         stride *= split
     return result

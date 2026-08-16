@@ -56,6 +56,7 @@ from .errors import Unsupported
 from .constants import (
     BATCH_MATMUL_OP,
     BATCH_MATMUL_FP8_OP,
+    CONV2D_FWD_OP,
     COPY_BACK_CANDIDATE_ATTR,
     DEVICE_NAME,
     ELIDED_COPY_BACK_ATTR,
@@ -64,6 +65,7 @@ from .constants import (
     TOPK_OPS,
 )
 from .ir import (
+    AllReduceAsyncFallback,
     FixedTiledLayout,
     SpyreConstantFallback,
     SpyreEmptyFallback,
@@ -84,7 +86,7 @@ from .pass_utils import (
     iter_var_id,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
-from .views import matching_dim
+from .views import compute_coordinates, matching_dim
 
 # ---------------------------------------------------------------------------
 # TODO(issue#1371): once SpyreTensorLayout is migrated to c10::SymInt, all
@@ -874,6 +876,94 @@ def _matmul_layouts(
     return [out_stl]
 
 
+def _conv_reduction_var(x: PropArg, reduction_candidates: set) -> sympy.Symbol | None:
+    """Pick conv's contraction var (`in`) from the reduction candidates.
+
+    A conv reduces over three loop vars -- the input channel `in` and the two
+    kernel taps `ki`/`kj` -- so find_reduction_var (which requires exactly one)
+    does not apply.  The layout-relevant contraction is `in`: it is the input
+    channel and the activation's stick dim.  `ki`/`kj` are windowed reductions
+    folded into the activation's spatial coordinates, never its stick.  So `in`
+    is the reduction candidate that appears on the stick of some candidate
+    activation layout (NHWC: stick = Mod(in, 64)).
+    """
+    for stl in x.layouts:
+        stick_syms = device_coordinates(stl, x.dep, None)[-1].free_symbols
+        hit = reduction_candidates & stick_syms
+        if hit:
+            return next(iter(hit))
+    return None
+
+
+def _conv_layouts(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[PropArg],
+) -> list[SpyreTensorLayout]:
+    """Layout propagation for the two-input conv2d reduction.
+
+    conv2d has the same input/output stick structure as matmul -- activation
+    (x) sticks on the contraction var, weight (y) and output stick on the
+    generated var (out-channel) -- so this mirrors _matmul_layouts.  The one
+    difference is the contraction var: conv reduces over {in, ki, kj}, and the
+    stick-relevant one is `in` (see _conv_reduction_var).
+    """
+    data = op.data
+    _check_supported_input_sticks(args, data.reduction_type)
+    out_coords = host_coordinates(output, output_dep, None)
+
+    x_dep, y_dep = identify_matmul_inputs([a.dep for a in args], output_dep)
+    if x_dep is None or y_dep is None:
+        raise Unsupported(
+            f"{data.reduction_type}: could not identify activation/weight"
+        )
+    if x_dep is args[0].dep:
+        x, y = args[0], args[1]
+    else:
+        x, y = args[1], args[0]
+
+    reduction_candidates = x.dep.index.free_symbols - output_dep.index.free_symbols
+    reduction_var = _conv_reduction_var(x, reduction_candidates)
+    if reduction_var is None:
+        raise Unsupported(
+            f"{data.reduction_type}: could not identify the input-channel "
+            f"contraction var among {reduction_candidates}"
+        )
+    generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep)
+
+    x_req_stl = find_stick_compatible_input_layout(
+        x, reduction_var, data.reduction_type, "x"
+    )
+    y_req_stl = find_stick_compatible_input_layout(
+        y, generated_var, data.reduction_type, "y"
+    )
+
+    out_stick_dim = next(
+        (i for i, c in enumerate(out_coords) if generated_var in c.free_symbols),
+        None,
+    )
+    if out_stick_dim is None:
+        raise Unsupported(
+            f"{data.reduction_type}: generated_var={generated_var} not found in "
+            f"output coords {out_coords}"
+        )
+
+    # The output must stick on generated_var (out-channel). Unlike matmul, whose
+    # N dim is always in the last two positions, conv's out-channel can sit
+    # anywhere (index 1 for an NCHW [mb, out, i, j] output), so move it to the
+    # stick (innermost) position explicitly and keep the other dims' order.
+    out_dims = len(output.size)
+    out_dim_order = [d for d in range(out_dims) if d != out_stick_dim] + [out_stick_dim]
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+    out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+    op.restick_cost_fn = FixedInOutNode.from_args(
+        [x, y], out_stl, [x_req_stl, y_req_stl], op
+    )
+    return [out_stl]
+
+
 def _multi_arg_pointwise_layouts(
     op: Operation,
     output: FixedLayout,
@@ -1241,6 +1331,9 @@ def compute_layouts(
     ]:
         return _matmul_layouts(op, output, output_dep, args)
 
+    if isinstance(data, Reduction) and data.reduction_type == CONV2D_FWD_OP:
+        return _conv_layouts(op, output, output_dep, args)
+
     if isinstance(data, Reduction) and data.reduction_type == "exx2":
         return _exx2_layout(op, output, output_dep, args)
 
@@ -1485,6 +1578,95 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
         operations.remove(op)
 
 
+def _eager_view_input_layout(
+    real_input: torch.Tensor,
+    ptl: FixedLayout,
+    name: str,
+) -> "FixedLayout | None":
+    """Rewrite a placeholder view's FixedLayout to "layout = base, dep = view".
+
+    Eager-mode placeholders arrive with view size/stride/offset baked onto
+    FixedLayout. Downstream passes (and inline-slice paths) instead expect
+    base-storage size/stride with the offset in ``layout.offset`` so
+    ``FixedLayout.make_indexer`` weaves it into ``MemoryDep.index``.
+
+    Returns the replacement layout, or ``None`` if no rewrite is needed.
+    """
+    base = real_input._base
+    storage_offset = real_input.storage_offset()
+
+    # The two gates below are intentionally orthogonal:
+    #
+    #   Example       | sub-region | offset | Action
+    #   --------------|------------|--------|-------------------------------
+    #   x[1:]         | y          | y      | size/stride <- base; offset
+    #   x[:6]         | y          | n      | size/stride <- base
+    #   x.t()[1:]     | n          | y      | keep view size/stride; offset
+    #   x.t()         | n          | n      | no rewrite
+    #
+    # Sub-region requires stride preserved AND size differs. A pure
+    # transpose differs on both, but rewriting it to base size/stride
+    # would silently strip the permutation -- it falls to the offset-only
+    # branch instead.
+    #
+    # Stride equality alone isn't sufficient: a size-1 dimension has an
+    # arbitrary stride in PyTorch, so a transpose/permute touching one can
+    # coincidentally match its base's stride tuple too. A genuine
+    # sub-region can only shrink -- every dim of the view must be <= the
+    # same dim of base -- which a transpose/permute never satisfies.
+    is_sub_region = (
+        base is not None
+        and tuple(real_input.stride()) == tuple(base.stride())
+        and tuple(real_input.size()) != tuple(base.size())
+        and all(real_input.size(d) <= base.size(d) for d in range(real_input.dim()))
+    )
+    if not (is_sub_region or storage_offset != 0):
+        return None
+
+    if is_sub_region:
+        # Offset (via make_indexer) + dep.ranges recover the view extent.
+        new_size = list(base.size())
+        new_stride = list(base.stride())
+    else:
+        # Keep the view's permuted size/stride, just attach the offset.
+        new_size = list(real_input.size())
+        new_stride = list(real_input.stride())
+
+    # Verify the offset is device-stick-aligned by computing the real
+    # device stick coordinate for a full read of this view, using the same
+    # device-coordinate machinery (compute_coordinates +
+    # is_stick_expr_offset_free) already relied on elsewhere in this module
+    # for equivalent checks. A flat host-offset heuristic can't see per-row
+    # stick padding -- a row boundary can be device-stick-aligned even when
+    # the row length itself isn't a multiple of elem_in_stick -- so the check
+    # has to happen in device space, not host space.
+    # TODO: unaligned stick-dim offsets need alt-layout retargeting;
+    # currently rejected to avoid silent miscompute downstream.
+    stl = real_input.device_tensor_layout()
+    elem_in_stick = get_elem_in_stick(ptl.dtype)
+    rank = len(real_input.shape)
+    ivars = sympy.symbols(f"_offset_check_i0:{rank}", integer=True, nonnegative=True)
+    var_ranges = {v: s for v, s in zip(ivars, real_input.shape)}
+    flat_index = storage_offset + sum(new_stride[d] * ivars[d] for d in range(rank))
+    stick_expr = compute_coordinates(
+        list(stl.device_size), list(stl.stride_map), var_ranges, flat_index
+    )[-1]
+    if not is_stick_expr_offset_free(stick_expr, elem_in_stick):
+        raise Unsupported(
+            f"graph input {name} has a non-stick-aligned device stick "
+            f"coordinate ({stick_expr}) at storage_offset={storage_offset}; "
+            f"not yet supported"
+        )
+
+    return FixedLayout(
+        device=ptl.device,
+        dtype=ptl.dtype,
+        size=new_size,
+        stride=new_stride,
+        offset=sympy.Integer(storage_offset),
+    )
+
+
 def propagate_spyre_tensor_layouts(
     graph: GraphLowering,
 ) -> None:
@@ -1512,6 +1694,9 @@ def propagate_spyre_tensor_layouts(
                 ptl = tb.data.data.layout
                 if not isinstance(ptl, FixedLayout):
                     raise Unsupported(f"graph input {name} does not have a FixedLayout")
+                new_layout = _eager_view_input_layout(real_input, ptl, name)
+                if new_layout is not None:
+                    tb.data.data.layout = new_layout
                 tb.layouts = [stl]
 
     # Alt layout each graph input has been forced to by a mutation write, so a
@@ -1764,7 +1949,15 @@ def propagate_spyre_tensor_layouts(
             if op.get_layout().device.type == DEVICE_NAME:
                 op.layouts = [generic_layout(op)]
                 op.restick_cost_fn = AnyInNode.from_args()
-        elif isinstance(op, (BroadcastAsyncFallback, WaitWorkFallback)):
+
+        elif isinstance(
+            op,
+            (
+                BroadcastAsyncFallback,
+                WaitWorkFallback,
+                AllReduceAsyncFallback,
+            ),
+        ):
             input_name = op.inputs[0].get_name()
             input_buf = V.graph.get_buffer(input_name)
             op.layouts = list(input_buf.layouts)

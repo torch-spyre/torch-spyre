@@ -1,7 +1,7 @@
 """
 runner.py
 ---------
-Orchestrates the three checks across all loaded config files.
+Orchestrates the checks across all loaded config files.
 Orchestrates together loader, parser, checks, display, and discovery modules.
 """
 
@@ -9,10 +9,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .checks import check_duplicates, check_missing, check_dead_patterns
+from .checks import (
+    check_duplicates,
+    check_missing,
+    check_dead_patterns,
+    check_missing_labels,
+)
 from .discovery import find_test_files
 from .display import bold, green, red, yellow, heuristic_base_names, warn
-from .loader import load_all_patterns
+from .loader import load_all_patterns, load_labels
 from .parser import parse_test_file
 
 
@@ -45,10 +50,15 @@ def run(
     int
         0 if clean (or only warnings), 1 if problems and fail_on_problems.
     """
+    print(bold("CHECK 0: Labels"))
+    total_hard_problems = check_missing_labels(load_labels(config_files))
+
     all_patterns = load_all_patterns(config_files)
 
     if not any(all_patterns.values()):
         print("[WARN] No test patterns found in any config file.")
+        if fail_on_problems and total_hard_problems > 0:
+            return 1
         return 0
 
     # Build the reference map: basename → (collectable_names, helper_only)
@@ -82,7 +92,6 @@ def run(
                         f"CHECK 2 + 3 skipped for this file."
                     )
 
-    total_hard_problems = 0
     total_warnings = 0
 
     # Determine which basenames to process:
@@ -178,9 +187,9 @@ def _print_summary(hard: int, warnings: int) -> None:
     print(bold("━" * 68))
     parts = []
     parts.append(
-        green("0 duplicates/missing")
+        green("0 duplicates/missing/unlabeled")
         if hard == 0
-        else red(f"{hard} duplicate(s)/missing test(s)")
+        else red(f"{hard} duplicate(s)/missing test(s)/unlabeled config(s)")
     )
     parts.append(
         green("0 dead patterns")

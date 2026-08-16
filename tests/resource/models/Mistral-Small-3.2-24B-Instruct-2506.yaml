@@ -124,22 +124,6 @@ cases:
     marks:
       - bf16operation
       - constant
-  - name: getattr.1
-    op: getattr
-    inputs:
-      - tensor:
-          shape: [1024, 1064]
-          stride: [1064, 1]
-          storage_offset: 0
-          dtype: torch.bfloat16
-          device: cuda:0
-          init: rand
-      - value: T
-    description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/pixtral/modeling_pixtral.py#L458 in torch_dynamo_resume_in_forward_at_452,
-      code: patch_embeds = torch.cat([p.flatten(1).T for p in patch_embeds_list], dim=0).unsqueeze(0)'
-    marks:
-      - bf16operation
-      - constant
   - name: torch.cat.1
     op: torch.cat
     inputs:

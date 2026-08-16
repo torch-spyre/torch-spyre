@@ -134,7 +134,7 @@ is the real, captured value of `buf0`'s (`y = a + b`'s) `loop_info`
 immediately after `coarse_tile()` runs, before any later pass touches it:
 
 ```python
-from torch_spyre._inductor.loop_info import CoarseTileInfo
+from torch_spyre._inductor.loop_info import CoarseTileInfo, PropagationPlan
 
 op.loop_info = CoarseTileInfo(
     loop_group_id=(0, 0),          # depth-2 path: group 0, inner slot 0
@@ -146,20 +146,37 @@ op.loop_info = CoarseTileInfo(
                                      # dim 1 tiled to 1024 (inner)
         [[(0, 512)], [(1, 1024)]],   # read of b: same tiling
     ],
-    output_tiled_dims=[],          # empty: buf0 has no outside consumers yet
-                                    # at this point (see below)
+    output_tiled_dims=[],          # empty: buf0 is loop_internal, so its own
+                                    # tile-sized buffer never advances
+    propagation=PropagationPlan(
+        kind="loop_internal",      # buf0 has no outside consumers, is not a
+                                    # graph output
+        full_ranges=None,
+        reduction=None,
+        outside_consumer_names=(),
+        is_graph_output=False,
+    ),
 )
 ```
 
 `tiled_dims_per_read` and `output_tiled_dims` are *decisions*, not
 substituted index expressions — see [Stage 1 (decision, planning
 time)](#treatment-by-consumer-topology) below for how `_general_tile_advance`
-later substitutes them into each `TensorArg.device_tile_advance_expr`.
+later substitutes them into each `TensorArg.device_tile_advance_expr`. The
+`propagation` field is `_plan_tiling_propagation`'s own decision for how this
+op's result crosses its loop boundary — `"loop_internal"` here because
+planning already knows, before any transformation pass runs, that `buf0` has
+no outside consumers and is not a graph output.
+
 `buf1` (`z = y * c`) is tiled identically except its first read (`y`, i.e.
 `buf0`) is loop-invariant at the outer level — `tiled_dims_per_read=[[[],
 [(1, 1024)]], [[(0, 512)], [(1, 1024)]]]` — because `buf0`'s own per-tile
 buffer is already fully divided by the time `buf1`'s dependency on it is
-recorded.
+recorded. `buf1`'s `propagation` is planned `PropagationPlan(kind="copy_out",
+full_ranges=[1024, 4096], reduction=None, outside_consumer_names=(),
+is_graph_output=True)` — `copy_out` because `buf1` is the literal graph
+output, decided at this same planning step, before Pass 3 has created the
+copy op or the full-size buffer that will eventually hold `z`.
 
 `_divide_ranges` is applied once per level in outermost-first order (the
 `hint_id` in each `(hint_id, K)` pair is used only for per-op `dim_index`
@@ -172,38 +189,49 @@ The per-inner-iteration `data.ranges` for both ops is `[512, 1024]`.
 
 ### LoopLevel IR after CustomPreSchedulingPasses
 
-After `coarse_tile` (which internally runs `insert_tiling_propagation` and
-therefore already inserts `coarse_tile_copy_buf1`, plus `_insert_read_copy_ops`
-for each direct graph-input read — see [Read-side adaptation: full-buffer
-inputs to a loop-internal
+After `coarse_tile` (which internally runs `_plan_tiling_propagation` and its
+three transformation passes, and therefore already inserts
+`coarse_tile_copy_buf1` via `_insert_all_write_copy_ops`, plus
+`_insert_read_copy_ops` via `_insert_all_read_copy_ops` for each direct
+graph-input read — see [Read-side adaptation: full-buffer inputs to a
+loop-internal
 op](#read-side-adaptation-full-buffer-inputs-to-a-loop-internal-op)),
 `span_reduction`, `work_distribution` (`_distribute_work`), and
 `scratchpad_planning` have all run, `graph.operations` contains seven ops.
 This is the real, unedited output of `format_operations(graph.operations)`
 (the same helper `CustomPreSchedulingPasses` itself logs at `INFO`) at
-`sencores=4`, in topological order — the last op, `SpyreEmptyFallback` (`buf2`
-below), is `coarse_tile_copy_buf1`'s eventual full-buffer target; `i0`/`i1`
-are the `inner_fn` index variables for the outer and inner tiled dims
-respectively. `a`'s read copy is shown in full below; `b`'s and `c`'s read
-copies are elided since each is structurally identical to `a`'s (same
-`FixedTiledLayout`, same `loop_info` shape, same single-`ops.load`
-`inner_fn`) — only the name of the graph input being copied and the
-consuming op differ:
+`sencores=4`, in topological order — the first op, `SpyreEmptyFallback`
+(`op5` below; the op numbering reflects graph-construction order, not
+topological position), is `coarse_tile_copy_buf1`'s eventual full-buffer
+target (`z`); `i0`/`i1` are the `inner_fn` index variables for the outer and
+inner tiled dims respectively. `a`'s read copy is shown in full below; `b`'s
+and `c`'s read copies are elided since each is structurally identical to
+`a`'s (same `FixedTiledLayout`, same `loop_info` shape, same single-`ops.load`
+`inner_fn`) — only the name of the graph input being copied, the consuming
+op, and the `lx` allocation offset differ. Every op's `loop_info` now carries
+a `propagation=PropagationPlan(...)` field — `_plan_tiling_propagation`'s
+decision, made once, before any transformation pass ran (see [What the
+coarse-tiling pass stamps](#what-the-coarse-tiling-pass-stamps) above) — and
+every buffer here, including the three read copies, is allocated in `lx`
+scratchpad rather than falling back to `hbm_pool`:
 
 ```
-op2: SpyreEmptyFallback
+op5: SpyreEmptyFallback
 
 coarse_tile_read_copy_buf0_arg0_1: ComputedBuffer   # read copy: a → a_tile
   layout=FixedTiledLayout('spyre:0', torch.float16, size=[512, 1024], stride=[1024, 1],
       device_layout=SpyreTensorLayout(device_size=[16, 512, 64], stride_map=[64, 1024, 1],
                                        device_dtype=DataFormats.SEN169_FP16))
+  allocation={'lx': 0}
   op_it_space_splits={d0: 4, d1: 1}
   dim_hints=[DimHint(dim_names=['A'], split_count=2, loop_var=d0, is_reduction=False, hint_id=0),
              DimHint(dim_names=['B'], split_count=4, loop_var=d1, is_reduction=False, hint_id=1)]
   loop_info=CoarseTileInfo(loop_group_id=(0, 0), loop_count=[2, 4],
       loop_tiled_dims=[[0], [1]], loop_tiled_reduction_dims=[[], []],
       tiled_dims_per_read=[[[(0, 512)], [(1, 1024)]]],
-      output_tiled_dims=[[], []])
+      output_tiled_dims=[[], []],
+      propagation=PropagationPlan(kind='loop_internal', full_ranges=None,
+          reduction=None, outside_consumer_names=(), is_graph_output=False))
   Pointwise(
     'spyre', torch.float16,
     def inner_fn(index):
@@ -215,7 +243,7 @@ coarse_tile_read_copy_buf0_arg0_1: ComputedBuffer   # read copy: a → a_tile
     origin_node=None,
   )
 
-# ... coarse_tile_read_copy_buf0_arg1_1 (read copy for b) elided ...
+# ... coarse_tile_read_copy_buf0_arg1_1 (read copy for b, allocation={'lx': 262144}) elided ...
 
 buf0: ComputedBuffer                          # y = a + b
   layout=FixedTiledLayout('spyre:0', torch.float16, size=[512, 1024], stride=[1024, 1],
@@ -228,7 +256,9 @@ buf0: ComputedBuffer                          # y = a + b
   loop_info=CoarseTileInfo(loop_group_id=(0, 0), loop_count=[2, 4],
       loop_tiled_dims=[[0], [1]], loop_tiled_reduction_dims=[[], []],
       tiled_dims_per_read=[[[], []], [[], []]],
-      output_tiled_dims=[])
+      output_tiled_dims=[],
+      propagation=PropagationPlan(kind='loop_internal', full_ranges=None,
+          reduction=None, outside_consumer_names=(), is_graph_output=False))
   Pointwise(
     'spyre', torch.float16,
     def inner_fn(index):
@@ -242,7 +272,7 @@ buf0: ComputedBuffer                          # y = a + b
     origin_node=add,
   )
 
-# ... coarse_tile_read_copy_buf1_arg2_1 (read copy for c) elided ...
+# ... coarse_tile_read_copy_buf1_arg2_1 (read copy for c, allocation={'lx': 262144}) elided ...
 
 buf1: ComputedBuffer                          # z = y * c
   layout=FixedTiledLayout('spyre:0', torch.float16, size=[512, 1024], stride=[1024, 1],
@@ -255,7 +285,9 @@ buf1: ComputedBuffer                          # z = y * c
   loop_info=CoarseTileInfo(loop_group_id=(0, 0), loop_count=[2, 4],
       loop_tiled_dims=[[0], [1]], loop_tiled_reduction_dims=[[], []],
       tiled_dims_per_read=[[], [[], []]],
-      output_tiled_dims=[])
+      output_tiled_dims=[],
+      propagation=PropagationPlan(kind='copy_out', full_ranges=[1024, 4096],
+          reduction=None, outside_consumer_names=(), is_graph_output=True))
   Pointwise(
     'spyre', torch.float16,
     def inner_fn(index):
@@ -274,7 +306,9 @@ coarse_tile_copy_buf1: ComputedBuffer         # identity copy: z_tile → z
   op_it_space_splits={d0: 4, d1: 1}
   loop_info=CoarseTileInfo(loop_group_id=(0, 0), loop_count=[2, 4],
       loop_tiled_dims=[[0], [1]], loop_tiled_reduction_dims=[[], []],
-      tiled_dims_per_read=[[]], output_tiled_dims=[[(0, 512)], [(1, 1024)]])
+      tiled_dims_per_read=[[[], []]], output_tiled_dims=[[(0, 512)], [(1, 1024)]],
+      propagation=PropagationPlan(kind='copy_out', full_ranges=[1024, 4096],
+          reduction=None, outside_consumer_names=(), is_graph_output=True))
   Pointwise(
     'spyre', torch.float16,
     def inner_fn(index):
@@ -289,10 +323,11 @@ coarse_tile_copy_buf1: ComputedBuffer         # identity copy: z_tile → z
 
 (`stack_traces` and `origins` fields that `format_operations` also prints are
 omitted above for brevity — they only carry the originating Python source
-line, not tiling-relevant information. `buf2`'s own `ComputedBuffer` fields
+line, not tiling-relevant information. `op5`'s own `ComputedBuffer` fields
 are elided the same way: it carries no `loop_info` or `op_it_space_splits`
-because it is never itself tiled, only mutated into. The two elided read
-copies, `coarse_tile_read_copy_buf0_arg1_1` (for `b`) and
+because it is never itself tiled, only mutated into — it is
+`coarse_tile_copy_buf1`'s eventual full-buffer target, `z`. The two elided
+read copies, `coarse_tile_read_copy_buf0_arg1_1` (for `b`) and
 `coarse_tile_read_copy_buf1_arg2_1` (for `c`), are shown at full length in
 the [Generated OpSpec](#generated-opspec-python-wrapper-source) section
 below.)
@@ -396,18 +431,21 @@ Key points:
   Because `y` is produced and fully consumed within the same tile iteration
   and its per-tile size fits in scratchpad, no HBM allocation is needed for
   it at all.
-- `buf1` (`z`'s tile-sized producer) is routed through the **Case 2**
-  copy-op path (`_insert_copy_op`) rather than the Case 1 early-return
-  loop-internal branch, because `buf1` is itself the literal graph output at
-  the moment `_propagate_tiled_op` runs on it (`z`/`buf2` do not exist yet —
-  they are created later in this same pass). `_propagate_tiled_op` now also
-  stamps `per_tile_fixed` on `buf1` directly inside that copy-op branch:
-  `buf1`'s own small buffer is loop-internal scratch by construction (written
-  once per iteration, fully drained by the inserted `coarse_tile_copy_buf1`
-  copy op before the next iteration overwrites it) regardless of why it took
-  the copy-op path. This is what lets `scratchpad_planning` place it in `lx`
-  rather than the `pool` HBM region — see the OpSpec and `bundle.mlir`
-  sections below.
+- `buf1` (`z`'s tile-sized producer) is planned `kind="copy_out"` rather than
+  `kind="loop_internal"`, because `buf1` is itself the literal graph output
+  (`_plan_tiling_propagation` sees `is_graph_output=True` for it — `z`/`op5`
+  do not exist yet at planning time; they are created later, by Pass 3,
+  `_insert_all_write_copy_ops`). Pass 3 also zeroes
+  `buf1.loop_info.output_tiled_dims` when it inserts the copy: `buf1`'s own
+  small buffer is loop-internal scratch by construction (written once per
+  iteration, fully drained by the inserted `coarse_tile_copy_buf1` copy op
+  before the next iteration overwrites it) regardless of why it took the
+  copy-out path. An empty `output_tiled_dims` is what tells
+  `_general_tile_advance` (`spyre_kernel.py`) to leave this tensor's
+  `device_tile_advance_expr` as `None` — no per-iteration address advance —
+  which is what lets `scratchpad_planning` place it in `lx` rather than
+  falling back to `hbm_pool` — see the OpSpec and `bundle.mlir` sections
+  below.
 
 ### Generated OpSpec (Python wrapper source)
 
@@ -422,9 +460,12 @@ originating source location and ATen op for each dispatch and carries no
 tiling-relevant information). The read copy for `a` is shown in full; the
 read copies for `b` and `c` are elided since each is structurally identical
 to `a`'s copy — same `op='identity'` shape, same single input/output
-`TensorArg` pair, same fixed (non-advancing) `hbm_pool` output — only the
-minted `_tile_adv_*` symbol names, `arg_index`, and `allocation` offset
-differ:
+`TensorArg` pair, same fixed (non-advancing) `lx` output — only the minted
+`_tile_adv_*` symbol names, `arg_index`, and `allocation` offset differ.
+Note the iteration-space symbols: every op except the final output copy uses
+`d0`/`d1`, not `c0`/`c1` — only `coarse_tile_copy_buf1` (the last `OpSpec`
+below) uses `c0`/`c1`, because it is generated from a different Inductor
+scheduler node than the other five:
 
 ```python
 sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
@@ -438,7 +479,7 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                         OpSpec(
                             op='identity',        # read copy: a → a_tile
                             is_reduction=False,
-                            iteration_space={sympify('c0'): (sympify('512'), 4), sympify('c1'): (sympify('1024'), 1)},
+                            iteration_space={sympify('d0'): (sympify('512'), 4), sympify('d1'): (sympify('1024'), 1)},
                             op_info={},
                             tiled_symbols=[[sympify('_tile_adv_coarse_tile_read_copy_buf0_arg0_1_lvl1')], [sympify('_tile_adv_coarse_tile_read_copy_buf0_arg0_1_lvl0')]],
                             tiled_symbol_trip_counts={sympify('_tile_adv_coarse_tile_read_copy_buf0_arg0_1_lvl0'): 2, sympify('_tile_adv_coarse_tile_read_copy_buf0_arg0_1_lvl1'): 4},
@@ -447,56 +488,57 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                                 TensorArg(              # input a (HBM, full tensor)
                                     is_input=True, arg_index=0, device_dtype=DataFormats.SEN169_FP16,
                                     device_size=[64, 1024, 64],
-                                    device_coordinates=[sympify('floor(c1/64)'), sympify('c0'), sympify('Mod(c1, 64)')],
+                                    device_coordinates=[sympify('floor(d1/64)'), sympify('d0'), sympify('Mod(d1, 64)')],
                                     allocation={'hbm': 0},
                                     device_tile_advance_expr=sympify('floor(32768*_tile_adv_coarse_tile_read_copy_buf0_arg0_1_lvl0) + floor(1048576*_tile_adv_coarse_tile_read_copy_buf0_arg0_1_lvl1)'),
                                 ),
-                                TensorArg(              # output a_tile (bulk HBM pool, not LX)
+                                TensorArg(              # output a_tile (LX scratchpad)
                                     is_input=False, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
                                     device_size=[16, 512, 64],
-                                    device_coordinates=[sympify('floor(c1/64)'), sympify('c0'), sympify('Mod(c1, 64)')],
-                                    allocation={'hbm_pool': 0},
+                                    device_coordinates=[sympify('floor(d1/64)'), sympify('d0'), sympify('Mod(d1, 64)')],
+                                    allocation={'lx': 0},
                                 ),
                             ]
                         ),
                         # ... OpSpec(op='identity', ...) for coarse_tile_read_copy_buf0_arg1_1
-                        # (read copy for b) elided — structurally identical to a's above ...
+                        # (read copy for b, allocation={'lx': 262144}) elided —
+                        # structurally identical to a's above ...
                         OpSpec(
                             op='add',
                             is_reduction=False,
-                            iteration_space={sympify('c0'): (sympify('512'), 4), sympify('c1'): (sympify('1024'), 1)},
+                            iteration_space={sympify('d0'): (sympify('512'), 4), sympify('d1'): (sympify('1024'), 1)},
                             op_info={},
                             tiled_symbols=[[sympify('_tile_adv_op0_lvl1')], [sympify('_tile_adv_op0_lvl0')]],
                             tiled_symbol_trip_counts={sympify('_tile_adv_op0_lvl0'): 2, sympify('_tile_adv_op0_lvl1'): 4},
                             symbolic_dim_bounds={},
                             args=[
-                                TensorArg(              # input a_tile (bulk HBM pool)
+                                TensorArg(              # input a_tile (LX scratchpad)
                                     is_input=True, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
                                     device_size=[16, 512, 64],
-                                    device_coordinates=[sympify('floor(c1/64)'), sympify('c0'), sympify('Mod(c1, 64)')],
-                                    allocation={'hbm_pool': 0},
+                                    device_coordinates=[sympify('floor(d1/64)'), sympify('d0'), sympify('Mod(d1, 64)')],
+                                    allocation={'lx': 0},
                                 ),
-                                TensorArg(              # input b_tile (bulk HBM pool)
+                                TensorArg(              # input b_tile (LX scratchpad)
                                     is_input=True, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
                                     device_size=[16, 512, 64],
-                                    device_coordinates=[sympify('floor(c1/64)'), sympify('c0'), sympify('Mod(c1, 64)')],
-                                    allocation={'hbm_pool': 1048576},
+                                    device_coordinates=[sympify('floor(d1/64)'), sympify('d0'), sympify('Mod(d1, 64)')],
+                                    allocation={'lx': 262144},
                                 ),
                                 TensorArg(              # output y (LX scratchpad)
                                     is_input=False, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
                                     device_size=[16, 512, 64],
-                                    device_coordinates=[sympify('floor(c1/64)'), sympify('c0'), sympify('Mod(c1, 64)')],
+                                    device_coordinates=[sympify('floor(d1/64)'), sympify('d0'), sympify('Mod(d1, 64)')],
                                     allocation={'lx': 0},
-                                    per_tile_fixed=True,
                                 ),
                             ]
                         ),
                         # ... OpSpec(op='identity', ...) for coarse_tile_read_copy_buf1_arg2_1
-                        # (read copy for c) elided — structurally identical to a's above ...
+                        # (read copy for c, allocation={'lx': 262144}) elided —
+                        # structurally identical to a's above ...
                         OpSpec(
                             op='mul',
                             is_reduction=False,
-                            iteration_space={sympify('c0'): (sympify('512'), 4), sympify('c1'): (sympify('1024'), 1)},
+                            iteration_space={sympify('d0'): (sympify('512'), 4), sympify('d1'): (sympify('1024'), 1)},
                             op_info={},
                             tiled_symbols=[[sympify('_tile_adv_op1_lvl1')], [sympify('_tile_adv_op1_lvl0')]],
                             tiled_symbol_trip_counts={sympify('_tile_adv_op1_lvl0'): 2, sympify('_tile_adv_op1_lvl1'): 4},
@@ -505,22 +547,20 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                                 TensorArg(              # input y (LX scratchpad)
                                     is_input=True, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
                                     device_size=[16, 512, 64],
-                                    device_coordinates=[sympify('floor(c1/64)'), sympify('c0'), sympify('Mod(c1, 64)')],
+                                    device_coordinates=[sympify('floor(d1/64)'), sympify('d0'), sympify('Mod(d1, 64)')],
                                     allocation={'lx': 0},
-                                    per_tile_fixed=True,
                                 ),
-                                TensorArg(              # input c_tile (bulk HBM pool)
+                                TensorArg(              # input c_tile (LX scratchpad)
                                     is_input=True, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
                                     device_size=[16, 512, 64],
-                                    device_coordinates=[sympify('floor(c1/64)'), sympify('c0'), sympify('Mod(c1, 64)')],
-                                    allocation={'hbm_pool': 2097152},
+                                    device_coordinates=[sympify('floor(d1/64)'), sympify('d0'), sympify('Mod(d1, 64)')],
+                                    allocation={'lx': 262144},
                                 ),
                                 TensorArg(              # output z tile (LX scratchpad)
                                     is_input=False, arg_index=-1, device_dtype=DataFormats.SEN169_FP16,
                                     device_size=[16, 512, 64],
-                                    device_coordinates=[sympify('floor(c1/64)'), sympify('c0'), sympify('Mod(c1, 64)')],
+                                    device_coordinates=[sympify('floor(d1/64)'), sympify('d0'), sympify('Mod(d1, 64)')],
                                     allocation={'lx': 0},
-                                    per_tile_fixed=True,
                                 ),
                             ]
                         ),
@@ -538,7 +578,6 @@ sdsc_fused_add_mul_0 = async_compile.sdsc('sdsc_fused_add_mul_0',
                                     device_size=[16, 512, 64],
                                     device_coordinates=[sympify('floor(c1/64)'), sympify('c0'), sympify('Mod(c1, 64)')],
                                     allocation={'lx': 0},
-                                    per_tile_fixed=True,
                                 ),
                                 TensorArg(              # output z (HBM, full tensor)
                                     is_input=False, arg_index=3, device_dtype=DataFormats.SEN169_FP16,
@@ -564,8 +603,9 @@ tiling-relevant information.)
 
 Key observations:
 
-- `c0` and `c1` are Inductor's iteration-space symbols for the two dimensions.
-  `iteration_space` reflects the per-inner-iteration tile size `[512, 1024]`.
+- `d0`/`d1` (or, for the final output copy, `c0`/`c1`) are Inductor's
+  iteration-space symbols for the two dimensions. `iteration_space` reflects
+  the per-inner-iteration tile size `[512, 1024]`.
 - **`tiled_symbols` no longer holds plain `c0`/`c1`.** Each op mints its own
   distinct symbols, one per `(op, nesting level)` pair, named
   `_tile_adv_{op_name}_lvl{level}` — e.g. `add`'s output buffer is `buf0`, so
@@ -591,124 +631,124 @@ Key observations:
 - **Only the four full-tensor HBM `TensorArg`s carry a
   `device_tile_advance_expr`.** This is the substituted, per-arg sympy
   expression `_general_tile_advance` builds from `loop_info`'s
-  `tiled_dims_per_read`/`output_tiled_dims` decisions — e.g. `a`'s read
-  copy's *input* (the full-buffer read of `a` itself) gets
+  `tiled_dims_per_read`/`output_tiled_dims` decisions — the sole
+  tile-advance mechanism (see `op_spec.py`'s `TensorArg` docstring) — e.g.
+  `a`'s read copy's *input* (the full-buffer read of `a` itself) gets
   `floor(32768*_tile_adv_coarse_tile_read_copy_buf0_arg0_1_lvl0) +
   floor(1048576*_tile_adv_coarse_tile_read_copy_buf0_arg0_1_lvl1)`, combining
   the outer level's per-step byte advance (`32768`) and the inner level's
   (`1048576`) into one expression, one additive term per level; `z`'s output
   (written by the final `identity` copy) gets the analogous
   `coarse_tile_copy_buf1`-keyed expression. Every other `TensorArg` —
-  `a_tile`/`b_tile`/`c_tile` in `hbm_pool`, and `y`/`mul`'s own output in
-  `lx` — has **no** `device_tile_advance_expr` field at all (it is omitted
-  by the printer whenever the value is `None`; see
-  `spyre_kernel.py::SpyreKernel.create_tensor_arg`). For the three
-  `hbm_pool` buffers this is because `loop_info.tiled_dims_per_read`/
-  `output_tiled_dims` omits every level's dim entirely for them (see the
-  dim-omission point in [LoopLevel
-  IR](#looplevel-ir-after-custompreschedulingpasses) above) —
-  `_general_tile_advance` substitutes `0` for every unlisted dim and, since
-  no level contributes a term, returns `None` outright. For `y` and `mul`'s
-  own output the same `None` result instead follows from
-  `per_tile_fixed=True` (see below): `_general_tile_advance` never even
-  looks at `loop_info` for those, since `create_tensor_arg` reads
-  `per_tile_fixed` straight off the layout. Either way, a missing
-  `device_tile_advance_expr` means `generate_bundle` addresses that
-  `TensorArg` with a fixed, non-advancing address — no `affine.apply` per
-  iteration — whether or not `per_tile_fixed` is actually set; see
-  `codegen/compute_ops.py`'s `_tensor_tiled_by_symbol`, which treats "no advance
-  expression" and "`per_tile_fixed`" as the same "does not advance" case for
+  `a_tile`/`b_tile`/`c_tile` and `y`/`mul`'s own output, all in `lx` — has
+  **no** `device_tile_advance_expr` field at all (it is omitted by the
+  printer whenever the value is `None`; see
+  `spyre_kernel.py::SpyreKernel._general_tile_advance`/`create_tensor_arg`).
+  In every case this is because `loop_info.tiled_dims_per_read`/
+  `output_tiled_dims` omits every level's dim entirely for that dependency
+  (see the dim-omission point in [LoopLevel
+  IR](#looplevel-ir-after-custompreschedulingpasses) above, and the
+  Small Example's `buf1` paragraph above for how `output_tiled_dims` ends up
+  empty for a loop-internal buffer) — `_general_tile_advance` substitutes
+  `0` for every unlisted dim and, since no level contributes a term, returns
+  `None` outright. A missing `device_tile_advance_expr` means
+  `generate_bundle` addresses that `TensorArg` with a fixed, non-advancing
+  address — no `affine.apply` per iteration; see
+  `codegen/compute_ops.py`'s `_tensor_tiled_by_symbol`, which treats a
+  `None` advance expression as the "does not advance" case for
   `bundle.mlir` purposes. `op0`'s (`add`'s) own two inputs reuse the same
-  fixed `a_tile`/`b_tile` `hbm_pool` addresses the read copies just wrote —
-  the read copy has already done the full-tensor addressing once per tile,
-  so `op0` never touches the `32768`/`1048576`-scale expressions at all.
-- **The read copies' outputs land in `hbm_pool` (bulk HBM), not `lx`.**
-  `a_tile`/`b_tile`/`c_tile` (`allocation={'hbm_pool': 0}`,
-  `{'hbm_pool': 1048576}`, `{'hbm_pool': 2097152}` respectively) are each
-  produced and fully consumed within the same tile iteration, the same
-  lifetime `y` and `mul`'s own output have — but unlike those two, they do
-  not get an `lx` slot here: three same-lifetime tile-sized buffers (the two
-  read-copy outputs feeding `add`, plus `y`) are live across the same
-  iteration, and `scratchpad_planning`'s allocator did not fit all of them
-  in scratchpad, so it fell back to `hbm_pool` for the read copies. `y` and
-  `mul`'s own output still land in `lx` because `scratchpad_planning` runs
-  after coarse tiling has already fixed each buffer's per-tile size and
-  lifetime — it is a placement decision made per compilation, not a fixed
-  property of being a read-copy output.
+  fixed `a_tile`/`b_tile` LX addresses the read copies just wrote — the read
+  copy has already done the full-tensor addressing once per tile, so `op0`
+  never touches the `32768`/`1048576`-scale expressions at all, and since it
+  takes no HBM operand at all it needs no address operand whatsoever (see
+  the next section).
+- **All five tile-sized buffers fit in `lx`; none fall back to `hbm_pool`.**
+  `a_tile`/`b_tile`/`c_tile` (`allocation={'lx': 0}`, `{'lx': 262144}`,
+  `{'lx': 262144}` respectively — `b_tile` and `c_tile` alias the same
+  offset because they are never live at the same time) plus `y` and `mul`'s
+  own output are all produced and fully consumed within the same tile
+  iteration. `scratchpad_planning`'s allocator fits all of them in LX
+  scratchpad simultaneously at this tile size (`[512, 1024]` fp16, 4 cores),
+  so no buffer here ever needs the bulk `hbm_pool` fallback
+  (`constants.py`'s `INTERMEDIATES_SEGMENT`). Whether a given buffer lands
+  in `lx` or spills to `hbm_pool` is a placement decision made per
+  compilation by `scratchpad_planning`, based on how much same-lifetime
+  data is live at once — it is not a fixed property of being a read-copy
+  output, and a larger tile size or more simultaneously-live buffers could
+  still force a spill to `hbm_pool` in a different example.
 - The intermediate tensor `y` (output of `add`, input to `mul`) has
   `allocation={'lx': 0}` — it lives in LX scratchpad memory at address 0.
   Its `device_size=[16, 512, 64]` reflects the per-tile shape `[512, 1024]`.
-  `per_tile_fixed=True` tells `generate_bundle` that this tensor's base
-  address is fixed across iterations (no `affine.apply` advance).  Because
-  `y` is
-  produced and fully consumed within the same tile iteration, no HBM
-  allocation is needed.
+  Its `loop_info.output_tiled_dims` is empty at every level (it is
+  `add`'s loop-internal output, kind `"loop_internal"`), so it carries no
+  `device_tile_advance_expr` — `generate_bundle` addresses it with a fixed
+  base address, no `affine.apply` advance.  Because `y` is produced and
+  fully consumed within the same tile iteration, no HBM allocation is
+  needed.
 - The final output `z` (output of `mul`) has no inside consumers, so it
-  takes the **Case 2** (copy-op) path: `mul` writes its per-tile result into
-  its own small buffer, and a separate loop-tagged `identity` op (the last
-  `OpSpec` above, generated from `coarse_tile_copy_buf1`) copies each tile
-  into the correct slice of `z`'s own, separately-allocated full HBM buffer
-  (`allocation={'hbm': ...}`, `arg_index=3`).  Because `mul`'s own small
-  buffer is fully drained by that copy op every iteration before the next
-  iteration overwrites it, it is loop-internal scratch by construction.
-  `_propagate_tiled_op` stamps `per_tile_fixed=True` on it directly inside
-  the copy-op branch, and `scratchpad_planning` places it in
-  `lx` (address 0, aliasing `y`'s slot since `y` and `mul`'s output are never
-  live at the same time within scratchpad's allocator).  The identity copy is
-  still the op whose `MutationLayoutSHOULDREMOVE` targets the full buffer; the
-  per-iteration copy offset into *that* full buffer is computed by
-  `affine.apply` in `bundle.mlir` (see next section) — only `mul`'s own
-  small buffer is fixed, not `z`'s full-size target.
+  takes the **copy-out** path (planned `kind="copy_out"`): `mul` writes its
+  per-tile result into its own small buffer, and a separate loop-tagged
+  `identity` op (the last `OpSpec` above, generated from
+  `coarse_tile_copy_buf1`) copies each tile into the correct slice of `z`'s
+  own, separately-allocated full HBM buffer (`allocation={'hbm': ...}`,
+  `arg_index=3`).  Because `mul`'s own small buffer is fully drained by that
+  copy op every iteration before the next iteration overwrites it, it is
+  loop-internal scratch by construction. Pass 3 (`_insert_all_write_copy_ops`)
+  zeroes `mul`'s own `loop_info.output_tiled_dims` directly when it inserts
+  the copy, and `scratchpad_planning` places it in `lx` (address 0, aliasing
+  `y`'s slot since `y` and `mul`'s output are never live at the same time
+  within scratchpad's allocator).  The identity copy is still the op whose
+  `MutationLayoutSHOULDREMOVE` targets the full buffer; the per-iteration
+  copy offset into *that* full buffer is computed by `affine.apply` in
+  `bundle.mlir` (see next section) — only `mul`'s own small buffer has no
+  advance, not `z`'s full-size target.
 - HBM inputs `a`, `b`, `c` also have `device_size=[64, 1024, 64]` — the full
   tensor shape `[1024, 4096]` in Spyre stick layout.  Their
-  `device_coordinates` use `c0` and `c1` to index the per-iteration tile
-  window into the full tensor.  Note that `add` and `mul` no longer read
-  `a`/`b`/`c` directly — as described above, each is read once per tile by
-  its own read-copy `OpSpec`, whose *output* (`a_tile`/`b_tile`/`c_tile`) is
-  what `add`/`mul` actually consume.  The LX scratchpad tensor `y` and
-  `mul`'s per-tile output both have `device_size=[16, 512, 64]`, the
-  stick-layout shape for `[512, 1024]` fp16: 16 sticks of 64 columns across
-  512 rows, and both carry `allocation={'lx': 0}` with `per_tile_fixed=True`
-  — both are produced and fully consumed entirely inside the loop body (`y`
-  by `mul`; `mul`'s own output by the `identity` copy), so both get a
-  dedicated LX scratchpad slot with no HBM traffic and no advancing address,
-  even though `mul`'s output also has an outside reader (the copy op) that
-  `y` does not.  If `mul`'s tile-sized buffer did not fit in scratchpad (e.g.
-  it were too large, or scratchpad were otherwise full),
+  `device_coordinates` use `d0`/`d1` (or, for `z`'s output copy, `c0`/`c1`)
+  to index the per-iteration tile window into the full tensor.  Note that
+  `add` and `mul` no longer read `a`/`b`/`c` directly — as described above,
+  each is read once per tile by its own read-copy `OpSpec`, whose *output*
+  (`a_tile`/`b_tile`/`c_tile`) is what `add`/`mul` actually consume.  The LX
+  scratchpad tensor `y` and `mul`'s per-tile output both have
+  `device_size=[16, 512, 64]`, the stick-layout shape for `[512, 1024]`
+  fp16: 16 sticks of 64 columns across 512 rows, and both carry
+  `allocation={'lx': 0}` with an empty `output_tiled_dims` — both are
+  produced and fully consumed entirely inside the loop body (`y` by `mul`;
+  `mul`'s own output by the `identity` copy), so both get a dedicated LX
+  scratchpad slot with no HBM traffic and no advancing address, even though
+  `mul`'s output also has an outside reader (the copy op) that `y` does
+  not.  If the tile-sized buffers did not all fit in scratchpad
+  simultaneously (e.g. a larger tile size, or more of them live at once),
   `scratchpad_planning` would fall back to `allocation={'hbm_pool': ...}`
-  instead — the same bulk-allocated HBM region
-  (`constants.py`'s `INTERMEDIATES_SEGMENT`) that `a_tile`/`b_tile`/
-  `c_tile` already use — and the buffer would still carry
-  `per_tile_fixed=True`, since that flag reflects the loop-internal-scratch
-  *lifetime* of the buffer, not which memory it happens to land in.
+  instead for whichever ones spill — the bulk-allocated HBM region
+  (`constants.py`'s `INTERMEDIATES_SEGMENT`) — and the buffer would still
+  carry an empty `output_tiled_dims`, since that reflects the
+  loop-internal-scratch *lifetime* of the buffer, not which memory it
+  happens to land in.
 
 ### Generated `bundle.mlir`
 
 The SDSC compiler (`compile_op_spec`) translates `tiled_symbols` into per-loop
 byte strides, producing a 2-dimensional `affine_map` for each `TensorArg`
-whose `device_tile_advance_expr` is non-`None`. With the read copies for `a`,
-`b`, and `c` in place (see [Read-side
-adaptation](#read-side-adaptation-full-buffer-inputs-to-a-loop-internal-op)
-above), there is still only one such map, `#map_0`, covering the three
-full-tensor HBM inputs plus `z`'s full-tensor HBM output — the same four
-operands (and the same map) as before the read copies existed. `a_tile`,
-`b_tile`, and `c_tile` (bulk `hbm_pool`) do **not** get a second affine map:
-as shown above, each has no `device_tile_advance_expr` at all (dim-omission
-makes `_general_tile_advance` return `None` for them), so `generate_bundle`
-addresses each with the same fixed, non-advancing per-core address every
-iteration — passed straight through as an operand, with no `affine.apply`.
-`y` and `mul`'s own output remain `per_tile_fixed=True` in LX scratchpad and
-likewise need no affine map:
+whose `device_tile_advance_expr` is non-`None`. There is exactly one such
+map, `#map_0`, covering the four full-tensor HBM operands (`a`, `b`, `c`,
+`z`, bound to `%arg_0`..`%arg_3`). `a_tile`/`b_tile`/`c_tile` and `y`/`mul`'s
+own output all live in `lx` (see [Key observations](#generated-opspec-python-wrapper-source)
+above) and each has `device_tile_advance_expr=None`, so none of them get an
+affine map, a per-core address, or any operand at all: `add`'s and `mul`'s
+`sdsc_execute` dispatches below take **zero** operands, since every value
+they touch is a fixed LX address baked directly into the compiled
+`sdsc_2.json`/`sdsc_4.json` kernels rather than passed in from the bundle.
+There is also no `%pool_base_addr` argument at all — the bundle's only
+inputs are the four full-tensor HBM arguments:
 
 ```none
 #map_0 = affine_map<(d0, d1)[s0] -> (s0 + 65536*d0 + 2097152*d1)>
 module {
-    func.func @sdsc_bundle(%pool_base_addr: !sdscbundle.input_arg<index>,
-                            %arg_0_base_addr: !sdscbundle.input_arg<index>,
+    func.func @sdsc_bundle(%arg_0_base_addr: !sdscbundle.input_arg<index>,
                             %arg_1_base_addr: !sdscbundle.input_arg<index>,
                             %arg_2_base_addr: !sdscbundle.input_arg<index>,
                             %arg_3_base_addr: !sdscbundle.input_arg<index>) {
-        %pool = sdscbundle.input_arg_extract value from %pool_base_addr : !sdscbundle.input_arg<index> -> index
         %arg_0 = sdscbundle.input_arg_extract value from %arg_0_base_addr : !sdscbundle.input_arg<index> -> index
         %arg_1 = sdscbundle.input_arg_extract value from %arg_1_base_addr : !sdscbundle.input_arg<index> -> index
         %arg_2 = sdscbundle.input_arg_extract value from %arg_2_base_addr : !sdscbundle.input_arg<index> -> index
@@ -719,63 +759,53 @@ module {
         %loop_bound_1 = arith.constant 4 : index
 
         // per-core address = base + core_index * 16384 bytes, for each of the
-        // 4 cores (sencores=4); shown here for arg_0 (tensor a) and the
-        // pool region backing a_tile, identical patterns repeat for arg_1
-        // (b), arg_2 (c), arg_3 (z), and the pool regions backing b_tile and
-        // c_tile — omitted here; see the full real output linked below. Note
-        // these are all computed once, outside the loop nest: none of them
-        // vary per iteration.
+        // 4 cores (sencores=4); shown here for arg_0 (tensor a), identical
+        // patterns repeat for arg_1 (b), arg_2 (c), arg_3 (z) — omitted here;
+        // see the full real output linked below. These are all computed
+        // once, outside the loop nest: none of them vary per iteration.
         %arg_0_core_offset_16384 = arith.constant 16384 : index
         %arg_0_core_16384 = arith.addi %arg_0, %arg_0_core_offset_16384 : index
         %arg_0_core_offset_32768 = arith.constant 32768 : index
         %arg_0_core_32768 = arith.addi %arg_0, %arg_0_core_offset_32768 : index
         %arg_0_core_offset_49152 = arith.constant 49152 : index
         %arg_0_core_49152 = arith.addi %arg_0, %arg_0_core_offset_49152 : index
-        %pool_offset_0 = arith.constant 0 : index
-        %pool_addr_0 = arith.addi %pool, %pool_offset_0 : index
-        %pool_offset_16384 = arith.constant 16384 : index
-        %pool_addr_16384 = arith.addi %pool, %pool_offset_16384 : index
-        %pool_offset_32768 = arith.constant 32768 : index
-        %pool_addr_32768 = arith.addi %pool, %pool_offset_32768 : index
-        %pool_offset_49152 = arith.constant 49152 : index
-        %pool_addr_49152 = arith.addi %pool, %pool_offset_49152 : index
-        // ... (arg_1_core_*, arg_2_core_*, arg_3_core_*, and the pool_addr_*
-        // groups at offsets 1048576 and 2097152 for b_tile/c_tile follow the
-        // same two patterns above — elided here ...)
+        // ... (arg_1_core_*, arg_2_core_*, arg_3_core_* follow the same
+        // pattern above — elided here ...)
 
         scf.for %i_0 = %c0 to %loop_bound_0 step %c1 {
             scf.for %i_1 = %c0 to %loop_bound_1 step %c1 {
-                // read copy: a(hbm)→a_tile(hbm_pool)
+                // read copy: a(hbm)→a_tile(lx)
                 %addr_0 = affine.apply #map_0(%i_0, %i_1)[%arg_0]
                 %addr_1 = affine.apply #map_0(%i_0, %i_1)[%arg_0_core_16384]
                 %addr_2 = affine.apply #map_0(%i_0, %i_1)[%arg_0_core_32768]
                 %addr_3 = affine.apply #map_0(%i_0, %i_1)[%arg_0_core_49152]
-                sdscbundle.sdsc_execute (%addr_0, %addr_1, %addr_2, %addr_3, %pool_addr_0, %pool_addr_16384, %pool_addr_32768, %pool_addr_49152)
-                    {sdsc_filename="sdsc_0.json", "symbol_ids"=[-1, -2, -3, -4, -5, -6, -7, -8]}
+                sdscbundle.sdsc_execute (%addr_0, %addr_1, %addr_2, %addr_3)
+                    {sdsc_filename="sdsc_0.json", "symbol_ids"=[-1, -2, -3, -4]}
 
-                // ... read copy: b(hbm)→b_tile(hbm_pool) (sdsc_1.json) elided
-                // — same structure as sdsc_0 above, offset by the b_tile
-                // pool_addr_1048576 group ...
+                // read copy: b(hbm)→b_tile(lx)
+                %addr_4 = affine.apply #map_0(%i_0, %i_1)[%arg_1]
+                %addr_5 = affine.apply #map_0(%i_0, %i_1)[%arg_1_core_16384]
+                %addr_6 = affine.apply #map_0(%i_0, %i_1)[%arg_1_core_32768]
+                %addr_7 = affine.apply #map_0(%i_0, %i_1)[%arg_1_core_49152]
+                sdscbundle.sdsc_execute (%addr_4, %addr_5, %addr_6, %addr_7)
+                    {sdsc_filename="sdsc_1.json", "symbol_ids"=[-5, -6, -7, -8]}
 
-                // add: a_tile(hbm_pool)+b_tile(hbm_pool)→y(lx)
-                sdscbundle.sdsc_execute (%pool_addr_0, %pool_addr_16384, %pool_addr_32768, %pool_addr_49152, %pool_addr_1048576, %pool_addr_1064960, %pool_addr_1081344, %pool_addr_1097728)
-                    {sdsc_filename="sdsc_2.json", "symbol_ids"=[-17, -18, -19, -20, -21, -22, -23, -24]}
+                // add: a_tile(lx)+b_tile(lx)→y(lx) — zero operands
+                sdscbundle.sdsc_execute () {sdsc_filename="sdsc_2.json", "symbol_ids"=[]}
 
-                // ... read copy: c(hbm)→c_tile(hbm_pool) (sdsc_3.json) elided
-                // — same structure as sdsc_0 above, offset by the c_tile
-                // pool_addr_2097152 group ...
+                // ... read copy: c(hbm)→c_tile(lx) (sdsc_3.json) elided —
+                // same structure as sdsc_0/sdsc_1 above, using %arg_2 ...
 
-                // mul: y(lx)*c_tile(hbm_pool)→mul_output(lx)
-                sdscbundle.sdsc_execute (%pool_addr_2097152, %pool_addr_2113536, %pool_addr_2129920, %pool_addr_2146304)
-                    {sdsc_filename="sdsc_4.json", "symbol_ids"=[-33, -34, -35, -36]}
+                // mul: y(lx)*c_tile(lx)→mul_output(lx) — zero operands
+                sdscbundle.sdsc_execute () {sdsc_filename="sdsc_4.json", "symbol_ids"=[]}
 
-                // identity: mul_output(lx)→z(hbm) — z is the only HBM operand
+                // identity: mul_output(lx)→z(hbm) — z is the only operand
                 %addr_12 = affine.apply #map_0(%i_0, %i_1)[%arg_3]
                 %addr_13 = affine.apply #map_0(%i_0, %i_1)[%arg_3_core_16384]
                 %addr_14 = affine.apply #map_0(%i_0, %i_1)[%arg_3_core_32768]
                 %addr_15 = affine.apply #map_0(%i_0, %i_1)[%arg_3_core_49152]
                 sdscbundle.sdsc_execute (%addr_12, %addr_13, %addr_14, %addr_15)
-                    {sdsc_filename="sdsc_5.json", "symbol_ids"=[-37, -38, -39, -40]}
+                    {sdsc_filename="sdsc_5.json", "symbol_ids"=[-13, -14, -15, -16]}
             }
         }
         return
@@ -783,62 +813,53 @@ module {
 }
 ```
 
-(This is a lightly elided version of the real captured output — the two
-read-copy dispatches for `b` and `c` (`sdsc_1.json`, `sdsc_3.json`) are
-elided since they repeat `sdsc_0`'s structure exactly, and the per-core /
-per-pool address setup for `arg_1`, `arg_2`, `arg_3`, and the `b_tile`/
-`c_tile` pool offsets is elided from the constant-declaration block for the
-same reason. Nothing about `add`, `mul`, or the final `identity` copy is
-elided — notice neither dispatch has any `affine.apply` at all, since every
-operand they take is one of the fixed `%pool_addr_*` values computed once,
-outside the loop.)
+(This is a lightly elided version of the real captured output — the
+read-copy dispatch for `c` (`sdsc_3.json`) is elided since it repeats
+`sdsc_0`'s/`sdsc_1`'s structure exactly using `%arg_2`, and the per-core
+address setup for `arg_1`/`arg_2`/`arg_3` is elided from the
+constant-declaration block for the same reason. Nothing about `add`, `mul`,
+or the final `identity` copy is elided — notice neither `add` nor `mul` has
+any `affine.apply`, or indeed any operand at all: `symbol_ids=[]` on both.)
 
 Key points:
 
-- **Only one affine map.** `#map_0` addresses the four full-tensor HBM
-  operands (`a`, `b`, `c`, `z` — bound to `%arg_0`..`%arg_3`), the same
-  layout, and the same single map, as before the read copies existed.
-  `a_tile`/`b_tile`/`c_tile` (bulk `hbm_pool`) do not get a second map: each
-  one's `TensorArg.device_tile_advance_expr` is `None` (see the OpSpec
-  above — a direct consequence of the dim-omission convention for "this
-  read copy's own buffer does not advance"), so `compile_op_spec` never
-  builds an `affine_map` for that region at all. Its per-core addresses are
-  still computed once, outside the loop nest, via plain `arith.addi` — but
-  inside the loop they are passed straight through as fixed operands, with
-  no per-iteration `affine.apply`. `mul`'s per-tile output and `y` need no
-  map either, for the separate reason that both remain
-  `per_tile_fixed=True` and live in LX scratchpad.
-- **Six dispatches instead of three.** Each inner-loop iteration now runs,
-  in order: the read copy for `a` (`sdsc_0.json`), the read copy for `b`
-  (`sdsc_1.json`), `add` (`sdsc_2.json`, reading `a_tile`/`b_tile` from
-  `hbm_pool` instead of `a`/`b` from HBM directly), the read copy for `c`
-  (`sdsc_3.json`), `mul` (`sdsc_4.json`, reading `c_tile` from `hbm_pool`
-  and `y` from LX), and finally the output `identity` copy
-  (`sdsc_5.json`). This is the `bundle.mlir`-level consequence of the
-  read-side adaptation described earlier in this doc: every full-buffer
+- **Only one affine map, and no `%pool_base_addr` argument.** `#map_0`
+  addresses the four full-tensor HBM operands (`a`, `b`, `c`, `z` — bound to
+  `%arg_0`..`%arg_3`); the bundle takes exactly these four arguments, with
+  no fifth pool-base-address parameter at all. `a_tile`/`b_tile`/`c_tile`
+  and `y`/`mul`'s own output do not get a second map: each one's
+  `TensorArg.device_tile_advance_expr` is `None` (see the OpSpec above — a
+  direct consequence of the dim-omission convention for "this buffer does
+  not advance"), so `compile_op_spec` never builds an `affine_map`, a
+  per-core address, or any operand for them at all.
+- **`add` and `mul` take zero operands.** Each inner-loop iteration runs, in
+  order: the read copy for `a` (`sdsc_0.json`, 4 operands), the read copy
+  for `b` (`sdsc_1.json`, 4 operands), `add` (`sdsc_2.json`, **0** operands
+  — both its inputs and its output are fixed LX addresses baked into the
+  compiled kernel), the read copy for `c` (`sdsc_3.json`, 4 operands), `mul`
+  (`sdsc_4.json`, **0** operands, same reason), and finally the output
+  `identity` copy (`sdsc_5.json`, 4 operands, since `z` is a full-tensor HBM
+  output that does advance). This is the `bundle.mlir`-level consequence of
+  the read-side adaptation described earlier in this doc: every full-buffer
   graph-input read is intercepted by its own dispatch before the op that
-  actually needs the data ever runs.
-- **A new `%pool_base_addr` argument.** The generated wrapper now passes a
-  fifth argument into the SDSC bundle — the base address of the bulk
-  `hbm_pool` region — because `a_tile`/`b_tile`/`c_tile` all live there.
-  Before the read copies existed, no per-tile HBM `pool` buffer was needed
-  for this example and the bundle took only the four full-tensor arguments.
+  actually needs the data ever runs, so by the time `add`/`mul` execute,
+  every operand they touch is already a fixed, non-advancing LX slot with
+  nothing left for the bundle to compute or pass in.
 - **Every full-tensor HBM operand is still expanded into `sencores` per-core
-  addresses**, exactly as before: at `sencores=4`, `arg_0` (tensor `a`)
-  contributes its own base address plus three `arith.addi`-computed offsets
+  addresses**: at `sencores=4`, `arg_0` (tensor `a`) contributes its own
+  base address plus three `arith.addi`-computed offsets
   (`arg_0_core_16384`, `arg_0_core_32768`, `arg_0_core_49152`, stepping by
-  `16384` bytes — `65536 / 4`). The new `hbm_pool` operands get the same
-  per-core expansion (`pool_addr_0`, `pool_addr_16384`, ... stepping by the
-  same `16384` bytes), which is why each read-copy and `add`/`mul` dispatch
-  above takes 8 address operands (4 cores × 2 tensors) rather than a single
-  pair — even though, unlike the HBM operands, none of the pool operands are
-  routed through `affine.apply`. At the default `sencores=32` this would
-  instead be 32 per-core addresses per operand — real, but too large to
-  usefully quote in a doc, which is why this example fixes `sencores=4`.
-- **Neither LX scratchpad tensor appears as a symbol at all.** `y` and
-  `mul`'s own output both have `per_tile_fixed=True` (see the OpSpec above),
-  so neither needs an address computation of any kind, per-core or
-  otherwise.
+  `16384` bytes — `65536 / 4`), and likewise for `arg_1`/`arg_2`/`arg_3` — 4
+  operands per full-tensor dispatch (4 cores × 1 tensor). At the default
+  `sencores=32` this would instead be 32 per-core addresses per operand —
+  real, but too large to usefully quote in a doc, which is why this example
+  fixes `sencores=4`.
+- **Neither LX scratchpad tensor, nor the three tile-sized LX copies,
+  appears as a symbol at all.** `a_tile`/`b_tile`/`c_tile`, `y`, and `mul`'s
+  own output all have an empty `output_tiled_dims` (see the OpSpec above),
+  so none of them needs an address computation of any kind, per-core or
+  otherwise — each is just a compile-time-fixed offset inside the compiled
+  `.json` kernel for its dispatch.
 
 ## Layer 1 — Pre-scheduling IR pass
 
@@ -909,8 +930,8 @@ applying a fixed spec-op index to every op.  This handles broadcast ops and
 other ops whose iteration space lacks a
 particular dimension — those ops get an empty sub-list `[]` for the
 corresponding level and are not split along that axis (they become
-loop-invariant at that depth, as detected by `insert_tiling_propagation` and
-flagged `per_tile_fixed`).
+loop-invariant at that depth, as detected by `_plan_tiling_propagation` and
+planned `kind="loop_internal"`).
 
 ### `Loops` is a frozen dataclass
 
@@ -938,24 +959,33 @@ def coarse_tile(
 sub-sequence of `graph.operations`; a gap indicates a data-flow dependency
 crossing the group boundary and raises `RuntimeError`.  The full
 `GraphLowering` is required (not just the operations list) because
-`insert_tiling_propagation` calls `V.graph` APIs to allocate new buffers.
+`_insert_all_reduction_ops`/`_insert_all_write_copy_ops` call `V.graph`
+APIs to allocate new buffers.
 `group_idx_offset` lets a caller make a second `coarse_tile()` call on the
 same graph (e.g. hint-driven groups stamped pre-stickification, followed by
 a later span-overflow-driven call) without the new call's group IDs
 colliding with IDs already stamped by the earlier one.
 
-`coarse_tile()` itself is a thin plan-then-transform driver: it calls
-`plan_coarse_tile_groups(operations, groups)` exactly once, up front, for
-every group in the list.  Planning does zero IR mutation — it only decides
-each op's tiling attributes and raises `Unsupported` if any op in any group
+`coarse_tile()` itself is a thin plan-then-transform driver, and planning
+is itself two calls, not one: `plan_coarse_tile_groups(operations, groups)`
+decides each op's tiling attributes (loop nesting, which dims are tiled),
+and `_plan_tiling_propagation(operations, groups, plan)` decides, for every
+tiled op, how its result crosses its loop boundary — see "Buffer
+propagation," below. Both run with zero IR mutation, up front, for every
+group in the list, and both raise `Unsupported` if any op in any group
 can't be tiled (see "Sequential recurrences are rejected at planning time"
-below).  Only if that single planning call succeeds does `coarse_tile()`
-move on to transformation: it loops over `groups` again and calls
-`_apply_plan` once per group to perform the actual IR mutation, followed by
-`insert_tiling_propagation`, `_zero_fixed_tile_advance_exprs`, and
-`_patch_retiled_load_indexes`.  There is no per-group interleaving of
-planning and mutation — every group is planned before any group is
-transformed.
+below). Only if planning succeeds does `coarse_tile()` move on to
+transformation: it loops over `groups` again and calls `_apply_plan` once
+per group to perform the actual IR mutation (stamping `loop_info`, dividing
+ranges). Transformation then runs three fixed, non-interleaved passes over
+the whole op list — `_insert_all_read_copy_ops` (Pass 1), then
+`_insert_all_reduction_ops` (Pass 2), then `_insert_all_write_copy_ops`
+(Pass 3), each consuming the plan's decisions rather than making new ones —
+followed by `_patch_retiled_load_indexes`, once per group.  There is no
+per-group interleaving of planning and mutation — every group is planned
+before any group is transformed — and no interleaving of the three
+transformation passes either — every op is fully handled by Pass 1 before
+Pass 2 starts, and by Pass 2 before Pass 3 starts.
 
 Each group tuple has the form:
 
@@ -1157,27 +1187,74 @@ achieve.  `scratchpad_planning` receives the full `GraphLowering` object
 (not just `operations`) because it needs access to graph-level metadata
 for buffer lifetime analysis.
 
-### Buffer propagation: `insert_tiling_propagation`
+### Buffer propagation: planning and the three transformation passes
 
-`coarse_tile()` calls `insert_tiling_propagation(operations, groups)`
-immediately after stamping all loop attributes.  Its job is to ensure that
-any op whose result is consumed **outside** the loop (or is a graph output)
-exposes a complete, fully-sized buffer to its consumers.  Ops whose outputs
-are consumed only inside the loop are marked so `generate_bundle` does not
-advance their base addresses.
+Its job is to ensure that any op whose result is consumed **outside** the
+loop (or is a graph output) exposes a complete, fully-sized buffer to its
+consumers.  Ops whose outputs are consumed only inside the loop are marked
+so `generate_bundle` does not advance their base addresses.
+
+This is split, like the rest of `coarse_tile()`, into a zero-mutation
+planning step and a fixed sequence of transformation passes that only
+consume the plan's decisions:
+
+- **Planning — `_plan_tiling_propagation(operations, groups, plan)`.**
+  Runs right after `plan_coarse_tile_groups`'s own per-op loop, over the
+  same `groups`/`plan`. For every tiled op it decides a `PropagationPlan`
+  (`torch_spyre/_inductor/loop_info.py`), stored on that op's
+  `CoarseTileInfo.propagation`, with one of three `kind`s:
+  `"loop_internal"`, `"copy_out"`, or `"reduction"` — see "Use-def analysis"
+  and "Treatment by consumer topology," below, for how `kind` is chosen.
+  A `Reduction` op tiled over a reduction dim always gets `kind="reduction"`
+  (see "Reduction tiling," further below); this check runs first, before
+  the use-def analysis that decides `loop_internal` vs. `copy_out` for
+  every other tiled op.
+- **Pass 1 — `_insert_all_read_copy_ops(operations)`.** For every tiled op
+  that directly reads a full-size buffer, inserts a tile-sized read
+  copy-in (see "Read-side adaptation," below). Runs first because Pass 2
+  and Pass 3 read each op's *current* reads/loader, and a tiled-reduction
+  or copy-out op may itself need a read copy-in before its own machinery is
+  built.
+- **Pass 2 — `_insert_all_reduction_ops(operations)`.** For every op whose
+  plan has `kind == "reduction"`, builds the fill/combine/accumulator
+  buffers from the plan's `ReductionPlan` data (see "Reduction tiling,"
+  below).
+- **Pass 3 — `_insert_all_write_copy_ops(operations)`.** For every op whose
+  plan has `kind == "copy_out"`, allocates the full buffer and inserts the
+  copy-out (see "Treatment by consumer topology," below). Runs last because
+  `_allocate_full_buffer`/`_insert_copy_op` read the op's *current*
+  reads/loader/layout, which Pass 1/2 may have already changed.
+
+A `"reduction"` op is never also `"copy_out"` — the plan's `kind` routes
+each op to exactly one of the three, so Pass 2 and Pass 3 never compete for
+the same op. Each pass re-resolves "the current object for buffer name X"
+fresh from `operations` at its own start, rather than trusting an object
+reference captured before an earlier pass ran — this is why no per-op
+resync hack is needed between passes: a name, once assigned, is stable
+across any later replacement (see `PropagationPlan`'s own docstring on name
+stability).
 
 #### Use-def analysis
 
-For each `ComputedBuffer` in a loop group the pass asks two questions:
+For each `ComputedBuffer` in a loop group, planning asks two questions:
 
 1. **Does this buffer have outside consumers?**  A consumer is "outside" if
    it carries a different `loop_info.loop_group_id` prefix, or has no
    `loop_info` at all.  Graph outputs (recorded in the Inductor buffer's
    `users`/`get_alias_name` machinery) count as outside consumers.
+   `_find_outside_consumers_planned` (the planning-time helper; the
+   transformation-time original, `_find_outside_consumers`, still exists
+   and is called by Pass 3) answers this by name, not object identity —
+   see the name-stability note above.
 
 2. **Does this buffer have inside consumers?**  A consumer is "inside" if it
    shares the same `loop_info.loop_group_id` tuple (i.e. it is another op in
    the same innermost loop body).
+
+If a tiled op has no outside consumers and is not a graph output, planning
+assigns `kind="loop_internal"` and stops — no buffer allocation, no copy
+op, nothing to build. Otherwise it falls through to the copy-out treatment
+below.
 
 (treatment-by-consumer-topology)=
 
@@ -1190,13 +1267,13 @@ tile), the loop body reads from full HBM tensors using tile-sized windows
 via `affine.apply` — no conversion, just addressing.  Only producer-side
 crossings need adaptation.
 
-For each tiled `ComputedBuffer`, the pass classifies by consumer topology
-and applies one of two treatments:
+For each tiled `ComputedBuffer`, planning classifies by consumer topology
+(`kind`) and Pass 3 applies one of two treatments accordingly:
 
-| Case | Inside consumers | Outside consumers | Treatment |
-|---|---|---|---|
-| 1 | ✓ | ✗ | Mark `per_tile_fixed` — flag only, no IR change |
-| 2 | any | ✓ | Allocate full HBM buffer; insert a loop-tagged copy op that publishes each tile into the correct slice |
+| Case | Inside consumers | Outside consumers | `kind` | Treatment |
+|---|---|---|---|---|
+| 1 | ✓ | ✗ | `loop_internal` | Nothing to build — Pass 3 skips this op entirely |
+| 2 | any | ✓ | `copy_out` | Pass 3 allocates a full HBM buffer and inserts a loop-tagged copy op that publishes each tile into the correct slice |
 
 Every cross-loop-group write, regardless of inside-consumer topology or
 whether any of the op's real inputs are themselves loop-internal, takes
@@ -1244,30 +1321,82 @@ unconditionally excludes `MutationLayoutSHOULDREMOVE` outputs). Under the
 current always-copy rule, the real op's own output is never a mutation
 layout, so it never loses scratchpad eligibility on that account.
 
-**Note on code-level naming**: The operative comment in `coarse_tile.py`
-(`_propagate_tiled_op`, around line 1658) describes a single unconditional
-path: "Every cross-loop-group write always takes the copy-op path: the real
-compute op keeps its own natural, input-derived, tile-sized layout, and a
-separate copy op takes `MutationLayoutSHOULDREMOVE(full_buf)`." The code's
-`insert_tiling_propagation` docstring describes the same single, unconditional
-treatment. The single operative treatment corresponds to the doc's Case 2 row
-above.
+**Note on code-level naming**: `coarse_tile.py`'s Pass 3 executor
+`_propagate_tiled_op` (called from `_insert_all_write_copy_ops` once per
+op planned `kind="copy_out"`) carries the operative comment describing a
+single unconditional path: "Every cross-loop-group write always takes the
+copy-op path: the real compute op keeps its own natural, input-derived,
+tile-sized layout, and a separate copy op takes
+`MutationLayoutSHOULDREMOVE(full_buf)`." The planning-time decision behind
+this — whether an op is `copy_out` at all — is made once, up front, by
+`_plan_tiling_propagation`; Pass 3 only executes it. The single operative
+treatment corresponds to the doc's Case 2 row above.
+
+**Revisited and re-deferred (2026-08-08): skipping the copy for
+span-overflow.** The span-overflow coarse-tiling path
+(`coarse_tile_span_overflow.py`) runs post-stickify and is intentionally
+narrow in scope — at most one loop level, at most one reduction per loop —
+which raised the question of whether that narrowness makes it safe to skip
+the copy op in at least some cases, avoiding the HBM round-trip. Three
+candidates were investigated and all three were rejected or deferred
+without becoming implemented:
+
+1. **Rely on `_resize_device_layout` preserving compatibility.** The
+   full buffer's device layout is derived from the tiled op's own
+   already-input-reconciled output layout by resizing it
+   (`_resize_device_layout`/`_stick_host_dim`), so perhaps that derivation
+   preserves enough structure to stay compatible with the op's inputs.
+   Rejected: `_resize_device_layout` preserves dim order and which host dim
+   is the stick, but *recomputes* `stride_map`/`device_size` for the new
+   size, and compatibility (`stick_compatible`, reached via
+   `device_coordinates`/`compute_coordinates`) depends on a size-dependent
+   coordinate-derivation step, not just dim order. Resizing does not
+   provably preserve compatibility.
+2. **Skip only when the tiled op has zero external-to-group reads.** If
+   every one of an op's reads is satisfied by sibling ops in the same
+   coarse-tile group (no graph inputs, no other-group outputs), there is
+   structurally nothing external to reconcile the full buffer's layout
+   against, so direct-write would be safe. Confirmed this shape is
+   non-vacuous in the grouping logic (`_plan_tiling_propagation` classifies
+   `copy_out` purely by output/consumer criteria, independent of an op's own
+   reads, and `span_overflow_groups`'s multi-op pointwise-run logic does not
+   require every op in a run to read an external buffer) and is exercised by
+   mocked-IR unit tests (`test_span_overflow_hint_analysis.py`'s
+   `test_chained_compatible_pointwise_ops_produce_one_group` and
+   `test_chained_pointwise_ops_conform_to_producer_split`). But no
+   end-to-end test compiling a real torch program through genuine
+   span-overflow triggering produces this shape — every real multi-op chain
+   found (e.g. `abs(a+b)*c`) has its last op read an additional external
+   tensor, and single-op programs are the norm. Deferred as unproven against
+   real workloads, not rejected as impossible.
+3. **Explicit per-edge compatibility re-check.** Reuse the same mechanism
+   `finalize_layouts` uses (`edge.layout(in_stl, target_stl)` via
+   `EdgeCostMap`) to re-derive `device_coordinates` for the full buffer's
+   actual resized layout against each of the tiled op's input edges, after
+   `_allocate_full_buffer` runs, and skip the copy only if every edge is
+   still compatible. This is well-scoped and would live entirely on the
+   post-stickify path. Deferred, not rejected — the most promising direction
+   for a follow-up, should a real workload surface case 2's shape or
+   otherwise justify the added complexity.
 
 **Case 1** is where most of the working-set-reduction win comes from.  An
 intermediate like `y` in the small example flows from one tiled op to
-another without ever leaving scratchpad.  `per_tile_fixed` is set on the
-`FixedTiledLayout`:
+another without ever leaving scratchpad.  Planning routes such an op to
+`kind="loop_internal"`, and Pass 3 leaves its `loop_info.output_tiled_dims`
+empty at every level:
 
 ```python
-if isinstance(op.layout, FixedTiledLayout):
-    op.layout.per_tile_fixed = True
+if propagation.kind == "loop_internal":
+    pass  # output_tiled_dims already [] from planning; nothing to build.
 ```
 
-This flag propagates to `TensorArg.per_tile_fixed` during codegen (in
-`spyre_kernel.py`).  `generate_bundle` (`codegen/bundle.py`) then skips
-emitting an `affine.apply` address for these args (the base address is fixed
-across iterations); `device_size` already matches the tile, so no update is
-needed either.
+An empty `output_tiled_dims` is what `_general_tile_advance`
+(`spyre_kernel.py`) reads when building the op's own `TensorArg`: it
+substitutes `0` for every dim at every level, so no term contributes and
+the resulting `device_tile_advance_expr` is `None`.  `generate_bundle`
+(`codegen/bundle.py`) then skips emitting an `affine.apply` address for
+that `TensorArg` (the base address is fixed across iterations);
+`device_size` already matches the tile, so no update is needed either.
 
 **Case 2**: the copy op carries the same `loop_info` (same `loop_group_id`,
 `loop_count`, and `loop_tiled_dims`) as the original op, so the scheduler
@@ -1312,7 +1441,11 @@ cannot represent at all; it would otherwise be discarded the moment
 `_propagate_tiled_op` returns.  The fix is split into two stages, one at
 planning time and one at codegen time.
 
-**Stage 1 (decision, planning time):** `plan_coarse_tile_groups`
+**Stage 1 (decision, planning time):** this is `plan_coarse_tile_groups`'s
+own, older planning step — distinct from `_plan_tiling_propagation`'s
+`kind`/`ReductionPlan` decisions described under [Buffer
+propagation](#buffer-propagation-planning-and-the-three-transformation-passes)
+above, and computed earlier in `coarse_tile()`'s pipeline. `plan_coarse_tile_groups`
 (`coarse_tile.py`) records, per dependency, a per-level *decision* — not a
 substituted expression — on `CoarseTileInfo.tiled_dims_per_read` (one entry
 per read dependency) and `CoarseTileInfo.output_tiled_dims` (for the
@@ -1441,32 +1574,45 @@ inner level's for the same dim.
 
 #### Read-side adaptation: full-buffer inputs to a loop-internal op
 
-The write-side perimeter above is not the whole story. `_propagate_tiled_op`
-checks whether `op` directly reads a full-size buffer produced by a
-cross-loop-group producer — either a full-size `SpyreEmptyFallback` buffer
-(typically an accumulator that the copy-op path above already promoted to
-full size; see "Reduction tiling," below, for the nested output-dim +
-inner-reduction-dim case that produces this), or any other `ComputedBuffer`
-whose own `loop_group_id` outer key differs from `op`'s (see
-`_full_buffer_read_deps`). A loop-internal op cannot read such a buffer
-directly: its own candidate layouts are tile-sized, and the full-size buffer
-has only one, full-size candidate layout, so the two can never be made
-stick-compatible. `_full_buffer_read_deps` detects this and
-`_insert_read_copy_ops` always materializes a tile-sized copy
-`ComputedBuffer` per such read, rewriting `op`'s `inner_fn` (via a
-`WrapperHandler` subclass, per the wrap-never-reconstruct convention) to
-read the copy instead of the full buffer. This means the "no conversion,
-just addressing" claim above holds only when the full buffer being read is
-a genuine graph input or other host-side tensor — not when it is itself the
-product of an earlier tile→full promotion inside the same compilation.
+The write-side perimeter above is not the whole story. Pass 1
+(`_insert_all_read_copy_ops`) checks, for every op, whether it directly
+reads a full-size buffer produced by a cross-loop-group producer — either a
+full-size `SpyreEmptyFallback` buffer (typically an accumulator that the
+copy-out path above already promoted to full size; see "Reduction tiling,"
+below, for the nested output-dim + inner-reduction-dim case that produces
+this), or any other `ComputedBuffer` whose own `loop_group_id` outer key
+differs from `op`'s (see `_full_buffer_read_deps`). A loop-internal op
+cannot read such a buffer directly: its own candidate layouts are
+tile-sized, and the full-size buffer has only one, full-size candidate
+layout, so the two can never be made stick-compatible. Pass 1 recomputes
+`_full_buffer_read_deps(op)` fresh, post-division, for every op — rather
+than relying on any planning-time snapshot — precisely because a
+cross-loop-group producer's full-size promotion may itself be a product of
+this same pipeline (a nested reduction's `accum_full`, built by Pass 2, or
+an earlier op's `copy_out` target, built by Pass 3 in a prior compilation
+pass over another group) and so is only guaranteed current once
+transformation has actually run. `_insert_read_copy_ops` always
+materializes a tile-sized copy `ComputedBuffer` per such read, rewriting
+`op`'s `inner_fn` (via a `WrapperHandler` subclass, per the
+wrap-never-reconstruct convention) to read the copy instead of the full
+buffer. This means the "no conversion, just addressing" claim above holds
+only when the full buffer being read is a genuine graph input or other
+host-side tensor — not when it is itself the product of an earlier
+tile→full promotion inside the same compilation.
 
 #### Reduction tiling: stick and non-stick reduction dims
 
 When a `Reduction` op has a non-empty `loop_tiled_reduction_dims`
-(i.e. the hint named a reduction dimension), `_propagate_tiled_reduction_op`
-uses a **fill-initialize + per-tile combine** pattern.  The exact buffer
-allocation depends on whether tiling is flat (reduction dim only) or nested
-(outer output dim + inner reduction dim):
+(i.e. the hint named a reduction dimension), planning routes it to
+`kind="reduction"` and computes its `ReductionPlan` (identity, nesting,
+full/per-tile shapes — see `loop_info.py`). Pass 2
+(`_insert_all_reduction_ops`, which calls the per-op executor
+`_propagate_tiled_reduction_op` for every op so planned) then builds the
+actual buffers using a **fill-initialize + per-tile combine** pattern,
+purely executing the plan's shape/identity/nesting decisions rather than
+making any new ones. The exact buffer allocation depends on whether tiling
+is flat (reduction dim only) or nested (outer output dim + inner reduction
+dim):
 
 **Flat (K-only) tiling** — a single `accum_full` HBM buffer is allocated.
 The fill and combine ops both target `accum_full` directly.
@@ -1482,8 +1628,8 @@ The fill and combine ops both target `accum_full` directly.
 3. **Insert a combine op** (inside the loop, same `loop_info` as the tiled
    reduction op) that merges each tile's partial result into `accum_full`
    using the appropriate pointwise binary operator.
-4. **Mark the tiled reduction op's output `per_tile_fixed`** — it is a
-   per-tile scratch buffer whose base address does not advance between
+4. **Leave the tiled reduction op's own `output_tiled_dims` empty** — it is
+   a per-tile scratch buffer whose base address does not advance between
    iterations.
 5. **Patch outside consumers** to read `accum_full`.
 
@@ -1493,10 +1639,11 @@ are allocated to enable LX scratchpad placement of the inner accumulator
 
 1. **Allocate `accum_full`** (full HBM output, shape matching the full
    output across all outer tiles).
-2. **Allocate `accum_tile`** (per-tile scratch, same per-tile output shape).
-   `accum_tile.layout.per_tile_fixed = True` so `generate_bundle` never
-   advances its base address; `scratchpad_planning` can therefore place it
-   in LX scratchpad memory.
+2. **Allocate `accum_tile`** (per-tile scratch, same per-tile output shape)
+   with an empty `output_tiled_dims`, so `_general_tile_advance` gives it no
+   `device_tile_advance_expr` and `generate_bundle` never advances its base
+   address; `scratchpad_planning` can therefore place it in LX scratchpad
+   memory.
 3. **Insert a fill op** (inside the outer loop, carrying the outer
    `loop_info`) that writes the identity value into `accum_tile` once per
    outer-loop tile.
@@ -1508,8 +1655,8 @@ are allocated to enable LX scratchpad placement of the inner accumulator
    outer `loop_info` so `generate_bundle` advances `accum_full`'s HBM
    address once per outer-loop tile.  The copy uses `MutationLayoutSHOULDREMOVE`
    so no extra allocation is created.
-6. **Mark the tiled reduction op's output `per_tile_fixed`** (the inner
-   scratch for the reduction kernel itself).
+6. **Leave the tiled reduction op's own `output_tiled_dims` empty** (the
+   inner scratch for the reduction kernel itself).
 7. **Patch outside consumers** to read `accum_full`.
 
 Identity values and combine operators by `reduction_type`:
@@ -1526,8 +1673,11 @@ Identity values and combine operators by `reduction_type`:
 `argmin` and `argmax` do not have element-wise combine operators and raise
 `RuntimeError` when a user attempts to tile them.
 
-Before running propagation, the pass calls `_validate_reduction_tiling(op)`,
-which raises `RuntimeError` for configurations not yet implemented:
+Before any transformation runs, `plan_coarse_tile_groups` calls
+`_validate_planned_reduction_tiling(op, tiled_dims, tiled_rdims)` at planning
+time — a pure function of already-known shape data — which raises
+`Unsupported` (from `torch_spyre/_inductor/errors.py`, a `RuntimeError`
+subclass) for configurations not yet implemented:
 
 - **Mixed output+reduction at the same nesting level** — `loop_tiled_dims[i]`
   and `loop_tiled_reduction_dims[i]` are both non-empty for some level `i`.
@@ -1787,10 +1937,15 @@ class TensorArg:
     device_size: list[int]
     device_coordinates: list[Expr]
     allocation: Any
-    per_tile_fixed: bool = False
     name: str | None = None
     device_tile_advance_expr: Expr | None = None
+    element_arrangement: Any = None
 ```
+
+`device_tile_advance_expr` is the sole tile-advance mechanism (see the
+docstring in `op_spec.py`): `None` means the address does not advance
+across loop iterations, replacing the older, separate `per_tile_fixed`
+flag entirely.
 
 `LoopSpec` is a peer of `OpSpec` and `UnimplementedOp` in the list that
 `SpyreKernel.codegen_kernel()` serializes.  It is not a subclass of `OpSpec`
@@ -2075,9 +2230,10 @@ tiled tensor, an `affine.apply` that computes the per-iteration HBM address
 from the loop induction variable(s), followed by `sdsc_execute`, as shown in
 the bundle.mlir section above.  `device_size` stays at the per-tile shape and
 `tiled_symbols` records which iteration-space symbols the enclosing loop
-levels advance; tensors with `per_tile_fixed=True` (e.g. LX scratchpad
-operands, see below) are skipped entirely — no `affine.apply` is emitted for
-them since their base address never changes across iterations.
+levels advance; tensors whose `device_tile_advance_expr` is `None` (e.g. LX
+scratchpad operands with an empty `output_tiled_dims`, see below) are
+skipped entirely — no `affine.apply` is emitted for them since their base
+address never changes across iterations.
 
 This is the only loop-codegen path: nothing upstream of `generate_bundle`
 branches on it, and there is no separate frontend loop-flattening step. An
@@ -2092,8 +2248,8 @@ landed.
 |---|---|
 | `torch_spyre/_inductor/loop_info.py` | Layer 1: `CoarseTileInfo` dataclass; `copy_op_metadata` |
 | `torch_spyre/_inductor/wsr/coarse_tile_hints.py` | `reorder_unhinted_interlopers()` reorders interlopers before grouping |
-| `torch_spyre/_inductor/wsr/coarse_tile.py` | Layer 1: `coarse_tile()` stamps `loop_info` and rewrites ranges; `insert_tiling_propagation` handles the data perimeter |
-| `torch_spyre/_inductor/insert_restickify.py` | Commits deferred `_pending_per_tile_fixed` flags in `finalize_layouts`; derives a restickify buffer's own `per_tile_fixed` from the *consuming* op's `loop_info` rather than inheriting the source layout's flag, needed when the restickify buffer takes over an advancing accumulator's role (the nested output-dim + reduction-dim tiling copy-out into `accum_tile`, `_insert_reduction_copy_op`) |
+| `torch_spyre/_inductor/wsr/coarse_tile.py` | Layer 1: `coarse_tile()` stamps `loop_info` and rewrites ranges; `_plan_tiling_propagation` plus the `_insert_all_read_copy_ops`/`_insert_all_reduction_ops`/`_insert_all_write_copy_ops` passes handle the data perimeter |
+| `torch_spyre/_inductor/insert_restickify.py` | `finalize_layouts` commits each op's chosen `FixedTiledLayout` and, for a tiled-reduction op, propagates that layout onto `accum_full` so fill/combine/copy all agree on device coordinates; also stamps a restickify node's `loop_info` from the op it feeds so the node lands in the same loop group |
 | `torch_spyre/_inductor/scheduler.py` | Layer 2: `CountedLoopSchedulerNode`, `build_loop_scheduler_nodes`, `_codegen_counted_loop`, `_regroup_by_outer_loop_key` |
 | `torch_spyre/_inductor/op_spec.py` | Layer 3: `LoopSpec` and `OpSpec` dataclasses |
 | `torch_spyre/_inductor/spyre_kernel.py` | Layer 3: serializes `LoopSpec` tree in `codegen_kernel()`; `wrap_op_specs_in_loop()` |
@@ -2247,8 +2403,9 @@ codegen time.
 ## Appendix: How IR rewiring works, and why it's sound
 
 The sections above describe *what* `coarse_tile.py` does semantically: which
-buffers get promoted to full size, which get an `identity` copy op, which get
-`per_tile_fixed` scratch treatment. This appendix describes *how* those
+buffers get promoted to full size, which get an `identity` copy op, which
+get an empty `output_tiled_dims` and stay loop-internal scratch. This
+appendix describes *how* those
 outcomes are implemented as edits to live Inductor IR objects, and why those
 edits cannot violate Inductor's own scheduler and dependency-tracking
 invariants. It is written for developers who need to modify `coarse_tile.py`
@@ -2368,8 +2525,8 @@ and they are staged deliberately rather than combined:
    substitution to the consumer's `inner_fn`, following the same
    wrap-never-reconstruct idiom as every other site in this appendix.
 
-   The concrete case is exactly the Small Example above: before
-   `insert_tiling_propagation`'s copy-op path is inserted for `buf1`, `buf1`'s
+   The concrete case is exactly the Small Example above: before Pass 3's
+   copy-out path is inserted for `buf1`, `buf1`'s
    captured load of `y` is `i1 + 4096*i0` — a coefficient computed against
    the *pre-tiling* full row stride (4096). Once `y`'s producer is tiled down
    to a `[512, 1024]` per-tile buffer, that captured `4096*i0` coefficient no
@@ -2503,7 +2660,7 @@ onto a target that already carries one:
 | `_insert_copy_op` | `coarse_tile.py` | full buffer (copy-out) |
 | `_insert_combine_op` | `coarse_tile.py` | `accum_full`/`accum_tile` (per-tile combine) |
 | `_insert_reduction_copy_op` | `coarse_tile.py` | `accum_full` (nested-tiling copy-out) |
-| fill op inside `_propagate_tiled_reduction_op` | `coarse_tile.py` | fill target (identity-value seed) |
+| fill op inside `_propagate_tiled_reduction_op` (Pass 2) | `coarse_tile.py` | fill target (identity-value seed) |
 
 This was checked directly against the current codebase and no violation was
 found — but the invariant is currently upheld by convention (one assignment
@@ -2534,13 +2691,16 @@ This appendix does not resolve that TODO; it is flagged here so a reader
 investigating a span-overflow-related bug touching a mutation-target buffer
 knows this question is already on record as open, not newly discovered.
 
-**Two passes named "propagation" — do not conflate them.** The pass-ordering
-section above already establishes when each pass runs; the naming collision
-is worth calling out explicitly since both passes touch
-`MutationLayoutSHOULDREMOVE`-adjacent state:
-`insert_tiling_propagation` (pre-scheduling, inside
-`CustomPreSchedulingPasses`, is the pass that *stamps* the layout — before
-any `Scheduler` object exists) is a completely different pass from
+**Two mechanisms named "propagation" — do not conflate them.** The
+pass-ordering section above already establishes when each runs; the naming
+collision is worth calling out explicitly since both touch
+`MutationLayoutSHOULDREMOVE`-adjacent state: `coarse_tile()`'s buffer
+*propagation* machinery (`_plan_tiling_propagation` plus its three
+transformation passes — `_insert_all_read_copy_ops`,
+`_insert_all_reduction_ops`, `_insert_all_write_copy_ops`; the last of
+these is the pass that *stamps* `MutationLayoutSHOULDREMOVE` — pre-
+scheduling, inside `CustomPreSchedulingPasses`, before any `Scheduler`
+object exists) is a completely different mechanism from
 `propagate_mutation_layouts` (pre-fusion, the first entry in
 `CustomPreFusionPasses`'s pass list shown above — it *unwraps*
 `MutationLayoutSHOULDREMOVE` back to a real `FixedTiledLayout`, after

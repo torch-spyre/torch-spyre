@@ -1,16 +1,73 @@
 """
-The three independent checks run against the loaded config patterns and
-the parsed test file:
+The checks run against the loaded config patterns and the parsed test file:
 
-  check_duplicates    -- same base name covered by multiple configs
-  check_missing       -- collectable base name not covered by any config
-  check_dead_patterns -- config pattern that matches nothing in the test file
+  check_missing_labels -- config file with no explicit test_suite_config.labels
+  check_duplicates      -- same base name covered by multiple configs
+  check_missing         -- collectable base name not covered by any config
+  check_dead_patterns   -- config pattern that matches nothing in the test file
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from .models import PatternEntry
 from .display import red, yellow, green, cyan, bold
+
+
+# -----------------------
+# CHECK 0: Missing labels
+# -----------------------
+
+
+def check_missing_labels(labels_by_file: dict[Path, list | None]) -> int:
+    """
+    Verify every config file declares an explicit test_suite_config.labels list.
+
+    filter_configs.py no longer defaults an absent labels field to a
+    catch-all tier -- a config with no labels field simply never runs under
+    any TEST_TYPE. That's a silent gap, not a safe default, so it's a hard
+    error here rather than a warning.
+
+    Parameters
+    ----------
+    labels_by_file : dict[Path, list | None]
+        Output of loader.load_labels(). None means the labels key was
+        absent or null in that config file.
+
+    Returns
+    -------
+    int
+        Number of config files missing an explicit labels field.
+    """
+    missing = sorted(
+        (path for path, labels in labels_by_file.items() if labels is None),
+        key=str,
+    )
+
+    if not missing:
+        print(
+            green(
+                f"  [labels] All {len(labels_by_file)} config(s) declare "
+                f"explicit labels.\n"
+            )
+        )
+        return 0
+
+    print(
+        red(
+            f"  [labels] {len(missing)} config file(s) missing an explicit "
+            f"'labels' field:\n"
+        )
+    )
+    for path in missing:
+        print(f"    {red('MISSING')}  {path}")
+        print(
+            "          add test_suite_config.labels: [regression]  "
+            "(if unsure which tier this belongs to)"
+        )
+    print()
+    return len(missing)
 
 
 # -----------------------

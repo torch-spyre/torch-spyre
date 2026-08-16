@@ -18,6 +18,7 @@ from torch_spyre._C import ElementArrangement
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
 RESTICKIFY_OP = "ReStickifyOpHBM"
+DEPTHWISE_CONV2D_OP = "depthwiseconv2dnative"
 BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
 MATMUL_REDUCTION_OPS = frozenset({BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP})
 
@@ -183,19 +184,41 @@ TOPK_OPS = {"topkvalue", "topkindex"}
 
 LAYOUT_LABELS = ["OUTPUT", "KERNEL", "INPUT", "KERNEL_IDX"]
 MATMUL_LAYOUT_LABELS = ["INPUT", "KERNEL", "OUTPUT", "KERNEL_IDX"]
+CONV2D_LAYOUT_LABELS = ["OUTPUT", "INPUT", "KERNEL", "KERNEL_IDX"]
 
 AVGPOOL2D_OP = "avgpoolfwd"
 # Pool opfunc names, mirroring TOPK_OPS. Add maxpool/minpool here as they land so
 # _is_pool stays a single membership test rather than a growing chain of ==.
 POOL_OPS = {AVGPOOL2D_OP}
 
+# Conv opfunc names. conv2d is a two-input reduction (activation + weight) with
+# windowed spatial dims -- a hybrid of the matmul and pool patterns. Kept as a
+# set so _is_conv is a single membership test as fp8/int8/int4 variants land.
+CONV2D_FWD_OP = "conv2d"
+# Both the forward conv2d (aten.convolution direct lowering, PR #3284) and the
+# depthwise conv2d (spyre.conv2d, PR #3510) op strings are convolutions for the
+# purposes of codegen dispatch (_is_conv). DEPTHWISE_CONV2D_OP is defined above.
+CONV_OPS = {CONV2D_FWD_OP, DEPTHWISE_CONV2D_OP}
+
 # Populate more valid labels from deeptools here if needed
 INPUT_DIM_LABELS = ["mb", "x", "y", "i", "j", "ki", "kj"]
 OUTPUT_DIM_LABELS = ["out"]
 MATMUL_DIM_LABELS = ["ki", "kj", "y", "x", "mb", "out", "in"]
+CONV2D_DIM_LABELS = ["mb", "out", "i", "j", "ki", "kj"]
 # Canonical avgpool iteration-space order: batch, out-H, out-W, channel,
 # kernel-H, kernel-W. These SDSC labels are owned by the codegen layer; dim-role
 # survival is derived from the node's live output ranges
 # (OpSpec.node_output_ranges), never from these strings, so SDSC naming does not
 # leak above codegen.
 POOL_DIM_LABELS = ["mb", "i", "j", "out", "ki", "kj"]
+# Canonical conv2d iteration-space order, mirroring POOL_DIM_LABELS: batch,
+# out-H, out-W, out-channel, in-channel (the contraction dim), kernel-H,
+# kernel-W. Like the pool labels, these SDSC strings are owned by the codegen
+# layer. Codegen maps each iteration symbol to a role structurally, from the
+# args' access expressions (set membership and co-occurrence in
+# device_coordinates), never from sizes or positions -- see
+# _match_labels_by_structure and _CONV_ROLE_LABELS in codegen/superdsc.py.
+# Squeezed size-1 roles (e.g. batch N==1) never appear as symbols and drop out
+# for free, so the mapping stays aligned with the surviving iteration-space
+# dims.
+CONV_DIM_LABELS = ["mb", "i", "j", "out", "in", "ki", "kj"]

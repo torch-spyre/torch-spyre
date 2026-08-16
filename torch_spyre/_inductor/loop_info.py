@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Literal
 import sympy
 
 if TYPE_CHECKING:
+    from torch._inductor.dependencies import MemoryDep
     from torch._inductor.ir import ComputedBuffer
 
 
@@ -49,7 +50,7 @@ class ReductionPlan:
     is_nested:
         True when an outer level tiles an output dim and an inner level
         tiles a reduction dim, requiring separate tile-sized and full-sized
-        accumulators (see ``_compute_fill_loop_info``). False for a flat
+        accumulators (see ``_compute_fill_loop_info_planned``). False for a flat
         (reduction-dim-only) tiling.
     full_output_ranges:
         Full (pre-division) output shape for the accumulation buffer --
@@ -61,11 +62,18 @@ class ReductionPlan:
         ``_divide_ranges`` performs later, in place, during transformation).
     outer_fill_loop_info:
         ``CoarseTileInfo`` covering only the outer output-dim levels, to
-        stamp on the fill op for a nested tiling (``_compute_fill_loop_info``).
+        stamp on the fill op for a nested tiling
+        (``_compute_fill_loop_info_planned``).
         ``None`` for a flat tiling, where the fill runs once before all loops.
         Its ``loop_group_id`` is planning-time, pre-offset numbering --
         transformation must re-slice it from the op's own real, stamped
         ``loop_group_id`` before use (see ``_propagate_tiled_reduction_op``).
+    full_output_strides:
+        Host strides of the full-sized accumulation buffer, captured from
+        ``op.layout.stride`` at planning time (before ``_divide_ranges`` runs).
+    per_tile_strides:
+        Host strides of the per-outer-tile accumulation buffer, derived from
+        ``full_output_strides`` via ``compute_tile_stride`` at planning time.
     """
 
     reduction_type: str
@@ -74,6 +82,8 @@ class ReductionPlan:
     full_output_ranges: list[sympy.Expr]
     per_tile_ranges: list[sympy.Expr]
     outer_fill_loop_info: "CoarseTileInfo | None"
+    full_output_strides: tuple[sympy.Expr, ...]
+    per_tile_strides: tuple[sympy.Expr, ...]
 
 
 @dataclass(frozen=True)
@@ -96,6 +106,10 @@ class PropagationPlan:
     full_ranges:
         Full (pre-division) iteration ranges for the copy-out's full buffer.
         Only set when ``kind == "copy_out"``.
+    full_strides:
+        Original (pre-division) strides of the tiled op's layout, captured at
+        planning time before ``_divide_ranges`` mutates the op.  Only set when
+        ``kind == "copy_out"``.
     reduction:
         Shape/identity/nesting decisions for the reduction machinery. Only
         set when ``kind == "reduction"``.
@@ -109,9 +123,60 @@ class PropagationPlan:
 
     kind: Literal["loop_internal", "copy_out", "reduction"]
     full_ranges: list[sympy.Expr] | None = None
+    full_strides: tuple[sympy.Expr, ...] | None = None
     reduction: ReductionPlan | None = None
     outside_consumer_names: tuple[str, ...] = ()
     is_graph_output: bool = False
+
+
+@dataclass(frozen=True)
+class ReadCopyEntry:
+    """One shared copy to insert for a cross-group buffer read.
+
+    Attributes
+    ----------
+    copy_name:
+        Qualified name to assign the inserted copy ComputedBuffer.
+    dep:
+        The canonical MemoryDep (buffer name + index + var_names + size)
+        every equivalent read in the group shares -- the same object one of
+        the consuming ops' own full_deps produced, used to size/index the
+        copy exactly as _insert_all_read_copy_ops does today.
+    insert_before_op_name:
+        get_operation_name() of the first (operations order) consuming op
+        in the group -- where the copy is inserted.
+    sizing_op_name:
+        get_operation_name() of the op supplying tiled_op.loop_info for
+        the copy's own read/write-level-extent computation (the first
+        consuming op, per the sizing-invariant in the design doc).
+    consumer_op_names:
+        Names of every op in the group that must have this dep's buffer
+        name patched (via _NameSwapHandler) to load from copy_name instead.
+    """
+
+    copy_name: str
+    dep: "MemoryDep"
+    insert_before_op_name: str
+    sizing_op_name: str
+    consumer_op_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ReadCopyPlan:
+    """Per-group plan for Pass 1 (read-copy insertion).
+
+    Computed once during planning (_plan_read_copies, run after every
+    group's _apply_plan) and consumed by a slimmed _insert_all_read_copy_ops
+    that only executes these decisions.
+
+    Attributes
+    ----------
+    entries:
+        One ReadCopyEntry per distinct (buffer name, canonical index expr)
+        pair read cross-group by at least one op in this group.
+    """
+
+    entries: tuple["ReadCopyEntry", ...]
 
 
 @dataclass

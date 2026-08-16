@@ -20,6 +20,7 @@ Usage (called by the GHA workflow):
 
 import argparse
 import os
+import platform as _platform
 import regex as re
 import sys
 import uuid
@@ -77,7 +78,9 @@ def is_benchmark_xml(root) -> bool:
     return all("benchmark" in (tc.get("classname", "")) for tc in cases)
 
 
-def parse_benchmark_xml(xml_path: Path, workflow: str = "", ci_run_id: str = ""):
+def parse_benchmark_xml(
+    xml_path: Path, workflow: str = "", ci_run_id: str = "", platform: str = ""
+):
     """
     Parse a performance-benchmark XML into (run_meta, list[benchmark_row]).
 
@@ -224,6 +227,7 @@ def parse_benchmark_xml(xml_path: Path, workflow: str = "", ci_run_id: str = "")
         "created_at": created_at,
         "version_info": version_info,
         "workflow": workflow,
+        "platform": platform,
     }
     return run_meta, benchmarks
 
@@ -243,6 +247,7 @@ def insert_benchmark_run(client, run_id: int, run_meta: dict) -> None:
                 run_meta.get("version_info"),
                 run_meta["created_at"].replace(tzinfo=None),
                 run_meta.get("workflow", ""),
+                run_meta.get("platform", ""),
             ]
         ],
         column_names=[
@@ -251,6 +256,7 @@ def insert_benchmark_run(client, run_id: int, run_meta: dict) -> None:
             "version_info",
             "created_at",
             "workflow",
+            "platform",
         ],
     )
 
@@ -628,6 +634,13 @@ def main():
         default="",
         help="Suite tier that produced this run, e.g. regression | integration | unit | smoke",
     )
+    parser.add_argument(
+        "--platform",
+        default=_platform.machine() or "",
+        help="Hardware arch the run executed on (x86_64 | ppc64le | s390x). "
+        "The benchmark XML carries no per-case platform tag, so the caller "
+        "supplies it; defaults to the ingest host's arch.",
+    )
     args = parser.parse_args()
 
     if args.xml_file:
@@ -654,6 +667,9 @@ def main():
     client.command(
         "ALTER TABLE benchmark_runs ADD COLUMN IF NOT EXISTS workflow String DEFAULT ''"
     )
+    client.command(
+        "ALTER TABLE benchmark_runs ADD COLUMN IF NOT EXISTS platform String DEFAULT ''"
+    )
 
     total_cases = 0
     total_benchmarks = 0
@@ -668,7 +684,7 @@ def main():
         if is_benchmark_xml(root):
             print("  Detected: performance benchmark XML")
             run_meta, benchmarks = parse_benchmark_xml(
-                xml_path, args.workflow, args.run_id
+                xml_path, args.workflow, args.run_id, args.platform
             )
             if run_meta is None:
                 continue
