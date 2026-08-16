@@ -150,6 +150,15 @@ jobs:
   # tests/configs/torch_spyre_tests/ and emits a JSON matrix containing only
   # the configs that match inputs.test_type.  The test job below consumes this
   # output via fromJSON so that only the requested subset of runners starts.
+  #
+  # test_type=trunk is the exception: it scans the whole tests/configs/ tree
+  # (torch_spyre_tests, model_ops_tests, upstream_tests, upstream_tests_beta),
+  # matching the Makefile's TEST_TYPE=trunk semantics (see Makefile's TEST_TYPE
+  # docs) instead of just torch_spyre_tests. distributed_tests is excluded
+  # from that wider scan even though its configs carry the trunk label too --
+  # it is already covered by the dedicated test_multi_spyre job below (needs
+  # spyre_pf_x2 multi-card runners), so including it here would double-run
+  # those configs through this single-card matrix as well.
   # ---------------------------------------------------------------------------
   generate_matrix:
     name: Generate test matrix (${{ inputs.test_type || 'regression' }})
@@ -169,8 +178,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
+          # trunk fetches the whole tests/configs/ tree (see the filter step
+          # below); every other tier stays scoped to torch_spyre_tests.
           sparse-checkout: |
-            tests/configs/torch_spyre_tests
+            ${{ (inputs.test_type || 'regression') == 'trunk' && 'tests/configs' || 'tests/configs/torch_spyre_tests' }}
             tests/oot_framework/utils/filter_configs.py
             .github/runner_overrides.yaml
           sparse-checkout-cone-mode: false
@@ -203,11 +214,41 @@ jobs:
             exit 0
           fi
 
-          matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
-            --config-dir tests/configs/torch_spyre_tests \
-            --test-type "${RAW_TEST_TYPE}" \
-            --runner-map .github/runner_overrides.yaml \
-            --format matrix-json)
+          # trunk covers everything torch-spyre's push-to-main workflows
+          # exercise across tests/configs/, not just torch_spyre_tests (see
+          # Makefile's TEST_TYPE=trunk docs). Every other tier keeps the
+          # narrower torch_spyre_tests-only scope. --config-dir is kept a
+          # literal path (not a shell variable) in both branches on purpose:
+          # tests/scripts/check_test_coverage.sh greps workflow YAMLs for a
+          # literal `--config-dir <path>` token to detect dynamic coverage,
+          # and can't resolve a variable.
+          if [ "${RAW_TEST_TYPE}" = "trunk" ]; then
+            matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
+              --config-dir tests/configs \
+              --test-type "${RAW_TEST_TYPE}" \
+              --runner-map .github/runner_overrides.yaml \
+              --format matrix-json)
+          else
+            matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
+              --config-dir tests/configs/torch_spyre_tests \
+              --test-type "${RAW_TEST_TYPE}" \
+              --runner-map .github/runner_overrides.yaml \
+              --format matrix-json)
+          fi
+
+          # distributed_tests configs carry the trunk label too but are
+          # exclusively run by the test_multi_spyre job below (multi-card
+          # runners) -- strip them back out so the wider trunk scan above
+          # doesn't also schedule them through this single-card matrix.
+          if [ "${RAW_TEST_TYPE}" = "trunk" ]; then
+            matrix=$(echo "${matrix}" | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          data['suite'] = [s for s in data['suite'] if not s['config'].startswith('distributed_tests/')]
+          print(json.dumps(data))
+          ")
+          fi
+
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
           # test_type is now the literal label vocabulary (smoke/unit/
