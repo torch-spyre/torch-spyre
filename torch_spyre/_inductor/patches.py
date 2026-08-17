@@ -74,6 +74,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
         CustomPostFusionPasses,
         CustomPreSchedulingPasses,
     )
+    from torch_spyre._inductor.propagate_hints import recover_spyre_hints
 
     # *) Inductor config tweaks (saved/restored)
     new_config = {
@@ -104,8 +105,6 @@ def enable_spyre_context(example_inputs: list[InputType]):
     # disable mul_softmax_pattern and div_softmax_pattern for now
     joint_graph.pass_patterns.pop()
 
-    # Inject the pre_scheduling_passes before the Scheduler is constructed,
-    # allowing the passes to modify the graph IR (buffers, inputs, constants).
     old_update_scheduler = GraphLowering._update_scheduler
 
     _pre_scheduling_pass = CustomPreSchedulingPasses()
@@ -114,6 +113,15 @@ def enable_spyre_context(example_inputs: list[InputType]):
         # Nested compiler contexts may wrap this hook more than once. The
         # graph-mutating pre-scheduling pipeline runs once per GraphLowering.
         if not getattr(self, "_spyre_pre_scheduling_complete", False):
+            # recover_spyre_hints runs here (after all post-grad FX passes including
+            # decompose_auto_functionalized) rather than in CustomPostPasses.
+            # decompose_auto_functionalized replaces auto_functionalized_v2 nodes
+            # via make_fx retracing, which creates new FX nodes whose meta["custom"]
+            # only contains hints from the innermost scope. Running recovery here
+            # ensures the final FX graph (post-decomposition) gets the full hint set.
+            gm = self.graph.owning_module
+            if gm is not None and "__spyre_dim_hints" in gm.meta:
+                recover_spyre_hints(self.graph)
             _pre_scheduling_pass(self)
             setattr(self, "_spyre_pre_scheduling_complete", True)
         old_update_scheduler(self)

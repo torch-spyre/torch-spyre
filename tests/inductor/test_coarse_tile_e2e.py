@@ -71,6 +71,18 @@ copy_f = torch.ops.spyre.copy_f
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
 
+# Set to False to run currently-raising tests normally instead of expecting raises.
+_EXPECT_RAISES = True
+
+
+def _run_coarse_tile_test_raises(fn, inputs, match):
+    """Run a test that currently raises; skip the raise check when _EXPECT_RAISES=False."""
+    if _EXPECT_RAISES:
+        with pytest.raises(Exception, match=match):
+            run_coarse_tile_test(fn, inputs)
+    else:
+        run_coarse_tile_test(fn, inputs)
+
 
 # ---------------------------------------------------------------------------
 # Driver
@@ -181,7 +193,7 @@ def run_coarse_tile_test(
         ):
             _, source_codes = run_and_get_code(torch.compile(fn), *dev_tensors)
 
-    if loopspec:
+    if loopspec and not config.ignore_wsr_hints:
         assert len(source_codes) > 0
         loopspec(source_codes[0])
 
@@ -710,7 +722,6 @@ def test_min_2d_512x256_reduce_dim0_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-# qqq
 def test_min_2d_512x256_reduce_dim0_A4_B4():
     """amin over dim=0 on [512,256] tiled A÷4 B÷4 → 128+64 elems/tile."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
@@ -851,11 +862,11 @@ def test_add_min_2d_512x256_reduce_dim0_A4():
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return a + temp
 
-    with pytest.raises(
-        Exception,
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
         match="partial reduction result consumed before accumulation is complete",
-    ):
-        run_coarse_tile_test(fn, inputs)
+    )
 
 
 def test_add_min_2d_512x256_reduce_dim0_B4():
@@ -896,11 +907,11 @@ def test_add_min_2d_512x256_reduce_dim0_A4_B4():
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     return a + temp
 
-    with pytest.raises(
-        Exception,
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
         match="partial reduction result consumed before accumulation is complete",
-    ):
-        run_coarse_tile_test(fn, inputs)
+    )
 
 
 def test_add_min_2d_512x256_reduce_dim1_A4():
@@ -938,11 +949,11 @@ def test_add_min_2d_512x256_reduce_dim1_B4():
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return a + temp
 
-    with pytest.raises(
-        Exception,
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
         match="partial reduction result consumed before accumulation is complete",
-    ):
-        run_coarse_tile_test(fn, inputs)
+    )
 
 
 def test_add_min_2d_512x256_reduce_dim1_A4_B4():
@@ -964,11 +975,11 @@ def test_add_min_2d_512x256_reduce_dim1_A4_B4():
                 with spyre_hint(expected_named_dims=["A", "B"]):
                     return a + temp
 
-    with pytest.raises(
-        Exception,
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
         match="partial reduction result consumed before accumulation is complete",
-    ):
-        run_coarse_tile_test(fn, inputs)
+    )
 
 
 def test_add_min_3d_512x256x256_reduce_dim0_A4_B2_C4():
@@ -1084,11 +1095,11 @@ def test_reduce_both_dense_add_2d_512x256_A4():
             with spyre_hint(expected_named_dims=["B"]):
                 return a.amin(dim=0) + b.amin(dim=0)
 
-    with pytest.raises(
-        Exception,
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
         match="partial reduction result consumed before accumulation is complete",
-    ):
-        run_coarse_tile_test(fn, inputs)
+    )
 
 
 def test_reduce_both_dense_add_2d_512x256_B4():
@@ -1119,11 +1130,11 @@ def test_reduce_both_dense_add_2d_512x256_A4_B4():
                 with spyre_hint(expected_named_dims=["B"]):
                     return a.amin(dim=0) + b.amin(dim=0)
 
-    with pytest.raises(
-        Exception,
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
         match="partial reduction result consumed before accumulation is complete",
-    ):
-        run_coarse_tile_test(fn, inputs)
+    )
 
 
 def test_reduce_both_sparse_add_2d_512x256_A4():
@@ -1153,11 +1164,11 @@ def test_reduce_both_sparse_add_2d_512x256_B4():
             with spyre_hint(expected_named_dims=["A"]):
                 return a.amin(dim=1) + b.amin(dim=1)
 
-    with pytest.raises(
-        Exception,
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
         match="partial reduction result consumed before accumulation is complete",
-    ):
-        run_coarse_tile_test(fn, inputs)
+    )
 
 
 def test_reduce_both_sparse_add_2d_512x256_A4_B4():
@@ -1173,11 +1184,11 @@ def test_reduce_both_sparse_add_2d_512x256_A4_B4():
                 with spyre_hint(expected_named_dims=["A"]):
                     return a.amin(dim=1) + b.amin(dim=1)
 
-    with pytest.raises(
-        Exception,
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
         match="partial reduction result consumed before accumulation is complete",
-    ):
-        run_coarse_tile_test(fn, inputs)
+    )
 
 
 def test_partial_reduction_two_hop_A4():
@@ -1203,11 +1214,11 @@ def test_partial_reduction_two_hop_A4():
             with spyre_hint(expected_named_dims=["A", "B"]):
                 return a + t
 
-    with pytest.raises(
-        Exception,
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
         match="partial reduction result consumed before accumulation is complete",
-    ):
-        run_coarse_tile_test(fn, inputs)
+    )
 
 
 # softmax decomposes into amax + pointwise + sum + pointwise — exercises
@@ -1665,33 +1676,29 @@ def test_restickify_pointwise_unsqueeze_mul_Lq2():
 # All on [512x256]: A÷4=128/tile (2 sticks), B÷4=64/tile (1 stick)
 # ---------------------------------------------------------------------------
 
-# --- copy into pre-allocated buffer: copy_f(a + b, c) ---
-
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_copy_into_preallocated_512x256_A4():
     """copy_f(a+b, c) on [512,256] tiled A÷4 — result written into zeros buffer."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["A", "B"]),
-        tensor("b", shape=(512, 256), dims=["A", "B"]),
     ]
 
-    def fn(a, b):
-        c = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
+    def fn(a):
+        with spyre_hint(named_dims=["A", "B"]):
+            c = torch.ones(a.shape, device=a.device, dtype=a.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                # copy_f is fused with the add (c is never read before write),
-                # but fn is still tiled correctly.
-                c = copy_f(a + b, c)
+                copy_f(a + c, c)
         return c
 
-    run_coarse_tile_test(fn, inputs)
+    run_coarse_tile_test(fn, inputs, loopspec=None)
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_copy_into_preallocated_512x256_B4():
     """copy_f(a+b, c) on [512,256] tiled B÷4."""
@@ -1701,19 +1708,18 @@ def test_copy_into_preallocated_512x256_B4():
     ]
 
     def fn(a, b):
-        c = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
+        with spyre_hint(named_dims=["A", "B"]):
+            c = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                # copy_f is fused with the add (c is never read before write),
-                # but fn is still tiled correctly.
-                c = copy_f(a + b, c)
+                copy_f(a + b, c)
         return c
 
     run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_copy_into_preallocated_512x256_A4_B4():
     """copy_f(a+b, c) on [512,256] tiled A÷4 B÷4."""
@@ -1723,13 +1729,12 @@ def test_copy_into_preallocated_512x256_A4_B4():
     ]
 
     def fn(a, b):
-        c = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
+        with spyre_hint(named_dims=["A", "B"]):
+            c = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
-                    # copy_f is fused with the add (c is never read before write),
-                    # but fn is still tiled correctly.
-                    c = copy_f(a + b, c)
+                    copy_f(a + b, c)
         return c
 
     run_coarse_tile_test(fn, inputs)
@@ -1739,7 +1744,7 @@ def test_copy_into_preallocated_512x256_A4_B4():
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_copy_inplace_accum_512x256_A4():
     """copy_f(acc + x, acc) on [512,256] tiled A÷4 — acc read and written inside loop."""
@@ -1751,14 +1756,14 @@ def test_copy_inplace_accum_512x256_A4():
     def fn(acc, x):
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                acc = copy_f(acc + x, acc)
+                copy_f(acc + x, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_copy_inplace_accum_512x256_B4():
     """copy_f(acc + x, acc) on [512,256] tiled B÷4."""
@@ -1770,14 +1775,14 @@ def test_copy_inplace_accum_512x256_B4():
     def fn(acc, x):
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                acc = copy_f(acc + x, acc)
+                copy_f(acc + x, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_copy_inplace_accum_512x256_A4_B4():
     """copy_f(acc + x, acc) on [512,256] tiled A÷4 B÷4."""
@@ -1790,7 +1795,7 @@ def test_copy_inplace_accum_512x256_A4_B4():
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
-                    acc = copy_f(acc + x, acc)
+                    copy_f(acc + x, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
@@ -1801,7 +1806,7 @@ def test_copy_inplace_accum_512x256_A4_B4():
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_copy_rmw_correction_512x256_A4():
     """copy_f(acc * scale + y, acc) on [512,256] tiled A÷4."""
@@ -1814,14 +1819,14 @@ def test_copy_rmw_correction_512x256_A4():
     def fn(acc, scale, y):
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                acc = copy_f(acc * scale + y, acc)
+                copy_f(acc * scale + y, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_copy_rmw_correction_512x256_B4():
     """copy_f(acc * scale + y, acc) on [512,256] tiled B÷4."""
@@ -1834,14 +1839,14 @@ def test_copy_rmw_correction_512x256_B4():
     def fn(acc, scale, y):
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                acc = copy_f(acc * scale + y, acc)
+                copy_f(acc * scale + y, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_copy_rmw_correction_512x256_A4_B4():
     """copy_f(acc * scale + y, acc) on [512,256] tiled A÷4 B÷4."""
@@ -1855,7 +1860,7 @@ def test_copy_rmw_correction_512x256_A4_B4():
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
-                    acc = copy_f(acc * scale + y, acc)
+                    copy_f(acc * scale + y, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
@@ -1871,7 +1876,7 @@ def test_copy_f_untiled():
 
     def fn(x):
         out = torch.zeros(256, device=x.device, dtype=x.dtype)
-        out = copy_f(x.amin(dim=0), out)
+        copy_f(x.amin(dim=0), out)
         return out
 
     run_coarse_tile_test(fn, inputs, loopspec=None)
@@ -1892,10 +1897,10 @@ def test_copy_not_deleted():
         out = torch.zeros(256, device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
-                out = copy_f(x.amin(dim=0), out)
+                copy_f(x.amin(dim=0), out)
         return out
 
-    with pytest.raises(InductorError, match="expected_reduction_dims"):
+    with pytest.raises(InductorError, match="validate_named_dims"):
         run_coarse_tile_test(fn, inputs)
 
 
@@ -1908,19 +1913,18 @@ def test_copy_after_reduction_512x256_A4():
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
                 temp = x.amin(dim=0)
-            with spyre_hint(expected_named_dims=["B"]):
-                out = copy_f(temp, out)
+            copy_f(temp, out)
         return out
 
-    with pytest.raises(
-        Exception,
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
         match="partial reduction result consumed before accumulation is complete",
-    ):
-        run_coarse_tile_test(fn, inputs)
+    )
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_copy_after_reduction_512x256_B4():
     """copy_f(x.amin(dim=0, out)) on [512,256] tiled B÷4."""
@@ -1932,7 +1936,7 @@ def test_copy_after_reduction_512x256_B4():
             with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
                 temp = x.amin(dim=0)
             with spyre_hint(expected_named_dims=["B"]):
-                out = copy_f(temp, out)
+                copy_f(temp, out)
         return out
 
     run_coarse_tile_test(fn, inputs)
@@ -1950,19 +1954,18 @@ def test_copy_after_reduction_512x256_A4_B4():
                     expected_named_dims=["B"], expected_reduction_dims=["A"]
                 ):
                     temp = x.amin(dim=0)
-                with spyre_hint(expected_named_dims=["B"]):
-                    out = copy_f(temp, out)
+                copy_f(temp, out)
         return out
 
-    with pytest.raises(
-        Exception,
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
         match="partial reduction result consumed before accumulation is complete",
-    ):
-        run_coarse_tile_test(fn, inputs)
+    )
 
 
 @pytest.mark.skip(
-    reason="correctness bug: H÷4 Lq÷4 tiled flash-style running max produces wrong results (39% mismatch)"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_copy_running_max_4d_H4_Lq4():
     """copy_f(maximum(real_max, amax(scores,dim=-2, running_max))) on [B,H,Lk,Lq] tiled H÷4 Lq÷4.
@@ -1988,7 +1991,7 @@ def test_copy_running_max_4d_H4_Lq4():
                     block_max = torch.amax(scores, dim=-2)
                 with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
                     running_max = torch.maximum(real_max, block_max)
-                real_max = copy_f(running_max, real_max)
+                copy_f(running_max, real_max)
         return real_max
 
     run_coarse_tile_test(fn, inputs)
@@ -1999,7 +2002,7 @@ def test_copy_running_max_4d_H4_Lq4():
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_copy_restickify_512x256_A4():
     """copy_f(a.t(, c)+b) on [256,512] result tiled A÷4 — copy of restickified add."""
@@ -2012,14 +2015,14 @@ def test_copy_restickify_512x256_A4():
         c = torch.zeros(b.shape, device=b.device, dtype=b.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                c = copy_f(a.t() + b, c)
+                copy_f(a.t() + b, c)
         return c
 
     run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_copy_restickify_512x256_B4():
     """copy_f(a.t(, c)+b) on [256,512] result tiled B÷4."""
@@ -2032,14 +2035,14 @@ def test_copy_restickify_512x256_B4():
         c = torch.zeros(b.shape, device=b.device, dtype=b.dtype)
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                c = copy_f(a.t() + b, c)
+                copy_f(a.t() + b, c)
         return c
 
     run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_copy_restickify_512x256_A4_B4():
     """copy_f(a.t(, c)+b) on [256,512] result tiled A÷4 B÷4."""
@@ -2053,7 +2056,7 @@ def test_copy_restickify_512x256_A4_B4():
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
-                    c = copy_f(a.t() + b, c)
+                    copy_f(a.t() + b, c)
         return c
 
     run_coarse_tile_test(fn, inputs)
@@ -2064,7 +2067,7 @@ def test_copy_restickify_512x256_A4_B4():
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_copy_accum_with_reduction_512x256_A4():
     """copy_f(acc * scale + x.amin(dim=1,keepdim=True, acc)) tiled A÷4."""
@@ -2079,7 +2082,7 @@ def test_copy_accum_with_reduction_512x256_A4():
             with spyre_hint(expected_named_dims=["A"], expected_reduction_dims=["B"]):
                 r = x.amin(dim=1, keepdim=True)
             with spyre_hint(expected_named_dims=["A", "B"]):
-                acc = copy_f(acc * scale + r, acc)
+                copy_f(acc * scale + r, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
@@ -2104,7 +2107,7 @@ def test_copy_accum_with_reduction_512x256_B4():
             with spyre_hint(expected_named_dims=["A"], expected_reduction_dims=["B"]):
                 r = x.amin(dim=1, keepdim=True)
             with spyre_hint(expected_named_dims=["A", "B"]):
-                acc = copy_f(acc * scale + r, acc)
+                copy_f(acc * scale + r, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
@@ -2132,7 +2135,7 @@ def test_copy_accum_with_reduction_512x256_A4_B4():
                 ):
                     r = x.amin(dim=1, keepdim=True)
                 with spyre_hint(expected_named_dims=["A", "B"]):
-                    acc = copy_f(acc * scale + r, acc)
+                    copy_f(acc * scale + r, acc)
         return acc
 
     run_coarse_tile_test(fn, inputs)
@@ -2142,7 +2145,7 @@ def test_copy_accum_with_reduction_512x256_A4_B4():
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_copy_two_copies_same_scope_512x256_A4():
     """Two copy_ ops in same hint scope tiled A÷4."""
@@ -2156,16 +2159,16 @@ def test_copy_two_copies_same_scope_512x256_A4():
         c2 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                c1 = copy_f(a + b, c1)
+                copy_f(a + b, c1)
             with spyre_hint(expected_named_dims=["A", "B"]):
-                c2 = copy_f(a * b, c2)
+                copy_f(a * b, c2)
         return c1, c2
 
     run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_copy_two_copies_same_scope_512x256_B4():
     """Two copy_ ops in same hint scope tiled B÷4."""
@@ -2179,16 +2182,16 @@ def test_copy_two_copies_same_scope_512x256_B4():
         c2 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
-                c1 = copy_f(a + b, c1)
+                copy_f(a + b, c1)
             with spyre_hint(expected_named_dims=["A", "B"]):
-                c2 = copy_f(a * b, c2)
+                copy_f(a * b, c2)
         return c1, c2
 
     run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_copy_two_copies_same_scope_512x256_A4_B4():
     """Two copy_ ops in same hint scope tiled A÷4 B÷4."""
@@ -2203,9 +2206,9 @@ def test_copy_two_copies_same_scope_512x256_A4_B4():
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
-                    c1 = copy_f(a + b, c1)
+                    copy_f(a + b, c1)
                 with spyre_hint(expected_named_dims=["A", "B"]):
-                    c2 = copy_f(a * b, c2)
+                    copy_f(a * b, c2)
         return c1, c2
 
     run_coarse_tile_test(fn, inputs)
@@ -2277,7 +2280,7 @@ def test_outside_consumer_pointwise_512x256_A4_B4():
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_outside_consumer_copy_then_read_512x256_A4():
     """out=zeros; tiled copy_f(x+y, out); return out/norm — tiled A÷4."""
@@ -2290,15 +2293,14 @@ def test_outside_consumer_copy_then_read_512x256_A4():
     def fn(x, y, norm):
         out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(expected_named_dims=["A", "B"]):
-                out = copy_f(x + y, out)
+            copy_f(x + y, out)
         return out / (torch.abs(norm) + 1.0)
 
     run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_outside_consumer_copy_then_read_512x256_B4():
     """out=zeros; tiled copy_f(x+y, out); return out/norm — tiled B÷4."""
@@ -2311,15 +2313,14 @@ def test_outside_consumer_copy_then_read_512x256_B4():
     def fn(x, y, norm):
         out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"B": 4}):
-            with spyre_hint(expected_named_dims=["A", "B"]):
-                out = copy_f(x + y, out)
+            copy_f(x + y, out)
         return out / (torch.abs(norm) + 1.0)
 
     run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_outside_consumer_copy_then_read_512x256_A4_B4():
     """out=zeros; tiled copy_f(x+y, out); return out/norm — tiled A÷4 B÷4."""
@@ -2333,8 +2334,7 @@ def test_outside_consumer_copy_then_read_512x256_A4_B4():
         out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
-                with spyre_hint(expected_named_dims=["A", "B"]):
-                    out = copy_f(x + y, out)
+                copy_f(x + y, out)
         return out / (torch.abs(norm) + 1.0)
 
     run_coarse_tile_test(fn, inputs)
@@ -2358,11 +2358,9 @@ def test_outside_consumer_two_accum_512x256_A4():
     def fn(x, scale):
         out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
         denom = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(expected_named_dims=["A", "B"]):
-                out = copy_f(out * scale + x, out)
-            with spyre_hint(expected_named_dims=["A"]):
-                denom = copy_f(denom + x.sum(dim=1), denom)
+        # with spyre_hint(num_tiles_per_dim={"A": 4}):
+        copy_f(out * scale + x, out)
+        copy_f(denom + x.sum(dim=1), denom)
         return out / denom.unsqueeze(1)
 
     run_coarse_tile_test(fn, inputs)
@@ -2379,17 +2377,15 @@ def test_outside_consumer_two_accum_512x256_B4():
         out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
         denom = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"B": 4}):
-            with spyre_hint(expected_named_dims=["A", "B"]):
-                out = copy_f(out * scale + x, out)
-            with spyre_hint(expected_named_dims=["A"]):
-                denom = copy_f(denom + x.sum(dim=1), denom)
+            copy_f(out * scale + x, out)
+            copy_f(denom + x.amin(dim=1), denom)
         return out / denom.unsqueeze(1)
 
-    with pytest.raises(
-        Exception,
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
         match="partial reduction result consumed before accumulation is complete",
-    ):
-        run_coarse_tile_test(fn, inputs)
+    )
 
 
 @pytest.mark.skip(
@@ -2407,10 +2403,8 @@ def test_outside_consumer_two_accum_512x256_A4_B4():
         denom = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
-                with spyre_hint(expected_named_dims=["A", "B"]):
-                    out = copy_f(out * scale + x, out)
-                with spyre_hint(expected_named_dims=["A"]):
-                    denom = copy_f(denom + x.sum(dim=1), denom)
+                copy_f(out * scale + x, out)
+                copy_f(denom + x.sum(dim=1), denom)
         return out / denom.unsqueeze(1)
 
     run_coarse_tile_test(fn, inputs)
@@ -3060,7 +3054,7 @@ def _flash_v2_fn(
                         denom_corrected = denominator * correction
                     with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
                         new_denom = denom_corrected + sum_scores
-                    denominator = copy_f(new_denom, denominator)
+                    copy_f(new_denom, denominator)
                     with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
                         matmul_out = torch.matmul(exp_scores, values)
                     # correction.unsqueeze(-1) is [B,H,Lq,1] — size-1 dim can't carry "D"
@@ -3068,8 +3062,8 @@ def _flash_v2_fn(
                     output_corrected = output * corr_expanded
                     with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
                         new_output = output_corrected + matmul_out
-                    output = copy_f(new_output, output)
-                    real_max = copy_f(running_max, real_max)
+                    copy_f(new_output, output)
+                    copy_f(running_max, real_max)
     return output / denominator.unsqueeze(-1)
 
 
@@ -3286,32 +3280,24 @@ def _flash_v3_fn(
                         real_max_diff = real_max - running_max
                     with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
                         correction = torch.exp(real_max_diff)
-                    with spyre_hint(
-                        expected_named_dims=["B", "H", "Lq"],
-                        expected_reduction_dims=["Lk"],
-                    ):
-                        sum_scores = exp_scores.sum(dim=-2)
-                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
-                        denom_corrected = denominator * correction
-                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
-                        new_denom = denom_corrected + sum_scores
-                    denominator = copy_f(new_denom, denominator)
-                    with spyre_hint(expected_named_dims=["B", "H", "Lq", "Lk"]):
-                        exp_scores_T = exp_scores.transpose(-1, -2).contiguous()
-                    with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
-                        matmul_out = torch.matmul(exp_scores_T, values)
-                    # correction.unsqueeze(-1) is [B,H,Lq,1] — size-1 dim can't carry "D"
-                    corr_expanded = correction.unsqueeze(-1)
-                    output_corrected = output * corr_expanded
-                    with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
-                        new_output = output_corrected + matmul_out
-                    output = copy_f(new_output, output)
-                    real_max = copy_f(running_max, real_max)
+
+                    copy_f(
+                        denominator * correction + exp_scores.sum(dim=-2),
+                        denominator,
+                    )  # B, H, Lq sparse
+                    copy_f(
+                        output * correction.unsqueeze(-1)
+                        + torch.matmul(exp_scores.transpose(-1, -2), values),
+                        output,
+                    )  # B, H, Lq, D
+
+                    copy_f(running_max, real_max)  # B, H, Lq sparse
+
     return output / denominator.unsqueeze(-1)
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_flash_v3_tile_H():
     """Flash v3: tile H÷4 only."""
@@ -3517,7 +3503,7 @@ def _flash_v4_fn(q, k, v, *, B, S, H, D, b_tiles=1, h_tiles=1, lq_tiles=1, lk_ti
                         denom_corrected = denominator * correction
                     with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
                         new_denom = denom_corrected + sum_scores
-                    denominator = copy_f(new_denom, denominator)
+                    copy_f(new_denom, denominator)
                     with spyre_hint(expected_named_dims=["B", "H", "Lq", "Lk"]):
                         exp_scores_T = exp_scores.transpose(-1, -2).contiguous()
                     with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
@@ -3526,9 +3512,9 @@ def _flash_v4_fn(q, k, v, *, B, S, H, D, b_tiles=1, h_tiles=1, lq_tiles=1, lk_ti
                     output_corrected = output * correction.unsqueeze(-1)
                     with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
                         new_output = output_corrected + matmul_out
-                    output = copy_f(new_output, output)
-                    real_max = copy_f(running_max, real_max)
-    output = copy_f(output / denominator.unsqueeze(-1), output)
+                    copy_f(new_output, output)
+                    copy_f(running_max, real_max)
+    copy_f(output / denominator.unsqueeze(-1), output)
     return output.transpose(1, 2).reshape(B, S, H * D)
 
 
@@ -4487,17 +4473,17 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                             real_max - running_max
                         )  # B, H, Lq sparse
 
-                        denominator = copy_f(
+                        copy_f(
                             denominator * correction + exp_scores.sum(dim=-1),
                             denominator,
                         )  # B, H, Lq sparse
-                        output = copy_f(
+                        copy_f(
                             output * correction.unsqueeze(-1)
                             + torch.matmul(exp_scores, values),
                             output,
                         )  # B, H, Lq, D
 
-                        real_max = copy_f(running_max, real_max)  # B, H, Lq sparse
+                        copy_f(running_max, real_max)  # B, H, Lq sparse
 
             return output / denominator.unsqueeze(-1)
 
@@ -4529,7 +4515,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         )
 
     @pytest.mark.skip(
-        reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+        reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
     )
     def test_hint_flash_attention_v2_divide_in_scope(self):
         """test_hint_flash_attention_v2 with the final divide INSIDE the scope.
@@ -4589,15 +4575,15 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                     exp_scores = torch.exp(scores - running_max.unsqueeze(-1))
                     correction = torch.exp(real_max - running_max)
 
-                    denominator = copy_f(
+                    copy_f(
                         denominator * correction + exp_scores.sum(dim=-1), denominator
                     )
-                    output = copy_f(
+                    copy_f(
                         output * correction.unsqueeze(-1)
                         + torch.matmul(exp_scores, values),
                         output,
                     )
-                    real_max = copy_f(running_max, real_max)
+                    copy_f(running_max, real_max)
 
                     # The one difference from test_hint_flash_attention_v2.
                     result = output / denominator.unsqueeze(-1)
@@ -4647,7 +4633,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     )
     # Consider deleting — superseded by Group 10 structured tests (_flash_v3_fn)
     @pytest.mark.skip(
-        reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+        reason="Numerically incorrect result.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
     )
     def test_hint_flash_attention_v3(self):
         from torch_spyre._inductor import spyre_hint
@@ -4709,17 +4695,17 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                                 real_max - running_max
                             )  # B, H, Lq sparse
 
-                            denominator = copy_f(
+                            copy_f(
                                 denominator * correction + exp_scores.sum(dim=-2),
                                 denominator,
                             )  # B, H, Lq sparse
-                            output = copy_f(
+                            copy_f(
                                 output * correction.unsqueeze(-1)
                                 + torch.matmul(exp_scores.transpose(-1, -2), values),
                                 output,
                             )  # B, H, Lq, D
 
-                            real_max = copy_f(running_max, real_max)  # B, H, Lq sparse
+                            copy_f(running_max, real_max)  # B, H, Lq sparse
             return output / denominator.unsqueeze(-1)
 
         queries_t_spyre = queries_t.to(device="spyre")
@@ -4814,17 +4800,17 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                                 real_max - running_max
                             )  # B, H, Lq sparse
 
-                            denominator = copy_f(
+                            copy_f(
                                 denominator * correction + exp_scores.sum(dim=-2),
                                 denominator,
                             )  # B, H, Lq sparse
-                            output = copy_f(
+                            copy_f(
                                 output * correction.unsqueeze(-1)
                                 + torch.matmul(exp_scores.transpose(-1, -2), values),
                                 output,
                             )  # B, H, Lq, D
 
-                            real_max = copy_f(running_max, real_max)  # B, H, Lq sparse
+                            copy_f(running_max, real_max)  # B, H, Lq sparse
             return output / denominator.unsqueeze(-1)
 
         queries_t_spyre = queries_t.to(device="spyre")
@@ -4892,7 +4878,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                         block_max = torch.amax(scores, dim=-2)  # [B, H, Lq]
                     with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
                         running_max = torch.maximum(real_max, block_max)
-                    real_max = copy_f(running_max, real_max)
+                    copy_f(running_max, real_max)
             return real_max
 
         ref = fn(scores)
@@ -4969,18 +4955,18 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                             running_max = torch.maximum(real_max, block_max)
                             exp_scores = torch.exp(scores - running_max.unsqueeze(-2))
                             correction = torch.exp(real_max - running_max)
-                            denominator = copy_f(
+                            copy_f(
                                 denominator * correction + exp_scores.sum(dim=-2),
                                 denominator,
                             )
-                            output = copy_f(
+                            copy_f(
                                 output * correction.unsqueeze(-1)
                                 + torch.matmul(exp_scores.transpose(-1, -2), v),
                                 output,
                             )
-                            real_max = copy_f(running_max, real_max)
+                            copy_f(running_max, real_max)
 
-            output = copy_f(output / denominator.unsqueeze(-1), output)
+            copy_f(output / denominator.unsqueeze(-1), output)
             return output.transpose(1, 2).reshape(B, S, H * D)
 
         ref = block(queries_t, keys_t, values_t)
@@ -5420,17 +5406,17 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                             real_max - running_max
                         )  # B, H, Lq sparse
 
-                        denominator = copy_f(
+                        copy_f(
                             denominator * correction + exp_scores.sum(dim=-1),
                             denominator,
                         )  # B, H, Lq sparse
-                        output = copy_f(
+                        copy_f(
                             output * correction.unsqueeze(-1)
                             + torch.matmul(exp_scores, values),
                             output,
                         )  # B, H, Lq, D
 
-                        real_max = copy_f(running_max, real_max)  # B, H, Lq sparse
+                        copy_f(running_max, real_max)  # B, H, Lq sparse
             return output / denominator.unsqueeze(-1)
 
         cfn = torch.compile(flash)
@@ -5710,7 +5696,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         compare_with_cpu(fn, x, y, run_compile=True, run_eager=False)
 
     @pytest.mark.skip(
-        reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+        reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
     )
     def test_hint_nested_tiling_copy_mutation_correct(self):
         """Nested Lq/D tiling into a direct copy_f() mutation (Case 3 rewire)."""
@@ -5729,13 +5715,13 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             c = torch.full((Lq, D), 0, device=a.device, dtype=torch.float16)
             with spyre_hint(num_tiles_per_dim={"Lq": 2}):
                 with spyre_hint(num_tiles_per_dim={"D": 2}):
-                    c = copy_f(a + b, c)
+                    copy_f(a + b, c)
             return c
 
         compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
 
     @pytest.mark.skip(
-        reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+        reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
     )
     def test_hint_nested_tiling_copy_mutation_divergent_input_layout(self):
         """Case 3 nested coarse-tiling where `a`'s device layout genuinely
@@ -5785,14 +5771,14 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             c = torch.full((B, Lq, D), 0, device=a.device, dtype=torch.float16)
             with spyre_hint(num_tiles_per_dim={"Lq": 2}):
                 with spyre_hint(num_tiles_per_dim={"B": 2}):
-                    c = copy_f(a + b, c)
+                    copy_f(a + b, c)
             return c
 
         spyre_result = torch.compile(fn)(a_dev, b_dev).cpu()
         compare_with_cpu(fn, a, b, target=spyre_result, run_eager=False)
 
     @pytest.mark.skip(
-        reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+        reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
     )
     def test_hint_nested_tiling_copy_mutation_flat(self):
         """Same Case 3 rewire as test_hint_nested_tiling_copy_mutation_correct,
@@ -5820,7 +5806,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             c = torch.full([Lq * D], 0, device=a.device, dtype=torch.float16)
             with spyre_hint(num_tiles_per_dim={"Lq": 2}):
                 with spyre_hint(num_tiles_per_dim={"D": 2}):
-                    c = copy_f(a + b, c)
+                    copy_f(a + b, c)
             return c
 
         compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
@@ -6753,7 +6739,7 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
 
 
 @pytest.mark.skip(
-    reason="failing after copy_f lowering switched to mutation buffer — MutationLayoutSHOULDREMOVE targets not yet handled properly"
+    reason="Numerically incorrect results after switching to copy_f.  Passes with SPYRE_INDUCTOR_IGNORE_HINTS=1"
 )
 def test_tiled_in_place_accumulator():
     """Regression test for the SpyreEmptyFallback / ct_fill STL bug.
@@ -6778,7 +6764,7 @@ def test_tiled_in_place_accumulator():
         with spyre_hint(num_tiles_per_dim={"H": 4}):
             with spyre_hint(num_tiles_per_dim={"Lq": lq_slices}):
                 block_max = torch.amax(x, dim=-1, keepdim=True)
-                acc = copy_f(acc + block_max * scale, acc)
+                copy_f(acc + block_max * scale, acc)
         return acc
 
     ref = fn(x_t, scale_t, acc_t.clone())

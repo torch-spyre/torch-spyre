@@ -298,23 +298,19 @@ def copy__cpu(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
 # Unlike aten.copy_, this op is not in noop_registry, so it is never eliminated
 # by Inductor's remove_noop_ops pass. Use this to guarantee a copy survives to
 # the coarse tile validator.
-@torch.library.custom_op("spyre::copy_f", mutates_args=(), device_types="spyre")
-def copy_f(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    result = dst.clone()
-    torch.ops.spyre.copy_(src, result)
-    return result
+@torch.library.custom_op("spyre::copy_f", mutates_args=("dst",), device_types="spyre")
+def copy_f(src: torch.Tensor, dst: torch.Tensor) -> None:
+    dst.copy_(src)
 
 
 @copy_f.register_fake
-def _(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    return dst.clone()
+def _(src: torch.Tensor, dst: torch.Tensor) -> None:
+    pass
 
 
 @torch.library.register_kernel("spyre::copy_f", ["cpu"])
-def copy_f_cpu(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    result = dst.clone()
-    result.copy_(src)
-    return result
+def copy_f_cpu(src: torch.Tensor, dst: torch.Tensor) -> None:
+    dst.copy_(src)
 
 
 # Copy input into output starting at offsets along dimensions dims and
