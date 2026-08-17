@@ -42,6 +42,7 @@ ORIGINAL TESTS (below the boundary marker)
 """
 
 import dataclasses
+import json
 import math
 import os
 import sys
@@ -6663,6 +6664,328 @@ def test_tiled_interior_lx_eligible_two_groups():
                 f"boundary producer scratch {src} (drained by {name}): "
                 f"expected LX-eligible, got {reasons[src]!r}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 (draft-unified-tiling-implementation-plan.md): a tiling stated as
+# TileSpec data and applied through CoarseTilingPass inside the scratchpad
+# pre-pass reproduces the hint path's emitted OpSpec tree.
+# ---------------------------------------------------------------------------
+
+
+def _canon_spec_tree(spec_lists) -> str:
+    """Serialize captured OpSpec/LoopSpec trees to a canonical string.
+
+    Includes everything the device is told to do (loop nesting, trip counts,
+    iteration spaces with their work divisions, per-arg device sizes /
+    coordinates / tile advances / allocation kinds) while dropping pure
+    bookkeeping: buffer names are rewritten to first-occurrence tokens (the
+    two compiles mint names in different pass orders) and debug handles are
+    skipped (provenance legitimately differs between the paths).
+    """
+    from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
+
+    def ser(node):
+        if isinstance(node, LoopSpec):
+            return {"loop": str(node.count), "body": [ser(s) for s in node.body]}
+        if isinstance(node, OpSpec):
+            return {
+                "op": node.op,
+                "is_reduction": node.is_reduction,
+                "it_space": [
+                    (str(k), str(v[0]), v[1]) for k, v in node.iteration_space.items()
+                ],
+                "args": [
+                    {
+                        "is_input": a.is_input,
+                        "arg_index": a.arg_index,
+                        "dtype": str(a.device_dtype),
+                        "device_size": [str(d) for d in a.device_size],
+                        "coords": [str(c) for c in a.device_coordinates],
+                        "alloc": sorted(a.allocation.keys())
+                        if isinstance(a.allocation, dict)
+                        else str(a.allocation),
+                        "name": a.name,
+                        "advance": str(a.device_tile_advance_expr),
+                        "arrangement": str(a.element_arrangement),
+                    }
+                    for a in node.args
+                ],
+                "tiled_symbols": [[str(s) for s in lvl] for lvl in node.tiled_symbols],
+                "trip_counts": [
+                    (str(k), str(v)) for k, v in node.tiled_symbol_trip_counts.items()
+                ],
+                "output_ranges": [str(r) for r in node.node_output_ranges]
+                if node.node_output_ranges
+                else None,
+                "op_info_keys": sorted(str(k) for k in node.op_info),
+            }
+        return {"unimplemented": getattr(node, "op", "?")}
+
+    text = json.dumps([[ser(s) for s in lst] for lst in spec_lists], indent=1)
+
+    name_re = re.compile(
+        r"\b(coarse_tile_read_copy_\w+|coarse_tile_copy_\w+|buf\d+|arg\d+_\d+)\b"
+    )
+    mapping: dict = {}
+
+    def sub(m):
+        tok = m.group(0)
+        if tok not in mapping:
+            mapping[tok] = f"B{len(mapping)}"
+        return mapping[tok]
+
+    return name_re.sub(sub, text)
+
+
+def _real_tiled_reads(loop_info):
+    """tiled_dims_per_read with loop-invariant entries dropped.
+
+    The hint path plans at pass 430, before constant promotion, so a promoted
+    scalar's read dep exists only on the 455 path — as a loop-invariant entry
+    that emits nothing. Comparing the advancing entries compares the decisions
+    that reach the device.
+    """
+    return [e for e in loop_info.tiled_dims_per_read if any(lvl for lvl in e)]
+
+
+def _loop_info_key(loop_info):
+    return (
+        loop_info.loop_group_id,
+        [str(c) for c in loop_info.loop_count],
+        loop_info.loop_tiled_dims,
+        loop_info.loop_tiled_reduction_dims,
+        _real_tiled_reads(loop_info),
+        loop_info.output_tiled_dims,
+    )
+
+
+def _compile_capturing_specs(fn, *, use_hints, choices=None):
+    """Compile ``fn`` on [512,256] fp16 inputs, capturing the emitted OpSpec
+    tree and every op's loop_info.
+
+    ``choices`` (buffer name -> TileSpec) installs a CoarseTilingPass as the
+    allocator's pre-optimization pass — the stage-1 wiring, where the choice
+    is an input. Runs under sencores=1: the 455-applied path runs after
+    work_distribution, so the ops it inserts carry no committed division —
+    joint division of inserted ops is the solver stages' deliverable, and a
+    multi-core run would diff on exactly that.
+    """
+    import contextlib
+
+    import torch_spyre._inductor.scratchpad.allocator as alloc_mod
+    from indirect_access_common import capture_op_specs
+    from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+    from torch_spyre._inductor.scratchpad.coarse_tiling import CoarseTilingPass
+
+    A, B = 512, 256
+    x = torch.randn(A, B, dtype=torch.float16) * 0.01
+    y = torch.randn(A, B, dtype=torch.float16) * 0.01
+
+    loop_infos = {}
+    op_names = []
+    orig_prepare = ScratchpadAllocator._prepare_buffers
+
+    def spy_prepare(self, graph):
+        op_names.extend(op.get_operation_name() for op in graph.operations)
+        loop_infos.update(
+            {
+                op.get_name(): op.loop_info
+                for op in graph.operations
+                if getattr(op, "loop_info", None) is not None
+            }
+        )
+        return orig_prepare(self, graph)
+
+    stack = contextlib.ExitStack()
+    orig_select = alloc_mod.select_allocator
+    if choices is not None:
+
+        def patched_select():
+            allocator = orig_select()
+            allocator.pre_optimization_passes.append(CoarseTilingPass(choices))
+            return allocator
+
+        stack.enter_context(
+            mock_patch.object(alloc_mod, "select_allocator", patched_select)
+        )
+
+    with stack, fresh_cache():
+        _pnd.reset()
+        _declare_tensor_dim("A", A)
+        _declare_tensor_dim("B", B)
+        x_dev = x.to("spyre")
+        y_dev = y.to("spyre")
+        if use_hints:
+            _name_tensor_dims(x_dev, ["A", "B"])
+            _name_tensor_dims(y_dev, ["A", "B"])
+        with (
+            config.patch(
+                {
+                    "lx_planning": True,
+                    "allow_all_ops_in_lx_planning": True,
+                    "sencores": 1,
+                }
+            ),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("torch_spyre.execution.async_compile.subprocess.run"),
+            mock_patch.object(ScratchpadAllocator, "_prepare_buffers", spy_prepare),
+            capture_op_specs() as captured,
+        ):
+            torch.compile(fn)(x_dev, y_dev)
+    return list(captured), loop_infos, op_names
+
+
+def test_tile_spec_pass_reproduces_hint_path_op_specs():
+    """One group, A÷4 over abs → add → mul: the spec trees are identical.
+
+    The hint path tiles at pass 430 (pre-stickification); the TileSpec path
+    applies the same tiling inside the scratchpad pre-pass at 455. The
+    emitted spec tree — the backend's declarative output — must be equal, so
+    the two paths agree about what the device is told to do: loop nesting and
+    trip counts, per-tile extents, tile advances, and the inserted full_buf /
+    copy ops. (R2.1 applied, R4.5's round-trip, stage-1 gate.)
+    """
+    from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
+
+    def fn_hinted(x, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                z = torch.abs(x) + y
+                return z * 2.0
+
+    def fn_plain(x, y):
+        z = torch.abs(x) + y
+        return z * 2.0
+
+    a_by_4 = TileSpec((TileAxis(0, 4),))
+    # The plain compile lowers abs/add/mul to buf0/buf1/buf2 (deterministic
+    # for this model); the choice is stage-1 input, expressed by buffer name.
+    choices = {"buf0": a_by_4, "buf1": a_by_4, "buf2": a_by_4}
+
+    ref_specs, ref_li, _ = _compile_capturing_specs(fn_hinted, use_hints=True)
+    cand_specs, cand_li, _ = _compile_capturing_specs(
+        fn_plain, use_hints=False, choices=choices
+    )
+
+    ref_tree = _canon_spec_tree(ref_specs)
+    cand_tree = _canon_spec_tree(cand_specs)
+    assert ref_tree == cand_tree, (
+        "TileSpec path diverged from the hint path's emitted spec tree:\n"
+        f"--- hint path ---\n{ref_tree}\n--- TileSpec path ---\n{cand_tree}"
+    )
+
+    # Inner check: spec-tree equality says *that* the paths agree; loop_info
+    # equality says *where* the tiling decisions landed, per op.
+    assert set(ref_li) == set(cand_li), (
+        f"tiled op sets differ: {sorted(ref_li)} vs {sorted(cand_li)}"
+    )
+    for name in sorted(ref_li):
+        assert _loop_info_key(ref_li[name]) == _loop_info_key(cand_li[name]), (
+            f"loop_info differs for {name}:\n"
+            f"  hint path: {ref_li[name]}\n"
+            f"  TileSpec path: {cand_li[name]}"
+        )
+
+
+def test_tile_spec_pass_two_groups_loop_info():
+    """Two groups (A÷4 then A÷8): grouping, ids, and loop_info round-trip.
+
+    Consecutive-run derivation splits the chain on the spec change; group ids
+    and hint ids are minted from derived bases. Full spec-tree equality is
+    deliberately not asserted here: tiling pre-stickification changes what
+    the stickifier sees, and on this model the hint path stickifies group 2's
+    [64, 256] tiles onto the A axis and inserts a full-size boundary
+    restickify (ReStickifyOpHBM) that the 455-applied path — tiling the
+    already-stickified graph — does not need. The per-op tiling decisions
+    must still match, and the 455 path staying restickify-free is pinned as
+    the R6.2 guard (the count must not regress).
+    """
+    from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
+
+    def fn_hinted(x, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                z = torch.abs(x) + y
+        with spyre_hint(num_tiles_per_dim={"A": 8}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                out = z * 2.0
+        return out
+
+    def fn_plain(x, y):
+        z = torch.abs(x) + y
+        return z * 2.0
+
+    choices = {
+        "buf0": TileSpec((TileAxis(0, 4),)),
+        "buf1": TileSpec((TileAxis(0, 4),)),
+        "buf2": TileSpec((TileAxis(0, 8),)),
+    }
+
+    ref_specs, ref_li, _ = _compile_capturing_specs(fn_hinted, use_hints=True)
+    cand_specs, cand_li, _ = _compile_capturing_specs(
+        fn_plain, use_hints=False, choices=choices
+    )
+
+    # The compute ops share names across the compiles; the copies' names
+    # embed source buffer names, so compare those via sorted loop_info keys.
+    for name in ("buf0", "buf1", "buf2"):
+        assert _loop_info_key(ref_li[name]) == _loop_info_key(cand_li[name]), (
+            f"loop_info differs for {name}:\n"
+            f"  hint path: {ref_li[name]}\n"
+            f"  TileSpec path: {cand_li[name]}"
+        )
+    # Groups round-trip: the A÷4 run lands as group (0,), the A÷8 op as (1,).
+    assert cand_li["buf0"].loop_group_id == (0,)
+    assert cand_li["buf1"].loop_group_id == (0,)
+    assert cand_li["buf2"].loop_group_id == (1,)
+
+    ref_copies = sorted(
+        _loop_info_key(li)
+        for name, li in ref_li.items()
+        if name.startswith("coarse_tile_")
+    )
+    cand_copies = sorted(
+        _loop_info_key(li)
+        for name, li in cand_li.items()
+        if name.startswith("coarse_tile_")
+    )
+    assert ref_copies == cand_copies, (
+        f"inserted copy tiling decisions differ:\n"
+        f"  hint path: {ref_copies}\n  TileSpec path: {cand_copies}"
+    )
+
+    # The documented asymmetry, pinned from both sides.
+    ref_tree = _canon_spec_tree(ref_specs)
+    cand_tree = _canon_spec_tree(cand_specs)
+    assert "ReStickifyOp" in ref_tree, (
+        "expected the hint path to carry a boundary restickify on this model"
+    )
+    assert "ReStickifyOp" not in cand_tree, (
+        "455-applied tiling must not introduce a restickify here (R6.2 guard)"
+    )
+
+
+def test_tile_spec_pass_noop_leaves_graph_unchanged():
+    """R7.3 (ordering half): a pass with nothing to do mutates nothing.
+
+    Untiled/absent choices are inert: no loop_info is stamped and no
+    coarse-tile buffers or copies are inserted.
+    """
+    from torch_spyre._inductor.scratchpad.plan_solver import TileSpec
+
+    def fn_plain(x, y):
+        z = torch.abs(x) + y
+        return z * 2.0
+
+    choices = {"buf0": TileSpec(), "not_a_buffer": TileSpec()}
+    _, loop_infos, op_names = _compile_capturing_specs(
+        fn_plain, use_hints=False, choices=choices
+    )
+    assert not loop_infos, f"no-op pass stamped loop_info: {sorted(loop_infos)}"
+    stray = [n for n in op_names if n.startswith("coarse_tile_")]
+    assert not stray, f"no-op pass inserted ops: {stray}"
 
 
 if __name__ == "__main__":
