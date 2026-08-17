@@ -2753,11 +2753,6 @@ def test_flash_tile_H():
     )
 
 
-@pytest.mark.skip(
-    reason="~34% uniform mismatch remains, B-tiling-specific but not "
-    "B-identity-dependent (squeeze/dimension-selection tile-advance bug "
-    "fixed; residual bug not yet root-caused)"
-)
 def test_flash_tile_B():
     """Flash v1: tile B÷2 only. B=2."""
     run_coarse_tile_test(

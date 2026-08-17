@@ -70,7 +70,7 @@ import torch
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.graph import GraphLowering
-from torch._inductor.utils import sympy_subs
+from torch._inductor.utils import sympy_index_symbol, sympy_subs
 from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
@@ -3730,9 +3730,12 @@ def _patch_consumers(
             _map=name_map,
             _info=retile_info if has_retile else None,
             _orig=orig_inner,
+            _consumer=consumer,
         ):
             if _info is not None:
-                handler = _NameAndIndexSwapHandler(V.ops, _map, {old_name: _info})
+                handler = _NameAndIndexSwapHandler(
+                    V.ops, _map, {old_name: _info}, _consumer
+                )
             else:
                 handler = NameSwapHandler(V.ops, _map)
             with V.set_ops_handler(handler):
@@ -3820,10 +3823,103 @@ def _patch_consumers(
             )
 
 
+def _squeezed_retile_dims(
+    info: _RetiledBufferInfo, consumer: ComputedBuffer
+) -> list[int]:
+    """Raw dims squeezed out of the old (tile-local) buffer but real in new.
+
+    A dim with ``old_size[d] == 1`` has no ``d{i}`` symbol in an incoming
+    load index at all -- Inductor's ``SqueezeView.squeezer`` drops unit-size
+    dims unconditionally when the *reader's own* index for that dim was
+    derived against this buffer's (by-then tile-local, size-1) layout, so
+    ``compute_tile_index``/``_retile_load_index`` has no atom to rescale for
+    that dim: rescaling can only touch coefficients already present in the
+    incoming index (see ``_retile_load_index``'s docstring). Restricted to
+    dims where ``new_stride[d] != 0`` -- a dim that stays size-1 (or
+    genuinely strideless) in the new buffer too contributes nothing and
+    needs no term.
+
+    Also restricted to dims where the *consumer's own* output is non-unit
+    for that raw dim (``consumer.data.ranges[d] != 1``). When the consumer's
+    own output dim is unit-size too (e.g. a coarse-tiled dim of extent 1,
+    such as B=1 when only H is tiled), there is no real loop variable for it
+    anywhere in this trace -- the consumer's own write index squeezes it out
+    exactly like the read did, so its only valid coordinate is the constant
+    0, not a symbol. Minting one anyway causes a name collision with an
+    unrelated, already-present symbol in the same dense numbering scheme
+    (both derived independently, so nothing stops them picking the same
+    name for two different logical slots), silently corrupting that other
+    symbol's coefficient instead of erroring.
+    """
+    return [
+        d
+        for d in range(len(info.old_size))
+        if info.old_size[d] == 1
+        and info.new_stride[d] != sympy.S.Zero
+        and int(consumer.data.ranges[d]) != 1
+    ]
+
+
+def _index_var_prefix(free_symbols: "OrderedSet[Expr] | set[Expr]") -> str:
+    """Infer the live loop-variable naming prefix from an index's own symbols.
+
+    ``index_vars_squeeze``/``index_vars_no_squeeze`` number loop variables
+    densely as ``f"{prefix}{i}"`` -- but the prefix varies across the
+    different retracing passes that reuse this same redirect machinery
+    (``d0``, ``q0``, ``_i0``, ``i0``, ... have all been observed for the
+    exact same logical dimension at different call sites/passes). Minting a
+    hardcoded ``d{i}`` symbol is only correct when the live trace happens to
+    use that exact prefix; otherwise the minted symbol is foreign to this
+    trace's variable space and later stages that concretize "unknown"
+    symbols (e.g. ``concretize_index`` treating it as a size symbol) will
+    silently replace it with a constant, dropping the dimension again after
+    _retile_load_index believed it had restored it. Detect the real prefix
+    from any sibling symbol already present in the index instead of
+    assuming one.
+    """
+    for sym in free_symbols:
+        name = sym.name
+        i = len(name)
+        while i > 0 and name[i - 1].isdigit():
+            i -= 1
+        if i < len(name):
+            return name[:i]
+    return "d"
+
+
+def _consumer_own_dim_symbol(
+    consumer: ComputedBuffer, dim: int, prefix: str = "d"
+) -> Expr:
+    """The consumer's own loop-variable symbol for raw output dim ``dim``.
+
+    Mirrors ``SpyreKernel._host_dim_to_index_symbol``'s squeeze arithmetic:
+    Inductor's ``index_vars_squeeze`` numbers loop variables densely (as
+    ``f"{prefix}{i}"``) over ``consumer.data.ranges``'s non-unit dims only,
+    so ``{prefix}{dim}`` is the correct symbol only when no unit dim
+    precedes it. ``consumer`` is the outside consumer being redirected
+    (e.g. ``div``), not the buffer it reads -- its own output ranges are
+    never squeezed by the redirect (only the *read* buffer's tile-local
+    layout was), so this always yields a real, live loop symbol already
+    used elsewhere in the consumer's index (e.g. by an unretiled sibling
+    read), PROVIDED ``prefix`` matches the naming convention live in that
+    index -- see ``_index_var_prefix``, which callers should use to derive
+    it rather than assuming the default.
+    """
+    it_idx = 0
+    mapped = dim
+    for host_idx, r in enumerate(consumer.data.ranges):
+        if int(r) != 1:
+            if host_idx == dim:
+                mapped = it_idx
+            it_idx += 1
+    return sympy_index_symbol(f"{prefix}{mapped}")
+
+
 def _retile_load_index(
     buf_name: str,
     index: Expr,
     info: _RetiledBufferInfo,
+    consumer: "ComputedBuffer | None" = None,
 ) -> Expr:
     """Rewrite a load index using compute_tile_index.  Raises Unsupported if
     the index cannot be decomposed (non-affine, or stride not in info.old_stride).
@@ -3831,6 +3927,21 @@ def _retile_load_index(
     Used by _RetileLoadIndexHandler and _NameAndIndexSwapHandler during real
     codegen.  In both cases the incoming index has coefficients equal to
     info.old_stride and the call rewrites them to info.new_stride.
+
+    When ``consumer`` is given AND has no loop_info of its own (i.e. it is an
+    "outside" consumer with no enclosing coarse-tile loop nest), any dim
+    squeezed out of the old (tile-local) buffer but real in the new (full)
+    buffer -- see _squeezed_retile_dims -- is added back as an explicit
+    ``consumer``-own-symbol * new_stride term, since compute_tile_index
+    cannot rescale a coefficient that isn't in the incoming index at all.
+    Inside consumers (those with their own loop_info) are never patched this
+    way: their incoming index is already derived from a real, enclosing loop
+    nest via normal codegen and already carries a correct term for every
+    real dimension -- adding another would double-count it. Only meaningful
+    for the tile->full ("grow") direction (_NameAndIndexSwapHandler); the
+    full->tile direction (_RetileLoadIndexHandler) never needs this --
+    shrinking a buffer's own layout for a group-internal consumer doesn't
+    lose dims from its index.
 
     The two handlers run in opposite directions:
     - _RetileLoadIndexHandler: full→tile (old_stride are the full strides,
@@ -3854,15 +3965,38 @@ def _retile_load_index(
 
     loop_syms = index.free_symbols
     if not loop_syms:
-        return index
+        new_index = index
+    else:
+        new_index = compute_tile_index(
+            index,
+            {sym: 1 for sym in loop_syms},
+            info.old_size,
+            info.old_stride,
+            info.new_stride,
+        )
 
-    new_index = compute_tile_index(
-        index,
-        {sym: 1 for sym in loop_syms},
-        info.old_size,
-        info.old_stride,
-        info.new_stride,
-    )
+    if consumer is not None:
+        for d in _squeezed_retile_dims(info, consumer):
+            # A consumer read by multiple _patch_consumers redirects (e.g.
+            # buf24 reading both a _divide_ranges-mutated buffer and a
+            # reduction accumulator) has its inner_fn wrapped more than
+            # once. By the time a later wrap sees this index, an earlier
+            # wrap may already have contributed a term for this exact dim
+            # -- under whatever loop-symbol naming convention was live at
+            # that earlier wrap's call site (which varies across retracing
+            # passes: d0, i0, q0, ... are all seen for the same logical
+            # dim). Detect that by coefficient, not by a hardcoded symbol
+            # name: if some free symbol already carries coefficient
+            # new_stride[d], this dim's term is already present and must
+            # not be added again.
+            already_present = any(
+                new_index.coeff(s) == info.new_stride[d] for s in new_index.free_symbols
+            )
+            if not already_present:
+                prefix = _index_var_prefix(new_index.free_symbols)
+                sym = _consumer_own_dim_symbol(consumer, d, prefix)
+                new_index += sym * info.new_stride[d]
+
     logger.debug(
         "coarse_tile: retiled load index for %s: %s -> %s",
         buf_name,
@@ -3902,14 +4036,18 @@ class _NameAndIndexSwapHandler(WrapperHandler):
         inner,
         name_map: dict[str, str],
         infos_by_old_name: dict[str, _RetiledBufferInfo],
+        consumer: "ComputedBuffer | None" = None,
     ):
         super().__init__(inner)
         self._name_map = name_map
         self._infos_by_old_name = infos_by_old_name
+        self._consumer = consumer
 
     def load(self, name, index):
         if name in self._infos_by_old_name:
-            index = _retile_load_index(name, index, self._infos_by_old_name[name])
+            index = _retile_load_index(
+                name, index, self._infos_by_old_name[name], self._consumer
+            )
         return super().load(self._name_map.get(name, name), index)
 
 

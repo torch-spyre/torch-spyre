@@ -1041,7 +1041,14 @@ def compute_restickify_target_layout(
     stick_size = get_elem_in_stick(host_layout.dtype)
     old_sd_outer_dim = next(
         (j for j in range(len(idc) - 1) if old_var in idc[j].free_symbols),
-        next((j for j in range(len(idc) - 1) if idc[j] == sympy.S.Zero), None),
+        next(
+            (
+                j
+                for j in range(len(idc) - 1)
+                if idc[j] == sympy.S.Zero and stl.device_size[j] == 1
+            ),
+            None,
+        ),
     )
     if old_sd_outer_dim is None:
         return None
