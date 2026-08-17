@@ -295,9 +295,9 @@ def copy__cpu(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
 
 
 # Functional (out-of-place) wrapper for spyre::copy_.
-# Returns a new tensor equal to dst with src written into it.
-# The graph sees a pure value-producing node; Inductor's reinplacer will
-# rewrite copy_f → copy_ (in-place) wherever it is safe to do so.
+# Unlike aten.copy_, this op is not in noop_registry, so it is never eliminated
+# by Inductor's remove_noop_ops pass. Use this to guarantee a copy survives to
+# the coarse tile validator.
 @torch.library.custom_op("spyre::copy_f", mutates_args=(), device_types="spyre")
 def copy_f(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
     result = dst.clone()
@@ -310,9 +310,16 @@ def _(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
     return dst.clone()
 
 
-inplaceable_ops[torch.ops.spyre.copy_f.default] = InplaceableOp(
-    torch.ops.spyre.copy_.default, 1
-)
+@torch.library.register_kernel("spyre::copy_f", ["cpu"])
+def copy_f_cpu(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+    result = dst.clone()
+    result.copy_(src)
+    return result
+
+
+# inplaceable_ops[torch.ops.spyre.copy_f.default] = InplaceableOp(
+#     torch.ops.spyre.copy_.default, 1
+# )
 
 
 # Copy input into output starting at offsets along dimensions dims and
