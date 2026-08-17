@@ -1266,26 +1266,41 @@ def lower_spyre_from_d2d(src, dst, src_off, dst_off):
 
 @register_spyre_lowering(torch.ops.spyre.copy_)
 def lower_spyre_copy_(src, dst):
-    src = lowering.to_dtype(src, dst.get_dtype())
-    src = lowering.expand(src, dst.get_size())
-    return Pointwise.create(
-        device=dst.get_device(),
-        dtype=dst.get_dtype(),
-        inner_fn=src.make_loader(),
-        ranges=list(dst.get_size()),
-    )
+    lowering.mutate_to(dst, src)
+    return dst
 
 
 @register_spyre_lowering(torch.ops.spyre.copy_f)
 def lower_spyre_copy_f(src, dst):
     src = lowering.to_dtype(src, dst.get_dtype())
     src = lowering.expand(src, dst.get_size())
-    return Pointwise.create(
+
+    pw = Pointwise.create(
         device=dst.get_device(),
         dtype=dst.get_dtype(),
         inner_fn=src.make_loader(),
         ranges=list(dst.get_size()),
     )
+
+    dst.realize()
+
+    try:
+        from torch._inductor.ir import MutationLayoutSHOULDREMOVE
+    except ImportError:
+        raise RuntimeError(
+            "spyre::copy_f lowering: MutationLayoutSHOULDREMOVE is not available. "
+            "Upstream likely removed/renamed it."
+        )
+
+    buffer = ir.ComputedBuffer(
+        name=None,
+        layout=MutationLayoutSHOULDREMOVE(dst),
+        data=pw.data.data,
+    )
+    buffer.name = V.graph.register_buffer(buffer)
+    V.graph.register_operation(buffer)
+
+    return dst
 
 
 @register_spyre_lowering(torch.ops.spyre.overwrite)

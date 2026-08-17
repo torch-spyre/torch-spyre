@@ -317,11 +317,6 @@ def copy_f_cpu(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
     return result
 
 
-# inplaceable_ops[torch.ops.spyre.copy_f.default] = InplaceableOp(
-#     torch.ops.spyre.copy_.default, 1
-# )
-
-
 # Copy input into output starting at offsets along dimensions dims and
 # return the updated output.
 @torch.library.custom_op(
