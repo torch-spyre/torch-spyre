@@ -25,6 +25,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
 )
 from torch_spyre._inductor.scratchpad.permutation_layout import (
+    NativePermutationLayoutSolver,
     PermutationBasedLayoutSolver,
     buffer_quality,
 )
@@ -37,6 +38,7 @@ from torch_spyre._inductor.scratchpad.cooling_schedules import (
 from torch_spyre._inductor.scratchpad.simulated_annealing import (
     SimulatedAnnealingLayoutSolver,
 )
+from torch_spyre._inductor import config
 
 # Heavy randomized anneals over many seeds, larger problems and longer
 # schedules. Skipped by default (slow); opt in with the env var.
@@ -431,6 +433,60 @@ class SimulatedAnnealingTests(TestCase):
 
             _assert_feasible(buffers, cap)
             self.assertGreaterEqual(_committed_total(buffers), initial_quality, seed)
+
+
+class NativePackerEquivalenceTests(TestCase):
+    """The C++ packer is the default accelerator and must reproduce the canonical
+    Python packer exactly. Native quality is bit-exact against Python and the RNG
+    is seeded, so the entire annealing trajectory -- and hence the finalized
+    buffer addresses, the plan quality, and the committed permutation -- must be
+    IDENTICAL whether the search runs on the Python packer or the native one.
+    Any divergence here is a wiring/parity bug, not a tolerance to loosen."""
+
+    def _run(self, buffers, capacity, initial, seed, *, native):
+        # The factory reads config.native_layout_packer at construction time, so
+        # the knob must be patched across the whole solver lifetime (construct +
+        # solve + the reconstruction in solve() + finalize).
+        with config.patch(native_layout_packer=native):
+            solver = SimulatedAnnealingLayoutSolver(
+                buffers,
+                capacity,
+                128,
+                initial=initial,
+                schedule=_short_schedule(),
+                random=rnd.Random(seed),
+            )
+            # Guard against the knob silently selecting the wrong packer and
+            # masking a real divergence: with the flag set we must actually be
+            # running on the C++ solver.
+            if native:
+                self.assertIsInstance(solver.plan, NativePermutationLayoutSolver)
+            else:
+                self.assertIsInstance(solver.plan, PermutationBasedLayoutSolver)
+            solver.solve()
+            solver.finalize()
+            return (
+                [b.address for b in buffers],
+                solver.plan.quality(),
+                list(solver.plan.permutation),
+            )
+
+    def test_python_and_native_produce_identical_plans(self):
+        for seed in range(40):
+            rng = rnd.Random(seed)
+            n = rng.randint(2, 8)
+            buffers = _random_buffers(rng, n)
+            cap = max(b.size for b in buffers) * rng.randint(2, 4)
+            initial = list(range(n))
+            rng.shuffle(initial)
+
+            py = self._run(
+                copy.deepcopy(buffers), cap, list(initial), seed, native=False
+            )
+            nat = self._run(
+                copy.deepcopy(buffers), cap, list(initial), seed, native=True
+            )
+            self.assertEqual(py, nat, f"seed={seed}")
 
 
 @unittest.skipUnless(
