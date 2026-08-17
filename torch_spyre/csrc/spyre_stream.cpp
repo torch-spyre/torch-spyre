@@ -192,8 +192,8 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     auto& storage = spyre_impl->storage();
     auto* ctx = static_cast<SharedOwnerCtx*>(storage.data_ptr().get_context());
 
-    DataConversionInfo dci = generate_dci(
-        cpu_tensor, dev_tensor, stl, cpu_tensor->storage_offset(), host2device);
+    DataConversionInfo dci =
+        generate_dci(cpu_tensor, dev_tensor, stl, host2device);
 
     copyAsyncImpl(cpu_ptr, &ctx->composite_addr, &dci, host2device);
 
