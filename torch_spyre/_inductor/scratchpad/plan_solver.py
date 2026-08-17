@@ -90,18 +90,111 @@ class LifetimeBoundBuffer:
         return self.start_time < other.end_time and other.start_time < self.end_time
 
 
+@dataclass(frozen=True)
+class TileAxis:
+    """One coarse-tile level: tile ``host_dim`` into ``count`` equal tiles.
+
+    ``host_dim`` is a positional index into the op's output coordinates
+    (``op_out_coords(op)``), or -- when ``is_reduction`` -- into the op's
+    ordered reduction loop variables. That is the frame ``coarse_tile``
+    ultimately consumes and the one ``op_it_space_splits`` already uses.
+    """
+
+    host_dim: int
+    count: int
+    is_reduction: bool = False
+
+    def __post_init__(self):
+        # A count of 1 is a no-op level (the hint path drops split_count==1
+        # outright); the untiled plan is the *empty* TileSpec, never a
+        # unit-count axis.
+        assert self.count >= 2, f"TileAxis count must be >= 2, got {self.count}"
+        assert self.host_dim >= 0, (
+            f"TileAxis host_dim must be >= 0, got {self.host_dim}"
+        )
+
+
+@dataclass(frozen=True)
+class TileSpec:
+    """A coarse tiling as data: an ordered, outermost-first tuple of levels.
+
+    Ordered, where core-division splits are dicts, because tile levels nest --
+    swapping two levels is a different plan. Frozen and hashable so ``==`` is
+    the "same tiling shape" test group derivation runs on. ``TileSpec()`` is
+    the untiled plan; note *undecided* is expressed by
+    ``chosen_division is None`` on the buffer, never by an empty spec.
+    """
+
+    axes: tuple[TileAxis, ...] = ()
+
+    def __post_init__(self):
+        # Accept any iterable of TileAxis but store a tuple, so instances
+        # stay hashable regardless of how callers built the sequence.
+        if not isinstance(self.axes, tuple):
+            object.__setattr__(self, "axes", tuple(self.axes))
+
+    @property
+    def is_untiled(self) -> bool:
+        return not self.axes
+
+    @property
+    def depth(self) -> int:
+        """Nesting depth of the tile loop this spec describes."""
+        return len(self.axes)
+
+    @property
+    def tile_count(self) -> int:
+        """Total trip count of the tile-loop nest (1 when untiled)."""
+        return math.prod(ax.count for ax in self.axes)
+
+    @property
+    def output_tile_count(self) -> int:
+        """How many tiles the op's own output write is sliced into.
+
+        Excludes reduction levels: tiling a reduction axis chunks the *input*
+        walk while the per-tile output scratch (the accumulator) keeps the
+        full output extent, so only output-axis counts shrink the footprint.
+        """
+        return math.prod(ax.count for ax in self.axes if not ax.is_reduction)
+
+    @property
+    def is_clean(self) -> bool:
+        """True when no reduction axis is tiled (no partial-sum combining)."""
+        return not any(ax.is_reduction for ax in self.axes)
+
+    @property
+    def label(self) -> str:
+        return (
+            " ".join(
+                f"{'~' if ax.is_reduction else ''}d{ax.host_dim}/{ax.count}"
+                for ax in self.axes
+            )
+            or "untiled"
+        )
+
+
 @dataclass
 class CoreDivision:
-    """One permissible core-division of a buffer's producing op.
+    """One permissible partition config of a buffer's producing op: a core
+    division paired with the coarse tiling it is legal under.
 
     ``output_splits`` / ``reduction_splits`` are the stride/coeff-keyed encoding
     produced by :func:`pass_utils.splits_by_index_coeff` -- exactly the shape
     stored in ``op.op_it_space_splits``. Solvers are expected to use these to size
     the buffer (per-core footprint = total / ``output_partition``).
+
+    ``tiling`` is *part of the candidate*, not a parallel choice: a division is
+    only meaningful relative to a tiling. Tiling changes both the legal split
+    set (per-dim divisibility and per-core span move in opposite directions)
+    and the coeff-keyed encoding itself (``_divide_ranges`` rewrites the index
+    expressions the keys come from), so a division carried across tilings is
+    uninterpretable. The empty spec is the untiled candidate, and with
+    auto coarse tiling off the field is inert.
     """
 
     output_splits: dict[int, int] = field(default_factory=dict)
     reduction_splits: dict[int, int] = field(default_factory=dict)
+    tiling: TileSpec = TileSpec()
 
     @property
     def cores_used(self) -> int:
@@ -130,7 +223,10 @@ class CoreDivision:
     def label(self) -> str:
         out = ",".join(f"s{s}/{f}" for s, f in sorted(self.output_splits.items()))
         red = ",".join(f"~s{s}/{f}" for s, f in sorted(self.reduction_splits.items()))
-        return " ".join(p for p in (out, red) if p) or "whole"
+        base = " ".join(p for p in (out, red) if p) or "whole"
+        if self.tiling.is_untiled:
+            return base
+        return f"{base} tile[{self.tiling.label}]"
 
 
 @dataclass
@@ -158,11 +254,17 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     def min_footprint(self) -> int:
         """Smallest per-core footprint any candidate division allows. With no
         candidates there is nothing to divide by, so it falls back to ``size``
-        (the placement-only case ``_wrap`` also dispatches on)."""
+        (the placement-only case ``_wrap`` also dispatches on).
+
+        A tiled candidate's own buffer is per-tile scratch, so its footprint
+        divides by the output tile count as well as the core partition -- this
+        is where coarse tiling's LX-residency win enters the capacity math.
+        """
         if not self.core_divisions:
             return self.size
         return min(
-            ceil_div(self.size, cd.output_partition) for cd in self.core_divisions
+            ceil_div(self.size, cd.output_partition * cd.tiling.output_tile_count)
+            for cd in self.core_divisions
         )
 
 

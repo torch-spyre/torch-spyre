@@ -14,6 +14,7 @@
 
 """Tests for layout solvers"""
 
+import dataclasses
 import json
 import os
 import subprocess
@@ -30,6 +31,8 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
     CoreDivisionBuffer,
     LifetimeBoundBuffer,
+    TileAxis,
+    TileSpec,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 
@@ -1361,6 +1364,90 @@ class TestTopologicalSort(TestCase):
             self._names([root, mid, a, b], lambda buf: -buf.size),
             ["root", "mid", "b", "a"],
         )
+
+
+class TestTileSpecRepresentation(TestCase):
+    """R2.1: a coarse tiling is candidate data paired onto the division.
+
+    ``TileAxis``/``TileSpec`` and ``CoreDivision.tiling`` are the stage-1
+    representation of draft-unified-tiling-implementation-plan.md — one
+    candidate list whose element pairs division and tiling, not two lists.
+    """
+
+    def test_untiled_default(self):
+        spec = TileSpec()
+        self.assertTrue(spec.is_untiled)
+        self.assertEqual(spec.depth, 0)
+        self.assertEqual(spec.tile_count, 1)
+        self.assertEqual(spec.output_tile_count, 1)
+        self.assertTrue(spec.is_clean)
+        self.assertEqual(spec.label, "untiled")
+
+    def test_derived_scalars(self):
+        spec = TileSpec((TileAxis(0, 4), TileAxis(1, 2, is_reduction=True)))
+        self.assertFalse(spec.is_untiled)
+        self.assertEqual(spec.depth, 2)
+        self.assertEqual(spec.tile_count, 8)
+        # The reduction level chunks the input walk; the per-tile output
+        # scratch keeps the full output extent, so it is excluded here.
+        self.assertEqual(spec.output_tile_count, 4)
+        self.assertFalse(spec.is_clean)
+        self.assertEqual(spec.label, "d0/4 ~d1/2")
+
+    def test_equality_is_shared_shape_and_order_matters(self):
+        a = TileSpec((TileAxis(0, 4), TileAxis(1, 2)))
+        b = TileSpec((TileAxis(0, 4), TileAxis(1, 2)))
+        swapped = TileSpec((TileAxis(1, 2), TileAxis(0, 4)))
+        self.assertEqual(a, b)
+        self.assertEqual(hash(a), hash(b))
+        # Tile levels nest, so order is meaning: swapping two levels is a
+        # different plan (unlike core-division splits, which are a product).
+        self.assertNotEqual(a, swapped)
+
+    def test_unit_count_axis_rejected(self):
+        # Tiling by 1 is a no-op level; the untiled plan is the empty spec.
+        with self.assertRaises(AssertionError):
+            TileAxis(0, 1)
+
+    def test_core_division_defaults_untiled(self):
+        cd = CoreDivision(output_splits={256: 4})
+        self.assertTrue(cd.tiling.is_untiled)
+
+    def test_min_footprint_divides_by_output_tile_count(self):
+        buf = CoreDivisionBuffer(
+            "b",
+            1024,
+            [0, 3],
+            core_divisions=[
+                CoreDivision(
+                    output_splits={256: 2},
+                    tiling=TileSpec((TileAxis(0, 4),)),
+                ),
+            ],
+        )
+        self.assertEqual(buf.min_footprint, 1024 // (2 * 4))
+
+    def test_min_footprint_reduction_tiling_keeps_output_extent(self):
+        buf = CoreDivisionBuffer(
+            "b",
+            1024,
+            [0, 3],
+            core_divisions=[
+                CoreDivision(
+                    tiling=TileSpec((TileAxis(0, 4, is_reduction=True),)),
+                ),
+            ],
+        )
+        self.assertEqual(buf.min_footprint, 1024)
+
+    def test_no_parallel_tiling_candidate_list(self):
+        # Negative (R2.1): the tiling pairs with the division on ONE indexed
+        # candidate list. A second list beside core_divisions would imply a
+        # free cross product, which the coeff-keyed split encoding cannot
+        # support — the same conflation shape as the shipped signature bug.
+        field_names = {f.name for f in dataclasses.fields(CoreDivisionBuffer)}
+        self.assertIn("core_divisions", field_names)
+        self.assertFalse({"tilings", "tile_specs", "tiling_candidates"} & field_names)
 
 
 if __name__ == "__main__":
