@@ -1,4 +1,5 @@
 test_suite_config:
+  labels: [trunk]
   files:
     # Classes exercised here:
     #   TestProfiler, TestExperimentalUtils, TestProfilerEventsParity

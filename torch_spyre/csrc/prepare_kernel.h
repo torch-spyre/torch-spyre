@@ -30,6 +30,12 @@
 
 namespace spyre {
 
+// flex's callback mirror and libaiupti's AIUpti_ActivityCompute::name are
+// assumed to have the same extent. The profiler-enabled build exercises both
+// sides of this transport contract.
+inline constexpr size_t kAIUptiActivityNameMaxBytes =
+    sizeof(flex::aiupti::AIUpti_ActivityCB::name) - 1;
+
 /**
  * @brief Builder class for constructing JobPlan from SpyreCode
  *
@@ -45,8 +51,11 @@ class JobPlanBuilder {
    * @param spyrecode_dir Path to the SpyreCode directory
    * @param stream Optional stream to use for init transfers. If nullptr, uses
    * the current stream from getCurrentStream()
+   * @param profiler_name Optional bounded base name for profiler-visible
+   * compute events. A JobExecPlan step suffix is added to each compute command.
    */
-  JobPlanBuilder(const std::string& spyrecode_dir, const SpyreStream* stream);
+  JobPlanBuilder(const std::string& spyrecode_dir, const SpyreStream* stream,
+                 std::optional<std::string> profiler_name = std::nullopt);
 
   /**
    * @brief Build the JobPlan
@@ -136,6 +145,8 @@ class JobPlanBuilder {
   nlohmann::json spyrecode_json_;
   /// Stream used for initialization transfers during preparation
   const SpyreStream stream_;
+  /// Optional compiler-generated base name for profiler-visible compute events
+  const std::optional<std::string> profiler_name_;
   /// Device memory allocation for the job (set during preparation and moved to
   /// JobPlan in translation)
   std::vector<flex::CompositeAddress> job_allocation_;
@@ -178,9 +189,12 @@ class JobPlanBuilder {
  * @param spyrecode_dir Path to the SpyreCode directory
  * @param stream Optional stream to use for init transfers. If nullptr, uses the
  * current stream from getCurrentStream()
+ * @param profiler_name Optional bounded base name for profiler-visible compute
+ * events. A JobExecPlan step suffix is added to each compute command.
  * @return Prepared JobPlan
  */
-std::unique_ptr<JobPlan> prepareKernel(const std::string& spyrecode_dir,
-                                       const SpyreStream* stream = nullptr);
+std::unique_ptr<JobPlan> prepareKernel(
+    const std::string& spyrecode_dir, const SpyreStream* stream = nullptr,
+    std::optional<std::string> profiler_name = std::nullopt);
 
 }  // namespace spyre

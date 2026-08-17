@@ -130,15 +130,11 @@ def _(
 
 @torch.library.custom_op("spyre::topkvalue", mutates_args=(), device_types="spyre")
 def topkvalue(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
-    if len(x.size()) != 2:
-        raise Unsupported("topk only implemented for 2-D tensors")
     pass
 
 
 @topkvalue.register_fake
 def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
-    if len(x.size()) != 2:
-        raise Unsupported("topk only implemented for 2-D tensors")
     norm_dim = dim % len(x.size())
     out_size = list(x.size())
     out_size[norm_dim] = k
@@ -147,15 +143,11 @@ def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
 
 @torch.library.custom_op("spyre::topkindex", mutates_args=(), device_types="spyre")
 def topkindex(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
-    if len(x.size()) != 2:
-        raise Unsupported("topk only implemented for 2-D tensors")
     pass
 
 
 @topkindex.register_fake
 def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
-    if len(x.size()) != 2:
-        raise Unsupported("topk only implemented for 2-D tensors")
     norm_dim = dim % len(x.size())
     out_size = list(x.size())
     out_size[norm_dim] = k
@@ -590,6 +582,74 @@ def batched_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:  # type: i
 def _(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     output_shape = list(x.shape[:-1]) + [y.shape[-1]]
     return x.new_empty(output_shape)
+
+
+@torch.library.custom_op("spyre::conv2d", mutates_args=(), device_types="spyre")
+def spyre_conv2d(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    groups: int,
+) -> torch.Tensor:  # type: ignore[empty-body]
+    pass
+
+
+@spyre_conv2d.register_fake
+def _(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    groups: int,
+) -> torch.Tensor:
+    # Compute output shape: (N, C_out, H_out, W_out)
+    N, C_in, H_in, W_in = input.shape
+    C_out, C_in_g, kH, kW = weight.shape
+
+    H_out = (H_in + 2 * padding[0] - dilation[0] * (kH - 1) - 1) // stride[0] + 1
+    W_out = (W_in + 2 * padding[1] - dilation[1] * (kW - 1) - 1) // stride[1] + 1
+
+    output_shape = [N, C_out, H_out, W_out]
+    return input.new_empty(output_shape)
+
+
+@torch.library.custom_op(
+    "spyre::conv2d_with_bias", mutates_args=(), device_types="spyre"
+)
+def spyre_conv2d_with_bias(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    groups: int,
+) -> torch.Tensor:  # type: ignore[empty-body]
+    pass
+
+
+@spyre_conv2d_with_bias.register_fake
+def _(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    groups: int,
+) -> torch.Tensor:
+    # Compute output shape: (N, C_out, H_out, W_out)
+    N, C_in, H_in, W_in = input.shape
+    C_out, C_in_g, kH, kW = weight.shape
+
+    H_out = (H_in + 2 * padding[0] - dilation[0] * (kH - 1) - 1) // stride[0] + 1
+    W_out = (W_in + 2 * padding[1] - dilation[1] * (kW - 1) - 1) // stride[1] + 1
+
+    output_shape = [N, C_out, H_out, W_out]
+    return input.new_empty(output_shape)
 
 
 @torch.library.custom_op("spyre::constant", mutates_args=(), device_types="spyre")

@@ -17,6 +17,17 @@ inputs:
     required: false
     type: string
     default: torch-spyre
+  runner_labels:
+    description: |
+      The runner-label selectors the caller requested in its `runs-on`
+      (a JSON array string, e.g. '["x86_64","spyre_pf_x1","linux",
+      "image_spyre_backend"]'). The matrix strategy parameterizes these
+      per job, so echoing them shows which labels routed this specific
+      run. Optional: when empty, only the resolved runner identity is
+      printed.
+    required: false
+    type: string
+    default: ''
 
 runs:
   using: composite
@@ -26,10 +37,27 @@ runs:
       env:
         VERBOSE: ${{ inputs.verbose }}
         TORCH_SPYRE_DIR: ${{ inputs.torch_spyre_dir }}
+        # The runner-label selectors the caller passed to `runs-on`. GHA
+        # does not expose the resolved `runs-on` array to the running job,
+        # so the caller forwards the exact expression it used.
+        REQUESTED_RUNNER_LABELS: ${{ inputs.runner_labels }}
+        # Built-in contexts describing the runner GHA actually selected.
+        RUNNER_NAME: ${{ runner.name }}
+        RUNNER_OS: ${{ runner.os }}
+        RUNNER_ARCH: ${{ runner.arch }}
       run: |
         source "$HOME/.bashrc"
         source /etc/profile.d/ibm-aiu-setup.sh
         echo "================================="
+        echo "--- runner labels ---"
+        # Requested labels: the `runs-on` selectors the matrix job asked
+        # for. Resolved identity: the runner GHA matched to them. Together
+        # these make it clear which labels a given run used.
+        echo "REQUESTED_RUNNER_LABELS ${REQUESTED_RUNNER_LABELS:-<none>}"
+        echo "RUNNER_NAME $RUNNER_NAME"
+        echo "RUNNER_OS $RUNNER_OS"
+        echo "RUNNER_ARCH $RUNNER_ARCH"
+        echo "---------------------------------"
         date
         pwd
         whoami

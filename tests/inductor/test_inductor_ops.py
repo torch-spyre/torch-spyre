@@ -31,6 +31,8 @@ from utils_inductor import (
     compare_with_pytorch,
 )
 import utils_inductor
+from unittest import mock
+from torch_spyre._inductor import config as inductor_config
 from torch._inductor.utils import run_and_get_code
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
 from torch_spyre._inductor.constants import IDENTITY_OP
@@ -1178,11 +1180,42 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_topk", "test_topk_cpu"): {
             "param_sets": {
+                "2d_k1_dim0": (unique_randn_along_dim((64, 256), dim=0), 1, 0),
                 "2d_k4_dim0": (unique_randn_along_dim((64, 256), dim=0), 4, 0),
                 "2d_k4_dim_minusone": (
                     unique_randn_along_dim((64, 256), dim=-1),
                     4,
                     -1,
+                ),
+                "3d_k2_dim1": (
+                    unique_randn_along_dim((64, 71, 256), dim=1),
+                    2,
+                    1,
+                ),
+                "3d_k3_dim1": (
+                    unique_randn_along_dim((67, 71, 256), dim=1),
+                    3,
+                    1,
+                ),
+                "3d_k4_dim0": (
+                    unique_randn_along_dim((67, 71, 256), dim=0),
+                    4,
+                    0,
+                ),
+                "4d_k2_dim1": (
+                    unique_randn_along_dim((6, 17, 7, 64), dim=1),
+                    2,
+                    1,
+                ),
+                "4d_k3_dim2": (
+                    unique_randn_along_dim((6, 17, 7, 64), dim=2),
+                    3,
+                    2,
+                ),
+                "4d_k4_dim0": (
+                    unique_randn_along_dim((6, 17, 7, 64), dim=0),
+                    4,
+                    0,
                 ),
                 # "2d_k4_dim0_lessthanstick": (unique_randn_along_dim((8, 32), dim=0), 4, 0),
                 # "2d_k4_dim_minusone_lessthanstick": (unique_randn_along_dim((1, 32), dim=-1), 4, -1),
@@ -2788,11 +2821,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             "expect_fail": ["8_groups"],
         },
+        # beta is a Python constant folded into the traced graph. beta=2 stays
+        # on the log branch; beta=50 pushes most elements past the threshold;
+        # beta=0 is legal in aten and saturates every element to +inf.
         ("test_softplus", "test_softplus_cpu"): {
             "param_sets": {
-                "2d": (cached_randn((256, 128), dtype=torch.float16),),
-                "3d": (cached_randn((64, 256, 128), dtype=torch.float16),),
-                "4d": (cached_randn((4, 17, 256, 128), dtype=torch.float16),),
+                "2d": (cached_randn((256, 128), dtype=torch.float16), 1.0),
+                "3d": (cached_randn((64, 256, 128), dtype=torch.float16), 1.0),
+                "4d": (cached_randn((4, 17, 256, 128), dtype=torch.float16), 1.0),
+                "5d": (cached_randn((1, 1, 7, 13, 19), dtype=torch.float16), 1.0),
+                "2d_beta_0p5": (cached_randn((256, 128), dtype=torch.float16), 0.5),
+                "2d_beta_50": (cached_randn((256, 128), dtype=torch.float16), 50.0),
+                "2d_beta_0": (cached_randn((256, 128), dtype=torch.float16), 0.0),
+                "5d_beta_0p5": (
+                    cached_randn((1, 1, 7, 13, 19), dtype=torch.float16),
+                    0.5,
+                ),
+                "5d_beta_2": (
+                    cached_randn((1, 1, 7, 13, 19), dtype=torch.float16),
+                    2.0,
+                ),
+                "5d_beta_50": (
+                    cached_randn((1, 1, 7, 13, 19), dtype=torch.float16),
+                    50.0,
+                ),
             },
         },
         # --- Migrated from test_ops.py ---
@@ -4866,6 +4918,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_conv2d", "test_conv2d_cpu"): {
             "param_sets": {
+                # Patch-embed conv with bias: stride-16 kernel gives a sub-stick
+                # spatial output (W_out == 8 < 64) whose flat H_out*W_out == 64 is
+                # stick-aligned. Regression for the bias broadcast layout bug --
+                # every other case below uses bias=None.
+                "1x6x128_patch16_bias": (
+                    cached_randn((1, 6, 128, 128)),
+                    cached_randn((64, 6, 16, 16)),
+                    cached_randn((64,)),
+                    (0, 0),
+                    (16, 16),
+                    1,
+                ),
                 "1x3x32_ksize3_no_pad": (
                     cached_randn((1, 3, 32, 32)),
                     cached_randn((16, 3, 3, 3)),
@@ -4898,14 +4962,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     1,
                 ),
-                "1x64_ksize3_depthwise": (
-                    cached_randn((1, 64, 32, 32)),
-                    cached_randn((64, 1, 3, 3)),
-                    None,
-                    (1, 1),
-                    (1, 1),
-                    64,
-                ),
                 "mistral_model": (
                     cached_randn((1, 3, 392, 532)),
                     cached_randn((1024, 3, 14, 14)),
@@ -4930,6 +4986,54 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     1,
                 ),
+            },
+        },
+        ("test_dwise_conv2d", "test_dwise_conv2d_cpu"): {
+            # Non-zero padding is an intentional capability gap on the direct
+            # depthwise path, not a bug: lower_convolution raises Unsupported
+            # because padding needs runtime support for non-zero tensor
+            # allocation addresses.  Padding itself is still supported via the
+            # bmm-decomposed path (see the test_conv2d param sets, e.g.
+            # 1x3x64_ksize3_pad1).  8x64_ksize3_pad1 was a passing test_conv2d
+            # case before depthwise gained its own lowering, so it is kept here
+            # as an xfail to record the capability change rather than letting it
+            # vanish from the suite.  It is strict (see ParameterizedTestMeta and
+            # the XPASS rewrite in tests/conftest.py), so if padding support
+            # lands this flips to a CI failure instead of the gap staying
+            # invisible.
+            #
+            # Caveat, measured: xfail asserts only *that* the case fails, not
+            # that padding is the reason.  Removing just the lowering guard does
+            # not make it XPASS -- the compile then reaches the backend and
+            # aborts (SIGABRT), which is the runtime support the
+            # guard's own message refers to.  So this entry tracks "depthwise +
+            # padding does not work end to end"; a message-asserting negative
+            # test would additionally pin *where* it is rejected.
+            "expect_fail": ["8x64_ksize3_pad1"],
+            "param_sets": {
+                "1x64_ksize3": (
+                    cached_randn((1, 64, 32, 32)),
+                    cached_randn((64, 1, 3, 3)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    64,
+                    [[32, 32, 1, 1, 64], [3, 3, 1, 1, 64]],
+                    [[1, 32, -1, 65536, 1024], [1, 3, -1, 9, 9]],
+                ),
+                "8x64_ksize3": (
+                    cached_randn((8, 64, 128, 128)),
+                    cached_randn((64, 1, 3, 3)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    64,
+                    [[128, 128, 1, 8, 64], [3, 3, 1, 1, 64]],
+                    [[1, 128, -1, 1048576, 16384], [1, 3, -1, 9, 9]],
+                ),
+                # Same shape/layouts as 8x64_ksize3, padding=(1, 1): xfail, see
+                # the expect_fail note above.  The layouts are inherited from the
+                # zero-padding case, which passes with them.
                 "8x64_ksize3_pad1": (
                     cached_randn((8, 64, 128, 128)),
                     cached_randn((64, 1, 3, 3)),
@@ -4937,7 +5041,213 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     (1, 1),
                     (1, 1),
                     64,
+                    [[128, 128, 1, 8, 64], [3, 3, 1, 1, 64]],
+                    [[1, 128, -1, 1048576, 16384], [1, 3, -1, 9, 9]],
                 ),
+                "1x3x64_ksize3": (
+                    cached_randn((1, 3, 64, 64)),
+                    cached_randn((3, 1, 3, 3)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    3,
+                    [[64, 64, 1, 1, 64], [3, 3, 1, 1, 64]],
+                    [[1, 64, -1, 12288, 4096], [1, 3, -1, 9, 9]],
+                ),
+                "1x3x64_ksize_1x3": (
+                    cached_randn((1, 3, 64, 64)),
+                    cached_randn((3, 1, 1, 3)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    3,
+                    [[64, 64, 1, 1, 64], [3, 1, 1, 1, 64]],
+                    [[1, 64, -1, 12288, 4096], [1, 3, -1, 3, 3]],
+                ),
+                "1x3x64_ksize_3x1": (
+                    cached_randn((1, 3, 64, 64)),
+                    cached_randn((3, 1, 3, 1)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    3,
+                    [[64, 64, 1, 1, 64], [1, 3, 1, 1, 64]],
+                    [[1, 64, -1, 12288, 4096], [1, 1, -1, 3, 3]],
+                ),
+                "1x3x64x1_ksize_3x1": (
+                    cached_randn((1, 3, 64, 1)),
+                    cached_randn((3, 1, 3, 1)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    3,
+                    [[1, 64, 1, 1, 64], [1, 3, 1, 1, 64]],
+                    [[1, 1, -1, 192, 64], [1, 1, -1, 3, 3]],
+                ),
+                "1x3x64x1_ksize_1x1": (
+                    cached_randn((1, 3, 64, 1)),
+                    cached_randn((3, 1, 1, 1)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    3,
+                    [[1, 64, 1, 1, 64], [1, 1, 1, 1, 64]],
+                    [[1, 1, -1, 192, 64], [1, 1, -1, 1, 1]],
+                ),
+                "2x3x32_ksize1": (
+                    cached_randn((2, 3, 32, 32)),
+                    cached_randn((3, 1, 1, 1)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    3,
+                    [[32, 32, 1, 2, 64], [1, 1, 1, 1, 64]],
+                    [[1, 32, -1, 3072, 1024], [1, 1, -1, 1, 1]],
+                ),
+                "1x16x64_ksize3": (
+                    cached_randn((1, 16, 64, 64)),
+                    cached_randn((16, 1, 3, 3)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    16,
+                    [[64, 64, 1, 1, 64], [3, 3, 1, 1, 64]],
+                    [[1, 64, -1, 65536, 4096], [1, 3, -1, 9, 9]],
+                ),
+                "2x32_ksize1_stride2": (
+                    cached_randn((2, 32, 64, 64)),
+                    cached_randn((32, 1, 1, 1)),
+                    None,
+                    (0, 0),
+                    (2, 2),
+                    32,
+                    [[64, 64, 1, 2, 64], [1, 1, 1, 1, 64]],
+                    [[1, 64, -1, 131072, 4096], [1, 1, -1, 1, 1]],
+                ),
+                "1x3x128_ksize5": (
+                    cached_randn((1, 3, 128, 128)),
+                    cached_randn((3, 1, 5, 5)),
+                    None,
+                    (0, 0),
+                    (1, 1),
+                    3,
+                    [[128, 128, 1, 1, 64], [5, 5, 1, 1, 64]],
+                    [[1, 128, -1, 49152, 16384], [1, 5, -1, 25, 25]],
+                ),
+            },
+        },
+        # conv2d exercising the native conv2d SDSC path (lower_convolution) with
+        # the direct-lowering flag on (config.conv2d_direct_lowering). Only a
+        # true 1x1 kernel falls back: it has size-1 window taps on *both* axes,
+        # so the SDSC carries no window dim and the backend rejects it. A
+        # 1xN / Nx1 kernel keeps one window dim and direct-lowers (see the k1x3
+        # / k3x1 cases below) -- 1x1 is covered by the ("test_conv2d", ...) case
+        # "2x3x32_ksize1" above (with NCHW input), so it is intentionally not
+        # duplicated here (this test feeds channel-last input, which suits direct
+        # lowering but not the decomposition's reshape path). Supported direct
+        # cases: fp16, groups==1, non-transposed, zero padding, dilation==1.
+        # Params are standard NCHW (x, weight[C_out,C_in,kH,kW], bias, stride);
+        # the test builds the channel-last device tensors and toggles the flag.
+        ("test_conv2d_direct", "test_conv2d_direct_base"): {
+            "param_sets": {
+                # 2x2 kernel, zero padding -- smallest direct-lowered window.
+                "1x64x8x8_k2": (
+                    cached_randn((1, 64, 8, 8)),
+                    cached_randn((64, 64, 2, 2)),
+                    None,
+                    (1, 1),
+                ),
+                # 3x3 kernel, zero padding -- the reference "working conv with
+                # zero padding" shape.
+                "1x64x8x8_k3": (
+                    cached_randn((1, 64, 8, 8)),
+                    cached_randn((64, 64, 3, 3)),
+                    None,
+                    (1, 1),
+                ),
+                # Batch N>1 with a 3x3 kernel.
+                "2x64x8x8_k3": (
+                    cached_randn((2, 64, 8, 8)),
+                    cached_randn((64, 64, 3, 3)),
+                    None,
+                    (1, 1),
+                ),
+                # Bias present: lowered as a separate channel-wise pointwise add.
+                "1x64x8x8_k3_bias": (
+                    cached_randn((1, 64, 8, 8)),
+                    cached_randn((64, 64, 3, 3)),
+                    cached_randn((64,)),
+                    (1, 1),
+                ),
+                # C_out != C_in (32 output channels), 3x3 kernel.
+                "1x64x8x8_k3_cout32": (
+                    cached_randn((1, 64, 8, 8)),
+                    cached_randn((32, 64, 3, 3)),
+                    None,
+                    (1, 1),
+                ),
+                # 1xN kernel (kH==1, kW==3): a 1-D conv along width. The kH tap
+                # is size-1 and squeezed out, so the SDSC carries only the kW
+                # window dim -- the backend accepts a single window dim, so
+                # this direct-lowers (a 1-D conv) rather than falling back.
+                "1x64x8x8_k1x3": (
+                    cached_randn((1, 64, 8, 8)),
+                    cached_randn((64, 64, 1, 3)),
+                    None,
+                    (1, 1),
+                ),
+                # Nx1 kernel (kH==3, kW==1): a 1-D conv along height. Mirror of
+                # the 1xN case on the other spatial axis.
+                "1x64x8x8_k3x1": (
+                    cached_randn((1, 64, 8, 8)),
+                    cached_randn((64, 64, 3, 1)),
+                    None,
+                    (1, 1),
+                ),
+                # --- Strided convolutions (stride 2). Correctness needs two
+                # things: (1) the output spatial dims i/j must not be split
+                # across cores, or the per-core input span shuffles -- so
+                # disable_conv2d_spatial_split clamps i/j splits to 1 (see
+                # superdsc parse_op_spec is_conv); and (2) the input WIDTH must
+                # be evenly tiled by the strided windows. The fp16 conv opfunc
+                # tiles the output width (Tj=4) but processes height row-by-row
+                # (Ti=1), so when (W_in - kW) % sW != 0 the dangling partial
+                # column is mis-accumulated. Clean-width cases direct-lower;
+                # ragged-width cases fall back to im2col+matmul (declined in
+                # _is_direct_conv_supported). Verified on Spyre HW.
+                #
+                # Clean width ((W_in-kW) % sW == 0) -> direct lowering. 13x13
+                # (->6x6, not tile-aligned) and 17x17 (->8x8, tile-aligned)
+                # cover both output alignments.
+                "1x64x13x13_k3_s2": (
+                    cached_randn((1, 64, 13, 13)),
+                    cached_randn((64, 64, 3, 3)),
+                    None,
+                    (2, 2),
+                ),
+                "1x64x17x17_k3_s2": (
+                    cached_randn((1, 64, 17, 17)),
+                    cached_randn((64, 64, 3, 3)),
+                    None,
+                    (2, 2),
+                ),
+                # Ragged HEIGHT, clean width (H:(8-3)%2=1, W:(9-3)%2=0). Height
+                # is untiled, so a ragged height is harmless -- this still
+                # direct-lowers and matches CPU (proves the width-tiling
+                # constraint is on width only, not either spatial dim).
+                "1x64x8x9_k3_s2": (
+                    cached_randn((1, 64, 8, 9)),
+                    cached_randn((64, 64, 3, 3)),
+                    None,
+                    (2, 2),
+                ),
+                # The declined corners -- ragged input width ((W_in-kW)%sW != 0)
+                # and kernel > 3 -- are covered by the pure-Python predicate test
+                # (test_conv2d_direct_support_predicate), not end-to-end here:
+                # once declined they route to the im2col+matmul decomposition,
+                # whose custom-op reshape does not handle this test's
+                # channel-last weight layout (a separate, pre-existing issue
+                # unrelated to direct lowering).
             },
         },
         ("test_avg_pool2d", "test_avg_pool2d_base"): {
@@ -5694,6 +6004,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             lambda x: torch.topk(x, k, dim=dim)[0], x, run_eager=False
         )
 
+    def test_topk_largest_false_rejected(self):
+        # largest=False cannot be served by the topkvalue/topkindex reduction
+        # (it always returns the largest elements), so compile must raise.
+        x = unique_randn_along_dim((64, 256), dim=0)
+        with pytest.raises(Exception, match="Unsupported"):
+            _compile_and_run(
+                lambda x: torch.topk(x, 4, dim=0, largest=False)[0],
+                [x],
+                "spyre",
+            )
+
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
         self.compare_with_cpu(
@@ -6402,8 +6723,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x)
 
-    def test_softplus_cpu(self, x):
-        beta = 1.0
+    def test_softplus_cpu(self, x, beta):
         threshold = 20.0
 
         def fn(input):
@@ -7133,6 +7453,137 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             groups,
             atol=0.5,
             rtol=0.1,
+        )
+
+    def test_conv2d_direct_base(self, x, weight, bias, stride):
+        # Exercises the native conv2d SDSC (lower_convolution), not the
+        # im2col+matmul decomposition. Enabled via config.conv2d_direct_lowering
+        # so aten.convolution survives decomposition and reaches the lowering.
+        #
+        # Spyre stores C as the stick (innermost) dim, so the activation must be
+        # physically channel-last (NHWC) and the weight must stick on C_out.  We
+        # hand the harness channel-last-contiguous tensors (their layout is
+        # preserved by .to("spyre")) and permute back to the logical NCHW /
+        # [C_out,C_in,kH,kW] layouts inside fn, so the standard compare_with_cpu
+        # harness holds (cpu fn(x_nhwc, w_dev, b) == spyre fn(...)).
+        #
+        # run_eager=False: Spyre has no eager conv2d kernel; only the compiled
+        # (direct-lowering) path is valid here.
+        x_nhwc = x.permute(0, 2, 3, 1).contiguous()  # [N, H, W, C_in]
+        w_dev = weight.permute(1, 2, 3, 0).contiguous()  # [C_in, kH, kW, C_out]
+
+        def fn(xc, wc, b):
+            xn = xc.permute(0, 3, 1, 2)  # NHWC -> NCHW
+            wn = wc.permute(3, 0, 1, 2)  # [C_in,kH,kW,C_out] -> [C_out,C_in,kH,kW]
+            out = torch.conv2d(xn, wn, b, stride=stride, padding=0, groups=1)
+            return out.permute(0, 2, 3, 1)  # NCHW -> NHWC
+
+        with mock.patch.object(inductor_config, "conv2d_direct_lowering", True):
+            self.compare_with_cpu(
+                fn,
+                x_nhwc,
+                w_dev,
+                bias,
+                atol=0.5,
+                rtol=0.1,
+                run_eager=False,
+            )
+
+    def test_conv2d_direct_support_predicate(self):
+        # Pure-Python guard check (no compile/hardware): the direct-lowering
+        # support predicate must decline the corners the Spyre conv SDSC / fp16
+        # opfunc cannot handle, so those convs stay on the im2col+matmul
+        # decomposition. Covered here:
+        #  - C_in not a multiple of the fp16 stick width (the direct SDSC
+        #    contracts over C_in with no partial-stick handling);
+        #  - kernel tap > 3 (the dense C_in*kH*kW contraction overflows the
+        #    LX scratchpad budget);
+        #  - ragged input width under stride, (W_in - kW) % sW != 0 (the fp16
+        #    opfunc tiles the output width and mis-accumulates the dangling
+        #    column; a ragged height is untiled and harmless).
+        from torch_spyre._inductor.decompositions import _is_direct_conv_supported
+        from torch_spyre._C import get_elem_in_stick
+
+        eps = get_elem_in_stick(torch.float16)  # 64 at fp16
+        common = dict(
+            stride=[1, 1],
+            transposed=False,
+            output_padding=[0, 0],
+            padding=[0, 0],
+            dilation=[1, 1],
+            groups=1,
+        )
+
+        def _supported(c_in, k=3, hw=8, **overrides):
+            x = torch.zeros(1, c_in, hw, hw, dtype=torch.float16)
+            w = torch.zeros(eps, c_in, k, k, dtype=torch.float16)
+            return _is_direct_conv_supported(x, w, **{**common, **overrides})
+
+        # C_in stick alignment.
+        self.assertTrue(_supported(eps), f"C_in={eps} should direct-lower")
+        self.assertTrue(_supported(2 * eps), f"C_in={2 * eps} should direct-lower")
+        self.assertFalse(
+            _supported(eps // 2), f"C_in={eps // 2} must fall back (not stick-aligned)"
+        )
+        self.assertFalse(_supported(3), "C_in=3 must fall back (not stick-aligned)")
+
+        # Kernel > 3 (dense contraction overflows LX).
+        self.assertTrue(_supported(eps, k=3), "k=3 should direct-lower")
+        self.assertFalse(_supported(eps, k=5), "k=5 must fall back (LX overflow)")
+
+        # Ragged input width under stride: (W_in - kW) % sW != 0.
+        self.assertTrue(
+            _supported(eps, k=3, hw=9, stride=[2, 2]),  # (9-3)%2==0, clean
+            "clean strided width should direct-lower",
+        )
+        self.assertFalse(
+            _supported(eps, k=3, hw=8, stride=[2, 2]),  # (8-3)%2==1, ragged
+            "ragged strided width must fall back",
+        )
+
+    def test_dwise_conv2d_cpu(
+        self, x, weight, bias, padding, stride, groups, dev_layout, dev_stride
+    ):
+        from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+        torch._dynamo.reset()
+        torch._inductor.codecache.FxGraphCache.clear()
+
+        device_dtype_fp16 = get_device_dtype(torch.float16)
+        x_layout = SpyreTensorLayout(dev_layout[0], dev_stride[0], device_dtype_fp16)
+        weight_layout = SpyreTensorLayout(
+            dev_layout[1], dev_stride[1], device_dtype_fp16
+        )
+
+        x_dev = x.to(device_layout=x_layout)
+        weight_dev = weight.to(device_layout=weight_layout)
+
+        def fn(x, weight, bias, padding, stride, groups):
+            return torch.conv2d(
+                x, weight, bias, stride=stride, padding=padding, groups=groups
+            )
+
+        cpu_result = fn(x, weight, bias, padding, stride, groups)
+
+        spyre_compiled = torch.compile(fn)(
+            x_dev, weight_dev, bias, padding, stride, groups
+        ).cpu()
+        spyre_eager = fn(x_dev, weight_dev, bias, padding, stride, groups).cpu()
+        torch.testing.assert_close(
+            spyre_compiled,
+            cpu_result,
+            equal_nan=True,
+            atol=0.5,
+            rtol=0.1,
+            msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
+        )
+        torch.testing.assert_close(
+            spyre_eager,
+            cpu_result,
+            equal_nan=True,
+            atol=0.5,
+            rtol=0.1,
+            msg=lambda msg: f"eager mode spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
