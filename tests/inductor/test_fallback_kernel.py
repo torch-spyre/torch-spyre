@@ -557,5 +557,65 @@ class TestPermutedEagerResultNotNormalized(unittest.TestCase):
                 )
 
 
+class TestMapResultReconstruction(unittest.TestCase):
+    """`_map_result` must rebuild every container an aten schema can return.
+
+    The end-to-end tests above only reach single-tensor results: no op currently
+    registered by `register_torch_compile_kernel` declares more than one return
+    (116 overloads, none multi-tensor), so the tuple/list branches are reachable
+    only if that list grows. They are exercised directly here rather than left to
+    a future registration to discover.
+
+    The interesting case is a tuple SUBCLASS. `structseq` -- what the multi-output
+    aten schemas (`aten.max.dim`, `aten.sort`, ...) actually return -- and
+    namedtuple both rebuild from an iterable via `_make`, but not by calling the
+    type with a list. `_map_result` must therefore not reconstruct via
+    `type(result)(mapped)`.
+    """
+
+    def _fn(self, t):
+        return t + 1
+
+    def test_tensor_and_passthrough(self):
+        from torch_spyre.ops.eager import _map_result
+
+        self.assertEqual(_map_result(torch.zeros(2), self._fn).tolist(), [1.0, 1.0])
+        # Non-tensor leaves are returned untouched.
+        for leaf in (None, 3, "s"):
+            self.assertIs(_map_result(leaf, self._fn), leaf)
+
+    def test_tuple_list_and_nesting(self):
+        from torch_spyre.ops.eager import _map_result
+
+        out = _map_result((torch.zeros(1), torch.zeros(1)), self._fn)
+        self.assertIsInstance(out, tuple)
+        self.assertEqual([t.item() for t in out], [1.0, 1.0])
+
+        out = _map_result([torch.zeros(1), None], self._fn)
+        self.assertIsInstance(out, list)
+        self.assertEqual(out[0].item(), 1.0)
+        self.assertIsNone(out[1])
+
+        out = _map_result(((torch.zeros(1),), [torch.zeros(1)]), self._fn)
+        self.assertEqual(out[0][0].item(), 1.0)
+        self.assertEqual(out[1][0].item(), 1.0)
+
+    def test_structseq_and_namedtuple_are_rebuilt_as_their_own_type(self):
+        from collections import namedtuple
+
+        from torch_spyre.ops.eager import _map_result
+
+        # structseq: the real return type of multi-output aten ops.
+        real = torch.max(torch.zeros(2, 2), dim=0)
+        out = _map_result(real, lambda t: t)
+        self.assertIsInstance(out, type(real))
+        self.assertEqual(out.values.shape, real.values.shape)
+
+        Pair = namedtuple("Pair", "first second")
+        out = _map_result(Pair(torch.zeros(1), torch.zeros(1)), self._fn)
+        self.assertIsInstance(out, Pair)
+        self.assertEqual(out.first.item(), 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
