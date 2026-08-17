@@ -22,6 +22,16 @@ on:
         description: Workflow name (model-module-tests | upstream-tests | model-ops-tests | integration-tests)
         required: false
         default: upstream-pytorch-tests
+      clickhouse_env:
+        description: >-
+          ClickHouse instance for a MANUAL re-ingest: "prod" (the CLICKHOUSE_*
+          secret set) or "dev" (the CLICKHOUSE_*_DEV set). Default prod. Lets a
+          manual re-ingest target dev WITHOUT editing this file and pushing to
+          main (see the env block below). The automatic workflow_run path always
+          uses prod: for a workflow_run event this input is empty, so the env
+          ternary falls through to the prod secret set.
+        required: false
+        default: prod
 
 concurrency:
   # Allow at most one ingest per triggering run (re-runs queue behind)
@@ -56,19 +66,18 @@ jobs:
       #   CLICKHOUSE_DB     e.g. spyre
       # ---------------------------------------------------------------------------
 
-      # DEV INSTANCE
-      # CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
-      # CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
-      # CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER_DEV }}
-      # CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS_DEV }}
-      # CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB_DEV }}
-
-      # PROD INSTANCE
-      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
-      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
-      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
-      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
-      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+      # Instance selected by the clickhouse_env input: "dev" -> the *_DEV secret
+      # set, anything else (incl. "prod" and the empty value a workflow_run event
+      # sends) -> the plain PROD set. The `!= 'dev'` test (not `== 'prod'`) is
+      # deliberate: it keeps the AUTOMATIC workflow_run path on prod, since that
+      # event carries no input. A secret context key must be a literal name, so
+      # this is a per-name ternary, not a computed `secrets[...]` lookup. This is
+      # what lets a manual DEV re-ingest happen with no edit+push to main.
+      CLICKHOUSE_HOST: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_HOST || secrets.CLICKHOUSE_HOST_DEV }}
+      CLICKHOUSE_PORT: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_PORT || secrets.CLICKHOUSE_PORT_DEV }}
+      CLICKHOUSE_USER: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_USER || secrets.CLICKHOUSE_USER_DEV }}
+      CLICKHOUSE_PASS: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_PASS || secrets.CLICKHOUSE_PASS_DEV }}
+      CLICKHOUSE_DB: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_DB || secrets.CLICKHOUSE_DB_DEV }}
 
       # Metadata about the triggering run
       TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id || inputs.gha_run_id }}
@@ -90,27 +99,18 @@ jobs:
           which python3
           python3 --version
 
-      - name: Checkout (for the ingest script)
+      # Check out the local composite action (and the ingest script it runs).
+      # The uv/venv/deps/ingest steps that used to live here inline now live in
+      # .github/actions/ingest-xml-to-clickhouse, shared with the perf job's
+      # inline push so there is one ingest implementation. `uses: ./...`
+      # resolves against the workspace, so the action tree must be present.
+      - name: Checkout (for the composite action and ingest script)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           sparse-checkout: |
+            .github/actions
             .github/scripts/ingest_xml.py
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
-
-      - name: setup venv
-        run: |
-          pwd
-          ls -la
-          uv venv
-          source .venv/bin/activate
-          echo "VIRTUAL_ENV $VIRTUAL_ENV"
-
-      - name: Install Python dependencies
-        run: |
-          source .venv/bin/activate
-          uv pip install requests clickhouse-driver clickhouse-connect lxml regex
+          sparse-checkout-cone-mode: false
 
       - name: Install gh CLI
         run: |
@@ -132,10 +132,12 @@ jobs:
           echo "pr_number=${PR}" >> "${GITHUB_OUTPUT}"
 
       # ---------------------------------------------------------------------------
-      # Download all XML artifacts produced by the triggering run.
-      # Each matrix job uploads one artifact named after its config file, e.g.
-      #   granite_3_3_8b_instruct_spyre.xml
-      #   test_view_ops_config.xml
+      # Download every artifact from the triggering run and unzip it. Artifact
+      # *names* carry no file extension (only the file inside the zip does), so
+      # filtering must happen post-unzip by actual filename, not by artifact
+      # name — a `select(.name | endswith(".xml"))` here dropped every artifact.
+      # The ingest step globs *.xml in the unzip dir, so non-XML files that come
+      # along are simply ignored.
       # ---------------------------------------------------------------------------
       - name: List artifacts from triggering run
         id: list-artifacts
@@ -144,7 +146,7 @@ jobs:
         run: |
           ARTIFACTS=$(gh api \
             "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/artifacts" \
-            --jq '[.artifacts[] | select(.name | endswith(".xml")) | {id: .id, name: .name}]')
+            --jq '[.artifacts[] | {id: .id, name: .name}]')
           echo "artifacts=$ARTIFACTS" >> "$GITHUB_OUTPUT"
           echo "Found artifacts:"
           echo "$ARTIFACTS" | python3 -c "import json,sys; [print(' •', a['name']) for a in json.load(sys.stdin)]"
@@ -189,26 +191,28 @@ jobs:
           echo "Resolved tier: ${TIER:-<none>}"
           echo "tier=${TIER}" >> "${GITHUB_OUTPUT}"
 
+      # Delegate the venv+deps+ingest to the shared composite action (the same
+      # one the perf job uses for its inline push). The ClickHouse connection
+      # comes from this job's env block above (DEV vs PROD toggle lives there);
+      # no product checkout exists here, so the action sparse-checks-out the
+      # script itself when torch-spyre-dir is not passed.
       - name: Ingest XML files into ClickHouse
-        run: |
-          source .venv/bin/activate
-          python3 .github/scripts/ingest_xml.py \
-            --xml-dir xml_artifacts \
-            --workflow "${TRIGGERING_WORKFLOW}" \
-            --branch   "${TRIGGERING_BRANCH}" \
-            --sha      "${TRIGGERING_SHA}" \
-            --run-id   "${TRIGGERING_RUN_ID}" \
-            --triggered-at "${TRIGGERING_AT}" \
-            --pr-number    "${{ steps.resolve-pr.outputs.pr_number }}" \
-            --trigger-type "${{ steps.extract-tier.outputs.tier }}" \
-            --platform     x86_64
-        env:
-          # PROD INSTANCE
-          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
-          CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
-          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
-          CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
-          CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+        uses: ./.github/actions/ingest-xml-to-clickhouse
+        with:
+          xml-dir: xml_artifacts
+          workflow: ${{ env.TRIGGERING_WORKFLOW }}
+          branch: ${{ env.TRIGGERING_BRANCH }}
+          sha: ${{ env.TRIGGERING_SHA }}
+          run-id: ${{ env.TRIGGERING_RUN_ID }}
+          triggered-at: ${{ env.TRIGGERING_AT }}
+          pr-number: ${{ steps.resolve-pr.outputs.pr_number }}
+          trigger-type: ${{ steps.extract-tier.outputs.tier }}
+          platform: x86_64
+          clickhouse-host: ${{ env.CLICKHOUSE_HOST }}
+          clickhouse-port: ${{ env.CLICKHOUSE_PORT }}
+          clickhouse-user: ${{ env.CLICKHOUSE_USER }}
+          clickhouse-pass: ${{ env.CLICKHOUSE_PASS }}
+          clickhouse-db: ${{ env.CLICKHOUSE_DB }}
 
       - name: Summary
         if: always()

@@ -1,0 +1,197 @@
+name: Ingest JUnit XML into ClickHouse
+description: >
+  Parse JUnit/benchmark XML files in a directory and insert their rows into
+  ClickHouse via .github/scripts/ingest_xml.py. This is the SINGLE ingest
+  implementation shared by two callers: the push-to-clickhouse.yaml
+  workflow_run job (which downloads uploaded artifacts first) and the perf job
+  in _test_matrix.yaml (which pushes its report.xml INLINE on the card runner,
+  because on a public repo benchmark numbers must not be uploaded as
+  world-readable artifacts). Secrets cannot reach a composite action, so the
+  caller passes the ClickHouse connection as plain inputs.
+
+inputs:
+  xml-dir:
+    description: Directory to glob for *.xml (non-recursive). Empty = skip.
+    required: false
+    default: ''
+  workflow:
+    description: Workflow name recorded against the rows.
+    required: false
+    default: ''
+  branch:
+    description: Branch recorded against the rows.
+    required: false
+    default: ''
+  sha:
+    description: Commit sha recorded against the rows.
+    required: false
+    default: ''
+  run-id:
+    description: Triggering run id recorded against the rows.
+    required: false
+    default: ''
+  triggered-at:
+    description: Trigger timestamp recorded against the rows (may be empty).
+    required: false
+    default: ''
+  pr-number:
+    description: PR number associated with the rows (empty on non-PR runs).
+    required: false
+    default: ''
+  trigger-type:
+    description: Suite tier (e.g. perf | regression | integration | smoke).
+    required: false
+    default: ''
+  platform:
+    description: >
+      Platform arch recorded on benchmark_runs rows (e.g. x86_64). Empty =
+      the ingest script falls back to its own host-arch default.
+    required: false
+    default: ''
+  torch-spyre-dir:
+    description: >
+      Directory that already holds a checkout containing
+      .github/scripts/ingest_xml.py (e.g. the prebaked dev image source dir or
+      a per-job checkout). When set and the script is found there, the action
+      reuses it instead of a redundant sparse-checkout. Empty = always
+      sparse-checkout the script into the workspace.
+    required: false
+    default: ''
+  clickhouse-host:
+    description: ClickHouse host. Empty = skip the whole ingest (clean no-op).
+    required: false
+    default: ''
+  clickhouse-port:
+    description: ClickHouse port (default 443 inside the script).
+    required: false
+    default: ''
+  clickhouse-user:
+    description: ClickHouse user (default "default" inside the script).
+    required: false
+    default: ''
+  clickhouse-pass:
+    description: ClickHouse password.
+    required: false
+    default: ''
+  clickhouse-db:
+    description: ClickHouse database (default "spyre" inside the script).
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    # ingest_xml.py get_client() reads CLICKHOUSE_HOST/PASS as REQUIRED env
+    # (a KeyError, not a clean skip, when absent), and an empty --xml-dir hits
+    # sys.exit(1). So the no-op gate MUST live here: when the connection or the
+    # dir is not configured, set configured=false and every later step is a
+    # no-op. This is what lets a caller without ClickHouse secrets (or a run
+    # with no XML) pass cleanly.
+    - name: Gate on ClickHouse config and XML dir
+      id: gate
+      shell: bash
+      env:
+        CH_HOST: ${{ inputs.clickhouse-host }}
+        XML_DIR: ${{ inputs.xml-dir }}
+      run: |
+        if [ -z "${CH_HOST}" ]; then
+          echo "::notice::ClickHouse host not configured — skipping ingest."
+          echo "configured=false" >> "$GITHUB_OUTPUT"
+        elif [ -z "${XML_DIR}" ]; then
+          echo "::notice::No xml-dir provided — skipping ingest."
+          echo "configured=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    # The ingest script lives under .github/scripts (a different path than the
+    # .github/actions the perf job already checks out). Reuse an on-disk copy
+    # when the caller has one (perf card runner: prebaked image or a per-job
+    # checkout); otherwise fall back to a sparse-checkout, which reproduces the
+    # push-to-clickhouse.yaml caller's original behavior (it has no product
+    # checkout).
+    - name: Locate ingest script (on disk)
+      id: locate
+      if: steps.gate.outputs.configured == 'true'
+      shell: bash
+      env:
+        TS_DIR: ${{ inputs.torch-spyre-dir }}
+      run: |
+        REL=.github/scripts/ingest_xml.py
+        FOUND=""
+        for base in "${TS_DIR}" "${GITHUB_WORKSPACE}"; do
+          [ -n "${base}" ] || continue
+          if [ -f "${base}/${REL}" ]; then
+            FOUND="${base}/${REL}"
+            break
+          fi
+        done
+        if [ -n "${FOUND}" ]; then
+          echo "Found ingest script at ${FOUND}"
+          echo "INGEST_SCRIPT=${FOUND}" >> "$GITHUB_ENV"
+          echo "need-checkout=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "Ingest script not on disk — will sparse-checkout."
+          echo "need-checkout=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Checkout ingest script (fallback)
+      if: steps.gate.outputs.configured == 'true' && steps.locate.outputs.need-checkout == 'true'
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        sparse-checkout: |
+          .github/scripts/ingest_xml.py
+        sparse-checkout-cone-mode: false
+
+    - name: Set ingest script path (fallback)
+      if: steps.gate.outputs.configured == 'true' && steps.locate.outputs.need-checkout == 'true'
+      shell: bash
+      run: echo "INGEST_SCRIPT=${GITHUB_WORKSPACE}/.github/scripts/ingest_xml.py" >> "$GITHUB_ENV"
+
+    - name: Install uv
+      if: steps.gate.outputs.configured == 'true'
+      uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+    - name: Setup venv and dependencies
+      if: steps.gate.outputs.configured == 'true'
+      shell: bash
+      run: |
+        # Create the ingest venv in the workspace, NOT the baked shared venv, so
+        # the ingest deps never perturb the dev image's torch-spyre environment.
+        uv venv
+        source .venv/bin/activate
+        uv pip install requests clickhouse-driver clickhouse-connect lxml regex
+
+    - name: Ingest XML files into ClickHouse
+      if: steps.gate.outputs.configured == 'true'
+      shell: bash
+      env:
+        CLICKHOUSE_HOST: ${{ inputs.clickhouse-host }}
+        CLICKHOUSE_PASS: ${{ inputs.clickhouse-pass }}
+        # Port/user/db are optional. Only export them when non-empty: the script
+        # reads PORT via int(os.environ.get("CLICKHOUSE_PORT", 443)), so an
+        # empty-string value would break int(""), and empty user/db would
+        # override the script's sensible defaults ("default" / "spyre").
+        CH_PORT_IN: ${{ inputs.clickhouse-port }}
+        CH_USER_IN: ${{ inputs.clickhouse-user }}
+        CH_DB_IN: ${{ inputs.clickhouse-db }}
+        PLATFORM_IN: ${{ inputs.platform }}
+      run: |
+        source .venv/bin/activate
+        [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
+        [ -n "${CH_USER_IN}" ] && export CLICKHOUSE_USER="${CH_USER_IN}"
+        [ -n "${CH_DB_IN}" ] && export CLICKHOUSE_DB="${CH_DB_IN}"
+        # Only pass --platform when non-empty; an empty value would override the
+        # ingest script's own host-arch default with a blank string.
+        PLATFORM_ARGS=()
+        [ -n "${PLATFORM_IN}" ] && PLATFORM_ARGS=(--platform "${PLATFORM_IN}")
+        python3 "${INGEST_SCRIPT}" \
+          --xml-dir "${{ inputs.xml-dir }}" \
+          --workflow "${{ inputs.workflow }}" \
+          --branch "${{ inputs.branch }}" \
+          --sha "${{ inputs.sha }}" \
+          --run-id "${{ inputs.run-id }}" \
+          --triggered-at "${{ inputs.triggered-at }}" \
+          --pr-number "${{ inputs.pr-number }}" \
+          --trigger-type "${{ inputs.trigger-type }}" \
+          "${PLATFORM_ARGS[@]}"
