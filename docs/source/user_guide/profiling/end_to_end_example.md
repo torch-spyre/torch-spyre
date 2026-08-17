@@ -1,9 +1,9 @@
 # End-to-End Example: Profiling a Granite Model on Spyre via FMS
 
-**Stack:** Torch-Spyre (new, Inductor-based).
+**Stack:** torch-spyre
 
 This page shows how to capture a `torch.profiler` trace of a
-Granite-class model running on Spyre, paired with `aiu-smi` device
+Granite-class model via FMS running on Spyre, paired with `aiu-smi` device
 telemetry. It uses today's tooling: `torch.profiler` + [`aiu-smi`](device_monitoring.md) + [`aiu-trace-analyzer`](trace_analysis.md).
 
 The Granite end-to-end path on Spyre today goes through the
@@ -15,32 +15,17 @@ source off that branch rather than from PyPI.
 
 This example profiles Granite 3.3-8B-Instruct on Spyre in eager mode so torch.compile is not required.
 
-:::{admonition} Where this page is going
-:class: note
-
-The script below wires `torch.profiler` around `fms.get_model(...)`
-explicitly. Once [RFC 0601][rfc-0601] lands, the in-tree
-`torch_spyre.profiler` API will replace this glue and the script will
-shrink. This page will be revised to the in-tree API once it ships.
-:::
-
 ## What you need
 
 **Prerequisites Step**
 
-Ensure that you have access a pod with spyre accelerator and torch spyre and spyre software stack installed.
-
-**Prerequisites Step**
-
-Ensure that you have access a pod with spyre accelerator and torch spyre and spyre software stack installed.
+Ensure that you have access to a pod with Spyre accelerator and torch-spyre and spyre software stack installed.
 
 | Piece | Source | Sample install (verify against the upstream README) |
 |---|---|---|
 | `foundation-model-stack` (`fms`) | [github.com/foundation-model-stack/foundation-model-stack][fms] (`eager_spyre` branch) | `git clone -b eager_spyre <repo>.git && uv pip install -e ./foundation-model-stack` |
 | `aiu-fms-testing-utils` | [github.com/foundation-model-stack/aiu-fms-testing-utils][aiu-fms] (`eager_spyre` branch) | `git clone -b eager_spyre <repo>.git && uv pip install -e ./aiu-fms-testing-utils` |
-| `kineto-spyre` (not required for torch >= 2.13)| [github.com/IBM/kineto-spyre][kineto-spyre] | `uv pip install --no-deps <release-wheel-url-matching-your-pytorch>` (see [releases page][kineto-spyre-releases]) |
 | `aiu-trace-analyzer` (optional) | [github.com/IBM/aiu-trace-analyzer][ata] | `pip install aiu-trace-analyzer` |
-| Granite checkpoint | [huggingface.co/ibm-granite/granite-3.3-8b-instruct](https://huggingface.co/ibm-granite/granite-3.3-8b-instruct) | `hf download ibm-granite/granite-3.3-8b-instruct --local-dir /tmp/models/granite-3.3-8b-instruct` |
 | Granite checkpoint | [huggingface.co/ibm-granite/granite-3.3-8b-instruct](https://huggingface.co/ibm-granite/granite-3.3-8b-instruct) | `hf download ibm-granite/granite-3.3-8b-instruct --local-dir /tmp/models/granite-3.3-8b-instruct` |
 
 The sample commands above are starting points; each upstream README is
@@ -72,7 +57,7 @@ hf download ibm-granite/granite-3.3-8b-instruct --local-dir /tmp/models/granite-
 # See below an example of 2.11 kineto Wheel on x86
 uv pip install --no-deps --force-reinstall \
   https://github.com/IBM/kineto-spyre/releases/download/torch-2.11.0.aiu.kineto.1.1.2/torch-2.11.0+aiu.kineto.1.1.2-cp312-cp312-linux_x86_64.whl
-  https://github.com/IBM/kineto-spyre/releases/download/torch-2.11.0.aiu.kineto.1.1.2/torch-2.11.0+aiu.kineto.1.1.2-cp312-cp312-linux_x86_64.whl
+
 ```
 
 Useful environment variables (see [Environment variables](environment_variables.md)
@@ -140,7 +125,7 @@ alpha = model.base_model.rot_emb.compute_freqs_cis(DEVICE, ids.shape[1])
 selected_freqs = model.base_model.rot_emb.cached_freqs[0][alpha][position_ids].to(DEVICE)
 mask = kwargs["mask"].to(dtype=torch.float16).to(DEVICE)
 
-# 3Warmup — first run is always slower due to JIT/compilation
+# 3. Warmup — first run is always slower due to runtime and device initialization
 print("=" * 42)
 print("Warming up.".center(42))
 print("=" * 42)
@@ -167,7 +152,6 @@ with profile(
         t0 = time.perf_counter()
         with torch.no_grad():
           model(ids.to(DEVICE), position_ids=position_ids.to(DEVICE), mask=mask, selected_freqs=selected_freqs)
-          model(ids.to(DEVICE), position_ids=position_ids.to(DEVICE), mask=mask, selected_freqs=selected_freqs)
         wall_clock_ms.append((time.perf_counter() - t0) * 1000)
         prof.step()
 
@@ -179,9 +163,7 @@ cpu_per_run_ms = sum(e.self_cpu_time_total for e in prof.events()) / 1000 / N_RU
 print("=" * 42)
 print("Profiling Granite Running on Spyre".center(42))
 print("=" * 42)
-print("=" * 42)
-print("Profiling Granite Running on Spyre".center(42))
-print("=" * 42)
+
 print(prof.key_averages().table(sort_by="device_time_total", row_limit=10))
 print(f"wall-clock ms: mean={mean(wall_clock_ms):.3f} median={median(wall_clock_ms):.3f}")
 print(f"profiler-derived CPU ms (per run): {cpu_per_run_ms:.3f}")
@@ -189,12 +171,12 @@ print(f"profiler-derived CPU ms (per run): {cpu_per_run_ms:.3f}")
 
 **Note**
 
-Ensure the profiler report includes Spyre/device time; otherwise the trace does not confirm the accelerator execution
+Confirm the profiler table reports Spyre or device time. If it does not, the trace is not capturing accelerator execution.
 
 Three patterns to call out:
 
-- **Run warmup iterations outside the timed loop**. The first few executions can include one-time runtime initialization, lazy setup, cache population, or other startup overhead. Excluding them keeps steady-state measurements representative.
-- **Use two orthogonal timing signals**. Wall-clock time from time.perf_counter() represents end-to-end latency observed by the caller, while profiler-derived CPU time provides a view of host-side activity. Comparing them can help identify whether latency is dominated by host-side work or accelerator execution, but their difference should not be treated as a direct measurement of device time.
+- **Run warmup iterations outside the timed loop**. The first runs carry one-time runtime and device initialization. Excluding them keeps the steady-state numbers representative.
+- **Use two orthogonal timing signals**. Wall-clock from time.perf_counter() is end-to-end latency; profiler-derived CPU time is host-side activity. Comparing them shows whether latency is host-bound or device-bound, though the difference is not a direct measurement of device time.
 - **`tensorboard_trace_handler(log_dir)` over `export_chrome_trace`.** Per-step JSON files make it easier to distinguish warmup executions from steady-state runs and inspect each profiler step independently.
   runs and open in TensorBoard *and* Chrome / Perfetto.
 
@@ -245,7 +227,7 @@ For a Granite-class transformer the typical signals are:
 
 | Symptom | Likely cause | Where to dig |
 |---|---|---|
-| First iteration much slower than the rest | the first iterations as runtime/device initialization or general warmup.
+| First iteration much slower than the rest | the first iterations as runtime/device initialization or general warmup.|
 | Wall-clock ≫ profiler CPU | Device-side work dominates (good for compute-bound layers like MLP / large matmul) | Cross-check with `aiu-smi` PT-array util. |
 | Wall-clock ≈ profiler CPU | Host-side bottleneck — Python or Dynamo overhead | `TORCH_LOGS="+inductor"` |
 | Per-layer kernel gaps | Tile staging between LPDDR5 and LX scratchpad | [Performance analysis methodology](performance_analysis_methodology.md) |
