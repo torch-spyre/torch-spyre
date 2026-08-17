@@ -3988,7 +3988,12 @@ def _retile_load_index(
             # dim). Detect that by coefficient, not by a hardcoded symbol
             # name: if some free symbol already carries coefficient
             # new_stride[d], this dim's term is already present and must
-            # not be added again.
+            # not be added again. Comparing by coefficient value (not
+            # dimension identity) is safe only because strides are unique
+            # across all non-irregular dims of a valid layout -- see this
+            # function's docstring ("Potential ambiguity from duplicate
+            # stride values"). If that uniqueness invariant is ever
+            # weakened, this check must be revisited too.
             already_present = any(
                 new_index.coeff(s) == info.new_stride[d] for s in new_index.free_symbols
             )
