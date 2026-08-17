@@ -66,10 +66,6 @@ for the full list):
 ```bash
 export PYTHONUNBUFFERED=1
 export SENCORES=32                 # full accelerator (1–32; default 32)
-# Inductor visibility — uncomment when investigating compile-time issues:
-# export TORCH_LOGS=ir_post_fusion,output_code,graph,aot_graphs,post_grad_graphs
-# export TORCH_LOGS_FORMAT=short
-# export TORCH_SPYRE_DEBUG=1
 ```
 
 ## The script
@@ -231,8 +227,7 @@ For a Granite-class transformer the typical signals are:
 | Wall-clock ≫ profiler CPU | Device-side work dominates (good for compute-bound layers like MLP / large matmul) | Cross-check with `aiu-smi` PT-array util. |
 | Wall-clock ≈ profiler CPU | Host-side bottleneck — Python or Dynamo overhead | `TORCH_LOGS="+inductor"` |
 | Per-layer kernel gaps | Tile staging between LPDDR5 and LX scratchpad | [Performance analysis methodology](performance_analysis_methodology.md) |
-| Low PT-array utilization in `aiu-smi` | Work-division inefficiency, stick-alignment padding | [Compiler work division](../../compiler/work_division_planning.md) |
-| Long Inductor pass times in stderr | Compile-time regression | [Inductor debug artifacts](../debugging/inductor_artifacts.md) |
+| Low PT-array utilization in `aiu-smi` | Work-division inefficiency, stick-alignment padding | |
 | Idle bubbles between consecutive kernels | Reconfiguration latency or DMA stalls | `aiu-trace-analyzer` gap analysis |
 
 ## See also
