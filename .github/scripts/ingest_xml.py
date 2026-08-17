@@ -88,7 +88,7 @@ def parse_benchmark_xml(
     """
     Parse a performance-benchmark XML into (run_meta, list[benchmark_row]).
 
-    Groups the 5 per-op-shape metric cases into one perf_benchmarks row each,
+    Groups the per-op-shape metric cases into one perf_benchmarks row each,
     pivoting the metric values into the appropriate columns.
 
     Returns:
@@ -284,62 +284,78 @@ def insert_benchmark_run(client, run_id: int, run_meta: dict) -> None:
     )
 
 
+_PERF_BENCHMARK_COLUMNS = [
+    "benchmark_id",
+    "run_id",
+    "record_type",
+    "operation_name",
+    "config_name",
+    "input_shapes",
+    "batch_size",
+    "prompt_length",
+    "run_mode",
+    "total_duration_ms",
+    "cpu_ms",
+    "spyre_ms",
+    "kernel_mean_ms",
+    "memory_transfer_mean_ms",
+    "compile_ms",
+    "runtime_ms",
+    "mem_size_mb",
+    "pt_util_percent",
+    "num_runs",
+    "custom_op_file",
+    "regression_status",
+    "created_at",
+]
+
+# Added to perf_benchmarks by a spyre-dashboard migration, which deploys
+# independently of this script. See insert_perf_benchmarks.
+_PERF_BENCHMARK_OPTIONAL_COLUMNS = ("compile_ms", "runtime_ms", "mem_size_mb")
+
+
+def _absent_columns(client, table: str, columns) -> set[str]:
+    rows = client.query(
+        "SELECT name FROM system.columns "
+        "WHERE database = currentDatabase() AND table = {t:String}",
+        parameters={"t": table},
+    ).result_rows
+    present = {r[0] for r in rows}
+    return {c for c in columns if c not in present}
+
+
 def insert_perf_benchmarks(client, run_id: int, benchmarks: list[dict]) -> None:
     if not benchmarks:
         return
+
+    columns = list(_PERF_BENCHMARK_COLUMNS)
+
+    # Drop the op-cost columns rather than failing when the migration adding them
+    # has not been applied to this database. The benchmark_runs row is already
+    # committed by now and the dedup check keys on it, so raising here would skip
+    # the run on every retry and lose its metrics for good.
+    absent = _absent_columns(
+        client, "perf_benchmarks", _PERF_BENCHMARK_OPTIONAL_COLUMNS
+    )
+    if absent:
+        print(
+            f"  Warning: perf_benchmarks has no {', '.join(sorted(absent))} — "
+            f"storing this run without them. Apply the spyre-dashboard migration "
+            f"to capture them."
+        )
+        columns = [c for c in columns if c not in absent]
+
+    def cell(b: dict, column: str):
+        if column == "run_id":
+            return run_id
+        if column == "created_at":
+            return b["created_at"].replace(tzinfo=None)
+        return b[column]
+
     client.insert(
         "perf_benchmarks",
-        [
-            [
-                b["benchmark_id"],
-                run_id,
-                b["record_type"],
-                b["operation_name"],
-                b["config_name"],
-                b["input_shapes"],
-                b["batch_size"],
-                b["prompt_length"],
-                b["run_mode"],
-                b["total_duration_ms"],
-                b["cpu_ms"],
-                b["spyre_ms"],
-                b["kernel_mean_ms"],
-                b["memory_transfer_mean_ms"],
-                b["compile_ms"],
-                b["runtime_ms"],
-                b["mem_size_mb"],
-                b["pt_util_percent"],
-                b["num_runs"],
-                b["custom_op_file"],
-                b["regression_status"],
-                b["created_at"].replace(tzinfo=None),
-            ]
-            for b in benchmarks
-        ],
-        column_names=[
-            "benchmark_id",
-            "run_id",
-            "record_type",
-            "operation_name",
-            "config_name",
-            "input_shapes",
-            "batch_size",
-            "prompt_length",
-            "run_mode",
-            "total_duration_ms",
-            "cpu_ms",
-            "spyre_ms",
-            "kernel_mean_ms",
-            "memory_transfer_mean_ms",
-            "compile_ms",
-            "runtime_ms",
-            "mem_size_mb",
-            "pt_util_percent",
-            "num_runs",
-            "custom_op_file",
-            "regression_status",
-            "created_at",
-        ],
+        [[cell(b, c) for c in columns] for b in benchmarks],
+        column_names=columns,
     )
 
 
@@ -698,15 +714,6 @@ def main():
     )
     client.command(
         "ALTER TABLE benchmark_runs ADD COLUMN IF NOT EXISTS platform String DEFAULT ''"
-    )
-    client.command(
-        "ALTER TABLE perf_benchmarks ADD COLUMN IF NOT EXISTS compile_ms Nullable(Float64)"
-    )
-    client.command(
-        "ALTER TABLE perf_benchmarks ADD COLUMN IF NOT EXISTS runtime_ms Nullable(Float64)"
-    )
-    client.command(
-        "ALTER TABLE perf_benchmarks ADD COLUMN IF NOT EXISTS mem_size_mb Nullable(Float64)"
     )
 
     total_cases = 0
