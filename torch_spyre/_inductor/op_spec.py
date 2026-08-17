@@ -20,10 +20,12 @@ import dataclasses
 import threading
 from typing import Any, Literal, Sequence
 
-from sympy import Symbol, Expr, Function
+from sympy import Symbol, Expr, Function, sympify
 from torch_spyre._C import DataFormats, ElementArrangement
 import torch
 from torch_spyre import _C
+
+from .constants import IDENTITY_OP
 
 
 class IndirectAccess(Function):
@@ -137,6 +139,51 @@ class DebugHandle:
         }
 
 
+@dataclasses.dataclass(frozen=True)
+class TensorWorkDivision:
+    """Tensor ownership expressed in operation-loop symbols.
+
+    Both mappings have the same symbol keys. ``work_slices`` gives each loop's
+    split count and ``core_id_to_work_slice`` maps the free symbol ``core_id``
+    to that loop's owned slice.
+    """
+
+    work_slices: dict[Symbol, int]
+    core_id_to_work_slice: dict[Symbol, Expr]
+
+    def remap_symbols(self, symbol_mapping: dict[Symbol, Symbol]) -> TensorWorkDivision:
+        """Return this ownership expressed in remapped loop symbols."""
+
+        return TensorWorkDivision(
+            {
+                symbol_mapping.get(dim, dim): split
+                for dim, split in self.work_slices.items()
+            },
+            {
+                symbol_mapping.get(dim, dim): sympify(slot).xreplace(symbol_mapping)
+                for dim, slot in self.core_id_to_work_slice.items()
+            },
+        )
+
+    def to_core_slices(self, num_cores: int) -> dict[str, dict[str, int]]:
+        """Expand symbolic ownership into DeepTools' per-core slice map."""
+
+        core_id = Symbol("core_id")
+        result = {}
+        for core in range(num_cores):
+            slots = {}
+            for dim, expression in self.core_id_to_work_slice.items():
+                slot = int(sympify(expression).subs(core_id, core))
+                split = self.work_slices[dim]
+                if not 0 <= slot < split:
+                    raise ValueError(
+                        f"core {core} owns invalid {dim} slot {slot} for split {split}"
+                    )
+                slots[str(dim)] = slot
+            result[str(core)] = slots
+        return result
+
+
 @dataclasses.dataclass
 class TensorArg:
     """
@@ -168,6 +215,8 @@ class TensorArg:
             device-element space via views.tiling_expr_to_device_expr, and summed into a
             single combined Expr. This is the sole tile-advance mechanism. ``None`` for
             ops without loop_info/coarse tiling.
+        work_division: Optional tensor-specific ownership used when it differs
+            from the operation's work division.
     """
 
     is_input: bool
@@ -175,11 +224,27 @@ class TensorArg:
     device_dtype: DataFormats
     device_size: list[int]
     device_coordinates: list[Expr]
-    allocation: Any
+    allocation: dict[str, Any]
     name: str | None = None
     device_tile_advance_expr: Expr | None = None
     element_arrangement: ElementArrangement = dataclasses.field(
         default_factory=lambda: ElementArrangement.STANDARD
+    )
+    work_division: TensorWorkDivision | None = None
+
+
+def is_lx_relayout_identity(op: str, args: Sequence[TensorArg]) -> bool:
+    """An LX identity whose input and output have different owners."""
+
+    if op != IDENTITY_OP or len(args) != 2:
+        return False
+    source, destination = args
+    return (
+        "lx" in source.allocation
+        and "lx" in destination.allocation
+        and source.work_division is not None
+        and destination.work_division is not None
+        and source.work_division != destination.work_division
     )
 
 

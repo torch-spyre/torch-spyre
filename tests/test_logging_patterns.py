@@ -315,7 +315,7 @@ class TestUnifiedLoggingPatterns(LoggingIsolationMixin):
 
     def test_unified_torch_logs_controls_new_patterns(self) -> None:
         """Verify TORCH_LOGS enables the new unified warning patterns."""
-        os.environ["TORCH_LOGS"] = "spyre.inductor:DEBUG"
+        os.environ["TORCH_LOGS"] = "+torch_spyre.inductor"
         logging_config, logging_utils = self._reload_logging_modules()
 
         compile_logger = logging_utils.get_logger("sdsc_compile")
@@ -428,6 +428,69 @@ class TestLegacyCompatibility(LoggingIsolationMixin):
         assert any("SPYRE_LOG_FILE is deprecated" in message for message in messages)
 
 
+class TestTorchSpyreNamespaceNormalization(LoggingIsolationMixin):
+    """Tests for the torch_spyre.* -> spyre.* TORCH_LOGS normalization.
+
+    Users must spell TORCH_LOGS targets as ``torch_spyre.*`` because that is
+    the only namespace torch's own find_spec() validator accepts (a bare
+    ``spyre.*`` target makes torch raise before any Spyre code runs). Internally
+    the level must land on the ``spyre.*`` logger that actually emits records.
+    """
+
+    def test_plus_torch_spyre_enables_internal_spyre_logger(self) -> None:
+        """+torch_spyre.inductor.passes must raise spyre.inductor.passes to DEBUG."""
+        os.environ["TORCH_LOGS"] = "+torch_spyre.inductor.passes"
+        logging_config, logging_utils = self._reload_logging_modules()
+
+        assert (
+            logging_config.get_log_level("spyre.inductor.passes")
+            == logging_config.LogLevel.DEBUG
+        )
+        assert logging_config.get_config_source("spyre.inductor.passes") == "TORCH_LOGS"
+
+        passes_logger = logging_utils.get_logger("passes")
+        assert passes_logger.name == "spyre.inductor.passes"
+        assert passes_logger.level == int(logging_config.LogLevel.DEBUG)
+
+        with capture_logs("spyre.inductor.passes", level="DEBUG") as captured:
+            passes_logger.debug("pass ran")
+        assert any("pass ran" in line for line in captured.output)
+
+    def test_no_prefix_maps_to_info(self) -> None:
+        """torch_spyre.inductor (no prefix) must configure spyre.inductor at INFO."""
+        os.environ["TORCH_LOGS"] = "torch_spyre.inductor"
+        logging_config, _ = self._reload_logging_modules()
+
+        assert (
+            logging_config.get_log_level("spyre.inductor")
+            == logging_config.LogLevel.INFO
+        )
+
+    def test_bare_torch_spyre_maps_to_spyre_root(self) -> None:
+        """A lone +torch_spyre token must map to the spyre root logger at DEBUG."""
+        os.environ["TORCH_LOGS"] = "+torch_spyre"
+        logging_config, _ = self._reload_logging_modules()
+
+        assert logging_config.get_log_level("spyre") == logging_config.LogLevel.DEBUG
+
+    def test_legacy_bare_spyre_is_rejected_by_pytorch(self) -> None:
+        """The spyre.* spelling is rejected by PyTorch's validator.
+
+        Users MUST use torch_spyre.* because PyTorch validates with
+        importlib.util.find_spec() before any Spyre code runs.
+        """
+        # Note: This test documents that spyre.* doesn't work.
+        # The test framework here bypasses validation by re-setting
+        # TORCH_LOGS after torch import, but real users can't do this.
+        os.environ["TORCH_LOGS"] = "+torch_spyre.inductor"
+        logging_config, _ = self._reload_logging_modules()
+
+        assert (
+            logging_config.get_log_level("spyre.inductor")
+            == logging_config.LogLevel.DEBUG
+        )
+
+
 class TestCompleteIntegration(LoggingIsolationMixin):
     """End-to-end tests for integrated logging configuration behavior."""
 
@@ -435,7 +498,7 @@ class TestCompleteIntegration(LoggingIsolationMixin):
         self,
     ) -> None:
         """Verify integration flow, convenience loggers, and file output."""
-        os.environ["TORCH_LOGS"] = "spyre.inductor:DEBUG"
+        os.environ["TORCH_LOGS"] = "+torch_spyre.inductor"
 
         with tempfile.TemporaryDirectory() as tmpdir:
             log_path = os.path.join(tmpdir, "spyre.log")

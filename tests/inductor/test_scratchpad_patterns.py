@@ -462,14 +462,13 @@ class PatternTests:
         return hbm_usage
 
     def run_pattern(self, solver_type: type[MemoryPlanSolver], pattern: Pattern):
-        solver = solver_type(AVAILABLE_LX_SIZE)
-
         buffers_to_plan = [
             copy.deepcopy(buf)
             for buf in pattern.buffers.values()
             if buf.name not in pattern.inputs + pattern.outputs
         ]
-        planned_buffers = solver.plan_layout(buffers_to_plan)
+        solver = solver_type(buffers_to_plan, AVAILABLE_LX_SIZE)
+        planned_buffers = solver.plan_layout()
         planned_buffers = {buf.name: buf for buf in planned_buffers}
         # Verify that the currently implemented allocation is indeed valid
         self.verify_actual_run(pattern, planned_buffers)

@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 470" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14">
+  <defs>
+    <marker id="ah" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#444"/>
+    </marker>
+    <style>
+      .title   { fill: #222; font-size: 16px; font-weight: 700; }
+      .caption { fill: #555; font-size: 12px; font-style: italic; }
+      .panel   { fill: #222; font-size: 14px; font-weight: 700; }
+      .sub     { fill: #555; font-size: 12px; }
+      .k0      { fill: #e6f0ff; stroke: #2c5aa0; stroke-width: 1.4; }
+      .k1      { fill: #ffe9d6; stroke: #b35a1a; stroke-width: 1.4; }
+      .core    { fill: #222; font-size: 12px; font-weight: 600; }
+      .slice0  { fill: #2c5aa0; font-size: 11px; font-weight: 700; }
+      .slice1  { fill: #b35a1a; font-size: 11px; font-weight: 700; }
+      .pair    { stroke: #2d7a2d; stroke-width: 2; fill: none; }
+      .pairtxt { fill: #2d7a2d; font-size: 12px; font-weight: 700; }
+      .cost    { fill: #a32020; font-size: 12px; font-weight: 700; }
+      .costok  { fill: #2d7a2d; font-size: 12px; font-weight: 700; }
+    </style>
+  </defs>
+
+  <text x="380" y="26" text-anchor="middle" class="title">Physical core mapping for a K-split</text>
+  <text x="380" y="46" text-anchor="middle" class="caption">Example: dims [M, K], splits [4, 2], 8 cores. Green brackets join the two cores that reduce output tile M0.</text>
+
+  <!-- ============ TOP PANEL: default ============ -->
+  <text x="40" y="88" class="panel">Default order</text>
+  <text x="40" y="106" class="sub">K varies slowest. The two K slices of tile M0 sit on core 0 and core 4.</text>
+
+  <!-- 8 cores: M=core%4, K=(core//4)%2  -> c0-3 K0, c4-7 K1 -->
+  <!-- c0 -->
+  <rect class="k0" x="40"  y="120" width="82" height="46" rx="6"/>
+  <text class="core"   x="81"  y="140" text-anchor="middle">core 0</text>
+  <text class="slice0" x="81"  y="158" text-anchor="middle">M0 K0</text>
+  <!-- c1 -->
+  <rect class="k0" x="130" y="120" width="82" height="46" rx="6"/>
+  <text class="core"   x="171" y="140" text-anchor="middle">core 1</text>
+  <text class="slice0" x="171" y="158" text-anchor="middle">M1 K0</text>
+  <!-- c2 -->
+  <rect class="k0" x="220" y="120" width="82" height="46" rx="6"/>
+  <text class="core"   x="261" y="140" text-anchor="middle">core 2</text>
+  <text class="slice0" x="261" y="158" text-anchor="middle">M2 K0</text>
+  <!-- c3 -->
+  <rect class="k0" x="310" y="120" width="82" height="46" rx="6"/>
+  <text class="core"   x="351" y="140" text-anchor="middle">core 3</text>
+  <text class="slice0" x="351" y="158" text-anchor="middle">M3 K0</text>
+  <!-- c4 -->
+  <rect class="k1" x="400" y="120" width="82" height="46" rx="6"/>
+  <text class="core"   x="441" y="140" text-anchor="middle">core 4</text>
+  <text class="slice1" x="441" y="158" text-anchor="middle">M0 K1</text>
+  <!-- c5 -->
+  <rect class="k1" x="490" y="120" width="82" height="46" rx="6"/>
+  <text class="core"   x="531" y="140" text-anchor="middle">core 5</text>
+  <text class="slice1" x="531" y="158" text-anchor="middle">M1 K1</text>
+  <!-- c6 -->
+  <rect class="k1" x="580" y="120" width="82" height="46" rx="6"/>
+  <text class="core"   x="621" y="140" text-anchor="middle">core 6</text>
+  <text class="slice1" x="621" y="158" text-anchor="middle">M2 K1</text>
+  <!-- c7 -->
+  <rect class="k1" x="670" y="120" width="82" height="46" rx="6"/>
+  <text class="core"   x="711" y="140" text-anchor="middle">core 7</text>
+  <text class="slice1" x="711" y="158" text-anchor="middle">M3 K1</text>
+
+  <!-- bracket joining core0 and core4 -->
+  <path class="pair" d="M81,176 L81,190 L441,190 L441,176"/>
+  <text class="pairtxt" x="261" y="206" text-anchor="middle">M0 collaborators are 4 cores apart</text>
+  <text class="cost" x="261" y="223" text-anchor="middle">PSUM accumulation crosses several ring hops</text>
+
+  <!-- ============ BOTTOM PANEL: contiguous_dim = K ============ -->
+  <text x="40" y="278" class="panel">contiguous_dim = K</text>
+  <text x="40" y="296" class="sub">K varies fastest. The two K slices of tile M0 sit on core 0 and core 1.</text>
+
+  <!-- 8 cores: K=core%2, M=(core//2)%4 -> alternate K0/K1 -->
+  <!-- c0 -->
+  <rect class="k0" x="40"  y="310" width="82" height="46" rx="6"/>
+  <text class="core"   x="81"  y="330" text-anchor="middle">core 0</text>
+  <text class="slice0" x="81"  y="348" text-anchor="middle">M0 K0</text>
+  <!-- c1 -->
+  <rect class="k1" x="130" y="310" width="82" height="46" rx="6"/>
+  <text class="core"   x="171" y="330" text-anchor="middle">core 1</text>
+  <text class="slice1" x="171" y="348" text-anchor="middle">M0 K1</text>
+  <!-- c2 -->
+  <rect class="k0" x="220" y="310" width="82" height="46" rx="6"/>
+  <text class="core"   x="261" y="330" text-anchor="middle">core 2</text>
+  <text class="slice0" x="261" y="348" text-anchor="middle">M1 K0</text>
+  <!-- c3 -->
+  <rect class="k1" x="310" y="310" width="82" height="46" rx="6"/>
+  <text class="core"   x="351" y="330" text-anchor="middle">core 3</text>
+  <text class="slice1" x="351" y="348" text-anchor="middle">M1 K1</text>
+  <!-- c4 -->
+  <rect class="k0" x="400" y="310" width="82" height="46" rx="6"/>
+  <text class="core"   x="441" y="330" text-anchor="middle">core 4</text>
+  <text class="slice0" x="441" y="348" text-anchor="middle">M2 K0</text>
+  <!-- c5 -->
+  <rect class="k1" x="490" y="310" width="82" height="46" rx="6"/>
+  <text class="core"   x="531" y="330" text-anchor="middle">core 5</text>
+  <text class="slice1" x="531" y="348" text-anchor="middle">M2 K1</text>
+  <!-- c6 -->
+  <rect class="k0" x="580" y="310" width="82" height="46" rx="6"/>
+  <text class="core"   x="621" y="330" text-anchor="middle">core 6</text>
+  <text class="slice0" x="621" y="348" text-anchor="middle">M3 K0</text>
+  <!-- c7 -->
+  <rect class="k1" x="670" y="310" width="82" height="46" rx="6"/>
+  <text class="core"   x="711" y="330" text-anchor="middle">core 7</text>
+  <text class="slice1" x="711" y="348" text-anchor="middle">M3 K1</text>
+
+  <!-- bracket joining core0 and core1 -->
+  <path class="pair" d="M81,366 L81,380 L171,380 L171,366"/>
+  <text class="pairtxt" x="126" y="396" text-anchor="middle">adjacent</text>
+  <text class="costok" x="380" y="396" text-anchor="middle">PSUM accumulation is a single ring hop</text>
+
+  <text x="380" y="440" text-anchor="middle" class="caption">core_to_slice_mapping in core_mapping.py, gated by SPYRE_CORE_ID_K_FAST_EMISSION (default on).</text>
+</svg>

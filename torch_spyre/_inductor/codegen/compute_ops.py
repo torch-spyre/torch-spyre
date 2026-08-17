@@ -15,10 +15,13 @@
 
 import dataclasses
 
-from torch_spyre._C import encode_constant, DataFormats
-from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.pass_utils import coeff_through_floor
 from sympy import Symbol
+
+from torch_spyre._C import DataFormats, encode_constant
+from torch_spyre._inductor.constants import CONV2D_DIM_LABELS, DEPTHWISE_CONV2D_OP
+from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.op_spec import TensorWorkDivision
+from torch_spyre._inductor.pass_utils import coeff_through_floor
 
 
 @dataclasses.dataclass(frozen=True)
@@ -262,30 +265,73 @@ def gen_coord_info_value(
     elems_per_stick: int,
     is_stick_dim: bool,
     is_stick_reduction: bool = False,
+    conv_params=None,
     padding: str = "nopad",
     is_fp8_stick: bool = False,
     stick_idx: int = -1,
     tensor_idx: int = -1,
     opfunc: str = "",
+    core_stride: int | None = None,
 ):
+    """
+    Args:
+        conv_params: Dict with padding info for convolution ops; contains 'conv_padding' (pad type) and 'total_size' (per-core slice size for padding dims).
+        If conv_params is not specified, pad type should default to "nopad" and total_size to size.
+    """
+    if conv_params is None:
+        conv_params = {"conv_padding": padding, "stride_len": 1, "total_size": size}
+
+    # How far the coordinate advances per core (the core_fold Affine alpha).
+    # Two equivalent encodings feed this, one per caller:
+    #   - Forward conv2d (#3284) passes core_stride (= out_per_core * stride) for
+    #     an overlapping reduction window (stride < kernel), where the per-core
+    #     window span (`size`) is larger than the per-core output stride.
+    #   - Depthwise conv2d (#3510) and every other op advance by
+    #     size * stride_len (stride_len==1, total_size==size for the non-conv
+    #     default), i.e. contiguous non-overlapping tiling.
+    # See _coord_per_core_size / _coord_core_stride.
+    core_alpha = (
+        core_stride if core_stride is not None else size * conv_params["stride_len"]
+    )
+    # The conv_params-derived padding string and per-core total_size are the
+    # depthwise-conv (#3510) encoding. Forward conv2d (#3284) and every other op
+    # keep their own `padding` arg and the windowed per-core `size` (which
+    # already equals total_size for the non-conv default), so gate on the
+    # depthwise opfunc to avoid overwriting forward conv's fullspan padding /
+    # windowed elem_arr_0 factor.
+    is_depthwise = opfunc == DEPTHWISE_CONV2D_OP
+    stick_padding = str(conv_params["conv_padding"]) if is_depthwise else padding
+    elem_arr_factor = conv_params["total_size"] if is_depthwise else size
     if not is_stick_dim:
         return {
             "spatial": 3,
             "temporal": 0,
             "elemArr": 1,
-            "padding": padding,
+            "padding": stick_padding,
             "folds": {
                 "dim_prop_func": [
-                    {"Affine": {"alpha_": size, "beta_": 0}},
+                    {"Affine": {"alpha_": core_alpha, "beta_": 0}},
                     {"Affine": {"alpha_": 0, "beta_": 0}},
                     {"Affine": {"alpha_": 0, "beta_": 0}},
                     {"Affine": {"alpha_": 1, "beta_": 0}},
                 ],
                 "dim_prop_attr": [
-                    {"factor_": nsplits, "label_": "core_fold"},
-                    {"factor_": 1, "label_": "corelet_fold"},
-                    {"factor_": 1, "label_": "row_fold"},
-                    {"factor_": size, "label_": "elem_arr_0"},
+                    {
+                        "factor_": nsplits,
+                        "label_": "core_fold",
+                    },
+                    {
+                        "factor_": 1,
+                        "label_": "corelet_fold",
+                    },
+                    {
+                        "factor_": 1,
+                        "label_": "row_fold",
+                    },
+                    {
+                        "factor_": elem_arr_factor,
+                        "label_": "elem_arr_0",
+                    },
                 ],
             },
         }
@@ -374,6 +420,66 @@ def gen_coord_info_value(
                 ],
             },
         }
+
+
+# SDSC dim labels for the conv2d padding (output-spatial) axes.
+
+_CONV2D_PAD_DIM_I = CONV2D_DIM_LABELS[2]
+_CONV2D_PAD_DIM_J = CONV2D_DIM_LABELS[3]
+
+
+def _build_padding_for_tensor(conv_params):
+    """Build padding_ for tensor allocations, only when conv_params is non-empty."""
+    if not conv_params:
+        return {}
+    return {
+        "padding_": {
+            str(_CONV2D_PAD_DIM_I): conv_params["pad_type"],
+            str(_CONV2D_PAD_DIM_J): conv_params["pad_type"],
+        }
+    }
+
+
+def get_conv_params(tensor_num, dim, opfunc, conv_params, size, splits):
+    conv_padding = "nopad"
+    total_size = size // splits
+    padding_len = 0
+    stride_len = 1
+    if tensor_num == 0 and opfunc == DEPTHWISE_CONV2D_OP:
+        required_keys = [
+            "stride_i",
+            "stride_j",
+            "kernel_h",
+            "kernel_w",
+        ]
+        missing = [k for k in required_keys if k not in conv_params]
+        if missing:
+            raise ValueError(f"Missing conv_params keys: {missing}")
+        if "pad_type" in conv_params and str(dim) in (
+            str(_CONV2D_PAD_DIM_I),
+            str(_CONV2D_PAD_DIM_J),
+        ):
+            conv_padding = conv_params["pad_type"]
+            padding_len = conv_params["pad_i"]
+            stride_len = conv_params["stride_i"]
+        if str(dim) == str(_CONV2D_PAD_DIM_I):
+            total_size = (
+                (size // splits) * conv_params["stride_i"] + conv_params["kernel_h"] - 1
+            )
+            padding_len = conv_params["pad_i"]
+            stride_len = conv_params["stride_i"]
+        elif str(dim) == str(_CONV2D_PAD_DIM_J):
+            total_size = (
+                (size // splits) * conv_params["stride_j"] + conv_params["kernel_w"] - 1
+            )
+            padding_len = conv_params["pad_j"]
+            stride_len = conv_params["stride_j"]
+    return {
+        "conv_padding": conv_padding,
+        "padding_len": padding_len,
+        "stride_len": stride_len,
+        "total_size": total_size,
+    }
 
 
 def _symbolic_split_info(
@@ -538,32 +644,25 @@ def generate_sdsc(
     symbols: list[int],
     symbol_id_offset: int = 0,
     tiled_symbols=None,
-    use_symbols: bool = False,
 ):
     """Generate SDSC JSON for one OpSpec.
 
     Returns a 4-tuple ``(sdsc_json, base_symbol_values, affine_strides, symbol_kinds)``:
     - ``sdsc_json``: the JSON dict to write to ``sdsc_N.json``
-    - ``base_symbol_values``: list of HBM byte offsets registered in ``symbols``;
-      empty when ``use_symbols=False``
+    - ``base_symbol_values``: list of HBM byte offsets registered in ``symbols``
     - ``affine_strides``: list (parallel to ``sdsc_spec.args``) of per-level
       stride lists.  Each element is a list of dicts, one per loop-nesting level
       (outermost first), where each dict maps ``tiled_sym -> stride_bytes`` for
-      that level's tiled symbols.  Always ``[[]] * len(sdsc_spec.args)`` when
-      ``use_symbols=False``.  Used by ``bundle.py`` to emit ``affine.apply`` ops
-      inside ``scf.for`` loops, with one stride per level mapped to the correct
-      loop variable.
-    - ``symbol_kinds``: list of ``SymbolKind`` parallel to ``base_symbol_values``;
-      empty when ``use_symbols=False``.  Classifies each symbol as a kernel base
-      address, per-core derived address, or pool-allocated address.
+      that level's tiled symbols.  Used by ``bundle.py`` to emit ``affine.apply``
+      ops inside ``scf.for`` loops, with one stride per level mapped to the
+      correct loop variable.
+    - ``symbol_kinds``: list of ``SymbolKind`` parallel to ``base_symbol_values``.
+      Classifies each symbol as a kernel base address, per-core derived
+      address, or pool-allocated address.
 
-    When ``use_symbols=False``, HBM tensor addresses are baked directly as
-    concrete integers into the SDSC JSON.  No symbol IDs are registered and
-    ``symbols`` is not modified.
-
-    When ``use_symbols=True``, HBM addresses are registered as negative symbol
-    IDs in the JSON and their values appended to ``symbols``, enabling
-    ``affine.apply`` address computation in ``bundle.mlir`` for tiled loops.
+    HBM addresses are registered as negative symbol IDs in the JSON and their
+    values appended to ``symbols``, enabling ``affine.apply`` address
+    computation in ``bundle.mlir`` for tiled loops.
 
     ``tensor.device_tile_advance_expr``: each tensor's own device-element-
     offset ``sympy.Expr | None``, symbolic in the real Inductor iteration
@@ -585,6 +684,13 @@ def generate_sdsc(
         }
         for c in range(sdsc_spec.num_cores)
     }
+    operation_work_division = TensorWorkDivision(
+        {dim: int(split) for dim, split in sdsc_spec.work_slices.items()},
+        {dim: sdsc_spec.core_id_to_work_slice[dim] for dim in sdsc_spec.work_slices},
+    )
+    for tensor in sdsc_spec.args:
+        if tensor.work_division is None:
+            tensor.work_division = operation_work_division
     symbolic_dims = sdsc_spec.symbolic_dims or {}
 
     # Register dimension symbols BEFORE address symbols so their IDs never collide.
@@ -650,355 +756,251 @@ def generate_sdsc(
             arg_index=arg_index,
         )
 
-    if use_symbols:
+    def offset_as_symbol(s, kind: SymbolKind):
+        key: tuple | int
+        if kind.is_pool:
+            key = ("pool", s)
+        elif kind.kind == "kernel":
+            key = ("kernel", kind.arg_index)
+        elif kind.kind == "kernel_slice":
+            key = ("kernel_slice", kind.arg_index, kind.offset)
+        elif kind.is_derived_symbolic:
+            # Per-core symbolic address: key by (tensor, core) so every
+            # (arg_index, core_idx) is a distinct registration and never
+            # collides with a concrete kernel_derived key (a bare int addr).
+            key = ("kernel_derived_symbolic", kind.arg_index, kind.core_idx)
+        else:
+            # kernel_derived: s is a large per-core HBM byte address,
+            # distinct from pool offsets and sentinel values.
+            key = s
+        if key not in local_symbols:
+            # Address symbols start after dim symbols in the ID counter.
+            local_symbols[key] = -(
+                symbol_id_offset + n_dim_syms + len(local_symbols) + 1
+            )
+            symbols.append(s)
+            local_symbol_kind.append(kind)
+        return local_symbols[key]
 
-        def offset_as_symbol(s, kind: SymbolKind):
-            key: tuple | int
-            if kind.is_pool:
-                key = ("pool", s)
-            elif kind.kind == "kernel":
-                key = ("kernel", kind.arg_index)
-            elif kind.kind == "kernel_slice":
-                key = ("kernel_slice", kind.arg_index, kind.offset)
-            elif kind.is_derived_symbolic:
-                # Per-core symbolic address: key by (tensor, core) so every
-                # (arg_index, core_idx) is a distinct registration and never
-                # collides with a concrete kernel_derived key (a bare int addr).
-                key = ("kernel_derived_symbolic", kind.arg_index, kind.core_idx)
-            else:
-                # kernel_derived: s is a large per-core HBM byte address,
-                # distinct from pool offsets and sentinel values.
-                key = s
-            if key not in local_symbols:
-                # Address symbols start after dim symbols in the ID counter.
-                local_symbols[key] = -(
-                    symbol_id_offset + n_dim_syms + len(local_symbols) + 1
+    def _register_per_core_derived(
+        tensor,
+        c: int,
+        addr: int,
+        core0_addr: int,
+        sliced_base_sym_idx: int,
+        symbolic_split: tuple[str, int, str] | None,
+    ) -> None:
+        """Register the c>0 derived address for a kernel tensor.
+
+        Routes to ``kernel_derived_symbolic`` when the tensor is split on a
+        symbolic dim (the byte offset depends on the runtime dim size and is
+        resolved by a later bundle arm), otherwise the concrete
+        ``kernel_derived`` path.  ``addr`` is the compile-time (max-shape)
+        address, used for the concrete path and as the symbols[] placeholder
+        value for the symbolic path.
+        """
+        if symbolic_split is not None:
+            _sdsc_dim_name, split_count, pytorch_sym = symbolic_split
+            # TODO:  only TAG the per-core address as symbolic. The
+            # runtime arith (core * ceildiv(S, split) * per_element_stride)
+            # and the per-element stride it needs are the bundle-arm
+            # follow-up, so nothing stride-related is computed here.
+            offset_as_symbol(
+                addr,
+                SymbolKind.kernel_derived_symbolic(
+                    arg_index=tensor.arg_index,
+                    core_idx=c,
+                    split_count=split_count,
+                    base_sym_idx=sliced_base_sym_idx,
+                    pytorch_sym=pytorch_sym,
+                ),
+            )
+        else:
+            offset_as_symbol(
+                addr,
+                _derived_kind(tensor.arg_index, core0_addr, addr, sliced_base_sym_idx),
+            )
+
+    # Compute per-tensor, per-level affine strides and register base addresses.
+    # affine_strides[i] is a list of dicts, one per loop-nesting level
+    # (outermost first), where each dict maps tiled_sym -> stride_bytes for
+    # the symbols at that level that advance tensor i.  Empty list of dicts
+    # (i.e. [{}] * n_levels or []) for non-tiled tensors.
+    affine_strides: list[list[dict]] = []
+    for tensor in sdsc_spec.args:
+        if "lx" in tensor.allocation:
+            # LX addresses are never registered as symbols in the SDSC JSON
+            # (isStartAddrSymbolic_ is always unset for lx, and bundle.py's
+            # _get_tensor_core_sym_id returns None for non-hbm components), so
+            # affine.apply can never target an LX address today. A tiled
+            # (advancing) lx tensor therefore has no way to express its
+            # per-iteration address change in this preserved-loop path.
+            # A non-advancing reference has no term in
+            # device_tile_advance_expr, which _tensor_tiled_by_symbol
+            # already detects directly.
+            is_tiled_lx = any(
+                _tensor_tiled_by_symbol(tensor, s)
+                for level_syms in tiled_symbols
+                for s in level_syms
+            )
+            if is_tiled_lx:
+                raise NotImplementedError(
+                    "Tiled (advancing) lx-allocated tensors are not yet supported."
                 )
-                symbols.append(s)
-                local_symbol_kind.append(kind)
-            return local_symbols[key]
-
-        def _register_per_core_derived(
-            tensor,
-            c: int,
-            addr: int,
-            core0_addr: int,
-            sliced_base_sym_idx: int,
-            symbolic_split: tuple[str, int, str] | None,
-        ) -> None:
-            """Register the c>0 derived address for a kernel tensor.
-
-            Routes to ``kernel_derived_symbolic`` when the tensor is split on a
-            symbolic dim (the byte offset depends on the runtime dim size and is
-            resolved by a later bundle arm), otherwise the concrete
-            ``kernel_derived`` path.  ``addr`` is the compile-time (max-shape)
-            address, used for the concrete path and as the symbols[] placeholder
-            value for the symbolic path.
-            """
-            if symbolic_split is not None:
-                _sdsc_dim_name, split_count, pytorch_sym = symbolic_split
-                # TODO:  only TAG the per-core address as symbolic. The
-                # runtime arith (core * ceildiv(S, split) * per_element_stride)
-                # and the per-element stride it needs are the bundle-arm
-                # follow-up, so nothing stride-related is computed here.
-                offset_as_symbol(
-                    addr,
-                    SymbolKind.kernel_derived_symbolic(
-                        arg_index=tensor.arg_index,
-                        core_idx=c,
-                        split_count=split_count,
-                        base_sym_idx=sliced_base_sym_idx,
-                        pytorch_sym=pytorch_sym,
-                    ),
-                )
-            else:
-                offset_as_symbol(
-                    addr,
-                    _derived_kind(
-                        tensor.arg_index, core0_addr, addr, sliced_base_sym_idx
-                    ),
-                )
-
-        # Compute per-tensor, per-level affine strides and register base addresses.
-        # affine_strides[i] is a list of dicts, one per loop-nesting level
-        # (outermost first), where each dict maps tiled_sym -> stride_bytes for
-        # the symbols at that level that advance tensor i.  Empty list of dicts
-        # (i.e. [{}] * n_levels or []) for non-tiled tensors.
-        affine_strides: list[list[dict]] = []
-        for tensor in sdsc_spec.args:
-            if "lx" in tensor.allocation:
-                # LX addresses are never registered as symbols in the SDSC JSON
-                # (isStartAddrSymbolic_ is always unset for lx, and bundle.py's
-                # _get_tensor_core_sym_id returns None for non-hbm components), so
-                # affine.apply can never target an LX address today. A tiled
-                # (advancing) lx tensor therefore has no way to express its
-                # per-iteration address change in this preserved-loop path.
-                # A non-advancing reference has no term in
-                # device_tile_advance_expr, which _tensor_tiled_by_symbol
-                # already detects directly.
-                is_tiled_lx = any(
-                    _tensor_tiled_by_symbol(tensor, s)
+            affine_strides.append([{} for _ in tiled_symbols])
+            continue
+        nb = num_bytes(tensor.data_format)
+        slice_offset_bytes = sum(tensor.offsets.values()) * nb
+        # core0_addr: compile-time address for core 0 including the tensor's
+        # slice offset (device_coordinate constant terms, e.g. z0+3 → 3 rows).
+        core0_addr = (
+            tensor.start_address
+            + core_idx_to_slice_offset(
+                tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
+            )
+            * nb
+        )
+        # Per-core symbolic split: cores 1..n-1 of a kernel tensor split on a
+        # symbolic dim get kernel_derived_symbolic addresses (byte offset
+        # depends on the runtime dim size).  A symbolic-split dim that is ALSO
+        # tiled for this tensor is out of scope: the per-core address would
+        # need both a symbolic term and an affine.apply term.
+        symbolic_split = _symbolic_split_info(
+            tensor, sdsc_spec.work_slices, symbolic_dims
+        )
+        if symbolic_split is not None:
+            sym_dim_name = symbolic_split[0]
+            sym_dim = Symbol(sym_dim_name)
+            # Real-symbol fast path: s IS the dim symbol (already renamed
+            # to its SDSC dim label by symbol_mapping), so name equality
+            # against sym_dim_name is a correct, direct test.
+            #
+            # Minted-symbol path (spyre_kernel._get_or_mint_level_symbol):
+            # a minted symbol names a loop-nesting *level*, not a
+            # dimension -- _general_tile_advance (spyre_kernel.py) sums
+            # every host dim tiled at a level into ONE combined
+            # coefficient on that level's minted symbol before this
+            # tensor's device_tile_advance_expr is ever built, so by the
+            # time we get here there is no way to recover, from a
+            # nonzero coeff(minted_sym) alone, *which* of this tensor's
+            # active dims that coefficient came from (see fix-loop
+            # round-1 review: a tensor with two active dims, tiled only
+            # on one of them, previously false-positived on the other
+            # merely because it was also active and the tensor advanced
+            # via *some* dim).
+            #
+            # Absent that per-dimension provenance, the only sound test
+            # (no false positives) is: flag `sym_dim_name` only when it
+            # is this tensor's *sole* active (non-reduced) dim -- then a
+            # nonzero combined coefficient cannot be attributed to any
+            # other dim, because there is no other dim. This is a
+            # deliberate narrowing versus "any tiling at all, on any
+            # dim" -- it can under-detect (miss a real conflict on a
+            # tensor with 2+ active dims where sym_dim_name genuinely is
+            # the tiled one) but never over-detects, which is the
+            # correctness-critical direction for a False positive to
+            # avoid: it would otherwise reject support for supported
+            # ops using this check.
+            active_dims = [d for d in tensor.strides if tensor.scales.get(d, 1) > 0]
+            tensor_advances_at_some_level = (
+                tensor.device_tile_advance_expr is not None
+                and any(
+                    coeff_through_floor(tensor.device_tile_advance_expr, s)
                     for level_syms in tiled_symbols
                     for s in level_syms
                 )
-                if is_tiled_lx:
-                    raise NotImplementedError(
-                        "Tiled (advancing) lx-allocated tensors are not yet supported."
-                    )
-                affine_strides.append([{} for _ in tiled_symbols])
-                continue
-            nb = num_bytes(tensor.data_format)
-            slice_offset_bytes = sum(tensor.offsets.values()) * nb
-            # core0_addr: compile-time address for core 0 including the tensor's
-            # slice offset (device_coordinate constant terms, e.g. z0+3 → 3 rows).
-            core0_addr = (
-                tensor.start_address
-                + core_idx_to_slice_offset(
-                    tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
-                )
-                * nb
             )
-            # Per-core symbolic split: cores 1..n-1 of a kernel tensor split on a
-            # symbolic dim get kernel_derived_symbolic addresses (byte offset
-            # depends on the runtime dim size).  A symbolic-split dim that is ALSO
-            # tiled for this tensor is out of scope: the per-core address would
-            # need both a symbolic term and an affine.apply term.
-            symbolic_split = _symbolic_split_info(
-                tensor, sdsc_spec.work_slices, symbolic_dims
+            tiled_on_split_dim = any(
+                str(s) == sym_dim_name
+                for level_syms in tiled_symbols
+                for s in level_syms
+                if s in tensor.strides
+            ) or (
+                sym_dim in tensor.strides
+                and tensor.scales.get(sym_dim, 1) > 0
+                and active_dims == [sym_dim]
+                and tensor_advances_at_some_level
             )
-            if symbolic_split is not None:
-                sym_dim_name = symbolic_split[0]
-                sym_dim = Symbol(sym_dim_name)
-                # Real-symbol fast path: s IS the dim symbol (already renamed
-                # to its SDSC dim label by symbol_mapping), so name equality
-                # against sym_dim_name is a correct, direct test.
-                #
-                # Minted-symbol path (spyre_kernel._get_or_mint_level_symbol):
-                # a minted symbol names a loop-nesting *level*, not a
-                # dimension -- _general_tile_advance (spyre_kernel.py) sums
-                # every host dim tiled at a level into ONE combined
-                # coefficient on that level's minted symbol before this
-                # tensor's device_tile_advance_expr is ever built, so by the
-                # time we get here there is no way to recover, from a
-                # nonzero coeff(minted_sym) alone, *which* of this tensor's
-                # active dims that coefficient came from (see fix-loop
-                # round-1 review: a tensor with two active dims, tiled only
-                # on one of them, previously false-positived on the other
-                # merely because it was also active and the tensor advanced
-                # via *some* dim).
-                #
-                # Absent that per-dimension provenance, the only sound test
-                # (no false positives) is: flag `sym_dim_name` only when it
-                # is this tensor's *sole* active (non-reduced) dim -- then a
-                # nonzero combined coefficient cannot be attributed to any
-                # other dim, because there is no other dim. This is a
-                # deliberate narrowing versus "any tiling at all, on any
-                # dim" -- it can under-detect (miss a real conflict on a
-                # tensor with 2+ active dims where sym_dim_name genuinely is
-                # the tiled one) but never over-detects, which is the
-                # correctness-critical direction for a False positive to
-                # avoid: it would otherwise reject support for supported
-                # ops using this check.
-                active_dims = [d for d in tensor.strides if tensor.scales.get(d, 1) > 0]
-                tensor_advances_at_some_level = (
-                    tensor.device_tile_advance_expr is not None
-                    and any(
-                        coeff_through_floor(tensor.device_tile_advance_expr, s)
-                        for level_syms in tiled_symbols
-                        for s in level_syms
-                    )
+            if tiled_on_split_dim:
+                raise Unsupported(
+                    f"Symbolic dim '{sym_dim_name}' is both split across "
+                    f"cores and tiled on the tensor at arg_index="
+                    f"{tensor.arg_index}; per-core symbolic addresses inside "
+                    "tiled loops are not supported."
                 )
-                tiled_on_split_dim = any(
-                    str(s) == sym_dim_name
-                    for level_syms in tiled_symbols
-                    for s in level_syms
-                    if s in tensor.strides
-                ) or (
-                    sym_dim in tensor.strides
-                    and tensor.scales.get(sym_dim, 1) > 0
-                    and active_dims == [sym_dim]
-                    and tensor_advances_at_some_level
-                )
-                if tiled_on_split_dim:
-                    raise Unsupported(
-                        f"Symbolic dim '{sym_dim_name}' is both split across "
-                        f"cores and tiled on the tensor at arg_index="
-                        f"{tensor.arg_index}; per-core symbolic addresses inside "
-                        "tiled loops are not supported."
-                    )
-            if tensor.arg_index >= 0:
-                # Kernel tensors: register the raw base address first so bundle.py
-                # can emit the input_arg function parameter.
-                #
-                # On the symbolic path, tensor.start_address = arg_index + tile_offset_bytes,
-                # where tile_offset_bytes is the per-tile byte advance computed for the
-                # affine-stride path.  We always register the raw kernel symbol keyed by
-                # arg_index so that bundle.py emits exactly one !sdscbundle.input_arg
-                # parameter per logical tensor, regardless of how many tiles reference it.
-                raw_base = tensor.arg_index  # sentinel value for this arg
+        if tensor.arg_index >= 0:
+            # Kernel tensors: register the raw base address first so bundle.py
+            # can emit the input_arg function parameter.
+            #
+            # On the symbolic path, tensor.start_address = arg_index + tile_offset_bytes,
+            # where tile_offset_bytes is the per-tile byte advance computed for the
+            # affine-stride path.  We always register the raw kernel symbol keyed by
+            # arg_index so that bundle.py emits exactly one !sdscbundle.input_arg
+            # parameter per logical tensor, regardless of how many tiles reference it.
+            raw_base = tensor.arg_index  # sentinel value for this arg
+            offset_as_symbol(raw_base, SymbolKind.kernel(arg_index=tensor.arg_index))
+            # Derive the 0-based symbols[] index of the kernel symbol from its
+            # registered ID.  Must be looked up (not inferred from current
+            # len(local_symbols)) because the same arg_index may have been
+            # registered already by an earlier tensor in this SDSC, in which case
+            # the offset_as_symbol call above was a no-op.
+            kernel_sym_idx = abs(local_symbols[("kernel", tensor.arg_index)]) - 1
+            # tile_offset_bytes: arg.allocation['hbm'] advances by i*stride for
+            # tile i, so start_address = arg_index + tile_offset. tile_offset_bytes
+            # == 0 for tile 0, positive for later tiles.
+            tile_offset_bytes = tensor.start_address - tensor.arg_index
+            # total_slice_offset: combine the per-tile byte offset with any
+            # device-coordinate compile-time slice offset (e.g. from z0+3 expressions).
+            # This is the total compile-time offset above the raw %arg_N base that the
+            # sliced-base SSA value represents in bundle.mlir.
+            total_slice_offset = tile_offset_bytes + slice_offset_bytes
+            # sliced_base_sym_idx: the symbols[] index that per-core derived symbols
+            # reference.  When total_slice_offset == 0 the kernel sym IS the sliced
+            # base; otherwise a kernel_slice sym is registered for the combined offset.
+            if total_slice_offset > 0:
                 offset_as_symbol(
-                    raw_base, SymbolKind.kernel(arg_index=tensor.arg_index)
+                    core0_addr,
+                    SymbolKind.kernel_slice(
+                        arg_index=tensor.arg_index, offset=total_slice_offset
+                    ),
                 )
-                # Derive the 0-based symbols[] index of the kernel symbol from its
-                # registered ID.  Must be looked up (not inferred from current
-                # len(local_symbols)) because the same arg_index may have been
-                # registered already by an earlier tensor in this SDSC, in which case
-                # the offset_as_symbol call above was a no-op.
-                kernel_sym_idx = abs(local_symbols[("kernel", tensor.arg_index)]) - 1
-                # tile_offset_bytes: arg.allocation['hbm'] advances by i*stride for
-                # tile i, so start_address = arg_index + tile_offset. tile_offset_bytes
-                # == 0 for tile 0, positive for later tiles.
-                tile_offset_bytes = tensor.start_address - tensor.arg_index
-                # total_slice_offset: combine the per-tile byte offset with any
-                # device-coordinate compile-time slice offset (e.g. from z0+3 expressions).
-                # This is the total compile-time offset above the raw %arg_N base that the
-                # sliced-base SSA value represents in bundle.mlir.
-                total_slice_offset = tile_offset_bytes + slice_offset_bytes
-                # sliced_base_sym_idx: the symbols[] index that per-core derived symbols
-                # reference.  When total_slice_offset == 0 the kernel sym IS the sliced
-                # base; otherwise a kernel_slice sym is registered for the combined offset.
-                if total_slice_offset > 0:
-                    offset_as_symbol(
-                        core0_addr,
-                        SymbolKind.kernel_slice(
-                            arg_index=tensor.arg_index, offset=total_slice_offset
-                        ),
-                    )
-                    slice_key = ("kernel_slice", tensor.arg_index, total_slice_offset)
-                    sliced_base_sym_idx = abs(local_symbols[slice_key]) - 1
-                else:
-                    sliced_base_sym_idx = kernel_sym_idx
+                slice_key = ("kernel_slice", tensor.arg_index, total_slice_offset)
+                sliced_base_sym_idx = abs(local_symbols[slice_key]) - 1
             else:
-                # Pool tensor: no raw-base or slice symbol needed.
-                sliced_base_sym_idx = -1
-            # Build per-level strides: for each level, collect the symbols at that
-            # level that tile this tensor (see _tensor_tiled_by_symbol -- a nonzero
-            # coeff on tensor.device_tile_advance_expr, with real dimension symbols
-            # additionally required to have a positive scale).
-            # Exclude symbols whose scale is negative: those are reduced dimensions
-            # whose stride describes element layout within one tile, not the advance
-            # between tiles.  Tiling by a reduction-dim symbol would incorrectly
-            # advance the base address of a pool output past its single allocated slot.
-            # A tile-local scratch tensor reused every iteration (see unroll.py)
-            # never advances either -- it simply has no term in
-            # device_tile_advance_expr, which _tensor_tiled_by_symbol already
-            # detects directly.
-            per_level_strides: list[dict] = []
-            any_tiled = False
-            for level_idx, level_syms in enumerate(tiled_symbols):
-                tensor_tiled_at_level = [
-                    s for s in level_syms if _tensor_tiled_by_symbol(tensor, s)
-                ]
-                strides_for_level: dict = {}
-                for s in tensor_tiled_at_level:
-                    coeff = (
-                        coeff_through_floor(tensor.device_tile_advance_expr, s)
-                        if tensor.device_tile_advance_expr is not None
-                        else 0
-                    )
-                    strides_for_level[s] = int(coeff) * nb
-                    any_tiled = True
-                per_level_strides.append(strides_for_level)
-            if not any_tiled:
-                # Non-tiled HBM: register per-core addresses.
-                for c in range(sdsc_spec.num_cores):
-                    addr = (
-                        tensor.start_address
-                        + core_idx_to_slice_offset(
-                            tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
-                        )
-                        * nb
-                    )
-                    if c == 0:
-                        if tensor.arg_index < 0:
-                            offset_as_symbol(addr, SymbolKind.pool())
-                        # kernel / kernel_slice already registered above; skip c==0
-                    else:
-                        if tensor.arg_index < 0:
-                            offset_as_symbol(addr, SymbolKind.pool())
-                        elif addr != core0_addr:
-                            # Only register a derived symbol when the core has a
-                            # distinct address from core 0.  When addr == core0_addr
-                            # (e.g. a non-split tensor where all cores share one
-                            # address) the sliced-base symbol already covers it and
-                            # we must not create a duplicate registration.
-                            _register_per_core_derived(
-                                tensor,
-                                c,
-                                addr,
-                                core0_addr,
-                                sliced_base_sym_idx,
-                                symbolic_split,
-                            )
-                affine_strides.append([{} for _ in tiled_symbols])
-            else:
-                # Tiled HBM: symbol value = per-core iter-0 base address.
-                # The affine map adds loop_var * tile_stride on top at runtime.
-                for c in range(sdsc_spec.num_cores):
-                    addr = (
-                        tensor.start_address
-                        + core_idx_to_slice_offset(
-                            tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
-                        )
-                        * nb
-                    )
-                    if c == 0:
-                        if tensor.arg_index < 0:
-                            offset_as_symbol(addr, SymbolKind.pool())
-                        # kernel / kernel_slice already registered above; skip c==0
-                    else:
-                        if tensor.arg_index < 0:
-                            offset_as_symbol(addr, SymbolKind.pool())
-                        elif addr != core0_addr:
-                            # Symbolic split on a non-tiled dim combined with
-                            # tiling on another dim still routes through the
-                            # helper; the split==tiled case is rejected above.
-                            _register_per_core_derived(
-                                tensor,
-                                c,
-                                addr,
-                                core0_addr,
-                                sliced_base_sym_idx,
-                                symbolic_split,
-                            )
-                affine_strides.append(per_level_strides)
-
-        def _start_addr_data(tensor):
-            # All per-core addresses were already registered by the per-tensor loop
-            # above. Look them up using the same key scheme as offset_as_symbol.
-            if "lx" in tensor.allocation:
-                return {
-                    f"[{c}, 0, 0]": str(tensor.start_address)
-                    for c in range(sdsc_spec.num_cores)
-                }
-            nb = num_bytes(tensor.data_format)
-            is_pool_tensor = tensor.arg_index < 0 and "hbm_pool" in tensor.allocation
-            # Recompute the symbolic-split status so c>0 cores resolve to the
-            # ("kernel_derived_symbolic", arg_index, core_idx) key the per-tensor
-            # loop registered.  Pure function of the tensor + work_slices, so this
-            # matches the registration decision exactly.
-            symbolic_split = _symbolic_split_info(
-                tensor, sdsc_spec.work_slices, symbolic_dims
-            )
-            # Hoist kernel-tensor compile-time offsets so they are not
-            # duplicated across the c==0 and c>0 branches.
-            if not is_pool_tensor:
-                slice_offset_bytes = sum(tensor.offsets.values()) * nb
-                tile_offset_bytes = tensor.start_address - tensor.arg_index
-                total_slice_offset = tile_offset_bytes + slice_offset_bytes
-                c0_slice_key: tuple | int = (
-                    ("kernel_slice", tensor.arg_index, total_slice_offset)
-                    if total_slice_offset > 0
-                    else ("kernel", tensor.arg_index)
+                sliced_base_sym_idx = kernel_sym_idx
+        else:
+            # Pool tensor: no raw-base or slice symbol needed.
+            sliced_base_sym_idx = -1
+        # Build per-level strides: for each level, collect the symbols at that
+        # level that tile this tensor (see _tensor_tiled_by_symbol -- a nonzero
+        # coeff on tensor.device_tile_advance_expr, with real dimension symbols
+        # additionally required to have a positive scale).
+        # Exclude symbols whose scale is negative: those are reduced dimensions
+        # whose stride describes element layout within one tile, not the advance
+        # between tiles.  Tiling by a reduction-dim symbol would incorrectly
+        # advance the base address of a pool output past its single allocated slot.
+        # A tile-local scratch tensor reused every iteration (see unroll.py)
+        # never advances either -- it simply has no term in
+        # device_tile_advance_expr, which _tensor_tiled_by_symbol already
+        # detects directly.
+        per_level_strides: list[dict] = []
+        any_tiled = False
+        for level_syms in tiled_symbols:
+            tensor_tiled_at_level = [
+                s for s in level_syms if _tensor_tiled_by_symbol(tensor, s)
+            ]
+            strides_for_level: dict = {}
+            for s in tensor_tiled_at_level:
+                coeff = (
+                    coeff_through_floor(tensor.device_tile_advance_expr, s)
+                    if tensor.device_tile_advance_expr is not None
+                    else 0
                 )
-                core0_addr_lookup = (
-                    tensor.start_address
-                    + core_idx_to_slice_offset(
-                        tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
-                    )
-                    * nb
-                )
-            result = {}
+                strides_for_level[s] = int(coeff) * nb
+                any_tiled = True
+            per_level_strides.append(strides_for_level)
+        if not any_tiled:
+            # Non-tiled HBM: register per-core addresses.
             for c in range(sdsc_spec.num_cores):
                 addr = (
                     tensor.start_address
@@ -1007,52 +1009,131 @@ def generate_sdsc(
                     )
                     * nb
                 )
-                if is_pool_tensor:
-                    key: tuple | int = ("pool", addr)
-                elif c == 0:
-                    key = c0_slice_key
-                elif addr == core0_addr_lookup:
-                    # Non-split tensor: all cores share core 0's address, so no
-                    # derived symbol was registered, reuse the sliced-base key.
-                    key = c0_slice_key
-                elif symbolic_split is not None:
-                    # Symbolic-dim split: c>0 registered a kernel_derived_symbolic
-                    # symbol keyed by (tensor, core).
-                    key = ("kernel_derived_symbolic", tensor.arg_index, c)
+                if c == 0:
+                    if tensor.arg_index < 0:
+                        offset_as_symbol(addr, SymbolKind.pool())
+                    # kernel / kernel_slice already registered above; skip c==0
                 else:
-                    # c>0 concrete per-core derived address (bare int key).
-                    key = addr
-                result[f"[{c}, 0, 0]"] = str(local_symbols[key])
-            return result
-
-    else:
-        # use_symbols=False: bake concrete HBM addresses directly into the JSON.
-        # symbols and local_symbols are not modified.
-        affine_strides = [[{} for _ in tiled_symbols] for _ in sdsc_spec.args]
-
-        def _start_addr_data(tensor):
-            if "lx" in tensor.allocation:
-                return {
-                    f"[{c}, 0, 0]": str(tensor.start_address)
-                    for c in range(sdsc_spec.num_cores)
-                }
-            return {
-                f"[{c}, 0, 0]": str(
+                    if tensor.arg_index < 0:
+                        offset_as_symbol(addr, SymbolKind.pool())
+                    elif addr != core0_addr:
+                        # Only register a derived symbol when the core has a
+                        # distinct address from core 0.  When addr == core0_addr
+                        # (e.g. a non-split tensor where all cores share one
+                        # address) the sliced-base symbol already covers it and
+                        # we must not create a duplicate registration.
+                        _register_per_core_derived(
+                            tensor,
+                            c,
+                            addr,
+                            core0_addr,
+                            sliced_base_sym_idx,
+                            symbolic_split,
+                        )
+            affine_strides.append([{} for _ in tiled_symbols])
+        else:
+            # Tiled HBM: symbol value = per-core iter-0 base address.
+            # The affine map adds loop_var * tile_stride on top at runtime.
+            for c in range(sdsc_spec.num_cores):
+                addr = (
                     tensor.start_address
                     + core_idx_to_slice_offset(
                         tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
                     )
-                    * num_bytes(tensor.data_format)
+                    * nb
                 )
+                if c == 0:
+                    if tensor.arg_index < 0:
+                        offset_as_symbol(addr, SymbolKind.pool())
+                    # kernel / kernel_slice already registered above; skip c==0
+                else:
+                    if tensor.arg_index < 0:
+                        offset_as_symbol(addr, SymbolKind.pool())
+                    elif addr != core0_addr:
+                        # Symbolic split on a non-tiled dim combined with
+                        # tiling on another dim still routes through the
+                        # helper; the split==tiled case is rejected above.
+                        _register_per_core_derived(
+                            tensor,
+                            c,
+                            addr,
+                            core0_addr,
+                            sliced_base_sym_idx,
+                            symbolic_split,
+                        )
+            affine_strides.append(per_level_strides)
+
+    def _start_addr_data(tensor):
+        # All per-core addresses were already registered by the per-tensor loop
+        # above. Look them up using the same key scheme as offset_as_symbol.
+        if "lx" in tensor.allocation:
+            return {
+                f"[{c}, 0, 0]": str(tensor.start_address)
                 for c in range(sdsc_spec.num_cores)
             }
+        nb = num_bytes(tensor.data_format)
+        is_pool_tensor = tensor.arg_index < 0 and "hbm_pool" in tensor.allocation
+        # Recompute the symbolic-split status so c>0 cores resolve to the
+        # ("kernel_derived_symbolic", arg_index, core_idx) key the per-tensor
+        # loop registered.  Pure function of the tensor + work_slices, so this
+        # matches the registration decision exactly.
+        symbolic_split = _symbolic_split_info(
+            tensor, sdsc_spec.work_slices, symbolic_dims
+        )
+        # Hoist kernel-tensor compile-time offsets so they are not
+        # duplicated across the c==0 and c>0 branches.
+        if not is_pool_tensor:
+            slice_offset_bytes = sum(tensor.offsets.values()) * nb
+            tile_offset_bytes = tensor.start_address - tensor.arg_index
+            total_slice_offset = tile_offset_bytes + slice_offset_bytes
+            c0_slice_key: tuple | int = (
+                ("kernel_slice", tensor.arg_index, total_slice_offset)
+                if total_slice_offset > 0
+                else ("kernel", tensor.arg_index)
+            )
+            core0_addr_lookup = (
+                tensor.start_address
+                + core_idx_to_slice_offset(
+                    tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
+                )
+                * nb
+            )
+        result = {}
+        for c in range(sdsc_spec.num_cores):
+            addr = (
+                tensor.start_address
+                + core_idx_to_slice_offset(
+                    tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
+                )
+                * nb
+            )
+            if is_pool_tensor:
+                key: tuple | int = ("pool", addr)
+            elif c == 0:
+                key = c0_slice_key
+            elif addr == core0_addr_lookup:
+                # Non-split tensor: all cores share core 0's address, so no
+                # derived symbol was registered, reuse the sliced-base key.
+                key = c0_slice_key
+            elif symbolic_split is not None:
+                # Symbolic-dim split: c>0 registered a kernel_derived_symbolic
+                # symbol keyed by (tensor, core).
+                key = ("kernel_derived_symbolic", tensor.arg_index, c)
+            else:
+                # c>0 concrete per-core derived address (bare int key).
+                key = addr
+            result[f"[{c}, 0, 0]"] = str(local_symbols[key])
+        return result
 
-    def _build_coord_info(tensor, tensor_idx: int) -> dict:
+    def _build_coord_info(op, tensor, tensor_idx: int) -> dict:
         """Builds the coordinate information for all dimensions of a tensor.
 
         Computes layout, slicing, and FP8 parameter metadata required for
         generating coordinate info across each dimension specified in the tensor's
-        layout order.
+        layout order.  For windowed conv2d input spatial dims the per-core size and
+        core-fold stride come from _coord_per_core_size / _coord_core_stride so
+        overlapping windows (stride < kernel) distribute correctly; non-conv ops
+        keep the plain per-core size and a None core_stride (unchanged behavior).
 
         Args:
             tensor: The tensor object containing layout, scale, and data format specs.
@@ -1063,7 +1144,7 @@ def generate_sdsc(
                 corresponding generated coordinate information value structure.
         """
         layout = sdsc_spec.layouts[tensor.layout]
-        dim_order = _filter_window_dims(layout["dim_order"])
+        dim_order = _filter_window_dims(layout["dim_order"], tensor.layout)
         stick_dim_order = layout["stick_dim_order"]
         is_input = tensor_idx < sdsc_spec.num_inputs
         result = {}
@@ -1071,14 +1152,28 @@ def generate_sdsc(
             dim_str = str(dim)
             scale = tensor.scales[dim]
             is_tiled = scale == 1
-            nsplits = sdsc_spec.work_slices[dim] if is_tiled else 1
-            size = (
-                _coord_size(dim_str, sdsc_spec.iteration_space[dim], is_input)
-                // nsplits
-                if is_tiled
-                else 1
-            )
+            nsplits = tensor.work_division.work_slices[dim] if is_tiled else 1
+            # dim_size feeds get_conv_params (#3510). size uses #3284's
+            # _coord_per_core_size, a safe superset: it returns the windowed
+            # span only for forward conv2d (opfunc=="conv2d") and otherwise
+            # falls back to dim_size // nsplits -- identical to #3510's path for
+            # depthwise and every other op.
+            dim_size = _coord_size(dim_str, sdsc_spec.iteration_space[dim], is_input)
+            size = _coord_per_core_size(dim, is_input, nsplits) if is_tiled else 1
             is_fp8, _, st_idx = _compute_fp8_coord_params(tensor, dim, sdsc_spec)
+            conv_params = (
+                get_conv_params(
+                    tensor_idx,
+                    dim,
+                    sdsc_spec.opfunc,
+                    sdsc_spec.conv_params,
+                    dim_size,
+                    nsplits,
+                )
+                if op == DEPTHWISE_CONV2D_OP
+                else None
+            )
+
             result[dim_str] = gen_coord_info_value(
                 size=size,
                 nsplits=nsplits,
@@ -1090,18 +1185,34 @@ def generate_sdsc(
                 tensor_idx=tensor_idx,
                 opfunc=sdsc_spec.opfunc,
                 padding=_coord_padding(dim_str, is_input),
+                # conv_params (#3510) drives depthwise padding; core_stride
+                # (#3284) is non-None only for forward-conv windowed dims. Each
+                # is inert for the other op, so both are always passed.
+                conv_params=conv_params,
+                core_stride=(
+                    _coord_core_stride(dim, is_input, nsplits) if is_tiled else None
+                ),
             )
         return result
 
-    def _filter_window_dims(dims: list) -> list:
-        """Drop the op's reduction-window dims (e.g. pool ki/kj) from a dim order.
+    def _filter_window_dims(dims: list, layout_key: str | None = None) -> list:
+        """Drop the op's reduction-window dims (e.g. pool/conv ki/kj) from a dim order.
 
         sdsc_spec.window_dims is empty for ops without a reduction window, so
         this is a no-op for them.
+
+        Exception: the KERNEL (weight) layout of conv2d carries ki/kj as explicit
+        physical axes (weight is [kj, ki, in, out]), so they must NOT be stripped
+        there.  For the activation (INPUT) and OUTPUT layouts ki/kj appear only as
+        folded window offsets and are correctly removed.
         """
+        if layout_key == "KERNEL":
+            return list(dims)
         return [d for d in dims if str(d) not in sdsc_spec.window_dims]
 
-    def _tensor_sched_layout_dims(dim_order: list) -> list:
+    def _tensor_sched_layout_dims(
+        dim_order: list, layout_key: str | None = None
+    ) -> list:
         """Return a tensor's own dim_order for scheduleTree_, minus window dims.
 
         scheduleTree_ layoutDimOrder_ must use the per-tensor dim_order, NOT the
@@ -1109,13 +1220,70 @@ def generate_sdsc(
         symbol Counter, different ordering), so sdsc_spec.layouts[label]["dim_order"]
         is only correct for the tensor that created that label.
         """
-        return _filter_window_dims(dim_order)
+        return _filter_window_dims(dim_order, layout_key)
+
+    def _tensor_input_padding(tensor) -> dict:
+        """input_coord_padding restricted to the dims this tensor actually has.
+
+        For multi-input windowed ops (conv2d) only the activation carries the
+        padded spatial dims (i/j); the weight (KERNEL) has none, so it gets no
+        padding_ entry.  For single-input pools this is a no-op (the sole input
+        has i/j).
+        """
+        tdims = {
+            str(d) for d in _tensor_sched_layout_dims(tensor.dim_order, tensor.layout)
+        }
+        return {
+            dim: pad
+            for dim, pad in sdsc_spec.input_coord_padding.items()
+            if dim in tdims
+        }
 
     def _coord_size(dim, default: int, is_input: bool) -> int:
         """Per-dim coordinate size, overridable for input tensors (pool pads H/W)."""
         if is_input:
             return sdsc_spec.input_coord_sizes.get(str(dim), default)
         return default
+
+    def _coord_per_core_size(dim, is_input: bool, nsplits: int) -> int:
+        """Per-core coordinate size for a tensor dim.
+
+        For a windowed conv input spatial dim (i/j, present in padding_sizes) the
+        per-core input footprint is the window span of the per-core output slice:
+        ``(out_per_core - 1)*stride + dilation*(k - 1) + 1``.  This is the number
+        of input elements the reduction window (ki/kj) is distributed over on
+        each core.  Dividing the *total* padded input span by the core count
+        instead (the plain path) undercounts for an overlapping window
+        (stride < kernel): e.g. in=8, cores=6 gives 1 < kernel, so the ki loop
+        has nothing to distribute.  Conv-only: avgpool keeps the plain path (for
+        its non-overlapping stride==kernel windows the two coincide anyway).
+        """
+        ps = sdsc_spec.padding_sizes.get(str(dim)) if is_input else None
+        if sdsc_spec.opfunc == "conv2d" and ps is not None and "windowDim_" in ps:
+            out_per_core = sdsc_spec.iteration_space[dim] // nsplits
+            stride = int(ps.get("stride_", 1))
+            dilation = int(ps.get("dilation_", 1))
+            k = int(sdsc_spec.iteration_space.get(Symbol(ps["windowDim_"]), 1))
+            return (out_per_core - 1) * stride + dilation * (k - 1) + 1
+        return (
+            _coord_size(str(dim), sdsc_spec.iteration_space[dim], is_input) // nsplits
+        )
+
+    def _coord_core_stride(dim, is_input: bool, nsplits: int) -> int | None:
+        """Core-fold stride (advance per core) for a windowed input spatial dim.
+
+        Returns ``out_per_core * stride`` -- how far the input window origin moves
+        between adjacent cores -- so overlapping windows (conv stride < kernel)
+        step correctly while each core still reads the full window span
+        (_coord_per_core_size).  Returns None for non-windowed dims (and for
+        avgpool), where gen_coord_info_value defaults the core stride to the
+        per-core size -- so avgpool's original behavior is unchanged.
+        """
+        ps = sdsc_spec.padding_sizes.get(str(dim)) if is_input else None
+        if sdsc_spec.opfunc == "conv2d" and ps is not None and "windowDim_" in ps:
+            out_per_core = sdsc_spec.iteration_space[dim] // nsplits
+            return out_per_core * int(ps.get("stride_", 1))
+        return None
 
     def _coord_padding(dim, is_input: bool) -> str:
         """Per-dim coordinate padding tag, overridable for input tensors."""
@@ -1127,12 +1295,18 @@ def generate_sdsc(
         """Extra memOrg_ padding fields, emitted only when the op needs them."""
         if not sdsc_spec.emit_memorg_padding:
             return {}
-        return {
+        extra: dict = {
             "isPadded": 1 if is_input else 0,
             "isZeroPadded": 0,
-            "dsOffset": 0,
-            "allocateNode_": alloc_node,
         }
+        # dsOffset / allocateNode_ are part of the forward-conv (#3284) and
+        # general memOrg contract; depthwise conv (#3510) intentionally omits
+        # them. Restore them for every non-depthwise op so forward conv2d
+        # matches its golden SDSC.
+        if sdsc_spec.opfunc != DEPTHWISE_CONV2D_OP:
+            extra["dsOffset"] = 0
+            extra["allocateNode_"] = alloc_node
+        return extra
 
     return (
         {
@@ -1155,6 +1329,9 @@ def generate_sdsc(
                 "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
                 "numCoresUsed_": sdsc_spec.num_cores,
                 "coreIdToDsc_": {str(c): 0 for c in range(sdsc_spec.num_cores)},
+                # The top-level map is the operation schedule. Each shuffle
+                # tensor's physical owners are carried separately on its
+                # allocation coordinates below.
                 "numWkSlicesPerDim_": {
                     str(dim): num_wk_slices
                     for dim, num_wk_slices in sdsc_spec.work_slices.items()
@@ -1224,7 +1401,9 @@ def generate_sdsc(
                                         "coreletSplit_": {},
                                         "rowSplit_": {},
                                         "peSfpSplit_": {},
-                                        "paddingSizes_": sdsc_spec.padding_sizes,
+                                        "paddingSizes_": sdsc_spec.padding_sizes_per_core
+                                        if sdsc_spec.padding_sizes_per_core
+                                        else sdsc_spec.padding_sizes,
                                     },
                                     "el_": {
                                         "name_": "core",
@@ -1240,7 +1419,9 @@ def generate_sdsc(
                                         "coreletSplit_": {},
                                         "rowSplit_": {},
                                         "peSfpSplit_": {},
-                                        "paddingSizes_": sdsc_spec.padding_sizes,
+                                        "paddingSizes_": sdsc_spec.padding_sizes_per_core
+                                        if sdsc_spec.padding_sizes_per_core
+                                        else sdsc_spec.padding_sizes,
                                     },
                                 }
                             },
@@ -1249,7 +1430,7 @@ def generate_sdsc(
                                     "layoutDimOrder_": [
                                         str(dim)
                                         for dim in _filter_window_dims(
-                                            layout_info["dim_order"]
+                                            layout_info["dim_order"], label
                                         )
                                     ],
                                     "stickDimOrder_": [
@@ -1284,20 +1465,26 @@ def generate_sdsc(
                                     if "lx" in tensor.allocation
                                     else "hbm",
                                     **(
+                                        _build_padding_for_tensor(sdsc_spec.conv_params)
+                                        if sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
+                                        and i == 0
+                                        else {}
+                                    ),
+                                    **(
                                         {"isStartAddrSymbolic_": 1}
-                                        if use_symbols and "lx" not in tensor.allocation
+                                        if "lx" not in tensor.allocation
                                         else {}
                                     ),
                                     "layoutDimOrder_": [
                                         str(dim)
                                         for dim in _tensor_sched_layout_dims(
-                                            tensor.dim_order
+                                            tensor.dim_order, tensor.layout
                                         )
                                     ],
                                     "maxDimSizes_": [
                                         tensor.max_dim_sizes[dim]
                                         for dim in _tensor_sched_layout_dims(
-                                            tensor.dim_order
+                                            tensor.dim_order, tensor.layout
                                         )
                                     ],
                                     **_build_indirect_access_fields(
@@ -1320,10 +1507,10 @@ def generate_sdsc(
                                         "data_": _start_addr_data(tensor),
                                     },
                                     **(
-                                        {"padding_": sdsc_spec.input_coord_padding}
+                                        {"padding_": _tensor_input_padding(tensor)}
                                         if (
                                             i < sdsc_spec.num_inputs
-                                            and sdsc_spec.input_coord_padding
+                                            and _tensor_input_padding(tensor)
                                         )
                                         else {}
                                     ),
@@ -1347,7 +1534,7 @@ def generate_sdsc(
                                                 in {
                                                     str(d)
                                                     for d in _tensor_sched_layout_dims(
-                                                        tensor.dim_order
+                                                        tensor.dim_order, tensor.layout
                                                     )
                                                 }
                                             }
@@ -1356,8 +1543,17 @@ def generate_sdsc(
                                         else {}
                                     ),
                                     "coordinates_": {
-                                        "coordInfo": _build_coord_info(tensor, i),
-                                        "coreIdToWkSlice_": {},
+                                        "coordInfo": _build_coord_info(
+                                            sdsc_spec.opfunc, tensor, i
+                                        ),
+                                        "coreIdToWkSlice_": (
+                                            tensor.work_division.to_core_slices(
+                                                sdsc_spec.num_cores
+                                            )
+                                            if sdsc_spec.opfunc == "shuffle"
+                                            and tensor.work_division is not None
+                                            else {}
+                                        ),
                                     },
                                 }
                                 for i, tensor in enumerate(sdsc_spec.args)
@@ -1372,7 +1568,8 @@ def generate_sdsc(
                                         for dim in _filter_window_dims(
                                             sdsc_spec.layouts[tensor.layout][
                                                 "dim_order"
-                                            ]
+                                            ],
+                                            tensor.layout,
                                         )
                                     ],
                                     "wordLength": num_bytes(tensor.data_format),
@@ -1389,21 +1586,45 @@ def generate_sdsc(
                                     else {
                                         "hbm": {
                                             "isPresent": 1,
-                                            **_memorg_extra(
-                                                i < sdsc_spec.num_inputs,
-                                                f"allocate-Tensor{i}_hbm",
+                                            **(
+                                                _memorg_extra(
+                                                    i < sdsc_spec.num_inputs,
+                                                    f"allocate-Tensor{i}_hbm",
+                                                )
+                                                if sdsc_spec.opfunc
+                                                != DEPTHWISE_CONV2D_OP
+                                                or i == 0
+                                                else {}
                                             ),
                                         },
                                         "lx": {
                                             "isPresent": 1,
-                                            **_memorg_extra(
-                                                i < sdsc_spec.num_inputs,
-                                                "",
+                                            **(
+                                                _memorg_extra(
+                                                    i < sdsc_spec.num_inputs,
+                                                    "",
+                                                )
+                                                if sdsc_spec.opfunc
+                                                != DEPTHWISE_CONV2D_OP
+                                                or i == 0
+                                                else {}
                                             ),
                                         },
                                     }
                                     if "lx" not in tensor.allocation
-                                    else {"lx": {"isPresent": 1}},
+                                    else (
+                                        {
+                                            "lx": {
+                                                "isPresent": 1,
+                                                "isPadded": 1,
+                                            }
+                                        }
+                                        if (
+                                            i == 0
+                                            and sdsc_spec.opfunc == DEPTHWISE_CONV2D_OP
+                                        )
+                                        else {"lx": {"isPresent": 1}}
+                                    ),
                                 }
                                 for i, tensor in enumerate(sdsc_spec.args)
                             ],
