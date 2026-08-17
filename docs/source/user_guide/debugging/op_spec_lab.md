@@ -125,9 +125,8 @@ not when the file was written — a program that builds its specs inside a
 `config.patch` is reported as it really compiled.
 
 `bundle_symbolic_args` is also *pinned*, as `BUNDLE_SYMBOLIC_ARGS`: the spec's
-allocations were baked under it, so a replay under a different value would
-silently bundle mismatched addresses. If your environment disagrees, the script
-says so and uses the captured value.
+allocations were baked under it, so a replay has to bundle under the same value.
+If your environment disagrees, the script says so and uses the captured one.
 
 ### 3. Run it
 

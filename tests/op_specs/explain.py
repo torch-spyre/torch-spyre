@@ -46,6 +46,12 @@ WIDTH = 78
 
 # ---------------------------------------------------------------------------
 # Small formatting helpers
+#
+# These four -- _labelled, _wrapped, _fit and _table -- are what hold the render
+# inside WIDTH at any nesting depth, and each has broken that at least once.
+# test_hostile_names_stay_within_width in test_op_spec_lab.py is the tripwire:
+# re-run it after touching anything here, since a short flat kernel exercises
+# almost none of this.
 # ---------------------------------------------------------------------------
 
 
@@ -522,6 +528,12 @@ def _op_block(op_spec, op_idx, n_ops, depth, verbose) -> list:
     # Each section is isolated: they reach into resolved-view internals whose
     # shape drifts (#2286), and one breaking used to take the whole render with
     # it. One bad section should cost one section.
+    #
+    # Sections return [] when they have nothing to say. _sticks is the deliberate
+    # exception: it lets a failed elems_per_stick() raise, because an absent
+    # sticks block is indistinguishable from "this op has no sticks", where the
+    # !! line names what broke. New sections should return [] unless they have
+    # the same ambiguity.
     _cores = getattr(sdsc_spec, "num_cores", None)
     sections = (
         ("origin", lambda: _origin(op_spec, pad)),

@@ -74,9 +74,8 @@ def make_pool(pool_bytes: int, contents=None) -> torch.Tensor:
 
     The pool is an opaque byte-addressed region that ``hbm_pool`` tensors sit
     inside at fixed offsets, so a 1-D uint8 tensor of that many bytes is the
-    right shape.  ``contents`` optionally seeds it; capture.py cannot supply
-    those bytes (see ``_record_args`` there), so production's uninitialized
-    pool is the norm.
+    right shape.  ``contents`` seeds it when a replay has bytes to seed it with;
+    a capture never does, so an uninitialized pool is the norm.
     """
     ensure_runtime()
     layout = SpyreTensorLayout(
