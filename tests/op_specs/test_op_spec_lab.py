@@ -130,22 +130,27 @@ class _FakeRunner:
         self.launches.append(args)
 
 
-def _record(name="sdsc_add_0", pool_bytes=0):
-    arg = capture.ArgRecord(
+def _arg_record(dtype=torch.float16):
+    return capture.ArgRecord(
         shape=(128, 256),
-        dtype=torch.float16,
+        dtype=dtype,
         device_size=[4, 128, 64],
         stride_map=[64, 256, 1],
         device_dtype_name="SEN169_FP16",
         element_arrangement_name="STANDARD",
     )
+
+
+def _record(name="sdsc_add_0", pool_bytes=0):
     return capture.KernelRecord(
         name=name,
         specs=[_add_op()],
         index=0,
         sencores=32,
         bundle_symbolic_args=True,
-        args=[arg for _ in range(3)],
+        # A distinct record per arg: sharing one object made a test that retyped
+        # arg0 silently retype all three.
+        args=[_arg_record() for _ in range(3)],
         pool_bytes=pool_bytes,
         observed_run=True,
     )
@@ -433,11 +438,26 @@ def test_capture_writes_what_it_recorded_before_the_target_crashed(tmp_path, cap
     out_dir = tmp_path / "captured"
 
     with patch.object(SpyreAsyncCompile, "sdsc", lambda self, n, s: _FakeRunner()):
-        assert capture.main([str(program), "--out", str(out_dir)]) == 0
+        status = capture.main([str(program), "--out", str(out_dir)])
 
+    # Not 0: a caller has to be able to tell a partial capture from a whole one
+    # without parsing stdout, since the scripts written look no different.
+    assert status == capture.EXIT_PARTIAL
     assert (out_dir / "sdsc_stub_0.py").exists()
     # The traceback itself goes to stderr; the note that says why is on stdout.
     assert "raised RuntimeError" in capsys.readouterr().out
+
+
+def test_capture_of_a_clean_program_exits_zero(tmp_path):
+    """The other half of the exit-code contract, so EXIT_PARTIAL means something."""
+    body = "SpyreAsyncCompile().sdsc('sdsc_ok_0', [])\n"
+    program = _stub_sdsc_program(tmp_path, body)
+    out_dir = tmp_path / "captured"
+
+    with patch.object(SpyreAsyncCompile, "sdsc", lambda self, n, s: _FakeRunner()):
+        assert capture.main([str(program), "--out", str(out_dir)]) == 0
+
+    assert (out_dir / "sdsc_ok_0.py").exists()
 
 
 def test_capture_blames_the_crash_when_nothing_compiled(tmp_path):
@@ -466,6 +486,28 @@ def test_emitted_script_pins_bundle_symbolic_args():
 
     assert namespace["BUNDLE_SYMBOLIC_ARGS"] is False
     assert "bundle_symbolic_args=BUNDLE_SYMBOLIC_ARGS" in src
+
+
+def test_build_tensors_synthesizes_fp8_args():
+    """fp8 reports is_floating_point but torch.rand has no kernel for it.
+
+    So the obvious ``torch.rand(shape, dtype=dtype)`` raises NotImplementedError
+    on the fp8 dtypes and every captured fp8 kernel -- a scaled_mm, say -- is
+    unreplayable. Exercised through the emitted script because that is where
+    build_tensors lives.
+    """
+    rec = _record()
+    rec.args[0].dtype = torch.float8_e4m3fn
+    namespace: dict = {"__file__": "/tmp/captured/sdsc_fp8_0.py"}
+    src = capture.emit_script(rec, "prog.py", 1, False)
+    exec(compile(src, "<emitted>", "exec"), namespace)  # noqa: S102
+
+    tensors, _ = namespace["build_tensors"]()
+
+    assert tensors[0].dtype == torch.float8_e4m3fn
+    assert tuple(tensors[0].shape) == (128, 256)
+    assert tensors[0].to(torch.float32).abs().sum() > 0  # not all zeros
+    assert tensors[1].dtype == torch.float16  # the wider dtypes are untouched
 
 
 def test_pin_bundle_symbolic_args_overrides_the_ambient_flag():

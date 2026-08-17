@@ -234,6 +234,11 @@ Beat 4 is the point. Reading a spec teaches you the field names; changing an inp
 and diffing the result is what teaches you which fields *mean* something. Captures
 land in `./captured/` unless you pass `--out`, and that directory is git-ignored.
 
+A capture never overwrites an existing file — a second one lands as `<name>_1.py`
+beside the first, so you keep both to diff rather than losing one. Example 4
+captures the same program twice, so its second capture passes its own `--out` to
+keep the filenames quoted below matching what you see.
+
 ### 01 — Elementwise add
 
 `x + y` over two 128x256 fp16 tensors. The floor: one OpSpec, three args, no
@@ -516,11 +521,18 @@ not fit the scratchpad carry `hbm_pool @ offset` where 02's carried `lx @ offset
 ```
 
 **4. Change one thing.** Shrink the chain — take the inner dimension from 256 down
-to 64, so `b` is `(128, 64)` and `c` is `(64, 128)` — and capture again. The pool
-does *not* go away; it scales:
+to 64, so `b` is `(128, 64)` and `c` is `(64, 128)` — and capture again, into its
+own directory so the first capture survives to diff against:
+
+```bash
+python tests/op_specs/capture.py tests/op_specs/programs/04_pool_chain.py \
+    --out captured/04_small
+```
+
+The pool does *not* go away; it scales:
 
 ```
-  captured/sdsc_fused__softmax_mm_0.py  (7 OpSpec(s), 4 arg(s), 8192-byte pool)
+  captured/04_small/sdsc_fused__softmax_mm_0.py  (7 OpSpec(s), 4 arg(s), 8192-byte pool)
 ```
 
 32768 bytes down to 8192, with the same seven ops and the same four args. Worth

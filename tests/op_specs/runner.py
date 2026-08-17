@@ -53,11 +53,12 @@ def pin_bundle_symbolic_args(value) -> None:
     """Force ``config.bundle_symbolic_args`` back to its capture-time value.
 
     A spec's ``allocation["hbm"]`` is baked when the spec is built -- the
-    arg_index itself under True, a real segment address under False -- but
-    ``generate_bundle`` reads the flag again at call time.  Left to the ambient
-    ``BUNDLE_SYMBOLIC_ARGS`` the two can disagree and the bundle gets addresses
-    that do not match the spec, silently.  ``None`` means "no recorded value",
-    as for a hand-written PROGRAM dict.
+    arg_index itself under True, an absolute address under False -- so a replay
+    has to bundle under the value the capture used.  ``generate_bundle`` requires
+    the flag on and raises otherwise, so a mismatch fails loudly rather than
+    producing a bundle that disagrees with the spec; pinning keeps a captured
+    script off the ambient ``BUNDLE_SYMBOLIC_ARGS`` altogether.  ``None`` means
+    "no recorded value", as for a hand-written PROGRAM dict.
     """
     if value is None:
         return

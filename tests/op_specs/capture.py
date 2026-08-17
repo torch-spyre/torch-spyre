@@ -38,6 +38,12 @@ Options:
     --no-execute      capture without a device or dxp_standalone (see below)
     --no-explain-header
                       omit the decoded OpSpec explanation from each script
+
+Exit status:
+    0                 the target ran to completion and every kernel was written
+    3                 scripts were written, but the target raised partway through
+                      so later kernels are missing (see ``EXIT_PARTIAL``)
+    1                 nothing was written
 """
 
 import argparse
@@ -72,6 +78,12 @@ from runner import TEMPLATE_IMPORTS, runner_template  # noqa: E402
 # Mock targets for --no-execute, matching docs/tools/capture_coarse_tile_ir.py.
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
+
+# Scripts were written, but the target raised before it finished, so the capture
+# covers only the kernels compiled up to that point.  Distinct from 1 ("nothing
+# written") and from argparse's 2, so a caller can tell a partial capture from a
+# complete one without parsing stdout.
+EXIT_PARTIAL = 3
 
 LICENSE_HEADER = "".join(
     f"# {line}\n" if line else "#\n"
@@ -424,7 +436,11 @@ def build_tensors():
     tensors = []
     for shape, dtype in SHAPES:
         if dtype.is_floating_point:
-            tensors.append(torch.rand(shape, dtype=dtype))
+            # The fp8 dtypes report is_floating_point but have no uniform
+            # kernel, so draw in fp32 and cast. Keyed on itemsize rather than a
+            # list of dtypes, which would go stale as fp8 variants are added.
+            src = dtype if dtype.itemsize > 1 else torch.float32
+            tensors.append(torch.rand(shape, dtype=src).to(dtype))
         else:
             tensors.append(torch.zeros(shape, dtype=dtype))
     return tensors, None
@@ -583,8 +599,9 @@ def main(argv=None) -> int:
             f"\nnote: {os.path.basename(script)} raised"
             f" {type(failure).__name__} partway through (traceback above)."
             "\n      The scripts above cover the kernels compiled before that"
-            "\n      point; later kernels never reached sdsc() and are missing."
+            f"\n      point; later kernels never reached sdsc(). Exit {EXIT_PARTIAL}."
         )
+        return EXIT_PARTIAL
     return 0
 
 
