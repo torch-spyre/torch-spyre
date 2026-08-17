@@ -18,8 +18,9 @@ on `torch_spyre` for the Spyre device. The `spyre` dependency group resolves
 `pyproject.toml` (currently `main`), so a separate local Torch-Spyre checkout
 is not used by default. For development against a specific Torch-Spyre
 revision, pin that rev in `[tool.uv.sources]` or add a local uv source
-override (see [Installation](../getting_started/installation.md) for building
-Torch-Spyre from source).
+override that points at your Torch-Spyre checkout. See
+[Installation](../getting_started/installation.md) for the Torch-Spyre
+install options.
 
 ![How hf-adapters runs a stock HuggingFace checkpoint on Spyre: the loader selects an adapter by config type, keeps weights, tokenizer, embeddings, projections, and the MLP from transformers, and replaces only the operations Spyre cannot run natively.](../_static/images/hf-adapters/fig-hf-adapters-approach.svg)
 
@@ -36,30 +37,34 @@ caches, the attention mask is built on CPU as a `float16` tensor, and
 documented in the project's
 [ARCHITECTURE.md](https://github.com/torch-spyre/hf-adapters/blob/main/ARCHITECTURE.md#how-the-adapters-work).
 
-Coverage spans four kinds of model: generative causal-LMs, embedding models
-through sentence-transformers, vision-language models that take an image and
-produce text, and speculative-decoding drafters. That is Llama, Qwen,
-Granite, Mistral, Phi, Gemma, OLMo, and GPT decoders; BERT, XLM-RoBERTa,
-MPNet, and ModernBERT encoders; and the Granite Vision, Mistral3 Vision, and
-Gemma 4 multimodal models. The canonical per-adapter list of verified
-checkpoints is in the project's
+Coverage spans three kinds of model: generative causal-LMs, embedding models
+through sentence-transformers, and speculative-decoding drafters. That is
+Llama, Qwen, Granite, Mistral, Phi, Gemma, OLMo, and GPT decoders; and BERT,
+XLM-RoBERTa, MPNet, and ModernBERT encoders. Vision-language checkpoints such
+as Granite Vision, Mistral3 Vision, and Gemma 4 run as well, but only their
+text backbone: the adapter extracts the language model, discards the vision
+encoder and projection layers, and loads it through `AutoSpyreModelForCausalLM`
+like any other decoder. Image input is not supported. The canonical
+per-adapter list of verified checkpoints is in the project's
 [ARCHITECTURE.md](https://github.com/torch-spyre/hf-adapters/blob/main/ARCHITECTURE.md#verified-checkpoints).
 
 ## Install
 
 hf-adapters uses [uv](https://docs.astral.sh/uv/) for dependency management.
-Clone it alongside your Torch-Spyre checkout and sync the `spyre` dependency
-group, which pulls in `torch_spyre`:
+Clone it alongside your Torch-Spyre checkout. On a host with Spyre hardware,
+sync the `spyre` group, which pulls in `torch_spyre`, together with the `test`
+group, which provides `pytest`:
 
 ```bash
 git clone https://github.com/torch-spyre/hf-adapters.git
 cd hf-adapters
-uv sync --group spyre
+uv sync --group spyre --group test
 ```
 
-The `spyre` group is only needed on a host with Spyre hardware. The CPU
-accuracy tests, which compare an adapter against stock HF, need no
-accelerator, but they do need the `test` group for `pytest`:
+`uv sync` is exact by default and prunes anything outside the groups you name,
+so both groups must be listed in a single command. The CPU accuracy tests,
+which compare an adapter against stock HF, need no accelerator. To set up a
+CPU-only host for those tests, sync just the `test` group:
 
 ```bash
 uv sync --group test
@@ -122,13 +127,13 @@ a single missing feature. Spyre uses dtype conversions that differ slightly
 from CPU, and greedy decoding is sensitive to small numerical differences: a
 tiny gap in the logits flips the argmax, and the error compounds token by
 token. Because the `torch_spyre` stack changes often, both the severity and
-the set of affected models shift over time, so treat multi-token generation as
-unreliable for any checkpoint you have not verified.
+the set of affected models shift over time, so it is worth checking multi-token
+output against CPU for a checkpoint before you rely on it.
 
-The hf-adapters test suite accounts for this. The multimodal tests, for
-example, assert a per-step logit cosine floor rather than exact token
-equality. For which checkpoints have been verified and in which mode, use the
-per-adapter list in
+The hf-adapters test suite accounts for this. The causal-LM accuracy tests
+assert the same top-1 token at each step against stock HF, and the embedding
+tests assert a per-token cosine floor rather than exact equality. For which
+checkpoints have been verified and in which mode, use the per-adapter list in
 [ARCHITECTURE.md](https://github.com/torch-spyre/hf-adapters/blob/main/ARCHITECTURE.md#verified-checkpoints),
 which is kept current as the stack moves.
 
