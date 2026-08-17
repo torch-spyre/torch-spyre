@@ -44,7 +44,7 @@ tells the reviewer what each branch is about without opening the PR:
 | `profiler/feat-…` | Multi-PR feature work |
 | `profiler/fix-…` | Bug fixes |
 
-Keep `<short-description>` to **3–5 hyphenated words**. `cmake-libaiupti`
+Keep `<short-description>` to **3–5 hyphenated words**. `link-libaiupti`
 is about right. `sol` is too terse to read at a glance, and
 `tex-scratchpad-vram-sol-average` should be split into smaller PRs.
 
