@@ -41,6 +41,16 @@ class TestMemoryPressureGC:
     @pytest.fixture(autouse=True)
     def setup_teardown(self):
         """Setup and teardown for each test."""
+        # Skip when the Spyre device cannot be initialized (e.g. VFIO device
+        # busy, hardware absent, driver not loaded).  A small torch.empty probe
+        # exercises start_runtime() without writing data to the device.
+        # This mirrors conftest._is_spyre_hardware_available() and the
+        # @unittest.skipUnless(Test_spyre, ...) pattern in test_spyre_profiler.py.
+        try:
+            torch.empty(1, device="spyre")
+        except RuntimeError as exc:
+            pytest.skip(f"Spyre device unavailable: {exc}")
+
         # Ensure GC is enabled at start
         gc.enable()
         gc.collect()
@@ -116,10 +126,11 @@ class TestMemoryPressureGC:
         def allocate_with_pressure():
             """Thread that will hit memory pressure."""
             try:
-                # Allocate less memory to avoid actual OOM, just trigger pressure
+                # Use torch.empty (no device fill) so allocations complete quickly
+                # without depending on data-init time on Spyre hardware.
                 tensors = []
                 for i in range(4):
-                    t = torch.randn(256 * 1024 * 1024, device="spyre")  # 1GB each
+                    t = torch.empty(256 * 1024 * 1024, device="spyre")  # 1GB each
                     tensors.append(t)
 
                 # Drop refs to allow GC
@@ -129,7 +140,7 @@ class TestMemoryPressureGC:
                 time.sleep(0.05)
 
                 # This should trigger memory pressure callback
-                t = torch.randn(256 * 1024 * 1024, device="spyre")
+                t = torch.empty(256 * 1024 * 1024, device="spyre")
                 allocation_succeeded.set()
 
             except Exception as e:
@@ -259,9 +270,11 @@ class TestMemoryPressureGC:
             """Each thread tries to allocate until hitting pressure."""
             try:
                 tensors = []
+                # Use torch.empty (no device fill) so allocations complete quickly
+                # without depending on data-init time on Spyre hardware.
                 # Each thread allocates 2GB
                 for i in range(2):
-                    t = torch.randn(512 * 1024 * 1024, device="spyre")
+                    t = torch.empty(512 * 1024 * 1024, device="spyre")
                     tensors.append(t)
 
                 # Drop some refs to allow GC to help
@@ -269,7 +282,7 @@ class TestMemoryPressureGC:
                     tensors.clear()
 
                 # Try one more allocation - may succeed or fail
-                t = torch.randn(256 * 1024 * 1024, device="spyre")
+                t = torch.empty(256 * 1024 * 1024, device="spyre")
 
                 with results_lock:
                     results.append(("success", thread_id))
