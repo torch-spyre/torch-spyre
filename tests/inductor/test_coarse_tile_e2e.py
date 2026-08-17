@@ -1992,9 +1992,6 @@ def test_copy_running_max_4d_H4_Lq4():
 # copy target receives a restickified input — tests copy layout after restickify
 
 
-# @pytest.mark.skip(
-#     reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
-# )
 def test_copy_restickify_512x256_A4():
     """copy_f(a.t(, c)+b) on [256,512] result tiled A÷4 — copy of restickified add."""
     inputs = [
@@ -2003,7 +2000,8 @@ def test_copy_restickify_512x256_A4():
     ]
 
     def fn(a, b):
-        c = torch.zeros(b.shape, device=b.device, dtype=b.dtype)
+        with spyre_hint(named_dims=["A", "B"]):
+            c = torch.zeros(b.shape, device=b.device, dtype=b.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 copy_f(a.t() + b, c)
@@ -2438,9 +2436,6 @@ def test_outside_consumer_reduction_512x256_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="correctness bug: A÷4 B÷4 tiled reduction with outside consumer produces inf (84.8% mismatch)"
-)
 def test_outside_consumer_reduction_512x256_A4_B4():
     """s=tiled_amin(x,dim=0) consumed outside as s+bias, tiled A÷4 B÷4."""
     inputs = [
