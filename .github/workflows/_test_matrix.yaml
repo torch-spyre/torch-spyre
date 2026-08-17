@@ -413,7 +413,17 @@ jobs:
         uses: ./.github/actions/run-test-suite
         with:
           suite_name: ${{ matrix.suite.name }}
-          config: tests/configs/torch_spyre_tests/${{ matrix.suite.config }}
+          # generate_matrix's `filter.outputs.matrix` emits `config` relative to
+          # the --config-dir it scanned: trunk scans the full tests/configs/
+          # tree (see the sparse-checkout step above), so matrix.suite.config
+          # already carries its subdir (e.g. "model_ops_tests/foo.yaml");
+          # every other tier scans tests/configs/torch_spyre_tests/ only, so
+          # matrix.suite.config is bare (e.g. "foo.yaml") and needs that prefix
+          # re-added here. Hard-coding the torch_spyre_tests/ prefix regardless
+          # of tier double-prefixes trunk configs into nonexistent paths
+          # ("No YAML config file(s) found").
+          config: ${{ needs.generate_matrix.outputs.resolved_test_type == 'trunk' && format('tests/configs/{0}', matrix.suite.config) || format('tests/configs/torch_spyre_tests/{0}',
+            matrix.suite.config) }}
           # Prebaked: run FROM the baked source dir + its SHARED venv at
           # $HOME/.venv (a sibling of the source, not inside it); normal: the
           # checkout (default 'torch-spyre') + its local '.venv'.
