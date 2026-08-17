@@ -6498,5 +6498,172 @@ def test_zeros_named_dims_hint_correctness():
     torch.testing.assert_close(got_likecval.cpu(), ref_likecval, atol=0.5, rtol=0.1)
 
 
+# ---------------------------------------------------------------------------
+# Coarse-tiling premise: tiling buys LX residency through the loop interior
+# (RFC draft-unified-tiling-cpsat.md, *Background* table; testing item 7's
+# positive half). The coarse-tiling optimization's whole motivation rests on
+# this holding, so it is pinned here against today's hint-driven path.
+# ---------------------------------------------------------------------------
+
+
+def test_tiled_interior_lx_eligible_two_groups():
+    """The allocator's residency verdicts reproduce the Background table.
+
+    Two hint groups over [512, 256]: group 1 (A÷4) computes ``abs(x) + y``
+    whose value crosses the group boundary; group 2 (A÷8) multiplies it, so a
+    read-side tile copy is inserted in front of the consumer. Row by row:
+
+    - interior per-tile scratch (the tiled compute ops, including the boundary
+      producer's own per-tile write) is LX-eligible: ``residency_reason`` None;
+    - read-side tile copies are LX-eligible: they own a fixed-address tile
+      buffer, unlike the write-side copy;
+    - the write-side copy op owns no storage (its layout *is*
+      ``MutationLayoutSHOULDREMOVE(full_buf)``) and is barred from LX;
+    - ``full_buf`` (a ``SpyreEmptyFallback``) is barred from LX.
+    """
+    from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE
+
+    from torch_spyre._inductor.ir import SpyreEmptyFallback
+    from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
+
+    torch.manual_seed(0xAFFE)
+
+    A, B = 512, 256
+    x = torch.randn(A, B, dtype=torch.float16) * 0.01
+    y = torch.randn(A, B, dtype=torch.float16) * 0.01
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                z = torch.abs(x) + y
+        with spyre_hint(num_tiles_per_dim={"A": 8}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                out = z * 2.0
+        return out
+
+    captured = {}
+    orig_prepare = ScratchpadAllocator._prepare_buffers
+
+    def spy_prepare(self, graph):
+        buffers = orig_prepare(self, graph)
+        captured["buffers"] = list(buffers)
+        # Classification must happen here, at allocator time: the scheduler
+        # later resolves MutationLayoutSHOULDREMOVE away, and get_read_writes()
+        # cannot run outside graph context.
+        reads = {
+            op.get_name(): [d.name for d in op.get_read_writes().reads]
+            for op in graph.operations
+            if isinstance(op, ComputedBuffer)
+        }
+        captured["reads"] = reads
+        captured["full_bufs"] = {
+            op.get_name()
+            for op in graph.operations
+            if isinstance(op, SpyreEmptyFallback)
+        }
+        captured["write_copies"] = [
+            op.get_name()
+            for op in graph.operations
+            if isinstance(op, ComputedBuffer)
+            and isinstance(op.layout, MutationLayoutSHOULDREMOVE)
+        ]
+        captured["read_copies"] = [
+            op.get_name()
+            for op in graph.operations
+            if isinstance(op, ComputedBuffer)
+            and op.get_name().startswith("coarse_tile_read_copy_")
+        ]
+        captured["interior"] = [
+            op.get_name()
+            for op in graph.operations
+            if isinstance(op, ComputedBuffer)
+            and getattr(op, "loop_info", None) is not None
+            and any(op.loop_info.loop_tiled_dims)
+            and not isinstance(op.layout, MutationLayoutSHOULDREMOVE)
+            and not op.get_name().startswith("coarse_tile_read_copy_")
+            and not any(r in captured["full_bufs"] for r in reads[op.get_name()])
+        ]
+        return buffers
+
+    with fresh_cache():
+        _pnd.reset()
+        _declare_tensor_dim("A", A)
+        _declare_tensor_dim("B", B)
+        x_dev = x.to("spyre")
+        y_dev = y.to("spyre")
+        _name_tensor_dims(x_dev, ["A", "B"])
+        _name_tensor_dims(y_dev, ["A", "B"])
+        with (
+            config.patch({"lx_planning": True, "allow_all_ops_in_lx_planning": True}),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("torch_spyre.execution.async_compile.subprocess.run"),
+            mock_patch.object(ScratchpadAllocator, "_prepare_buffers", spy_prepare),
+        ):
+            run_and_get_code(torch.compile(fn), x_dev, y_dev)
+
+    reads = captured["reads"]
+    reasons = {b.name: b.residency_reason for b in captured["buffers"]}
+    full_bufs = captured["full_bufs"]
+    write_copies = captured["write_copies"]
+    read_copies = captured["read_copies"]
+    interior = captured["interior"]
+
+    # One boundary per group: the add feeds group 2 across the cut, and the
+    # mul is a graph output — each materializes a full_buf plus a write copy.
+    assert len(full_bufs) == 2, f"expected 2 full_bufs, got {sorted(full_bufs)}"
+    assert len(write_copies) == 2, f"expected 2 write-side copies, got {write_copies}"
+    # Two tiled reads of graph inputs in group 1, plus group 2's tiled read of
+    # the boundary full_buf.
+    assert len(read_copies) == 3, f"expected 3 read copies, got {read_copies}"
+
+    # full_buf never occupies LX: its producer is an ExternKernel, which
+    # _op_output_good_for_lx_reuse rejects.
+    for name in sorted(full_bufs):
+        assert reasons[name] == "op not allowed", (
+            f"full_buf {name}: expected 'op not allowed', got {reasons[name]!r}"
+        )
+
+    # The write-side copy owns no storage — MutationLayoutSHOULDREMOVE is
+    # rejected outright.
+    for name in write_copies:
+        assert reasons[name] == "op not allowed", (
+            f"write copy {name}: expected 'op not allowed', got {reasons[name]!r}"
+        )
+
+    # The read-side copy owns its tile buffer and its own write is fixed, so
+    # it keeps LX candidacy.
+    for name in read_copies:
+        assert reasons[name] is None, (
+            f"read copy {name}: expected LX-eligible, got {reasons[name]!r}"
+        )
+
+    # Interior per-tile scratch stays LX-eligible. Interior = a tiled compute
+    # op that is not a copy and does not read a full_buf directly (the graph
+    # also carries a vestigial full-size identity read of the boundary
+    # full_buf, correctly evicted as "tiled (advancing)" — that op is not an
+    # interior row and is excluded by the full_buf-read filter).
+    # abs, add (group 1) and mul (group 2): the boundary producers' own
+    # per-tile writes are retargeted to fixed-address scratch, so all three
+    # compute ops are interior rows.
+    assert len(interior) == 3, f"expected 3 interior scratch ops, got {interior}"
+    for name in interior:
+        assert reasons[name] is None, (
+            f"interior scratch {name}: expected LX-eligible, got {reasons[name]!r}"
+        )
+
+    # The core claim, stated at its sharpest: the buffer the write-side copy
+    # drains — the boundary producer's per-tile scratch — is itself
+    # LX-eligible even though its value crosses the cut through full_buf.
+    for name in write_copies:
+        for src in reads[name]:
+            if src in full_bufs:
+                continue
+            assert reasons[src] is None, (
+                f"boundary producer scratch {src} (drained by {name}): "
+                f"expected LX-eligible, got {reasons[src]!r}"
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
