@@ -46,7 +46,7 @@ ktir = [
 
 [project.optional-dependencies]
 cpsat = [ # OR-Tools CP-SAT LX layout solver (layout_solver='cpsat' / LAYOUT_SOLVER=cpsat)
-    "ortools>=9.0",
+    "ortools>=9.0; platform_machine != 's390x'",
 ]
 build = [ # no-isolation build
     # any change here should be reflected in the build system above

@@ -43,6 +43,7 @@ from .ir import (
     SpyreEmptyFallback,
     BroadcastAsyncFallback,
     WaitWorkFallback,
+    AllReduceAsyncFallback,
 )
 from torch_spyre._C import get_elem_in_stick
 from torch._inductor.virtualized import V
@@ -1844,5 +1845,56 @@ def lower_c10d_wait_tensor_async(tensor):
         WaitWorkFallback(
             torch.ops.spyre.wait_work.default,
             tensor,
+        )
+    )
+
+
+@register_spyre_lowering(torch.ops._c10d_functional.all_reduce.default)
+def lower_c10d_all_reduce_async(tensor, reduce_op, group_name):
+    """
+    Direct lowering for _c10d_functional.all_reduce using ASYNC pattern.
+
+    Creates an async all_reduce operation that returns immediately without blocking.
+    Output tensor has shape[0] = input.shape[0].
+    """
+    tensor.realize()
+    logger.debug(
+        "Lowering _c10d_functional.all_reduce to AllReduceAsyncFallback "
+        "(reduce_op=%s, group_name='%s')",
+        reduce_op,
+        group_name,
+    )
+    return ir.TensorBox.create(
+        AllReduceAsyncFallback(
+            torch.ops.spyre.all_reduce_async.default,
+            tensor,
+            reduce_op,
+            group_name,
+        )
+    )
+
+
+@register_spyre_lowering(torch.ops._c10d_functional.all_reduce_.default)
+def lower_c10d_all_reduce_inplace(tensor, reduce_op, group_name):
+    """
+    Lowering for _c10d_functional.all_reduce_ (in-place variant).
+
+    Inductor's reinplace pass converts the functional all_reduce to the in-place
+    all_reduce_ when the output shape matches the input. This lowering catches
+    that case and emits the same Spyre all_reduce op (always in-place on device).
+    """
+    tensor.realize()
+    logger.debug(
+        "Lowering _c10d_functional.all_reduce_ to AllReduceAsyncFallback "
+        "(reduce_op=%s, group_name='%s')",
+        reduce_op,
+        group_name,
+    )
+    return ir.TensorBox.create(
+        AllReduceAsyncFallback(
+            torch.ops._c10d_functional.all_reduce_.default,
+            tensor,
+            reduce_op,
+            group_name,
         )
     )

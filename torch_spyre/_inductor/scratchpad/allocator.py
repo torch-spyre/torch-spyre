@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import logging
 import math
 import time
 from collections.abc import Sequence
 from dataclasses import replace
-from typing import Any, Callable, Optional
+from typing import Any, Callable, cast, Optional
 
 import sympy
 import torch
@@ -63,6 +64,9 @@ from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
 )
 from torch_spyre._inductor.scratchpad.simulated_annealing import (
     SimulatedAnnealingLayoutSolver,
+)
+from torch_spyre._inductor.scratchpad.exhaustive_search import (
+    ExhaustiveSearchSolver,
 )
 from torch_spyre._inductor.scratchpad.passes import (
     ScratchpadOptimizationPass,
@@ -113,6 +117,33 @@ _LX_TRACKER_CAPACITY_BYTES = (
     _LX_PHYSICAL_CAPACITY_BYTES - _LX_PROGRAM_DEBUG_RESERVATION_BYTES
 )
 _LX_ALLOCATION_GRANULARITY_BYTES = 128
+
+
+def _extern_kernel_in_live_range(graph: GraphLowering, uses: list[int]) -> bool:
+    """True if an opaque extern kernel runs at any point while the buffer is live.
+
+    The LX scratchpad is a fixed per-core resource shared by *every* compiled
+    Spyre program, and it is not threaded through the generated wrapper as a
+    tensor -- a resident buffer is handed from one kernel launch to the next by
+    its LX offset alone. An extern kernel is opaque: its body can launch other
+    compiled programs (a nested ``torch.compile``, or any eager op, which
+    torch-spyre compiles standalone via ``compile_once``), and those programs
+    allocate the same LX offsets. A buffer left resident across such a call is
+    therefore silently overwritten, and its consumer reads the other program's
+    data.
+
+    Being *accessed by* the extern kernel is the narrow case (already fatal,
+    since the value must be a real HBM tensor to be passed to it); merely being
+    live *across* one is equally fatal and is not visible from ``uses``
+    membership alone.
+    """
+    if not uses:
+        return False
+    return any(
+        isinstance(graph.operations[i], ExternKernel)
+        for i in range(min(uses), max(uses) + 1)
+    )
+
 
 # A ``MemoryPlanSolver`` is single-use (buffers are required at construction),
 # so the allocators hold a factory -- how to build a solver for a given buffer
@@ -417,8 +448,8 @@ class ScratchpadAllocator:
         restickify = self._restickify_barrier(graph, name, uses)
         if restickify is not None:
             return restickify
-        if any(isinstance(graph.operations[u], ExternKernel) for u in uses):
-            return "extern kernel user"
+        if _extern_kernel_in_live_range(graph, uses):
+            return "extern kernel user or live across extern kernel"
         if self._is_index_or_indirectly_accessed(graph, name, uses, op):
             # Index tensors and the value tensors they index into are read via
             # data-dependent (indirect) addressing, must stay in hbm.
@@ -476,6 +507,8 @@ class ScratchpadAllocator:
             return "no consumer reads it from LX"
         if self._is_index_or_indirectly_accessed(graph, name, uses, None):
             return "index tensor or indirectly accessed"
+        if _extern_kernel_in_live_range(graph, uses):
+            return "extern kernel user or live across extern kernel"
         if not GraphEditor.all_uses_are_rewritable(graph, uses):
             return "use is not rewritable to the clone"
         if buffer_not_read_in_full(graph, name):
@@ -1468,205 +1501,6 @@ def _canonical_key(splits: tuple[dict, dict]) -> tuple:
     return (tuple(sorted(out.items())), tuple(sorted(red.items())))
 
 
-class StrategyBCoOptimizingAllocator(ScratchpadAllocator):
-    """`Strategy B` assumes work_distribution committed one best option (seed). Here we
-    first add a few variants based on the seed, pick the combination that minimizes HBM
-    bytes among all, then defer to ScratchpadAllocator's flow. As seed is in the search
-    space, the worst case matches ScratchpadAllocator.
-    """
-
-    def plan_allocation(self, graph: GraphLowering):
-        for p in self.pre_optimization_passes:
-            p.apply_pass(graph)
-
-        # Enumerate options, run search, commit winners back to op_it_space_splits.
-        ops = graph.operations
-
-        # Distinct matmul output-splits (drop K) to seed the pointwise search.
-        matmul_bases, matmul_roles = _find_distinct_matmul_splits(ops)
-
-        options_per_op = [
-            _enum_split_options(op, matmul_bases, matmul_roles) for op in ops
-        ]
-        t1 = time.perf_counter()
-        best_chosen, timings, search_cache, search_lifetimes = self._search(
-            graph, ops, options_per_op
-        )
-        t_search = time.perf_counter() - t1
-
-        for op, opt_idx, options in zip(ops, best_chosen, options_per_op):
-            chosen = options[opt_idx]
-            if chosen != getattr(op, "op_it_space_splits", ({}, {})):
-                op.op_it_space_splits = chosen
-
-        n_paths = math.prod(len(o) for o in options_per_op)
-        winner = {
-            f"{ops[i].get_name()}({self._get_op_name(ops[i])})": options_per_op[i][
-                best_chosen[i]
-            ]
-            for i in range(len(ops))
-            if len(options_per_op[i]) > 1
-        }
-        logger.info(
-            "co-opt search: %d paths in %.1fms (key components in "
-            "_generate_buffers(): residency %.1fms + mem_usage %.1fms); "
-            "winner=%s",
-            n_paths,
-            t_search * 1e3,
-            timings["residency"] * 1e3,
-            timings["mem_usage"] * 1e3,
-            winner,
-        )
-
-        # try insert clone again, as what was incompatible could be compatible now
-        # TODO simplify the previous pre-opt (at the beginning of this func), we will
-        # run check core-div-mismatch a few times due to clone-insertion, speed-up?
-        n_ops_before_clone = len(graph.operations)
-        for p in self.pre_optimization_passes:
-            p.apply_pass(graph)
-
-        # Standard downstream flow on the now-fixed winning splits. Mirrors
-        # ScratchpadAllocator.plan_allocation past the pre-passes. Reuse the search's
-        # per-core-view cache + liveness only if the clone pass left the graph
-        # unchanged: a clone insertion both appends an op (shifts the
-        # position-indexed liveness) and rewrites input consumers' MemoryDep to read
-        # the clone (changes the (op, splits, dep) cache key), so on any op-count
-        # change both are stale and we rebuild from scratch (cache=lifetimes=None).
-        clone_inserted = len(graph.operations) != n_ops_before_clone
-        buffers = self._generate_buffers(
-            graph,
-            cache=None if clone_inserted else search_cache,
-            lifetimes=None if clone_inserted else search_lifetimes,
-        )
-        solver = self._build_solver(buffers)
-        allocation = solver.plan_layout(log_lx_usage=True)
-        assert not self._lx_relayout_plans
-        reasons = self._get_spill_reasons(solver, allocation)
-        self._push_allocation(graph, allocation)
-        self._log_lx_pinning(graph, reasons)
-        for p in self.post_optimization_passes:
-            p.apply_pass(graph)
-
-    # ------------------------------------------------------------------
-    # Search
-    # ------------------------------------------------------------------
-
-    def _search(
-        self,
-        graph: GraphLowering,
-        ops: list[Operation],
-        options_per_op: list[list[tuple[dict, dict]]],
-    ) -> tuple[list[int], dict[str, float], dict, dict[str, list[int]]]:
-        """DFS over the option cross-product, scoring each leaf via
-        _score_layout. Returns (best option index per op, timing breakdown in
-        seconds, _per_core_view_on_buf cache, liveness). The timing dict has
-        keys `residency` and `mem_usage` — the two split-dependent
-        shared-object builds inside _generate_buffers, which dominate per-leaf
-        cost. Liveness is split-invariant and computed once here, not per leaf.
-        No early-stop pruning — bounded by ≤ K^N leaves where N counts ops with
-        >1 option (most return [seed]). Per-leaf cost is one full
-        _generate_buffers + plan_layout pass; the `cache` param on
-        _per_core_view_on_buf amortizes sympy work if it ever becomes hot. The
-        cache and liveness are returned so the final commit pass can reuse them
-        when the post-search clone pass leaves the graph unchanged (see
-        plan_allocation).
-        """
-        chosen: list[int] = [0] * len(ops)
-        best_total: float = math.inf
-        best_chosen: list[int] = list(chosen)
-        timings: dict[str, float] = {
-            "residency": 0.0,
-            "mem_usage": 0.0,
-        }
-
-        # HBM footprint per buffer. A buffer with no Spyre device_layout
-        # occupies no on-device HBM, so it contributes 0.
-        buf_total_bytes: dict[str, int] = {
-            name: (
-                math.prod(buf.layout.device_layout.device_size[:-1]) * 128
-                if isinstance(buf.layout, FixedTiledLayout)
-                else 0
-            )
-            for name, buf in graph.name_to_buffer.items()
-        }
-
-        # get_read_writes() re-traces the store function over the iteration space
-        # on every call and is NOT memoized upstream, yet its result is
-        # split-invariant (the symbolic deps don't depend on op_it_space_splits).
-        # The per-leaf residency/get_ncores path calls it for every op, so across
-        # ~K^N leaves it would dominate — but `op_read_writes` memoizes it per op
-        # instance (split-invariant), so the first leaf warms the cache for all.
-
-        # Liveness depends only on graph structure (not op.op_it_space_splits),
-        # so compute it once for the whole search instead of per leaf.
-        lifetimes = calculate_liveness(graph)
-
-        # Memoize _per_core_view_on_buf across leaves. Keyed on
-        # (op name, split values, dep) — see _per_core_view_on_buf for why
-        # op name is required. A single dict is correct across the whole
-        # search; scoped to this graph only since dep is not unique across
-        # graphs.
-        cache: dict = {}
-
-        def recurse(op_idx: int) -> None:
-            nonlocal best_total, best_chosen
-            if op_idx == len(ops):
-                hbm = self._score_layout(
-                    graph, buf_total_bytes, cache, timings, lifetimes
-                )
-                if hbm < best_total:
-                    best_total = hbm
-                    best_chosen = list(chosen)  # list() makes a copy
-                return
-
-            op = ops[op_idx]
-            options = options_per_op[op_idx]
-
-            # Mutate-and-undo: stash and restore op.op_it_space_splits.
-            # If the op originally lacked the attribute, restore it as
-            # ({}, {}) — equivalent to "unset" for all readers (which use
-            # getattr(..., ({}, {})) or hasattr+empty-dict default).
-            prev_split: tuple[dict, dict] = getattr(op, "op_it_space_splits", ({}, {}))
-            for opt_idx, option in enumerate(options):
-                op.op_it_space_splits = option
-                chosen[op_idx] = opt_idx
-                recurse(op_idx + 1)
-            op.op_it_space_splits = prev_split
-
-        recurse(0)
-        return best_chosen, timings, cache, lifetimes
-
-    # ------------------------------------------------------------------
-    # Leaf scoring
-    # ------------------------------------------------------------------
-
-    def _score_layout(
-        self,
-        graph: GraphLowering,
-        buf_total_bytes: dict[str, int],
-        cache: Optional[dict] = None,
-        timings: Optional[dict[str, float]] = None,
-        lifetimes: Optional[dict[str, list[int]]] = None,
-    ) -> int:
-        """HBM bytes under the current split assignment: total device
-        bytes of every buffer the solver couldn't pin. Non-committing
-        (addresses land on throwaway buffers) and solver-agnostic.
-
-        If `timings` is provided, _generate_buffers accumulates its
-        `residency` / `mem_usage` sub-step seconds into it. `lifetimes`
-        (split-invariant) is forwarded to avoid recomputing it per leaf.
-
-        Note: 0-byte entries are guaranteed never to appear in pinned_names.
-        """
-        buffers = self._generate_buffers(graph, cache, timings, lifetimes)
-        allocation = self._build_solver(buffers).plan_layout()
-        pinned_names = {b.name for b in allocation if b.address is not None}
-
-        return sum(
-            total for name, total in buf_total_bytes.items() if name not in pinned_names
-        )
-
-
 class CoOptimizingAllocator(ScratchpadAllocator):
     def __init__(
         self,
@@ -1674,19 +1508,22 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         size: int,
         pre_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
         post_optimization_passes: list[ScratchpadOptimizationPass] | None = None,
+        prune: bool = False,
     ):
         """Joint core-division + LX-placement allocator.
 
         Args:
-            layout_planning: Factory for a core-division-aware solver (the
-                OR-Tools ``CpSatLayoutSolver``). This allocator drives the
-                *joint* entry point, so it needs the ``CoreDivisionLayoutSolver``
-                interface rather than a plain ``MemoryPlanSolver``. The
-                ortools-missing fallback to greedy placement lives in
-                :func:`select_allocator`, which never constructs this allocator
-                without a valid solver.
+            layout_planning: Factory for a core-division-aware solver — either
+                the OR-Tools ``CpSatLayoutSolver`` (ILP) or an
+                ``ExhaustiveSearchSolver`` (DFS) wrapping a placement-only
+                factory. This allocator drives the *joint* entry point, so it
+                needs the ``CoreDivisionLayoutSolver`` interface rather than a
+                plain ``MemoryPlanSolver``. The ortools-missing fallback to
+                greedy placement lives in :func:`select_allocator`, which
+                never constructs this allocator without a valid factory.
             pre_optimization_passes: Graph passes applied before layout planning.
             post_optimization_passes: Graph passes applied after layout planning.
+            prune: Enable heuristic based pruning of core division search space.
         """
         super().__init__(
             layout_planning=layout_planning,
@@ -1697,6 +1534,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # Narrow the base's ``LayoutSolverFactory`` annotation: the joint entry
         # point requires the core-division interface.
         self.layout_planning: Optional[CoreDivisionSolverFactory] = layout_planning
+        self.prune = prune
 
     def _prepare_buffers(self, graph: GraphLowering) -> Sequence[Any]:
         in_place = self._determine_in_place_division_invariant(graph)
@@ -1707,7 +1545,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
     def _solve(self, solver: MemoryPlanSolver) -> Sequence[Any]:
         assert isinstance(solver, CoreDivisionLayoutSolver)
-        return solver.plan_layout_and_core_divisions()
+        result = solver.plan_layout_and_core_divisions()
+        assert not self._lx_relayout_plans
+        return result
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
         # The divisions must be committed such that any buffer clones can correctly
@@ -1722,7 +1562,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     ) -> dict:
         # Surface the solver's per-buffer spill causes so the LX-pinning debug
         # log reports why each buffer landed in HBM, on par with the other
-        # allocators.
+        # allocators. Both CoreDivisionLayoutSolver implementations expose it.
         assert isinstance(solver, CoreDivisionLayoutSolver)
         return solver.spill_reasons
 
@@ -1748,14 +1588,24 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         """
         max_cores = config.sencores
         fixed_division_ops = ops_in_offset_mutation_component(graph)
-        return {
-            op.name: (
-                [_fixed_core_division(op)]
-                if op.name in fixed_division_ops
-                else self._enumerate_core_divisions(op, max_cores)
-            )
-            for op in graph.operations
-        }
+
+        ops = graph.operations
+        matmul_bases, matmul_roles = _find_distinct_matmul_splits(ops)
+
+        result = {}
+        for op in graph.operations:
+            if op.name in fixed_division_ops:
+                divs = [_fixed_core_division(op)]
+            elif self.prune:
+                divs = [
+                    CoreDivision(output_splits=dict(out), reduction_splits=dict(red))
+                    for out, red in _enum_split_options(op, matmul_bases, matmul_roles)
+                ]
+            else:
+                divs = self._enumerate_core_divisions(op, max_cores)
+            result[op.name] = divs
+
+        return result
 
     def _enumerate_core_divisions(
         self, op: Operation, max_cores: int
@@ -2019,11 +1869,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # cd_parent_matches entry set just above. Multi-output ops carry a
             # MultiOutputLayout with no single device_layout and cannot alias one
             # clone, so they are skipped.
-            out_layout = graph.get_buffer(output_name).get_layout()
+            out_layout = graph.get_buffer(output_name).layout
             for clone_name in last_consumer_clones.get(output_name, []):
                 if clone_name in parents:
                     continue
-                clone_layout = graph.get_buffer(clone_name).get_layout()
+                clone_layout = graph.get_buffer(clone_name).layout
                 if (
                     op is None
                     or not hasattr(out_layout, "device_layout")
@@ -2310,89 +2160,57 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         return out
 
 
-_PLACEMENT_SOLVERS: dict[str, type[MemoryPlanSolver]] = {
-    "greedy": GreedyLayoutSolver,
-    "bestfit": BestFitLayoutSolver,
-    "firstfit": FirstFitLayoutSolver,
-    "simulated_annealing": SimulatedAnnealingLayoutSolver,
-}
-
-
-def _make_cpsat_solver() -> Optional[CoreDivisionSolverFactory]:
-    """Build a CP-SAT layout solver factory, or ``None`` when ortools is
-    unavailable.
+def _make_cpsat_solver(
+    buffers: Sequence[LifetimeBoundBuffer], size: int
+) -> MemoryPlanSolver:
+    """Build the CP-SAT layout solver, or ``GreedyLayoutSolver`` when ortools
+    is unavailable.
 
     Imported lazily so this module (and every non-cpsat path) loads without
-    ortools installed; ``CpSatLayoutSolver.__init__`` raises ``ImportError`` when
-    ortools (``cp_model``) is missing, which we translate to ``None`` so callers
-    can fall back to a placement-only greedy solve. Availability is probed with
-    a throwaway empty-buffers instance -- solvers require their buffers at
-    construction, so there is nothing to build ahead of time here.
+    ortools installed; ``CpSatLayoutSolver.__init__`` raises ``ImportError``
+    when ortools (``cp_model``) is missing, which we translate to a
+    placement-only greedy fallback so callers never see an unusable factory.
     """
     try:
         from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
             CpSatLayoutSolver,
         )
 
-        # Throwaway instance: CpSatLayoutSolver.__init__ is where the
-        # ortools-missing ImportError actually raises (module import alone
-        # never does -- ilp_solver_ortools swallows it at module scope), so
-        # the probe has to construct one to detect availability here.
-        CpSatLayoutSolver([], 0)
-        return CpSatLayoutSolver
+        return CpSatLayoutSolver(buffers, size)
     except ImportError as exc:
         logger.warning(
             "cpsat layout solver unavailable (%s); falling back to the "
             "default greedy allocator.",
             exc,
         )
-        return None
+        return GreedyLayoutSolver(buffers, size)
+
+
+_PLACEMENT_SOLVERS: dict[str, LayoutSolverFactory] = {
+    "greedy": GreedyLayoutSolver,
+    "bestfit": BestFitLayoutSolver,
+    "firstfit": FirstFitLayoutSolver,
+    "simulated_annealing": SimulatedAnnealingLayoutSolver,
+    "cpsat": _make_cpsat_solver,
+}
 
 
 def select_allocator() -> ScratchpadAllocator:
     """Build the scratchpad allocator and inject its layout solver from config.
 
     This is the single place that maps config to an (allocator, solver) pair, so
-    the allocators themselves take an explicit solver and never inspect config:
+    the allocators themselves take an explicit solver factory and never inspect
+    config:
 
-    * ``layout_solver == "cpsat"`` with ``co_optimizing_lx_planning`` -> joint
-      core-division + LX placement via :class:`CoOptimizingAllocator`. Falls back
-      to placement-only greedy :class:`ScratchpadAllocator` when ortools is absent.
-    * ``layout_solver == "cpsat"`` without co-optimization -> placement-only
-      :class:`ScratchpadAllocator` driven by the CP-SAT solver, placing buffers on
-      each op's pre-determined core division (the buffers are converted to
-      trivial ``CoreDivisionBuffer``s). Falls back to greedy when ortools is
-      absent.
-    * ``co_optimizing_lx_planning`` (non-cpsat solver) -> gap-based
-      co-optimization via :class:`StrategyBCoOptimizingAllocator`.
-    * otherwise -> placement-only :class:`ScratchpadAllocator` with the configured
-      gap-based solver (greedy/bestfit/firstfit).
+    * Without ``co_optimizing_lx_planning``, returns a :class:`ScratchpadAllocator`
+      instance that solves for LX placement only.
+    * With ``co_optimizing_lx_planning``, returns a :class:`CoOptimizingAllocator`
+      instance. A core-division-capable factory (currently only ``"cpsat"``, and
+      only when ortools is available) is used directly; every other factory is
+      wrapped in an :class:`ExhaustiveSearchSolver` that does an exhaustive
+      search of all the core division options.
     """
     size = _lx_planning_size()
-    if config.layout_solver == "cpsat":
-        # Both cpsat paths share the same ortools-missing degradation: build the
-        # CP-SAT solver factory here and fall back to greedy placement (still
-        # correct) when it is unavailable, so the allocators never see a
-        # ``None`` factory.
-        solver = _make_cpsat_solver()
-        if config.co_optimizing_lx_planning:
-            if solver is None:
-                return ScratchpadAllocator(
-                    layout_planning=GreedyLayoutSolver, size=size
-                )
-            if config.lx_planner_relayout:
-                logger.warning(
-                    "LX relayout is not supported by CoOptimizingAllocator; "
-                    "continuing without relayout"
-                )
-            return CoOptimizingAllocator(layout_planning=solver, size=size)
-        # Placement-only CP-SAT on the pre-determined core divisions.
-        if solver is None:
-            logger.debug(
-                "falling back to greedy solver. Make sure Or-Tools is available"
-            )
-            return ScratchpadAllocator(layout_planning=GreedyLayoutSolver, size=size)
-        return ScratchpadAllocator(layout_planning=solver, size=size)
 
     try:
         solver_cls = _PLACEMENT_SOLVERS[config.layout_solver]
@@ -2404,10 +2222,27 @@ def select_allocator() -> ScratchpadAllocator:
     if config.co_optimizing_lx_planning:
         if config.lx_planner_relayout:
             logger.warning(
-                "LX relayout is not supported by StrategyBCoOptimizingAllocator; "
+                "LX relayout is not supported by CoOptimizingAllocator; "
                 "continuing without relayout"
             )
-        return StrategyBCoOptimizingAllocator(layout_planning=solver_cls, size=size)
+        # Throwaway empty-buffer probe: cheap (no real solving happens in
+        # __init__) and the only way to know whether this factory's solver is
+        # core-division-capable when the factory may be a plain function (the
+        # ortools-availability-aware cpsat factory) rather than a solver class.
+        if not isinstance(solver_cls([], size), CoreDivisionLayoutSolver):
+            return CoOptimizingAllocator(
+                layout_planning=functools.partial(
+                    ExhaustiveSearchSolver, inner_factory=solver_cls
+                ),
+                size=size,
+                prune=True,
+            )
+        # The isinstance check above just proved this factory's solver is a
+        # CoreDivisionLayoutSolver at runtime; narrow the static type to match.
+        return CoOptimizingAllocator(
+            layout_planning=cast(CoreDivisionSolverFactory, solver_cls), size=size
+        )
+
     return ScratchpadAllocator(layout_planning=solver_cls, size=size)
 
 

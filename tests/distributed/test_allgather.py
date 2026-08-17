@@ -74,13 +74,15 @@ class TestAllGather(TestCase):
         if dist.is_initialized():
             dist.destroy_process_group()
 
-    def _test_allgather_helper(self, shape, dtype):
+    def _test_allgather_helper(self, shape, dtype, async_op=False):
         """
         Helper method to test allgather with specific parameters.
 
         Args:
             shape: Tensor shape
             dtype: Tensor data type
+            async_op: If True, launch the collective asynchronously and call
+                      work.wait() before inspecting the result
         """
         # Calculate total number of elements in the tensor
         num_elements = torch.tensor(shape).prod().item()
@@ -101,7 +103,14 @@ class TestAllGather(TestCase):
 
         output_list = [torch.zeros_like(input_device) for _ in range(self.comm_size)]
 
-        dist.all_gather(output_list, input_device)
+        work = dist.all_gather(output_list, input_device, async_op=async_op)
+
+        if async_op:
+            self.assertIsNotNone(work, "async_op=True must return a Work handle")
+            work.wait()
+            self.assertTrue(work.is_completed())
+        else:
+            self.assertIsNone(work, "async_op=False must return None")
 
         # Build all expected slices at once and compare in bulk.
         # All ranks contribute contiguous blocks: rank r owns [r*N .. (r+1)*N - 1],
@@ -142,6 +151,22 @@ class TestAllGather(TestCase):
     def test_allgather_2d_tensor_int32(self):
         """Test allgather with 2D tensor shapes using int32."""
         self._test_allgather_helper(shape=(4, 64), dtype=torch.int32)
+
+    def test_allgather_float16_async(self):
+        """Test allgather with float16 tensors using async_op=True."""
+        self._test_allgather_helper(shape=(128,), dtype=torch.float16, async_op=True)
+
+    def test_allgather_float32_async(self):
+        """Test allgather with float32 tensors using async_op=True."""
+        self._test_allgather_helper(shape=(256,), dtype=torch.float32, async_op=True)
+
+    def test_allgather_int32_async(self):
+        """Test allgather with int32 tensors using async_op=True."""
+        self._test_allgather_helper(shape=(192,), dtype=torch.int32, async_op=True)
+
+    def test_allgather_2d_tensor_float16_async(self):
+        """Test allgather with 2D float16 tensors using async_op=True."""
+        self._test_allgather_helper(shape=(4, 64), dtype=torch.float16, async_op=True)
 
 
 if __name__ == "__main__":

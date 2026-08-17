@@ -5,7 +5,9 @@
 Variables that affect profile capture, telemetry, and observability.
 Debug-oriented variables (`TORCH_SPYRE_DEBUG`, `TORCH_COMPILE_DEBUG`,
 `TORCHINDUCTOR_FORCE_DISABLE_CACHES`, `INDUCTOR_PROVENANCE`,
-`TORCH_TRACE`) live under [Debugging](../debugging/index.md).
+`TORCH_TRACE`) live under [Debugging](../debugging/index.md); the FFDC
+table below re-lists `TORCH_COMPILE_DEBUG` only to note its effect on
+captured artifacts.
 
 ## Logging
 
@@ -70,7 +72,12 @@ The `torch_spyre.*` namespace is only for the `TORCH_LOGS` environment variable.
 
 | Variable | Effect |
 |---|---|
-| `USE_SPYRE_PROFILER=1` | Opt in to automatic FFDC JSON reports on Spyre compile / runtime / unimplemented failures. Retrieve with `torch.spyre.get_diagnostic_report()`. (Same name as the CMake profiler build flag; at runtime this env var alone gates capture.) |
+| `TORCH_SPYRE_FFDC=1` | Opt in to automatic FFDC JSON reports on Spyre frontend-compile / backend-compile / runtime / unimplemented failures. Retrieve with `torch.spyre.get_diagnostic_report()`. Separate from `USE_SPYRE_PROFILER` (CMake / Kineto build flag); this env var alone gates capture at runtime and is not set by default on pods. |
+| `TORCH_COMPILE_DEBUG=1` | Optional. Writes `torch_compile_debug/` artifacts that FFDC links into `artifacts.paths` (see [FFDC user guide](ffdc.md)). Not required for capture. |
+| `DUMP_SPYRE_CODE=1` | Optional. Emits `sdsc_*.json` and `*.mlir` bundle files that FFDC can reference. Not required for capture. |
+
+See the [FFDC user guide](ffdc.md) for the full workflow, report locations,
+and pod/CI usage.
 
 ## Device enumeration
 
