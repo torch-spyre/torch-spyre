@@ -1057,15 +1057,13 @@ def _collect_index_tensor_layouts(
     symbol_mapping: dict,
     index_tensor_indices: set[int],
     logger: object,
-    gather_mb_injected: bool = False,
     mb_sym: Symbol | None = None,
+    index_stick_syms: dict[int, Symbol] | None = None,
 ) -> tuple[dict, dict]:
     """First pass: compute (dim_order, stick_dim) for each index tensor.
 
-    For P=1 gathers the index tensor has all-constant coordinates (no loop
-    variables), so its natural dim_order is empty.  When ``gather_mb_injected``
-    is True, override the layout to ``([mb_sym], mb_sym)`` so the KERNEL_IDX
-    has a valid non-empty layout.
+    For P=1 gathers (mb_sym present, dim_order empty), override to ([mb_sym], mb_sym).
+    For absent stick coordinate, append the pre-registered placeholder symbol.
 
     Returns:
         index_tensor_layouts: dict mapping tensor_idx -> (dim_order, stick_dim)
@@ -1073,14 +1071,19 @@ def _collect_index_tensor_layouts(
     """
     index_tensor_layouts: dict[int, tuple[list, object]] = {}
     index_active_dims: dict[int, set] = {}
+    index_stick_syms = index_stick_syms or {}
 
     for i in index_tensor_indices:
         arg = op_spec.args[i]
         dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
-        if gather_mb_injected and not dim_order:
-            # P=1: index tensor has all-constant coords; use the synthetic dim.
+        if mb_sym is not None and not dim_order:
+            # P=1: all-constant coords; use injected mb_sym.
             dim_order = [mb_sym]
             stick_dim = mb_sym
+        elif dim_order and stick_dim is None and i in index_stick_syms:
+            # Absent stick coordinate; append pre-registered placeholder.
+            stick_dim = index_stick_syms[i]
+            dim_order = dim_order + [stick_dim]
         index_tensor_layouts[i] = (dim_order, stick_dim)
         active_dims = {d for d in dim_order if d is not stick_dim}
         index_active_dims[i] = active_dims
@@ -1098,13 +1101,13 @@ def _create_sdsc_tensors(
     iteration_space: dict,
     op_dim_order: list[Symbol],
     op_stick_dim: Symbol | None,
-    gather_mb_injected: bool = False,
     injected_dims: dict[str, Any] | None = None,
 ) -> tuple[list[SDSCArgs], dict, Symbol | None]:
     dims = list(iteration_space.keys())
     if injected_dims is None:
         injected_dims = {}
     mb_sym = injected_dims.get("mb_sym")
+    index_stick_syms = injected_dims.get("index_stick_syms")
     layouts: dict = {}
     # matmul and conv share the two-input tensor treatment: each arg keeps its
     # own natural (per-tensor) dim order and the weight gets the KERNEL layout
@@ -1119,8 +1122,7 @@ def _create_sdsc_tensors(
     has_indirect_access = bool(index_tensor_indices)
 
     # For indirect access: pre-compute index tensor layouts (first pass).
-    # Pass gather_mb_injected so index tensors with all-constant coordinates get
-    # their layout overridden to ([mb_sym], mb_sym) instead of ([], None).
+    # mb_sym injects a dimension for P=1 gathers (all-constant coords).
     index_tensor_layouts: dict[int, tuple[list, Any]] = {}
     index_active_dims: dict[int, set] = {}
     if has_indirect_access:
@@ -1129,8 +1131,8 @@ def _create_sdsc_tensors(
             symbol_mapping,
             index_tensor_indices,
             logger,
-            gather_mb_injected=gather_mb_injected,
             mb_sym=mb_sym,
+            index_stick_syms=index_stick_syms,
         )
 
     missing_dim = None
@@ -1229,7 +1231,15 @@ def _create_sdsc_tensors(
             else:
                 scales[dim] = 1
 
-            strides[dim] = _calculate_device_stride(stride_idx, arg.device_size)
+            # Injected stick dims don't exist in device_size; use stride=1.
+            if (
+                has_indirect_access
+                and i in index_tensor_indices
+                and dim in (index_stick_syms.values() if index_stick_syms else [])
+            ):
+                strides[dim] = 1
+            else:
+                strides[dim] = _calculate_device_stride(stride_idx, arg.device_size)
             offsets[dim] = 0
             dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
 
@@ -1316,21 +1326,31 @@ def _create_sdsc_tensors(
                     backGap[dim] = dev_dim_size - it_dim_size
                 strides[dim] = strides[dim] // dev_dim_size * it_dim_size
 
-        # Prepend mb_sym to all tensors except the P=1 index tensor, which
-        # already has mb_sym set by _collect_index_tensor_layouts.
-        is_gather_index = (
-            gather_mb_injected and has_indirect_access and i in index_tensor_indices
+        # Injected dimensions (mb_sym for P=1, stick symbols for absent coords)
+        # require explicit max_dim_size: 1 for value/output, -1 for others.
+        injected_dim_sizes: dict[Symbol, int] = {}
+
+        # P=1 gather: mb_sym prepended to value/output tensors only (index
+        # tensors already have it from _collect_index_tensor_layouts).
+        is_index_p1 = (
+            mb_sym is not None and has_indirect_access and i in index_tensor_indices
         )
-        if mb_sym is not None and not is_gather_index:
+        if mb_sym is not None and not is_index_p1:
             dim_order = [mb_sym] + dim_order
             scales[mb_sym] = 1
             strides[mb_sym] = _calculate_device_stride(0, arg.device_size)
             offsets[mb_sym] = 0
-            # P=1 gather value tensor fetches exactly 1 row per iteration.
-            if gather_mb_injected and is_indirect_value_tensor(arg):
-                max_dim_sizes[mb_sym] = 1
-            else:
-                max_dim_sizes[mb_sym] = -1
+            injected_dim_sizes[mb_sym] = 1 if is_indirect_value_tensor(arg) else -1
+
+        # Injected stick dims: set max_dim_size=1 for all tensors
+        # that carry them in dim_order.
+        if index_stick_syms:
+            for idx, stick_sym in index_stick_syms.items():
+                if stick_sym in dim_order:
+                    injected_dim_sizes[stick_sym] = 1
+
+        for dim, size in injected_dim_sizes.items():
+            max_dim_sizes[dim] = size
 
         # For topk: inject topk_missing_dim only into output tensor's dim_order.
         topk_missing_dim = injected_dims.get("topk_missing_dim")
@@ -1767,39 +1787,61 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         work_slices = {mb_sym: 1, **work_slices}
         op_dim_order = [mb_sym] + op_dim_order
 
-    # P=1 gather: when the index has only 1 element, Inductor eliminates the
-    # mb loop, leaving the index tensor with all-constant coordinates and no
-    # loop variable.  Inject a synthetic dim=1 so the KERNEL_IDX gets a valid
-    # non-empty layout, and the backend executes exactly one gather iteration.
-    gather_mb_injected: bool = False
+    # Inject missing dimensions into index tensors: P=1 (no loops) or
+    # absent stick coordinate (size-1 logical dim).
+    def _inject_index_dim(sym: Symbol, prepend: bool = False) -> None:
+        """Register injected dimension into iteration space and dim_order."""
+        sdsc_iteration_space[sym] = 1
+        dim_splits[sym] = 1
+        work_slices[sym] = 1
+        nonlocal op_dim_order
+        if prepend:
+            op_dim_order = [sym] + op_dim_order
+        elif sym not in op_dim_order:
+            op_dim_order = op_dim_order + [sym]
+
     if has_indirect_access and mb_sym is None:
         for idx in index_tensor_indices:
             idx_arg = op_spec.args[idx]
             idx_dim_order, _ = _get_device_dim_order(idx_arg, symbol_mapping)
             if not idx_dim_order:
-                # All-constant coords → P=1. Use 1, not stick_size: stick_size
-                # iterations would overflow a 1-row output tensor.
-                stick_size = idx_arg.device_dtype.elems_per_stick()
-                # Pick the first label not already in op_dim_order to avoid
-                # collisions when a higher-rank gather has consumed "mb".
+                # P=1: all-constant coords, no loop variable.
                 _existing_names = {s.name for s in op_dim_order}
                 _p1_label = next(
                     lbl for lbl in INPUT_DIM_LABELS if lbl not in _existing_names
                 )
                 mb_sym = Symbol(_p1_label)
-                sdsc_iteration_space = {mb_sym: 1, **sdsc_iteration_space}
-                dim_splits = {mb_sym: 1, **dim_splits}
-                work_slices = {mb_sym: 1, **work_slices}
-                op_dim_order = [mb_sym] + op_dim_order
-                gather_mb_injected = True
+                _inject_index_dim(mb_sym, prepend=True)
                 logger.debug(
-                    "P=1 gather detected (index tensor %d, stick_size=%d): "
-                    "injecting virtual %s=1 into SDSC iteration space",
+                    "P=1 gather detected (index tensor %d): injecting virtual %s=1",
                     idx,
-                    stick_size,
                     _p1_label,
                 )
                 break
+
+    # Absent stick coordinate: batch dim present but stick collapsed to 0.
+    index_stick_syms: dict[int, Symbol] = {}
+    if has_indirect_access:
+        for idx in index_tensor_indices:
+            idx_arg = op_spec.args[idx]
+            idx_dim_order, idx_stick_dim = _get_device_dim_order(
+                idx_arg, symbol_mapping
+            )
+            if idx_dim_order and idx_stick_dim is None:
+                _existing_names = {s.name for s in op_dim_order} | {
+                    s.name for s in idx_dim_order
+                }
+                _stick_label = next(
+                    lbl for lbl in INPUT_DIM_LABELS if lbl not in _existing_names
+                )
+                stick_sym = Symbol(_stick_label)
+                _inject_index_dim(stick_sym, prepend=False)
+                index_stick_syms[idx] = stick_sym
+                logger.debug(
+                    "Index tensor %d: stick coordinate absent; injecting %s",
+                    idx,
+                    _stick_label,
+                )
 
     if op_stick_dim is None:
         if is_pool or _is_depthwise_conv(op_spec.op):
@@ -1850,6 +1892,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     # For topk: if all output dims are in the input, add a missing dimension.
     injected_dims = {"mb_sym": mb_sym} if mb_sym else {}
+    if index_stick_syms:
+        injected_dims["index_stick_syms"] = index_stick_syms
     if _is_topk(op_spec.op) and len(op_spec.args) >= 2:
         input_arg = op_spec.args[0]
         output_arg = op_spec.args[-1]
@@ -1873,7 +1917,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         sdsc_iteration_space,
         op_dim_order,
         op_stick_dim,
-        gather_mb_injected=gather_mb_injected,
         injected_dims=injected_dims,
     )
     if missing_dim is not None:
@@ -2123,7 +2166,6 @@ def compile_op_spec(
     op_spec: OpSpec,
     symbols: list[int],
     symbol_id_offset: int = 0,
-    use_symbols: bool = False,
 ) -> tuple[Any, list[int], list[list[dict]], list[SymbolKind]]:
     sdsc_spec, symbol_mapping = parse_op_spec(op_spec)
     logger.debug("%s", sdsc_spec)
@@ -2140,6 +2182,5 @@ def compile_op_spec(
         symbols,
         symbol_id_offset,
         tiled_symbols=tiled_symbols_per_level,
-        use_symbols=use_symbols,
     )
     return result

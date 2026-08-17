@@ -16,6 +16,7 @@ import os
 import threading
 import types
 import importlib
+
 import torch
 
 from .constants import DEVICE_NAME, DISTRIBUTED_BACKEND_NAME
@@ -190,10 +191,8 @@ def make_spyre_module() -> types.ModuleType:
     mod.set_device = lambda idx: impl.set_device(idx)
     mod._is_compiled = lambda: True
     mod.memory = memory
-
-    from torch_spyre.profiler._ffdc import get_diagnostic_report
-
-    mod.get_diagnostic_report = get_diagnostic_report
+    # Public profiler API (eagerly imported above); avoid private _ffdc import.
+    mod.get_diagnostic_report = profiler.get_diagnostic_report
 
     import torch  # noqa: E402
 
@@ -400,7 +399,3 @@ def _autoload_impl():
 
     # Enable spyre code with symbolic args by default
     os.environ.setdefault("BUNDLE_SYMBOLIC_ARGS", "1")
-
-
-if not profiler.is_available():
-    profiler = None

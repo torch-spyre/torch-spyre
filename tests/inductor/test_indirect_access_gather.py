@@ -286,6 +286,26 @@ class _GatherScenarios(IndirectAccessTestCase):
         self.name_dims(ids, {"P": P})
         self._stage_and_e2e(lambda t, i: t[i], table, ids, expect=GATHER_OP_SPEC)
 
+    def test_embedding_2d_index_stick_size_1(self):
+        V, E, B = 4096, 1024, 2
+        weight = self.to_spyre(torch.rand(V, E, dtype=torch.float16))
+        idx = torch.randint(0, V, (B, 1), dtype=torch.int32).to("spyre")
+        self.name_dims(weight, {"V": V, "E": E})
+        self.name_dims(idx, {"B": B, "one": 1})
+        self._stage_and_e2e(
+            lambda w, i: torch.embedding(w, i), weight, idx, expect=GATHER_OP_SPEC
+        )
+
+    def test_embedding_2d_index_dim_size_1(self):
+        V, E, B = 4096, 1024, 1
+        weight = self.to_spyre(torch.rand(V, E, dtype=torch.float16))
+        idx = torch.randint(0, V, (B, 1), dtype=torch.int32).to("spyre")
+        self.name_dims(weight, {"V": V, "E": E})
+        self.name_dims(idx, {"B": B, "one": 1})
+        self._stage_and_e2e(
+            lambda w, i: torch.embedding(w, i), weight, idx, expect=GATHER_OP_SPEC
+        )
+
     def test_advanced_indexing_with_tanh(self):
         x, i = self._xi(P=32)
         self._stage_and_e2e(

@@ -202,14 +202,17 @@ jobs:
   # ---------------------------------------------------------------------------
   # Aggregate the per-suite JUnit XMLs the `test` matrix uploaded (one per
   # suite, instead of the single combined report this job used to produce
-  # inline) and report final counts + timings back into ClickHouse. Runs on
-  # ubuntu-latest -- pure API/aggregation work, no Spyre hardware needed.
+  # inline) and report final counts + timings back into ClickHouse.
   # ---------------------------------------------------------------------------
   report:
     name: Report results
     needs: [build, test]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - linux
+      - image_spyre_backend
     env:
       CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST_DEV }}
       CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT_DEV }}
