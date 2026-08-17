@@ -24,9 +24,9 @@ setuptools==81.0.0
     # via torch
 sympy==1.14.0
     # via torch
-torch==2.13.0 ; sys_platform == 'darwin'
+torch==2.13.0 ; python_full_version < '3.15' and sys_platform == 'darwin'
     # via torch-spyre
-torch==2.13.0+cpu ; sys_platform != 'darwin'
+torch==2.13.0+cpu ; python_full_version >= '3.15' or sys_platform != 'darwin'
     # via torch-spyre
 typing-extensions==4.16.0
     # via torch

@@ -355,6 +355,9 @@ class TestSpyreModelOps(TestCase):
         device_replace_disabled: bool = bool(
             pytestconfig.getoption("--no-device-replace", default=False)
         )
+        assert not device_replace_disabled, (
+            "Tentatively, --no-device-replace option is disabled"
+        )
 
         method_name = self._testMethodName
         ops_item: OpsNamedItem = op.ops_item
@@ -408,7 +411,7 @@ class TestSpyreModelOps(TestCase):
         # Build CPU SampleInput — all construction delegated to spyre_test_config_models
         cpu_sample: SampleInput = ops_item.build_sample_input(
             seed=seed,
-            test_device=None if device_replace_disabled else test_device,
+            test_device="cpu",
             SampleInput=SampleInput,
         )
 

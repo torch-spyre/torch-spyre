@@ -23,6 +23,7 @@ reads a ``ComputedBuffer``'s ``origins`` to construct the handle.
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Any, Sequence
 
 import regex
@@ -49,27 +50,38 @@ logger = get_inductor_logger("provenance")
 _SPYRE_PROV_HISTORY_ATTR = "_spyre_prov_history"
 
 
+_DEBUG_HANDLE_ID_VERSION = 2
+
+
 def _stable_id(
     source: SourceLoc | None,
     aten_op: str | None,
     ir_chain: tuple[str, ...],
+    fused_from: tuple[DebugHandle, ...] = (),
 ) -> int:
-    """Deterministic content hash of an op's provenance.
+    """Deterministic content hash of an op's stable provenance identity.
 
-    Stability contract: reproducible for the same op within a compile and across
-    recompiles on the same toolchain, but NOT across torch/scheduler versions
-    (``ir_chain`` includes scheduling-assigned buffer names). It is a within-compile
-    linking key, not a cross-run fingerprint; cross-version consumers should key on
-    ``source`` + ``aten_op`` instead.
+    The identity includes the complete structured source range, ATen op, ordered
+    IR chain, and ordered fused constituent IDs. Transformation history is
+    deliberately excluded because it describes how an operation was produced,
+    not which operation it represents. IDs are reproducible for equivalent
+    recompiles on the same toolchain, but not across source relocation or
+    torch/scheduler versions because paths and scheduled names participate.
     """
-    canonical = "|".join(
-        [
-            source.to_str() if source is not None else "",
-            aten_op or "",
-            ",".join(ir_chain),
-        ]
+    canonical = json.dumps(
+        {
+            "version": _DEBUG_HANDLE_ID_VERSION,
+            "source": source.to_dict() if source is not None else None,
+            "aten_op": aten_op,
+            "ir_chain": list(ir_chain),
+            "fused_from": [str(handle.id) for handle in fused_from],
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
     )
-    digest = hashlib.sha256(canonical.encode("utf-8")).digest()
+    digest = hashlib.sha256(canonical.encode("ascii")).digest()
     # Top 8 bytes = 64 bits; ``>> 1`` drops the sign bit so the id is a
     # non-negative value that always fits a *signed* 64-bit integer, the common
     # interchange width (JSON int64, MLIR ``i64``, protobuf ``int64``). A full
@@ -187,7 +199,7 @@ def build_debug_handle(buffer: Any) -> DebugHandle | None:
         )
 
     return DebugHandle(
-        id=_stable_id(source, aten_op, ir_chain),
+        id=_stable_id(source, aten_op, ir_chain, fused_from),
         source=source,
         aten_op=aten_op,
         ir_chain=ir_chain,

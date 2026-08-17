@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import argparse
 import torch
 import torch.distributed as dist
 import os
@@ -19,8 +20,15 @@ DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
 C10D_BACKEND = "spyreccl"
 
 
-def run_test(comm_rank, comm_size):
-    """Run a gather test where each rank contributes a unique tensor."""
+def run_test(comm_rank, comm_size, async_op=False):
+    """Run a gather test where each rank contributes a unique tensor.
+
+    Args:
+        comm_rank: Rank of the current process
+        comm_size: Total number of processes
+        async_op: If True, launch the collective asynchronously and overlap CPU
+                  work with the hardware operation before calling work.wait().
+    """
     global DEVICE
 
     dst_rank = 0
@@ -41,13 +49,31 @@ def run_test(comm_rank, comm_size):
 
     # Prepare output tensors (only needed at root, but we prepare for all for simplicity)
     output_list = None
+    expected = []
     if comm_rank == dst_rank:
         # Root rank prepares a list to receive tensors from all ranks
         output_list = [torch.zeros_like(input_device) for _ in range(comm_size)]
+        # build expected tensors on CPU while the collective runs on hardware
+        for rank_idx in range(comm_size):
+            rank_start = rank_idx * num_elements
+            rank_end = rank_start + num_elements
+            expected.append(torch.arange(rank_start, rank_end, dtype=torch.float16))
 
-    # Gather with the collective library
-    print(f"[{comm_rank} of {comm_size}] Gather Tensor: Spyre")
-    dist.gather(input_device, gather_list=output_list, dst=dst_rank)
+    if async_op:
+        # Launch gather asynchronously — returns a Work handle immediately
+        print(f"[{comm_rank} of {comm_size}] Gather Tensor (async): Spyre")
+        work = dist.gather(
+            input_device, gather_list=output_list, dst=dst_rank, async_op=True
+        )
+
+        # Note: Opportunity for overlapping of host activities with asynchronous communication.
+
+        # Block until the async collective has completed
+        work.wait()
+    else:
+        # Gather with the collective library
+        print(f"[{comm_rank} of {comm_size}] Gather Tensor: Spyre")
+        dist.gather(input_device, gather_list=output_list, dst=dst_rank)
 
     # Check the result at root
     if comm_rank == dst_rank:
@@ -55,14 +81,9 @@ def run_test(comm_rank, comm_size):
         all_correct = True
         for rank_idx in range(comm_size):
             result = output_list[rank_idx].to("cpu")
-            # Expected values for each rank: contiguous range starting at rank_idx * num_elements
-            rank_start = rank_idx * num_elements
-            rank_end = rank_start + num_elements
-            expected_tensor = torch.arange(rank_start, rank_end, dtype=torch.float16)
-
             print(f"  From rank {rank_idx}: {result[:10]} .. {result[-10:]}")
 
-            if torch.allclose(result, expected_tensor):
+            if torch.allclose(result, expected[rank_idx]):
                 print(f"  Rank {rank_idx} tensor is correct")
             else:
                 print(f"  Rank {rank_idx} tensor is incorrect!")
@@ -75,10 +96,21 @@ def run_test(comm_rank, comm_size):
                 f"[{comm_rank} of {comm_size}] Some gathered tensors are incorrect"
             )
     else:
-        print(f"[{comm_rank} of {comm_size}] Non-root rank completed gather")
+        mode = " (async)" if async_op else ""
+        print(f"[{comm_rank} of {comm_size}] Non-root rank completed gather{mode}")
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Distributed gather example")
+    parser.add_argument(
+        "--async",
+        dest="async_op",
+        action="store_true",
+        default=False,
+        help="Launch gather asynchronously (async_op=True)",
+    )
+    args = parser.parse_args()
+
     # Check that the c10d backend was loaded properly
     if dist.distributed_c10d.is_backend_available(C10D_BACKEND) is False:
         raise RuntimeError(f"Error: Missing the C10 Backend {C10D_BACKEND}")
@@ -95,8 +127,6 @@ if __name__ == "__main__":
     comm_size = dist.get_world_size()
     comm_rank = dist.get_rank()
 
-    run_test(comm_rank, comm_size)
+    run_test(comm_rank, comm_size, async_op=args.async_op)
 
     dist.destroy_process_group()
-
-# Made with Bob

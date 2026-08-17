@@ -32,7 +32,10 @@ import heapq
 import math
 
 from torch_spyre._inductor.scratchpad.contact_profile import Profile
-from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
+from torch_spyre._inductor.scratchpad.plan_solver import (
+    LifetimeBoundBuffer,
+    assert_in_place_parent_is_read,
+)
 
 
 def buffer_quality(buf: LifetimeBoundBuffer) -> float:
@@ -239,6 +242,15 @@ class PermutationBasedLayoutSolverBase(ABC):
             for pname in buf.in_place_parents:
                 parent = self._name_to_idx.get(pname)
                 if parent is not None:
+                    # A write-only computed parent has nothing to hand over, so
+                    # the pair is not expressible rather than merely unprofitable.
+                    # Checked here because this is the one place that resolves
+                    # declared pairs. The other two in-place invariants asserted
+                    # by ``_assert_in_place_relationships`` are placement-time
+                    # gates here rather than preconditions -- an oversized child
+                    # is simply not placed in-place, see ``_can_inplace`` -- so
+                    # asserting them would reject plans this solver handles.
+                    assert_in_place_parent_is_read(self.buffers[parent], buf.name)
                     partners[child].add(parent)
                     partners[parent].add(child)
         return partners
