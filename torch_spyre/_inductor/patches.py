@@ -17,6 +17,7 @@ from functools import wraps
 
 import torch
 from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
@@ -144,6 +145,14 @@ def enable_spyre_context(example_inputs: list[InputType]):
 
     def _spyre_scheduler_node_has_side_effects(self: SchedulerNode) -> bool:
         if getattr(self.node, "_coarse_tile_force_live", False):
+            return True
+        # ComputedBuffers with MutationLayoutSHOULDREMOVE write into a
+        # pre-existing buffer (e.g. copy_f dst). The scheduler's own DCE
+        # doesn't know about this layout convention and marks them dead when
+        # no downstream op reads the output name. Keep them live.
+        if isinstance(self.node, ComputedBuffer) and isinstance(
+            self.node.layout, MutationLayoutSHOULDREMOVE
+        ):
             return True
         return old_scheduler_node_has_side_effects(self)
 
