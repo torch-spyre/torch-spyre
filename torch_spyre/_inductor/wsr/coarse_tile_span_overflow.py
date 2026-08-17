@@ -153,6 +153,7 @@ def _dims_to_hints(
     op: ComputedBuffer,
     dims: tuple[tuple[int, int, bool], ...],
     hint_ids: list[int],
+    dim_name: str = "_span_overflow",
 ) -> list[DimHint]:
     """Create per-op DimHints from (host_dim, split_count, is_reduction) triples.
 
@@ -162,6 +163,9 @@ def _dims_to_hints(
     its own output coordinates here, so a conforming op still gets a loop_var
     that is correct for its own indexing, not copied from the op it conforms
     to.
+
+    ``dim_name`` labels the produced hints' provenance; the coarse-tiling
+    scratchpad pass reuses this lowering under its own marker.
     """
     out_coords = op_out_coords(op)
     hints: list[DimHint] = []
@@ -196,7 +200,7 @@ def _dims_to_hints(
         )
         hints.append(
             DimHint(
-                dim_names=["_span_overflow"],
+                dim_names=[dim_name],
                 split_count=split_count,
                 loop_var=loop_var,
                 is_reduction=is_reduction,

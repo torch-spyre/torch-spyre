@@ -739,24 +739,33 @@ def _loop_var_to_ranges_pos(out_coords: list, sym: sympy.Symbol) -> int | None:
     return None
 
 
-def _loop_var_to_reduction_ranges_pos(
-    op: ComputedBuffer, sym: sympy.Symbol
-) -> int | None:
-    """Return position of loop variable sym in op.data.reduction_ranges, or None.
+def reduction_loop_vars(op: ComputedBuffer) -> list[sympy.Symbol]:
+    """The ordered reduction loop variables of a Reduction op.
 
-    Uses dep-tracking symbols (d0, d1, ...) rather than SymT.R0_INDEX symbols
+    One entry per ``op.data.reduction_ranges`` position, in that order. Uses
+    dep-tracking symbols (d0, d1, ...) rather than SymT.R0_INDEX symbols
     (r0_0, r0_1, ...) which are a different namespace.  Finds reduction symbols
     by set-subtracting output index symbols from input index symbols, in
     dep.ranges order (which matches reduction_ranges order).
+
+    This list is the frame a reduction ``TileAxis.host_dim`` indexes, so the
+    hint lowering (``tile_spec_to_dim_hints``) and the hint lookup here
+    (:func:`_loop_var_to_reduction_ranges_pos`) share one derivation.
     """
     assert isinstance(op.data, Reduction)
     rw = op.get_read_writes()
     out_dep = next(iter(rw.writes))
     out_syms = out_dep.index.free_symbols
     in_dep = next(d for d in rw.reads if hasattr(d, "index"))
-    reduction_syms = [s for s in in_dep.ranges if s not in out_syms]
+    return [s for s in in_dep.ranges if s not in out_syms]
+
+
+def _loop_var_to_reduction_ranges_pos(
+    op: ComputedBuffer, sym: sympy.Symbol
+) -> int | None:
+    """Return position of loop variable sym in op.data.reduction_ranges, or None."""
     try:
-        return reduction_syms.index(sym)
+        return reduction_loop_vars(op).index(sym)
     except ValueError:
         return None
 
