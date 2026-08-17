@@ -1272,6 +1272,11 @@ def lower_spyre_copy_(src, dst):
 
 @register_spyre_lowering(torch.ops.spyre.copy_f)
 def lower_spyre_copy_f(src, dst):
+    # Custom lowering for copy_f to ensure it creates
+    # a mutation layout in all cases.  mutate_to()
+    # has multiple code paths and does not always
+    # mutate
+
     src = lowering.to_dtype(src, dst.get_dtype())
     src = lowering.expand(src, dst.get_size())
 
@@ -1284,17 +1289,9 @@ def lower_spyre_copy_f(src, dst):
 
     dst.realize()
 
-    try:
-        from torch._inductor.ir import MutationLayoutSHOULDREMOVE
-    except ImportError:
-        raise RuntimeError(
-            "spyre::copy_f lowering: MutationLayoutSHOULDREMOVE is not available. "
-            "Upstream likely removed/renamed it."
-        )
-
     buffer = ir.ComputedBuffer(
         name=None,
-        layout=MutationLayoutSHOULDREMOVE(dst),
+        layout=ir.MutationLayoutSHOULDREMOVE(dst),
         data=pw.data.data,
     )
     buffer.name = V.graph.register_buffer(buffer)
