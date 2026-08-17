@@ -313,6 +313,29 @@ def copy_f_cpu(src: torch.Tensor, dst: torch.Tensor) -> None:
     dst.copy_(src)
 
 
+# Purely functional at trace time (mutates_args=()) so aot_autograd's
+# assert_functional_graph never sees a mutation. The real write into acc is
+# introduced later by lower_spyre_opaque_copy_ at Inductor lowering time,
+# which builds a MutationLayoutSHOULDREMOVE(acc) buffer identical to the one
+# copy_f's lowering builds. Callers must reassign: acc = opaque_copy_(value,
+# acc). Use this instead of copy_f where AOTAutograd functionalization would
+# otherwise reject the mutation (e.g. inside a decomposition traced by
+# torch.compile).
+@torch.library.custom_op("spyre::opaque_copy_", mutates_args=(), device_types="spyre")
+def opaque_copy_(value: torch.Tensor, acc: torch.Tensor) -> torch.Tensor:
+    return value.clone()
+
+
+@opaque_copy_.register_fake
+def _(value: torch.Tensor, acc: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(value)
+
+
+@torch.library.register_kernel("spyre::opaque_copy_", ["cpu"])
+def opaque_copy__cpu(value: torch.Tensor, acc: torch.Tensor) -> torch.Tensor:
+    return value.clone()
+
+
 # Copy input into output starting at offsets along dimensions dims and
 # return the updated output.
 @torch.library.custom_op(

@@ -1300,6 +1300,38 @@ def lower_spyre_copy_f(src, dst):
     return dst
 
 
+@register_spyre_lowering(torch.ops.spyre.opaque_copy_)
+def lower_spyre_opaque_copy_(value, acc):
+    # opaque_copy_ is functional at the FX/AOTAutograd level (see customops.py)
+    # so that assert_functional_graph never sees a mutation. The real
+    # mutating write into acc is introduced here, at lowering time, by
+    # building the same MutationLayoutSHOULDREMOVE(acc) buffer that
+    # lower_spyre_copy_f builds for copy_f. Everything downstream that keys
+    # off MutationLayoutSHOULDREMOVE (e.g. wsr/coarse_tile.py) treats this
+    # identically to a copy_f write.
+    value = lowering.to_dtype(value, acc.get_dtype())
+    value = lowering.expand(value, acc.get_size())
+
+    pw = Pointwise.create(
+        device=acc.get_device(),
+        dtype=acc.get_dtype(),
+        inner_fn=value.make_loader(),
+        ranges=list(acc.get_size()),
+    )
+
+    acc.realize()
+
+    buffer = ir.ComputedBuffer(
+        name=None,
+        layout=ir.MutationLayoutSHOULDREMOVE(acc),
+        data=pw.data.data,
+    )
+    buffer.name = V.graph.register_buffer(buffer)
+    V.graph.register_operation(buffer)
+
+    return acc
+
+
 @register_spyre_lowering(torch.ops.spyre.overwrite)
 def lower_overwrite(input, output, dims, offsets):
     depr_msg = """torch.ops.spyre.overwrite is deprecated. Use standard PyTorch operations like \
