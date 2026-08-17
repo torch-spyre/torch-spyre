@@ -1006,11 +1006,11 @@ def test_add_min_3d_512x256x256_reduce_dim0_A4_B2_C4():
                     with spyre_hint(expected_named_dims=["A", "B", "C"]):
                         return a + temp
 
-    with pytest.raises(
-        Exception,
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
         match="partial reduction result consumed before accumulation is complete",
-    ):
-        run_coarse_tile_test(fn, inputs)
+    )
 
 
 def test_add_min_3d_512x256x256_reduce_dim1_A4_B2_C4():
@@ -1039,11 +1039,11 @@ def test_add_min_3d_512x256x256_reduce_dim1_A4_B2_C4():
                     with spyre_hint(expected_named_dims=["A", "B", "C"]):
                         return a + temp
 
-    with pytest.raises(
-        Exception,
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
         match="partial reduction result consumed before accumulation is complete",
-    ):
-        run_coarse_tile_test(fn, inputs)
+    )
 
 
 def test_add_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
@@ -1072,11 +1072,11 @@ def test_add_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
                     with spyre_hint(expected_named_dims=["A", "B", "C"]):
                         return a + temp
 
-    with pytest.raises(
-        Exception,
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
         match="partial reduction result consumed before accumulation is complete",
-    ):
-        run_coarse_tile_test(fn, inputs)
+    )
 
 
 # dense+dense: both inputs reduce over dim=0 → [B] dense outputs, then add
@@ -1734,9 +1734,6 @@ def test_copy_into_preallocated_512x256_A4_B4():
 # --- in-place accumulation: copy_f(acc + x, acc) ---
 
 
-@pytest.mark.skip(
-    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
-)
 def test_copy_inplace_accum_512x256_A4():
     """copy_f(acc + x, acc) on [512,256] tiled A÷4 — acc read and written inside loop."""
     inputs = [
@@ -1753,9 +1750,6 @@ def test_copy_inplace_accum_512x256_A4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
-)
 def test_copy_inplace_accum_512x256_B4():
     """copy_f(acc + x, acc) on [512,256] tiled B÷4."""
     inputs = [
@@ -1772,9 +1766,6 @@ def test_copy_inplace_accum_512x256_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
-)
 def test_copy_inplace_accum_512x256_A4_B4():
     """copy_f(acc + x, acc) on [512,256] tiled A÷4 B÷4."""
     inputs = [
@@ -1796,9 +1787,6 @@ def test_copy_inplace_accum_512x256_A4_B4():
 # flash attention accumulator pattern
 
 
-@pytest.mark.skip(
-    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
-)
 def test_copy_rmw_correction_512x256_A4():
     """copy_f(acc * scale + y, acc) on [512,256] tiled A÷4."""
     inputs = [
@@ -1816,9 +1804,6 @@ def test_copy_rmw_correction_512x256_A4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
-)
 def test_copy_rmw_correction_512x256_B4():
     """copy_f(acc * scale + y, acc) on [512,256] tiled B÷4."""
     inputs = [
@@ -1836,9 +1821,6 @@ def test_copy_rmw_correction_512x256_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
-)
 def test_copy_rmw_correction_512x256_A4_B4():
     """copy_f(acc * scale + y, acc) on [512,256] tiled A÷4 B÷4."""
     inputs = [
@@ -1914,15 +1896,13 @@ def test_copy_after_reduction_512x256_A4():
     )
 
 
-@pytest.mark.skip(
-    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
-)
 def test_copy_after_reduction_512x256_B4():
     """copy_f(x.amin(dim=0, out)) on [512,256] tiled B÷4."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
-        out = torch.zeros(256, device=x.device, dtype=x.dtype)
+        with spyre_hint(named_dims=["B"]):
+            out = torch.zeros(256, device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
                 temp = x.amin(dim=0)
@@ -1956,7 +1936,7 @@ def test_copy_after_reduction_512x256_A4_B4():
 
 
 @pytest.mark.skip(
-    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
+    reason="copy_f into locally-created buffer with nested 2D tiling (H÷4 Lq÷4) produces wrong results"
 )
 def test_copy_running_max_4d_H4_Lq4():
     """copy_f(maximum(real_max, amax(scores,dim=-2, running_max))) on [B,H,Lk,Lq] tiled H÷4 Lq÷4.
@@ -2010,9 +1990,6 @@ def test_copy_restickify_512x256_A4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
-)
 def test_copy_restickify_512x256_B4():
     """copy_f(a.t(, c)+b) on [256,512] result tiled B÷4."""
     inputs = [
@@ -2021,7 +1998,8 @@ def test_copy_restickify_512x256_B4():
     ]
 
     def fn(a, b):
-        c = torch.zeros(b.shape, device=b.device, dtype=b.dtype)
+        with spyre_hint(named_dims=["A", "B"]):
+            c = torch.zeros(b.shape, device=b.device, dtype=b.dtype)
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 copy_f(a.t() + b, c)
@@ -2030,9 +2008,6 @@ def test_copy_restickify_512x256_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
-)
 def test_copy_restickify_512x256_A4_B4():
     """copy_f(a.t(, c)+b) on [256,512] result tiled A÷4 B÷4."""
     inputs = [
@@ -2041,7 +2016,8 @@ def test_copy_restickify_512x256_A4_B4():
     ]
 
     def fn(a, b):
-        c = torch.zeros(b.shape, device=b.device, dtype=b.dtype)
+        with spyre_hint(named_dims=["A", "B"]):
+            c = torch.zeros(b.shape, device=b.device, dtype=b.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
@@ -2055,9 +2031,6 @@ def test_copy_restickify_512x256_A4_B4():
 # flash attention accumulator pattern: correction * running value + new contribution
 
 
-@pytest.mark.skip(
-    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
-)
 def test_copy_accum_with_reduction_512x256_A4():
     """copy_f(acc * scale + x.amin(dim=1,keepdim=True, acc)) tiled A÷4."""
     inputs = [
@@ -2133,9 +2106,6 @@ def test_copy_accum_with_reduction_512x256_A4_B4():
 # --- two copies in same hint scope: copy_f(a+b, c1); copy_f(a*b, c2) ---
 
 
-@pytest.mark.skip(
-    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
-)
 def test_copy_two_copies_same_scope_512x256_A4():
     """Two copy_ ops in same hint scope tiled A÷4."""
     inputs = [
@@ -2144,8 +2114,9 @@ def test_copy_two_copies_same_scope_512x256_A4():
     ]
 
     def fn(a, b):
-        c1 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
-        c2 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
+        with spyre_hint(named_dims=["A", "B"]):
+            c1 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
+            c2 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 copy_f(a + b, c1)
@@ -2156,9 +2127,6 @@ def test_copy_two_copies_same_scope_512x256_A4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
-)
 def test_copy_two_copies_same_scope_512x256_B4():
     """Two copy_ ops in same hint scope tiled B÷4."""
     inputs = [
@@ -2167,8 +2135,9 @@ def test_copy_two_copies_same_scope_512x256_B4():
     ]
 
     def fn(a, b):
-        c1 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
-        c2 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
+        with spyre_hint(named_dims=["A", "B"]):
+            c1 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
+            c2 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             with spyre_hint(expected_named_dims=["A", "B"]):
                 copy_f(a + b, c1)
@@ -2179,9 +2148,6 @@ def test_copy_two_copies_same_scope_512x256_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
-)
 def test_copy_two_copies_same_scope_512x256_A4_B4():
     """Two copy_ ops in same hint scope tiled A÷4 B÷4."""
     inputs = [
@@ -2190,8 +2156,9 @@ def test_copy_two_copies_same_scope_512x256_A4_B4():
     ]
 
     def fn(a, b):
-        c1 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
-        c2 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
+        with spyre_hint(named_dims=["A", "B"]):
+            c1 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
+            c2 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 with spyre_hint(expected_named_dims=["A", "B"]):
@@ -2268,9 +2235,6 @@ def test_outside_consumer_pointwise_512x256_A4_B4():
 # output initialized outside, written tile-by-tile via copy_, divided outside.
 
 
-@pytest.mark.skip(
-    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
-)
 def test_outside_consumer_copy_then_read_512x256_A4():
     """out=zeros; tiled copy_f(x+y, out); return out/norm — tiled A÷4."""
     inputs = [
@@ -2280,7 +2244,8 @@ def test_outside_consumer_copy_then_read_512x256_A4():
     ]
 
     def fn(x, y, norm):
-        out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
+        with spyre_hint(named_dims=["A", "B"]):
+            out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             copy_f(x + y, out)
         return out / (torch.abs(norm) + 1.0)
@@ -2288,9 +2253,6 @@ def test_outside_consumer_copy_then_read_512x256_A4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
-)
 def test_outside_consumer_copy_then_read_512x256_B4():
     """out=zeros; tiled copy_f(x+y, out); return out/norm — tiled B÷4."""
     inputs = [
@@ -2300,7 +2262,8 @@ def test_outside_consumer_copy_then_read_512x256_B4():
     ]
 
     def fn(x, y, norm):
-        out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
+        with spyre_hint(named_dims=["A", "B"]):
+            out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             copy_f(x + y, out)
         return out / (torch.abs(norm) + 1.0)
@@ -2308,9 +2271,6 @@ def test_outside_consumer_copy_then_read_512x256_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
-)
 def test_outside_consumer_copy_then_read_512x256_A4_B4():
     """out=zeros; tiled copy_f(x+y, out); return out/norm — tiled A÷4 B÷4."""
     inputs = [
@@ -2320,7 +2280,8 @@ def test_outside_consumer_copy_then_read_512x256_A4_B4():
     ]
 
     def fn(x, y, norm):
-        out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
+        with spyre_hint(named_dims=["A", "B"]):
+            out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
         with spyre_hint(num_tiles_per_dim={"A": 4}):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 copy_f(x + y, out)
@@ -2334,25 +2295,28 @@ def test_outside_consumer_copy_then_read_512x256_A4_B4():
 # This is the minimal flash attention accumulator pattern.
 
 
-@pytest.mark.skip(
-    reason="infeasible restickify for 1D denom in mixed 1D/2D tiled scope"
-)
 def test_outside_consumer_two_accum_512x256_A4():
     """Flash-style: out=zeros, denom=zeros; tiled copy_; return out/denom — A÷4."""
     inputs = [
-        tensor("x", shape=(512, 256), dims=["A", "B"]),
-        tensor("scale", shape=(512, 256), dims=["A", "B"]),
+        tensor("x", shape=(512, 512), dims=["A", "B"]),
+        tensor("scale", shape=(512, 512), dims=["A", "B"]),
     ]
 
     def fn(x, scale):
-        out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
-        denom = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
-        # with spyre_hint(num_tiles_per_dim={"A": 4}):
-        copy_f(out * scale + x, out)
-        copy_f(denom + x.sum(dim=1), denom)
+        with spyre_hint(named_dims=["A", "B"]):
+            out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
+        with spyre_hint(named_dims=["A"]):
+            denom = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            copy_f(out * scale + x, out)
+            copy_f(denom + x.amin(dim=0), denom)
         return out / denom.unsqueeze(1)
 
-    run_coarse_tile_test(fn, inputs)
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="partial reduction result consumed before accumulation is complete",
+    )
 
 
 def test_outside_consumer_two_accum_512x256_B4():
@@ -3283,7 +3247,7 @@ def _flash_v3_fn(
 
 
 @pytest.mark.skip(
-    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
+    reason="flash v3 with copy_f into locally-created buffers produces wrong results under H tiling"
 )
 def test_flash_v3_tile_H():
     """Flash v3: tile H÷4 only."""
@@ -4501,7 +4465,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         )
 
     @pytest.mark.skip(
-        reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
+        reason="Expected FixedTiledLayout for output buf — layout not promoted correctly with divide inside scope"
     )
     def test_hint_flash_attention_v2_divide_in_scope(self):
         """test_hint_flash_attention_v2 with the final divide INSIDE the scope.
@@ -5680,7 +5644,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         compare_with_cpu(fn, x, y, run_compile=True, run_eager=False)
 
     @pytest.mark.skip(
-        reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
+        reason="nested 2D tiling of copy_f into locally-created buffer produces wrong results"
     )
     def test_hint_nested_tiling_copy_mutation_correct(self):
         """Nested Lq/D tiling into a direct copy_f() mutation (Case 3 rewire)."""
@@ -5705,7 +5669,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
 
     @pytest.mark.skip(
-        reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
+        reason="nested 2D tiling of copy_f into locally-created buffer produces wrong results"
     )
     def test_hint_nested_tiling_copy_mutation_divergent_input_layout(self):
         """Case 3 nested coarse-tiling where `a`'s device layout genuinely
@@ -5762,7 +5726,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         compare_with_cpu(fn, a, b, target=spyre_result, run_eager=False)
 
     @pytest.mark.skip(
-        reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
+        reason="nested 2D tiling of copy_f into locally-created buffer produces wrong results"
     )
     def test_hint_nested_tiling_copy_mutation_flat(self):
         """Same Case 3 rewire as test_hint_nested_tiling_copy_mutation_correct,
@@ -6722,9 +6686,6 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
 # ===========================================================================
 
 
-@pytest.mark.skip(
-    reason="coarse tiling does not yet handle MutationLayoutSHOULDREMOVE into graph-input buffers"
-)
 def test_tiled_in_place_accumulator():
     """Regression test for the SpyreEmptyFallback / ct_fill STL bug.
 

@@ -103,6 +103,11 @@ class PropagationPlan:
         (or is a graph output) and needs a full-sized buffer + copy op.
         ``"reduction"``: the op is a Reduction tiled over a reduction dim;
         see ``reduction`` for the accumulator/fill/combine shape decisions.
+        ``"mutation_write_back"``: the op already carries
+        ``MutationLayoutSHOULDREMOVE`` targeting a graph-output buffer; it
+        IS the cross-tile write-back, so no separate copy op is inserted —
+        only ``output_tiled_dims`` is set so the hardware advances its write
+        pointer per tile.
     full_ranges:
         Full (pre-division) iteration ranges for the copy-out's full buffer.
         Only set when ``kind == "copy_out"``.
@@ -121,7 +126,7 @@ class PropagationPlan:
         True if this op's buffer name appears in the graph's output names.
     """
 
-    kind: Literal["loop_internal", "copy_out", "reduction"]
+    kind: Literal["loop_internal", "copy_out", "reduction", "mutation_write_back"]
     full_ranges: list[sympy.Expr] | None = None
     full_strides: tuple[sympy.Expr, ...] | None = None
     reduction: ReductionPlan | None = None
