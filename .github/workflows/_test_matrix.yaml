@@ -304,6 +304,8 @@ jobs:
       - uses: ./.github/actions/gather-runner-info
         with:
           verbose: 'true'
+          # Echo the exact runner-label selectors this job's runs-on used.
+          runner_labels: ${{ format('["x86_64","spyre_pf_x0","{0}","{1}"]', inputs.runner_label, inputs.image_label) }}
 
       - name: Build torch-spyre wheel
         id: build
@@ -393,6 +395,8 @@ jobs:
         with:
           verbose: 'true'
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
+          # Echo the exact runner-label selectors this job's runs-on used.
+          runner_labels: ${{ format('["x86_64","{0}","{1}","{2}"]', matrix.suite.runner || 'spyre_pf_x1', inputs.runner_label, inputs.image_label) }}
 
       # Install the wheel built once by build_torch_spyre — no recompile.
       # Skipped on the RPM path (build_torch_spyre skipped) AND on the prebaked
@@ -699,6 +703,8 @@ jobs:
         with:
           verbose: 'true'
           torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
+          # Echo the exact runner-label selectors this job's runs-on used.
+          runner_labels: ${{ format('["x86_64","spyre_pf_x2","{0}","{1}"]', inputs.runner_label, inputs.image_label) }}
 
       # Install the wheel built once by build_torch_spyre — no recompile.
       # Skipped on the RPM path (build skipped) AND on the prebaked path.
