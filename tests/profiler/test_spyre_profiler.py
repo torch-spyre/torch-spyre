@@ -216,9 +216,14 @@ class TestSpyreProfiler(TestCase):
             K = k_cpu.to(device)
             V = v_cpu.to(device)
             output = compiled_fn(Q, K, V, block_size)
+            # Force memset activity in the profiled region.
+            scratch = torch.zeros((L, D), dtype=torch.float16, device=device)
             # Move the result back to CPU during profiling so DtoH memcpy events
             # are also required in the exported trace.
             output.cpu()
+            # Drop a temporary device allocation in the profiled region so a
+            # memory release event can be emitted before export.
+            del scratch
             # Flush device work before the profile closes so async events land in
             # the trace before export.
             torch.spyre.synchronize()
@@ -254,6 +259,35 @@ class TestSpyreProfiler(TestCase):
                 dtoh_invalid,
                 f"{len(dtoh_invalid)} DtoH memcpy event(s) have invalid ts/dur: "
                 + ", ".join(e.get("name", "<unnamed>") for e in dtoh_invalid),
+            )
+
+            memset_events = [
+                e
+                for e in trace_events
+                if e.get("cat") == "gpu_memset" and e.get("name") == "Memset (Device)"
+            ]
+            self.assertTrue(memset_events, "Expected at least one device memset event")
+            memset_invalid = [e for e in memset_events if has_invalid_timing(e)]
+            self.assertFalse(
+                memset_invalid,
+                f"{len(memset_invalid)} memset event(s) have invalid ts/dur: "
+                + ", ".join(e.get("name", "<unnamed>") for e in memset_invalid),
+            )
+
+            memrelease_events = [
+                e
+                for e in trace_events
+                if e.get("cat") == "privateuse1_driver"
+                and e.get("name") == "Memory (Release)"
+            ]
+            self.assertTrue(
+                memrelease_events, "Expected at least one memory release event"
+            )
+            memrelease_invalid = [e for e in memrelease_events if has_invalid_timing(e)]
+            self.assertFalse(
+                memrelease_invalid,
+                f"{len(memrelease_invalid)} memory release event(s) have invalid ts/dur: "
+                + ", ".join(e.get("name", "<unnamed>") for e in memrelease_invalid),
             )
 
             # Require kernel events and validate their timing fields
