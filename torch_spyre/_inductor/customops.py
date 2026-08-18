@@ -835,9 +835,11 @@ def quantscalepertokenfp8(
     2. ``scale = amax * mulConst``
        — multiply by ``mulConst`` (= ``1 / scale_ub``, FP16-encoded).
     3. ``scale = max(scale, clipMin)``
-       — clamp from below; ``clipMin`` = ``QUANTSCALEPERTOKENFP8_CLIP_MIN``.
+       — clamp from below; ``clipMin`` = ``QUANTSCALEPERTOKENFP8_CLIP_MIN``
+       (prevents the scale from collapsing to zero for all-zero or very small tokens).
     4. ``scale = min(scale, clipMax)``
-       — clamp from above; ``clipMax`` = ``QUANTSCALEPERTOKENFP8_CLIP_MAX``.
+       — clamp from above; ``clipMax`` = ``QUANTSCALEPERTOKENFP8_CLIP_MAX``
+       (prevents FP16 overflow for very large tokens).
 
     The FP16 encoding of ``mulConst`` introduces up to one ULP of rounding
     relative to a float32 reference, so device output may differ from a plain

@@ -195,8 +195,7 @@ QUANTSCALEPERTOKENFP8_CLIP_MIN = 4096
 # Required by the DeepTools DDL template (quant_scale_per_token.ddl) for operation compilation.
 # Value: 32255 (0x7DFF) - Raw DDL template constant, not an FP16-encoded value.
 # Note: This is NOT encode_constant(65504.0, SEN169_FP16) which produces 24063 (0x5DFF).
-# This is a magic constant specific to the DDL template's clipping logic.
-# Used in FMIN operation to clip the computed scale value.
+# This is a magic constant specific to the DDL template's upper-bound clipping logic.
 QUANTSCALEPERTOKENFP8_CLIP_MAX = 32255
 
 
