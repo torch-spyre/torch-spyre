@@ -192,6 +192,18 @@ runs:
             local prev_lines=0
             while [[ ! -f "${STALL_FLAG}.done" ]]; do
               sleep "$STALL_CHECK_INTERVAL"
+              # Once pytest has printed its terminal summary line the suite has
+              # finished executing; any silence after that is teardown, not a
+              # hang. Distributed suites are the motivating case: torchrun's
+              # elastic agent can linger silently after every rank passed, and
+              # counting that window as a stall kills a run that already passed
+              # (spurious exit 147). Stop watching as soon as a terminal summary
+              # appears; the parent's `wait "$TEST_PID"` (plus the bounded
+              # torchrun teardown in run_test.sh) collects the real exit code.
+              if grep -qE '^=+ (.*[0-9]+ (passed|failed|error|skipped|xfailed|xpassed|deselected)|no tests ran)' "$LOG_FILE" 2>/dev/null; then
+                echo "[stall-watcher] pytest summary seen — teardown may be quiet, stopping stall watch"
+                return
+              fi
               current_lines=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
               if [[ "$current_lines" -eq "$prev_lines" ]]; then
                 elapsed_stall=$(( elapsed_stall + STALL_CHECK_INTERVAL ))
