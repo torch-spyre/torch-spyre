@@ -37,6 +37,7 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     buf_id,
     core_divisions,
     per_core_extent,
+    reduced_axes,
     row_major_strides,
 )
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
@@ -262,6 +263,45 @@ class TestPerCoreExtent(unittest.TestCase):
         arg = self._arg([16, 512, 64], [d0, d1, sympy.Mod(d1, 64)])
         with self.assertRaises(NotImplementedError):
             per_core_extent(arg, {d1: 7})
+
+
+class TestReducedAxes(unittest.TestCase):
+    """Which input axes a reduction consumes, read from the coordinates."""
+
+    def test_the_placeholder_axis_is_the_reduced_one(self):
+        """``sum(x[256, 2048], dim=0)`` as projected: the reduced axis survives in
+        the output as a unit extent at a constant coordinate."""
+        lanes, rows = sympy.symbols("c0 c1")
+        stick, lane = sympy.floor(lanes / 64), sympy.Mod(lanes, 64)
+        reduced, placeholder = reduced_axes(
+            [stick, rows, lane],
+            [32, 256, 64],
+            [sympy.Integer(0), stick, lane],
+            [1, 32, 64],
+        )
+        self.assertEqual(reduced, (1,))  # the 256 rows
+        self.assertEqual(placeholder, (0,))
+
+    def test_a_dropped_axis_needs_no_placeholder(self):
+        """The same reduction with the output already at rank 2."""
+        lanes, rows = sympy.symbols("c0 c1")
+        stick, lane = sympy.floor(lanes / 64), sympy.Mod(lanes, 64)
+        self.assertEqual(
+            reduced_axes([stick, rows, lane], [32, 256, 64], [stick, lane], [32, 64]),
+            ((1,), ()),
+        )
+
+    def test_nothing_reduced_raises(self):
+        lanes, rows = sympy.symbols("c0 c1")
+        with self.assertRaises(NotImplementedError):
+            reduced_axes([rows, lanes], [256, 64], [rows, lanes], [256, 64])
+
+    def test_a_resized_surviving_axis_raises(self):
+        """A kept axis whose extent changed is not a reduction of the other axes."""
+        lanes, rows = sympy.symbols("c0 c1")
+        stick, lane = sympy.floor(lanes / 64), sympy.Mod(lanes, 64)
+        with self.assertRaises(NotImplementedError):
+            reduced_axes([stick, rows, lane], [32, 256, 64], [stick, lane], [16, 64])
 
 
 if __name__ == "__main__":

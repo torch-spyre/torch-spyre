@@ -1693,6 +1693,10 @@ Path(out_path).write_text(merged)
 print(f"[torch_oot_device_tests_run] Merged {len(shard_paths)} XML shard(s) -> {out_path}", flush=True)
 '
 
+# Command prefix _run_pytest_isolated applies to the pytest/torchrun invocation.
+# Empty for normal runs; the signal-retry path sets it to bound its re-run.
+_OOT_TIMEOUT_PREFIX=()
+
 # ---------------------------------------------------------------------------
 # _run_pytest_isolated <run_dir> <run_basename> <exit_tmp> <output_tmp> \
 #                      [pytest_args...]
@@ -1710,6 +1714,10 @@ _run_pytest_isolated() {
     local _dir="$1" _base="$2" _exit_tmp="$3" _out_tmp="$4"
     shift 4
     local _args=("$@")
+    # Empty unless the caller is the signal-retry path, which bounds its re-run
+    # against a wedged device (see _run_xdist_fallback). Normal runs are unbounded
+    # so a legitimately long suite is never cut short.
+    local _tmo=("${_OOT_TIMEOUT_PREFIX[@]+"${_OOT_TIMEOUT_PREFIX[@]}"}")
     (
         set +euo pipefail
         cd "$_dir"
@@ -1741,14 +1749,28 @@ _run_pytest_isolated() {
             mkdir -p "${_LOGDIR}"
 
             # Run with split_output.sh wrapper
-            _run_cmd torchrun --nproc-per-node "$_NPROC" --no-python bash "${_dir}/split_output.sh" python3 -u -m pytest "$_base" "${_args[@]}"
+            _run_cmd "${_tmo[@]+"${_tmo[@]}"}" torchrun --nproc-per-node "$_NPROC" --no-python bash "${_dir}/split_output.sh" python3 -u -m pytest "$_base" "${_args[@]}"
+
+            # split_output.sh tees only rank 0 to stdout, so on failure the
+            # non-zero ranks' output is the only record of the root cause --
+            # torchrun reports their exit code but not why (e.g. a card that
+            # failed to open). Emit them before the directory is removed.
+            if [[ "$(cat "$_exit_tmp" 2>/dev/null || echo 1)" != "0" ]]; then
+                for _rank_log in "${_LOGDIR}"/output-at-rank-*.txt; do
+                    [[ -f "$_rank_log" ]] || continue
+                    [[ "$_rank_log" == *output-at-rank-0.txt ]] && continue
+                    echo "===== BEGIN $(basename "$_rank_log") ====="
+                    cat "$_rank_log"
+                    echo "===== END $(basename "$_rank_log") ====="
+                done
+            fi
 
             # Clean up log directory
             rm -rf "${_LOGDIR}"
         else
             echo "[torch_oot_device_tests_run] Running serial test"
             # Regular pytest for non-distributed tests
-            _run_cmd python3 -m pytest "$_base" "${_args[@]}"
+            _run_cmd "${_tmo[@]+"${_tmo[@]}"}" python3 -m pytest "$_base" "${_args[@]}"
         fi
     ) || true
 }
@@ -1814,8 +1836,22 @@ _run_xdist_fallback() {
     local _xdist_args=("-n1" "${_extra[@]+"${_extra[@]}"}")
     [[ -n "$_shard_xml" ]] && _xdist_args+=("--junit-xml=${_shard_xml}")
 
+    # This retry re-runs on the SAME device that just killed pytest with a signal.
+    # When the cause is a wedged AIU card (VFIO/RAS stall) rather than a software
+    # crash, the re-run blocks on the device forever: no output, and on CI the
+    # /dev/vfio card stays locked for the whole outer job cap. Bound it so a dead
+    # card costs one shard instead of the pool. Override via OOT_FALLBACK_TIMEOUT
+    # (0 or "" disables); SIGKILL because a VFIO-blocked process ignores SIGTERM.
+    local _fb_timeout="${OOT_FALLBACK_TIMEOUT-15m}"
     local _xdist_out_tmp="/tmp/_spyre_xdist_out_${$}_$$.tmp"
+    if [[ -n "$_fb_timeout" && "$_fb_timeout" != "0" ]] && command -v timeout >/dev/null 2>&1; then
+        echo "[torch_oot_device_tests_run]     Retry bounded to ${_fb_timeout} (wedged-device guard)."
+        _OOT_TIMEOUT_PREFIX=("timeout" "--signal=KILL" "$_fb_timeout")
+    else
+        _OOT_TIMEOUT_PREFIX=()
+    fi
     _run_pytest_isolated "$_dir" "$_base" "$_exit_tmp" "$_xdist_out_tmp" "${_xdist_args[@]}"
+    _OOT_TIMEOUT_PREFIX=()
 
     local _xexit=139
     if [[ -f "$_exit_tmp" ]]; then
@@ -2675,6 +2711,11 @@ for i in "${!RUN_FILES[@]}"; do
     # triggered the fallback path below, which handles XML injection itself).
     if [[ -n "$_SHARD_XML" && -f "$_SHARD_XML" && $_exit -lt 128 ]]; then
         python3 -c "$_XML_INJECT_PY" "$_SHARD_XML" "$YAML_CONFIG" || true
+    elif [[ -n "$_SHARD_XML" && -f "$_SHARD_XML" && $_exit -ge 128 ]]; then
+        # Say so explicitly. Otherwise a signal exit is visible only as a MISSING
+        # "Tags injected" line for one shard, which reads as a hang in the injector
+        # rather than as pytest having been killed.
+        echo "[torch_oot_device_tests_run] XML tag injection SKIPPED for $(basename "$_SHARD_XML") (signal exit $_exit) — retrying below."
     fi
 
     # -----------------------------------------------------------------------
