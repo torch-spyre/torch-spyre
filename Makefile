@@ -117,12 +117,34 @@ else
 endif
 
 # Single-card / multi-card split, via the testtype__distributed marker every distributed_tests/ config now carries.
+#   make tests-single-card TEST_TYPE=integration  # 45 configs, torch_spyre_tests, 1 card
+#   make tests-multi-card  TEST_TYPE=integration  # 9 configs, distributed_tests, 2 cards
+#   make tests-single-card TEST_TYPE=regression   # 103 configs, torch_spyre_tests, 1 card
+#   make tests-multi-card  TEST_TYPE=regression   # 9 configs, distributed_tests, 2 cards
+#   make tests-single-card TEST_TYPE=trunk        # 177 configs, full tree minus distributed_tests, 1 card
+#   make tests-multi-card  TEST_TYPE=trunk        # 9 configs, distributed_tests, 2 cards
 .PHONY: tests-single-card tests-multi-card
-tests-single-card: ## Run TEST_TYPE's non-distributed slice only (excludes testtype__distributed). Needs 1 card.
-	$(MAKE) tests PYTEST_ARGS='$(PYTEST_ARGS) -m "not testtype__distributed"'
+tests-single-card: ## Run TEST_TYPE's non-distributed slice only (distributed_tests excluded from the scan). Needs 1 card.
+ifeq ($(TEST_TYPE),trunk)
+	$(eval _ALL := $(shell python3 $(FILTER_SCRIPT) --config-dir tests/configs --test-type trunk --format paths))
+else
+	$(eval _ALL := $(shell python3 $(FILTER_SCRIPT) --config-dir $(TEST_CONFIGS) --test-type "$(TEST_TYPE)" --format paths))
+endif
+	$(eval _DISTRIBUTED := $(abspath $(wildcard tests/configs/distributed_tests/*.yaml)))
+	$(eval _PATHS := $(filter-out $(_DISTRIBUTED),$(_ALL)))
+	@if [ -z "$(_PATHS)" ]; then \
+		echo "ERROR: no non-distributed configs matched TEST_TYPE=$(TEST_TYPE)" >&2; \
+		exit 1; \
+	fi
+	@TORCH_SPYRE_TEST_TYPE="$(TEST_TYPE)" bash tests/run_test.sh $(_PATHS) $(PYTEST_ARGS)
 
-tests-multi-card: ## Run TEST_TYPE's distributed slice only (testtype__distributed). Needs 2 cards.
-	$(MAKE) tests TEST_CONFIGS=tests/configs/distributed_tests PYTEST_ARGS='$(PYTEST_ARGS) -m "testtype__distributed"'
+tests-multi-card: ## Run TEST_TYPE's distributed slice only (tests/configs/distributed_tests). Needs 2 cards.
+	$(eval _PATHS := $(shell python3 $(FILTER_SCRIPT) --config-dir tests/configs/distributed_tests --test-type "$(TEST_TYPE)" --format paths))
+	@if [ -z "$(_PATHS)" ]; then \
+		echo "ERROR: no configs matched TEST_TYPE=$(TEST_TYPE) under tests/configs/distributed_tests" >&2; \
+		exit 1; \
+	fi
+	@TORCH_SPYRE_TEST_TYPE="$(TEST_TYPE)" bash tests/run_test.sh $(_PATHS) $(PYTEST_ARGS)
 
 
 # ---------------------------------------------------------------------------
