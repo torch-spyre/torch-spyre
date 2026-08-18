@@ -50,6 +50,15 @@ jobs:
       rpm_location: ${{ inputs.rpm_location || '' }}
       rpm_names: ${{ inputs.rpm_names || '' }}
       build_torch_spyre: ${{ inputs.build_torch_spyre == true }}
+    # ClickHouse connection for the perf job's inline ingest. Nightly is
+    # schedule-triggered (never pull_request), so a nightly test_type=perf run
+    # can ingest here. Forwarded explicitly, matching the other callers.
+    secrets:
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
 
   # ---------------------------------------------------------------------------
   # Job 2: run-spyre-unit-tests (fan-in gate)

@@ -13,7 +13,9 @@ from pathlib import Path
 from .runner import run
 
 
-_DESCRIPTION = "Check OOT configs for duplicate and missing test coverage."
+_DESCRIPTION = (
+    "Check OOT configs for missing labels, duplicate and missing test coverage."
+)
 
 _EPILOG = """
 examples

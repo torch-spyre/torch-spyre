@@ -626,6 +626,7 @@ def _merge_file_entries(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "path": path,
                 "unlisted_test_mode": entry.get("unlisted_test_mode", "xfail"),
                 "tests": list(entry.get("tests") or []),
+                "labels": list(entry.get("labels") or []),
             }
         else:
             existing = merged[path]
@@ -639,6 +640,13 @@ def _merge_file_entries(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     f"ignoring '{incoming_mode}'.",
                     file=sys.stderr,
                 )
+
+            # Same path claimed by multiple source configs: union their
+            # labels (order-preserving) so the merged file entry is
+            # discoverable under every tier any contributing config declared.
+            for lbl in entry.get("labels") or []:
+                if lbl not in existing["labels"]:
+                    existing["labels"].append(lbl)
 
             for test_block in entry.get("tests") or []:
                 block_names = frozenset(
@@ -744,9 +752,18 @@ def merge_yaml_configs(
         suites.append(suite)
 
     # ---- Merge `files` entries ----------------------------------------
+    # Thread each source config's own test_suite_config.labels onto its file
+    # entries BEFORE merging. The merged document has no single top-level
+    # labels field that could represent per-file provenance once files from
+    # different configs are combined, so this is how a file's origin labels
+    # (e.g. "integration") survive the merge -- see FileEntry.labels.
     all_file_entries: List[Dict[str, Any]] = []
     for suite in suites:
-        all_file_entries.extend(suite.get("files") or [])
+        suite_labels = suite.get("labels") or []
+        for f in suite.get("files") or []:
+            f = dict(f)
+            f["labels"] = list(suite_labels)
+            all_file_entries.append(f)
 
     merged_files = _merge_file_entries(all_file_entries)
 

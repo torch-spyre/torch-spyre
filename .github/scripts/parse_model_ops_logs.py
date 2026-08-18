@@ -106,6 +106,12 @@ RE_TEST_INLINE = re.compile(
     r"\s+(?P<status>XPASS|XFAIL)"
 )
 
+# [TAGS = tag1 tag2 …] block on the test result line.
+# We only want the last token — the yaml test-case tag, which always starts
+# with "torch." (e.g. torch.lt.2_spyre, torch.sym_sum.3, torch.float.4).
+# Structure: model__x dtype__x op__x platform__x86_64 [modifier] <torch.op.N[_spyre]>
+RE_TAGS = re.compile(r"\[TAGS\s*=[^\]]*\s(?P<tag>torch\.[\w.]+)\s*\]")
+
 # GHA stall-watcher variant — the stall message interrupts the line so the
 # status appears on the NEXT line by itself:
 #   "…::test_name [stall-watcher] No new output for 30s …"
@@ -450,6 +456,7 @@ class _TestLogAnalyzer:
         self._pending_test: str | None = None
         self._pending_op: str | None = None
         self._pending_status: str | None = None  # "XPASS" | "XFAIL"
+        self._pending_tags: str = ""
         self._in_shapes_block: bool = False  # inside [INPUT SHAPES]
 
         # Accumulated shape/stride/dtype/arg data for the pending record
@@ -463,6 +470,7 @@ class _TestLogAnalyzer:
         self._legacy_op: str | None = None
         self._legacy_test: str | None = None
         self._legacy_in_block: bool = False
+        self._legacy_tags: str = ""
 
     # ── public ────────────────────────────────────────────────────────────
 
@@ -492,6 +500,9 @@ class _TestLogAnalyzer:
             self._pending_test = m.group("test")
             self._pending_op = _op_from_test_name(self._pending_test)
             self._pending_status = m.group("status")
+            # Extract the yaml tag from [TAGS = …] on the same line
+            mt = RE_TAGS.search(line)
+            self._pending_tags = mt.group("tag") if mt else ""
             self._in_shapes_block = False
             self._clear_shape_state()
             return
@@ -708,10 +719,12 @@ class _TestLogAnalyzer:
                 op=self._pending_op,
                 test=self._pending_test,
                 status=self._pending_status,
+                tags=self._pending_tags,
             )
         self._pending_test = None
         self._pending_op = None
         self._pending_status = None
+        self._pending_tags = ""
         self._in_shapes_block = False
         self._clear_shape_state()
 
@@ -722,13 +735,15 @@ class _TestLogAnalyzer:
                 op=self._legacy_op,
                 test=self._legacy_test,
                 status=status,
+                tags=self._legacy_tags,
             )
         self._legacy_op = None
         self._legacy_test = None
         self._legacy_in_block = False
+        self._legacy_tags = ""
         self._clear_shape_state()
 
-    def _store(self, op: str, test: str, status: str):
+    def _store(self, op: str, test: str, status: str, tags: str = ""):
         """Write the accumulated record into xpass_variants or xfail_variants."""
         # Apply normalization to operation name
         op = _normalize_op_name(op)
@@ -766,6 +781,7 @@ class _TestLogAnalyzer:
             "arg_values": args,
             "target_shape": target_shape,
             "status": status,
+            "tags": tags,
         }
         if status == "XPASS":
             self.xpass_variants[key] = record

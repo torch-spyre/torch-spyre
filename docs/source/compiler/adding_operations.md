@@ -67,6 +67,42 @@ Canonical examples are `spyre::max_dim_int64_fallback` and
 `spyre::min_dim_int64_fallback`, which fall back to CPU for int64 reductions
 while the fp16/fp32 cases run natively on Spyre via decomposition.
 
+## Extending finalized kernel schemas
+
+Profiler events identify a compiled kernel bundle by fingerprinting its
+finalized `OpSpec`, `TensorArg`, and `LoopSpec` records. Adding an operation
+that uses the existing fields requires no provenance-specific change. Changing
+one of these dataclass schemas, or introducing a new value type inside
+`op_info`, also changes the kernel-provenance contract.
+
+When adding, removing, or changing a finalized-schema field:
+
+1. Update the explicit field set and canonical representation in
+   [kernel_provenance.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/kernel_provenance.py).
+   Every field must be represented, or deliberately excluded with a comment
+   explaining why it cannot affect bundle identity.
+2. Bump `KERNEL_PROVENANCE_KEY_VERSION` if the canonical payload or its
+   meaning changes. Retain parsing support for every released event-name
+   version in `profiler_event.py`; do not reinterpret an existing version.
+3. Add determinism and differentiation tests in
+   [test_kernel_provenance.py](https://github.com/torch-spyre/torch-spyre/blob/main/tests/inductor/test_kernel_provenance.py).
+   Independently reconstructed equivalent specs must produce the same key, and
+   identity-relevant changes must produce different keys.
+4. Verify the generated-wrapper round trip because cached and fresh compiles
+   reconstruct specs before building the descriptor.
+
+The runtime schema check intentionally rejects unhandled dataclass drift.
+Descriptor construction then logs a warning and disables only the profiler
+join for that kernel; compilation continues rather than emitting a key with
+ambiguous meaning.
+
+`op_info` values must have a deterministic canonical representation.
+Currently supported values are `None`, booleans, integers, floats,
+strings, bytes, SymPy expressions, mappings, and non-string sequences composed
+from those types. Do not place process-local identities or volatile runtime
+state in a finalized spec. If a new value type is necessary, extend
+canonicalization and test equivalent independently constructed values.
+
 ## Modifying existing kernels: wrap, never reconstruct
 
 When a compiler pass needs to alter how an existing `ComputedBuffer` computes
