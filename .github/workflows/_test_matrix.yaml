@@ -79,17 +79,68 @@ on:
         default: true
       test_type:
         description: >-
-          Suite subset to run: smoke | core | full | suite_<group> | <label>.
-          Selects configs whose test_suite_config.labels array contains this
-          value, or (for suite_<group>) whose path sits under that directory.
-          Default: full (every config).
+          Suite subset to run: smoke | unit | integration | regression |
+          trunk | suite_<group> | <label>. Selects configs whose
+          test_suite_config.labels array contains this value literally, or
+          (for suite_<group>) whose path sits under that directory -- there
+          is no catch-all value that ignores a config's labels.
+          integration covers the device-layer surfaces flex and
+          deeptools/dxp_standalone exercise most (streams, job launch
+          plans, codegen, LX/scratchpad planning, tensor layout,
+          allocator/GC, D2D copies). Default: regression (every config
+          labeled for full functional coverage) -- callers that want the
+          narrower CI default (e.g. integration-tests.yaml) pass test_type
+          explicitly.
         required: false
         type: string
-        default: full
+        default: regression
+
+      # Spyre-Next integration path: test the PRE-BAKED dev image directly instead
+      # of checking out + rebuilding torch-spyre on the runner. The ephemeral ARC
+      # runner is FROM torch-spyre-dev, which already has the editable-installed
+      # torch_spyre + the full source tree (incl tests/, tests/configs/) + the
+      # shared venv at $PREBAKED_TORCH_SPYRE_DIR. When true: skip the product
+      # checkout, the build_torch_spyre wheel job, and install-prebuilt-torch-spyre;
+      # run the suite against the baked dir. DEFAULT false → the normal PR/nightly
+      # callers (tests.yml / tests-nightly.yml) are byte-for-byte unchanged.
+      prebaked_image:
+        description: Test the pre-baked torch-spyre-dev image (no checkout/build). Integration path only.
+        required: false
+        type: boolean
+        default: false
+
+    secrets:
+      # ClickHouse connection for the perf job's inline benchmark ingest. The
+      # perf report.xml is written on the card runner and is NOT uploaded as an
+      # artifact (benchmark numbers must not become world-readable on a public
+      # repo), so it cannot ride the push-to-clickhouse.yaml artifact-download
+      # path the way the matrix suites do. Instead the perf job pushes it inline.
+      # All optional: a caller that omits them (or a non-perf run) simply skips
+      # the inline push, leaving every existing caller byte-for-byte unchanged.
+      CLICKHOUSE_HOST:
+        required: false
+      CLICKHOUSE_PORT:
+        required: false
+      CLICKHOUSE_USER:
+        required: false
+      CLICKHOUSE_PASS:
+        required: false
+      CLICKHOUSE_DB:
+        required: false
 
 defaults:
   run:
     shell: bash
+
+env:
+  # The baked torch-spyre source dir in the dev image (runner is FROM
+  # torch-spyre-dev). Used by the prebaked_image path in place of a checkout.
+  PREBAKED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
+  # The baked SHARED venv in the dev image. It lives at $HOME/.venv (the dev
+  # image exports it as $VIRTUAL_ENV), NOT nested under PREBAKED_TORCH_SPYRE_DIR
+  # — so run-test-suite's default relative '.venv' cannot resolve after it cd's
+  # into the source dir. The prebaked path passes this absolute path instead.
+  PREBAKED_VENV_PATH: /home/senuser/.venv
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -99,56 +150,141 @@ jobs:
   # tests/configs/torch_spyre_tests/ and emits a JSON matrix containing only
   # the configs that match inputs.test_type.  The test job below consumes this
   # output via fromJSON so that only the requested subset of runners starts.
+  #
+  # test_type=trunk is the exception: it scans the whole tests/configs/ tree
+  # (torch_spyre_tests, model_ops_tests, upstream_tests, upstream_tests_beta),
+  # matching the Makefile's TEST_TYPE=trunk semantics (see Makefile's TEST_TYPE
+  # docs) instead of just torch_spyre_tests. distributed_tests is excluded
+  # from that wider scan even though its configs carry the trunk label too --
+  # it is already covered by the dedicated test_multi_spyre job below (needs
+  # spyre_pf_x2 multi-card runners), so including it here would double-run
+  # those configs through this single-card matrix as well.
   # ---------------------------------------------------------------------------
   generate_matrix:
-    name: Generate test matrix (${{ inputs.test_type || 'full' }})
-    runs-on: ubuntu-latest
+    name: Generate test matrix (${{ inputs.test_type || 'regression' }})
+    # Normal path: ubuntu-latest with a fresh sparse checkout of the configs.
+    # Prebaked path: run ON the runner image so the matrix is computed from the
+    # SAME PR-pinned configs baked into the dev image (not a re-fetch of main),
+    # keeping content-addressed consistency.
+    runs-on: ${{ inputs.prebaked_image && fromJSON(format('["x86_64","spyre_pf_x0","{0}","{1}"]', inputs.runner_label, inputs.image_label)) || 'ubuntu-latest'
+      }}
     outputs:
       matrix: ${{ steps.filter.outputs.matrix }}
+      resolved_test_type: ${{ steps.filter.outputs.resolved_test_type }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # NORMAL: sparse-checkout the configs from github.com at the requested ref.
+      - if: ${{ !inputs.prebaked_image }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
+          # trunk fetches the whole tests/configs/ tree (see the filter step
+          # below); every other tier stays scoped to torch_spyre_tests.
           sparse-checkout: |
-            tests/configs/torch_spyre_tests
+            ${{ (inputs.test_type || 'regression') == 'trunk' && 'tests/configs' || 'tests/configs/torch_spyre_tests' }}
             tests/oot_framework/utils/filter_configs.py
             .github/runner_overrides.yaml
           sparse-checkout-cone-mode: false
 
       - name: Filter configs by TEST_TYPE
         id: filter
+        env:
+          RAW_TEST_TYPE: ${{ inputs.test_type || 'regression' }}
         run: |
-          pip install pyyaml --quiet
-          matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
-            --config-dir tests/configs/torch_spyre_tests \
-            --test-type "${{ inputs.test_type || 'full' }}" \
-            --runner-map .github/runner_overrides.yaml \
-            --format matrix-json)
+          # Prebaked: read the configs baked in the dev image; else the checkout cwd.
+          # cd into the source root so every path below stays repo-relative and
+          # byte-identical to the normal path (the CI-coverage scanner greps
+          # `--config-dir tests/configs/torch_spyre_tests` literally).
+          if [ "${{ inputs.prebaked_image }}" = "true" ]; then
+            cd "${PREBAKED_TORCH_SPYRE_DIR}"
+          else
+            pip install pyyaml --quiet
+          fi
+
+          # perf is NOT an OOT pytest-config suite: it is a benchmark mode of
+          # `make tests` (TEST_TYPE=perf shells out to spyre-perf-suite; see the
+          # Makefile `ifeq ($(TEST_TYPE),perf)` branch). It carries no
+          # test_suite_config.labels, so the config filter below would always
+          # return an empty matrix. Route it to the dedicated `perf` job instead:
+          # emit an empty matrix (the `test` matrix job is then skipped) and pin
+          # resolved_test_type=perf so the downstream perf gate fires.
+          if [ "${RAW_TEST_TYPE}" = "perf" ]; then
+            echo "matrix={\"suite\":[]}" >> "$GITHUB_OUTPUT"
+            echo "resolved_test_type=perf" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # trunk covers everything torch-spyre's push-to-main workflows
+          # exercise across tests/configs/, not just torch_spyre_tests (see
+          # Makefile's TEST_TYPE=trunk docs). Every other tier keeps the
+          # narrower torch_spyre_tests-only scope. --config-dir is kept a
+          # literal path (not a shell variable) in both branches on purpose:
+          # tests/scripts/check_test_coverage.sh greps workflow YAMLs for a
+          # literal `--config-dir <path>` token to detect dynamic coverage,
+          # and can't resolve a variable.
+          if [ "${RAW_TEST_TYPE}" = "trunk" ]; then
+            matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
+              --config-dir tests/configs \
+              --test-type "${RAW_TEST_TYPE}" \
+              --runner-map .github/runner_overrides.yaml \
+              --format matrix-json)
+          else
+            matrix=$(python3 tests/oot_framework/utils/filter_configs.py \
+              --config-dir tests/configs/torch_spyre_tests \
+              --test-type "${RAW_TEST_TYPE}" \
+              --runner-map .github/runner_overrides.yaml \
+              --format matrix-json)
+          fi
+
+          # distributed_tests configs carry the trunk label too but are
+          # exclusively run by the test_multi_spyre job below (multi-card
+          # runners) -- strip them back out so the wider trunk scan above
+          # doesn't also schedule them through this single-card matrix.
+          if [ "${RAW_TEST_TYPE}" = "trunk" ]; then
+            matrix=$(echo "${matrix}" | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          data['suite'] = [s for s in data['suite'] if not s['config'].startswith('distributed_tests/')]
+          print(json.dumps(data))
+          ")
+          fi
+
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
+          # test_type is now the literal label vocabulary (smoke/unit/
+          # integration/regression/trunk) with no alias-resolution layer, so
+          # everything downstream (TORCH_SPYRE_TEST_TYPE env var, the
+          # test_multi_spyre distributed-suite gate) can compare against the
+          # trimmed raw input directly.
+          resolved=$(echo "${RAW_TEST_TYPE}" | xargs)
+          echo "resolved_test_type=$resolved" >> "$GITHUB_OUTPUT"
+
   # ---------------------------------------------------------------------------
-  # Job 1: test matrix  (dynamic — driven by generate_matrix output)
+  # Job 0b: build torch-spyre ONCE
+  #
+  # Compiles the torch_spyre._C extension a single time and uploads it as a
+  # wheel artifact. Every test / test_multi_spyre matrix job below installs that
+  # one wheel instead of recompiling from source (previously each of the ~90
+  # matrix jobs ran its own ~12 min build). Gated exactly like the old per-job
+  # build step, so the RPM path (rpm_names set, build disabled) still skips it.
   # ---------------------------------------------------------------------------
-  test:
-    name: ${{ matrix.suite.name }}
-    needs: generate_matrix
+  build_torch_spyre:
+    name: Build torch-spyre wheel (once)
+    # Prebaked path skips the build entirely — torch_spyre is already editable-
+    # installed in the baked dev image. (Guarded first so the normal condition is
+    # only evaluated off the prebaked path.)
+    if: ${{ !inputs.prebaked_image && (inputs.rpm_names == '' || inputs.build_torch_spyre) }}
+    # Compile-only: needs the backend image + SDK toolchain but NO physical Spyre
+    # card, so it targets the cardless spyre_pf_x0 pool. This leaves the scarce
+    # card runners (spyre_pf_x1/x2) for the test jobs below.
     runs-on:
       - x86_64
-      - ${{ matrix.suite.runner || 'spyre_pf_x1' }}
+      - spyre_pf_x0
       - ${{ inputs.runner_label }}
       - ${{ inputs.image_label }}
-    timeout-minutes: 60
-    env:
-      # GitHub Actions sets CI=true which causes pytest inductor tests to fail.
-      # Explicitly clear it.
-      CI: ''
-      TORCH_SPYRE_TEST_TYPE: ${{ inputs.test_type || 'full' }}
-
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.generate_matrix.outputs.matrix) }}
-
+    timeout-minutes: 40
+    outputs:
+      wheel_name: ${{ steps.build.outputs.wheel_name }}
     steps:
       - name: Checkout composite actions
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -162,6 +298,95 @@ jobs:
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
 
+      # No checkout-pytorch: the C++ build compiles against the installed torch
+      # wheel headers; the pytorch source tree (TORCH_ROOT) is only used by the
+      # upstream *test* configs, which run in the matrix jobs, not here.
+      - uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
+          # Echo the exact runner-label selectors this job's runs-on used.
+          runner_labels: ${{ format('["x86_64","spyre_pf_x0","{0}","{1}"]', inputs.runner_label, inputs.image_label) }}
+
+      - name: Build torch-spyre wheel
+        id: build
+        uses: ./.github/actions/build-torch-spyre-wheel
+        with:
+          image_label: ${{ inputs.image_label }}
+
+      - name: Upload torch-spyre wheel
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: torch-spyre-wheel
+          path: torch-spyre/dist/*.whl
+          if-no-files-found: error
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # Job 1: test matrix  (dynamic — driven by generate_matrix output)
+  # ---------------------------------------------------------------------------
+  test:
+    name: ${{ matrix.suite.name }}
+    needs: [generate_matrix, build_torch_spyre]
+    # Run when the single build succeeded, or was skipped (RPM path). If it
+    # failed, skip every test job (fail-fast) — build_torch_spyre going red then
+    # fails the reusable workflow, blocking merge.
+    #
+    # The leading `!cancelled() &&` is REQUIRED, not cosmetic: without a
+    # status-check function in the `if`, GitHub applies its default
+    # transitive-skip and skips this job whenever a `needs` job was skipped.
+    # That would make the `== 'skipped'` branch dead code and silently skip
+    # every test on the RPM path. (The OR group must stay parenthesised because
+    # `&&` binds tighter than `||`.)
+    if: >-
+      !cancelled() &&
+      (needs.build_torch_spyre.result == 'success' ||
+       needs.build_torch_spyre.result == 'skipped')
+    runs-on:
+      - x86_64
+      - ${{ matrix.suite.runner || 'spyre_pf_x1' }}
+      - ${{ inputs.runner_label }}
+      - ${{ inputs.image_label }}
+    timeout-minutes: 60
+    env:
+      # GitHub Actions sets CI=true which causes pytest inductor tests to fail.
+      # Explicitly clear it.
+      CI: ''
+      TORCH_SPYRE_TEST_TYPE: ${{ needs.generate_matrix.outputs.resolved_test_type }}
+
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.generate_matrix.outputs.matrix) }}
+
+    steps:
+      # Composite actions: NORMAL path sparse-checks-out .github/actions into the
+      # workspace. PREBAKED path symlinks the baked .github into the workspace
+      # instead — `uses: ./.github/actions/*` resolves against $GITHUB_WORKSPACE
+      # (never the shell cwd or an arbitrary baked dir), so without this the
+      # baked-but-unlinked actions can't be found ("did you forget to run
+      # actions/checkout"). The symlink runs the EXACT baked harness — no fetch,
+      # preserving the prebaked provenance guarantee — and lives in the runner's
+      # disposable workspace, so the baked tree is only referenced, never mutated.
+      - name: Checkout composite actions
+        if: ${{ !inputs.prebaked_image }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - name: Expose baked composite actions in the workspace
+        if: ${{ inputs.prebaked_image }}
+        run: ln -sfn "${PREBAKED_TORCH_SPYRE_DIR}/.github" "${GITHUB_WORKSPACE}/.github"
+
+      # Product source: NORMAL path checks out the PR ref. PREBAKED path uses the
+      # baked /home/senuser/torch-spyre (source + editable venv already in image)
+      # → no checkout, no runtime mkdir under $HOME (this was the collision).
+      - if: ${{ !inputs.prebaked_image }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: torch-spyre
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
+
       - name: Check out pre-built PyTorch
         if: ${{ inputs.checkout_pytorch }}
         uses: ./.github/actions/checkout-pytorch
@@ -169,10 +394,16 @@ jobs:
       - uses: ./.github/actions/gather-runner-info
         with:
           verbose: 'true'
+          torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
+          # Echo the exact runner-label selectors this job's runs-on used.
+          runner_labels: ${{ format('["x86_64","{0}","{1}","{2}"]', matrix.suite.runner || 'spyre_pf_x1', inputs.runner_label, inputs.image_label) }}
 
-      - name: Build torch-spyre
-        if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
-        uses: ./.github/actions/build-torch-spyre
+      # Install the wheel built once by build_torch_spyre — no recompile.
+      # Skipped on the RPM path (build_torch_spyre skipped) AND on the prebaked
+      # path (torch_spyre already editable-installed in the baked image).
+      - name: Install prebuilt torch-spyre
+        if: ${{ !inputs.prebaked_image && needs.build_torch_spyre.result == 'success' }}
+        uses: ./.github/actions/install-prebuilt-torch-spyre
 
       - name: Derive report paths
         run: |
@@ -186,16 +417,36 @@ jobs:
         uses: ./.github/actions/run-test-suite
         with:
           suite_name: ${{ matrix.suite.name }}
-          config: tests/configs/torch_spyre_tests/${{ matrix.suite.config }}
+          # generate_matrix's `filter.outputs.matrix` emits `config` relative to
+          # the --config-dir it scanned: trunk scans the full tests/configs/
+          # tree (see the sparse-checkout step above), so matrix.suite.config
+          # already carries its subdir (e.g. "model_ops_tests/foo.yaml");
+          # every other tier scans tests/configs/torch_spyre_tests/ only, so
+          # matrix.suite.config is bare (e.g. "foo.yaml") and needs that prefix
+          # re-added here. Hard-coding the torch_spyre_tests/ prefix regardless
+          # of tier double-prefixes trunk configs into nonexistent paths
+          # ("No YAML config file(s) found").
+          config: ${{ needs.generate_matrix.outputs.resolved_test_type == 'trunk' && format('tests/configs/{0}', matrix.suite.config) || format('tests/configs/torch_spyre_tests/{0}',
+            matrix.suite.config) }}
+          # Prebaked: run FROM the baked source dir + its SHARED venv at
+          # $HOME/.venv (a sibling of the source, not inside it); normal: the
+          # checkout (default 'torch-spyre') + its local '.venv'.
+          torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
+          venv_path: ${{ inputs.prebaked_image && env.PREBAKED_VENV_PATH || '.venv' }}
           extra_test_flags: ${{ inputs.extra_test_flags }}
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
           pre_run: |
-            # Clear the cached AIU setup guard and stale topo.json so
-            # ibm-aiu-setup.sh re-discovers all cards on the x4 runner.
+            # Reset the AIU setup guard and stale topo so ibm-aiu-setup.sh
+            # re-discovers cards. set +u because the script references unset
+            # vars; || exit 1 because run-test-suite runs with set +e and a
+            # failed refresh must not let tests run with stale topology.
+            # Inlined into an eval single-quoted string: no apostrophes, no
+            # double-dash tokens.
+            set +u
             unset _IBM_AIU_SETUP
             rm -rf /tmp/etc/ibm/spyre/topo.json
-            source /etc/profile.d/ibm-aiu-setup.sh
+            source /etc/profile.d/ibm-aiu-setup.sh || exit 1
 
       - name: Upload JUnit XML report
         if: always()
@@ -207,21 +458,189 @@ jobs:
           retention-days: 10
 
   # ---------------------------------------------------------------------------
+  # Job 1b: perf benchmark  (test_type=perf only, never per-PR)
+  #
+  # perf is a benchmark MODE of `make tests`, not an OOT pytest-config suite, so
+  # it never appears in the config-driven `test` matrix above (generate_matrix
+  # emits an empty matrix for perf). `make tests TEST_TYPE=perf` shells out to
+  # the spyre-perf-suite console script baked into the dev image and writes
+  # report.xml into RESULTS_DIR. This job runs that single benchmark step on a
+  # card runner. The reports are not uploaded as artifacts; the results are
+  # consumed only by the ClickHouse ingest path.
+  #
+  # POLICY: perf is a weekly-only suite -- it must NEVER run on a per-PR trigger
+  # (it is expensive and holds a scarce card runner). The `github.event_name !=
+  # pull_request` guard below is the hard stop: even if a pull_request path
+  # forwarded test_type=perf, this job stays skipped. The weekly/scheduled and
+  # orchestrator paths reach here via workflow_dispatch/schedule, not
+  # pull_request, so they are unaffected.
+  # ---------------------------------------------------------------------------
+  perf:
+    name: Perf benchmark
+    needs: [generate_matrix, build_torch_spyre]
+    if: >-
+      !cancelled() &&
+      github.event_name != 'pull_request' &&
+      needs.generate_matrix.outputs.resolved_test_type == 'perf' &&
+      (needs.build_torch_spyre.result == 'success' ||
+       needs.build_torch_spyre.result == 'skipped')
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - ${{ inputs.runner_label }}
+      - ${{ inputs.image_label }}
+    timeout-minutes: 120
+    env:
+      # Flat results dir, matching the Makefile default and PR #3452. The suite
+      # writes both report.txt and report.xml here.
+      RESULTS_DIR: ${{ github.workspace }}/perf-results
+      # Mapped to env so the inline-ingest step can gate on it: secrets cannot be
+      # used in a step `if:`. Empty (caller passed no ClickHouse secrets) => the
+      # ingest step is skipped and the perf run still succeeds.
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+    steps:
+      # ALWAYS sparse-checkout .github from the workflow ref, in BOTH prebaked
+      # and normal mode. `uses: ./.github/actions/*` resolves the action
+      # DEFINITION against $GITHUB_WORKSPACE/.github before any step of that
+      # action runs, so a composite action added on this branch must be present
+      # in the workspace even when the benchmark runs from a prebaked image. The
+      # matrix jobs symlink the baked .github instead, which is fine there because
+      # they only use actions old enough to be in every image; the perf job is the
+      # one that references a NEWER action (ingest-xml-to-clickhouse), so a symlink
+      # to an older baked .github fails to resolve it ("Can't find action.yml ...
+      # Did you forget to run actions/checkout"). A fresh sparse-checkout of just
+      # .github is tiny, is owned by the disposable runner workspace (a separate
+      # dir from PREBAKED_TORCH_SPYRE_DIR, so the baked tree is never mutated), and
+      # always carries the current actions + the .github/scripts the ingest action
+      # reads. The benchmark itself still runs from the baked source dir
+      # (PREBAKED_TORCH_SPYRE_DIR) below, so prebaked provenance for the RUN is
+      # unchanged.
+      - name: Checkout composite actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
+          sparse-checkout: .github
+          sparse-checkout-cone-mode: false
+
+      - if: ${{ !inputs.prebaked_image }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: torch-spyre
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ inputs.repository || github.event.pull_request.head.repo.full_name || github.repository }}
+
+      - uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
+          torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
+
+      - name: Install prebuilt torch-spyre
+        if: ${{ !inputs.prebaked_image && needs.build_torch_spyre.result == 'success' }}
+        uses: ./.github/actions/install-prebuilt-torch-spyre
+
+      - name: Run perf benchmark (make tests TEST_TYPE=perf)
+        run: |
+          # Prebaked: run FROM the baked source dir + its SHARED venv at
+          # $HOME/.venv; normal: the checkout ('torch-spyre') + local '.venv'.
+          if [ "${{ inputs.prebaked_image }}" = "true" ]; then
+            SRC_DIR="${PREBAKED_TORCH_SPYRE_DIR}"
+            VENV="${PREBAKED_VENV_PATH}"
+          else
+            SRC_DIR="torch-spyre"
+            VENV="torch-spyre/.venv"
+          fi
+          mkdir -p "${RESULTS_DIR}"
+          # Refresh AIU setup so the benchmark sees the card topology, mirroring
+          # the matrix suites' pre_run. set +u because the script reads unset
+          # vars; a failed refresh must abort before the benchmark runs.
+          set +u
+          unset _IBM_AIU_SETUP
+          rm -rf /tmp/etc/ibm/spyre/topo.json
+          source /etc/profile.d/ibm-aiu-setup.sh || exit 1
+          set -u
+          # shellcheck disable=SC1091
+          source "${VENV}/bin/activate"
+          make -C "${SRC_DIR}" tests TEST_TYPE=perf RESULTS_DIR="${RESULTS_DIR}"
+
+      # The benchmark reports are not uploaded as workflow artifacts; the
+      # results are consumed only by the ClickHouse ingest path.
+      - name: Confirm perf report was produced
+        run: |
+          # Fail if the benchmark did not write its report. Do not echo the
+          # report contents to the build log.
+          test -f "${RESULTS_DIR}/report.xml" \
+            || { echo "::error::perf run did not produce report.xml"; exit 1; }
+          echo "perf report written to \${RESULTS_DIR} (not uploaded)"
+
+      # Push the perf report to ClickHouse INLINE on this card runner. The
+      # report is never uploaded as a workflow artifact (public repo: artifacts
+      # are world-readable and benchmark numbers must stay private), so it
+      # cannot ride the push-to-clickhouse.yaml artifact-download path the
+      # matrix suites use. The composite action is the SAME ingest
+      # implementation that workflow reuses, so there is one code path, not two.
+      # Gated on CLICKHOUSE_HOST: a caller that passes no ClickHouse secrets
+      # skips the push and the perf run still succeeds.
+      - name: Ingest perf report into ClickHouse (inline, no artifact)
+        if: ${{ env.CLICKHOUSE_HOST != '' }}
+        uses: ./.github/actions/ingest-xml-to-clickhouse
+        with:
+          xml-dir: ${{ env.RESULTS_DIR }}
+          workflow: ${{ github.workflow }}
+          branch: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref_name }}
+          sha: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          run-id: ${{ github.run_id }}
+          triggered-at: ''
+          # perf never runs on pull_request (see the job `if:` above), so there
+          # is no PR to associate; leave empty.
+          pr-number: ''
+          trigger-type: perf
+          # perf runs on x86 GitHub-hosted runners, so the rows are x86_64.
+          platform: x86_64
+          torch-spyre-dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
+          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
+          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
+          clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
+          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
+          clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
+
+  # ---------------------------------------------------------------------------
   # Job 2: Multi-Spyre test matrix
   #
   # Only runs for test_type values that include the distributed suite:
-  #   full              — includes everything
+  #   regression         — includes everything (distributed_tests configs
+  #                        carry the regression label)
+  #   trunk              — push-to-main coverage (distributed_tests configs
+  #                        carry the trunk label too)
+  #   integration        — used as the reduced default by integration-tests.yaml;
+  #                        distributed comms (streams/barrier/broadcast/gather/
+  #                        allgather) are exactly the device-layer surface this
+  #                        tier exists to protect, so it always runs alongside it
+  #                        (distributed_tests configs carry the "integration"
+  #                        label too, so this also matches filter_configs.py's
+  #                        own label matching)
   #   suite_distributed — targets the distributed_tests/ directory directly
-  #   (empty)           — same as full
-  # For smoke / core / suite_<other> the distributed job is skipped entirely
+  #   (empty)           — same as regression
+  # For smoke / unit / suite_<other> the distributed job is skipped entirely
   # so no x2 runners are allocated.
   # ---------------------------------------------------------------------------
   test_multi_spyre:
     name: ${{ matrix.suite.name }}
+    needs: [generate_matrix, build_torch_spyre]
+    # Run for distributed-including test_types AND only when the single build
+    # succeeded or was skipped (RPM path). A failed build skips this job too.
+    # The leading `!cancelled() &&` is REQUIRED (see the `test` job above):
+    # without a status-check function the default transitive-skip would skip
+    # this job on the RPM path, where build_torch_spyre is intentionally skipped.
     if: >-
-      inputs.test_type == '' ||
-      inputs.test_type == 'full' ||
-      inputs.test_type == 'suite_distributed'
+      !cancelled() &&
+      (needs.generate_matrix.outputs.resolved_test_type == '' ||
+       needs.generate_matrix.outputs.resolved_test_type == 'regression' ||
+       needs.generate_matrix.outputs.resolved_test_type == 'trunk' ||
+       needs.generate_matrix.outputs.resolved_test_type == 'integration' ||
+       needs.generate_matrix.outputs.resolved_test_type == 'suite_distributed') &&
+      (needs.build_torch_spyre.result == 'success' ||
+       needs.build_torch_spyre.result == 'skipped')
     runs-on:
       - x86_64
       - spyre_pf_x2
@@ -245,15 +664,32 @@ jobs:
             config: distributed_tests/test_gather.yaml
           - name: Test Multi-Spyre Allgather
             config: distributed_tests/test_allgather.yaml
+          - name: Test Multi-Spyre Allreduce
+            config: distributed_tests/test_allreduce.yaml
+          - name: Test Multi-Spyre Reduce
+            config: distributed_tests/test_reduce.yaml
+          - name: Test Multi-Spyre Broadcast Compiled
+            config: distributed_tests/test_broadcast_compiled.yaml
+          - name: Test Multi-Spyre Allreduce Compiled
+            config: distributed_tests/test_allreduce_compiled.yaml
 
     steps:
+      # See the `test` job above: prebaked path symlinks the baked .github into
+      # $GITHUB_WORKSPACE so `uses: ./.github/actions/*` resolves to the baked
+      # harness (no fetch); normal path sparse-checks-out .github/actions.
       - name: Checkout composite actions
+        if: ${{ !inputs.prebaked_image }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           sparse-checkout: .github/actions
           sparse-checkout-cone-mode: false
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Expose baked composite actions in the workspace
+        if: ${{ inputs.prebaked_image }}
+        run: ln -sfn "${PREBAKED_TORCH_SPYRE_DIR}/.github" "${GITHUB_WORKSPACE}/.github"
+
+      - if: ${{ !inputs.prebaked_image }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           path: torch-spyre
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
@@ -266,10 +702,15 @@ jobs:
       - uses: ./.github/actions/gather-runner-info
         with:
           verbose: 'true'
+          torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
+          # Echo the exact runner-label selectors this job's runs-on used.
+          runner_labels: ${{ format('["x86_64","spyre_pf_x2","{0}","{1}"]', inputs.runner_label, inputs.image_label) }}
 
-      - name: Build torch-spyre
-        if: ${{ inputs.rpm_names == '' || inputs.build_torch_spyre }}
-        uses: ./.github/actions/build-torch-spyre
+      # Install the wheel built once by build_torch_spyre — no recompile.
+      # Skipped on the RPM path (build skipped) AND on the prebaked path.
+      - name: Install prebuilt torch-spyre
+        if: ${{ !inputs.prebaked_image && needs.build_torch_spyre.result == 'success' }}
+        uses: ./.github/actions/install-prebuilt-torch-spyre
 
       - name: Derive report paths
         run: |
@@ -283,18 +724,24 @@ jobs:
         with:
           suite_name: ${{ matrix.suite.name }}
           config: tests/configs/${{ matrix.suite.config }}
+          torch_spyre_dir: ${{ inputs.prebaked_image && env.PREBAKED_TORCH_SPYRE_DIR || 'torch-spyre' }}
+          venv_path: ${{ inputs.prebaked_image && env.PREBAKED_VENV_PATH || '.venv' }}
           extra_test_flags: ${{ inputs.extra_test_flags_multi_spyre }}
           parallel: 'false'
           junit_xml_path: ${{ env.REPORT_PATH }}
           report_name: ${{ env.REPORT_NAME }}
           pre_run: |
-            # Multi-Spyre tests require a fresh topology probe: clear the
-            # cached AIU setup guard and the stale topo.json so
-            # ibm-aiu-setup.sh re-discovers all attached cards.
-
+            # Multi-Spyre tests require a fresh topology probe: reset the AIU
+            # setup guard and stale topo so ibm-aiu-setup.sh re-discovers all
+            # attached cards. set +u because the script references unset vars;
+            # || exit 1 because run-test-suite runs with set +e and a failed
+            # refresh must not let tests run with stale topology.
+            # Inlined into an eval single-quoted string: no apostrophes, no
+            # double-dash tokens.
+            set +u
             unset _IBM_AIU_SETUP
             rm -rf /tmp/etc/ibm/spyre/topo.json
-            source /etc/profile.d/ibm-aiu-setup.sh
+            source /etc/profile.d/ibm-aiu-setup.sh || exit 1
 
       - name: Upload JUnit XML report
         if: always()

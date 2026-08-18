@@ -5,9 +5,51 @@ This module contains helper functions for creating module input generators
 and other test utilities that are used by OOTTestBase.
 """
 
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import torch
+
+
+def _make_named_module_info_cls(module_info_cls: type) -> type:
+    """Build a ``ModuleInfo`` subclass whose ``name`` comes from the YAML entry.
+
+    Upstream derives ``name`` -- and therefore the generated test name, see
+    ``common_modules.py`` ``test_name = module_info.formatted_name`` -- from
+    ``module_cls.__name__``. That makes two entries for the same class collide:
+    the second registration raises ``AssertionError: Redefinition of test ...``
+    from ``common_device_type.py``.
+
+    A YAML may legitimately register the same class more than once, each entry
+    carrying its own captured shapes. Today that is one entry per decoder layer;
+    the same need arises for any other axis a generator splits on (e.g. one entry
+    per execution phase). This wrapper is deliberately agnostic about WHY there
+    are several: it only makes the YAML's ``name`` authoritative, so a generator
+    can encode any distinction in the name with no further framework change.
+
+    Built lazily by a factory because ``ModuleInfo`` is imported inside the
+    caller (torch's test internals are optional at import time), so the subclass
+    cannot be declared at module scope without making that import mandatory.
+
+    ``name`` is a read-only property upstream, so it is overridden rather than
+    assigned. Seed derivation is deliberately NOT touched: the seed comes from
+    ``input_config.seed`` plus an invocation-index offset and never from the name,
+    so renaming an entry must not change the tensors it builds.
+    """
+
+    class _OOTNamedModuleInfo(module_info_cls):  # type: ignore[valid-type,misc]
+        def __init__(self, *args, oot_name: Optional[str] = None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._oot_name = oot_name
+
+        @property
+        def name(self) -> str:
+            return self._oot_name if self._oot_name else super().name
+
+        @property
+        def formatted_name(self) -> str:
+            return self.name.replace(".", "_")
+
+    return _OOTNamedModuleInfo
 
 
 def create_module_inputs_func_from_yaml(item: Any) -> Callable:
@@ -57,9 +99,10 @@ def create_module_inputs_func_from_yaml(item: Any) -> Callable:
                             seed=seed,
                             op_name=item.name,
                             test_device=test_device,
+                            dtype=dtype,
                         )
                         constructor_kwargs = constructor_spec.resolved_kwargs(
-                            test_device=test_device
+                            test_device=test_device, dtype=dtype
                         )
                     else:
                         constructor_args = []
@@ -70,13 +113,17 @@ def create_module_inputs_func_from_yaml(item: Any) -> Callable:
 
                     # Build forward inputs for this invocation
                     if hasattr(forward_spec, "build_cpu_args"):
+                        fwd_seed = None if seed is None else seed + 10000 + i * 1000
                         forward_args = forward_spec.build_cpu_args(
-                            seed=(None if seed is None else seed + 10000 + i * 1000),
+                            seed=fwd_seed,
                             op_name=item.name,
                             test_device=test_device,
+                            dtype=dtype,
                         )
                         forward_kwargs = forward_spec.resolved_kwargs(
-                            test_device=test_device
+                            test_device=test_device,
+                            seed=fwd_seed,
+                            dtype=dtype,
                         )
                     else:
                         forward_args = []
@@ -98,6 +145,7 @@ def create_module_inputs_func_from_yaml(item: Any) -> Callable:
                         test_device=test_device,
                         FunctionInput=FunctionInput,
                         ModuleInput=ModuleInput,
+                        dtype=dtype,
                     )
                 ]
 
@@ -153,9 +201,10 @@ def create_module_inputs_func_from_config(config: Any) -> Callable:
                 seed=seed,
                 op_name=module_info.name,
                 test_device=test_device,
+                dtype=dtype,
             )
             constructor_kwargs = constructor_spec.resolved_kwargs(
-                test_device=test_device
+                test_device=test_device, dtype=dtype
             )
         else:
             constructor_args = []
@@ -172,12 +221,16 @@ def create_module_inputs_func_from_config(config: Any) -> Callable:
             if isinstance(forward_spec, list):
                 for i, spec in enumerate(forward_spec):
                     if spec.has_inputs():
+                        fwd_seed = None if seed is None else seed + 10000 + i * 1000
                         forward_args = spec.build_cpu_args(
-                            seed=(None if seed is None else seed + 10000 + i * 1000),
+                            seed=fwd_seed,
                             op_name=module_info.name,
                             test_device=test_device,
+                            dtype=dtype,
                         )
-                        forward_kwargs = spec.resolved_kwargs(test_device=test_device)
+                        forward_kwargs = spec.resolved_kwargs(
+                            test_device=test_device, seed=fwd_seed, dtype=dtype
+                        )
                     else:
                         forward_args = []
                         forward_kwargs = {}
@@ -192,13 +245,15 @@ def create_module_inputs_func_from_config(config: Any) -> Callable:
             # Handle single forward_inputs (backward compatibility)
             else:
                 if forward_spec.has_inputs():
+                    fwd_seed = None if seed is None else seed + 10000
                     forward_args = forward_spec.build_cpu_args(
-                        seed=(None if seed is None else seed + 10000),
+                        seed=fwd_seed,
                         op_name=module_info.name,
                         test_device=test_device,
+                        dtype=dtype,
                     )
                     forward_kwargs = forward_spec.resolved_kwargs(
-                        test_device=test_device
+                        test_device=test_device, seed=fwd_seed, dtype=dtype
                     )
                 else:
                     forward_args = []

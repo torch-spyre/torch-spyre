@@ -14,15 +14,19 @@
 
 """Tests for PrepareKernel Python bindings and JobPlan verification."""
 
+import base64
+import copy
+import hashlib
+import json
 import os
 import tempfile
-import json
+
 import pytest
 import torch
 import torch_spyre
 
 
-@pytest.fixture(scope="module", autouse=True)
+@pytest.fixture(scope="module")
 def initialize_runtime():
     """Initialize Spyre runtime before running tests."""
     # Initialize torch with spyre device to start runtime
@@ -31,6 +35,61 @@ def initialize_runtime():
     # Runtime cleanup happens automatically
 
 
+@pytest.fixture
+def registry_key(request):
+    """Derive a reproducible canonical key from the current test node."""
+    digest = hashlib.sha256(request.node.nodeid.encode("utf-8")).digest()[:10]
+    return base64.b32encode(digest).decode("ascii").lower()
+
+
+def _registry_event_name(key):
+    return f"spyre_kernel_v1_registry_test_{key}"
+
+
+def test_kernel_provenance_registry_insert_and_duplicate(registry_key):
+    event_name = _registry_event_name(registry_key)
+    before = torch_spyre._C.kernel_provenance_registry_stats()
+
+    assert torch_spyre._C.register_kernel_provenance(event_name, ["11", "12"])
+    after_insert = torch_spyre._C.kernel_provenance_registry_stats()
+    assert after_insert["entries"] == before["entries"] + 1
+
+    assert torch_spyre._C.register_kernel_provenance(event_name, ["11", "12"])
+    after_duplicate = torch_spyre._C.kernel_provenance_registry_stats()
+    assert after_duplicate["entries"] == after_insert["entries"]
+    assert after_duplicate["conflicts"] == after_insert["conflicts"]
+    before_lookup = torch_spyre._C.kernel_provenance_registry_stats()
+    assert torch_spyre._C.lookup_kernel_provenance(registry_key) == ["11", "12"]
+    after_lookup = torch_spyre._C.kernel_provenance_registry_stats()
+    assert after_lookup["hits"] == before_lookup["hits"] + 1
+
+
+def test_kernel_provenance_registry_rejects_conflict_without_overwrite(registry_key):
+    event_name = _registry_event_name(registry_key)
+    assert torch_spyre._C.register_kernel_provenance(event_name, ["21"])
+    before = torch_spyre._C.kernel_provenance_registry_stats()
+
+    assert not torch_spyre._C.register_kernel_provenance(event_name, ["22"])
+
+    after = torch_spyre._C.kernel_provenance_registry_stats()
+    assert after["entries"] == before["entries"]
+    assert after["conflicts"] == before["conflicts"] + 1
+    assert torch_spyre._C.lookup_kernel_provenance(registry_key) == ["21"]
+
+
+def test_kernel_provenance_registry_miss_and_unparseable_name(registry_key):
+    before = torch_spyre._C.kernel_provenance_registry_stats()
+    assert torch_spyre._C.lookup_kernel_provenance(registry_key) is None
+    after_miss = torch_spyre._C.kernel_provenance_registry_stats()
+    assert after_miss["misses"] == before["misses"] + 1
+
+    assert not torch_spyre._C.register_kernel_provenance("not_an_event", ["31"])
+    after_invalid = torch_spyre._C.kernel_provenance_registry_stats()
+    assert after_invalid["entries"] == after_miss["entries"]
+    assert after_invalid["conflicts"] == after_miss["conflicts"]
+
+
+@pytest.mark.usefixtures("initialize_runtime")
 class TestPrepareKernel:
     """Test suite for PrepareKernel and JobPlan bindings."""
 
@@ -39,6 +98,7 @@ class TestPrepareKernel:
         tmpdir,
         exec_command="ComputeOnDevice",
         exec_properties=None,
+        job_exec_plan=None,
     ):
         """Create a mock SpyreCode directory structure for testing.
 
@@ -54,42 +114,45 @@ class TestPrepareKernel:
         os.makedirs(spyrecode_dir, exist_ok=True)
 
         # Auto-generate properties if not provided
-        if exec_properties is None:
-            if exec_command == "ComputeOnDevice":
-                exec_properties = {"job_bin_ptr": "120259084288"}
-            elif exec_command == "ComputeOnHost":
-                exec_properties = {
-                    "ohandle": "output_buffer",
-                    "size": "1024",
-                    "ishape": ["64", "16"],
-                    "ihandle": "",
-                    "hcm": {"vdci": {}, "senConstants": []},
-                }
-
-        # Build JobExecPlan
-        job_exec_plan = [{"command": exec_command, "properties": exec_properties}]
-
-        # If ComputeOnHost, add required H2D and Compute steps
-        if exec_command == "ComputeOnHost":
-            # Add H2D transfer (transfers output_buffer to device)
-            job_exec_plan.append(
-                {
-                    "command": "DataTransfer",
-                    "properties": {
-                        "dirn": "false",
-                        "host_handle": "output_buffer",
-                        "dev_ptr": "120259084288",
+        if job_exec_plan is None:
+            if exec_properties is None:
+                if exec_command == "ComputeOnDevice":
+                    exec_properties = {"job_bin_ptr": "120259084288"}
+                elif exec_command == "ComputeOnHost":
+                    exec_properties = {
+                        "ohandle": "output_buffer",
                         "size": "1024",
-                    },
-                }
-            )
-            # Add Compute step
-            job_exec_plan.append(
-                {
-                    "command": "ComputeOnDevice",
-                    "properties": {"job_bin_ptr": "120259084288"},
-                }
-            )
+                        "ishape": ["64", "16"],
+                        "ihandle": "",
+                        "hcm": {"vdci": {}, "senConstants": []},
+                    }
+
+            # Build JobExecPlan
+            job_exec_plan = [{"command": exec_command, "properties": exec_properties}]
+
+            # If ComputeOnHost, add required H2D and Compute steps
+            if exec_command == "ComputeOnHost":
+                # Add H2D transfer (transfers output_buffer to device)
+                job_exec_plan.append(
+                    {
+                        "command": "DataTransfer",
+                        "properties": {
+                            "dirn": "false",
+                            "host_handle": "output_buffer",
+                            "dev_ptr": "120259084288",
+                            "size": "1024",
+                        },
+                    }
+                )
+                # Add Compute step
+                job_exec_plan.append(
+                    {
+                        "command": "ComputeOnDevice",
+                        "properties": {"job_bin_ptr": "120259084288"},
+                    }
+                )
+        else:
+            job_exec_plan = copy.deepcopy(job_exec_plan)
 
         # Create a minimal spyrecode.json
         spyrecode_json = {
@@ -155,6 +218,130 @@ class TestPrepareKernel:
 
             # First step should be ComputeSpecialize
             assert job_plan.get_step_type(0) == "Compute"
+
+    def test_profiler_name_overrides_spyrecode_name_and_adds_step_suffix(self):
+        """Compiler provenance name identifies every device-compute step."""
+        profiler_name = "spyre_kernel_v1_fused_mm_" + "a" * 16
+        job_exec_plan = [
+            {
+                "command": "ComputeOnDevice",
+                "properties": {
+                    "job_bin_ptr": "120259084288",
+                    "name": "legacy_name",
+                },
+            },
+            {
+                "command": "ComputeOnDevice",
+                "properties": {"job_bin_ptr": "120259084288"},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, job_exec_plan=job_exec_plan
+            )
+
+            job_plan = torch_spyre._C.prepare_kernel(
+                spyrecode_dir,
+                profiler_name=profiler_name,
+            )
+
+            assert job_plan.get_step_name(0) == f"{profiler_name}#0"
+            assert job_plan.get_step_name(1) == f"{profiler_name}#1"
+
+    def test_profiler_name_accepts_exact_aiupti_limit(self):
+        """The finalized name may fill the AIUPTI buffer through byte 127."""
+        suffix = "#0"
+        profiler_name = "p" * (
+            torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES - len(suffix)
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+
+            job_plan = torch_spyre._C.prepare_kernel(
+                spyrecode_dir,
+                profiler_name=profiler_name,
+            )
+
+            assert job_plan.get_step_name(0) == profiler_name + suffix
+
+    def test_profiler_name_rejects_final_name_over_aiupti_limit(self):
+        """The C++ boundary checks the name after adding the step suffix."""
+        suffix = "#0"
+        profiler_name = "p" * (
+            torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES - len(suffix) + 1
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+
+            with pytest.raises(
+                RuntimeError,
+                match="profiler-visible compute name exceeds AIUPTI limit",
+            ):
+                torch_spyre._C.prepare_kernel(
+                    spyrecode_dir,
+                    profiler_name=profiler_name,
+                )
+
+    def test_spyrecode_compute_name_is_preserved_without_profiler_name(self):
+        """Existing named SpyreCode plans retain their current behavior."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir,
+                exec_properties={
+                    "job_bin_ptr": "120259084288",
+                    "name": "legacy_name",
+                },
+            )
+
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            assert job_plan.get_step_name(0) == "legacy_name"
+
+    def test_overlong_spyrecode_compute_name_remains_backend_controlled(self):
+        """A backend label over the provenance limit must not fail preparation."""
+        backend_name = "b" * (torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES + 1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir,
+                exec_properties={
+                    "job_bin_ptr": "120259084288",
+                    "name": backend_name,
+                },
+            )
+
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            assert job_plan.get_step_name(0) == backend_name
+
+    def test_overlong_directory_compute_name_fallback_does_not_fail(self):
+        """Graceful provenance fallback must not make preparation fatal."""
+        prefix = "k" * torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES
+        with tempfile.TemporaryDirectory(prefix=prefix) as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            expected = os.path.join(
+                os.path.basename(tmpdir),
+                "spyreCodeDir",
+                "bundle.mlir#0",
+            )
+            assert len(expected) > torch_spyre._C.AIUPTI_ACTIVITY_NAME_MAX_BYTES
+            assert job_plan.get_step_name(0) == expected
+
+    def test_directory_compute_name_fallback_is_preserved(self):
+        """Older unnamed plans retain the directory-derived fallback."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            expected = os.path.join(
+                os.path.basename(tmpdir),
+                "spyreCodeDir",
+                "bundle.mlir#0",
+            )
+            assert job_plan.get_step_name(0) == expected
 
     def test_prepare_kernel_invalid_directory(self):
         """Test PrepareKernel with invalid directory."""
@@ -375,6 +562,254 @@ class TestPrepareKernel:
                 match="ihandle 'nonexistent_buffer' not found in pinned buffer map",
             ):
                 torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+    def test_invalid_hcm_metadata_raises_runtime_error(self):
+        """Invalid HCM metadata should raise a clean RuntimeError during prepare_kernel."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            properties = {
+                "ohandle": "output_buffer",
+                "size": "1024",
+                "ishape": ["64", "16"],
+                "ihandle": "",
+                "hcm": {"vdci": "invalid", "senConstants": []},
+            }
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost", exec_properties=properties
+            )
+
+            with pytest.raises(
+                RuntimeError,
+                match="Failed to parse SpyreCode command: .*vdci field",
+            ):
+                torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+    def test_stoull_allocate_negative_size(self):
+        """Test that negative size in Allocate command is rejected."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job_exec_plan = [
+                {
+                    "command": "ComputeOnDevice",
+                    "properties": {"job_bin_ptr": "120259084288"},
+                }
+            ]
+
+            spyrecode_dir = os.path.join(tmpdir, "spyreCodeDir")
+            os.makedirs(spyrecode_dir, exist_ok=True)
+
+            spyrecode_json = {
+                "JobPreparationPlan": [
+                    {"command": "Allocate", "properties": {"size": "-1024"}},
+                    {
+                        "command": "InitTransfer",
+                        "properties": {
+                            "init_bin_file": "init_binary.bin",
+                            "dev_ptr": "120259084288",
+                            "size": "1024",
+                        },
+                    },
+                ],
+                "JobExecPlan": job_exec_plan,
+            }
+
+            with open(os.path.join(spyrecode_dir, "spyrecode.json"), "w") as f:
+                json.dump(spyrecode_json, f, indent=2)
+
+            with open(os.path.join(spyrecode_dir, "init_binary.bin"), "wb") as f:
+                f.write(b"\x00" * 1024)
+
+            with pytest.raises(
+                RuntimeError,
+                match="negative value not allowed for unsigned integer",
+            ):
+                torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+    def test_stoull_allocate_negative_size_with_leading_whitespace(self):
+        """Test that negative size with leading whitespace is rejected."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job_exec_plan = [
+                {
+                    "command": "ComputeOnDevice",
+                    "properties": {"job_bin_ptr": "120259084288"},
+                }
+            ]
+
+            spyrecode_dir = os.path.join(tmpdir, "spyreCodeDir")
+            os.makedirs(spyrecode_dir, exist_ok=True)
+
+            spyrecode_json = {
+                "JobPreparationPlan": [
+                    {"command": "Allocate", "properties": {"size": "  -512"}},
+                    {
+                        "command": "InitTransfer",
+                        "properties": {
+                            "init_bin_file": "init_binary.bin",
+                            "dev_ptr": "120259084288",
+                            "size": "1024",
+                        },
+                    },
+                ],
+                "JobExecPlan": job_exec_plan,
+            }
+
+            with open(os.path.join(spyrecode_dir, "spyrecode.json"), "w") as f:
+                json.dump(spyrecode_json, f, indent=2)
+
+            with open(os.path.join(spyrecode_dir, "init_binary.bin"), "wb") as f:
+                f.write(b"\x00" * 1024)
+
+            with pytest.raises(
+                RuntimeError,
+                match="negative value not allowed for unsigned integer",
+            ):
+                torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+    @staticmethod
+    def _prepare_with_symbolic_args(spyrecode_dir, symbolic_args):
+        """Run prepare_kernel with BUNDLE_SYMBOLIC_ARGS set, then restore it."""
+        old_val = os.environ.get("BUNDLE_SYMBOLIC_ARGS")
+        try:
+            os.environ["BUNDLE_SYMBOLIC_ARGS"] = "1" if symbolic_args else "0"
+            return torch_spyre._C.prepare_kernel(spyrecode_dir)
+        finally:
+            if old_val is None:
+                os.environ.pop("BUNDLE_SYMBOLIC_ARGS", None)
+            else:
+                os.environ["BUNDLE_SYMBOLIC_ARGS"] = old_val
+
+    def test_d2h_tensor_segment(self):
+        """D2H from a tensor segment builds a (deferred) D2H step when
+        addresses are bound (BUNDLE_SYMBOLIC_ARGS != "1")."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            properties = {
+                "dirn": "true",
+                "host_handle": "d2h_output",
+                "dev_ptr": "0",
+                "size": "1024",
+            }
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="DataTransfer", exec_properties=properties
+            )
+
+            job_plan = self._prepare_with_symbolic_args(
+                spyrecode_dir, symbolic_args=False
+            )
+
+            assert job_plan.num_steps() == 1
+            assert job_plan.get_step_type(0) == "D2H"
+
+    def test_d2h_tensor_segment_symbolic(self):
+        """D2H from a tensor segment is rejected under symbolic args: the
+        transfer must go through the program segment in that mode."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            properties = {
+                "dirn": "true",
+                "host_handle": "d2h_output",
+                "dev_ptr": "0",
+                "size": "1024",
+            }
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="DataTransfer", exec_properties=properties
+            )
+
+            with pytest.raises(
+                RuntimeError, match="D2H dev_ptr must be in program segment"
+            ):
+                self._prepare_with_symbolic_args(spyrecode_dir, symbolic_args=True)
+
+    def test_pipeline_barrier_dma_steps_default_true(self):
+        """H2D and D2H steps must carry pipeline_barrier=True by default."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # H2D: produced inside the correction sequence at step index 1
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost"
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            assert job_plan.get_step_type(1) == "H2D"
+            assert job_plan.get_step_pipeline_barrier(1) is True, (
+                "H2D step must carry pipeline_barrier=True by default"
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # D2H: standalone DataTransfer with dirn="true"
+            job_exec_plan = [
+                {
+                    "command": "DataTransfer",
+                    "properties": {
+                        "dirn": "true",
+                        "host_handle": "output_buffer",
+                        "dev_ptr": "120259084288",
+                        "size": "1024",
+                    },
+                }
+            ]
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, job_exec_plan=job_exec_plan
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            assert job_plan.get_step_type(0) == "D2H"
+            assert job_plan.get_step_pipeline_barrier(0) is True, (
+                "D2H step must carry pipeline_barrier=True by default"
+            )
+
+    def test_pipeline_barrier_correction_sequence(self):
+        """Correction sequence: HostCompute=False, H2D=True, Compute=True.
+
+        HostCompute opts out (overlap-eligible: runs while prior device compute
+        is in flight). H2D and Compute inherit the safe default True. Compute
+        must wait for H2D to close the RAW hazard on the seg-7 correction region.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(
+                tmpdir, exec_command="ComputeOnHost"
+            )
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            # Correction sequence: HostCompute(0) → H2D(1) → Compute(2)
+            assert job_plan.num_steps() == 3
+            assert job_plan.get_step_type(0) == "HostCompute"
+            assert job_plan.get_step_type(1) == "H2D"
+            assert job_plan.get_step_type(2) == "Compute"
+
+            assert job_plan.get_step_pipeline_barrier(0) is False, (
+                "HostCompute step must carry pipeline_barrier=False to preserve "
+                "host/device overlap (correction callback runs while prior device "
+                "compute is still in flight)"
+            )
+            assert job_plan.get_step_pipeline_barrier(1) is True, (
+                "H2D step must carry pipeline_barrier=True (safe default: "
+                "inherited from base class)"
+            )
+            assert job_plan.get_step_pipeline_barrier(2) is True, (
+                "Compute step must carry pipeline_barrier=True: it is a "
+                "consumer of H2D's seg-7 write (RAW hazard); Compute must "
+                "wait for H2D. Inert under STRICT_ORDERING; load-bearing "
+                "under OP_ORDERING."
+            )
+
+    def test_pipeline_barrier_pure_compute_true(self):
+        """A standalone ComputeOnDevice step must carry pipeline_barrier=True."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            assert job_plan.num_steps() == 1
+            assert job_plan.get_step_type(0) == "Compute"
+            assert job_plan.get_step_pipeline_barrier(0) is True, (
+                "Compute step must carry pipeline_barrier=True: consumer of "
+                "DMA'd inputs (RAW hazard). Inert under STRICT_ORDERING; "
+                "load-bearing under OP_ORDERING."
+            )
+
+    def test_get_step_pipeline_barrier_out_of_range(self):
+        """get_step_pipeline_barrier must raise for an out-of-range index."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spyrecode_dir = self.create_mock_spyrecode(tmpdir)
+            job_plan = torch_spyre._C.prepare_kernel(spyrecode_dir)
+
+            with pytest.raises(RuntimeError, match="Step index out of range"):
+                job_plan.get_step_pipeline_barrier(999)
 
 
 if __name__ == "__main__":

@@ -25,9 +25,16 @@ from torch.testing._internal.common_utils import (
 
 from torch_spyre.model_utils import (
     _dma_to_spyre_dim_order_swapped,
+    _dma_to_spyre_indirect_access,
     load_model_to_spyre,
     patch_module_to_for_spyre,
 )
+
+# fp16 lands on device as DLFLOAT16 (SEN169_FP16, 9 mantissa bits), so a
+# round-trip is never bit-exact: 2**-10 half-ULP, and fp16 subnormals come
+# back halved (abs error <= 3.1e-5).
+DLFLOAT16_RTOL = 2e-3
+DLFLOAT16_ATOL = 1e-4
 
 
 @instantiate_parametrized_tests
@@ -55,6 +62,72 @@ class TestLoadModelToSpyre(TestCase):
         with self.assertRaises(AssertionError):
             _dma_to_spyre_dim_order_swapped(torch.randn(4, dtype=torch.float16))
 
+    # ── embedding gather-optimal (indirect-access) layout ──────────
+
+    def test_embedding_has_indirect_access_layout(self):
+        """A 2D Embedding table gets device dims [rows, D // eps, eps] with the
+        vocab dim outermost. For a (1000, 256) fp16 table, eps=64, so the
+        device layout is [1000, 4, 64]."""
+        from torch_spyre._C import get_spyre_tensor_layout
+
+        w = torch.randn(1000, 256, dtype=torch.float16)
+        dev = _dma_to_spyre_indirect_access(w)
+        layout = get_spyre_tensor_layout(dev)
+        self.assertEqual(list(layout.device_size), [1000, 4, 64])
+        # device_size only checks the block shape; round-trip through the
+        # layout so a wrong stride_map entry (correct shape, scrambled data)
+        # fails loudly instead of passing silently.
+        torch.testing.assert_close(
+            dev.cpu(), w, rtol=DLFLOAT16_RTOL, atol=DLFLOAT16_ATOL
+        )
+
+    def test_embedding_stick_size_is_dtype_aware(self):
+        """elems_per_stick is 32 at fp32, so a (1000, 256) fp32 table splits
+        into 256/32 = 8 sticks, not 4."""
+        from torch_spyre._C import get_spyre_tensor_layout
+
+        w = torch.randn(1000, 256, dtype=torch.float32)
+        dev = _dma_to_spyre_indirect_access(w)
+        layout = get_spyre_tensor_layout(dev)
+        self.assertEqual(list(layout.device_size), [1000, 8, 32])
+        # Round-trip so a wrong stride_map entry fails loudly, not just a
+        # device_size check (the fp32 stick split is 8x32, not 4x64). fp32 maps
+        # to IEEE_FP32, so this round-trip is lossless -- defaults suffice.
+        torch.testing.assert_close(dev.cpu(), w)
+
+    def test_embedding_non_tiling_hidden_dim_warns_and_falls_back(self):
+        """A hidden dim that isn't a multiple of the stick size warns and
+        returns None so the caller uses the default layout."""
+        w = torch.randn(1000, 100, dtype=torch.float16)  # 100 % 64 != 0
+        with self.assertWarns(UserWarning):
+            dev = _dma_to_spyre_indirect_access(w)
+        self.assertIsNone(dev)
+
+    def test_indirect_access_rejects_non_2d(self):
+        """The indirect-access helper only accepts 2D tables."""
+        with self.assertRaises(AssertionError):
+            _dma_to_spyre_indirect_access(torch.randn(4, dtype=torch.float16))
+
+    def test_load_model_routes_embedding_through_indirect_access(self):
+        """An nn.Embedding table lands on Spyre with the indirect-access layout
+        (vocab dim outermost), not the default layout."""
+        from torch_spyre._C import get_spyre_tensor_layout
+
+        model = nn.Embedding(1000, 256, dtype=torch.float16)
+        load_model_to_spyre(model)
+
+        self.assertEqual(model.weight.device.type, "spyre")
+        layout = get_spyre_tensor_layout(model.weight)
+        self.assertEqual(list(layout.device_size), [1000, 4, 64])
+
+    def test_load_model_embedding_non_tiling_falls_back(self):
+        """An embedding whose hidden dim doesn't tile still loads (default
+        layout) and warns."""
+        model = nn.Embedding(1000, 100, dtype=torch.float16)
+        with self.assertWarns(UserWarning):
+            load_model_to_spyre(model)
+        self.assertEqual(model.weight.device.type, "spyre")
+
     # ── routing ────────────────────────────────────────────────────
 
     def test_load_model_routes_linear_weight_through_dim_order(self):
@@ -77,6 +150,42 @@ class TestLoadModelToSpyre(TestCase):
         load_model_to_spyre(model)
         self.assertEqual(model.weight.device.type, "spyre")
         self.assertEqual(model.bias.device.type, "spyre")
+
+    # ── _apply is honored (matches nn.Module.to semantics) ─────────
+
+    def test_submodule_apply_override_keeps_params_on_cpu(self):
+        """A child that overrides _apply governs its own subtree: its params
+        stay on CPU while a sibling Linear still gets the dim_order layout."""
+        from torch_spyre._C import get_spyre_tensor_layout
+
+        class KeepOnCpu(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(8, 4, dtype=torch.float16))
+
+            def _apply(self, fn, recurse=True):
+                return self
+
+        class Root(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lin = nn.Linear(64, 128, dtype=torch.float16)
+                self.keep = KeepOnCpu()
+
+        model = Root()
+        load_model_to_spyre(model)
+
+        self.assertEqual(model.keep.weight.device.type, "cpu")
+        self.assertEqual(model.lin.weight.device.type, "spyre")
+        self.assertEqual(get_spyre_tensor_layout(model.lin.weight).device_size[0], 2)
+
+    def test_instance_apply_override_keeps_params_on_cpu(self):
+        """An instance-level _apply monkeypatch (the runner's Attention pattern)
+        is honored just like a class-level override."""
+        model = nn.Linear(8, 8, dtype=torch.float16)
+        model._apply = lambda fn, recurse=True, _m=model: _m
+        load_model_to_spyre(model)
+        self.assertEqual(model.weight.device.type, "cpu")
 
     # ── dtype contract (PR #2258) ──────────────────────────────────
 

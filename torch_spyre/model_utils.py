@@ -23,6 +23,11 @@ which tells the DMA engine to stickify along host dim-0 (out_features)
 instead of the default last dim (in_features). No CPU transpose or
 intermediate copy is required.
 
+``nn.Embedding`` tables are instead read as a gather (indexed by token id
+along the vocab/leading dim), so they get a gather-optimal "indirect
+access" layout -- vocab dim outermost, hidden dim split into sticks --
+rather than the matmul or default layout.
+
 Critically, the tensor's PyTorch shape stays ``(out, in)`` -- only the
 *device* layout changes. This means:
 
@@ -49,7 +54,10 @@ Usage::
     model.to("spyre")
 """
 
-import logging
+import warnings
+
+from torch_spyre._inductor.logging_utils import get_inductor_logger
+
 
 import torch
 import torch.nn as nn
@@ -63,7 +71,7 @@ from torch_spyre._C import (
 )
 from torch_spyre.constants import DEVICE_NAME
 
-logger = logging.getLogger(__name__)
+logger = get_inductor_logger("model_utils")
 
 
 def _ensure_spyre_runtime() -> None:
@@ -138,7 +146,143 @@ def _dma_to_spyre_dim_order_swapped(
     return dst
 
 
+def _dma_to_spyre_indirect_access(
+    weight: torch.Tensor,
+    target_dtype: torch.dtype | None = None,
+) -> torch.Tensor | None:
+    """Transfer a 2D ``nn.Embedding`` table to Spyre with a gather-optimal layout.
+
+    An embedding table is read as a gather (indexed by token id along the
+    vocab/leading dim), not a matmul, so it wants a different device layout
+    than the row-major matmul weights: the vocab dim outermost and the hidden
+    dim split into stick-sized blocks, i.e. device dims
+    ``[rows, D // eps, eps]`` where ``eps`` is the elements-per-stick for the
+    device dtype. This is the "indirect access" layout the gather source
+    needs (indexed dim outermost); see the tensors-and-layouts docs.
+
+    Uses the 3-arg device-dims ``SpyreTensorLayout`` overload with the *device*
+    dtype (``get_device_dtype``), not the host ``torch.dtype``.
+
+    Requires ``D % eps == 0``; otherwise the sticks can't tile the hidden dim,
+    so we warn and return ``None`` to signal the caller to fall back to the
+    default layout, which still loads and runs, just without the gather
+    optimization.
+
+    Caller must ensure ``weight.ndim == 2``.
+    """
+    assert weight.ndim == 2, "indirect-access path is for 2D embedding tables only"
+
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+    dev_dtype = target_dtype if target_dtype is not None else weight.dtype
+
+    rows, d = weight.shape
+    # elems_per_stick is dtype-aware (64 at fp16/bf16, 32 at fp32), so query it
+    # rather than hardcoding a stick size.
+    eps = SpyreTensorLayout(list(weight.shape), dev_dtype).elems_per_stick()
+    if d % eps != 0:
+        warnings.warn(
+            f"Embedding hidden dim {d} is not a multiple of the Spyre stick "
+            f"size {eps} for dtype {dev_dtype}; falling back to the default "
+            "layout (no gather optimization) for this embedding table.",
+            stacklevel=2,
+        )
+        return None
+
+    layout = SpyreTensorLayout(
+        [rows, d // eps, eps],  # device_size: vocab dim outermost
+        [d, eps, 1],  # stride_map
+        get_device_dtype(dev_dtype),
+    )
+    dst = spyre_empty_with_layout(weight.size(), weight.stride(), dev_dtype, layout)
+    copy_tensor(weight, dst, non_blocking=False)
+    return dst
+
+
 # --- Model loading ---------------------------------------------------
+
+
+def _module_overrides_apply(module: nn.Module) -> bool:
+    """True if ``module`` customizes ``_apply`` and should govern its own subtree."""
+    apply = module._apply
+    return getattr(apply, "__func__", apply) is not nn.Module._apply
+
+
+def _transfer_module(
+    module: nn.Module,
+    dtype: torch.dtype | None,
+    counts: dict[str, int],
+    prefix: str = "",
+) -> None:
+    """Recursively move ``module``'s params/buffers to Spyre, honoring ``_apply``.
+
+    Mirrors ``nn.Module._apply``'s virtual recursion: a submodule that overrides
+    ``_apply`` is delegated to and pruned from the walk. Normal modules get the
+    optimal ``dim_order=[1, 0]`` layout for 2D ``nn.Linear`` weights, the
+    gather-optimal indirect-access layout for 2D ``nn.Embedding`` tables, and
+    the default layout for everything else. Tensors already on Spyre are skipped
+    (idempotent). ``counts`` accumulates transferred-tensor tallies for logging;
+    ``prefix`` is the module's dotted path (as in ``named_modules``) for logs.
+    """
+    if _module_overrides_apply(module):
+        module._apply(
+            lambda t: _dma_to_spyre_default(t, target_dtype=dtype)
+            if t is not None and t.device.type != DEVICE_NAME
+            else t
+        )
+        return
+
+    for child_name, child in module.named_children():
+        child_prefix = f"{prefix}.{child_name}" if prefix else child_name
+        _transfer_module(child, dtype, counts, child_prefix)
+
+    is_linear = isinstance(module, nn.Linear)
+    is_embedding = isinstance(module, nn.Embedding)
+    for name, param in list(module._parameters.items()):
+        if param is None or param.device.type == DEVICE_NAME:
+            continue
+        p = param.data
+        # 2D Linear weight -> optimal stickified matmul layout; 2D Embedding
+        # table -> gather-optimal indirect-access layout; everything else
+        # (bias, norms, ...) -> default layout.
+        dev = None
+        if is_linear and name == "weight" and p.ndim == 2:
+            logger.debug(
+                "  %s.%s: shape=%s -> Spyre dim_order=[1, 0]",
+                prefix,
+                name,
+                list(p.shape),
+            )
+            dev = _dma_to_spyre_dim_order_swapped(p, target_dtype=dtype)
+            counts["linear"] += 1
+        elif is_embedding and name == "weight" and p.ndim == 2:
+            dev = _dma_to_spyre_indirect_access(p, target_dtype=dtype)
+            # dev is None if the hidden dim doesn't tile into sticks; the helper
+            # has already warned, so fall through to the default layout below.
+            if dev is not None:
+                logger.debug(
+                    "  %s.%s: shape=%s -> Spyre indirect-access (gather) layout",
+                    prefix,
+                    name,
+                    list(p.shape),
+                )
+                counts["embedding"] += 1
+        if dev is None:
+            logger.debug(
+                "  %s.%s: shape=%s -> Spyre default layout",
+                prefix,
+                name,
+                list(p.shape),
+            )
+            dev = _dma_to_spyre_default(p, target_dtype=dtype)
+            counts["other"] += 1
+        module._parameters[name] = nn.Parameter(dev, requires_grad=param.requires_grad)
+
+    for name, buf in list(module._buffers.items()):
+        if buf is None or buf.device.type == DEVICE_NAME:
+            continue
+        module._buffers[name] = _dma_to_spyre_default(buf, target_dtype=dtype)
+        counts["buffer"] += 1
 
 
 def load_model_to_spyre(
@@ -152,8 +296,15 @@ def load_model_to_spyre(
     (optimal for Spyre matmul). Tensor shapes are preserved, so the
     model works unmodified with the existing inference path.
 
+    For each ``nn.Embedding``, the table is transferred with a
+    gather-optimal indirect-access layout (vocab dim outermost, hidden
+    dim split into sticks) so the token-id gather runs efficiently. If
+    the hidden dim doesn't tile into sticks, it falls back to the
+    default layout with a warning.
+
     All other parameters and buffers use the default Spyre layout.
 
+    Submodules that override ``_apply`` are honored, matching ``nn.Module.to`` semantics.
     Idempotent: parameters already on Spyre are skipped.
     """
     if dtype is not None:
@@ -161,59 +312,16 @@ def load_model_to_spyre(
     # Ensure Spyre runtime is initialized before using _C functions
     _ensure_spyre_runtime()
 
-    linear_count = 0
-    other_param_count = 0
-    buffer_count = 0
-
-    for name, module in model.named_modules():
-        is_linear = isinstance(module, nn.Linear)
-
-        for param_name, param in list(module._parameters.items()):
-            if param is None:
-                continue
-            if param.device.type == DEVICE_NAME:
-                continue
-
-            p = param.data
-
-            # 2D Linear weight -> optimal stickified layout via dim_order.
-            # Everything else (bias, embeddings, norms, ...) -> default layout.
-            if is_linear and param_name == "weight" and p.ndim == 2:
-                logger.debug(
-                    "  %s.%s: shape=%s -> Spyre dim_order=[1, 0]",
-                    name,
-                    param_name,
-                    list(p.shape),
-                )
-                dev = _dma_to_spyre_dim_order_swapped(p, target_dtype=dtype)
-                linear_count += 1
-            else:
-                logger.debug(
-                    "  %s.%s: shape=%s -> Spyre default layout",
-                    name,
-                    param_name,
-                    list(p.shape),
-                )
-                dev = _dma_to_spyre_default(p, target_dtype=dtype)
-                other_param_count += 1
-
-            module._parameters[param_name] = nn.Parameter(
-                dev, requires_grad=param.requires_grad
-            )
-
-        for buf_name, buf in list(module._buffers.items()):
-            if buf is None or buf.device.type == DEVICE_NAME:
-                continue
-            module._buffers[buf_name] = _dma_to_spyre_default(buf, target_dtype=dtype)
-            buffer_count += 1
-
+    counts = {"linear": 0, "embedding": 0, "other": 0, "buffer": 0}
+    _transfer_module(model, dtype, counts)
     logger.info(
-        "load_model_to_spyre: %d Linear weights optimized "
-        "(dim_order=[1,0]), %d other params and %d buffers "
-        "transferred with default layout",
-        linear_count,
-        other_param_count,
-        buffer_count,
+        "load_model_to_spyre: %d Linear weights optimized (dim_order=[1,0]), "
+        "%d Embedding tables optimized (indirect-access layout), %d other "
+        "params and %d buffers transferred with default layout",
+        counts["linear"],
+        counts["embedding"],
+        counts["other"],
+        counts["buffer"],
     )
     return model
 

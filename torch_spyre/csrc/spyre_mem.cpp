@@ -384,6 +384,12 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   dci.isHostToSen_ = host2device;
   dci.dataformat_src_ = host2device ? cpu_format_host : dev_format_dev;
   dci.dataformat_dst_ = host2device ? dev_format_dev : cpu_format_host;
+  TORCH_CHECK(
+      isDCIConversionSupported(dci.dataformat_src_, dci.dataformat_dst_),
+      "Unsupported DCI data format conversion: src=",
+      static_cast<int>(dci.dataformat_src_),
+      " dst=", static_cast<int>(dci.dataformat_dst_),
+      " (cpu_type=", cpu_str_type, ", dev_type=", dev_str_type, ")");
 
   std::vector<int64_t> cpu_shape;
   std::vector<int64_t> dev_shape = stl.device_size;
@@ -431,7 +437,7 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
   dci.input_shape_ = host2device ? cpu_shape : dev_shape;
   dci.output_shape_ = host2device ? dev_shape : cpu_shape;
-  if (g_debug_info_enabled) {
+  if (torch_spyre::logging::legacy::is_legacy_debug_enabled()) {
     std::stringstream s;
     dci.exportJson(s);
     DEBUGINFO("DataConversionInfo: ", s.str());
@@ -766,6 +772,27 @@ const at::Tensor& spyre_resize_(
   at::_copy_from(cpu_buf, self, /*non_blocking=*/false);
   DEBUGINFO("resize_ expand to shape=", size_int,
             " layout=", self_impl->spyre_layout.toString());
+  return self;
+}
+
+at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
+  TORCH_CHECK(self.is_privateuseone(),
+              "spyre_fill_tensor: tensor must be on spyre device");
+  TORCH_CHECK(self.numel() > 0, "spyre_fill_tensor: cannot fill empty tensor");
+
+  // Get the device allocation (CompositeAddress) from the spyre tensor
+  auto* spyre_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
+  auto& storage = spyre_impl->storage();
+  auto* ctx = static_cast<SharedOwnerCtx*>(storage.data_ptr().get_context());
+
+  // Map torch dtype to DataFormats for the value->pattern conversion, which
+  // fillAsync performs internally.
+  DataFormats dtype = get_device_dtype(self.scalar_type());
+
+  // Launch a device-side MEMORY_FILL DMA via the typed fillAsync overload.
+  SpyreStream stream;
+  stream.fillAsync(&ctx->composite_addr, value, dtype, /*use_dmai=*/true);
+
   return self;
 }
 

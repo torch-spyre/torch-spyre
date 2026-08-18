@@ -72,14 +72,42 @@ def _get_lock():
     return _lock
 
 
+def _normalize_component(component: str) -> str:
+    """Normalize a TORCH_LOGS component name onto the internal namespace.
+
+    torch validates every TORCH_LOGS target with importlib.util.find_spec(),
+    which runs during ``import torch``. Only ``torch_spyre.*`` is a real
+    on-disk package that passes that check; a bare ``spyre.*`` target makes
+    torch raise ``Invalid log settings`` before any Spyre code runs. So the
+    ``torch_spyre.*`` spelling is the one users must type on the command line.
+
+    Internally, however, all Spyre loggers are named ``spyre.*`` (both the
+    Python ``spyre.inductor.*`` loggers and the C++ ``spyre.runtime`` etc.).
+    This maps the ``torch_spyre`` prefix onto ``spyre`` so the configured
+    level lands on the logger that actually emits records:
+
+        "torch_spyre"                 -> "spyre"
+        "torch_spyre.inductor.passes" -> "spyre.inductor.passes"
+
+    The legacy bare ``spyre.*`` spelling is returned unchanged for
+    backward compatibility.
+    """
+    if component == "torch_spyre" or component.startswith("torch_spyre."):
+        return "spyre" + component[len("torch_spyre") :]
+    return component
+
+
 def _parse_torch_logs() -> Dict[str, LogLevel]:
     """Parse TORCH_LOGS environment variable for spyre namespaces.
 
-    Supported formats:
-    - TORCH_LOGS="spyre.inductor:DEBUG"
-    - TORCH_LOGS="+spyre.inductor"  (enables at INFO)
-    - TORCH_LOGS="-spyre.inductor"  (disables)
-    - TORCH_LOGS="spyre:INFO,spyre.inductor:DEBUG"
+    Matches PyTorch's TORCH_LOGS syntax exactly:
+    - TORCH_LOGS="+torch_spyre.inductor"  (enables at DEBUG)
+    - TORCH_LOGS="torch_spyre.inductor"   (enables at INFO, no prefix)
+    - TORCH_LOGS="-torch_spyre.inductor"  (sets to ERROR)
+
+    The ``torch_spyre.*`` spelling is required because PyTorch validates
+    with importlib.util.find_spec(), which only accepts real packages.
+    It is normalized onto the internal ``spyre.*`` namespace.
 
     Returns:
         Dictionary mapping component names to log levels
@@ -96,29 +124,21 @@ def _parse_torch_logs() -> Dict[str, LogLevel]:
             continue
 
         if entry.startswith("+"):
-            component = entry[1:]
+            component = _normalize_component(entry[1:])
+            if component.startswith("spyre"):
+                config[component] = LogLevel.DEBUG
+                _config_source[component] = "TORCH_LOGS"
+        elif entry.startswith("-"):
+            component = _normalize_component(entry[1:])
+            if component.startswith("spyre"):
+                config[component] = LogLevel.ERROR
+                _config_source[component] = "TORCH_LOGS"
+        else:
+            # No prefix = INFO level (matches PyTorch behavior)
+            component = _normalize_component(entry)
             if component.startswith("spyre"):
                 config[component] = LogLevel.INFO
                 _config_source[component] = "TORCH_LOGS"
-        elif entry.startswith("-"):
-            component = entry[1:]
-            if component.startswith("spyre"):
-                config[component] = LogLevel.DISABLED
-                _config_source[component] = "TORCH_LOGS"
-        elif ":" in entry:
-            component, level_str = entry.split(":", 1)
-            component = component.strip()
-            level_str = level_str.strip()
-            if component.startswith("spyre"):
-                try:
-                    level = getattr(LogLevel, level_str.upper())
-                    config[component] = level
-                    _config_source[component] = "TORCH_LOGS"
-                except AttributeError:
-                    warnings.warn(
-                        f"Invalid log level '{level_str}' for {component}",
-                        stacklevel=3,
-                    )
 
     return config
 
@@ -300,6 +320,36 @@ def initialize():
     configure_python_logging()
 
 
+def _sync_cpp_config():
+    """Push current Python config to the C++ LoggingConfig singleton."""
+    from torch_spyre._C import _logging as cpp_logging
+
+    config = cpp_logging.LoggingConfig.instance()
+    config.initialize_from_python(get_config_for_cpp())
+    config.set_log_file(_log_file_path or "")
+
+
+def reset():
+    """Reset logging configuration and re-initialize from environment.
+
+    This clears all state and re-reads environment variables. Intended for
+    testing scenarios where env vars are modified after initial import.
+    """
+    global _config, _config_source, _log_file_path, _log_file_source
+    global _initialized, _python_logging_configured
+
+    with _get_lock():
+        _config = {}
+        _config_source = {}
+        _log_file_path = None
+        _log_file_source = "default"
+        _initialized = False
+        _python_logging_configured = False
+
+    initialize()
+    _sync_cpp_config()
+
+
 def get_log_level(component: str) -> LogLevel:
     """Get effective log level for a component.
 
@@ -349,6 +399,7 @@ def set_log_level(component: str, level: str):
         if component == "spyre":
             root_logger = logging.getLogger("spyre")
             root_logger.setLevel(int(level_enum))
+    _sync_cpp_config()  # Push change to C++ singleton
 
 
 def enable(component: str):
@@ -369,6 +420,52 @@ def disable(component: str):
     set_log_level(component, "DISABLED")
 
 
+def set_log_passes(pass_names: str):
+    """Enable per-pass logging for compiler pipelines.
+
+    Controls which compiler passes emit DEBUG-level output after execution.
+    This is required in addition to setting the logger level to DEBUG for
+    the spyre.inductor.passes component.
+
+    Args:
+        pass_names: One of:
+            - "all" or "1": Log after every pass
+            - Comma-separated list of pass names (e.g., "split_multi_ops,insert_restickify")
+            - "" (empty): Disable per-pass logging
+
+    Example:
+        >>> from torch_spyre import logging_config
+        >>> # Enable DEBUG logging for passes
+        >>> logging_config.set_log_level('spyre.inductor.passes', 'DEBUG')
+        >>> # Enable all passes to emit DEBUG output
+        >>> logging_config.set_log_passes('all')
+
+        >>> # Or enable only specific passes
+        >>> logging_config.set_log_passes('split_multi_ops,insert_restickify')
+
+    Note:
+        This is an inductor-specific configuration that controls the
+        ``_should_log_pass`` check in ``torch_spyre._inductor.passes``.
+        It complements the standard log level configuration.
+    """
+    # Import here to avoid circular dependency at module load time
+    from torch_spyre._inductor import config
+
+    config.log_passes = pass_names
+
+
+def get_log_passes() -> str:
+    """Get the current per-pass logging configuration.
+
+    Returns:
+        Current value of log_passes (e.g., "all", "split_multi_ops", or "")
+    """
+    # Import here to avoid circular dependency at module load time
+    from torch_spyre._inductor import config
+
+    return config.log_passes
+
+
 def get_log_file() -> Optional[str]:
     """Get the configured log file path, if any."""
     if not _initialized:
@@ -377,7 +474,14 @@ def get_log_file() -> Optional[str]:
 
 
 def set_log_file(path: Optional[str]):
-    """Set the log file path programmatically."""
+    """Set the log file path programmatically.
+
+    Thread-safety note: on the C++ side the old stream is destroyed
+    immediately, so this must not be called while C++ threads are
+    actively emitting log records.  In normal usage this is safe
+    because configuration happens at import time or under the GIL
+    before compiled workloads spawn threads.
+    """
     global _log_file_path, _log_file_source, _python_logging_configured
 
     if not _initialized:
@@ -388,6 +492,8 @@ def set_log_file(path: Optional[str]):
         _log_file_source = "programmatic" if path else "default"
         _python_logging_configured = False
         configure_python_logging()
+
+    _sync_cpp_config()
 
 
 def get_effective_config() -> Dict[str, str]:

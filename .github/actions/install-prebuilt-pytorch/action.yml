@@ -1,0 +1,47 @@
+name: Install prebuilt PyTorch
+description: |
+  Download a prebuilt PyTorch wheel (built once by build-pytorch-from-source,
+  e.g. from the exact pytorch/pytorch commit under test) and reinstall it
+  into torch-spyre's venv, overriding whatever install-prebuilt-torch-spyre's
+  `uv sync` resolved from the pinned pytorch-cpu index.
+
+  torch-spyre's compiled _C.so is ABI-bound to this exact PyTorch build, not
+  the pinned wheel -- run this AFTER install-prebuilt-torch-spyre so it wins.
+
+inputs:
+  torch_spyre_dir:
+    description: Path to the checked-out torch-spyre directory (its .venv is reused)
+    required: false
+    default: torch-spyre
+  artifact_name:
+    description: Name of the uploaded PyTorch wheel artifact to download
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Download prebuilt PyTorch wheel
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: ${{ github.workspace }}/prebuilt-pytorch-wheel
+
+    - name: Reinstall prebuilt PyTorch
+      shell: bash
+      env:
+        TORCH_SPYRE_DIR: ${{ inputs.torch_spyre_dir }}
+      run: |
+        source "$HOME/.bashrc"
+        source /etc/profile.d/ibm-aiu-setup.sh
+
+        [[ "$TORCH_SPYRE_DIR" != /* ]] && TORCH_SPYRE_DIR="${PWD}/${TORCH_SPYRE_DIR}"
+        cd "$TORCH_SPYRE_DIR" || exit 1
+        source .venv/bin/activate
+
+        WHEEL="$(ls -1 "$GITHUB_WORKSPACE"/prebuilt-pytorch-wheel/*.whl | head -1)"
+        if [[ -z "$WHEEL" ]]; then
+          echo "::error::No prebuilt PyTorch wheel found under prebuilt-pytorch-wheel/" >&2
+          exit 1
+        fi
+        echo "Installing prebuilt PyTorch wheel: $WHEEL"
+        uv pip install --no-deps --reinstall "$WHEEL"

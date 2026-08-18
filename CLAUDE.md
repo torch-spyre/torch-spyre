@@ -43,9 +43,13 @@ Test sub-suites:
 | `TORCH_SPYRE_DEBUG=1` | Enable C++ debug logging and `-O0` builds |
 | `SENCORES` | Number of Spyre cores (1–32, default 32) |
 | `LX_PLANNING=1` | Enable LX scratchpad memory planning |
+| `HBM_POOL_PLANNING=1` | Enable HBM-pool planning for intermediates not in LX |
+| `LAYOUT_SOLVER` | LX layout solver: `greedy` (default), `firstfit`, `bestfit`, `cpsat`, `simulated_annealing` |
+| `TORCH_SPYRE_NATIVE_PACKER` | Use the C++ layout packer in the `simulated_annealing` solver (default `1`; `0` = pure Python) |
 | `TORCH_LOGS="+inductor"` | Verbose Inductor logging |
 | `TORCH_COMPILE_DEBUG=1` | Dump Inductor debug artifacts |
 | `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 downcast warnings |
+| `SPYRE_DUMP_COST=1` | Predicted-runtime report after pre-scheduling |
 
 ## Spyre Hardware Basics
 

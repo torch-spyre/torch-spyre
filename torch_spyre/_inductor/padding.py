@@ -54,7 +54,7 @@ from torch._inductor.ir import (
 )
 from torch._inductor.virtualized import V
 
-from .constants import BATCH_MATMUL_OP
+from .constants import BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
@@ -151,7 +151,13 @@ def _rebuild_matmul(
     object.__setattr__(reduction, "inner_fn", new_inner_fn)
     # reduction_ranges stays at K; no extension here.
 
-    return replace_computed_buffer_body(op, reduction, operations)
+    return replace_computed_buffer_body(
+        op,
+        reduction,
+        operations,
+        pass_name="insert_bmm_padding",
+        reason="redirect matmul to padded input",
+    )
 
 
 def pad_fp8_weight_input(graph) -> None:
@@ -244,7 +250,7 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         reduction = op.data
         if not isinstance(reduction, Reduction):
             continue
-        if reduction.reduction_type != BATCH_MATMUL_OP:
+        if reduction.reduction_type not in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP]:
             continue
 
         rw = op.get_read_writes()
@@ -371,6 +377,14 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
         op_idx = operations.index(op)
         for i, new_op in enumerate(y_new_ops):
             operations.insert(op_idx + i, new_op)
+
+        # When coarse-tiling runs pre-stickification, the consuming matmul
+        # already carries loop_info.  The padding ops must inherit it so they
+        # remain contiguous in the loop group for build_loop_scheduler_nodes.
+        if hasattr(op, "loop_info"):
+            for new_op in y_new_ops:
+                if isinstance(new_op, ComputedBuffer):
+                    new_op.loop_info = op.loop_info  # type: ignore[attr-defined]
 
         # --- Rebuild matmul inner_fn to load y from the padded buffer ---
         # x is left entirely untouched: the original inner_fn's x loader is

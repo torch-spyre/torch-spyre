@@ -1,0 +1,439 @@
+# Copyright 2026 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import math
+from sympy import Symbol
+from torch._inductor.scheduler import (
+    BaseSchedulerNode,
+    ExternKernelSchedulerNode,
+    FusedSchedulerNode,
+    NopKernelSchedulerNode,
+)
+from torch._inductor.ir import FallbackKernel
+from torch._inductor.virtualized import V
+from .constants import SEGMENT_SIZE, INTERMEDIATES_SEGMENT
+from .ir import FixedTiledLayout, SpyreEmptyFallback
+from .logging_utils import get_inductor_logger
+from .scheduler import CountedLoopSchedulerNode
+from . import config
+
+logger = get_inductor_logger("HBM_POOL_PLANNING")
+_STICK_BYTES = 128
+
+
+class Allocator:
+    """
+    Tracks a set of free blocks within an hbm segment. Buffers
+    whose live ranges do not overlap share the same region. Each block is a
+    (offset, size) pair measured in bytes.
+
+    Ensures peak concurrent memory usage does not exceed the segment size limit.
+    """
+
+    def __init__(self, segment_size: int) -> None:
+        self._free: list[tuple[int, int]] = []  # (offset, size) free blocks
+        self._pool_end: int = 0  # current end of the pool
+        self._segment_size: int = segment_size
+        self._currently_allocated: int = 0  # bytes in-use right now
+        self._peak_usage: int = 0  # peak concurrent usage
+
+    def allocate(self, size: int) -> int:
+        """Return a byte offset from INTERMEDIATES_SEGMENT for a block of
+        `size` bytes. Reuses an existing free block when possible."""
+        for i, (blk_offset, blk_size) in enumerate(self._free):
+            if blk_size >= size:
+                self._free.pop(i)
+                # Return any leftover fragment to the free list.
+                remainder = blk_size - size
+                if remainder > 0:
+                    self._free.append((blk_offset + size, remainder))
+                offset = blk_offset
+                break
+        else:
+            # No suitable free block — extend the pool.
+            offset = self._pool_end
+            self._pool_end += size
+
+        self._currently_allocated += size
+        if self._currently_allocated > self._peak_usage:
+            self._peak_usage = self._currently_allocated
+
+        if self._peak_usage > self._segment_size:
+            raise RuntimeError(
+                f"HBM intermediate pool peak usage ({self._peak_usage} bytes, "
+                f"{self._peak_usage / (1024**3):.2f} GB) exceeds segment size "
+                f"({self._segment_size} bytes, {self._segment_size / (1024**3):.2f} GB)"
+            )
+
+        return offset
+
+    def free(self, offset: int, size: int) -> None:
+        """Return a previously allocated block to the free list."""
+        self._free.append((offset, size))
+        self._currently_allocated -= size
+
+    def get_peak_usage(self) -> int:
+        """Return the peak concurrent memory usage in bytes."""
+        return self._peak_usage
+
+    def get_pool_end(self) -> int:
+        return self._pool_end
+
+
+def _align_up(n: int, alignment: int) -> int:
+    return ((n + alignment - 1) // alignment) * alignment
+
+
+def _compute_size_bytes(name: str) -> int:
+    """Return the stick-aligned device size in bytes for buffer `name`."""
+    buf = V.graph.get_buffer(name)
+    layout = buf.maybe_get_layout()
+    assert isinstance(layout, FixedTiledLayout), (
+        f"hbm_pool_planning: expected FixedTiledLayout for {name}, got {type(layout)}"
+    )
+    dev_layout = layout.device_layout
+    num_sticks = math.prod(dev_layout.device_size[:-1])
+    size_bytes = num_sticks * _STICK_BYTES
+    return _align_up(size_bytes, _STICK_BYTES)
+
+
+def _compute_live_ranges(
+    nodes: list[BaseSchedulerNode],
+    pool_candidates: set[str],
+) -> dict[str, tuple[int, int]]:
+    """Return {buf_name: (start_step, end_step)} for each pool candidate.
+
+    start_step: timestep of the node that writes the buffer.
+    end_step: last timestep at which any node reads the buffer.
+    """
+    start: dict[str, int] = {}
+    end: dict[str, int] = {}
+
+    for idx, node in enumerate(nodes):
+        rw = node.read_writes
+        for dep in rw.writes:
+            if dep.name in pool_candidates:
+                start[dep.name] = idx
+        for dep in rw.reads:
+            if dep.name in pool_candidates:
+                end[dep.name] = idx
+
+    live_ranges: dict[str, tuple[int, int]] = {}
+    for name in pool_candidates:
+        if name in start:
+            live_ranges[name] = (start[name], end.get(name, len(nodes) + 1))
+    return live_ranges
+
+
+def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+    """Pool-allocate buffers so non-overlapping tensors share the HBM intermediates segment.
+
+    This is a *distinct* pass from LX scratchpad planning
+    (`scratchpad/allocator.py`, `scratchpad_planning()`). Both passes decide
+    where an intermediate tensor's data lives, but:
+    - This pass runs in `CustomPostFusionPasses`, **after** Inductor's
+      scheduler fusion has already run.
+    - LX planning runs in `CustomPreSchedulingPasses`, **before** the
+      Scheduler is even constructed.
+    - This pass bump/free-list-allocates a region of regular HBM (the
+      "intermediates segment", see `constants.INTERMEDIATES_SEGMENT`); LX
+      planning allocates a fixed on-chip SRAM scratchpad per core.
+    - A buffer is only an hbm_pool candidate if LX planning did *not* already
+      claim it (`"lx" not in layout.allocation`); the two passes are
+      mutually exclusive per buffer, applied in that order.
+
+    Collects pool candidates from two sources:
+    - Kernel intermediates: buffers both written and read within the graph,
+      detected via written & read sets on ComputedBuffer nodes.
+    - SpyreEmptyFallback full buffers created by coarse_tile.py (non-outputs).
+      These are ExternKernel nodes invisible to the written & read path above.
+
+    For each candidate, assigns layout.allocation["hbm_pool"] = INTERMEDIATES_SEGMENT + offset.
+    Graph inputs/outputs and LX-allocated buffers are excluded.
+
+    Bundle scoping: this pass runs after ``spyre_fuse_nodes`` (see
+    ``CustomPostFusionPasses`` in passes.py), so ``nodes`` is the final,
+    post-fusion top-level list -- each entry is exactly one SDSC bundle
+    (one SpyreKernel / .run() call).  A buffer is pool-eligible only if
+    the bundle that writes it is the same bundle that contains every read
+    of it; a buffer written in one bundle and read from a different one
+    falls back to standalone HBM, since bundle-scoped pools do not
+    coexist across separate kernel invocations.  Pool offsets, sizes, and
+    live-range analysis are all computed independently per bundle.
+
+    See docs/source/compiler/hbm_pool_planning.md for the full design and a
+    side-by-side comparison table with LX scratchpad planning.
+    """
+
+    if not config.hbm_pool_planning:
+        V.graph.hbm_pool_sizes = {}
+        return nodes
+
+    graph_inputs: set[str] = set(V.graph.graph_inputs.keys())
+    graph_outputs: set[str] = set(V.graph.get_output_names())
+    io_names: set[str] = graph_inputs | graph_outputs
+
+    _kernel_arg_types = (
+        FallbackKernel,
+        ExternKernelSchedulerNode,
+        NopKernelSchedulerNode,
+    )
+
+    # Now that this pass runs after spyre_fuse_nodes (post-fusion), each
+    # top-level entry in `nodes` is a bundle that may itself be a
+    # FusedSchedulerNode wrapping several SchedulerNodes/CountedLoopScheduler
+    # Nodes (or a CountedLoopSchedulerNode -- a FusedSchedulerNode subclass --
+    # wrapping a counted-loop body).  Flatten both so individual ops are
+    # visible at distinct timesteps for written/read detection and live-range
+    # analysis.  FusedSchedulerNode.get_nodes() returns self.snodes verbatim
+    # (not recursively flattened), so the recursion below handles nesting of
+    # arbitrary depth.
+    def _iter_all_nodes(
+        node_list: list[BaseSchedulerNode],
+    ):
+        for n in node_list:
+            if isinstance(n, FusedSchedulerNode):
+                yield from _iter_all_nodes(n.get_nodes())
+            else:
+                yield n
+
+    # Mutation buffers share the same allocation dict object as their target, so a
+    # name-based check is insufficient.
+    io_alloc_ids: set[int] = {
+        id(layout.allocation)
+        for io_name in io_names
+        if (io_buf := V.graph.get_buffer(io_name)) is not None
+        and not isinstance(io_buf, Symbol)
+        # Use maybe_get_layout(): None-valued args carried by FallbackKernels
+        # have no layout and raise from get_layout().
+        and isinstance(layout := io_buf.maybe_get_layout(), FixedTiledLayout)
+    }
+
+    def _is_intermediate(name: str) -> bool:
+        buf = V.graph.get_buffer(name)
+        if buf is None:
+            return False
+        layout = buf.maybe_get_layout()
+        return (
+            isinstance(layout, FixedTiledLayout)
+            and "lx" not in layout.allocation
+            and id(layout.allocation) not in io_alloc_ids
+        )
+
+    # Buffers read by Fallback/Extern/Nop nodes must stay Python-side tensors,
+    # regardless of which bundle they belong to.
+    all_flat_nodes: list[BaseSchedulerNode] = list(_iter_all_nodes(nodes))
+    fallback_read = {
+        dep.name
+        for node in all_flat_nodes
+        if isinstance(node, _kernel_arg_types)
+        for dep in node.read_writes.reads
+    }
+
+    # Build per-buffer writer-bundle / reader-bundles maps by walking each
+    # top-level bundle's own flattened node list once.  A buffer normally has
+    # exactly one writer (bundle), tracked in buffer_writer_bundle; it may
+    # have readers in zero, one, or several bundles.  buffer_writer_bundles
+    # additionally accumulates *every* bundle that ever wrote a given name,
+    # so a buffer written by more than one bundle (e.g. a loop-carried
+    # accumulator whose in-place update is mutation-renamed by Inductor's
+    # scheduler to the same name as its initializer in an earlier bundle) can
+    # be detected even though buffer_writer_bundle itself only ever retains
+    # the last writer.
+    buffer_writer_bundle: dict[str, str] = {}
+    buffer_writer_bundles: dict[str, set[str]] = {}
+    buffer_reader_bundles: dict[str, set[str]] = {}
+
+    for bundle in nodes:
+        bundle_name = bundle.get_name()
+        bundle_flat = list(_iter_all_nodes([bundle]))
+        bundle_non_kernel = [
+            n for n in bundle_flat if not isinstance(n, _kernel_arg_types)
+        ]
+        for node in bundle_non_kernel:
+            for dep in node.read_writes.writes:
+                if dep.name not in graph_outputs:
+                    buffer_writer_bundle[dep.name] = bundle_name
+                    buffer_writer_bundles.setdefault(dep.name, set()).add(bundle_name)
+            for dep in node.read_writes.reads:
+                if dep.name not in graph_inputs:
+                    buffer_reader_bundles.setdefault(dep.name, set()).add(bundle_name)
+        # SpyreEmptyFallback nodes allocate a buffer but emit no dep-tracked
+        # write, so they never appear via the dep walk above.  Collect them
+        # explicitly, using the underlying buffer's name (node.node.get_name())
+        # rather than the scheduler node's own operation name
+        # (node.get_name()) -- for an ExternKernelSchedulerNode these differ
+        # (e.g. "op30" vs "buf27").
+        for node in bundle_flat:
+            if (
+                isinstance(node, ExternKernelSchedulerNode)
+                and isinstance(node.node, SpyreEmptyFallback)
+                and node.node.get_name() not in graph_outputs
+            ):
+                buffer_writer_bundle[node.node.get_name()] = bundle_name
+                buffer_writer_bundles.setdefault(node.node.get_name(), set()).add(
+                    bundle_name
+                )
+
+    written = set(buffer_writer_bundle)
+    read = set(buffer_reader_bundles)
+
+    def _is_cross_bundle(name: str) -> bool:
+        if len(buffer_writer_bundles.get(name, set())) > 1:
+            logger.debug(
+                "hbm_pool_planning: %s written by multiple bundles %s -- "
+                "excluding from pool eligibility",
+                name,
+                sorted(buffer_writer_bundles[name]),
+            )
+            return True
+        readers = buffer_reader_bundles.get(name, set())
+        writer = buffer_writer_bundle.get(name)
+        return bool(readers - {writer})
+
+    all_candidates = {
+        name
+        for name in (written & read) - io_names - fallback_read
+        if _is_intermediate(name) and not _is_cross_bundle(name)
+    }
+
+    V.graph.hbm_pool_sizes = {}
+
+    # Sort by start step so the allocator processes tensors in execution
+    # order.  Tie-break on (end_step, name) for determinism:
+    def _alloc_sort_key(item: tuple[str, tuple[int, int]]) -> tuple[int, int, str]:
+        name, (start, end) = item
+        return (start, end, name)
+
+    for bundle in nodes:
+        bundle_name = bundle.get_name()
+        # Restrict to buffers this bundle actually writes -- buffer_writer_
+        # bundle[name] == bundle_name is implied by membership in
+        # all_candidates plus this bundle's own written set, but recomputing
+        # a local written set keeps this loop self-contained.
+        bundle_candidates = {
+            name
+            for name in all_candidates
+            if buffer_writer_bundle.get(name) == bundle_name
+        }
+        if not bundle_candidates:
+            continue
+
+        # Use the bundle's own direct, unflattened children here (not the
+        # recursively-flattened list used above for candidate
+        # identification). A CountedLoopSchedulerNode's merged read/write
+        # set (see ReadWrites.merge_list) drops any buffer the loop both
+        # writes and reads internally -- a loop-carried accumulator has no
+        # visible read at all from this node's perspective. _compute_live_
+        # ranges then falls back to `len(nodes) + 1` for such a buffer's
+        # end_step, conservatively keeping it live through the rest of the
+        # bundle, rather than the buggy alternative: fully flattening into
+        # the loop body would expose its one internal read as an ordinary
+        # timestep, ending its live range there and letting the allocator
+        # free and reuse its offset for a different, still-live buffer
+        # (e.g. the loop's own per-iteration scratch tile).
+        #
+        # This opacity relies on `bundle` being a FusedSchedulerNode whose
+        # `get_nodes()` returns *other* nodes (the loop appearing as one
+        # timestep among siblings). When spyre_fuse_nodes has no fusible
+        # neighbors to group a loop with, `_make_fused` returns the bare
+        # CountedLoopSchedulerNode itself as the top-level bundle -- in that
+        # case `bundle.get_nodes()` returns the loop's own internal snodes,
+        # bypassing the opacity entirely. Guard against that by treating a
+        # bare loop bundle as a single opaque timestep.
+        if isinstance(bundle, CountedLoopSchedulerNode):
+            live_range_nodes = [bundle]
+        else:
+            live_range_nodes = bundle.get_nodes()
+        live_ranges = _compute_live_ranges(live_range_nodes, bundle_candidates)
+        sorted_bufs = sorted(live_ranges.items(), key=_alloc_sort_key)
+
+        allocator = Allocator(SEGMENT_SIZE)
+
+        # Track (end_step, offset, size) so we can free blocks promptly.
+        pending_frees: list[tuple[int, int, int]] = []
+
+        for name, (start, end) in sorted_bufs:
+            # Free any blocks whose live range ended before this start step.
+            still_live = []
+            for entry in pending_frees:
+                e, off, sz = entry
+                if e < start:
+                    allocator.free(off, sz)
+                else:
+                    still_live.append(entry)
+            pending_frees = still_live
+
+            size = _compute_size_bytes(name)
+            offset = allocator.allocate(size)
+
+            # Assign pool offset directly to layout.allocation.
+            buf = V.graph.get_buffer(name)
+            layout = buf.maybe_get_layout()
+            assert isinstance(layout, FixedTiledLayout)
+            if config.bundle_symbolic_args:
+                layout.allocation["hbm_pool"] = offset
+            else:
+                layout.allocation["hbm_pool"] = INTERMEDIATES_SEGMENT + offset
+
+            if isinstance(buf, SpyreEmptyFallback):
+                # SpyreEmptyFallback.should_allocate() returns False once
+                # pool-allocated, so the wrapper never emits an AllocateLine
+                # for it. Base Inductor's free machinery
+                # (Scheduler.free_buffers -> codegen_free -> can_reuse) does
+                # not consult should_allocate(); it frees any buffer whose
+                # last use has passed regardless of whether it was ever
+                # allocated. Without this, the generated wrapper emits
+                # `del buf27` with no prior `buf27 = ...`, raising
+                # UnboundLocalError. free_buffers() itself subtracts
+                # V.graph.removed_buffers before iterating, so adding the
+                # name here keeps it out of codegen entirely.
+                V.graph.removed_buffers.add(name)
+
+            pending_frees.append((end, offset, size))
+
+            logger.debug(
+                "hbm_pool_planning: bundle=%s  %s  live=[%d,%d]  size=%d  offset=%d",
+                bundle_name,
+                name,
+                start,
+                end,
+                size,
+                offset,
+            )
+
+        peak = allocator.get_peak_usage()
+        pool_extent = allocator.get_pool_end()
+        logger.info(
+            "hbm_pool_planning: bundle=%s assigned %d intermediates, peak concurrent "
+            "usage %.2f GB, pool extent %.2f GB / %.2f GB",
+            bundle_name,
+            len(sorted_bufs),
+            peak / (1024**3),
+            pool_extent / (1024**3),
+            SEGMENT_SIZE / (1024**3),
+        )
+        V.graph.hbm_pool_sizes[bundle_name] = pool_extent
+
+    if not V.graph.hbm_pool_sizes:
+        logger.info("hbm_pool_planning: no bundle had any pool-eligible intermediate")
+    else:
+        logger.info(
+            "hbm_pool_planning: %d bundle(s) with pool allocations, "
+            "total pool bytes across bundles %.2f GB",
+            len(V.graph.hbm_pool_sizes),
+            sum(V.graph.hbm_pool_sizes.values()) / (1024**3),
+        )
+
+    return nodes

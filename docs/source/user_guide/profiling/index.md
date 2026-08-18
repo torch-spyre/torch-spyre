@@ -5,6 +5,7 @@
 :maxdepth: 2
 
 environment_variables
+ffdc
 pytorch_profiler
 device_monitoring
 trace_analysis
@@ -23,18 +24,19 @@ workloads running on the Spyre accelerator. The full design of the
 planned toolkit is in
 [RFC 0601 — Spyre Profiling Toolkit][rfc-0601].
 
-The in-tree `torch_spyre.profiler` package is currently a scaffold —
-`torch_spyre.profiler.is_available()` returns `False`, and there is no
-public API yet. Profiling today goes through `torch.profiler` plus the
-external integrations described on this page (`kineto-spyre`,
-`aiu-smi`, `aiu-trace-analyzer`); the in-tree API will be populated as
-RFC 0601 lands.
+The in-tree `torch_spyre.profiler` package is importable and exports
+FFDC retrieval (`get_diagnostic_report`). Device presence is
+`torch.spyre.is_available()`. Day-to-day performance work still goes
+through `torch.profiler` plus the external integrations on this page
+(`kineto-spyre`, `aiu-smi`, `aiu-trace-analyzer`). Broader in-tree
+profiling APIs will land with RFC 0601.
 
 ## What can be profiled today
 
 | Capability | Status | Where |
 |---|---|---|
 | Compiler pipeline logs | Available | [Environment variables](environment_variables.md) |
+| FFDC diagnostic reports on Spyre compile/runtime/unimplemented failures | Available (`TORCH_SPYRE_FFDC=1`) | [FFDC user guide](ffdc.md) · [API: `get_diagnostic_report`](../../api/torch_spyre.rst) · [Environment variables](environment_variables.md) |
 | CPU-side timing with `torch.profiler` | Available | [PyTorch Profiler](pytorch_profiler.md) |
 | Device telemetry (power, temperature, bandwidth) | Available — PF and VF mode (IBM-internal distribution; public release tracked in [#1335][issue-1335]) | [Device monitoring](device_monitoring.md) |
 | Device-side kernel timing via `ProfilerActivity.PrivateUse1` | Preview (requires [`kineto-spyre`][kineto-spyre] wheel) | [PyTorch Profiler](pytorch_profiler.md) |
@@ -43,6 +45,28 @@ RFC 0601 lands.
 | Kineto bridge (`SpyreActivityProfiler`) | In progress — in-tree Kineto integration for `ProfilerActivity.PrivateUse1` device-side events (PR [#1856][pr-1856]) | upstream Kineto integration |
 | Scratchpad utilization metrics | Planned | [RFC 0601][rfc-0601] |
 | IR-instrumentation-based fine-grained profiler | Planned | [RFC 0601][rfc-0601] |
+
+### FFDC quick example
+
+When `TORCH_SPYRE_FFDC=1`, frontend-compile, backend-compile,
+kernel-launch, and unimplemented-operation failures write a JSON
+diagnostic report. Retrieve the newest valid report with:
+
+```python
+import torch
+import torch_spyre
+
+report = torch.spyre.get_diagnostic_report()
+if report is not None:
+    print(report["failure"]["category"], report["failure"]["message"])
+    print(report["failure"]["file"], report["failure"]["lineno"])
+    print(report["_report_path"])
+```
+
+See the [FFDC user guide](ffdc.md) for failure categories, report
+locations, pod/CI workflow, and JSON triage. The
+[API reference](../../api/torch_spyre.rst) documents the function
+contract.
 
 ### Memory API quick example
 
@@ -86,6 +110,8 @@ The module also exposes `reset_accumulated_memory_stats()` and
 - [Environment variables](environment_variables.md) — logging, device
   enumeration, runtime/driver variables used by `aiu-smi` and
   `aiu-trace-analyzer`
+- [FFDC (First Failure Data Capture)](ffdc.md) — automatic failure
+  reports, report locations, and triage workflow
 - [PyTorch Profiler](pytorch_profiler.md) — `torch.profiler` usage, CPU
   today, device-side preview
 - [Device monitoring](device_monitoring.md) — `aiu-smi` setup
@@ -100,7 +126,7 @@ The module also exposes `reset_accumulated_memory_stats()` and
 ## See also
 
 - [Debugging](../debugging/index.md) — correctness-focused workflow,
-  including `TORCH_COMPILE_DEBUG` artifacts and the `sendnn` bisect
+  including `TORCH_COMPILE_DEBUG` artifacts and FFDC capture
 - [Running Models](../running_models.md) — `torch.compile` usage
 - [Compiler Architecture](../../compiler/architecture.md) — pipeline
   overview

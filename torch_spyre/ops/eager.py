@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+from torch_spyre._C import fill_tensor, copy_tensor
 import torch_spyre.ops.fallbacks  # noqa: F401
 from .fallbacks import _get_op_overloads
 import warnings
@@ -58,8 +59,122 @@ def maybe_wrap_dim(dim: int, ndims: int) -> int:
     return dim
 
 
-def dispatch_to_torch_compile(*args, compiled=None, **kwargs):
-    return compiled(*args, **kwargs)
+def _materialize_offset_view(x):
+    """Return an offset-0 copy of a Spyre tensor that carries a nonzero
+    ``storage_offset``; pass everything else through unchanged.
+
+    A standalone-compiled kernel drops its input's ``storage_offset`` (upstream
+    Inductor's placeholder path reads sizes/strides only, and SpyreTensorLayout
+    has no offset field), so it binds the storage BASE pointer and reads from
+    element 0 regardless of the view's true offset — see ``_reoffset`` in
+    ``torch_spyre/_inductor/lowering.py``. Only ``spyre::copy_from_d2d``
+    re-injects the offset in-graph; every other compiled eager op would
+    silently read the wrong data.
+
+    ``clone()`` dispatches ``aten::clone`` -> ``aten::copy_`` ->
+    ``spyre::copy_from_d2d``, i.e. that same offset-honoring path, producing a
+    correct offset-0 buffer. This is a no-op for the overwhelmingly common
+    offset-0 case (fresh buffers, and slices that already forced a copy).
+
+    ``List[Tensor]`` args (e.g. ``aten.cat``/``aten.stack``) are recursed into
+    element-wise so an offset view nested in a list is materialized too;
+    otherwise those ops would silently read element 0 of each nested view.
+    """
+    if isinstance(x, torch.Tensor):
+        if x.device.type == "spyre" and x.storage_offset() != 0:
+            return x.clone()
+        return x
+    if isinstance(x, (list, tuple)):
+        return type(x)(_materialize_offset_view(e) for e in x)
+    return x
+
+
+def _write_arg_slots(op):
+    """Positions and names of an op's mutated (write-aliased) arguments.
+
+    Such arguments (e.g. ``out=`` of an out-variant, ``self`` of an in-place op)
+    need read-modify-write handling rather than a plain read-side clone: the
+    standalone-compiled kernel would write to the storage base (element 0)
+    instead of the view's ``storage_offset``. ``alias_info.is_write`` identifies
+    them from the schema.
+    """
+    positions: set[int] = set()
+    names: set[str] = set()
+    for i, arg in enumerate(op._schema.arguments):
+        if arg.alias_info is not None and arg.alias_info.is_write:
+            positions.add(i)
+            names.add(arg.name)
+    return positions, names
+
+
+def _remap_result(result, lookup):
+    """Swap substituted clones back to the caller's originals in a return value.
+
+    ``lookup`` maps ``id(clone) -> original``. The compiled kernel echoes the
+    write-arg object it was handed (verified: ``relu_``/``add.out`` return the
+    same object), so an in-place/out op returns the clone we substituted;
+    restore the caller's tensor identity so aliasing is preserved.
+    """
+    if isinstance(result, torch.Tensor):
+        return lookup.get(id(result), result)
+    if isinstance(result, tuple):
+        mapped = [_remap_result(r, lookup) for r in result]
+        if hasattr(type(result), "_make"):  # namedtuple / structseq
+            return type(result)._make(mapped)
+        return tuple(mapped)
+    if isinstance(result, list):
+        return [_remap_result(r, lookup) for r in result]
+    return result
+
+
+def _make_offset_safe_dispatch(op):
+    """Build a dispatch wrapper that keeps nonzero-offset Spyre tensors correct
+    across the standalone-compiled kernel.
+
+    - Read (non-write) args: materialize a nonzero-offset view to a fresh
+      offset-0 buffer (``_materialize_offset_view``) before the call.
+    - Write (mutated) args: read-modify-write. Clone the offset view to an
+      offset-0 buffer, run the kernel against the clone, then ``copy_`` the
+      result back into the caller's view.
+
+    Everything is a no-op for the common offset-0 case.
+    """
+    write_positions, write_names = _write_arg_slots(op)
+
+    def dispatch(*args, compiled=None, **kwargs):
+        write_back = []  # (clone, original) for each substituted write view
+
+        def prep_write(x):
+            if isinstance(x, torch.Tensor):
+                if x.device.type == "spyre" and x.storage_offset() != 0:
+                    local = x.clone()
+                    write_back.append((local, x))
+                    return local
+                return x
+            if isinstance(x, (list, tuple)):
+                return type(x)(prep_write(e) for e in x)
+            return x
+
+        args = tuple(
+            prep_write(a) if i in write_positions else _materialize_offset_view(a)
+            for i, a in enumerate(args)
+        )
+        kwargs = {
+            k: (prep_write(v) if k in write_names else _materialize_offset_view(v))
+            for k, v in kwargs.items()
+        }
+
+        result = compiled(*args, **kwargs)
+
+        if write_back:
+            for local, original in write_back:
+                original.copy_(local)
+            result = _remap_result(
+                result, {id(local): original for local, original in write_back}
+            )
+        return result
+
+    return dispatch
 
 
 def register_torch_compile_kernel(ops):
@@ -71,7 +186,8 @@ def register_torch_compile_kernel(ops):
         if "dtype" in op.name():
             # ops that change dtype are not supported yet
             continue
-        compiled_kernel = compile_once(op, dynamic=False)(dispatch_to_torch_compile)
+        dispatch = _make_offset_safe_dispatch(op)
+        compiled_kernel = compile_once(op, dynamic=False)(dispatch)
         torch.library.register_kernel(op.name(), ["spyre"])(compiled_kernel)
 
 
@@ -89,6 +205,7 @@ register_torch_compile_kernel(
         aten.div,
         aten.exp,
         aten.floor,
+        aten.index_select,
         aten.log,
         aten.mean,
         aten.mul,
@@ -121,6 +238,7 @@ register_torch_compile_kernel(
         aten.where.self_out,
         aten.clamp,
         aten.constant_pad_nd,
+        aten.embedding.default,
     ]
 )
 
@@ -129,9 +247,45 @@ register_torch_compile_kernel(
 def spyre__fill_scalar(
     self: torch.Tensor, other: int | float | bool | complex
 ) -> torch.Tensor:
-    tmp = torch.ones(self.size(), dtype=self.dtype) * other
-    self.copy_(tmp)
+    if isinstance(other, complex):
+        raise TypeError("spyre fill_ does not support complex fill values")
+    fill_tensor(self, float(other))
     return self
+
+
+@torch.library.register_kernel("aten::full", ["spyre"])  # type:ignore
+def spyre_full(
+    size: list | tuple,
+    fill_value: int | float | bool | complex,
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
+) -> torch.Tensor:
+    assert layout in (torch.strided, None), f"doesn't support layout={layout}"
+    assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
+    if isinstance(fill_value, complex):
+        raise TypeError("spyre full does not support complex fill values")
+    t = torch.empty(size, dtype=dtype, device=device)
+    fill_tensor(t, float(fill_value))
+    return t
+
+
+@torch.library.register_kernel("aten::ones", ["spyre"])  # type:ignore
+def spyre_ones(
+    size: list | tuple,
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
+) -> torch.Tensor:
+    assert layout in (torch.strided, None), f"doesn't support layout={layout}"
+    assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
+    t = torch.empty(size, dtype=dtype, device=device)
+    fill_tensor(t, 1.0)
+    return t
 
 
 @torch.library.register_kernel("aten::normal_", ["spyre"])  # type:ignore
@@ -149,12 +303,8 @@ def spyre__normal_(self, mean=0.0, std=1.0, *, generator=None):
 
 @torch.library.register_kernel("aten::zero_", ["spyre"])  # type:ignore
 def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
-    """Zero out the tensor in-place."""
-    # Create zeros on CPU
-    tmp = torch.zeros(self.size(), dtype=self.dtype, device="cpu")
-    # Copy to device
-    self.copy_(tmp)
-    # TODO: Can we zero out tensors in-place without copy
+    """Zero out the tensor in-place using device-side FillDMA."""
+    fill_tensor(self, 0.0)
     return self
 
 
@@ -209,10 +359,29 @@ def spyre__copy_from(self, dst, non_blocking=False):
     if (self.device.type == "cpu" and dst.device.type == "spyre") or (
         self.device.type == "spyre" and dst.device.type == "cpu"
     ):
-        torch_spyre._C.copy_tensor(self, dst, non_blocking)
+        copy_tensor(self, dst, non_blocking)
         return dst
     elif self.device.type == "spyre" and self.device == dst.device:
-        torch.ops.spyre.copy_from_d2d(self, dst)
+        # copy_from_d2d requires torch.compile, which cannot run inside
+        # no_dispatch() (e.g. during FakeTensorMode constant propagation).
+        # Fall back to a CPU roundtrip copy in that case.
+        #
+        # Detecting "am I inside no_dispatch()" uses the private
+        # ``torch._C._dispatch_tls_is_dispatch_key_excluded("Python")`` (no
+        # public predicate exists — no_dispatch() excludes the Python dispatch
+        # key). Revisit if upstream exposes a stable API; the alternative
+        # (attempt copy_from_d2d and catch the re-entrancy failure) is worse.
+        if torch._C._dispatch_tls_is_dispatch_key_excluded("Python"):
+            cpu_tmp = self.to("cpu")
+            copy_tensor(cpu_tmp, dst, non_blocking)
+        else:
+            # Pass storage_offsets explicitly: a graph input's storage_offset
+            # is dropped by Inductor, so the lowering must re-introduce it
+            # in-graph (see copy_from_d2d in customops.py and
+            # lower_spyre_from_d2d).
+            torch.ops.spyre.copy_from_d2d(
+                self, dst, self.storage_offset(), dst.storage_offset()
+            )
         return dst
     else:
         if non_blocking:

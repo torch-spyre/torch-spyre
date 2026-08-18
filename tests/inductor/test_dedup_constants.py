@@ -167,7 +167,7 @@ class TestDedupConstants(unittest.TestCase):
 
         def fn(x, y):
             # Both arithmetic nodes have scalar arg 1.0.
-            # convert_constant_with_graph_node emits one py_const per consumer.
+            # Constant materialization emits one py_const per consumer.
             return x + 1.0, y + 1.0
 
         ops = self._compile(fn, (x, y))

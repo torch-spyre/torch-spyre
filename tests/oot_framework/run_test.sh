@@ -18,7 +18,9 @@
 # --parallel detects the number of Spyre cards from PCIDEVICE_IBM_COM_AIU_PF
 # (comma count+1) or torch.spyre.device_count(), then distributes the resolved
 # test files round-robin across cards, running each card's slice in a
-# background subshell with SPYRE_DEVICES=<card_idx>.  Falls back to serial
+# background subshell with SPYRE_DEVICES=<physical_device_id> (honouring an
+# already-set SPYRE_DEVICES list such as "1,5,7" rather than assuming
+# 0..N-1).  Falls back to serial
 # execution when only one card is detected.  JUnit XML shards from all cards
 # are merged into the single --junit-xml destination at the end.
 
@@ -96,24 +98,51 @@ fi
 #                  (comma count + 1) or torch.spyre.device_count() as fallback.
 #                  Falls back to serial execution when only one card is found.
 #
+# --mode=<gating|validate>
+#                  Mode of running this script
+#                    gating   (default) -- current behaviour: failed tests
+#                              propagates to a non-zero exit code (e.g. for CI jobs
+#                              that needing gating on all tests passed).
+#                    validate -- test failures are recorded in the printed
+#                              summary as usual but won't gate a CI job. 
+#                              All other non-zero exits are captured anyway.
+#
 # Usage:
 #   run_test.sh config.yaml                 # default: all tests run serially
 #   run_test.sh config.yaml --include-slow  # same, explicit
 #   run_test.sh config.yaml --skip-slow     # skip slow tests on this platform
 #   run_test.sh config.yaml --parallel      # parallelize tests across all Spyre cards
+#   run_test.sh config.yaml --mode=validate # test failures don't fail the script
 # ------------------------------------------------------------------------------------
 _SKIP_SLOW=0
 _PARALLEL=0
+_MODE="gating"
 _FILTERED_ARGS=()
+_take_next_mode=0
 for _arg in "$@"; do
+    if [[ $_take_next_mode -eq 1 ]]; then
+        _MODE="$_arg"
+        _take_next_mode=0
+        continue
+    fi
     case "$_arg" in
         --skip-slow)    _SKIP_SLOW=1 ;;
         --include-slow) _SKIP_SLOW=0 ;;
         --parallel)     _PARALLEL=1 ;;
+        --mode=*)       _MODE="${_arg#--mode=}" ;;
+        --mode)         _take_next_mode=1 ;;
         *)              _FILTERED_ARGS+=("$_arg") ;;
     esac
 done
 set -- "${_FILTERED_ARGS[@]+"${_FILTERED_ARGS[@]}"}"
+
+case "$_MODE" in
+    gating|validate) ;;
+    *)
+        echo "ERROR: --mode must be 'gating' or 'validate' (got: '$_MODE')" >&2
+        exit 1
+        ;;
+esac
 # ---------------------------------------------------------------------------
 # Multi-config support
 #
@@ -703,13 +732,81 @@ def analyze(path):
     # can gate them via the YAML config, AND need cleanup so the raw star-imported
     # instance is not collected by pytest as a plain TestCase.
     class_level_parametrized_mixed = set()
+    # is_upstream/is_oot for THIS file, computed once up front (reused below).
+    import os as _os
+    _torch_root = _os.environ.get("TORCH_ROOT", "")
+    _torch_device_root = _os.environ.get("TORCH_DEVICE_ROOT", "")
+    _is_upstream_file = bool(
+        _torch_root
+        and _os.path.abspath(path).startswith(_os.path.abspath(_torch_root))
+    )
+    _is_oot_file = bool(
+        _torch_device_root
+        and _os.path.abspath(path).startswith(_os.path.abspath(_torch_device_root))
+    )
+    _apply_transitive_closure = _is_upstream_file and not _is_oot_file
+
+    # Transitive closure: a class counts as a TestCase subclass if any of its
+    # bases (directly or transitively, through locally-defined intermediate
+    # classes) is TestCase-like. This catches chains like
+    # `class FooBase(TestCase)` -> `class Foo(FooBase)` regardless of naming,
+    # e.g. TestPatternMatcher(TestPatternMatcherBase) in
+    # test_mkldnn_pattern_matcher.py, whose base name does not literally end
+    # in "TestBase" and was previously invisible to this scan entirely
+    # (see issue #3188).
+    #
+    # Scoped to upstream-only files: OOT-native files under TORCH_DEVICE_ROOT
+    # commonly use non-"TestCase"/"TestBase"-named helper base classes on
+    # purpose for classes that already hand-roll direct Spyre-device testing
+    # without any instantiate_device_type_tests() dispatch (e.g.
+    # BaseTestScratchpadUsage in test_scratchpad_use.py). Making those newly
+    # "visible" here sweeps them into needs_injection/uncontrolled below, and
+    # instantiate_device_type_tests() rebuilding them via multiple inheritance
+    # silently changes their setUp()/MRO — verified this regressed
+    # test_scratchpad_use.py from 109 passed (main) to 39 failed when the
+    # transitive check was applied unconditionally. So for non-upstream files
+    # we keep the original direct-only check.
+    _local_bases = {}
+    if _apply_transitive_closure:
+        for _n in ast.iter_child_nodes(tree):
+            if isinstance(_n, ast.ClassDef):
+                _names = []
+                for _b in _n.bases:
+                    if isinstance(_b, ast.Name):        _names.append(_b.id)
+                    elif isinstance(_b, ast.Attribute): _names.append(_b.attr)
+                _local_bases[_n.name] = _names
+
+    def _is_testcase_like(name, _seen=None):
+        if "TestCase" in name or name.endswith("TestBase"):
+            return True
+        if not _apply_transitive_closure:
+            return False
+        _seen = _seen or set()
+        if name in _seen:
+            return False
+        _seen.add(name)
+        return any(_is_testcase_like(_b, _seen) for _b in _local_bases.get(name, []))
+
+    # Classes whose TestCase-ness is established ONLY via the transitive
+    # closure above (their immediate base name does not itself contain
+    # "TestCase" / end in "TestBase") — e.g. TestPatternMatcher, whose direct
+    # base "TestPatternMatcherBase" does not match the direct check. These are
+    # newly-visible classes (see issue #3188) and are treated more carefully
+    # below when classifying standalone instantiate_parametrized_tests() calls,
+    # since long-established directly-visible classes (e.g. TestConvolutionNN
+    # in test_convolution.py, based directly on NNTestCase) must keep their
+    # existing classification to avoid changing behavior for unrelated suites.
+    transitive_only_classes = set()
+
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.ClassDef):
             for base in node.bases:
                 base_name = ""
                 if isinstance(base, ast.Name):        base_name = base.id
                 elif isinstance(base, ast.Attribute): base_name = base.attr
-                if "TestCase" in base_name or base_name.endswith("TestBase"):
+                if _is_testcase_like(base_name):
+                    if not ("TestCase" in base_name or base_name.endswith("TestBase")):
+                        transitive_only_classes.add(node.name)
                     has_device, all_parametrized, _ = class_methods_info(node, parametrize_names)
                     all_classes[node.name] = has_device
                     # Check for @instantiate_parametrized_tests as a class decorator.
@@ -785,7 +882,33 @@ def analyze(path):
             elif fname == "instantiate_parametrized_tests" and node.args:
                 arg = node.args[0]
                 if isinstance(arg, ast.Name):
-                    parametrized_instantiated.add(arg.id)
+                    cls_name = arg.id
+                    # Standalone-call form only expands @parametrize methods; it
+                    # says nothing about per-device dispatch. Treating it alone as
+                    # "fully handled" leaves upstream classes that are NEVER also
+                    # passed to instantiate_device_type_tests() completely
+                    # unwrapped, so TorchTestBase never sees them and YAML
+                    # mode:skip/xfail entries are silently ignored (see issue
+                    # #3188: TestPatternMatcher in test_mkldnn_pattern_matcher.py
+                    # hardcodes device="cpu" and is only ever passed to
+                    # instantiate_parametrized_tests()).
+                    #
+                    # Scope this correction to transitive_only_classes: classes
+                    # that are only newly visible to this analyzer via the
+                    # transitive-closure TestCase check above (itself already
+                    # scoped to upstream-only files via _apply_transitive_closure).
+                    # Long-established directly-visible classes using this same
+                    # standalone-call pattern (e.g. TestConvolutionNN in
+                    # test_convolution.py, TestLRScheduler in
+                    # test_lrscheduler.py) keep their prior "fully handled"
+                    # classification unchanged, since other YAML suites already
+                    # depend on that behavior and default to unlisted_test_mode:
+                    # skip — reclassifying them here would silently drop
+                    # coverage for tests not explicitly listed in those
+                    # unrelated configs.
+                    if cls_name in transitive_only_classes:
+                        continue  # leave out of parametrized_instantiated -> uncontrolled
+                    parametrized_instantiated.add(cls_name)
     # A class that appears in BOTH open and restricted sets (e.g. the file
     # calls instantiate_device_type_tests twice for the same class, once with
     # only_for and once without) is treated as open: the open call already
@@ -1018,6 +1141,15 @@ _restore_staticmethods(_cls_${cls}, globals())
 # left in globals() by the star-import.
 if '${cls}' in globals():
     del globals()['${cls}']
+"
+    done
+    # injection_block also binds _cls_${cls} as its own module-level global for
+    # every class in NEEDS_INJECTION_CLASSES. It is still the raw TestCase, so
+    # pytest's unittest plugin collects it too unless it is deleted here.
+    for cls in "${NEEDS_INJECTION_CLASSES[@]}"; do
+        cleanup_block+="
+if '_cls_${cls}' in globals():
+    del globals()['_cls_${cls}']
 "
     done
 
@@ -1722,9 +1854,13 @@ _run_xdist_fallback() {
     fi
     rm -f "$_xdist_out_tmp"
 
-    # Propagate test failures from the xdist fallback run.
+    # Propagate test failures from the xdist fallback run. As above, in
+    # --mode=validate a test-failure exit (1) is recorded in the summary but
+    # does not fail the script; other non-zero exits are unaffected by mode.
     if [[ $_xexit -eq 1 ]]; then
-        [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+        if [[ "$_MODE" != "validate" ]]; then
+            [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+        fi
     elif [[ $_xexit -ne 0 && $_xexit -ne 5 ]]; then
         OVERALL_EXIT=$_xexit
     fi
@@ -1744,9 +1880,16 @@ _run_xdist_fallback() {
 #   1. PCIDEVICE_IBM_COM_AIU_PF: contains a comma-separated list of PCI bus IDs per card.
 #      Card count = number of commas + 1.
 #   2. torch.spyre.device_count(): runtime query via the flex driver.
-#      Respects the AIU_WORLD_SIZE / SPYRE_DEVICES if already set, so we clear
-#      those for the probe to get the raw hardware count.
-#   3. Falls back to 1 (serial) if neither source yields > 0.
+#      Inherits AIU_WORLD_SIZE / SPYRE_DEVICES from the environment as-is.
+#      flex::getNumDevices() (see spyre_device_enum.cpp) already narrows its
+#      count to those vars when either is set, so if the caller has
+#      restricted visible devices that restriction is naturally honoured
+#      here. Clearing them before the probe (as this used to do) would let
+#      --parallel spread tests across cards the caller never authorized for
+#      this run.
+#   3. Falls back to 1 (serial) if neither source yields > 0. On failure, the
+#      probe's stderr is surfaced so import/runtime errors are diagnosable
+#      instead of silently downgrading to serial execution.
 #
 # ---------------------------------------------------------------------------
 _detect_spyre_card_count() {
@@ -1757,22 +1900,30 @@ _detect_spyre_card_count() {
         return
     fi
 
-    # Alternately torch.spyre.device_count() without any env overrides
-    local _count
+    local _count _probe_err
+    _probe_err="/tmp/_spyre_card_probe_err_${$}.tmp"
     _count=$(
-        env -u AIU_WORLD_SIZE -u SPYRE_DEVICES \
         python3 -c "
-import torch_spyre, torch
+import sys
+import torch
 try:
     print(torch.spyre.device_count())
-except Exception:
+except Exception as e:
+    print(e, file=sys.stderr)
     print(0)
-" 2>/dev/null
+" 2>"$_probe_err"
     ) || true
     if [[ "$_count" =~ ^[0-9]+$ && "$_count" -gt 0 ]]; then
+        rm -f "$_probe_err"
         echo "$_count"
         return
     fi
+
+    if [[ -s "$_probe_err" ]]; then
+        echo "[torch_oot_device_tests_run] WARNING: Spyre card-count probe failed -- falling back to 1 card. Error was:" >&2
+        sed 's/^/[torch_oot_device_tests_run]     /' "$_probe_err" >&2
+    fi
+    rm -f "$_probe_err"
 
     # Fallback: single card serial
     echo 1
@@ -1783,7 +1934,9 @@ except Exception:
 #
 # Collects every test node ID from ALL resolved files, distributes them
 # round-robin across N Spyre cards, and runs each card's slice in a
-# background subshell with SPYRE_DEVICES=<card_idx>.
+# background subshell with SPYRE_DEVICES=<physical_device_id> -- the actual
+# device index (e.g. from an already-set SPYRE_DEVICES list such as
+# "1,5,7"), not the 0..N-1 round-robin slot.
 #
 # Splitting at the test-ID level (not the file level) is essential: when
 # multiple configs share a single test file (e.g. all inductor shard configs
@@ -1807,6 +1960,13 @@ _run_parallel_across_cards() {
     echo ""
     echo "[torch_oot_device_tests_run_parallel] --parallel: collecting test IDs from ${#RUN_FILES[@]} file(s) to distribute across ${_n_cards} card(s)..."
 
+    # Timestamp the collection phase so its cost is visible in the run log.
+    # Collection re-imports torch + each OOT wrapper per file, so this phase
+    # can dominate --parallel wall-clock; the elapsed line lets a pod run
+    # confirm the fan-out speedup empirically. SECONDS is a bash builtin
+    # (seconds since shell start) — no external `date` dependency.
+    local _collect_start=$SECONDS
+
     # -----------------------------------------------------------------------
     # Step 1: collect all test node IDs across every resolved file.
     #
@@ -1822,45 +1982,81 @@ _run_parallel_across_cards() {
     # Per-file collection is done with SPYRE_TEST_FILE set (so the OOT
     # framework can identify the config) but without SPYRE_DEVICES / hardware
     # initialisation so collection is fast even on a login node.
+    #
+    # Collection needs no hardware, so the per-file `--collect-only` probes
+    # are fanned out as background jobs (bounded to _n_cards concurrent) and
+    # each writes its raw node IDs to a per-file temp file. Running them
+    # serially and foreground here was the dominant cost of --parallel (every
+    # OOT wrapper re-imports torch + re-execs the module + regenerates the
+    # full device-type variant matrix), so parallelising the probes removes
+    # that serial bottleneck. The results are then read back in file order so
+    # _all_node_ids / _all_node_file_idx ordering is identical to the serial
+    # collection this replaces.
     # -----------------------------------------------------------------------
     # _all_node_ids: parallel arrays — node_id, file_idx (into RUN_FILES)
     local -a _all_node_ids=()
     local -a _all_node_file_idx=()
 
+    # Build the -m probe args once (identical for every file, same as serial path).
+    local -a _collect_args=()
+    local _has_m=0
+    for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
+        [[ "$_a" == "-m" ]] && { _has_m=1; break; }
+    done
+    if [[ $_has_m -eq 1 ]]; then
+        local _take_next=0
+        for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
+            if [[ $_take_next -eq 1 ]]; then
+                _collect_args+=("$_a"); _take_next=0; continue
+            fi
+            [[ "$_a" == "-m" ]] && { _collect_args+=("$_a"); _take_next=1; }
+        done
+    fi
+
+    # Fan out collection: one background probe per file, bounded to _n_cards
+    # concurrent jobs. Each writes matched node IDs to _collect_out_files[i].
+    local -a _collect_out_files=()
+    local -a _collect_pids=()
     for i in "${!RUN_FILES[@]}"; do
         local _rf="${RUN_FILES[$i]}"
-        local _of="${TEST_FILES[$i]}"
         local _rd _rb
         _rd="$(dirname "$_rf")"
         _rb="$(basename "$_rf")"
+        local _cout="/tmp/_spyre_collect_ids_${$}_${i}.tmp"
+        _collect_out_files+=("$_cout")
 
-        echo "[torch_oot_device_tests_run]   collecting: $(basename "$_of")"
+        echo "[torch_oot_device_tests_run]   collecting: $(basename "${TEST_FILES[$i]}")"
 
-        # Build the -m probe args (same as serial path).
-        local -a _collect_args=()
-        local _has_m=0
-        for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
-            [[ "$_a" == "-m" ]] && { _has_m=1; break; }
-        done
-        if [[ $_has_m -eq 1 ]]; then
-            local _take_next=0
-            for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
-                if [[ $_take_next -eq 1 ]]; then
-                    _collect_args+=("$_a"); _take_next=0; continue
-                fi
-                [[ "$_a" == "-m" ]] && { _collect_args+=("$_a"); _take_next=1; }
-            done
-        fi
-
-        local _raw_ids
-        _raw_ids=$(
+        (
             export SPYRE_TEST_FILE="$_rf"
             export OOT_TEST_FILE="$_rf"
             cd "$_rd" && python3 -m pytest "$_rb" \
                 "${_collect_args[@]+"${_collect_args[@]}"}" \
                 --collect-only -q --no-header 2>/dev/null \
-            | grep '\.py::' || true
-        )
+            | grep '\.py::' > "$_cout" || true
+        ) &
+        _collect_pids+=($!)
+
+        # Throttle to at most _n_cards concurrent probes.
+        while [[ "$(jobs -rp | wc -l)" -ge "$_n_cards" ]]; do
+            wait -n 2>/dev/null || true
+        done
+    done
+
+    # Wait for any remaining probes to finish before reading their output.
+    for _cpid in "${_collect_pids[@]+"${_collect_pids[@]}"}"; do
+        wait "$_cpid" 2>/dev/null || true
+    done
+
+    # Read back each file's collected IDs in file order, preserving the exact
+    # ordering the original serial loop produced.
+    for i in "${!RUN_FILES[@]}"; do
+        local _of="${TEST_FILES[$i]}"
+        local _cout="${_collect_out_files[$i]}"
+
+        local _raw_ids=""
+        [[ -f "$_cout" ]] && _raw_ids="$(< "$_cout")"
+        rm -f "$_cout"
 
         if [[ -z "$_raw_ids" ]]; then
             echo "[torch_oot_device_tests_run_serial]   WARNING: no test IDs collected from $(basename "$_of") -- it will be skipped in parallel mode." >&2
@@ -1885,6 +2081,9 @@ _run_parallel_across_cards() {
             _all_node_file_idx+=("$i")
         done <<< "$_raw_ids"
     done
+
+    local _collect_elapsed=$(( SECONDS - _collect_start ))
+    echo "[torch_oot_device_tests_run_parallel] Collection phase completed in ${_collect_elapsed}s (${#RUN_FILES[@]} file(s), up to ${_n_cards} concurrent probe(s))."
 
     local _total="${#_all_node_ids[@]}"
     if [[ $_total -eq 0 ]]; then
@@ -1916,12 +2115,36 @@ _run_parallel_across_cards() {
         echo "${_all_node_file_idx[$j]}:${_all_node_ids[$j]}" >> "${_card_id_files[$_k]}"
     done
 
+    # -----------------------------------------------------------------------
+    # Card-slot -> physical SPYRE_DEVICES index mapping.
+    #
+    # _n_cards is a count (e.g. 3), not a list of physical device indices.
+    # When the caller restricted visible devices with SPYRE_DEVICES (e.g.
+    # "1,5,7"), device_count() already narrows the detected count to match,
+    # but the physical indices are NOT 0..N-1 -- they are exactly the values
+    # listed. Each per-card subshell must export its real index, not its
+    # position in the round-robin loop, or it ends up targeting cards the
+    # caller never listed (e.g. card 0 when only 1,5,7 were authorized).
+    # -----------------------------------------------------------------------
+    local -a _CARD_DEVICE_IDS=()
+    if [[ -n "${SPYRE_DEVICES:-}" ]]; then
+        IFS=',' read -r -a _CARD_DEVICE_IDS <<< "${SPYRE_DEVICES}"
+    fi
+    if [[ "${#_CARD_DEVICE_IDS[@]}" -ne "$_n_cards" ]]; then
+        # No restriction (or a mismatched one) -- fall back to the natural
+        # 0..N-1 physical indexing.
+        _CARD_DEVICE_IDS=()
+        for (( _k=0; _k<_n_cards; _k++ )); do
+            _CARD_DEVICE_IDS+=("$_k")
+        done
+    fi
+
     # Print the assignment summary.
     for (( _k=0; _k<_n_cards; _k++ )); do
         local _cnt
         _cnt=$(wc -l < "${_card_id_files[$_k]}" 2>/dev/null || echo 0)
         _cnt="${_cnt// /}"   # trim whitespace
-        echo "[torch_oot_device_tests_run_parallel_info]   card ${_k} (SPYRE_DEVICES=${_k}): ${_cnt} test(s)"
+        echo "[torch_oot_device_tests_run_parallel_info]   card ${_k} (SPYRE_DEVICES=${_CARD_DEVICE_IDS[$_k]}): ${_cnt} test(s)"
     done
     echo ""
 
@@ -1952,6 +2175,7 @@ _run_parallel_across_cards() {
         : > "$_card_summary_file"
 
         local _subshell_card="$_k"
+        local _subshell_device_id="${_CARD_DEVICE_IDS[$_k]}"
         local _subshell_id_file="${_card_id_files[$_k]}"
         local _subshell_exit_tmp="$_card_exit_tmp"
         local _subshell_shard_list="$_card_shard_list"
@@ -1960,7 +2184,7 @@ _run_parallel_across_cards() {
 
         (
             set +euo pipefail
-            export SPYRE_DEVICES="${_subshell_card}"
+            export SPYRE_DEVICES="${_subshell_device_id}"
             # Isolate the Inductor / FxGraph cache per card so that concurrent
             # shutil.rmtree() calls from FxGraphCache.clear() in different card
             # subshells do not race on the same /tmp/torchinductor_*/fxgraph/
@@ -1996,7 +2220,7 @@ _run_parallel_across_cards() {
                 done <<< "${_file_to_ids[$_fidx]}"
 
                 echo "========================================================================"
-                echo "[torch_oot_device_tests_run] card ${_subshell_card} | SPYRE_DEVICES=${_subshell_card} | ${#_node_ids[@]} test(s)"
+                echo "[torch_oot_device_tests_run] card ${_subshell_card} | SPYRE_DEVICES=${_subshell_device_id} | ${#_node_ids[@]} test(s)"
                 if [[ "$run_file" != "$original_file" ]]; then
                     echo "[torch_oot_device_tests_run] Running (via OOT wrapper): $original_file"
                 else
@@ -2091,7 +2315,13 @@ _run_parallel_across_cards() {
                 # Exit-code handling.
                 case $_exit in
                     0) ;;
-                    1)  [[ $_card_overall -eq 0 ]] && _card_overall=1 ;;
+                    1)
+                        # Test failure — masked in --mode=validate (see serial
+                        # loop above for the equivalent, non-parallel path).
+                        if [[ "$_MODE" != "validate" ]]; then
+                            [[ $_card_overall -eq 0 ]] && _card_overall=1
+                        fi
+                        ;;
                     5)  echo "[torch_oot_device_tests_run] WARNING: no tests collected for card ${_subshell_card} slice of $(basename "$original_file")" >&2 ;;
                     127)
                         echo "[torch_oot_device_tests_run_err] FATAL: python3/pytest not found for $original_file" >&2
@@ -2114,7 +2344,14 @@ _run_parallel_across_cards() {
                             ) || true
                             if [[ -f "$_exit_tmp" ]]; then
                                 local _xexit; _xexit=$(< "$_exit_tmp"); rm -f "$_exit_tmp"
-                                [[ $_xexit -ne 0 && $_xexit -ne 5 && $_card_overall -eq 0 ]] && _card_overall=$_xexit
+                                if [[ $_xexit -eq 1 ]]; then
+                                    # Test failure on retry — masked in --mode=validate.
+                                    if [[ "$_MODE" != "validate" ]]; then
+                                        [[ $_card_overall -eq 0 ]] && _card_overall=1
+                                    fi
+                                elif [[ $_xexit -ne 0 && $_xexit -ne 5 ]]; then
+                                    [[ $_card_overall -eq 0 ]] && _card_overall=$_xexit
+                                fi
                                 if [[ -n "$_shard_xml" && -f "$_shard_xml" ]]; then
                                     python3 -c "$_XML_INJECT_PY" "$_shard_xml" "$YAML_CONFIG" || true
                                 fi
@@ -2315,9 +2552,19 @@ for i in "${!RUN_FILES[@]}"; do
     # so conftest.py files are discovered correctly.
     #
     # If the probe finds 0 matching tests (exit code 5) the -m flag is stripped
-    # from _FILE_PYTEST_ARGS so the file's tests all run normally. 
+    # from _FILE_PYTEST_ARGS so the file's tests all run normally --
     # the marker filter applies to files that USE that marker
-    # family; files that don't use it are unaffected.
+    # family; files that don't use it are unaffected. This fallback is for
+    # op__/dtype__/module__/platform__-style tags, where a per-file 0-match
+    # just means "this marker family isn't used here". It does NOT apply to
+    # testtype__<label> (see _OOTTestTypeMarkerPatcher): that tag is a
+    # whole-file inclusion marker driven by the config's
+    # test_suite_config.labels, so a 0-match genuinely means this file's
+    # config doesn't carry the requested label and the file must stay
+    # excluded, not fall back to running unfiltered. -m is left in place for
+    # that case; the real run below will also report 0 collected (exit 5),
+    # which the exit-code handling further down already treats as
+    # NOTEST/warning-only, not a failure.
     #
     # ---------------------------------------------------------------------------
     _HAS_M=0
@@ -2341,12 +2588,16 @@ for i in "${!RUN_FILES[@]}"; do
             fi
         done
 
+        # `|| _probe_exit=$?` is required: exit 5 (nothing collected) is the
+        # expected signal here, and under `set -e` a bare subshell would abort
+        # the whole run before the exit code could be inspected.
         _probe_exit=0
         (cd "$run_dir" && python3 -m pytest "$run_basename" \
-            "${_PROBE_ARGS[@]}" --collect-only -q 2>/dev/null)
-        _probe_exit=$?
+            "${_PROBE_ARGS[@]}" --collect-only -q 2>/dev/null) || _probe_exit=$?
 
-        if [[ $_probe_exit -eq 5 ]]; then
+        if [[ $_probe_exit -eq 5 && "${_PROBE_ARGS[*]}" == *"testtype__"* ]]; then
+            echo "[torch_oot_device_tests_run] -m filter matched 0 tests in $(basename "$original_file") (testtype__ label not present) -- file excluded" >&2
+        elif [[ $_probe_exit -eq 5 ]]; then
             # 0 tests match this marker in this file — strip -m from args.
             echo "[torch_oot_device_tests_run] -m filter matched 0 tests in $(basename "$original_file"), running without -m" >&2
             _ARGS_NO_M=()
@@ -2443,8 +2694,12 @@ for i in "${!RUN_FILES[@]}"; do
         1)
             # Some tests failed or errored — pytest already reported them.
             # Propagate so CI marks the job as failed when mandatory_success
-            # tests do not pass.
-            [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+            # tests do not pass. In --mode=validate this is intentionally not
+            # propagated: the failure is still visible in the printed
+            # summary, but the script itself exits 0 for this case.
+            if [[ "$_MODE" != "validate" ]]; then
+                [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+            fi
             ;;
         5)
             # No tests collected — warn but do not fail the overall run.

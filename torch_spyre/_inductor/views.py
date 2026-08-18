@@ -17,7 +17,7 @@
 from dataclasses import dataclass, astuple
 import math
 import sympy
-from typing import Optional, Sequence, Dict, Tuple, Callable
+from typing import Callable, Dict, Optional, Sequence, Tuple, cast
 from torch.utils._sympy.functions import ModularIndexing, FloorDiv
 
 from torch._inductor.virtualized import V
@@ -35,6 +35,11 @@ def find_repeat_vars(index_exprs, var_ranges):
                 if m.has(var):
                     mods.append(m)
             if len(mods) != 1:
+                if len(mods) > 1:
+                    raise Unsupported(
+                        f"variable {var} (range {var_range}) appears in multiple Mod "
+                        f"expressions {mods} and cannot be mapped to coordinates."
+                    )
                 continue
             node = mods[0]
             base, modulus = node.args
@@ -95,7 +100,7 @@ def convert_modular_indexing(expr: sympy.Expr) -> sympy.Expr:
 # NOTE: this is intentionally a local copy of pass_utils.concretize_expr.
 # views.py cannot import from pass_utils because pass_utils imports
 # compute_coordinates from views (circular dependency).  The duplication
-# is acceptable because both are thin wrappers around V.graph.sizevars.size_hint.
+# is acceptable because both are thin wrappers around V.graph.sizevars.optimization_hint.
 def _concretize_for_cmp(expr):
     """Return a concrete numeric value for use in comparison operators only.
 
@@ -124,7 +129,7 @@ def _concretize_for_cmp(expr):
     if isinstance(expr, float):
         return expr  # passthrough (incl. math.inf); avoids int(math.inf) error
     if hasattr(expr, "free_symbols") and expr.free_symbols:
-        return V.graph.sizevars.size_hint(expr)
+        return V.graph.sizevars.optimization_hint(expr)
     return int(expr)
 
 
@@ -146,6 +151,10 @@ def compute_coordinates(
     may contain symbolic expressions (e.g. a dynamic batch dimension); the
     algorithm concretizes range values only for comparison logic, while the
     output coordinate expressions remain symbolic.
+
+    Raises ``Unsupported`` if ``index`` walks a dimension backwards (a loop
+    variable with a negative coefficient, as produced by ``prims.rev``): a
+    device coordinate can only ascend.
     """
     assert all(isinstance(s, (int, sympy.Integer)) for s in stride), (
         f"compute_coordinates requires concrete strides, got {stride}"
@@ -180,6 +189,26 @@ def compute_coordinates(
         # TODO(issue#1373): replace with sympy predicates to avoid concretization.
         concrete_step = _concretize_for_cmp(step)
         concrete_limit = _concretize_for_cmp(limit)
+
+        # ``limit`` below ``step`` means the access walks the dimension
+        # backwards (the index carries a term like ``N - 1 - var``, as
+        # ``prims.rev`` / ``Tensor.flip`` produces).  Every dim test below
+        # compares a non-negative ``stride[dim]`` against ``concrete_step``, so
+        # a descending term can match no dim and would be dropped from
+        # ``coordinates`` entirely -- silently yielding the coordinate for
+        # ``var == 0`` at every iteration.  Device coordinates can only ascend,
+        # so reject it loudly instead (see issue #3558).
+        #
+        # Testing ``limit - step`` rather than ``step``'s sign isolates the
+        # direction from any additive constant folded into both: for a term
+        # ``a*var + b`` over range ``R``, ``limit - step == a*(R - 1)``, so the
+        # comparison sees ``a``'s sign alone.
+        if concrete_limit < concrete_step:
+            raise Unsupported(
+                f"index term for {var} runs backwards (step {step}, limit "
+                f"{limit}): reversed traversal of a tensor dimension cannot "
+                f"be expressed as a device coordinate"
+            )
 
         # find primary dim with largest stride less than or equal to step
         primary_stride = 0
@@ -254,6 +283,14 @@ def compute_coordinates(
         # compute index({var=1}) and index({var=var_ranges[var]})
         step = term.xreplace({var: 1})
         limit = term.xreplace({var: range_val})
+
+        mods_with_var = [m for m in term.atoms(sympy.Mod) if m.has(var)]
+        if len(mods_with_var) > 1:
+            raise Unsupported(
+                f"variable {var} (range {range_val}) appears in multiple Mod "
+                f"expressions {mods_with_var} and cannot be mapped to coordinates."
+            )
+
         add_term(var=var, step=step, limit=limit)
 
     # NOTE: indirect_access_subs substitution is NOT applied here. It is deferred to
@@ -348,7 +385,9 @@ def normalize_coordinates(
 
     Split dimension into n dimensions if expression has n>1 terms.
     Split dim_size into n according to iteration range of each term.
-    Fuse contiguous dimensions if corresponding terms can be fused.
+    Fuse contiguous dimensions if corresponding terms can be fused.  Size-1
+    device dims with a constant zero coordinate are dropped, and do not stop
+    the dims on either side of them from fusing.
     """
     # terms in non-increasing stride order
     terms = []
@@ -437,10 +476,19 @@ def normalize_coordinates(
         split_dim_terms = []
 
         cum_size = 1
+        # Save original numerators before the loop resets them to 1.
+        # dim_terms[i].num is the flat-index step for variable i.  The
+        # device-dimension range for variable i equals the ratio of
+        # consecutive steps: original_nums[i+1] // original_nums[i].
+        # Using dim_terms[i+1].num directly (which has already been reset
+        # to 1 for lower terms) would give the next variable's raw step,
+        # producing inflated dim_sizes and spurious backGaps when 3+ vars
+        # share a single flat device dimension (e.g. ho*96+kh*24+wo*4+kw).
+        original_nums: list[sympy.Expr] = [cast(sympy.Expr, t.num) for t in dim_terms]
         # for all terms but the last
         for i in range(0, len(dim_terms) - 1):
-            # set dim_size to numerator of next term
-            dim_terms[i].dim_size = dim_terms[i + 1].num
+            # range of variable i = step[i+1] / step[i]
+            dim_terms[i].dim_size = original_nums[i + 1] // original_nums[i]
             # set numerator of next term to 1
             dim_terms[i + 1].num = 1
             # compute cumulative dim_size of all terms up to current term
@@ -458,11 +506,43 @@ def normalize_coordinates(
     # never fuse last dimension = stick dimension!
     fused_terms = []
     fused_term = terms[0]
+    # Whether a transparent placeholder term was skipped since ``fused_term``
+    # was last (re)set.  A placeholder is a size-1 device dim with a constant
+    # zero coordinate, e.g. the squeezed ``seq`` dim that
+    # ``get_generic_stick_layout`` puts *between* ``H`` and the non-stick half
+    # of ``D`` for a ``[B, H, 1, D]`` attention output.  It occupies no space
+    # and is discarded by the flush guards below, but because this scan only
+    # compares neighbouring list entries it would flush the pending term and
+    # break a fusion run between two dims that ``compute_coordinates`` already
+    # treats as stride-adjacent (``next_stride`` ignores ``size == 1`` dims).
+    # Splitting an otherwise contiguous axis that way makes ``align_tensors``
+    # mint an extra loop variable for it, and for a matmul that produces a
+    # second reduction dim, which the backend cannot schedule (a bmm contracts
+    # exactly one dim; deeptools aborts with ``out_reuse_dim.size() == 1``).
+    skipped_placeholder = False
     for term in terms[1:-1]:
+        if term.var is None and term.dim_size == 1 and term.offset == 0:
+            skipped_placeholder = True
+            continue
         if (
             fused_term.num == 1
             and fused_term.var == term.var
             and fused_term.den == term.mod
+            # Fusing *across* a placeholder must not change the address that
+            # any (dim, coordinate) pair encodes.  It provably does not when
+            # the pair is densely packed (``den == term.den * term.dim_size``),
+            # the inner term skips no elements (``num == 1``), and the outer
+            # term carries no offset -- the outer offset counts in units of the
+            # outer ``den`` and is not rescaled when ``den`` shrinks on fusion.
+            # Adjacent terms keep the historical predicate unchanged.
+            and (
+                not skipped_placeholder
+                or (
+                    term.num == 1
+                    and fused_term.offset == 0
+                    and fused_term.den == term.den * term.dim_size
+                )
+            )
         ):
             # fuse terms
             fused_term.num = term.num
@@ -473,6 +553,7 @@ def normalize_coordinates(
             if fused_term.dim_size > 1 or fused_term.var is not None:
                 fused_terms.append(fused_term)
             fused_term = term
+        skipped_placeholder = False
     if fused_term.dim_size > 1 or fused_term.var is not None:
         fused_terms.append(fused_term)
     # add term for stick dimension
@@ -486,7 +567,9 @@ def align_tensors(
     tensors: list[Dict[str, list[sympy.Expr]]],
     indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
 ) -> tuple[
-    (dict[sympy.Symbol, tuple[sympy.Expr, int]], list[dict[str, list[sympy.Expr]]])
+    dict[sympy.Symbol, tuple[sympy.Expr, int]],
+    list[dict[str, list]],
+    dict[sympy.Symbol, tuple[tuple[sympy.Symbol, int], ...]],
 ]:
     """
     Transform op iteration space and tensor arguments to satisfy codegen requirements.
@@ -500,7 +583,7 @@ def align_tensors(
     # Save original (possibly symbolic) range expressions before concretizing.
     # The algorithm below requires concrete ints for sorting and integer division,
     # but we must propagate symbolic expressions forward so downstream passes
-    # (work_division, SDSC codegen) see the symbols to extract fields, not size_hints.
+    # (work_division, SDSC codegen) see the symbols to extract fields, not hints.
     orig_ranges = {var: val[0] for var, val in iteration_space.items()}
     # local import: pass_utils imports compute_coordinates/matching_dim from
     # this module, so importing at module scope would create a cycle.
@@ -610,6 +693,7 @@ def align_tensors(
     new_var_ranges = {}
     new_op_it_space_splits = {}
     remap = {}  # map old var to new vars in splits order
+    work_division_remap = {}
     for var, split in splits.items():
         div = op_it_space_splits[var] if var in op_it_space_splits else 1
         if len(split) > 1:
@@ -620,10 +704,24 @@ def align_tensors(
                 new_var_ranges[new_var] = split[i + 1] // split[i]
                 remap[var].append(new_var)
 
+            bases = {}
             # distribute work division for old var to new vars
             for v in reversed(remap[var]):
-                new_op_it_space_splits[v] = math.gcd(div, new_var_ranges[v])
+                # Re-intersect the committed split against the basis work
+                # division used for this var.
+                if v == var and v in stick_dim:
+                    # Stick var: stick count. The element range would drop a
+                    # legal split when the size is not a multiple of it
+                    # (e.g. gcd(2, 67) == 1).
+                    eps = int(stick_size[stick_dim.index(v)])
+                    basis = (int(new_var_ranges[v]) + eps - 1) // eps  # stick count
+                else:
+                    # Non-stick var (or synthetic sub-dim): element range.
+                    basis = new_var_ranges[v]
+                bases[v] = int(basis)
+                new_op_it_space_splits[v] = math.gcd(div, basis)
                 div //= new_op_it_space_splits[v]
+            work_division_remap[var] = tuple((v, bases[v]) for v in remap[var])
         else:
             # no splits keep existing var, range, and work division
             # may happen with a single stick since the stick size is omitted
@@ -647,6 +745,7 @@ def align_tensors(
             new_op_it_space_splits[var] = (
                 op_it_space_splits[var] if var in op_it_space_splits else 1
             )
+            work_division_remap[var] = ((var, 1),)
     # create new tensors with new sizes and coordinate expressions matching new vars
     new_tensors = []
     for j, terms in enumerate(all_terms):
@@ -765,4 +864,47 @@ def align_tensors(
         if k not in indirect_syms
     }
 
-    return new_iteration_space, new_tensors
+    return new_iteration_space, new_tensors, work_division_remap
+
+
+def tiling_expr_to_device_expr(
+    device_size: Sequence[sympy.Expr],
+    stride_map: Sequence[sympy.Expr],
+    index: sympy.Expr,
+) -> sympy.Expr:
+    """
+    Convert a tile offset expression (index) to a device layout (device_size and
+    stride_map)
+    """
+
+    assert all(isinstance(s, (int, sympy.Integer)) for s in device_size), (
+        f"tiling_expr_to_device_expr requires a concrete device_size, got {device_size}"
+    )
+    assert all(isinstance(s, (int, sympy.Integer)) for s in stride_map), (
+        f"tiling_expr_to_device_expr requires a concrete stride_map, got {stride_map}"
+    )
+
+    out = sympy.S.Zero
+    n = len(stride_map)
+    vars = index.free_symbols
+    for var in vars:
+        # index.xreplace({var: 1}) can degenerate to the bare Python int 1
+        # (not sympy.Integer(1)) when `index` is itself exactly the single
+        # symbol being replaced (e.g. index == var, coefficient 1, no other
+        # additive term) -- sympy auto-simplifies Mul(1, var) to var, and
+        # substituting var -> 1 into var alone returns the literal object
+        # passed in. sympy.sympify coerces that raw int back to a proper
+        # sympy numeric type so the second .xreplace call below (which
+        # every other, non-degenerate case already returns) does not crash
+        # with "'int' object has no attribute 'xreplace'".
+        step = sympy.sympify(index.xreplace({var: 1})).xreplace({v: 0 for v in vars})
+        j = -1  # device dimension for var
+        for i in range(n):
+            if (
+                device_size[i] > 1
+                and stride_map[i] > (stride_map[j] if j != -1 else 0)
+                and stride_map[i] <= step
+            ):
+                j = i
+        out += var * math.prod(device_size[j + 1 : n]) * step // stride_map[j]
+    return out

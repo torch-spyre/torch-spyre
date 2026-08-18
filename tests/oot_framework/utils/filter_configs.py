@@ -17,9 +17,19 @@ Filter OOT test suite configs by TEST_TYPE label or suite-prefix group.
 
 Selection rules
 ---------------
-  (empty) / "full"   All configs (backward compatible by default).
   "smoke"            Configs whose test_suite_config.labels contains "smoke".
-  "core"             Configs whose test_suite_config.labels contains "core".
+  "unit"             Configs whose test_suite_config.labels contains "unit".
+  "integration"      Configs whose test_suite_config.labels contains
+                     "integration" -- the device-layer surfaces flex and
+                     deeptools/dxp_standalone exercise most (streams, job
+                     launch plans, codegen, LX/scratchpad planning, tensor
+                     layout, allocator/GC, D2D copies). Used as the default
+                     test_type for integration-tests.yaml.
+  "regression"       Configs whose test_suite_config.labels contains
+                     "regression" -- the full functional-coverage tier.
+  "trunk"            Configs whose test_suite_config.labels contains
+                     "trunk" -- everything torch-spyre's push-to-main
+                     workflows cover.
   "suite_<group>"    Configs residing inside a directory named "<group>", or
                      whose filename starts with "<group>_".  This lets the
                      existing <group>/<name>_config.yaml layout act as a
@@ -27,7 +37,18 @@ Selection rules
   <other>            Treated as an arbitrary label name; matches configs
                      whose labels array contains the value.
 
-Configs with no labels field default to ["full"] (backward compatible).
+These tier names (smoke/unit/integration/regression/trunk) ARE the label
+vocabulary tests/configs/**/*.yaml declares -- there is no separate alias
+layer translating human-facing names to internal label names.
+
+Only explicitly declared labels are respected: a config's
+test_suite_config.labels array is matched literally against --test-type, with
+no catch-all value that matches regardless of labels. Configs with no labels
+field match nothing -- they are excluded from every test_type, including
+regression and trunk. Every config must carry an explicit labels list; an
+unlabeled config is a gap to close by adding one (see
+tests/scripts/check_oot_configs.py, which fails CI on missing labels), not a
+signal to widen matching.
 
 Output formats
 --------------
@@ -55,7 +76,7 @@ Usage
   # GitHub Actions generate_matrix job
   python3 tests/oot_framework/utils/filter_configs.py \\
       --config-dir tests/configs/torch_spyre_tests \\
-      --test-type core \\
+      --test-type unit \\
       --runner-map .github/runner_overrides.yaml \\
       --format matrix-json
 """
@@ -100,11 +121,11 @@ def _display_name(config_path: Path, config_dir: Path) -> str:
 
 
 def _load_labels(path: Path) -> list:
-    """Read test_suite_config.labels from a YAML config; default to ["full"]."""
+    """Read test_suite_config.labels from a YAML config; no labels means no match."""
     with path.open() as fh:
         raw = yaml.safe_load(fh) or {}
     tsc = raw.get("test_suite_config") or {}
-    return list(tsc.get("labels", ["full"]))
+    return list(tsc.get("labels") or [])
 
 
 def _load_runner_map(runner_map_path: str) -> dict:
@@ -118,8 +139,13 @@ def _load_runner_map(runner_map_path: str) -> dict:
 
 
 def _matches(labels: list, config_path: Path, test_type: str) -> bool:
-    """Return True if *config_path* should be included for *test_type*."""
-    if not test_type or test_type == "full":
+    """Return True if *config_path* should be included for *test_type*.
+
+    No catch-all: every test_type (including regression/trunk) must appear
+    literally in the config's labels array. An empty test_type matches
+    everything (used only when a caller deliberately omits filtering).
+    """
+    if not test_type:
         return True
 
     if test_type.startswith("suite_"):
@@ -149,11 +175,13 @@ def main() -> None:
     )
     ap.add_argument(
         "--test-type",
-        default="full",
+        default="regression",
         metavar="TYPE",
         help=(
-            "Selection type: smoke | core | full | suite_<group> | <label>. "
-            "Default: full (all configs)."
+            "Selection type: smoke | unit | integration | regression | "
+            "trunk | suite_<group> | <label>. Matches configs whose "
+            "test_suite_config.labels array contains this value literally "
+            "-- no catch-all. Default: regression."
         ),
     )
     ap.add_argument(

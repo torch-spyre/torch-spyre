@@ -74,7 +74,7 @@ class TestGather(TestCase):
         if dist.is_initialized():
             dist.destroy_process_group()
 
-    def _test_gather_helper(self, shape, dtype, dst):
+    def _test_gather_helper(self, shape, dtype, dst, async_op=False):
         """
         Helper method to test gather with specific parameters.
 
@@ -82,6 +82,8 @@ class TestGather(TestCase):
             shape: Tensor shape
             dtype: Tensor data type
             dst: Destination rank for gather
+            async_op: If True, launch the collective asynchronously and call
+                      work.wait() before inspecting the result
         """
         # Calculate total number of elements in the tensor
         num_elements = torch.tensor(shape).prod().item()
@@ -104,8 +106,22 @@ class TestGather(TestCase):
             gather_list = [
                 torch.zeros_like(input_device) for _ in range(self.comm_size)
             ]
-            dist.gather(input_device, gather_list=gather_list, dst=dst)
+            work = dist.gather(
+                input_device, gather_list=gather_list, dst=dst, async_op=async_op
+            )
+        else:
+            work = dist.gather(
+                input_device, gather_list=None, dst=dst, async_op=async_op
+            )
 
+        if async_op:
+            self.assertIsNotNone(work, "async_op=True must return a Work handle")
+            work.wait()
+            self.assertTrue(work.is_completed())
+        else:
+            self.assertIsNone(work, "async_op=False must return None")
+
+        if self.comm_rank == dst:
             # Build all expected slices at once and compare in bulk.
             # All ranks contribute contiguous blocks: rank r owns [r*N .. (r+1)*N - 1],
             # so the full expected output is simply arange(comm_size * N) reshaped.
@@ -122,7 +138,6 @@ class TestGather(TestCase):
                 f"Rank {self.comm_rank}: gather result incorrect at destination rank {dst}",
             )
         else:
-            dist.gather(input_device, gather_list=None, dst=dst)
             self.assertTrue(True, "Non-destination rank completed gather successfully")
 
     def test_gather_float16(self):
@@ -178,6 +193,35 @@ class TestGather(TestCase):
         """Test gather to non-zero destination rank with 2D tensor shapes using int32."""
         dst_rank = min(1, self.comm_size - 1)
         self._test_gather_helper(shape=(4, 64), dtype=torch.int32, dst=dst_rank)
+
+    def test_gather_float16_async(self):
+        """Test gather to rank 0 with float16 tensors using async_op=True."""
+        self._test_gather_helper(
+            shape=(128,), dtype=torch.float16, dst=0, async_op=True
+        )
+
+    def test_gather_float32_async(self):
+        """Test gather to rank 0 with float32 tensors using async_op=True."""
+        self._test_gather_helper(
+            shape=(256,), dtype=torch.float32, dst=0, async_op=True
+        )
+
+    def test_gather_int32_async(self):
+        """Test gather to rank 0 with int32 tensors using async_op=True."""
+        self._test_gather_helper(shape=(192,), dtype=torch.int32, dst=0, async_op=True)
+
+    def test_gather_2d_tensor_float16_async(self):
+        """Test gather with 2D float16 tensors using async_op=True."""
+        self._test_gather_helper(
+            shape=(4, 64), dtype=torch.float16, dst=0, async_op=True
+        )
+
+    def test_gather_rank_non_zero_float16_async(self):
+        """Test gather to non-zero destination rank with float16 tensors using async_op=True."""
+        dst_rank = min(1, self.comm_size - 1)
+        self._test_gather_helper(
+            shape=(128,), dtype=torch.float16, dst=dst_rank, async_op=True
+        )
 
 
 if __name__ == "__main__":
