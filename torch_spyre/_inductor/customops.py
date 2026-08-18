@@ -636,9 +636,7 @@ def _(
     dilation: Sequence[int],
     groups: int,
 ) -> torch.Tensor:
-    return input.new_empty(
-        _conv_output_shape(input, weight, stride, padding, dilation)
-    )
+    return input.new_empty(_conv_output_shape(input, weight, stride, padding, dilation))
 
 
 @torch.library.custom_op(
@@ -666,9 +664,7 @@ def _(
     dilation: Sequence[int],
     groups: int,
 ) -> torch.Tensor:
-    return input.new_empty(
-        _conv_output_shape(input, weight, stride, padding, dilation)
-    )
+    return input.new_empty(_conv_output_shape(input, weight, stride, padding, dilation))
 
 
 @torch.library.custom_op("spyre::constant", mutates_args=(), device_types="spyre")

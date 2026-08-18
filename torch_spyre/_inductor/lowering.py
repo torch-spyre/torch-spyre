@@ -574,7 +574,7 @@ def lower_depthwise_conv2d(x, w, stride, padding, dilation, groups):
     # Reshape doesn't work as V.graph.get_buffer resolves to the underlying
     # buffer with get_size() returning 3 entries only.
     #
-    # Keeping the op at rank 3 enables using the input tensor's activation 
+    # Keeping the op at rank 3 enables using the input tensor's activation
     # and stick dim as pinned.
     #
     x_size = x.get_size()
@@ -973,8 +973,7 @@ def lower_convolution(
     is_conv1d = len(x.get_size()) == 3
     if not is_conv1d and len(x.get_size()) != 4:
         raise Unsupported(
-            f"conv2d direct lowering: expected 3D or 4D input, "
-            f"got {len(x.get_size())}D"
+            f"conv2d direct lowering: expected 3D or 4D input, got {len(x.get_size())}D"
         )
     if is_conv1d and len(weight.get_size()) != 3:
         raise Unsupported(
@@ -1021,7 +1020,7 @@ def lower_convolution(
     weight_loader = weight.make_loader()
 
     if is_conv1d:
-        # Rank-3 conv1d: no host height axis. 
+        # Rank-3 conv1d: no host height axis.
         N, C_in, W_in = x.get_size()
         C_out, C_in_per_group, kW = weight.get_size()
         H_in, kH = 1, 1

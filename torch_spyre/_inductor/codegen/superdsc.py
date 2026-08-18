@@ -714,7 +714,7 @@ def _align_conv2d_dim_labels(
             f"height, but kernel_h is {kernel_h!r}, not 1"
         )
     # Full canonical label list with each entry's unit-ness, in iteration-space
-    # order: output roles (mb, out, i, j) then window roles (ki, kj). 
+    # order: output roles (mb, out, i, j) then window roles (ki, kj).
     range_of_role = {
         "batch": node_output_ranges[0],
         "channel": node_output_ranges[1],
