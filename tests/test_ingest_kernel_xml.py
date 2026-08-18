@@ -232,7 +232,9 @@ FULL_SCHEMA = {
 }
 
 
-def test_kernel_xml_is_skipped_before_anything_is_written(ingest, monkeypatch, tmp_path):
+def test_kernel_xml_is_skipped_before_anything_is_written(
+    ingest, monkeypatch, tmp_path
+):
     """No perf_kernels table: nothing may be written, so a retry can pick it up.
 
     Writing the benchmark_runs row first would record source_file, and the dedup
@@ -253,7 +255,9 @@ def test_kernel_xml_is_skipped_when_only_run_type_is_missing(
     """
     client = FakeClient(
         {
-            "benchmark_runs": [c for c in FULL_SCHEMA["benchmark_runs"] if c != "run_type"],
+            "benchmark_runs": [
+                c for c in FULL_SCHEMA["benchmark_runs"] if c != "run_type"
+            ],
             "perf_kernels": FULL_SCHEMA["perf_kernels"],
         }
     )
