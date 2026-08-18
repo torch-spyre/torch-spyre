@@ -26,17 +26,31 @@ without emitting any target IR, so one set can serve every OpSpec consumer.  The
 KTIR emitter is simply the first such consumer (hence the KTIR references
 below); future emitters are intended to share them, which is why the module is
 named for the ``OpSpec`` it reads rather than for KTIR.
+
+``__all__`` is the contract: those four are what a consumer may import.  Anything
+underscore-prefixed is a step inside one of them -- reachable from a test, but not
+something to build on.
 """
 
 from __future__ import annotations
+
+from collections.abc import Sequence
 
 import sympy
 from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 
+__all__ = [
+    "align_reshape_plan",
+    "buf_id",
+    "core_divisions",
+    "per_core_extent",
+    "row_major_strides",
+]
 
-def _row_major_strides(device_size: list[int]) -> list[int]:
+
+def row_major_strides(device_size: Sequence[int]) -> list[int]:
     """Row-major (C-contiguous) strides for a device-size list."""
     n = len(device_size)
     strides = [1] * n
@@ -45,7 +59,7 @@ def _row_major_strides(device_size: list[int]) -> list[int]:
     return strides
 
 
-def _buf_id(arg: TensorArg) -> str:
+def buf_id(arg: TensorArg) -> str:
     """Stable identity of the buffer an op arg refers to, for register threading.
 
     Keys on the op-spec ``name`` (the buffer name): unique per buffer and
@@ -64,7 +78,7 @@ def _buf_id(arg: TensorArg) -> str:
         # create_tensor_arg always populates the name, so a None here is a
         # broken internal invariant, not an unsupported-capability case.
         raise ValueError(
-            "_buf_id: TensorArg.name is None -- every projected op arg must "
+            "buf_id: TensorArg.name is None -- every projected op arg must "
             "carry a buffer name for register-threading identity (arg_index is "
             "-1 for fused intermediates and cannot disambiguate them)"
         )
@@ -109,7 +123,7 @@ def _dim_info(coord: sympy.Expr) -> tuple[str, sympy.Symbol | None]:
     is rejected earlier at layout selection (the within-stick dim must be a full
     64-element stick).  Raise loudly rather than carrying a dead classification:
     if this fires, a new frontend construct reached alignment and both this
-    helper and ``_align_reshape_plan`` need real multi-symbol support.
+    helper and ``align_reshape_plan`` need real multi-symbol support.
     """
     syms = coord.free_symbols
     if not syms:
@@ -125,7 +139,12 @@ def _dim_info(coord: sympy.Expr) -> tuple[str, sympy.Symbol | None]:
         return (_DIM_BARE, sym)
     if isinstance(coord, (sympy.Mod, ModularIndexing)):
         return (_DIM_WITHIN_STICK, sym)
-    if isinstance(coord, FloorDiv):
+    # Both spellings of the outer-stick index: torch's FloorDiv, and the plain
+    # sympy ``floor(c/64)`` the projection actually produces -- the pointwise path
+    # never noticed the difference because identical operand and output
+    # coordinates take the fast path out of ``align_reshape_plan`` before any
+    # classification happens.
+    if isinstance(coord, (FloorDiv, sympy.floor)):
         return (_DIM_OUTER_STICK, sym)
     # A single-symbol coordinate that is none of the known device-axis forms
     # (e.g. ``2*d0 + 1``) is not a plain outer-stick chunk index.  Raise loudly
@@ -139,7 +158,7 @@ def _dim_info(coord: sympy.Expr) -> tuple[str, sympy.Symbol | None]:
     )
 
 
-def _align_reshape_plan(
+def align_reshape_plan(
     in_coords: list[sympy.Expr],
     in_block: list[int],
     out_coords: list[sympy.Expr],
@@ -218,3 +237,83 @@ def _align_reshape_plan(
         )
     broadcast_to = out_block if reshape_to != out_block else None
     return (reshape_to, broadcast_to)
+
+
+# ---------------------------------------------------------------------------
+# Work division: the core grid, as the iteration space states it
+# ---------------------------------------------------------------------------
+
+
+def core_divisions(
+    iteration_space: dict[sympy.Symbol, tuple[sympy.Expr, int]],
+) -> tuple[list[tuple[sympy.Symbol, int, int]], int]:
+    """``(divisions, total_cores)`` for one iteration space.
+
+    ``OpSpec.iteration_space`` maps each symbol to ``(range, work_division)``,
+    where the division is the number of cores that symbol's range is split
+    across -- decided upstream by ``work_division.py`` from ``config.sencores``.
+    The core grid is one flat index in ``[0, total_cores)``, read as a mixed-radix
+    number over the divided symbols, so each division is returned as
+    ``(sym, div, inner)`` **innermost-first**: that symbol's portion of the grid
+    is ``(core_id // inner) % div``.
+
+    ``total_cores`` is the product of the divisions, so an undivided space gives
+    ``([], 1)`` -- a single-core kernel, stated by the contract rather than
+    assumed.
+    """
+    split = [
+        (sym, int(div)) for sym, (_range, div) in iteration_space.items() if div > 1
+    ]
+    total_cores = 1
+    for _sym, div in split:
+        total_cores *= div
+    divisions: list[tuple[sympy.Symbol, int, int]] = []
+    inner = 1
+    for sym, div in reversed(split):  # innermost first
+        divisions.append((sym, div, inner))
+        inner *= div
+    return divisions, total_cores
+
+
+def per_core_extent(
+    arg: TensorArg, divisors: dict[sympy.Symbol, int]
+) -> tuple[list[int], list[sympy.Symbol | None]]:
+    """``(extent, symbol)`` per device axis: one core's share, and what divides it.
+
+    Each device axis carries at most one iteration symbol -- a bare ``c_i`` or an
+    outer-stick ``c_i // stick`` -- so at most one divisor applies to it, and the
+    axis' per-core extent is its full extent divided by that divisor.  The
+    trailing axis is the within-stick one and is never divided: a stick is the
+    unit of transfer, so splitting it across cores would split a stick.
+
+    The returned symbol list says which division each axis follows (``None`` for
+    an axis no division touches), which is what turns a division into a step
+    along that axis.
+    """
+    extent = [int(s) for s in arg.device_size]
+    coords = list(arg.device_coordinates)
+    if divisors and len(coords) != len(extent):
+        raise NotImplementedError(
+            f"OpSpec work division: {arg.name!r} carries {len(coords)} device "
+            f"coordinate(s) for {len(extent)} device axes, so which axis a "
+            "divided symbol walks cannot be told"
+        )
+    per_core: list[int] = []
+    symbols: list[sympy.Symbol | None] = []
+    last = len(extent) - 1
+    for axis, size in enumerate(extent):
+        symbol = None
+        if divisors and axis != last:
+            kind, symbol = _dim_info(coords[axis])
+            if kind == _DIM_CONST:
+                symbol = None
+        divisor = divisors.get(symbol, 1) if symbol is not None else 1
+        if divisor > 1 and size % divisor:
+            raise NotImplementedError(
+                f"OpSpec work division: device axis {axis} of {arg.name!r} has "
+                f"extent {size}, which {divisor} cores do not divide evenly; a "
+                "ragged per-core tile is not supported"
+            )
+        per_core.append(size // divisor)
+        symbols.append(symbol if divisor > 1 else None)
+    return per_core, symbols

@@ -400,17 +400,21 @@ Model Loading Utilities
 -----------------------
 
 The ``torch_spyre.model_utils`` module provides utilities that transfer a
-model to Spyre with optimal weight layout. For ``nn.Linear`` layers, weights
-are stickified along ``out_features`` (using ``dim_order=[1, 0]``) so that
-matrix multiplications can run at full throughput without a host-side
-transpose.
+model to Spyre with an optimal per-weight layout. For ``nn.Linear`` layers,
+weights are stickified along ``out_features`` (using ``dim_order=[1, 0]``) so
+that matrix multiplications can run at full throughput without a host-side
+transpose. For ``nn.Embedding`` layers, tables get a gather-optimal
+"indirect access" layout (vocab dim outermost) because they are read as a
+gather rather than a matmul.
 
 .. function:: torch_spyre.model_utils.load_model_to_spyre(model, dtype=None)
 
    Transfer all parameters and buffers of *model* to Spyre. ``nn.Linear``
-   weights use a dimension-swapped layout (``dim_order=[1, 0]``); all other
-   tensors use the default layout. Idempotent: parameters already on Spyre
-   are skipped.
+   weights use a dimension-swapped layout (``dim_order=[1, 0]``);
+   ``nn.Embedding`` tables use a gather-optimal "indirect access" layout
+   (vocab dim outermost, hidden dim split into sticks); all other tensors
+   use the default layout. Idempotent: parameters already on Spyre are
+   skipped.
 
    :param model: The model to transfer.
    :type model: torch.nn.Module
@@ -688,6 +692,12 @@ Environment Variables
    * - ``SPYRE_LOG_PASSES``
      - Comma-separated list of pass names after which to log the
        op-spec IR at pipeline stage boundaries (default empty)
+   * - ``TORCH_SPYRE_NATIVE_PACKER``
+     - Use the C++ permutation-layout packer accelerator in the
+       simulated-annealing layout solver (default ``1``; set ``0`` to force
+       the pure-Python packer). No effect unless
+       ``LAYOUT_SOLVER=simulated_annealing``.
+       See :doc:`/compiler/simulated_annealing_layout`
    * - ``MAX_BUCKETS``
      - Maximum number of work division buckets (default ``32``)
    * - ``MIN_DEFAULT_GRANULARITY``
