@@ -5258,7 +5258,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     3,
                     [[64, 1, 1, 64], [1, 1, 1, 64]],
-                    [[1, -1, 192, 64], [ 1, -1, 1, 1]],
+                    [[1, -1, 192, 64], [1, -1, 1, 1]],
                 ),
                 "2x3x32_ksize1": (
                     cached_randn((2, 3, 32)),
@@ -5467,7 +5467,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     None,
                     1,
                 ),
-                # --- Strided convolutions (stride 2). 
+                # --- Strided convolutions (stride 2).
                 "1x64x13_k3_s2": (
                     cached_randn((1, 64, 13)),
                     cached_randn((64, 64, 3)),
