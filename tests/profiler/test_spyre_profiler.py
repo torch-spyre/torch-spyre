@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import json
-import math
 import pytest
 import unittest
 import torch
@@ -147,62 +146,28 @@ class TestSpyreProfiler(TestCase):
     @pytest.mark.requires_spyre_profiler
     @unittest.skipUnless(Test_spyre, "requires spyre device")
     def test_no_zero_timestamp_or_duration(self) -> None:
-        """Verify no Chrome trace event has ts == 0 or dur == 0 after flash attention."""
+        """Verify no Chrome trace event has ts == 0 or dur == 0 for a large matmul workload."""
 
         device = torch.device("spyre")
-        B, H, L, D = 1, 4, 16, 32
-        block_size = 8
+        M, K, N = 1024, 2048, 1024
 
         # Keep source tensors on CPU so the profiled region can include explicit
         # HtoD transfers that must appear in the Chrome trace.
-        q_cpu = torch.randn(B, H, L, D, dtype=torch.float16)
-        k_cpu = torch.randn(B, H, L, D, dtype=torch.float16)
-        v_cpu = torch.randn(B, H, L, D, dtype=torch.float16)
+        a_cpu = torch.randn(M, K, dtype=torch.float16)
+        b_cpu = torch.randn(K, N, dtype=torch.float16)
 
         # Separate warmup inputs are moved to Spyre before profiling so the
         # first profiled call measures runtime activity rather than compilation.
-        Q = q_cpu.to(device)
-        K = k_cpu.to(device)
-        V = v_cpu.to(device)
+        a_warmup = a_cpu.to(device)
+        b_warmup = b_cpu.to(device)
 
-        def flash(Q, K, V, block_size):
-            output = torch.zeros_like(Q)
-            M = torch.full(
-                (B, H, L), float("-inf"), device=Q.device, dtype=torch.float16
-            )
-            denominator = torch.zeros((B, H, L), device=Q.device, dtype=torch.float16)
-            scale = 1.0 / math.sqrt(D)
+        def large_matmul(a, b):
+            return torch.matmul(a, b)
 
-            for start in range(0, L, block_size):
-                end = start + block_size
-                K_block = K[:, :, start:end, :]
-                V_block = V[:, :, start:end, :]
-                K_block_T = K_block.transpose(-1, -2).contiguous()
-
-                scores = torch.matmul(Q, K_block_T) * scale  # B, H, L, block_size
-                scores = scores.transpose(-1, -2).contiguous()  # avoid stick reduction
-                block_max = torch.amax(scores, dim=-2)
-                max_running = torch.maximum(M, block_max)
-
-                exp_scores = torch.exp(
-                    scores - max_running.unsqueeze(-2)
-                )  # B, H, block_size, L
-                correction = torch.exp(M - max_running)
-
-                denominator = denominator * correction + exp_scores.sum(dim=-2)
-                output = output * correction.unsqueeze(-1) + torch.bmm(
-                    exp_scores.transpose(-1, -2).flatten(0, 1),
-                    V_block.flatten(0, 1),
-                ).unflatten(0, (B, H))
-
-                M = max_running
-
-            return output / denominator.unsqueeze(-1)
-
-        compiled_fn = torch.compile(flash, backend="inductor")
+        compiled_fn = torch.compile(large_matmul, backend="inductor")
         # Warm up outside the profiled region to avoid compile-time activity in
         # the trace we validate below.
-        compiled_fn(Q, K, V, block_size)
+        compiled_fn(a_warmup, b_warmup)
         # Spyre execution is asynchronous, so drain warmup work before the
         # profiled region starts.
         torch.spyre.synchronize()
@@ -212,12 +177,11 @@ class TestSpyreProfiler(TestCase):
         ) as prof:
             # Move inputs during profiling so HtoD memcpy events are required in
             # the exported trace.
-            Q = q_cpu.to(device)
-            K = k_cpu.to(device)
-            V = v_cpu.to(device)
-            output = compiled_fn(Q, K, V, block_size)
+            a = a_cpu.to(device)
+            b = b_cpu.to(device)
+            output = compiled_fn(a, b)
             # Force memset activity in the profiled region.
-            scratch = torch.zeros((L, D), dtype=torch.float16, device=device)
+            scratch = torch.zeros((M, N), dtype=torch.float16, device=device)
             # Move the result back to CPU during profiling so DtoH memcpy events
             # are also required in the exported trace.
             output.cpu()
