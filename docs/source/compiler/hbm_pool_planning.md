@@ -173,6 +173,40 @@ HBM pool planning is controlled by `config.hbm_pool_planning`, which defaults
 to on. Set `HBM_POOL_PLANNING=0` to disable it globally; in that mode all
 intermediates fall back to standalone HBM.
 
+**Pool size budget:**
+
+Each bundle's pool is capped at `constants.MAX_POOL_SIZE_BYTES`, defined as
+`SEGMENT_SIZE - 2 GiB`. `SEGMENT_SIZE` is the full size of the HBM segment
+(`constants.INTERMEDIATES_SEGMENT`) that the pool is carved out of; the 2 GiB
+of headroom below that is reserved for other consumers of the same program
+segment (e.g. kernel-address and dimension-symbol bookkeeping), which are
+allocated from the same segment independently of pool planning. The
+reservation is scoped to the program's own HBM segment -- rather than, say, a
+separate fixed address range -- because the segment is the unit the runtime
+already partitions and tracks; carving the pool's budget out of it keeps all
+of a program's HBM consumers accounted for against the same limit instead of
+introducing a second, independently-tracked budget.
+
+`Allocator.allocate()` gates on the pool's bump-pointer high-water mark
+(`pool_end`), not on peak concurrent usage: `pool_end` is exactly the byte
+count `generate_bundle` reserves via `sdscbundle.device_mem_allocate`, and
+free-list fragmentation can push `pool_end` past the budget even while
+concurrent usage stays low, so gating on usage alone would let an
+over-budget pool slip through undetected.
+
+**Overflow behavior:**
+
+If a bundle's pool-eligible intermediates would collectively push `pool_end`
+past `MAX_POOL_SIZE_BYTES`, `Allocator.allocate()` returns `None` for the
+buffer(s) that would overflow it. Those buffers are not failures: they simply
+fall back to standalone HBM allocation (no `"hbm_pool"` key on their layout),
+the same path already used for cross-bundle and I/O buffers. The rest of the
+bundle's pool-eligible buffers are unaffected. The cost of falling back is
+that the buffer's address is computed independently (typically via
+`affine.apply`-based addressing) rather than as a cheap `arith.addi` offset
+from the bundle's single `%pool` base -- strictly a performance cost, not a
+correctness one.
+
 **Interaction with symbolic arguments:**
 
 In `bundle_symbolic_args=False` mode (not the default -- the default is
