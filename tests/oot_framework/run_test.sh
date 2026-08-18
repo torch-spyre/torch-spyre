@@ -1743,6 +1743,20 @@ _run_pytest_isolated() {
             # Run with split_output.sh wrapper
             _run_cmd torchrun --nproc-per-node "$_NPROC" --no-python bash "${_dir}/split_output.sh" python3 -u -m pytest "$_base" "${_args[@]}"
 
+            # split_output.sh tees only rank 0 to stdout, so on failure the
+            # non-zero ranks' output is the only record of the root cause --
+            # torchrun reports their exit code but not why (e.g. a card that
+            # failed to open). Emit them before the directory is removed.
+            if [[ "$(cat "$_exit_tmp" 2>/dev/null || echo 1)" != "0" ]]; then
+                for _rank_log in "${_LOGDIR}"/output-at-rank-*.txt; do
+                    [[ -f "$_rank_log" ]] || continue
+                    [[ "$_rank_log" == *output-at-rank-0.txt ]] && continue
+                    echo "===== BEGIN $(basename "$_rank_log") ====="
+                    cat "$_rank_log"
+                    echo "===== END $(basename "$_rank_log") ====="
+                done
+            fi
+
             # Clean up log directory
             rm -rf "${_LOGDIR}"
         else
