@@ -10,10 +10,16 @@ inputs:
     type: string
     default: torch-spyre
 
+outputs:
+  wheel_name:
+    description: Basename of the built wheel (found under <torch_spyre_dir>/dist).
+    value: ${{ steps.build.outputs.wheel_name }}
+
 runs:
   using: composite
   steps:
     - name: Build and install torch-spyre against local PyTorch
+      id: build
       shell: bash
       env:
         TORCH_SPYRE_DIR: ${{ inputs.torch_spyre_dir }}
@@ -74,4 +80,19 @@ runs:
         CFLAGS=" -Wno-error=maybe-uninitialized -Wno-error=uninitialized -Wno-error=restrict" \
         CXXFLAGS=" -Wno-error=maybe-uninitialized -Wno-error=uninitialized -Wno-error=restrict" \
         uv sync --all-extras --active --inexact --no-build-isolation --reinstall-package torch-spyre -v
+
+        # Package a wheel too -- while the local-pytorch pyproject.toml
+        # override above is still in effect (the EXIT trap reverts it only
+        # once this whole script exits) -- so callers can upload it and have
+        # a matrix job elsewhere install it via install-prebuilt-torch-spyre,
+        # instead of rebuilding torch-spyre a second time.
+        uv build --wheel --no-build-isolation --out-dir dist
+        WHEEL="$(ls -1 dist/*.whl | head -1)"
+        if [[ -z "$WHEEL" ]]; then
+          echo "::error::No wheel produced under ${TORCH_SPYRE_DIR}/dist" >&2
+          exit 1
+        fi
+        echo "Built wheel: $WHEEL"
+        echo "wheel_name=$(basename "$WHEEL")" >> "$GITHUB_OUTPUT"
+
         unset CXX

@@ -16,13 +16,15 @@ import pytest
 import torch
 
 
-def _assert_tensor_equal(result, expected, dtype, message_prefix):
+def _assert_tensor_equal(
+    result, expected, dtype, message_prefix, *, rtol=1e-5, atol=1e-5
+):
     if dtype.is_floating_point:
-        matches = torch.allclose(result, expected, rtol=1e-5, atol=1e-5)
+        matches = torch.allclose(result, expected, rtol=rtol, atol=atol)
         if not matches:
             # Find first mismatch for detailed error reporting
             diff = torch.abs(result - expected)
-            mismatch_mask = diff > (1e-5 + 1e-5 * torch.abs(expected))
+            mismatch_mask = diff > (atol + rtol * torch.abs(expected))
             if mismatch_mask.any():
                 mismatch_indices = torch.nonzero(mismatch_mask, as_tuple=False)
                 first_mismatch = mismatch_indices[0].tolist()

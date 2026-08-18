@@ -56,6 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code_changed: ${{ steps.filter.outputs.code_changed }}
+      integration_labeled: ${{ steps.label.outputs.labeled }}
     steps:
       - name: Checkout composite actions
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -67,15 +68,22 @@ jobs:
         id: filter
         uses: ./.github/actions/detect-doc-only-change
 
+      - name: Check for the integration-test label
+        id: label
+        uses: ./.github/actions/detect-integration-test-label
+
   # Build the torch_spyre._C extension ONCE and publish it as a wheel; the
   # matrix job below installs that single wheel instead of recompiling per entry.
   build:
     name: Build torch-spyre wheel (once)
     needs: changes
-    # Also skipped when `integration-test` is labeled -- Jenkins handles it instead
+    # Also skipped when `integration-test` is labeled -- Jenkins handles it instead.
+    # Read via the composite action: a merge_group payload carries no
+    # pull_request object, so the inline labels expression never matched in the
+    # queue and this rebuilt/retested every queued entry.
     if: |
       needs.changes.outputs.code_changed == 'true' &&
-      !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'integration-test'))
+      needs.changes.outputs.integration_labeled != 'true'
     # Compile-only: needs the backend image + SDK toolchain but NO physical Spyre
     # card, so it targets the cardless spyre_pf_x0 pool and leaves card runners
     # for the test jobs.

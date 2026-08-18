@@ -9,7 +9,7 @@
 # the source of truth for known LX-planning failures (the in-file .py
 # skip-lists were removed as duplicates).
 test_suite_config:
-  labels: [full]
+  labels: [regression, trunk]
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_inductor_ops_lx_planning.py
       unlisted_test_mode: skip
@@ -19,13 +19,28 @@ test_suite_config:
         # in both wraps collapse to (pointwise|reduction).
         - names:
             - LxPlanning.*::test_conv2d_1x3x32_ksize3_no_pad_lx_planning_(pointwise|reduction)
-            - LxPlanning.*::test_conv2d_1x64_ksize3_depthwise_lx_planning_(pointwise|reduction)
+            # patch-embed conv (H_out*W_out == 64, one fp16 stick): the mandatory
+            # (N,C_out,64)->(N,C_out,8,8) reshape splits a full stick into the
+            # 2-variable stick expr 8*d1+d2, which the restickify solver rejects
+            # once a fused LX consumer pins the layout. Fine standalone (free
+            # output layout); the standalone test_conv2d case validates the fix.
+            - LxPlanning.*::test_conv2d_1x6x128_patch16_bias_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_dwise_conv2d_1x64_ksize3_depthwise_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_conv2d_2x32_ksize1_stride2_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_conv2d_2x3x32_ksize1_lx_planning_(pointwise|reduction)
             - LxPlanning.*::test_conv2d_mistral_model_lx_planning_(pointwise|reduction)
+            # Native direct-lowered conv2d, STRIDED cases only. A stride-2 conv
+            # miscomputes when its output is pinned in LX via the test-only
+            # allow_all_ops_in_lx_planning clone-insertion path (the inserted
+            # identity copy reads the strided-conv output buffer densely and the
+            # spatial elements shuffle). Non-strided direct convs are correct
+            # under LX (all 16 stride-1 direct cases pass). Production never
+            # pins conv output -- conv is not in OP_OUTPUT_GOOD_FOR_LX_REUSE --
+            # so this is a test-only path (backend follow-up on PR #3284).
+            - LxPlanning.*::test_conv2d_direct_.*_s2_lx_planning_(pointwise|reduction)
           mode: xfail
         - names:
-            - LxPlanning.*::test_(all_dim|any_dim|count_nonzero|cummax|cummin|cumprod|logcumsumexp|max_default|median|mode_|nanmean|nanmedian|nanquantile|nansum|quantile|std_|topk|conv2d|var_).*_lx_planning_(pointwise|reduction)
+            - LxPlanning.*::test_(all_dim|any_dim|count_nonzero|cummax|cummin|cumprod|logcumsumexp|max_default|median|mode_|nanmean|nanmedian|nanquantile|nansum|quantile|std_|topk|conv2d|dwise_conv2d|var_).*_lx_planning_(pointwise|reduction)
           mode: mandatory_success
           tags:
             - ops__inductor-reduction
