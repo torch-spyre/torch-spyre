@@ -1936,7 +1936,8 @@ def test_copy_after_reduction_512x256_A4_B4():
 
 
 @pytest.mark.skip(
-    reason="copy_f into locally-created buffer with nested 2D tiling (H÷4 Lq÷4) produces wrong results"
+    reason="4D H4xLq4 copy_f into locally-created buffer still mismatches after "
+    "mutation_write_back copy_out fix (39.7% mismatch) -- distinct/deeper bug"
 )
 def test_copy_running_max_4d_H4_Lq4():
     """copy_f(maximum(real_max, amax(scores,dim=-2, running_max))) on [B,H,Lk,Lq] tiled H÷4 Lq÷4.
@@ -3247,7 +3248,9 @@ def _flash_v3_fn(
 
 
 @pytest.mark.skip(
-    reason="flash v3 with copy_f into locally-created buffers produces wrong results under H tiling"
+    reason="flash v3 H-tiling still mismatches after mutation_write_back copy_out "
+    "fix (49% mismatch) -- distinct/deeper bug, not the locally-created-buffer "
+    "copy_out routing issue"
 )
 def test_flash_v3_tile_H():
     """Flash v3: tile H÷4 only."""
@@ -5643,9 +5646,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         compare_with_cpu(fn, x, y, run_compile=True, run_eager=False)
 
-    @pytest.mark.skip(
-        reason="nested 2D tiling of copy_f into locally-created buffer produces wrong results"
-    )
     def test_hint_nested_tiling_copy_mutation_correct(self):
         """Nested Lq/D tiling into a direct copy_f() mutation (Case 3 rewire)."""
         from torch_spyre._inductor import spyre_hint
@@ -5668,9 +5668,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
 
-    @pytest.mark.skip(
-        reason="nested 2D tiling of copy_f into locally-created buffer produces wrong results"
-    )
     def test_hint_nested_tiling_copy_mutation_divergent_input_layout(self):
         """Case 3 nested coarse-tiling where `a`'s device layout genuinely
         diverges from `b`'s -- exercises per-arg tile_advance_expr (each arg
@@ -5725,9 +5722,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         spyre_result = torch.compile(fn)(a_dev, b_dev).cpu()
         compare_with_cpu(fn, a, b, target=spyre_result, run_eager=False)
 
-    @pytest.mark.skip(
-        reason="nested 2D tiling of copy_f into locally-created buffer produces wrong results"
-    )
     def test_hint_nested_tiling_copy_mutation_flat(self):
         """Same Case 3 rewire as test_hint_nested_tiling_copy_mutation_correct,
         but on a flattened [Lq * D] 1-D tensor rather than [Lq, D] 2-D.

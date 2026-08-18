@@ -665,6 +665,23 @@ def _plan_tiling_propagation(
                             is_graph_output=True,
                         )
                         continue
+                    # Locally-created mutation target that IS the graph
+                    # output (not a graph input): per the comment above,
+                    # this must still go through the normal copy_out path,
+                    # patching graph_outputs by the *target's* name (buf_name
+                    # itself never appears there -- see
+                    # PropagationPlan.graph_output_name).
+                    if target_is_output and mut_target is not None:
+                        full_ranges = _compute_full_ranges_planned(op, info)
+                        info.propagation = PropagationPlan(
+                            kind="copy_out",
+                            full_ranges=full_ranges,
+                            full_strides=tuple(op.layout.stride),
+                            outside_consumer_names=(),
+                            is_graph_output=True,
+                            graph_output_name=mut_target_name,
+                        )
+                        continue
                 info.propagation = PropagationPlan(kind="loop_internal")
                 continue
 
@@ -2016,7 +2033,7 @@ def _propagate_tiled_op(
     )
     _patch_consumers(outside_consumers, buf_name, full_name, operations, retile_info)
     if is_graph_output:
-        _patch_graph_outputs(buf_name, full_buf)
+        _patch_graph_outputs(propagation.graph_output_name or buf_name, full_buf)
 
     logger.debug(
         "coarse_tile: write copy-out %s -> %s old_stride=%s new_stride=%s "

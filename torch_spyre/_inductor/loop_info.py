@@ -123,7 +123,17 @@ class PropagationPlan:
         the module docstring on name stability) of ComputedBuffers outside
         this op's own outermost loop group that read this op's result.
     is_graph_output:
-        True if this op's buffer name appears in the graph's output names.
+        True if this op's buffer name appears in the graph's output names,
+        OR if this op is a ``MutationLayoutSHOULDREMOVE`` write into a
+        locally-created buffer that itself is the graph output (see
+        ``graph_output_name``).
+    graph_output_name:
+        Only set (and only differs from the op's own name) when this op is
+        a ``MutationLayoutSHOULDREMOVE`` write whose mutation *target* --
+        not the op's own buffer -- is the graph output (e.g.
+        ``copy_f(src, c)`` where ``c`` is a locally-created buffer that is
+        also the function's return value). ``None`` otherwise, meaning the
+        op's own name should be used to patch ``V.graph.graph_outputs``.
     """
 
     kind: Literal["loop_internal", "copy_out", "reduction", "mutation_write_back"]
@@ -132,6 +142,7 @@ class PropagationPlan:
     reduction: ReductionPlan | None = None
     outside_consumer_names: tuple[str, ...] = ()
     is_graph_output: bool = False
+    graph_output_name: str | None = None
 
 
 @dataclass(frozen=True)
