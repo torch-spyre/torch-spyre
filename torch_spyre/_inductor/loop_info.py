@@ -131,7 +131,7 @@ class PropagationPlan:
         Only set (and only differs from the op's own name) when this op is
         a ``MutationLayoutSHOULDREMOVE`` write whose mutation *target* --
         not the op's own buffer -- is the graph output (e.g.
-        ``copy_f(src, c)`` where ``c`` is a locally-created buffer that is
+        ``copy_forced(src, c)`` where ``c`` is a locally-created buffer that is
         also the function's return value). ``None`` otherwise, meaning the
         op's own name should be used to patch ``V.graph.graph_outputs``.
     """

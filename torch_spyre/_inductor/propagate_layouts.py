@@ -1440,7 +1440,7 @@ def _target_device_layout(target, name: str):
     layouts = getattr(graph_input, "layouts", None)
     if not layouts:
         # Also check candidate layouts set by propagate_layouts on the producing
-        # ComputedBuffer (e.g. a constant-fill op that precedes the copy_f).
+        # ComputedBuffer (e.g. a constant-fill op that precedes the copy_forced).
         # Exclude SpyreEmptyFallback and SpyreConstantFallback: those are
         # synthetic buffers whose layouts must be derived from their first
         # writer, not locked here. Only use this when the producer has a

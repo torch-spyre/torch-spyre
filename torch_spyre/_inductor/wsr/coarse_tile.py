@@ -622,7 +622,7 @@ def _plan_tiling_propagation(
             if not all_consumer_names and not is_graph_output:
                 # A MutationLayoutSHOULDREMOVE op whose own buffer name isn't
                 # a graph output may still write directly into a graph-input
-                # buffer that is also a graph output (e.g. copy_f(src, acc)
+                # buffer that is also a graph output (e.g. copy_forced(src, acc)
                 # where acc is both a graph input and the graph output — the
                 # op's own buffer is buf1, but arg0_1/acc is the graph output).
                 # Detect that case and classify as mutation_write_back so
@@ -1921,7 +1921,7 @@ def _propagate_mutation_write_back(
     """Set output_tiled_dims on a mutation_write_back op.
 
     The op already carries MutationLayoutSHOULDREMOVE targeting a
-    graph-output buffer (e.g. copy_f(src, acc) where acc is both a graph
+    graph-output buffer (e.g. copy_forced(src, acc) where acc is both a graph
     input and the graph output).  Its MutationLayout write IS the cross-tile
     write-back -- no separate copy op is needed, no full buffer allocation,
     no graph-output patching.
@@ -2461,7 +2461,7 @@ def _insert_copy_op(
     outer_key = tiled_op.loop_info.loop_group_id[0]  # type: ignore[attr-defined]
 
     # The copy-out must come AFTER any mutation ops in the same loop group
-    # that write into tiled_op's scratch buffer (e.g. copy_f with
+    # that write into tiled_op's scratch buffer (e.g. copy_forced with
     # MutationLayoutSHOULDREMOVE targeting tiled_op). Insert after the last
     # such mutation, not immediately after tiled_op.
     insert_after_idx = tiled_idx

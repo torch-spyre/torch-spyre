@@ -422,7 +422,7 @@ def finalize_layouts(graph: GraphLowering) -> None:
                 #    ordinary producer's output would be read; or
                 #  - coarse_tile.py's copy_out path for a MutationLayoutSHOULDREMOVE
                 #    op whose target is a locally-created graph-output buffer
-                #    (e.g. copy_f(src, c) where c is returned directly) --
+                #    (e.g. copy_forced(src, c) where c is returned directly) --
                 #    _insert_copy_op's inserted coarse_tile_copy_* op reads the
                 #    mutation op's own output the same way. The mutation target
                 #    there is an ordinary ComputedBuffer, not a SpyreEmptyFallback,

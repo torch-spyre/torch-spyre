@@ -147,7 +147,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
         if getattr(self.node, "_coarse_tile_force_live", False):
             return True
         # ComputedBuffers with MutationLayoutSHOULDREMOVE write into a
-        # pre-existing buffer (e.g. copy_f dst). The scheduler's own DCE
+        # pre-existing buffer (e.g. copy_forced dst). The scheduler's own DCE
         # doesn't know about this layout convention and marks them dead when
         # no downstream op reads the output name. Keep them live.
         if isinstance(self.node, ComputedBuffer) and isinstance(

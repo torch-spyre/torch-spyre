@@ -166,7 +166,7 @@ def recover_spyre_hints(graph: torch.fx.Graph) -> None:
     snapshot from collect_spyre_hints against the current graph on ``target``.
 
     Passes running between collect and recover can both insert nodes (e.g.
-    decompose_auto_functionalized inserts copy_f_default) and delete/replace
+    decompose_auto_functionalized inserts copy_forced_default) and delete/replace
     nodes (e.g. auto_functionalized_v2 is replaced). The algorithm must handle
     both cases:
 

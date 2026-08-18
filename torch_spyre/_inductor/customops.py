@@ -277,18 +277,20 @@ def _(
 # remove_noop_ops pass (unlike aten.copy_, this op is not in
 # noop_registry). Use this to guarantee a copy survives to the coarse
 # tile validator.
-@torch.library.custom_op("spyre::copy_f", mutates_args=("dst",), device_types="spyre")
-def copy_f(src: torch.Tensor, dst: torch.Tensor) -> None:
+@torch.library.custom_op(
+    "spyre::copy_forced", mutates_args=("dst",), device_types="spyre"
+)
+def copy_forced(src: torch.Tensor, dst: torch.Tensor) -> None:
     dst.copy_(src)
 
 
-@copy_f.register_fake
+@copy_forced.register_fake
 def _(src: torch.Tensor, dst: torch.Tensor) -> None:
     pass
 
 
-@torch.library.register_kernel("spyre::copy_f", ["cpu"])
-def copy_f_cpu(src: torch.Tensor, dst: torch.Tensor) -> None:
+@torch.library.register_kernel("spyre::copy_forced", ["cpu"])
+def copy_forced_cpu(src: torch.Tensor, dst: torch.Tensor) -> None:
     dst.copy_(src)
 
 
@@ -296,10 +298,10 @@ def copy_f_cpu(src: torch.Tensor, dst: torch.Tensor) -> None:
 # assert_functional_graph never sees a mutation. The real write into acc is
 # introduced later by lower_spyre_opaque_copy_ at Inductor lowering time,
 # which builds a MutationLayoutSHOULDREMOVE(acc) buffer identical to the one
-# copy_f's lowering builds. Callers must reassign: acc = opaque_copy_(value,
-# acc). Use this instead of copy_f where AOTAutograd functionalization would
-# otherwise reject the mutation (e.g. inside a decomposition traced by
-# torch.compile).
+# copy_forced's lowering builds. Callers must reassign:
+# acc = opaque_copy_(value, acc). Use this instead of copy_forced where
+# AOTAutograd functionalization would otherwise reject the mutation (e.g.
+# inside a decomposition traced by torch.compile).
 @torch.library.custom_op("spyre::opaque_copy_", mutates_args=(), device_types="spyre")
 def opaque_copy_(value: torch.Tensor, acc: torch.Tensor) -> torch.Tensor:
     return value.clone()

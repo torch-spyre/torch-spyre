@@ -1264,9 +1264,9 @@ def lower_spyre_from_d2d(src, dst, src_off, dst_off):
     lowering.mutate_to(dst, src)
 
 
-@register_spyre_lowering(torch.ops.spyre.copy_f)
-def lower_spyre_copy_f(src, dst):
-    # Custom lowering for copy_f to ensure it creates
+@register_spyre_lowering(torch.ops.spyre.copy_forced)
+def lower_spyre_copy_forced(src, dst):
+    # Custom lowering for copy_forced to ensure it creates
     # a mutation layout in all cases.  mutate_to()
     # has multiple code paths and does not always
     # mutate
@@ -1300,9 +1300,9 @@ def lower_spyre_opaque_copy_(value, acc):
     # so that assert_functional_graph never sees a mutation. The real
     # mutating write into acc is introduced here, at lowering time, by
     # building the same MutationLayoutSHOULDREMOVE(acc) buffer that
-    # lower_spyre_copy_f builds for copy_f. Everything downstream that keys
-    # off MutationLayoutSHOULDREMOVE (e.g. wsr/coarse_tile.py) treats this
-    # identically to a copy_f write.
+    # lower_spyre_copy_forced builds for copy_forced. Everything downstream
+    # that keys off MutationLayoutSHOULDREMOVE (e.g. wsr/coarse_tile.py)
+    # treats this identically to a copy_forced write.
     value = lowering.to_dtype(value, acc.get_dtype())
     value = lowering.expand(value, acc.get_size())
 
