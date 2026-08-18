@@ -209,6 +209,79 @@ module {
     _mlir_ktdp_available(),
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
 )
+class TestWorkDividedEmission(unittest.TestCase):
+    """The same add over 32 cores: the grid, one tile id, and a smaller tile.
+
+    Everything that changes against ``EXPECTED_ADD_KTIR`` is a consequence of the
+    iteration space's work division -- ``grid = [32]``, the per-core index, and
+    tiles of [16, 16, 64] instead of the whole [16, 512, 64].  The *views* do not
+    change: every core addresses the same buffer.
+    """
+
+    EXPECTED_DIVIDED_ADD_KTIR = """\
+#map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 511 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+#set1 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 15 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+module {
+  func.func @ktir_fused_add_0(%arg0: index, %arg1: index, %arg2: index) attributes {grid = [32]} {
+    %c0 = arith.constant 0 : index
+    %0 = ktdp.get_compute_tile_id : index
+    %1 = ktdp.construct_memory_view %arg0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
+    %2 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
+    %3 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
+    %c16 = arith.constant 16 : index
+    %4 = arith.muli %0, %c16 : index
+    %5 = ktdp.construct_access_tile %1[%c0, %4, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<16x512x64xf16> -> !ktdp.access_tile<16x16x64xindex>
+    %6 = ktdp.load %5 : <16x16x64xindex> -> tensor<16x16x64xf16>
+    %c16_0 = arith.constant 16 : index
+    %7 = arith.muli %0, %c16_0 : index
+    %8 = ktdp.construct_access_tile %2[%c0, %7, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<16x512x64xf16> -> !ktdp.access_tile<16x16x64xindex>
+    %9 = ktdp.load %8 : <16x16x64xindex> -> tensor<16x16x64xf16>
+    %10 = tensor.empty() : tensor<16x16x64xf16>
+    %11 = linalg.add ins(%6, %9 : tensor<16x16x64xf16>, tensor<16x16x64xf16>) outs(%10 : tensor<16x16x64xf16>) -> tensor<16x16x64xf16>
+    %c16_1 = arith.constant 16 : index
+    %12 = arith.muli %0, %c16_1 : index
+    %13 = ktdp.construct_access_tile %3[%c0, %12, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<16x512x64xf16> -> !ktdp.access_tile<16x16x64xindex>
+    ktdp.store %11, %13 : tensor<16x16x64xf16>, <16x16x64xindex>
+    return
+  }
+}
+"""
+
+    def test_divided_add_golden(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir(
+            "ktir_fused_add_0", [make_op_spec(divisions={"d1": 32})]
+        )
+        self.assertEqual(emitted, self.EXPECTED_DIVIDED_ADD_KTIR)
+
+    def test_one_core_emits_no_tile_id(self):
+        """An undivided space costs nothing: the single-core text is unchanged."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("ktir_fused_add_0", [make_op_spec()])
+        self.assertNotIn("get_compute_tile_id", emitted)
+        self.assertEqual(emitted, TestKtirEmitter.EXPECTED_ADD_KTIR)
+
+    def test_two_divided_symbols_read_the_id_as_mixed_radix(self):
+        """``d0`` takes ``id // 4`` and ``d1`` takes ``id % 4`` of an 8-core grid,
+        from the one tile id -- the plan's ``inner`` and ``div`` spelled out."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir(
+            "ktir_add_8", [make_op_spec(divisions={"d0": 2, "d1": 4})]
+        )
+        self.assertIn("attributes {grid = [8]}", emitted)
+        self.assertEqual(emitted.count("get_compute_tile_id"), 1)
+        self.assertIn("arith.divui", emitted)
+        self.assertIn("arith.remui", emitted)
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
 class TestTiledLoopEmission(unittest.TestCase):
     """A two-level nest, planned and emitted through the ordinary path.
 

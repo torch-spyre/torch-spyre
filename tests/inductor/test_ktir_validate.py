@@ -238,11 +238,15 @@ class TestValidateRejections(unittest.TestCase):
     def test_empty_spec_list_rejected(self):
         self._rejects([], "no OpSpec to emit")
 
-    def test_work_division_rejected(self):
-        """The grid comes from the contract, so the refusal reads the contract:
-        a symbol the iteration space splits has no grid to emit for yet."""
-        specs = [make_op_spec(divisions={"d1": 32})]
-        self._rejects(specs, "multi-core work division is not supported")
+    def test_mixed_work_division_rejected(self):
+        """Two ops in one kernel, two grids: there is only one grid to emit."""
+        specs = [make_op_spec(), make_op_spec(divisions={"d1": 2})]
+        self._rejects(specs, "different work divisions")
+
+    def test_ragged_work_division_rejected(self):
+        """A division that does not divide the axis evenly has no per-core tile."""
+        specs = [make_op_spec(divisions={"d1": 7})]  # 512 / 7 is not a whole tile
+        self._rejects(specs, "do not divide evenly")
 
     # -- spec-tree shape ---------------------------------------------------
 
@@ -343,10 +347,8 @@ class TestRejectionsThroughGenerateKtir(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             ktir.generate_ktir("ktir_fused_atan2_0", specs)
 
-    def test_work_division_unsupported(self):
-        specs = [make_op_spec()]
-        d1 = next(s for s in specs[0].iteration_space if str(s) == "d1")
-        specs[0].iteration_space[d1] = (512, 32)
+    def test_ragged_work_division_unsupported(self):
+        specs = [make_op_spec(divisions={"d1": 7})]
         with self.assertRaises(NotImplementedError):
             ktir.generate_ktir("ktir_fused_add_0", specs)
 
@@ -374,6 +376,57 @@ class TestPlanOptions(unittest.TestCase):
             sorted(f.name for f in dataclasses.fields(ktir.PlanOptions)),
             ["bake_addresses"],
         )
+
+
+class TestWorkDivision(unittest.TestCase):
+    """The grid, and the per-core tile, as ``iteration_space`` states them.
+
+    ``work_division.py`` has already turned ``config.sencores`` into a per-symbol
+    division by the time the emitter sees a spec, so the emitter reads the
+    contract and never the config -- the same source the SDSC path reads as its
+    work slices.
+    """
+
+    def test_an_undivided_space_is_one_core(self):
+        plan = ktir.build_kernel_plan([make_op_spec()])
+        self.assertEqual(plan.grid, (1,))
+        self.assertEqual(plan.divisions, ())
+
+    def test_the_grid_is_the_product_of_the_divisions(self):
+        plan = ktir.build_kernel_plan([make_op_spec(divisions={"d1": 32})])
+        self.assertEqual(plan.grid, (32,))
+        self.assertEqual(plan.divisions, (ktir.Division(symbol="d1", div=32, inner=1),))
+
+    def test_two_divided_symbols_are_mixed_radix(self):
+        """Outermost-first, and ``inner`` is that symbol's stride in the grid."""
+        plan = ktir.build_kernel_plan([make_op_spec(divisions={"d0": 2, "d1": 4})])
+        self.assertEqual(plan.grid, (8,))
+        self.assertEqual(
+            plan.divisions,
+            (
+                ktir.Division(symbol="d0", div=2, inner=4),
+                ktir.Division(symbol="d1", div=4, inner=1),
+            ),
+        )
+
+    def test_the_tile_shrinks_and_the_view_does_not(self):
+        """One core's tile is its share; every core addresses the whole buffer."""
+        plan = ktir.build_kernel_plan([make_op_spec(divisions={"d1": 32})])
+        for buffer in plan.parameters:
+            with self.subTest(buf_id=buffer.buf_id):
+                self.assertEqual(buffer.layout.extent, (16, 512, 64))
+        step = plan.steps[0]
+        self.assertEqual(step.out.extent, (16, 16, 64))  # 512 / 32 rows
+        # The division walks dim 1 in per-core-extent steps, and nothing else.
+        self.assertEqual(step.out.index_coeffs, ((0,), (16,), (0,)))
+
+    def test_a_division_no_output_axis_follows_is_rejected(self):
+        """A stick is the unit of transfer, so the lane axis is never divided --
+        which leaves a division of the lane symbol with no axis to walk, and every
+        core writing the same elements.  Refused rather than silently duplicated."""
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan([make_op_spec(divisions={"d2": 2})])
+        self.assertIn("no device axis of the output", str(ctx.exception))
 
 
 class TestKernelPlan(unittest.TestCase):
@@ -408,10 +461,6 @@ class TestKernelPlan(unittest.TestCase):
             [e.base_elements for e in plan.parameters],
             [0, (1 << 34) // 2, (2 << 34) // 2],
         )
-
-    def test_the_grid_is_one_core(self):
-        """One core until the grid is read from the iteration space."""
-        self.assertEqual(ktir.build_kernel_plan([make_op_spec()]).grid, (1,))
 
     def test_repeated_buffer_is_registered_once(self):
         specs = [make_op_spec()] + [make_op_spec()]
@@ -616,19 +665,6 @@ class TestLoopDerivations(unittest.TestCase):
         c_access = ktir._access(c, c.device_size, c_q, c_layout)
         self.assertEqual(c_access.extent, (1, 64))
         self.assertEqual(c_access.index_coeffs, ((1, 0), (0, 0)))
-
-    def test_symbolic_view_extent_rejected(self):
-        """A symbolic device size would have to reach the kernel as an argument
-        and size a dynamic memref dim; neither exists yet.
-
-        Asserted at the derivation, not through the walk: a symbolic
-        ``device_size`` does not survive the pointwise alignment check's
-        ``int()`` either, so the walk reports the wrong thing about it.
-        """
-        arg = make_op_spec(size=[sympy.Symbol("s0"), 512, 64]).args[0]
-        with self.assertRaises(NotImplementedError) as ctx:
-            ktir._solve_layout(arg, [])
-        self.assertIn("is symbolic; a symbolic device size", str(ctx.exception))
 
     def test_untiled_access_sits_at_the_view_origin(self):
         """Depth zero is the general answer, not a special case."""
