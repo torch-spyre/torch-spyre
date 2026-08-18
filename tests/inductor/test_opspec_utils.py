@@ -31,17 +31,17 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     _DIM_CONST,
     _DIM_OUTER_STICK,
     _DIM_WITHIN_STICK,
-    _align_reshape_plan,
-    _buf_id,
     _dim_info,
     _iteration_space_key,
-    _row_major_strides,
+    align_reshape_plan,
+    buf_id,
+    row_major_strides,
 )
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 
 
 def _arg(name, arg_index=0) -> TensorArg:
-    """Minimal TensorArg; only ``name`` matters for ``_buf_id``."""
+    """Minimal TensorArg; only ``name`` matters for ``buf_id``."""
     return TensorArg(
         is_input=True,
         arg_index=arg_index,
@@ -55,31 +55,31 @@ def _arg(name, arg_index=0) -> TensorArg:
 
 class TestRowMajorStrides(unittest.TestCase):
     def test_rank3(self):
-        self.assertEqual(_row_major_strides([16, 512, 64]), [32768, 64, 1])
+        self.assertEqual(row_major_strides([16, 512, 64]), [32768, 64, 1])
 
     def test_rank1(self):
-        self.assertEqual(_row_major_strides([64]), [1])
+        self.assertEqual(row_major_strides([64]), [1])
 
     def test_rank2(self):
-        self.assertEqual(_row_major_strides([8, 3]), [3, 1])
+        self.assertEqual(row_major_strides([8, 3]), [3, 1])
 
 
 class TestBufId(unittest.TestCase):
     def test_name_is_identity(self):
-        self.assertEqual(_buf_id(_arg("buf0")), "buf0")
+        self.assertEqual(buf_id(_arg("buf0")), "buf0")
 
     def test_same_name_same_id_across_input_output(self):
         # An intermediate appearing as both input and output (arg_index sentinel
         # -1 either side) must key on the shared name, not arg_index.
         as_in = _arg("buf7", arg_index=-1)
         as_out = _arg("buf7", arg_index=-1)
-        self.assertEqual(_buf_id(as_in), _buf_id(as_out))
+        self.assertEqual(buf_id(as_in), buf_id(as_out))
 
     def test_none_name_raises_value_error(self):
         # Missing name is a broken internal invariant, not a capability gap:
         # ValueError, not NotImplementedError.
         with self.assertRaises(ValueError):
-            _buf_id(_arg(None))
+            buf_id(_arg(None))
 
 
 class TestDimInfo(unittest.TestCase):
@@ -97,10 +97,14 @@ class TestDimInfo(unittest.TestCase):
         self.assertEqual(sym, d0)
 
     def test_outer_stick(self):
+        """Both spellings: torch's FloorDiv, and the sympy floor the projection
+        actually produces (which used to be classified as neither)."""
         d0 = sympy.Symbol("d0")
-        kind, sym = _dim_info(FloorDiv(d0, 64))
-        self.assertEqual(kind, _DIM_OUTER_STICK)
-        self.assertEqual(sym, d0)
+        for coord in (FloorDiv(d0, 64), sympy.floor(d0 / 64)):
+            with self.subTest(coord=coord):
+                kind, sym = _dim_info(coord)
+                self.assertEqual(kind, _DIM_OUTER_STICK)
+                self.assertEqual(sym, d0)
 
     def test_multi_symbol_raises(self):
         d0, d1 = sympy.symbols("d0 d1")
@@ -156,14 +160,14 @@ class TestIterationSpaceKey(unittest.TestCase):
 class TestAlignReshapePlan(unittest.TestCase):
     def test_identity_returns_none(self):
         d0, d1 = sympy.symbols("d0 d1")
-        self.assertIsNone(_align_reshape_plan([d0, d1], [16, 64], [d0, d1], [16, 64]))
+        self.assertIsNone(align_reshape_plan([d0, d1], [16, 64], [d0, d1], [16, 64]))
 
     def test_broadcast_unmatched_output_axis(self):
         # Input [a, within] aligned into output [a, b, within]: the output's
         # ``b`` axis has no input counterpart, so it reshapes to extent 1 and
         # then broadcasts to the output block.
         a, b, c = sympy.symbols("a b c")
-        plan = _align_reshape_plan(
+        plan = align_reshape_plan(
             [a, sympy.Mod(c, 64)],
             [16, 64],
             [a, b, sympy.Mod(c, 64)],
@@ -175,7 +179,7 @@ class TestAlignReshapePlan(unittest.TestCase):
         # Matched input axes in decreasing order -> would need a permute.
         a, b, c = sympy.symbols("a b c")
         with self.assertRaises(NotImplementedError):
-            _align_reshape_plan(
+            align_reshape_plan(
                 [b, a, sympy.Mod(c, 64)],
                 [2, 3, 64],
                 [a, b, sympy.Mod(c, 64)],
@@ -187,7 +191,7 @@ class TestAlignReshapePlan(unittest.TestCase):
         # data -> needs a cross-stick transpose (restickify), not a reshape.
         a, d, c = sympy.symbols("a d c")
         with self.assertRaises(NotImplementedError):
-            _align_reshape_plan(
+            align_reshape_plan(
                 [a, sympy.Mod(c, 64)],
                 [4, 64],
                 [d, sympy.Mod(c, 64)],
