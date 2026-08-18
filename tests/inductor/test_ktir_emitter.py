@@ -209,6 +209,168 @@ module {
     _mlir_ktdp_available(),
     "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
 )
+class TestWorkDividedEmission(unittest.TestCase):
+    """The same add over 32 cores: the grid, one tile id, and a smaller tile.
+
+    Everything that changes against ``EXPECTED_ADD_KTIR`` is a consequence of the
+    iteration space's work division -- ``grid = [32]``, the per-core index, and
+    tiles of [16, 16, 64] instead of the whole [16, 512, 64].  The *views* do not
+    change: every core addresses the same buffer.
+    """
+
+    EXPECTED_DIVIDED_ADD_KTIR = """\
+#map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 511 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+#set1 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 15 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+module {
+  func.func @ktir_fused_add_0(%arg0: index, %arg1: index, %arg2: index) attributes {grid = [32]} {
+    %c0 = arith.constant 0 : index
+    %0 = ktdp.get_compute_tile_id : index
+    %1 = ktdp.construct_memory_view %arg0, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
+    %2 = ktdp.construct_memory_view %arg1, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
+    %3 = ktdp.construct_memory_view %arg2, sizes: [16, 512, 64], strides: [32768, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
+    %c16 = arith.constant 16 : index
+    %4 = arith.muli %0, %c16 : index
+    %5 = ktdp.construct_access_tile %1[%c0, %4, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<16x512x64xf16> -> !ktdp.access_tile<16x16x64xindex>
+    %6 = ktdp.load %5 : <16x16x64xindex> -> tensor<16x16x64xf16>
+    %c16_0 = arith.constant 16 : index
+    %7 = arith.muli %0, %c16_0 : index
+    %8 = ktdp.construct_access_tile %2[%c0, %7, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<16x512x64xf16> -> !ktdp.access_tile<16x16x64xindex>
+    %9 = ktdp.load %8 : <16x16x64xindex> -> tensor<16x16x64xf16>
+    %10 = tensor.empty() : tensor<16x16x64xf16>
+    %11 = linalg.add ins(%6, %9 : tensor<16x16x64xf16>, tensor<16x16x64xf16>) outs(%10 : tensor<16x16x64xf16>) -> tensor<16x16x64xf16>
+    %c16_1 = arith.constant 16 : index
+    %12 = arith.muli %0, %c16_1 : index
+    %13 = ktdp.construct_access_tile %3[%c0, %12, %c0] {access_tile_order = #map, access_tile_set = #set1} : memref<16x512x64xf16> -> !ktdp.access_tile<16x16x64xindex>
+    ktdp.store %11, %13 : tensor<16x16x64xf16>, <16x16x64xindex>
+    return
+  }
+}
+"""
+
+    def test_divided_add_golden(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir(
+            "ktir_fused_add_0", [make_op_spec(divisions={"d1": 32})]
+        )
+        self.assertEqual(emitted, self.EXPECTED_DIVIDED_ADD_KTIR)
+
+    def test_one_core_emits_no_tile_id(self):
+        """An undivided space costs nothing: the single-core text is unchanged."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("ktir_fused_add_0", [make_op_spec()])
+        self.assertNotIn("get_compute_tile_id", emitted)
+        self.assertEqual(emitted, TestKtirEmitter.EXPECTED_ADD_KTIR)
+
+    def test_two_divided_symbols_read_the_id_as_mixed_radix(self):
+        """``d0`` takes ``id // 4`` and ``d1`` takes ``id % 4`` of an 8-core grid,
+        from the one tile id -- the plan's ``inner`` and ``div`` spelled out."""
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir(
+            "ktir_add_8", [make_op_spec(divisions={"d0": 2, "d1": 4})]
+        )
+        self.assertIn("attributes {grid = [8]}", emitted)
+        self.assertEqual(emitted.count("get_compute_tile_id"), 1)
+        self.assertIn("arith.divui", emitted)
+        self.assertIn("arith.remui", emitted)
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
+class TestReductionEmission(unittest.TestCase):
+    """``sum`` over the axis that does not survive, one stick per core.
+
+    The spec is the shape the frontend really produces for
+    ``torch.sum(x[256, 2048], dim=0)``: the reduced axis is still in the output's
+    ``device_size`` as a unit extent with a constant coordinate, and the output's
+    2048 lanes are 32 sticks, which is what the 32 cores divide.
+
+    What comes out is the form a hand-written KTIR ``sum`` kernel uses -- a
+    ``linalg.reduce`` with ``dimensions = [1]`` into a bare ``tensor.empty``, and
+    no reshape, because the placeholder axis is dropped rather than reduced.  A
+    ``linalg.fill`` accumulator would be rejected by the scheduler's first pass,
+    and ``tensor.expand_shape`` is not supported anywhere in it, so both are worth
+    the golden pinning them out.
+    """
+
+    EXPECTED_SUM_KTIR = """\
+#map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#map1 = affine_map<(d0, d1) -> (d0, d1)>
+#set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 255 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+#set1 = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+#set2 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 255 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+#set3 = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+module {
+  func.func @ktir_sum_0(%arg0: index, %arg1: index) attributes {grid = [32]} {
+    %c0 = arith.constant 0 : index
+    %0 = ktdp.get_compute_tile_id : index
+    %1 = ktdp.construct_memory_view %arg0, sizes: [32, 256, 64], strides: [16384, 64, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<32x256x64xf16>
+    %2 = ktdp.construct_memory_view %arg1, sizes: [32, 64], strides: [64, 1] {coordinate_set = #set1, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<32x64xf16>
+    %3 = ktdp.construct_access_tile %1[%0, %c0, %c0] {access_tile_order = #map, access_tile_set = #set2} : memref<32x256x64xf16> -> !ktdp.access_tile<1x256x64xindex>
+    %4 = ktdp.load %3 : <1x256x64xindex> -> tensor<1x256x64xf16>
+    %5 = tensor.empty() : tensor<1x64xf16>
+    %reduced = linalg.reduce ins(%4 : tensor<1x256x64xf16>) outs(%5 : tensor<1x64xf16>) dimensions = [1] 
+      (%in: f16, %init: f16) {
+        %7 = arith.addf %in, %init : f16
+        linalg.yield %7 : f16
+      }
+    %6 = ktdp.construct_access_tile %2[%0, %c0] {access_tile_order = #map1, access_tile_set = #set3} : memref<32x64xf16> -> !ktdp.access_tile<1x64xindex>
+    ktdp.store %reduced, %6 : tensor<1x64xf16>, <1x64xindex>
+    return
+  }
+}
+"""
+
+    @staticmethod
+    def _sum_specs():
+        """``sum(x[256, 2048], dim=0)`` as the frontend projects it."""
+        import sympy
+
+        lanes, rows = sympy.symbols("c0 c1")
+        # The two device-axis coordinate forms the projection emits: the plain
+        # sympy floor for the outer-stick index, and Mod for the lanes.
+        stick, lane = sympy.floor(lanes / 64), sympy.Mod(lanes, 64)
+        return [
+            make_op_spec(
+                "sum",
+                is_reduction=True,
+                inputs=1,
+                sizes=[[32, 256, 64], [1, 32, 64]],
+                # The reduced axis is still in the output, as a unit extent at a
+                # constant coordinate: rank 3 in, rank 3 out.
+                coords_per_arg=[[stick, rows, lane], [sympy.Integer(0), stick, lane]],
+                space={lanes: (2048, 32), rows: (256, 1)},
+            )
+        ]
+
+    def test_sum_golden(self):
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        emitted = generate_ktir("ktir_sum_0", self._sum_specs())
+        self.assertEqual(emitted, self.EXPECTED_SUM_KTIR)
+
+    def test_the_placeholder_axis_is_dropped_not_reduced(self):
+        """The output is rank 2 everywhere -- view, tile and stored tensor -- so
+        no reshape stands between the reduce and the store."""
+        from torch_spyre._inductor.codegen import ktir
+
+        plan = ktir.build_kernel_plan(self._sum_specs())
+        [step] = plan.steps
+        self.assertEqual(step.reduce_dims, (1,))  # the 256 rows
+        self.assertEqual(step.out.extent, (1, 64))
+        self.assertEqual(plan.buffers["buf0"].layout.extent, (32, 64))
+        self.assertNotIn("expand_shape", ktir.generate_ktir("k", self._sum_specs()))
+
+
+@unittest.skipUnless(
+    _mlir_ktdp_available(),
+    "mlir_ktdp with the func/arith/linalg/scf/tensor dialect bindings is not installed",
+)
 class TestTiledLoopEmission(unittest.TestCase):
     """A two-level nest, planned and emitted through the ordinary path.
 

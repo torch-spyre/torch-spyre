@@ -35,8 +35,10 @@ from ..logging_utils import get_inductor_logger
 from ..propagate_hints import DimHint
 from ..pass_utils import op_out_coords, host_coordinates, indirect_sizes_from_op
 from ..ir import FixedTiledLayout
+from .coarse_tile import _loop_var_to_reduction_ranges_pos
 from .span_overflow_hint_analysis import (
     SpanOverflowTilePlan,
+    _bmm_k_symbol,
     can_conform_pointwise_tile,
     plan_span_overflow_tile,
 )
@@ -121,14 +123,12 @@ def _consumer_shares_group_tiled_dim(
 
     Both cases fail closed via the loop-variable correspondence below.
 
-    The automatic span-overflow planner only ever tiles output ranges (see
-    ``SpanOverflowTileLevel``: ``is_reduction`` is always False on the auto
-    path, because reduction-range tiling would require partial-result
-    accumulation), so every signature reaching here should already be
-    output-only.  We assert that invariant explicitly below — on **both** the
-    consumer's signature and each producer's dims — and fail closed if a future
-    planner change ever emits a reduction-range tile, since such a tile would
-    break the loop-carried accumulation this join assumes away.
+    The automatic planner normally tiles output ranges, but its BMM fallback can
+    tile K.  We assert the output-range invariant explicitly below -- on both
+    the consumer's signature and each producer's dims -- and fail closed if a
+    reduction-range tile reaches this check, since such a tile would break the
+    loop-carried accumulation this join assumes away.  K fallback plans must
+    remain independent groups.
 
     Checking the producer side matters only because a Reduction can now root a
     run (see ``span_overflow_groups``).  Before that, an unjoined Reduction
@@ -246,23 +246,47 @@ def _dims_to_hints(
     out_coords = op_out_coords(op)
     hints: list[DimHint] = []
     for (host_dim, split_count, is_reduction), hint_id in zip(dims, hint_ids):
-        if host_dim >= len(out_coords):
-            raise Unsupported(
-                f"Cannot adapt span-overflow plan for {op.get_name()}: "
-                f"host_dim={host_dim} is out of bounds for "
-                f"{len(out_coords)} output coordinates."
-            )
-
-        coord = out_coords[host_dim]
-        free_symbols = coord.free_symbols
-        if len(free_symbols) != 1:
-            raise Unsupported(
-                f"Cannot adapt span-overflow plan for {op.get_name()}: "
-                f"host_dim={host_dim} output coordinate {coord} has "
-                f"{len(free_symbols)} free symbols; expected exactly one loop var."
-            )
-
-        loop_var = next(iter(free_symbols))
+        if is_reduction:
+            reduction_ranges = list(getattr(op.data, "reduction_ranges", []))
+            if host_dim >= len(reduction_ranges):
+                raise Unsupported(
+                    f"Cannot adapt span-overflow reduction plan for {op.get_name()}: "
+                    f"host_dim={host_dim} is out of bounds for reduction ranges "
+                    f"{reduction_ranges}."
+                )
+            loop_var = _bmm_k_symbol(op)
+            if loop_var is None:
+                raise Unsupported(
+                    f"Cannot adapt span-overflow reduction plan for {op.get_name()}: "
+                    "could not identify the BMM K loop variable."
+                )
+            try:
+                reduction_pos = _loop_var_to_reduction_ranges_pos(op, loop_var)
+            except (StopIteration, AttributeError, TypeError, ValueError):
+                reduction_pos = None
+            if reduction_pos != host_dim:
+                raise Unsupported(
+                    f"Cannot adapt span-overflow reduction plan for {op.get_name()}: "
+                    f"BMM K loop variable {loop_var} maps to reduction range "
+                    f"position {reduction_pos}, expected {host_dim}."
+                )
+            coord = loop_var
+        else:
+            if host_dim >= len(out_coords):
+                raise Unsupported(
+                    f"Cannot adapt span-overflow plan for {op.get_name()}: "
+                    f"host_dim={host_dim} is out of bounds for "
+                    f"{len(out_coords)} output coordinates."
+                )
+            coord = out_coords[host_dim]
+            free_symbols = coord.free_symbols
+            if len(free_symbols) != 1:
+                raise Unsupported(
+                    f"Cannot adapt span-overflow plan for {op.get_name()}: "
+                    f"host_dim={host_dim} output coordinate {coord} has "
+                    f"{len(free_symbols)} free symbols; expected exactly one loop var."
+                )
+            loop_var = next(iter(free_symbols))
         logger.debug(
             "[span-overflow groups] op=%s host_dim=%d coord=%s "
             "loop_var=%s split_count=%s hint_id=%d is_reduction=%s",
@@ -381,26 +405,31 @@ def span_overflow_groups(
     ``[bmm, pointwise]``, as in
     ``test_bmm_producer_groups_with_pointwise_consumer``.
 
-    A Reduction that cannot join instead **opens its own run**
-    (``current_root_is_reduction``), so a directly-connected consumer can fuse
-    into its loop (BMM -> PW, BMM -> BMM, BMM -> sum).  Tile ``t`` of a
-    Reduction's *output* dim is self-contained exactly as a Pointwise tile is,
-    so the producer's per-tile slice feeds the consumer in the same iteration.
-    A **Pointwise** consumer of such a run must additionally read the run and
-    pass ``_consumer_shares_group_tiled_dim`` — the Pointwise fast paths
-    otherwise reuse the run's ``host_dim`` positionally, which is unsound once
-    the producer is a Reduction (see that helper).  A **Reduction** consumer
-    already goes through that check on the join branch, which is also what
-    rejects a producer whose tiled dim lands on the consumer's reduction (K)
-    range.  If nothing joins, the run flushes to exactly the singleton group an
-    unjoined Reduction used to produce eagerly.  An op that
-    reads a buffer from an already-closed group, or from the open run without
-    being fusable into it, still raises ``Unsupported``: two independent loop
-    nests over the same span-overflow-sized data can desynchronize, and for ops
-    tiled specifically because their *full* buffer violates the hardware span
-    limit, falling back to materializing that full buffer for an "outside
-    consumer" would silently reintroduce the exact span violation tiling was
-    meant to prevent.
+    A Reduction that cannot join instead opens its own run when it tiles an
+    output range, so a directly-connected consumer can fuse into its loop
+    (BMM -> PW, BMM -> BMM, BMM -> sum).  Tile ``t`` of a Reduction's
+    *output* dim is self-contained exactly as a Pointwise tile is, so the
+    producer's per-tile slice feeds the consumer in the same iteration.  A
+    K-only reduction-range plan is the exception: it remains an independent
+    group and consumes producers through their materialized outputs.  A
+    **Pointwise** consumer of a Reduction-rooted run must additionally read the
+    run and pass ``_consumer_shares_group_tiled_dim`` -- the Pointwise fast
+    paths otherwise reuse the run's ``host_dim`` positionally, which is unsound
+    once the producer is a Reduction (see that helper).  A **Reduction**
+    consumer already goes through that check on the join branch, which is also
+    what rejects a producer whose tiled dim lands on the consumer's reduction
+    (K) range.  If nothing joins, the run flushes to exactly the singleton
+    group an unjoined Reduction used to produce eagerly.
+
+    Any plan that reads a buffer from an already-closed group, or from the
+    open run without being fusable into it, still raises ``Unsupported``: two
+    independent loop nests over the same span-overflow-sized data can
+    desynchronize, and for ops tiled specifically because their *full* buffer
+    violates the hardware span limit, falling back to materializing that full
+    buffer for an outside consumer would silently reintroduce the exact span
+    violation tiling was meant to prevent. K-only plans also fail this guard:
+    their reduction-range loop cannot be synchronized with an output-tiled
+    producer, so independently nesting the two plans is unsafe.
     """
     from .. import config
 
@@ -421,7 +450,7 @@ def span_overflow_groups(
     dim_hint_assignments: list[tuple[Operation, list[DimHint]]] = []
     next_hint_id = _SPAN_OVERFLOW_HINT_ID
     auto_tiled_producers: set[str] = set()
-    # Producers whose group was closed by a Reduction consumer joining it (see
+    # Output-range-tiled producers whose group was closed by a Reduction consumer joining it (see
     # the reduction-join branch below).  These are a subset of
     # ``auto_tiled_producers``; tracked separately only so a *second* consumer
     # reading such a producer gets a precise "multi-consumer not yet supported"
@@ -523,6 +552,9 @@ def span_overflow_groups(
             continue
 
         signature = _auto_span_plan_signature(plan)
+        reduction_only_plan = bool(signature) and all(
+            is_reduction for _host_dim, _split, is_reduction in signature
+        )
         logger.debug(
             "[span-overflow groups] op=%s plan_levels=%s reasons=%s",
             op.get_name(),
@@ -541,29 +573,24 @@ def span_overflow_groups(
         completed_conflicts = sorted(
             read_deps & (auto_tiled_producers | manually_hinted_producers)
         )
+        joined_conflicts = sorted(set(completed_conflicts) & reduction_joined_producers)
+        if joined_conflicts:
+            # A producer already synchronized with one reduction consumer
+            # cannot safely feed a second independently tiled reduction.
+            raise Unsupported(
+                f"Cannot auto-tile {op.get_name()}: it reads producer(s) "
+                f"{joined_conflicts} that were already auto-tiled and joined "
+                "by another reduction consumer. A single auto-tiled producer "
+                "can currently feed only one reduction consumer in one "
+                "synchronized group; multiple consumers sharing one "
+                "auto-tiled producer is not yet supported (#3217)."
+            )
         if completed_conflicts:
             logger.warning(
                 "[span-overflow groups] op=%s rejected_conflicting_auto_producers=%s",
                 op.get_name(),
                 completed_conflicts,
             )
-            joined_conflicts = sorted(
-                set(completed_conflicts) & reduction_joined_producers
-            )
-            if joined_conflicts:
-                # The producer was already auto-tiled *and* joined into a
-                # synchronized loop by an earlier reduction consumer.  A single
-                # auto-tiled producer can currently feed only one reduction
-                # consumer; a second consumer would need its own tile loop over
-                # the same producer, which is not yet supported.
-                raise Unsupported(
-                    f"Cannot auto-tile {op.get_name()}: it reads producer(s) "
-                    f"{joined_conflicts} that were already auto-tiled and joined "
-                    "by another reduction consumer. A single auto-tiled producer "
-                    "can currently feed only one reduction consumer in one "
-                    "synchronized group; multiple consumers sharing one "
-                    "auto-tiled producer is not yet supported (#3217)."
-                )
             raise Unsupported(
                 f"Cannot auto-tile {op.get_name()}: it reads already-tiled "
                 f"producer(s) {completed_conflicts} that are not in an open "
@@ -741,29 +768,40 @@ def span_overflow_groups(
             continue
 
         # A Reduction/BMM op that did not join an open producer group (above)
-        # opens a run of its own rather than being emitted as a closed
-        # singleton, so a directly-connected Pointwise consumer can still fuse
-        # into its loop (BMM -> PW).  Tile t of a Reduction's *output* dim is
-        # self-contained just as a Pointwise tile is, so the producer's per-tile
-        # slice feeds the consumer within the same iteration — no full-buffer
-        # materialization, no second unsynchronized loop nest.
-        #
-        # Behavior-preserving when nothing joins: flush_current_group() then
-        # emits exactly the singleton group (same ops, same hint_ids, same
-        # levels) this branch used to build eagerly.  The only observable
-        # difference is *when* the group is emitted, and the flush at the top of
-        # this iteration's fall-through path guarantees the run is empty here,
-        # so group ordering is unchanged.  Consumers that cannot legally join
-        # still raise Unsupported, only now via the pending_conflicts path above
-        # (identical message) instead of the completed-group path.
-        current_group.append((op, signature))
-        current_signature = signature
-        current_root_is_reduction = True
-        logger.info(
-            "[span-overflow groups] op=%s started_new_reduction_rooted_group split=%s",
-            op.get_name(),
-            list(signature),
-        )
+        # either opens a run of its own (for output-range tiles) or stays as an
+        # independent singleton (for reduction-range/K-only tiles).  K-only
+        # plans cannot join or root a producer-consumer run because each K tile
+        # is only a partial accumulation.
+        if reduction_only_plan:
+            hint_ids = list(range(next_hint_id, next_hint_id + len(signature)))
+            next_hint_id += len(signature)
+            dim_hint_assignments.append((op, _dims_to_hints(op, signature, hint_ids)))
+            levels = [
+                (hint_id, sympy.Integer(split_count))
+                for hint_id, (_host_dim, split_count, _is_reduction) in zip(
+                    hint_ids, signature
+                )
+            ]
+            groups.append(([op], levels))
+            logger.debug(
+                "[span-overflow groups] created group_index=%d op=%s levels=%s",
+                len(groups) - 1,
+                op.get_name(),
+                levels,
+            )
+        else:
+            # Output-tiled Reductions open a run so a directly-connected
+            # consumer can fuse into their loop (BMM -> PW, BMM -> BMM,
+            # BMM -> sum).  Tile t of an output dim is self-contained just as
+            # a Pointwise tile is.
+            current_group.append((op, signature))
+            current_signature = signature
+            current_root_is_reduction = True
+            logger.info(
+                "[span-overflow groups] op=%s started_new_reduction_rooted_group split=%s",
+                op.get_name(),
+                list(signature),
+            )
 
         level_summary = [
             (host_dim, split_count) for host_dim, split_count, _ in signature

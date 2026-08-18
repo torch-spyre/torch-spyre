@@ -301,6 +301,7 @@ class _ParameterizedScratchpadMeta(type):
     # added to ``parameter_axes`` work without editing this method.
     _AXIS_LABELS = {
         "solver_method": lambda v: str(v),
+        "hint_mode": lambda v: str(v),
         "sencores": lambda v: f"sc{v}",
         "co_optimization": lambda v: "coopt" if v else "nocoopt",
     }

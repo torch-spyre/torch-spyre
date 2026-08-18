@@ -28,6 +28,7 @@
 #include <variant>
 #include <vector>
 
+#include "spyrecode-host-functions/fast_process_hcm.h"
 #include "spyrecode-host-functions/spyrecode.h"
 
 namespace spyre {
@@ -437,8 +438,17 @@ class JobPlanStepHostCompute final : public JobPlanStep {
       : hcm_(std::move(hcm)),
         output_buffer_(output_buffer),
         input_buffer_(input_buffer),
-        ishape_(ishape) {
+        ishape_(std::move(ishape)) {
     pipeline_barrier_ = false;  // host callbacks are overlap-eligible
+
+    // Try to build fast plan at construction time (prepare time)
+    if (hcm_) {
+      fast_plan_.valid = deeptools::buildFastHcmPatchPlan(fast_plan_, *hcm_);
+      if (!fast_plan_.valid) {
+        // Mark as permanently invalid so we don't retry
+        fast_plan_.output_size = UINT32_MAX;
+      }
+    }
   }
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
@@ -450,6 +460,9 @@ class JobPlanStepHostCompute final : public JobPlanStep {
   void* output_buffer_;       // Non-owning pointer (JobPlan owns the buffer)
   const void* input_buffer_;  // Non-owning pointer (JobPlan owns the buffer)
   std::vector<int64_t> ishape_;
+
+  // Pre-compiled patch plan for fast execution
+  mutable deeptools::FastHcmPatchPlan fast_plan_;
 };
 
 /**

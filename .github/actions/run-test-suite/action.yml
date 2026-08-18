@@ -42,6 +42,14 @@ inputs:
     description: How often (seconds) the stall watcher polls
     required: false
     default: '30'
+  card_release_timeout_secs:
+    description: >-
+      Grace period before retrying an attempt that failed because the AIU card
+      was still held (VFIO device busy). Longer than the plain retry backoff:
+      the holder is a leftover process from the previous attempt in this pod,
+      and the pod's VFIO devices are fixed at admission.
+    required: false
+    default: '60'
   junit_xml_path:
     description: Full path for the --junit-xml report (leave empty to skip)
     required: false
@@ -70,6 +78,7 @@ runs:
         MAX_ATTEMPTS: ${{ inputs.max_attempts }}
         STALL_TIMEOUT_SECS: ${{ inputs.stall_timeout_secs }}
         STALL_CHECK_INTERVAL: ${{ inputs.stall_check_interval }}
+        CARD_RELEASE_TIMEOUT_SECS: ${{ inputs.card_release_timeout_secs }}
       run: |-
         set +e
         set +o pipefail
@@ -244,8 +253,16 @@ runs:
           fi
 
           echo "=== Attempt ${attempt} FAILED (exit=${TEST_EXIT}) ==="
+          # Backoff before the next attempt. Card contention needs longer than a
+          # plain rerun: the holder is a leftover process of the *previous*
+          # attempt inside this same pod, and the VFIO devices are fixed at pod
+          # admission, so there is no second card to fall back to.
+          _RETRY_SLEEP=10
           if grep -qE "ResponseTimeout|Exceeded max iterations|Fatal Python error: Aborted|LX logout" "$LOG_FILE"; then
             echo "    --> Hardware RAS timeout detected — will retry"
+          elif grep -qE 'RAS::VFIO::DeviceOpenFail|"code":"0x332b"|Device or resource busy' "$LOG_FILE"; then
+            echo "    --> Card still held (VFIO device busy) — will retry after ${CARD_RELEASE_TIMEOUT_SECS}s grace"
+            _RETRY_SLEEP=$CARD_RELEASE_TIMEOUT_SECS
           elif [[ $_STALLED_LAST_ATTEMPT -eq 1 ]]; then
             echo "    --> Stall detected — will retry with -n1 (xdist worker isolation)"
           else
@@ -253,7 +270,7 @@ runs:
           fi
 
           rm -f "$LOG_FILE" "$STALL_FLAG" "${STALL_FLAG}.done" "${STALL_FLAG}.stalled"
-          [[ $attempt -lt $MAX_ATTEMPTS ]] && sleep 10
+          [[ $attempt -lt $MAX_ATTEMPTS ]] && sleep "$_RETRY_SLEEP"
         done
 
         echo "=== All ${MAX_ATTEMPTS} attempts failed for ${{ inputs.suite_name }} ==="
