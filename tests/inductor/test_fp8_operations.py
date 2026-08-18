@@ -25,19 +25,19 @@ import pytest
 import torch
 
 from torch._inductor.exc import InductorError
-from torch_spyre._inductor.constants import FP8_E4M3FN_MAX, FP8_E4M3FN_MIN, FP8_E4M3_MAX
+from torch_spyre._inductor.constants import FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from utils_inductor import (
     cached_randn,
     compare_with_pytorch,
 )
 
 # Maximum spacing between adjacent representable values in FP8 E4M3
-FP8_E4M3_MAX_SPACING = 32.0
+FP8_E4M3FN_MAX_SPACING = 32.0
 
 
 # Additional test constants
 FP8_E4M3_HALF_MAX = (
-    FP8_E4M3_MAX / 2.0
+    FP8_E4M3FN_MAX / 2.0
 )  # 224.0 - Half of FP8 E4M3 max for testing reduced quantization ranges
 FP16_SAFE_LARGE_VALUE = (
     30000.0  # Well below FP16 max (65504) to avoid overflow in edge case tests
@@ -223,7 +223,7 @@ class TestFP8Operations:
             scale_value,
             mean,
             std,
-            atol=FP8_E4M3_MAX_SPACING * scale_value,
+            atol=FP8_E4M3FN_MAX_SPACING * scale_value,
             rtol=0.0,
         )
 
@@ -307,7 +307,7 @@ class TestFP8Operations:
             return torch.ops.spyre.quantscalepertokenfp8(x)
 
         def pytorch_fn(x):
-            return torch.amax(torch.abs(x), dim=-1, keepdim=True) / FP8_E4M3_MAX
+            return torch.amax(torch.abs(x), dim=-1, keepdim=True) / FP8_E4M3FN_MAX
 
         compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=1e-3, rtol=1e-3)
 
@@ -340,18 +340,18 @@ class TestFP8Operations:
             return torch.ops.spyre.quantscalepertokenfp8(x)
 
         def pytorch_fn(x):
-            return torch.amax(torch.abs(x), dim=-1, keepdim=True) / FP8_E4M3_MAX
+            return torch.amax(torch.abs(x), dim=-1, keepdim=True) / FP8_E4M3FN_MAX
 
         compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=1e-3, rtol=1e-3)
 
     @pytest.mark.parametrize(
         "shape,scale_ub",
         [
-            ((2, 4, 8), FP8_E4M3_MAX),  # Default FP8_E4M3_MAX
+            ((2, 4, 8), FP8_E4M3FN_MAX),  # Default FP8_E4M3FN_MAX
             ((2, 4, 8), FP8_E4M3_HALF_MAX),  # Half of default
             ((2, 4, 8), 100.0),  # Custom value to test non-standard quantization range
-            ((2, 4, 32), FP8_E4M3_MAX),  # Larger hidden dim
-            ((1, 128, 512), FP8_E4M3_MAX),  # Production-like shape
+            ((2, 4, 32), FP8_E4M3FN_MAX),  # Larger hidden dim
+            ((1, 128, 512), FP8_E4M3FN_MAX),  # Production-like shape
             ((1, 128, 512), FP8_E4M3_HALF_MAX),  # Production-like with custom scale_ub
         ],
     )
@@ -394,7 +394,7 @@ class TestFP8Operations:
             return torch.ops.spyre.quantscalepertokenfp8(x)
 
         def pytorch_fn(x):
-            return torch.amax(torch.abs(x), dim=-1, keepdim=True) / FP8_E4M3_MAX
+            return torch.amax(torch.abs(x), dim=-1, keepdim=True) / FP8_E4M3FN_MAX
 
         compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=1e-3, rtol=1e-3)
 
@@ -411,7 +411,7 @@ class TestFP8Operations:
             return torch.ops.spyre.quantscalepertokenfp8(x)
 
         def pytorch_fn(x):
-            return torch.amax(torch.abs(x), dim=-1, keepdim=True) / FP8_E4M3_MAX
+            return torch.amax(torch.abs(x), dim=-1, keepdim=True) / FP8_E4M3FN_MAX
 
         # Compare with relaxed tolerance due to hardware epsilon
         # Note: Hardware adds small epsilon to prevent division by zero
@@ -420,8 +420,8 @@ class TestFP8Operations:
     @pytest.mark.parametrize(
         "shape,scale_ub",
         [
-            ((2, 4, 8), FP8_E4M3_MAX),
-            ((1, 128, 512), FP8_E4M3_MAX),
+            ((2, 4, 8), FP8_E4M3FN_MAX),
+            ((1, 128, 512), FP8_E4M3FN_MAX),
         ],
     )
     def test_quantscalepertokenfp8_with_quantize_integration(self, shape, scale_ub):
@@ -450,7 +450,7 @@ class TestFP8Operations:
             # CPU reference implementation
             scale = torch.amax(torch.abs(x), dim=-1, keepdim=True) / scale_ub
             x_scaled = x / scale
-            x_fp8 = x_scaled.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+            x_fp8 = x_scaled.clamp(-FP8_E4M3FN_MAX, FP8_E4M3FN_MAX).to(torch.float8_e4m3fn)
             return x_fp8.to(torch.float16) * scale
 
         # Use tolerance appropriate for FP8 quantization roundtrip
@@ -497,7 +497,7 @@ class TestFP8Operations:
             return torch.ops.spyre.quantscalepertokenfp8(x)
 
         def pytorch_fn(x):
-            return torch.amax(torch.abs(x), dim=-1, keepdim=True) / FP8_E4M3_MAX
+            return torch.amax(torch.abs(x), dim=-1, keepdim=True) / FP8_E4M3FN_MAX
 
         # Use appropriate tolerance based on input type
         # Note: zeros and near_zero have relaxed tolerance (atol=1e-5, rtol=1e-2) because:

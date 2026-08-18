@@ -31,7 +31,7 @@ from .constants import (
     CONV2D_FWD_OP,
     COPY_BACK_CANDIDATE_ATTR,
     DEPTHWISE_CONV2D_OP,
-    FP8_E4M3_MAX,
+    FP8_E4M3FN_MAX,
     QUANTSCALEPERTOKENFP8_CLIP_MAX,
     QUANTSCALEPERTOKENFP8_CLIP_MIN,
 )
@@ -1856,7 +1856,7 @@ def lower_qfp8wt(x):
 
 
 @register_spyre_lowering(torch.ops.spyre.quantscalepertokenfp8)
-def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3_MAX):
+def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3FN_MAX):
     """
     Lower quantscalepertokenfp8 as a Reduction operation.
 
@@ -1874,7 +1874,7 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3_MAX):
     if scale_ub <= 0:
         raise ValueError(
             f"scale_ub must be positive, got {scale_ub}. "
-            f"Typical value is FP8_E4M3_MAX ({FP8_E4M3_MAX})"
+            f"Typical value is FP8_E4M3FN_MAX ({FP8_E4M3FN_MAX})"
         )
     if not (1e-10 < scale_ub < 1e10):  # Reasonable FP16 range
         logger.warning(

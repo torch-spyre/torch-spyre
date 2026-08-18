@@ -21,7 +21,7 @@ from torch_spyre.ops.eager import compile_once
 from torch_spyre.ops.fallbacks import warn_fallback
 
 from .errors import Unsupported
-from .constants import FP8_E4M3_MAX
+from .constants import FP8_E4M3FN_MAX
 
 aten = torch.ops.aten
 
@@ -821,7 +821,7 @@ def _(input: torch.Tensor) -> torch.Tensor:
     "spyre::quantscalepertokenfp8", mutates_args=(), device_types="spyre"
 )
 def quantscalepertokenfp8(
-    input: torch.Tensor, scale_ub: float = FP8_E4M3_MAX
+    input: torch.Tensor, scale_ub: float = FP8_E4M3FN_MAX
 ) -> torch.Tensor:
     """
     Compute per-token quantization scale for FP8 conversion.
@@ -834,7 +834,7 @@ def quantscalepertokenfp8(
 
     Args:
         input: Input tensor (FP16) to compute scales for, shape [batch, seq, hidden]
-        scale_ub: Upper bound for scaling (default: FP8_E4M3_MAX = 448.0, FP8 E4M3 max value)
+        scale_ub: Upper bound for scaling (default: FP8_E4M3FN_MAX = 448.0, FP8 E4M3 max value)
 
     Returns:
         Per-token scale tensor (FP16), shape [batch, seq, 1]
@@ -854,7 +854,7 @@ def quantscalepertokenfp8(
 
 
 @quantscalepertokenfp8.register_fake
-def _(input: torch.Tensor, scale_ub: float = FP8_E4M3_MAX) -> torch.Tensor:
+def _(input: torch.Tensor, scale_ub: float = FP8_E4M3FN_MAX) -> torch.Tensor:
     # Output has same shape as input except last dim becomes 1
     out_shape = list(input.shape)
     out_shape[-1] = 1

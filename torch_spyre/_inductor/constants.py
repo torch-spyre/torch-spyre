@@ -184,7 +184,6 @@ SPYRE_INT32_OPS = [
 FP8_E4M3FN_INFO = torch.finfo(torch.float8_e4m3fn)
 FP8_E4M3FN_MAX = float(FP8_E4M3FN_INFO.max)
 FP8_E4M3FN_MIN = float(FP8_E4M3FN_INFO.min)
-FP8_E4M3_MAX = FP8_E4M3FN_MAX  # Alias used by quantscalepertokenfp8
 
 # DDL template constant for quantscalepertokenfp8 clipMin parameter
 # Required by the DeepTools DDL template (quant_scale_per_token.ddl) for operation compilation.
