@@ -135,8 +135,8 @@ def _concretize_for_cmp(expr):
 
 def _decompose_constant_offset(
     offset: sympy.Expr,
-    stride: Sequence[sympy.Expr],
     size: Sequence[sympy.Expr],
+    stride: Sequence[sympy.Expr],
     coordinates: list[sympy.Expr],
 ) -> bool:
     """Attribute a constant storage offset to device coordinates positionally.
@@ -292,7 +292,7 @@ def compute_coordinates(
         # _decompose_constant_offset).  Symbolic offsets, or an offset that
         # cannot be fully peeled, fall back to add_term's original behavior.
         handled = not offset.free_symbols and _decompose_constant_offset(
-            offset, stride, size, coordinates
+            offset, size, stride, coordinates
         )
         if not handled:
             add_term(var=offset, step=sympy.S.One, limit=sympy.oo)
