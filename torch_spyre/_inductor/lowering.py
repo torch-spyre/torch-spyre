@@ -1264,12 +1264,6 @@ def lower_spyre_from_d2d(src, dst, src_off, dst_off):
     lowering.mutate_to(dst, src)
 
 
-@register_spyre_lowering(torch.ops.spyre.copy_)
-def lower_spyre_copy_(src, dst):
-    lowering.mutate_to(dst, src)
-    return dst
-
-
 @register_spyre_lowering(torch.ops.spyre.copy_f)
 def lower_spyre_copy_f(src, dst):
     # Custom lowering for copy_f to ensure it creates

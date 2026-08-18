@@ -273,31 +273,10 @@ def _(
     pass
 
 
-# Copy src into dst in-place (the mutating primitive).
-# No @compile_once needed: the body calls aten::copy_ which dispatches
-# through spyre__copy_from → copy_from_d2d / copy_tensor — no cycle back
-# to spyre::copy_ itself.
-@torch.library.custom_op("spyre::copy_", mutates_args=("dst",), device_types="spyre")
-def copy_(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    dst.copy_(src)
-    return dst
-
-
-@copy_.register_fake
-def _(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    return dst
-
-
-@torch.library.register_kernel("spyre::copy_", ["cpu"])
-def copy__cpu(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    dst.copy_(src)
-    return dst
-
-
-# Functional (out-of-place) wrapper for spyre::copy_.
-# Unlike aten.copy_, this op is not in noop_registry, so it is never eliminated
-# by Inductor's remove_noop_ops pass. Use this to guarantee a copy survives to
-# the coarse tile validator.
+# Copy src into dst in-place, guaranteed to survive Inductor's
+# remove_noop_ops pass (unlike aten.copy_, this op is not in
+# noop_registry). Use this to guarantee a copy survives to the coarse
+# tile validator.
 @torch.library.custom_op("spyre::copy_f", mutates_args=("dst",), device_types="spyre")
 def copy_f(src: torch.Tensor, dst: torch.Tensor) -> None:
     dst.copy_(src)
