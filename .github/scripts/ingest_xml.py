@@ -339,9 +339,10 @@ def insert_perf_benchmarks(client, run_id: int, benchmarks: list[dict]) -> None:
     )
     if absent:
         print(
-            f"  Warning: perf_benchmarks has no {', '.join(sorted(absent))} — "
+            f"  [warn] perf_benchmarks has no {', '.join(sorted(absent))} — "
             f"storing this run without them. Apply the spyre-dashboard migration "
-            f"to capture them."
+            f"to capture them.",
+            file=sys.stderr,
         )
         columns = [c for c in columns if c not in absent]
 
