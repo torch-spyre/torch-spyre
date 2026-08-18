@@ -723,7 +723,6 @@ def _is_direct_conv_supported(
     dilation: list[int],
     groups: int,
 ) -> bool:
-    print(f"_is_direct_conv_supported: input: {input.shape} weight: {weight.shape} stride: {stride} groups: {groups}")
     """Cases the native conv2d direct lowering (lower_convolution) handles.
 
     Keep this in lock-step with the guards in lower_convolution so that whenever
@@ -828,7 +827,6 @@ def _is_direct_conv_supported(
         # See the "Assumption this routing decision rests on" note above.
         and C_in % eps == 0
     )
-    print(f"In direct_lowering_supported: supported: {supported}")
     if not supported:
         return False
     # Ragged input width (see docstring): the fp16 opfunc tiles the output width
@@ -867,7 +865,6 @@ def conv2d_via_bmm_decomp(
     # non-fp16) fall through and decompose to im2col+matmul as before. This is
     # the compile-path target; the flag defaults off so eager and default
     # compile behavior are unchanged.
-    print(f"CONFIG: conv2d_direct_lowering: {config.conv2d_direct_lowering}")
     if config.conv2d_direct_lowering and _is_direct_conv_supported(
         input, weight, stride, transposed, output_padding, padding, dilation, groups
     ):

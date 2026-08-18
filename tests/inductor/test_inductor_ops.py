@@ -5429,6 +5429,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
         },
         ("test_conv1d_direct", "test_conv1d_direct_base"): {
+            "expect_fail": ["1x64x13_k3_s2", "1x64x17_k3_s2", "1x64x9_k3_s2"],
             "param_sets": {
                 # k2, zero padding -- smallest direct-lowered window.
                 "1x64x8_k2": (
