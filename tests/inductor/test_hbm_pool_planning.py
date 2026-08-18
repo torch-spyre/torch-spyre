@@ -121,6 +121,17 @@ def _make_ftl_buffer(name, host_size=(64,), dim_order=(0,)):
     return buf
 
 
+def _make_ftl_buffer_aliased(name, alias_of, host_size=(64,), dim_order=(0,)):
+    """Real ComputedBuffer whose FixedTiledLayout.allocation is the exact
+    same dict object as `alias_of`'s -- reproduces the aliasing
+    MutationLayoutSHOULDREMOVE (or copy-elision) produces when one op's
+    write target is another buffer's storage under a different name.
+    """
+    buf = _make_ftl_buffer(name, host_size, dim_order)
+    buf.get_layout().allocation = alias_of.get_layout().allocation
+    return buf
+
+
 def _make_snode_with_rw(name, writes, reads):
     """MagicMock SchedulerNode with real MemoryDep read_writes for the
     given buffer names, and get_nodes()/get_name() wired for
@@ -429,6 +440,39 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
 
         buf = V.graph.get_buffer("accum")
         self.assertNotIn("hbm_pool", buf.get_layout().allocation)
+
+    def test_aliased_buffer_across_bundles_is_not_pool_eligible(self):
+        """A buffer allocated in bundle A (e.g. a `full()` accumulator) that
+        is later mutated in bundle B under a *different* name -- because
+        MutationLayoutSHOULDREMOVE/copy-elision makes the mutating op's
+        FixedTiledLayout.allocation the same dict object as the original
+        buffer's, not merely dependency-linked to it by name -- must not be
+        pool-eligible in either bundle.
+
+        Regression test for issue #3775: bundle B's own candidacy check for
+        "alias" sees a normal, single-bundle-local write+read and pool-
+        allocates it, silently mutating the shared allocation dict. That
+        retroactively assigns "target" (bundle A, never itself a candidate)
+        a stale/foreign offset that is out of bounds against bundle A's own
+        pool size, since bundle A's allocator never accounted for it. The
+        old _is_cross_bundle check is purely name-keyed and cannot see this:
+        "target" and "alias" share no read/write dependency edge at all.
+        """
+        target = _make_ftl_buffer("target")
+        write_target = _make_snode_with_rw("write_target", writes=["target"], reads=[])
+        bundle_a = FusedSchedulerNode(MagicMock(), [write_target])
+
+        _make_ftl_buffer_aliased("alias", alias_of=target)
+        write_alias = _make_snode_with_rw("write_alias", writes=["alias"], reads=[])
+        read_alias = _make_snode_with_rw("read_alias", writes=[], reads=["alias"])
+        bundle_b = FusedSchedulerNode(MagicMock(), [write_alias, read_alias])
+
+        hbm_pool_planning([bundle_a, bundle_b])
+
+        target_buf = V.graph.get_buffer("target")
+        alias_buf = V.graph.get_buffer("alias")
+        self.assertNotIn("hbm_pool", target_buf.get_layout().allocation)
+        self.assertNotIn("hbm_pool", alias_buf.get_layout().allocation)
 
     def test_buffer_that_overflows_pool_falls_back_to_standalone_hbm(self):
         """When MAX_POOL_SIZE is too small to hold every pool-eligible

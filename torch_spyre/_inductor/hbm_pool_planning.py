@@ -235,6 +235,25 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
             and id(layout.allocation) not in io_alloc_ids
         )
 
+    def _alloc_id(name: str) -> int | None:
+        """Return id(layout.allocation) for `name`, or None if unavailable.
+
+        Buffers that alias another buffer's storage (e.g. a
+        MutationLayoutSHOULDREMOVE target written by a later, differently-
+        named op) share the same allocation dict object even though the two
+        names are unrelated by any read/write dependency edge -- this is the
+        same aliasing io_alloc_ids above already has to work around for
+        graph I/O.  Resolving it here lets bundle attribution below catch
+        the intermediate-to-intermediate case too.
+        """
+        buf = V.graph.get_buffer(name)
+        if buf is None:
+            return None
+        layout = buf.maybe_get_layout()
+        if not isinstance(layout, FixedTiledLayout):
+            return None
+        return id(layout.allocation)
+
     # Buffers read by Fallback/Extern/Nop nodes must stay Python-side tensors,
     # regardless of which bundle they belong to.
     all_flat_nodes: list[BaseSchedulerNode] = list(_iter_all_nodes(nodes))
@@ -258,6 +277,11 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
     buffer_writer_bundle: dict[str, str] = {}
     buffer_writer_bundles: dict[str, set[str]] = {}
     buffer_reader_bundles: dict[str, set[str]] = {}
+    # id(layout.allocation) -> every bundle that wrote a name resolving to
+    # that allocation dict.  Populated alongside buffer_writer_bundles so
+    # aliased names (see _alloc_id) are attributed to the same underlying
+    # storage even though they share no name-based dependency edge.
+    alloc_id_bundles: dict[int, set[str]] = {}
 
     for bundle in nodes:
         bundle_name = bundle.get_name()
@@ -270,6 +294,8 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
                 if dep.name not in graph_outputs:
                     buffer_writer_bundle[dep.name] = bundle_name
                     buffer_writer_bundles.setdefault(dep.name, set()).add(bundle_name)
+                    if (alloc_id := _alloc_id(dep.name)) is not None:
+                        alloc_id_bundles.setdefault(alloc_id, set()).add(bundle_name)
             for dep in node.read_writes.reads:
                 if dep.name not in graph_inputs:
                     buffer_reader_bundles.setdefault(dep.name, set()).add(bundle_name)
@@ -289,6 +315,8 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
                 buffer_writer_bundles.setdefault(node.node.get_name(), set()).add(
                     bundle_name
                 )
+                if (alloc_id := _alloc_id(node.node.get_name())) is not None:
+                    alloc_id_bundles.setdefault(alloc_id, set()).add(bundle_name)
 
     written = set(buffer_writer_bundle)
     read = set(buffer_reader_bundles)
@@ -300,6 +328,16 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
                 "excluding from pool eligibility",
                 name,
                 sorted(buffer_writer_bundles[name]),
+            )
+            return True
+        alloc_id = _alloc_id(name)
+        if alloc_id is not None and len(alloc_id_bundles.get(alloc_id, set())) > 1:
+            logger.debug(
+                "hbm_pool_planning: %s shares its allocation with a buffer "
+                "written in another bundle %s -- excluding from pool "
+                "eligibility",
+                name,
+                sorted(alloc_id_bundles[alloc_id]),
             )
             return True
         readers = buffer_reader_bundles.get(name, set())
