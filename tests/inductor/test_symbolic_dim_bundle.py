@@ -28,7 +28,7 @@ from torch_spyre._inductor.codegen.bundle import (
     generate_bundle,
 )
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
-from torch_spyre._inductor.constants import MAX_POOL_SIZE
+from torch_spyre._inductor.constants import MAX_POOL_SIZE_BYTES
 from torch_spyre._inductor.op_spec import OpSpec
 
 
@@ -374,7 +374,7 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
             self._run_bundle([entry], pool_size=0)
 
     def test_pool_size_above_max_raises(self):
-        """A pool symbol with pool_size > MAX_POOL_SIZE must fail loudly."""
+        """A pool symbol with pool_size > MAX_POOL_SIZE_BYTES must fail loudly."""
         pool_kind = SymbolKind.pool()
         entry = (
             _make_sdsc_json(hbm_sym_ids_per_core={"[0, 0, 0]": -1}),
@@ -384,11 +384,11 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
         )
 
         with self.assertRaises(AssertionError):
-            self._run_bundle([entry], pool_size=MAX_POOL_SIZE + 1)
+            self._run_bundle([entry], pool_size=MAX_POOL_SIZE_BYTES + 1)
 
     def test_pool_size_at_max_succeeds(self):
-        """A pool symbol with pool_size == MAX_POOL_SIZE (the exact budget
-        boundary) must be accepted, not rejected -- MAX_POOL_SIZE is itself
+        """A pool symbol with pool_size == MAX_POOL_SIZE_BYTES (the exact budget
+        boundary) must be accepted, not rejected -- MAX_POOL_SIZE_BYTES is itself
         an in-budget value, and Allocator can legitimately return an offset
         whose pool_end lands exactly there."""
         pool_kind = SymbolKind.pool()
@@ -399,8 +399,8 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
             [pool_kind],
         )
 
-        bundle = self._run_bundle([entry], pool_size=MAX_POOL_SIZE)
+        bundle = self._run_bundle([entry], pool_size=MAX_POOL_SIZE_BYTES)
         self.assertIn(
-            f"%pool = sdscbundle.device_mem_allocate {MAX_POOL_SIZE} bytes : index",
+            f"%pool = sdscbundle.device_mem_allocate {MAX_POOL_SIZE_BYTES} bytes : index",
             bundle,
         )

@@ -23,7 +23,7 @@ import sympy
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec
-from torch_spyre._inductor.constants import MAX_POOL_SIZE
+from torch_spyre._inductor.constants import MAX_POOL_SIZE_BYTES
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, format_op_spec_list
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
@@ -248,9 +248,9 @@ def generate_bundle(
         else:
             f.write("\tfunc.func @sdsc_bundle() {\n")
 
-        assert not has_pool or 0 < pool_size <= MAX_POOL_SIZE, (
+        assert not has_pool or 0 < pool_size <= MAX_POOL_SIZE_BYTES, (
             f"generate_bundle: pool_size={pool_size} out of range "
-            f"(0, {MAX_POOL_SIZE}] for a bundle with a pool symbol present"
+            f"(0, {MAX_POOL_SIZE_BYTES}] for a bundle with a pool symbol present"
         )
         if has_pool:
             f.write(

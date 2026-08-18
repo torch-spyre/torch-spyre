@@ -495,14 +495,14 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
         self.assertNotIn("hbm_pool", alias_buf.get_layout().allocation)
 
     def test_buffer_that_overflows_pool_falls_back_to_standalone_hbm(self):
-        """When MAX_POOL_SIZE is too small to hold every pool-eligible
+        """When MAX_POOL_SIZE_BYTES is too small to hold every pool-eligible
         buffer, the ones that fit get an hbm_pool allocation and the
         overflow buffer(s) fall back to standalone HBM (no hbm_pool key)
         instead of raising.
 
         buf0 (128 bytes) and buf1 (256 bytes) have non-overlapping live
         ranges but the allocator restarts a fresh Allocator per bundle, so
-        with MAX_POOL_SIZE patched to 200 bytes, buf0 fits (128 <= 200) but
+        with MAX_POOL_SIZE_BYTES patched to 200 bytes, buf0 fits (128 <= 200) but
         buf1 does not (256 > 200): the very first allocation call already
         exceeds budget for buf1 regardless of live-range-driven reuse.
         """
@@ -514,7 +514,7 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
         r1 = _make_snode_with_rw("r1", writes=[], reads=["buf1"])
         bundle = FusedSchedulerNode(MagicMock(), [w0, r0, w1, r1])
 
-        with patch("torch_spyre._inductor.hbm_pool_planning.MAX_POOL_SIZE", 200):
+        with patch("torch_spyre._inductor.hbm_pool_planning.MAX_POOL_SIZE_BYTES", 200):
             hbm_pool_planning([bundle])
 
         buf0 = V.graph.get_buffer("buf0")
@@ -526,7 +526,7 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
         self.assertEqual(V.graph.hbm_pool_sizes[bundle.get_name()], 128)
 
     def test_all_buffers_overflow_pool_produces_zero_size_pool(self):
-        """If MAX_POOL_SIZE is too small for even the first buffer, every
+        """If MAX_POOL_SIZE_BYTES is too small for even the first buffer, every
         pool-eligible buffer in the bundle falls back to standalone HBM and
         the bundle's recorded pool extent is 0 -- no RuntimeError."""
         _make_ftl_buffer("buf0", host_size=(64,))
@@ -534,7 +534,7 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
         reader = _make_snode_with_rw("reader", writes=[], reads=["buf0"])
         bundle = FusedSchedulerNode(MagicMock(), [writer, reader])
 
-        with patch("torch_spyre._inductor.hbm_pool_planning.MAX_POOL_SIZE", 1):
+        with patch("torch_spyre._inductor.hbm_pool_planning.MAX_POOL_SIZE_BYTES", 1):
             hbm_pool_planning([bundle])
 
         buf0 = V.graph.get_buffer("buf0")
@@ -558,7 +558,7 @@ class TestHbmPoolPlanningPerBundle(unittest.TestCase):
         # one live buffer at a time, not both concurrently.
         bundle = FusedSchedulerNode(MagicMock(), [w0, r0, w1, r1])
 
-        with patch("torch_spyre._inductor.hbm_pool_planning.MAX_POOL_SIZE", 128):
+        with patch("torch_spyre._inductor.hbm_pool_planning.MAX_POOL_SIZE_BYTES", 128):
             hbm_pool_planning([bundle])
 
         buf0 = V.graph.get_buffer("buf0")

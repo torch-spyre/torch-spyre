@@ -22,7 +22,7 @@ from torch._inductor.scheduler import (
 )
 from torch._inductor.ir import FallbackKernel
 from torch._inductor.virtualized import V
-from .constants import MAX_POOL_SIZE, INTERMEDIATES_SEGMENT
+from .constants import MAX_POOL_SIZE_BYTES, INTERMEDIATES_SEGMENT
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .logging_utils import get_inductor_logger
 from .scheduler import CountedLoopSchedulerNode
@@ -30,6 +30,7 @@ from . import config
 
 logger = get_inductor_logger("HBM_POOL_PLANNING")
 _STICK_BYTES = 128
+_BYTES_PER_GB = 1024**3
 
 
 class Allocator:
@@ -419,7 +420,7 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
         live_ranges = _compute_live_ranges(live_range_nodes, bundle_candidates)
         sorted_bufs = sorted(live_ranges.items(), key=_alloc_sort_key)
 
-        allocator = Allocator(MAX_POOL_SIZE)
+        allocator = Allocator(MAX_POOL_SIZE_BYTES)
 
         # Track (end_step, offset, size) so we can free blocks promptly.
         pending_frees: list[tuple[int, int, int]] = []
@@ -499,16 +500,16 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
                 "the %.2f GB pool budget and fell back to standalone HBM",
                 bundle_name,
                 overflowed,
-                MAX_POOL_SIZE / (1024**3),
+                MAX_POOL_SIZE_BYTES / _BYTES_PER_GB,
             )
         logger.info(
             "hbm_pool_planning: bundle=%s assigned %d intermediates, peak concurrent "
             "usage %.2f GB, pool extent %.2f GB / %.2f GB",
             bundle_name,
             len(sorted_bufs) - overflowed,
-            peak / (1024**3),
-            pool_extent / (1024**3),
-            MAX_POOL_SIZE / (1024**3),
+            peak / _BYTES_PER_GB,
+            pool_extent / _BYTES_PER_GB,
+            MAX_POOL_SIZE_BYTES / _BYTES_PER_GB,
         )
         V.graph.hbm_pool_sizes[bundle_name] = pool_extent
 
@@ -519,7 +520,7 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
             "hbm_pool_planning: %d bundle(s) with pool allocations, "
             "total pool bytes across bundles %.2f GB",
             len(V.graph.hbm_pool_sizes),
-            sum(V.graph.hbm_pool_sizes.values()) / (1024**3),
+            sum(V.graph.hbm_pool_sizes.values()) / _BYTES_PER_GB,
         )
 
     return nodes
