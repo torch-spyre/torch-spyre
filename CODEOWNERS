@@ -49,3 +49,6 @@
 /pytest.ini               @ashokponkumar @jabostian @anubhavjana @n-marion
 /pytest_models.ini        @ashokponkumar @jabostian @anubhavjana @n-marion
 /Makefile                 @ashokponkumar @jabostian @anubhavjana @n-marion
+
+# Extensions
+/extensions/spyre-metrics-api   @kazunoriogata @inatatsu

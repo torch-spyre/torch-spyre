@@ -1,0 +1,44 @@
+## This is a safe guard to prevent tooling to look for config files
+## in the torch-spyre project root directory.
+
+[project]
+name = "torch_spyre.extensions"
+authors = [
+    {name = "Torch-Spyre Authors"}
+]
+description = "Torch-Spyre extensions"
+version = "0.0.1"
+
+[build-system]
+requires = [
+    "build",
+    "setuptools>=70.1.0,<80.0",
+    "wheel"
+]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools] # Guard for setuptools
+# Sub-directories are pruned in MANIFEST.in
+
+[tool.ruff] # Guard for ruff
+# Exclude all sub-projects to isolate torch-spyre and extension projects
+#
+# NOTE: Pre-commit checks exclude all sub-projects because of "exclude=" setting
+# in the top-level pyproject.toml to isolate torch-spyre and extension projects.
+# Enable pre-commit checks for each of sub-projects by modify GitHub workflow settings to
+# run the check explicitly when the sub-project is ready.
+extend-exclude = ["**/"]
+
+[tool.mypy] # Guard for mypy
+# Exclude all sub-projects to isolate torch-spyre and extension projects
+#
+# NOTE: Pre-commit checks exclude all sub-projects because of "exclude=" setting
+# in the top-level pyproject.toml to isolate torch-spyre and extension projects.
+# Enable pre-commit checks for each of sub-projects by modify GitHub workflow settings to
+# run the check explicitly when the sub-project is ready.
+exclude = [".*/"]
+
+[tool.uv] # Guard for uv
+
+[tool.uv.build-backend]
+source-exclude = [".*/"]
