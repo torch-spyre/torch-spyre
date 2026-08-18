@@ -116,6 +116,14 @@ else
 	@TORCH_SPYRE_TEST_TYPE="$(TEST_TYPE)" bash tests/run_test.sh $(TEST_CONFIGS) $(PYTEST_ARGS)
 endif
 
+# Single-card / multi-card split, via the testtype__distributed marker every distributed_tests/ config now carries.
+.PHONY: tests-single-card tests-multi-card
+tests-single-card: ## Run TEST_TYPE's non-distributed slice only (excludes testtype__distributed). Needs 1 card.
+	$(MAKE) tests PYTEST_ARGS='$(PYTEST_ARGS) -m "not testtype__distributed"'
+
+tests-multi-card: ## Run TEST_TYPE's distributed slice only (testtype__distributed). Needs 2 cards.
+	$(MAKE) tests TEST_CONFIGS=tests/configs/distributed_tests PYTEST_ARGS='$(PYTEST_ARGS) -m "testtype__distributed"'
+
 
 # ---------------------------------------------------------------------------
 # OOT config checks (duplicates + missing + dead patterns)
