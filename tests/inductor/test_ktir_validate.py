@@ -71,6 +71,7 @@ def make_op_spec(
     size: list = ADD_SIZE,
     sizes: list | None = None,
     coords: list | None = None,
+    coords_per_arg: list | None = None,
     dtype: DataFormats = FP16,
     allocations: list | None = None,
     baked: bool = False,
@@ -92,8 +93,10 @@ def make_op_spec(
     The deviations, each a keyword:
 
     * ``op`` / ``inputs`` / ``outputs`` / ``names`` -- the op and its roles.
-    * ``size`` for every arg, or ``sizes`` per arg; ``coords=[]`` for a tiled arg,
-      which addresses through ``advances`` instead of coordinates.
+    * ``size`` for every arg, or ``sizes`` per arg; likewise ``coords`` for every
+      arg or ``coords_per_arg`` for one list each, which a reduction needs because
+      its output drops an axis.  ``coords=[]`` is a tiled arg, addressing through
+      ``advances`` instead of coordinates.
     * ``allocations`` per arg, for an ``lx`` / ``hbm_pool`` intermediate or an
       unrecognised space; ``baked=True`` for the byte HBM address the baked form
       wants, which is the same field said the other way, so not both.
@@ -123,17 +126,18 @@ def make_op_spec(
             if allocation is None:
                 allocation = {"hbm": arg_index << 34 if baked else None}
         arg_size = at(sizes, position) or size
+        arg_coords = at(coords_per_arg, position)
+        if arg_coords is None:
+            arg_coords = (
+                sympy.symbols(f"d0:{len(arg_size)}") if coords is None else coords
+            )
         args.append(
             TensorArg(
                 is_input=is_input,
                 arg_index=arg_index,
                 device_dtype=dtype,
                 device_size=list(arg_size),
-                device_coordinates=(
-                    list(sympy.symbols(f"d0:{len(arg_size)}"))
-                    if coords is None
-                    else list(coords)
-                ),
+                device_coordinates=list(arg_coords),
                 allocation=allocation,
                 name=at(names, position)
                 or (f"arg{ordinal}" if is_input else f"buf{ordinal}"),
@@ -256,10 +260,11 @@ class TestValidateRejections(unittest.TestCase):
     def test_unexpected_entry_rejected(self):
         self._rejects(["not a spec"], "unexpected spec entry str")
 
-    def test_reduction_rejected(self):
-        """A reduction is a second emission shape, not a second binding: refused
-        until a builder method exists for it."""
-        self._rejects([make_op_spec(is_reduction=True)], "reductions are not supported")
+    def test_family_mismatch_rejected(self):
+        """An ``add`` asked for as a reduction: the recipe is what has an
+        emission, so the request is refused rather than emitted elementwise."""
+        specs = [make_op_spec(is_reduction=True)]
+        self._rejects(specs, "registered as ELEMENTWISE")
 
     def test_unregistered_op_rejected(self):
         """An op with no recipe is rejected, and the message names what exists."""
@@ -335,9 +340,8 @@ class TestRejectionsThroughGenerateKtir(unittest.TestCase):
     ``mlir_ktdp``; they run here precisely because it validates first.
     """
 
-    def test_reduction_unsupported(self):
-        specs = [make_op_spec()]
-        specs[0].is_reduction = True
+    def test_family_mismatch_unsupported(self):
+        specs = [make_op_spec(is_reduction=True)]
         with self.assertRaises(NotImplementedError):
             ktir.generate_ktir("ktir_fused_add_0", specs)
 
@@ -552,12 +556,12 @@ class TestRecipes(unittest.TestCase):
             ktir.Recipe(arity=0, family=ktir.Family.ELEMENTWISE, binding=lambda: None)
 
     def test_family_comes_from_the_spec_not_the_name(self):
-        """The family is read from the spec rather than the op name, so one
-        binding can be wanted in more than one shape.  Only ELEMENTWISE has an
-        emission today, which is why a reducing spec is refused by the walk."""
-        spec = [make_op_spec()][0]
-        self.assertIs(ktir.Family.of(spec), ktir.Family.ELEMENTWISE)
-        self.assertEqual(list(ktir.Family), [ktir.Family.ELEMENTWISE])
+        """A reducing spec asks for REDUCTION even when the op is registered
+        elementwise -- which is why the plan walk rejects it rather than the walk
+        silently emitting the wrong shape."""
+        self.assertIs(ktir.Family.of(make_op_spec()), ktir.Family.ELEMENTWISE)
+        reducing = make_op_spec(is_reduction=True)
+        self.assertIs(ktir.Family.of(reducing), ktir.Family.REDUCTION)
 
     def test_emit_asserts_on_an_unplanned_step(self):
         """The emitter's only remaining ``raise`` is this plan-bug guard.
