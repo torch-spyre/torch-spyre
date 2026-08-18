@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import math
 from contextlib import contextmanager
 from warnings import warn
 
@@ -1872,17 +1873,33 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3FN_MAX):
 
     clipMin and clipMax are in constants_raw so they bypass encode_constant.
     """
-    # Validate scale_ub parameter
+    # Validate scale_ub: must be a finite positive value whose reciprocal
+    # (mulConst = 1/scale_ub) is representable as a non-zero FP16 value.
+    # FP16 range: [6.104e-5, 65504.0], so scale_ub must be in [1/65504, 1/6.104e-5]
+    # i.e. [~1.53e-5, 16384.0].
+    _fp16_max = torch.finfo(torch.float16).max        # 65504.0
+    _fp16_tiny = torch.finfo(torch.float16).tiny      # 6.103515625e-05
+
+    if not math.isfinite(scale_ub):
+        raise ValueError(
+            f"scale_ub must be a finite number, got {scale_ub}. "
+            f"Typical value is FP8_E4M3FN_MAX ({FP8_E4M3FN_MAX})"
+        )
     if scale_ub <= 0:
         raise ValueError(
             f"scale_ub must be positive, got {scale_ub}. "
             f"Typical value is FP8_E4M3FN_MAX ({FP8_E4M3FN_MAX})"
         )
-    if not (1e-10 < scale_ub < 1e10):  # Reasonable FP16 range
-        logger.warning(
-            "scale_ub=%s is outside typical range [1e-10, 1e10]. "
-            "This may cause FP16 encoding issues.",
-            scale_ub,
+    _mul_const_fp32 = 1.0 / scale_ub
+    if _mul_const_fp32 > _fp16_max:
+        raise ValueError(
+            f"scale_ub={scale_ub} is too small: mulConst = 1/scale_ub = {_mul_const_fp32} "
+            f"overflows FP16 (max {_fp16_max}). Minimum scale_ub is 1/{_fp16_max} ≈ {1.0/_fp16_max:.3e}."
+        )
+    if _mul_const_fp32 < _fp16_tiny:
+        raise ValueError(
+            f"scale_ub={scale_ub} is too large: mulConst = 1/scale_ub = {_mul_const_fp32} "
+            f"underflows FP16 (smallest normal {_fp16_tiny}). Maximum scale_ub is 1/{_fp16_tiny} = {1.0/_fp16_tiny}."
         )
 
     # Get reduction parameters - use standard inner_fn

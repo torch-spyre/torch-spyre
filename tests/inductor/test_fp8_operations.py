@@ -516,21 +516,29 @@ class TestFP8Operations:
         compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=atol, rtol=rtol)
 
     @pytest.mark.parametrize(
-        "scale_ub,should_fail",
+        "scale_ub,should_fail,match",
         [
-            (0.0, True),  # Zero should fail
-            (-1.0, True),  # Negative should fail
-            (448.0, False),  # Valid default
-            (224.0, False),  # Valid half range
+            (0.0, True, "scale_ub must be positive"),       # Zero
+            (-1.0, True, "scale_ub must be positive"),      # Negative
+            (float("nan"), True, "scale_ub must be a finite number"),   # NaN
+            (float("inf"), True, "scale_ub must be a finite number"),   # +inf
+            (float("-inf"), True, "scale_ub must be a finite number"),  # -inf
+            (1e-6, True, "overflows FP16"),   # mulConst=1e6 overflows FP16
+            (1e5, True, "underflows FP16"),   # mulConst=1e-5 < FP16 tiny, underflows
+            (448.0, False, None),   # Valid default
+            (224.0, False, None),   # Valid half range
         ],
     )
-    def test_quantscalepertokenfp8_scale_ub_validation(self, scale_ub, should_fail):
+    def test_quantscalepertokenfp8_scale_ub_validation(self, scale_ub, should_fail, match):
         """Test that invalid scale_ub values raise appropriate errors.
 
         Validates:
         - scale_ub=0.0 raises ValueError
         - scale_ub<0 raises ValueError
-        - Valid positive values work correctly
+        - NaN and ±inf raise ValueError (non-finite)
+        - scale_ub too small raises ValueError (mulConst overflows FP16)
+        - scale_ub too large raises ValueError (mulConst underflows FP16)
+        - Valid positive values in FP16 reciprocal range work correctly
         """
         x = cached_randn((2, 4, 8), dtype=torch.float16, scale=1.0)
 
@@ -541,10 +549,9 @@ class TestFP8Operations:
             return torch.amax(torch.abs(x), dim=-1, keepdim=True) / scale_ub
 
         if should_fail:
-            with pytest.raises(InductorError, match="scale_ub must be positive"):
+            with pytest.raises(InductorError, match=match):
                 compare_with_pytorch(spyre_fn, pytorch_fn, x)
         else:
-            # Use compare_with_pytorch for proper value correctness validation
             compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=1e-3, rtol=2e-3)
 
 
