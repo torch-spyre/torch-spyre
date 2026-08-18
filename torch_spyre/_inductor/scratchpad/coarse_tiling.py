@@ -42,7 +42,7 @@ from ..errors import Unsupported
 from ..logging_utils import get_inductor_logger
 from ..propagate_hints import DimHint
 from ..wsr.coarse_tile import (
-    coarse_tile,
+    coarse_tile_pre_stickify,
     reduction_loop_vars,
     validate_coarse_tile_groups,
 )
@@ -228,4 +228,10 @@ class CoarseTilingPass(ScratchpadOptimizationPass):
             )
 
         validate_coarse_tile_groups(groups)
-        coarse_tile(graph, groups=groups, group_idx_offset=group_idx_offset)
+        # coarse_tile_pre_stickify, not the post_stickify entry point, even
+        # though this pass runs inside scratchpad planning: read copy-ins are
+        # what make the applied tiling reproduce the hint path's emitted spec
+        # tree op for op (the stage-1 equivalence gate).
+        coarse_tile_pre_stickify(
+            graph, groups=groups, group_idx_offset=group_idx_offset
+        )

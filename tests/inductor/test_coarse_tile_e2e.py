@@ -6784,176 +6784,10 @@ def test_zeros_named_dims_hint_correctness():
 
 
 # ---------------------------------------------------------------------------
-# Coarse-tiling premise: tiling buys LX residency through the loop interior
-# (RFC draft-unified-tiling-cpsat.md, *Background* table; testing item 7's
-# positive half). The coarse-tiling optimization's whole motivation rests on
-# this holding, so it is pinned here against today's hint-driven path.
-# ---------------------------------------------------------------------------
-
-
-def test_tiled_interior_lx_eligible_two_groups():
-    """The allocator's residency verdicts reproduce the Background table.
-
-    Two hint groups over [512, 256]: group 1 (A÷4) computes ``abs(x) + y``
-    whose value crosses the group boundary; group 2 (A÷8) multiplies it, so a
-    read-side tile copy is inserted in front of the consumer. Row by row:
-
-    - interior per-tile scratch (the tiled compute ops, including the boundary
-      producer's own per-tile write) is LX-eligible: ``residency_reason`` None;
-    - read-side tile copies are LX-eligible: they own a fixed-address tile
-      buffer, unlike the write-side copy;
-    - the write-side copy op owns no storage (its layout *is*
-      ``MutationLayoutSHOULDREMOVE(full_buf)``) and is barred from LX;
-    - ``full_buf`` (a ``SpyreEmptyFallback``) is barred from LX.
-    """
-    from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE
-
-    from torch_spyre._inductor.ir import SpyreEmptyFallback
-    from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
-
-    torch.manual_seed(0xAFFE)
-
-    A, B = 512, 256
-    x = torch.randn(A, B, dtype=torch.float16) * 0.01
-    y = torch.randn(A, B, dtype=torch.float16) * 0.01
-
-    def fn(x, y):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(expected_named_dims=["A", "B"]):
-                z = torch.abs(x) + y
-        with spyre_hint(num_tiles_per_dim={"A": 8}):
-            with spyre_hint(expected_named_dims=["A", "B"]):
-                out = z * 2.0
-        return out
-
-    captured = {}
-    orig_prepare = ScratchpadAllocator._prepare_buffers
-
-    def spy_prepare(self, graph):
-        buffers = orig_prepare(self, graph)
-        captured["buffers"] = list(buffers)
-        # Classification must happen here, at allocator time: the scheduler
-        # later resolves MutationLayoutSHOULDREMOVE away, and get_read_writes()
-        # cannot run outside graph context.
-        reads = {
-            op.get_name(): [d.name for d in op.get_read_writes().reads]
-            for op in graph.operations
-            if isinstance(op, ComputedBuffer)
-        }
-        captured["reads"] = reads
-        captured["full_bufs"] = {
-            op.get_name()
-            for op in graph.operations
-            if isinstance(op, SpyreEmptyFallback)
-        }
-        captured["write_copies"] = [
-            op.get_name()
-            for op in graph.operations
-            if isinstance(op, ComputedBuffer)
-            and isinstance(op.layout, MutationLayoutSHOULDREMOVE)
-        ]
-        captured["read_copies"] = [
-            op.get_name()
-            for op in graph.operations
-            if isinstance(op, ComputedBuffer)
-            and op.get_name().startswith("coarse_tile_read_copy_")
-        ]
-        captured["interior"] = [
-            op.get_name()
-            for op in graph.operations
-            if isinstance(op, ComputedBuffer)
-            and getattr(op, "loop_info", None) is not None
-            and any(op.loop_info.loop_tiled_dims)
-            and not isinstance(op.layout, MutationLayoutSHOULDREMOVE)
-            and not op.get_name().startswith("coarse_tile_read_copy_")
-            and not any(r in captured["full_bufs"] for r in reads[op.get_name()])
-        ]
-        return buffers
-
-    with fresh_cache():
-        _pnd.reset()
-        _declare_tensor_dim("A", A)
-        _declare_tensor_dim("B", B)
-        x_dev = x.to("spyre")
-        y_dev = y.to("spyre")
-        _name_tensor_dims(x_dev, ["A", "B"])
-        _name_tensor_dims(y_dev, ["A", "B"])
-        with (
-            config.patch({"lx_planning": True, "allow_all_ops_in_lx_planning": True}),
-            mock_patch(_LAUNCH_JOBPLAN),
-            mock_patch(_PREPARE_KERNEL),
-            mock_patch("torch_spyre.execution.async_compile.subprocess.run"),
-            mock_patch.object(ScratchpadAllocator, "_prepare_buffers", spy_prepare),
-        ):
-            run_and_get_code(torch.compile(fn), x_dev, y_dev)
-
-    reads = captured["reads"]
-    reasons = {b.name: b.residency_reason for b in captured["buffers"]}
-    full_bufs = captured["full_bufs"]
-    write_copies = captured["write_copies"]
-    read_copies = captured["read_copies"]
-    interior = captured["interior"]
-
-    # One boundary per group: the add feeds group 2 across the cut, and the
-    # mul is a graph output — each materializes a full_buf plus a write copy.
-    assert len(full_bufs) == 2, f"expected 2 full_bufs, got {sorted(full_bufs)}"
-    assert len(write_copies) == 2, f"expected 2 write-side copies, got {write_copies}"
-    # Two tiled reads of graph inputs in group 1, plus group 2's tiled read of
-    # the boundary full_buf.
-    assert len(read_copies) == 3, f"expected 3 read copies, got {read_copies}"
-
-    # full_buf never occupies LX: its producer is an ExternKernel, which
-    # _op_output_good_for_lx_reuse rejects.
-    for name in sorted(full_bufs):
-        assert reasons[name] == "op not allowed", (
-            f"full_buf {name}: expected 'op not allowed', got {reasons[name]!r}"
-        )
-
-    # The write-side copy owns no storage — MutationLayoutSHOULDREMOVE is
-    # rejected outright.
-    for name in write_copies:
-        assert reasons[name] == "op not allowed", (
-            f"write copy {name}: expected 'op not allowed', got {reasons[name]!r}"
-        )
-
-    # The read-side copy owns its tile buffer and its own write is fixed, so
-    # it keeps LX candidacy.
-    for name in read_copies:
-        assert reasons[name] is None, (
-            f"read copy {name}: expected LX-eligible, got {reasons[name]!r}"
-        )
-
-    # Interior per-tile scratch stays LX-eligible. Interior = a tiled compute
-    # op that is not a copy and does not read a full_buf directly (the graph
-    # also carries a vestigial full-size identity read of the boundary
-    # full_buf, correctly evicted as "tiled (advancing)" — that op is not an
-    # interior row and is excluded by the full_buf-read filter).
-    # abs, add (group 1) and mul (group 2): the boundary producers' own
-    # per-tile writes are retargeted to fixed-address scratch, so all three
-    # compute ops are interior rows.
-    assert len(interior) == 3, f"expected 3 interior scratch ops, got {interior}"
-    for name in interior:
-        assert reasons[name] is None, (
-            f"interior scratch {name}: expected LX-eligible, got {reasons[name]!r}"
-        )
-
-    # The core claim, stated at its sharpest: the buffer the write-side copy
-    # drains — the boundary producer's per-tile scratch — is itself
-    # LX-eligible even though its value crosses the cut through full_buf.
-    for name in write_copies:
-        for src in reads[name]:
-            if src in full_bufs:
-                continue
-            assert reasons[src] is None, (
-                f"boundary producer scratch {src} (drained by {name}): "
-                f"expected LX-eligible, got {reasons[src]!r}"
-            )
-
-
-# ---------------------------------------------------------------------------
 # Stage 1 (draft-unified-tiling-implementation-plan.md): a tiling stated as
 # TileSpec data and applied through CoarseTilingPass inside the scratchpad
-# pre-pass reproduces the hint path's emitted OpSpec tree.
+# pre-pass reproduces the hint path's emitted OpSpec tree. The helpers below
+# are shared by the stage-1 tests in TestCoarseTilingOpSpecGeneration.
 # ---------------------------------------------------------------------------
 
 
@@ -7121,155 +6955,322 @@ def _compile_capturing_specs(fn, *, use_hints, choices=None):
     return list(captured), loop_infos, op_names
 
 
-def test_tile_spec_pass_reproduces_hint_path_op_specs():
-    """One group, A÷4 over abs → add → mul: the spec trees are identical.
+# ---------------------------------------------------------------------------
+# Coarse-tiling premise: tiling buys LX residency through the loop interior
+# (RFC draft-unified-tiling-cpsat.md, *Background* table; testing item 7's
+# positive half). The coarse-tiling optimization's whole motivation rests on
+# this holding, so it is pinned here against today's hint-driven path.
+# ---------------------------------------------------------------------------
+class TestCoarseTilingOpSpecGeneration(unittest.TestCase):
+    def test_tiled_interior_lx_eligible_two_groups(self):
+        """The allocator's residency verdicts reproduce the Background table.
 
-    The hint path tiles at pass 430 (pre-stickification); the TileSpec path
-    applies the same tiling inside the scratchpad pre-pass at 455. The
-    emitted spec tree — the backend's declarative output — must be equal, so
-    the two paths agree about what the device is told to do: loop nesting and
-    trip counts, per-tile extents, tile advances, and the inserted full_buf /
-    copy ops. (R2.1 applied, R4.5's round-trip, stage-1 gate.)
-    """
-    from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
+        Two hint groups over [512, 256]: group 1 (A÷4) computes ``abs(x) + y``
+        whose value crosses the group boundary; group 2 (A÷8) multiplies it, so a
+        read-side tile copy is inserted in front of the consumer. Row by row:
 
-    def fn_hinted(x, y):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(expected_named_dims=["A", "B"]):
-                z = torch.abs(x) + y
-                return z * 2.0
+        - interior per-tile scratch (the tiled compute ops, including the boundary
+          producer's own per-tile write) is LX-eligible: ``residency_reason`` None;
+        - read-side tile copies are LX-eligible: they own a fixed-address tile
+          buffer, unlike the write-side copy;
+        - the write-side copy op owns no storage (its layout *is*
+          ``MutationLayoutSHOULDREMOVE(full_buf)``) and is barred from LX;
+        - ``full_buf`` (a ``SpyreEmptyFallback``) is barred from LX.
+        """
+        from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE
 
-    def fn_plain(x, y):
-        z = torch.abs(x) + y
-        return z * 2.0
+        from torch_spyre._inductor.ir import SpyreEmptyFallback
+        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
 
-    a_by_4 = TileSpec((TileAxis(0, 4),))
-    # The plain compile lowers abs/add/mul to buf0/buf1/buf2 (deterministic
-    # for this model); the choice is stage-1 input, expressed by buffer name.
-    choices = {"buf0": a_by_4, "buf1": a_by_4, "buf2": a_by_4}
+        torch.manual_seed(0xAFFE)
 
-    ref_specs, ref_li, _ = _compile_capturing_specs(fn_hinted, use_hints=True)
-    cand_specs, cand_li, _ = _compile_capturing_specs(
-        fn_plain, use_hints=False, choices=choices
-    )
+        A, B = 512, 256
+        x = torch.randn(A, B, dtype=torch.float16) * 0.01
+        y = torch.randn(A, B, dtype=torch.float16) * 0.01
 
-    ref_tree = _canon_spec_tree(ref_specs)
-    cand_tree = _canon_spec_tree(cand_specs)
-    assert ref_tree == cand_tree, (
-        "TileSpec path diverged from the hint path's emitted spec tree:\n"
-        f"--- hint path ---\n{ref_tree}\n--- TileSpec path ---\n{cand_tree}"
-    )
+        def fn(x, y):
+            with spyre_hint(num_tiles_per_dim={"A": 4}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    z = torch.abs(x) + y
+            with spyre_hint(num_tiles_per_dim={"A": 8}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    out = z * 2.0
+            return out
 
-    # Inner check: spec-tree equality says *that* the paths agree; loop_info
-    # equality says *where* the tiling decisions landed, per op.
-    assert set(ref_li) == set(cand_li), (
-        f"tiled op sets differ: {sorted(ref_li)} vs {sorted(cand_li)}"
-    )
-    for name in sorted(ref_li):
-        assert _loop_info_key(ref_li[name]) == _loop_info_key(cand_li[name]), (
-            f"loop_info differs for {name}:\n"
-            f"  hint path: {ref_li[name]}\n"
-            f"  TileSpec path: {cand_li[name]}"
+        captured = {}
+        orig_prepare = ScratchpadAllocator._prepare_buffers
+
+        def spy_prepare(self, graph):
+            buffers = orig_prepare(self, graph)
+            captured["buffers"] = list(buffers)
+            # Classification must happen here, at allocator time: the scheduler
+            # later resolves MutationLayoutSHOULDREMOVE away, and get_read_writes()
+            # cannot run outside graph context.
+            reads = {
+                op.get_name(): [d.name for d in op.get_read_writes().reads]
+                for op in graph.operations
+                if isinstance(op, ComputedBuffer)
+            }
+            captured["reads"] = reads
+            captured["full_bufs"] = {
+                op.get_name()
+                for op in graph.operations
+                if isinstance(op, SpyreEmptyFallback)
+            }
+            captured["write_copies"] = [
+                op.get_name()
+                for op in graph.operations
+                if isinstance(op, ComputedBuffer)
+                and isinstance(op.layout, MutationLayoutSHOULDREMOVE)
+            ]
+            captured["read_copies"] = [
+                op.get_name()
+                for op in graph.operations
+                if isinstance(op, ComputedBuffer)
+                and op.get_name().startswith("coarse_tile_read_copy_")
+            ]
+            captured["interior"] = [
+                op.get_name()
+                for op in graph.operations
+                if isinstance(op, ComputedBuffer)
+                and getattr(op, "loop_info", None) is not None
+                and any(op.loop_info.loop_tiled_dims)
+                and not isinstance(op.layout, MutationLayoutSHOULDREMOVE)
+                and not op.get_name().startswith("coarse_tile_read_copy_")
+                and not any(r in captured["full_bufs"] for r in reads[op.get_name()])
+            ]
+            return buffers
+
+        with fresh_cache():
+            _pnd.reset()
+            _declare_tensor_dim("A", A)
+            _declare_tensor_dim("B", B)
+            x_dev = x.to("spyre")
+            y_dev = y.to("spyre")
+            _name_tensor_dims(x_dev, ["A", "B"])
+            _name_tensor_dims(y_dev, ["A", "B"])
+            with (
+                config.patch(
+                    {"lx_planning": True, "allow_all_ops_in_lx_planning": True}
+                ),
+                mock_patch(_LAUNCH_JOBPLAN),
+                mock_patch(_PREPARE_KERNEL),
+                mock_patch("torch_spyre.execution.async_compile.subprocess.run"),
+                mock_patch.object(ScratchpadAllocator, "_prepare_buffers", spy_prepare),
+            ):
+                run_and_get_code(torch.compile(fn), x_dev, y_dev)
+
+        reads = captured["reads"]
+        reasons = {b.name: b.residency_reason for b in captured["buffers"]}
+        full_bufs = captured["full_bufs"]
+        write_copies = captured["write_copies"]
+        read_copies = captured["read_copies"]
+        interior = captured["interior"]
+
+        # One boundary per group: the add feeds group 2 across the cut, and the
+        # mul is a graph output — each materializes a full_buf plus a write copy.
+        assert len(full_bufs) == 2, f"expected 2 full_bufs, got {sorted(full_bufs)}"
+        assert len(write_copies) == 2, (
+            f"expected 2 write-side copies, got {write_copies}"
+        )
+        # Two tiled reads of graph inputs in group 1, plus group 2's tiled read of
+        # the boundary full_buf.
+        assert len(read_copies) == 3, f"expected 3 read copies, got {read_copies}"
+
+        # full_buf never occupies LX: its producer is an ExternKernel, which
+        # _op_output_good_for_lx_reuse rejects.
+        for name in sorted(full_bufs):
+            assert reasons[name] == "op not allowed", (
+                f"full_buf {name}: expected 'op not allowed', got {reasons[name]!r}"
+            )
+
+        # The write-side copy owns no storage — MutationLayoutSHOULDREMOVE is
+        # rejected outright.
+        for name in write_copies:
+            assert reasons[name] == "op not allowed", (
+                f"write copy {name}: expected 'op not allowed', got {reasons[name]!r}"
+            )
+
+        # The read-side copy owns its tile buffer and its own write is fixed, so
+        # it keeps LX candidacy.
+        for name in read_copies:
+            assert reasons[name] is None, (
+                f"read copy {name}: expected LX-eligible, got {reasons[name]!r}"
+            )
+
+        # Interior per-tile scratch stays LX-eligible. Interior = a tiled compute
+        # op that is not a copy and does not read a full_buf directly (the graph
+        # also carries a vestigial full-size identity read of the boundary
+        # full_buf, correctly evicted as "tiled (advancing)" — that op is not an
+        # interior row and is excluded by the full_buf-read filter).
+        # abs, add (group 1) and mul (group 2): the boundary producers' own
+        # per-tile writes are retargeted to fixed-address scratch, so all three
+        # compute ops are interior rows.
+        assert len(interior) == 3, f"expected 3 interior scratch ops, got {interior}"
+        for name in interior:
+            assert reasons[name] is None, (
+                f"interior scratch {name}: expected LX-eligible, got {reasons[name]!r}"
+            )
+
+        # The core claim, stated at its sharpest: the buffer the write-side copy
+        # drains — the boundary producer's per-tile scratch — is itself
+        # LX-eligible even though its value crosses the cut through full_buf.
+        for name in write_copies:
+            for src in reads[name]:
+                if src in full_bufs:
+                    continue
+                assert reasons[src] is None, (
+                    f"boundary producer scratch {src} (drained by {name}): "
+                    f"expected LX-eligible, got {reasons[src]!r}"
+                )
+
+    def test_tile_spec_pass_reproduces_hint_path_op_specs(self):
+        """One group, A÷4 over abs → add → mul: the spec trees are identical.
+
+        The hint path tiles at pass 430 (pre-stickification); the TileSpec path
+        applies the same tiling inside the scratchpad pre-pass at 455. The
+        emitted spec tree — the backend's declarative output — must be equal, so
+        the two paths agree about what the device is told to do: loop nesting and
+        trip counts, per-tile extents, tile advances, and the inserted full_buf /
+        copy ops. (R2.1 applied, R4.5's round-trip, stage-1 gate.)
+        """
+        from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
+
+        def fn_hinted(x, y):
+            with spyre_hint(num_tiles_per_dim={"A": 4}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    z = torch.abs(x) + y
+                    return z * 2.0
+
+        def fn_plain(x, y):
+            z = torch.abs(x) + y
+            return z * 2.0
+
+        a_by_4 = TileSpec((TileAxis(0, 4),))
+        # The plain compile lowers abs/add/mul to buf0/buf1/buf2 (deterministic
+        # for this model); the choice is stage-1 input, expressed by buffer name.
+        choices = {"buf0": a_by_4, "buf1": a_by_4, "buf2": a_by_4}
+
+        ref_specs, ref_li, _ = _compile_capturing_specs(fn_hinted, use_hints=True)
+        cand_specs, cand_li, _ = _compile_capturing_specs(
+            fn_plain, use_hints=False, choices=choices
         )
 
-
-def test_tile_spec_pass_two_groups_loop_info():
-    """Two groups (A÷4 then A÷8): grouping, ids, and loop_info round-trip.
-
-    Consecutive-run derivation splits the chain on the spec change; group ids
-    and hint ids are minted from derived bases. Full spec-tree equality is
-    deliberately not asserted here: tiling pre-stickification changes what
-    the stickifier sees, and on this model the hint path stickifies group 2's
-    [64, 256] tiles onto the A axis and inserts a full-size boundary
-    restickify (ReStickifyOpHBM) that the 455-applied path — tiling the
-    already-stickified graph — does not need. The per-op tiling decisions
-    must still match, and the 455 path staying restickify-free is pinned as
-    the R6.2 guard (the count must not regress).
-    """
-    from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
-
-    def fn_hinted(x, y):
-        with spyre_hint(num_tiles_per_dim={"A": 4}):
-            with spyre_hint(expected_named_dims=["A", "B"]):
-                z = torch.abs(x) + y
-        with spyre_hint(num_tiles_per_dim={"A": 8}):
-            with spyre_hint(expected_named_dims=["A", "B"]):
-                out = z * 2.0
-        return out
-
-    def fn_plain(x, y):
-        z = torch.abs(x) + y
-        return z * 2.0
-
-    choices = {
-        "buf0": TileSpec((TileAxis(0, 4),)),
-        "buf1": TileSpec((TileAxis(0, 4),)),
-        "buf2": TileSpec((TileAxis(0, 8),)),
-    }
-
-    ref_specs, ref_li, _ = _compile_capturing_specs(fn_hinted, use_hints=True)
-    cand_specs, cand_li, _ = _compile_capturing_specs(
-        fn_plain, use_hints=False, choices=choices
-    )
-
-    # The compute ops share names across the compiles; the copies' names
-    # embed source buffer names, so compare those via sorted loop_info keys.
-    for name in ("buf0", "buf1", "buf2"):
-        assert _loop_info_key(ref_li[name]) == _loop_info_key(cand_li[name]), (
-            f"loop_info differs for {name}:\n"
-            f"  hint path: {ref_li[name]}\n"
-            f"  TileSpec path: {cand_li[name]}"
+        ref_tree = _canon_spec_tree(ref_specs)
+        cand_tree = _canon_spec_tree(cand_specs)
+        assert ref_tree == cand_tree, (
+            "TileSpec path diverged from the hint path's emitted spec tree:\n"
+            f"--- hint path ---\n{ref_tree}\n--- TileSpec path ---\n{cand_tree}"
         )
-    # Groups round-trip: the A÷4 run lands as group (0,), the A÷8 op as (1,).
-    assert cand_li["buf0"].loop_group_id == (0,)
-    assert cand_li["buf1"].loop_group_id == (0,)
-    assert cand_li["buf2"].loop_group_id == (1,)
 
-    ref_copies = sorted(
-        _loop_info_key(li)
-        for name, li in ref_li.items()
-        if name.startswith("coarse_tile_")
-    )
-    cand_copies = sorted(
-        _loop_info_key(li)
-        for name, li in cand_li.items()
-        if name.startswith("coarse_tile_")
-    )
-    assert ref_copies == cand_copies, (
-        f"inserted copy tiling decisions differ:\n"
-        f"  hint path: {ref_copies}\n  TileSpec path: {cand_copies}"
-    )
+        # Inner check: spec-tree equality says *that* the paths agree; loop_info
+        # equality says *where* the tiling decisions landed, per op.
+        assert set(ref_li) == set(cand_li), (
+            f"tiled op sets differ: {sorted(ref_li)} vs {sorted(cand_li)}"
+        )
+        for name in sorted(ref_li):
+            assert _loop_info_key(ref_li[name]) == _loop_info_key(cand_li[name]), (
+                f"loop_info differs for {name}:\n"
+                f"  hint path: {ref_li[name]}\n"
+                f"  TileSpec path: {cand_li[name]}"
+            )
 
-    # The documented asymmetry, pinned from both sides.
-    ref_tree = _canon_spec_tree(ref_specs)
-    cand_tree = _canon_spec_tree(cand_specs)
-    assert "ReStickifyOp" in ref_tree, (
-        "expected the hint path to carry a boundary restickify on this model"
-    )
-    assert "ReStickifyOp" not in cand_tree, (
-        "455-applied tiling must not introduce a restickify here (R6.2 guard)"
-    )
+    def test_tile_spec_pass_two_groups_loop_info(self):
+        """Two groups (A÷4 then A÷8): grouping, ids, and loop_info round-trip.
 
+        Consecutive-run derivation splits the chain on the spec change; group ids
+        and hint ids are minted from derived bases. Full spec-tree equality is
+        deliberately not asserted here: tiling pre-stickification changes what
+        the stickifier sees, and on this model the hint path stickifies group 2's
+        [64, 256] tiles onto the A axis and inserts a full-size boundary
+        restickify (ReStickifyOpHBM) that the 455-applied path — tiling the
+        already-stickified graph — does not need. The per-op tiling decisions
+        must still match, and the 455 path staying restickify-free is pinned as
+        the R6.2 guard (the count must not regress).
+        """
+        from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
 
-def test_tile_spec_pass_noop_leaves_graph_unchanged():
-    """R7.3 (ordering half): a pass with nothing to do mutates nothing.
+        def fn_hinted(x, y):
+            with spyre_hint(num_tiles_per_dim={"A": 4}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    z = torch.abs(x) + y
+            with spyre_hint(num_tiles_per_dim={"A": 8}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    out = z * 2.0
+            return out
 
-    Untiled/absent choices are inert: no loop_info is stamped and no
-    coarse-tile buffers or copies are inserted.
-    """
-    from torch_spyre._inductor.scratchpad.plan_solver import TileSpec
+        def fn_plain(x, y):
+            z = torch.abs(x) + y
+            return z * 2.0
 
-    def fn_plain(x, y):
-        z = torch.abs(x) + y
-        return z * 2.0
+        choices = {
+            "buf0": TileSpec((TileAxis(0, 4),)),
+            "buf1": TileSpec((TileAxis(0, 4),)),
+            "buf2": TileSpec((TileAxis(0, 8),)),
+        }
 
-    choices = {"buf0": TileSpec(), "not_a_buffer": TileSpec()}
-    _, loop_infos, op_names = _compile_capturing_specs(
-        fn_plain, use_hints=False, choices=choices
-    )
-    assert not loop_infos, f"no-op pass stamped loop_info: {sorted(loop_infos)}"
-    stray = [n for n in op_names if n.startswith("coarse_tile_")]
-    assert not stray, f"no-op pass inserted ops: {stray}"
+        ref_specs, ref_li, _ = _compile_capturing_specs(fn_hinted, use_hints=True)
+        cand_specs, cand_li, _ = _compile_capturing_specs(
+            fn_plain, use_hints=False, choices=choices
+        )
+
+        # The compute ops share names across the compiles; the copies' names
+        # embed source buffer names, so compare those via sorted loop_info keys.
+        for name in ("buf0", "buf1", "buf2"):
+            assert _loop_info_key(ref_li[name]) == _loop_info_key(cand_li[name]), (
+                f"loop_info differs for {name}:\n"
+                f"  hint path: {ref_li[name]}\n"
+                f"  TileSpec path: {cand_li[name]}"
+            )
+        # Groups round-trip: the A÷4 run lands as group (0,), the A÷8 op as (1,).
+        assert cand_li["buf0"].loop_group_id == (0,)
+        assert cand_li["buf1"].loop_group_id == (0,)
+        assert cand_li["buf2"].loop_group_id == (1,)
+
+        ref_copies = sorted(
+            _loop_info_key(li)
+            for name, li in ref_li.items()
+            if name.startswith("coarse_tile_")
+        )
+        cand_copies = sorted(
+            _loop_info_key(li)
+            for name, li in cand_li.items()
+            if name.startswith("coarse_tile_")
+        )
+        assert ref_copies == cand_copies, (
+            f"inserted copy tiling decisions differ:\n"
+            f"  hint path: {ref_copies}\n  TileSpec path: {cand_copies}"
+        )
+
+        # The documented asymmetry, pinned from both sides.
+        ref_tree = _canon_spec_tree(ref_specs)
+        cand_tree = _canon_spec_tree(cand_specs)
+        assert "ReStickifyOp" in ref_tree, (
+            "expected the hint path to carry a boundary restickify on this model"
+        )
+        assert "ReStickifyOp" not in cand_tree, (
+            "455-applied tiling must not introduce a restickify here (R6.2 guard)"
+        )
+
+    def test_tile_spec_pass_noop_leaves_graph_unchanged(self):
+        """R7.3 (ordering half): a pass with nothing to do mutates nothing.
+
+        Untiled/absent choices are inert: no loop_info is stamped and no
+        coarse-tile buffers or copies are inserted.
+        """
+        from torch_spyre._inductor.scratchpad.plan_solver import TileSpec
+
+        def fn_plain(x, y):
+            z = torch.abs(x) + y
+            return z * 2.0
+
+        choices = {"buf0": TileSpec(), "not_a_buffer": TileSpec()}
+        _, loop_infos, op_names = _compile_capturing_specs(
+            fn_plain, use_hints=False, choices=choices
+        )
+        assert not loop_infos, f"no-op pass stamped loop_info: {sorted(loop_infos)}"
+        stray = [n for n in op_names if n.startswith("coarse_tile_")]
+        assert not stray, f"no-op pass inserted ops: {stray}"
 
 
 if __name__ == "__main__":
