@@ -2169,7 +2169,7 @@ cases:
           dtype: torch.bfloat16
           device: cuda
           init: rand
-      - py: (Ellipsis, slice(None, floordiv, None))
+      - py: (Ellipsis, slice(None, 256, None))
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L288 in rotate_half,
       code: x1 = x[..., : x.shape[-1] // 2]'
     marks:
@@ -2463,7 +2463,7 @@ cases:
           dtype: torch.bfloat16
           device: cuda
           init: rand
-      - py: (Ellipsis, slice(None, floordiv_2, None))
+      - py: (Ellipsis, slice(None, 256, None))
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L288 in rotate_half,
       code: x1 = x[..., : x.shape[-1] // 2]'
     marks:

@@ -27,7 +27,11 @@ from torch_spyre._inductor.propagate_layouts import (
     PropArg,
     _check_supported_input_sticks,
 )
-from torch_spyre._inductor.views import compute_coordinates, tiling_expr_to_device_expr
+from torch_spyre._inductor.views import (
+    compute_coordinates,
+    normalize_coordinates,
+    tiling_expr_to_device_expr,
+)
 from torch.utils._sympy.functions import ModularIndexing
 
 p0, p1, p2, p3, p4, p5 = sympy.symbols("p0 p1 p2 p3 p4 p5", integer=True)
@@ -347,6 +351,122 @@ class TestTilingExprToDeviceExpr(TestCase):
         index = p0
         result = tiling_expr_to_device_expr([64, 1024, 64], [64, 4096, 1], index)
         self.assertEqual(result, p0)
+
+
+class TestNormalizeCoordinatesFusion(TestCase):
+    """``normalize_coordinates``' contiguous-device-dim fusion.
+
+    The fusion loop is a single-pass adjacent-pair scan, so an inert placeholder
+    term -- a size-1 device dim with a constant-zero coordinate -- used to break a
+    fusion run even though the emitted layout discards it anyway. Leaving the run
+    broken splits one logical axis across two device dims, and a matmul reading
+    such a layout ends up contracting two axes, which the backend cannot schedule
+    (deeptools ``getMinParamBmm``'s ``out_reuse_dim`` DT_CHECK).
+    """
+
+    def _normalize(self, var_ranges, size, coordinates):
+        counter = [0]
+
+        def synthetic_var():
+            counter[0] += 1
+            return sympy.Symbol(f"z{counter[0] - 1}")
+
+        return normalize_coordinates(dict(var_ranges), size, coordinates, synthetic_var)
+
+    def _addr(self, terms):
+        """Flat device address encoded by a dense term list (last term = stick)."""
+        stride = sympy.Integer(1)
+        addr = sympy.S.Zero
+        for term in reversed(terms):
+            if term.var is None:
+                coord = term.offset
+            else:
+                coord = (
+                    term.num * sympy.floor(sympy.Mod(term.var, term.mod) / term.den)
+                    + term.offset
+                )
+            addr += stride * coord
+            stride *= term.dim_size
+        return addr
+
+    def test_placeholder_does_not_block_fusion(self):
+        """``[B=1, H=16, seq=1, D=128]`` SDPA output read as one flat 2048 axis.
+
+        ``get_generic_stick_layout``'s rank-4 map puts the squeezed ``seq`` dim
+        between ``H`` and the non-stick half of ``D``, and the squeezed ``B`` dim
+        just before the stick. ``H`` and ``D``'s outer half must still fuse into a
+        single 32-wide dim, so the matmul consuming this buffer contracts exactly
+        one axis.
+        """
+        k = sympy.Symbol("c1")
+        terms = self._normalize(
+            {k: 2048},
+            [16, 1, 2, 1, 64],
+            [
+                sympy.floor(k / 128),
+                sympy.S.Zero,
+                sympy.floor(sympy.Mod(k, 128) / 64),
+                sympy.S.Zero,
+                sympy.Mod(k, 64),
+            ],
+        )
+        self.assertEqual([int(t.dim_size) for t in terms], [32, 64])
+        # ... and the fused dim addresses exactly what the two dims did.
+        addr = self._addr(terms)
+        for val in range(2048):
+            self.assertEqual(int(addr.subs({k: val})), val)
+
+    def test_fusion_declined_when_outer_term_has_offset(self):
+        """An offset on the outer term counts in units of that term's ``den``.
+
+        Fusing shrinks ``den``, which would silently rescale the offset, so the
+        fusion must not happen across a placeholder in that case.
+        """
+        k = sympy.Symbol("c1")
+        terms = self._normalize(
+            {k: 1024},
+            [16, 1, 2, 1, 64],
+            [
+                4 + sympy.floor(k / 128),
+                sympy.S.Zero,
+                sympy.floor(sympy.Mod(k, 128) / 64),
+                sympy.S.Zero,
+                sympy.Mod(k, 64),
+            ],
+        )
+        self.assertEqual([int(t.dim_size) for t in terms], [16, 2, 64])
+        addr = self._addr(terms)
+        for val in (0, 1, 63, 64, 127, 128, 1023):
+            self.assertEqual(int(addr.subs({k: val})), 512 + val)
+
+    def test_fusion_declined_when_pair_is_not_dense(self):
+        """A gap between the two dims (3*64 < 256) makes the fusion inexact."""
+        k = sympy.Symbol("c1")
+        terms = self._normalize(
+            {k: 1536},
+            [8, 1, 3, 64],
+            [
+                sympy.floor(k / 256),
+                sympy.S.Zero,
+                sympy.floor(sympy.Mod(k, 256) / 64),
+                sympy.Mod(k, 64),
+            ],
+        )
+        self.assertEqual([int(t.dim_size) for t in terms], [8, 3, 64])
+
+    def test_adjacent_fusion_unchanged(self):
+        """No placeholder: the historical predicate is untouched."""
+        k = sympy.Symbol("c1")
+        terms = self._normalize(
+            {k: 2048},
+            [16, 2, 64],
+            [
+                sympy.floor(k / 128),
+                sympy.floor(sympy.Mod(k, 128) / 64),
+                sympy.Mod(k, 64),
+            ],
+        )
+        self.assertEqual([int(t.dim_size) for t in terms], [32, 64])
 
 
 if __name__ == "__main__":

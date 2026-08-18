@@ -40,6 +40,7 @@ try:
     _HAS_ORTOOLS = True
 except ImportError:
     _HAS_ORTOOLS = False
+    CpSatLayoutSolver = None  # type: ignore[assignment,misc]
 
 
 Ts = TypeVarTuple("Ts")
@@ -786,14 +787,14 @@ class TestCloneAtGraphBoundaries(
 class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
     """Generic real-graph coverage for the co-optimising allocator.
 
-    ``StrategyBCoOptimizingAllocator`` (``co_optimizing_lx_planning=True``) seeds
-    from the core-division work-distribution, commits the winning splits onto
+    DFS-based co-optimizing allocator (``co_optimizing_lx_planning=True``) searches
+    over candidate core divisions, commits the winning splits onto
     ``op_it_space_splits``, then places buffers. These tests put real compiled
     graphs through that path.
 
     The prescribed-allocation tests encode the *desired* plan, which is the one
-    StrategyB produces. These plans are brittle and are not unique but are
-    plans which achieve desirable performance. New plans should be profiled
+    the DFS co-optimizer produces. These plans are brittle and are not unique but
+    are plans which achieve desirable performance. New plans should be profiled
     before making these test more permissive.
 
     NOTE: this suite is intentionally *disabled* today. Unlike
@@ -1361,13 +1362,17 @@ class TestSelectAllocator(unittest.TestCase):
     def test_dispatch_by_config(self):
         from torch_spyre._inductor.scratchpad.allocator import (
             CoOptimizingAllocator,
+            ExhaustiveSearchSolver,
             ScratchpadAllocator,
-            StrategyBCoOptimizingAllocator,
+            _make_cpsat_solver,
             select_allocator,
         )
         from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
         from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
             BestFitLayoutSolver,
+        )
+        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+            CpSatLayoutSolver,
         )
 
         with ts_inductor_config.patch(
@@ -1387,37 +1392,38 @@ class TestSelectAllocator(unittest.TestCase):
         with ts_inductor_config.patch(
             layout_solver="greedy", co_optimizing_lx_planning=True
         ):
-            self.assertIsInstance(select_allocator(), StrategyBCoOptimizingAllocator)
+            a = select_allocator()
+            self.assertIsInstance(a, CoOptimizingAllocator)
+            solver = a.layout_planning([], a.size)
+            self.assertIsInstance(solver, ExhaustiveSearchSolver)
+            self.assertIs(solver._inner_factory, GreedyLayoutSolver)
 
-        # cpsat + co-optimization routes to the joint allocator when ortools is
-        # present, else degrades to greedy placement (the fallback now lives in
-        # select_allocator, not inside CoOptimizingAllocator).
+        # cpsat + co-optimization always routes to the joint allocator: when
+        # ortools is present the cpsat factory is core-division-capable and is
+        # used directly, else it degrades to an ExhaustiveSearchSolver wrapping
+        # the cpsat factory's own greedy fallback.
         with ts_inductor_config.patch(
             layout_solver="cpsat", co_optimizing_lx_planning=True
         ):
             a = select_allocator()
+            self.assertIsInstance(a, CoOptimizingAllocator)
+            solver = a.layout_planning([], a.size)
             if _HAS_ORTOOLS:
-                self.assertIsInstance(a, CoOptimizingAllocator)
+                self.assertIs(a.layout_planning, _make_cpsat_solver)
+                self.assertIsInstance(solver, CpSatLayoutSolver)
             else:
-                self.assertIs(type(a), ScratchpadAllocator)
-                self.assertEqual(a.layout_planning, GreedyLayoutSolver)
+                self.assertIsInstance(solver, ExhaustiveSearchSolver)
+                self.assertIs(solver._inner_factory, _make_cpsat_solver)
 
         # cpsat without co-optimization is placement-only: a ScratchpadAllocator
-        # driven by the CP-SAT solver on the pre-determined core divisions.
+        # driven by the cpsat factory (which falls back to greedy internally
+        # when ortools is absent) on the pre-determined core divisions.
         with ts_inductor_config.patch(
             layout_solver="cpsat", co_optimizing_lx_planning=False
         ):
             a = select_allocator()
             self.assertIs(type(a), ScratchpadAllocator)
-            if _HAS_ORTOOLS:
-                from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
-                    CpSatLayoutSolver,
-                )
-
-                self.assertEqual(a.layout_planning, CpSatLayoutSolver)
-            else:
-                # ortools absent: falls back to greedy placement.
-                self.assertEqual(a.layout_planning, GreedyLayoutSolver)
+            self.assertIs(a.layout_planning, _make_cpsat_solver)
 
         with ts_inductor_config.patch(
             layout_solver="bogus", co_optimizing_lx_planning=False

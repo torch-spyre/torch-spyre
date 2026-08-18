@@ -148,8 +148,9 @@ disable_copy_opt: bool = os.environ.get("DISABLE_COPY_OPT", "0") == "1"
 # When True (default), HBM tensor addresses are emitted as runtime symbols
 # with !sdscbundle.input_arg<index> parameters and input_arg_extract ops
 # in the bundle.mlir.
-# When False, HBM tensor addresses are baked as concrete integers
-# into the SDSC JSON and bundle.mlir emits sdsc_execute with no operands.
+# When False, HBM tensor addresses are baked as concrete integers.
+# (SDSC path always symbolic as of #3741; baked mode only via the KTIR
+# emitter, i.e. also requires ktir_emitter=True / TORCH_SPYRE_KTIR=1.)
 bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 
 # Layout solver class used by default in scratchpad.allocator.ScratchpadAllocator.
@@ -165,5 +166,13 @@ bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 layout_solver: Literal[
     "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
 ] = os.environ.get("LAYOUT_SOLVER", "greedy")  # type: ignore[assignment]
+
+# Use the C++ (native) permutation-layout packer accelerator, which the
+# simulated-annealing layout solver drives. The native and Python packers are
+# behaviourally identical (verified bit-for-bit); the native one is faster. Set
+# False (or ``TORCH_SPYRE_NATIVE_PACKER=0``/``false``, which backs this default)
+# to force the pure-Python packer. A missing native class is a stale or
+# incomplete build, not a supported mode, and raises rather than falling back.
+native_layout_packer: bool = _get_env_bool("TORCH_SPYRE_NATIVE_PACKER", True)
 
 install_config_module(sys.modules[__name__])

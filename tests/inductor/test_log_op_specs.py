@@ -283,7 +283,6 @@ class TestBundleLogging:
                         kernel_name="test_kernel",
                         output_dir="/tmp/test",
                         specs=[op],
-                        use_symbols=False,
                     )
 
                 info_calls = mock_info.call_args_list

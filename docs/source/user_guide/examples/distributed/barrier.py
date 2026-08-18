@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import argparse
 import torch
 import torch.distributed as dist
 import time
@@ -28,6 +29,16 @@ if C10D_BACKEND != dist.get_default_backend_for_device("spyre"):
         f"Error: Missing a C10 Backend for {'spyre'}! Expected {C10D_BACKEND}"
     )
 
+parser = argparse.ArgumentParser(description="Distributed barrier example")
+parser.add_argument(
+    "--async",
+    dest="async_op",
+    action="store_true",
+    default=False,
+    help="Launch barrier asynchronously (async_op=True)",
+)
+args = parser.parse_args()
+
 # Initialize the distributed environment
 print("# Initialize Distributed Group ")
 dist.init_process_group(device_id=DEVICE)
@@ -39,11 +50,27 @@ print(
     f"[{comm_rank} of {comm_size}] Before the barrier: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 )
 
-# Add a delay to slow down the barrier. Different at different ranks.
+# Add a delay to slow down some ranks so the async overlap is visible
 time.sleep(comm_rank % 3)
 
-# Execute the barrier
-dist.barrier()
+if args.async_op:
+    # Launch barrier asynchronously — returns a Work handle immediately
+    work = dist.barrier(async_op=True)
+    print(
+        f"[{comm_rank} of {comm_size}] Issued the barrier: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+    # Overlap: do local CPU work while the barrier runs on hardware
+    cpu_result = sum(range(comm_rank + 1))  # trivial local computation
+    print(
+        f"[{comm_rank} of {comm_size}] Local CPU work completed (sum 0..{comm_rank} = {cpu_result})"
+    )
+
+    # Block until all ranks have reached the barrier
+    work.wait()
+else:
+    # Execute the barrier
+    dist.barrier()
 
 print(
     f"[{comm_rank} of {comm_size}] After the barrier : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"

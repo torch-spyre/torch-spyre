@@ -46,6 +46,7 @@ except ImportError:
     # before skipUnless can suppress the class.
     CpSatLayoutSolver = None  # type: ignore[assignment,misc]
     _HAS_ORTOOLS = False
+    CpSatLayoutSolver = None  # type: ignore[assignment,misc]
 
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
     BestFitLayoutSolver,

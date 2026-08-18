@@ -18,11 +18,50 @@
 
 #include <ATen/core/op_registration/adaption.h>
 
+#include <cerrno>
+#include <climits>
+#include <cstdint>
+#include <cstdlib>
+#include <limits>
+#include <stdexcept>
+#include <string>
+
 #include "module.h"
 #include "spyre_device_enum.h"
 #include "spyre_stream.h"
 
 namespace spyre {
+
+c10::DeviceIndex parse_local_rank() {
+  const char* env = std::getenv("LOCAL_RANK");
+  if (!env || env[0] == '\0') {
+    return 0;
+  }
+
+  errno = 0;
+  char* end = nullptr;
+  const int64_t val = std::strtoll(env, &end, 10);
+
+  if (end == env || *end != '\0') {
+    throw std::invalid_argument(
+        std::string("LOCAL_RANK is not a valid integer: '") + env + "'");
+  }
+  if (errno == ERANGE || val < 0) {
+    throw std::range_error(std::string("LOCAL_RANK value is out of range: '") +
+                           env + "'");
+  }
+  // c10::DeviceIndex is int8_t — guard against silent truncation.
+  constexpr int64_t kMaxDeviceIndex =
+      static_cast<int64_t>(std::numeric_limits<c10::DeviceIndex>::max());
+  if (val > kMaxDeviceIndex) {
+    throw std::range_error(std::string("LOCAL_RANK value ") +
+                           std::to_string(val) +
+                           " exceeds the maximum supported device index (" +
+                           std::to_string(kMaxDeviceIndex) + ")");
+  }
+
+  return static_cast<c10::DeviceIndex>(val);
+}
 
 c10::DeviceType SpyreGuardImpl::type() const {
   return c10::DeviceType::PrivateUse1;
@@ -113,7 +152,22 @@ c10::DeviceCapability SpyreGuardImpl::getDeviceCapability(
   return cap;
 }
 
-thread_local c10::DeviceIndex SpyreGuardImpl::tls_idx = 0;
+// Safe seed for the thread_local initializer.
+// parse_local_rank() can throw (malformed / out-of-range LOCAL_RANK).  A
+// thread_local dynamic initializer has no surrounding try/catch on worker
+// threads, so an exception there calls std::terminate.  Return 0 on any
+// error; _startRuntime re-calls parse_local_rank() on the guarded path and
+// will surface the error as a catchable exception.
+static c10::DeviceIndex parse_local_rank_safe() noexcept {
+  try {
+    return parse_local_rank();
+  }
+  catch (...) {
+    return 0;
+  }
+}
+
+thread_local c10::DeviceIndex SpyreGuardImpl::tls_idx = parse_local_rank_safe();
 
 // Registration — runs when _C.so is loaded.
 // Loading _C.so does NOT trigger device initialization; that only

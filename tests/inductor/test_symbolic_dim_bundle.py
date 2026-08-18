@@ -153,7 +153,7 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
         with open(os.path.join(self.output_dir, "bundle.mlir")) as f:
             return f.read()
 
-    def _run_bundle(self, compiled_entries, op_specs=None, use_symbols=False):
+    def _run_bundle(self, compiled_entries, op_specs=None):
         """Run generate_bundle with mocked compile_op_spec, return bundle.mlir text."""
         if op_specs is None:
             op_specs = [_minimal_op_spec() for _ in compiled_entries]
@@ -167,12 +167,11 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
                 "test",
                 self.output_dir,
                 op_specs,
-                use_symbols=use_symbols,
             )
         return self._read_bundle()
 
     def test_single_dim_sym_function_signature(self):
-        """Dimension symbol produces an input_arg param even when use_symbols=False."""
+        """Dimension symbol always produces an input_arg param."""
         dim_kind = SymbolKind.dimension(granularity=56, max_value=616, pytorch_sym="s0")
         entry = (_make_sdsc_json(dim_sym_ids={"mb": [-1]}), [0], [], [dim_kind])
 
@@ -264,8 +263,7 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
     def test_dimension_and_kernel_address_combination(self):
         """A dimension symbol and a kernel-address symbol coexist in one bundle.
 
-        Both kinds must appear side by side, in the correct param/operand order,
-        when use_symbols=True and a dimension symbol is also present.
+        Both kinds must appear side by side, in the correct param/operand order.
         """
         dim_kind = SymbolKind.dimension(granularity=56, max_value=616, pytorch_sym="s0")
         kernel_kind = SymbolKind.kernel(arg_index=0)
@@ -279,7 +277,7 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
             [dim_kind, kernel_kind],
         )
 
-        bundle = self._run_bundle([entry], use_symbols=True)
+        bundle = self._run_bundle([entry])
 
         # Kernel-address param comes before the dimension param in the signature.
         self.assertIn(

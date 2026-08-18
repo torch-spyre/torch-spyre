@@ -86,7 +86,7 @@ tests: ## Run torch spyre tests. Narrow scope with TEST_TYPE=smoke|unit|integrat
 # suite, so no new Makefile target or Jenkins wiring is needed.
 ifeq ($(TEST_TYPE),perf)
 	@mkdir -p "$(RESULTS_DIR)"
-	spyre-perf-suite --default --stacks torch-spyre \
+	spyre-perf-suite --no-experimental --stacks torch-spyre \
 		--report "$(RESULTS_DIR)/report.txt"
 	@test -f "$(RESULTS_DIR)/report.xml" || \
 		{ echo "ERROR: spyre-perf-suite did not emit $(RESULTS_DIR)/report.xml" >&2; \

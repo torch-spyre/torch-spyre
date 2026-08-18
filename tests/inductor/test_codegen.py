@@ -683,7 +683,7 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
     def test_per_core_symbolic_addresses_emitted(self):
         op_spec = self._make_symbolic_op_spec()
         sdsc_json, _, _, symbol_kinds = compile_op_spec(
-            idx=0, op_spec=op_spec, symbols=[], use_symbols=True
+            idx=0, op_spec=op_spec, symbols=[]
         )
 
         top = next(iter(sdsc_json.values()))
@@ -744,9 +744,7 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
         # in the SDSC's local range, before any address symbol. A future change
         # that inverts this would silently shift bundle.mlir operand positions.
         op_spec = self._make_symbolic_op_spec()
-        _, _, _, symbol_kinds = compile_op_spec(
-            idx=0, op_spec=op_spec, symbols=[], use_symbols=True
-        )
+        _, _, _, symbol_kinds = compile_op_spec(idx=0, op_spec=op_spec, symbols=[])
         first_address = next(
             i for i, sk in enumerate(symbol_kinds) if not sk.is_dimension
         )

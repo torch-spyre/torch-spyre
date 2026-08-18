@@ -77,8 +77,8 @@ class TestBarrier(TestCase):
     def test_barrier_basic(self):
         """Test basic barrier functionality - all ranks should proceed together."""
         # Simple barrier test - just verify it doesn't hang or crash
-        dist.barrier()
-        # If we reach here, barrier worked
+        work = dist.barrier()
+        self.assertIsNone(work, "async_op=False must return None")
         self.assertTrue(True, "Barrier completed successfully")
 
     def test_barrier_synchronization_timing(self):
@@ -130,6 +130,42 @@ class TestBarrier(TestCase):
 
         # If we reach here, all barriers completed successfully
         self.assertTrue(True, "Multiple barriers completed successfully")
+
+    def test_barrier_basic_async(self):
+        """Test barrier with async_op=True returns a Work handle and completes."""
+        work = dist.barrier(async_op=True)
+        self.assertIsNotNone(work, "async_op=True must return a Work handle")
+        work.wait()
+        self.assertTrue(work.is_completed())
+        self.assertTrue(True, "Async barrier completed successfully")
+
+    def test_barrier_synchronization_timing_async(self):
+        """
+        Test that async barrier synchronizes all ranks correctly.
+        Work handle is obtained immediately; work.wait() does the blocking.
+        """
+        sleep_duration = self.comm_rank * 0.5
+        max_sleep = (self.comm_size - 1) * 0.5
+
+        time.sleep(sleep_duration)
+
+        start_time = time.time()
+        work = dist.barrier(async_op=True)
+        self.assertIsNotNone(work, "async_op=True must return a Work handle")
+
+        # Block until all ranks have reached the barrier
+        work.wait()
+        self.assertTrue(work.is_completed())
+
+        elapsed_time = time.time() - start_time
+
+        tolerance = 0.2
+        self.assertGreaterEqual(
+            elapsed_time,
+            max_sleep - sleep_duration - tolerance,
+            f"Rank {self.comm_rank}: Async barrier did not wait long enough. "
+            f"Got {elapsed_time:.3f}s",
+        )
 
 
 if __name__ == "__main__":
