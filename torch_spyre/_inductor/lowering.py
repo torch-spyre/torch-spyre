@@ -1877,8 +1877,8 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3FN_MAX):
     # (mulConst = 1/scale_ub) is representable as a non-zero FP16 value.
     # FP16 range: [6.104e-5, 65504.0], so scale_ub must be in [1/65504, 1/6.104e-5]
     # i.e. [~1.53e-5, 16384.0].
-    _fp16_max = torch.finfo(torch.float16).max        # 65504.0
-    _fp16_tiny = torch.finfo(torch.float16).tiny      # 6.103515625e-05
+    _fp16_max = torch.finfo(torch.float16).max  # 65504.0
+    _fp16_tiny = torch.finfo(torch.float16).tiny  # 6.103515625e-05
 
     if not math.isfinite(scale_ub):
         raise ValueError(
@@ -1894,12 +1894,12 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3FN_MAX):
     if _mul_const_fp32 > _fp16_max:
         raise ValueError(
             f"scale_ub={scale_ub} is too small: mulConst = 1/scale_ub = {_mul_const_fp32} "
-            f"overflows FP16 (max {_fp16_max}). Minimum scale_ub is 1/{_fp16_max} ≈ {1.0/_fp16_max:.3e}."
+            f"overflows FP16 (max {_fp16_max}). Minimum scale_ub is 1/{_fp16_max} ≈ {1.0 / _fp16_max:.3e}."
         )
     if _mul_const_fp32 < _fp16_tiny:
         raise ValueError(
             f"scale_ub={scale_ub} is too large: mulConst = 1/scale_ub = {_mul_const_fp32} "
-            f"underflows FP16 (smallest normal {_fp16_tiny}). Maximum scale_ub is 1/{_fp16_tiny} = {1.0/_fp16_tiny}."
+            f"underflows FP16 (smallest normal {_fp16_tiny}). Maximum scale_ub is 1/{_fp16_tiny} = {1.0 / _fp16_tiny}."
         )
 
     # Get reduction parameters - use standard inner_fn

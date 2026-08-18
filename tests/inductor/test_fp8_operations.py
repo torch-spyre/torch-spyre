@@ -454,7 +454,9 @@ class TestFP8Operations:
             # CPU reference implementation
             scale = torch.amax(torch.abs(x), dim=-1, keepdim=True) / scale_ub
             x_scaled = x / scale
-            x_fp8 = x_scaled.clamp(-FP8_E4M3FN_MAX, FP8_E4M3FN_MAX).to(torch.float8_e4m3fn)
+            x_fp8 = x_scaled.clamp(-FP8_E4M3FN_MAX, FP8_E4M3FN_MAX).to(
+                torch.float8_e4m3fn
+            )
             return x_fp8.to(torch.float16) * scale
 
         # Use tolerance appropriate for FP8 quantization roundtrip
@@ -512,18 +514,20 @@ class TestFP8Operations:
     @pytest.mark.parametrize(
         "scale_ub,should_fail,match",
         [
-            (0.0, True, "scale_ub must be positive"),       # Zero
-            (-1.0, True, "scale_ub must be positive"),      # Negative
-            (float("nan"), True, "scale_ub must be a finite number"),   # NaN
-            (float("inf"), True, "scale_ub must be a finite number"),   # +inf
+            (0.0, True, "scale_ub must be positive"),  # Zero
+            (-1.0, True, "scale_ub must be positive"),  # Negative
+            (float("nan"), True, "scale_ub must be a finite number"),  # NaN
+            (float("inf"), True, "scale_ub must be a finite number"),  # +inf
             (float("-inf"), True, "scale_ub must be a finite number"),  # -inf
-            (1e-6, True, "overflows FP16"),   # mulConst=1e6 overflows FP16
-            (1e5, True, "underflows FP16"),   # mulConst=1e-5 < FP16 tiny, underflows
-            (448.0, False, None),   # Valid default
-            (224.0, False, None),   # Valid half range
+            (1e-6, True, "overflows FP16"),  # mulConst=1e6 overflows FP16
+            (1e5, True, "underflows FP16"),  # mulConst=1e-5 < FP16 tiny, underflows
+            (448.0, False, None),  # Valid default
+            (224.0, False, None),  # Valid half range
         ],
     )
-    def test_quantscalepertokenfp8_scale_ub_validation(self, scale_ub, should_fail, match):
+    def test_quantscalepertokenfp8_scale_ub_validation(
+        self, scale_ub, should_fail, match
+    ):
         """Test that invalid scale_ub values raise appropriate errors.
 
         Validates:
