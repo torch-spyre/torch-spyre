@@ -40,9 +40,8 @@ from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
 
 logger = get_inductor_logger("sdsc_compile")
 
-# Wall-clock ceiling on ONE backend-compiler invocation, shared by both of them
-# (dxp_standalone on the SDSC path, dbo-opt on the KTIR path) so the two behave
-# alike. It bounds a wedged compiler -- which would otherwise block
+# Wall-clock ceiling on ONE backend-compiler invocation, only used for dbo-opt
+# on the KTIR path. It bounds a wedged compiler -- which would otherwise block
 # torch.compile forever with no diagnostic -- rather than policing slowness:
 # both finish in well under a second on a small kernel.
 _COMPILE_TIMEOUT_S = 60.0
@@ -153,7 +152,6 @@ class SpyreAsyncCompile(AsyncCompile):
                 subprocess.run(
                     ["dxp_standalone", "-d", output_dir],
                     check=True,
-                    timeout=_COMPILE_TIMEOUT_S,
                 )
             except Exception as exc:
                 try_collect(
@@ -197,7 +195,16 @@ class SpyreAsyncCompile(AsyncCompile):
 
         # Emit before opening the file: if generate_ktir raises we must not
         # leave a truncated/empty .ktir behind.
-        ktir_text = generate_ktir(kernel_name, specs)
+        #
+        # Canonical KTIR spells base addresses as func arguments.  dbo-opt needs
+        # them baked into constants (dataflow-scheduler#65), so this path -- the
+        # one that runs dbo-opt -- asks for that form; the emitter itself has no
+        # opinion about the backend.  Drop the argument when #65 is fixed.
+        ktir_text = generate_ktir(
+            kernel_name,
+            specs,
+            bake_addresses=not _spyre_config.bundle_symbolic_args,
+        )
 
         # Persist the emitted KTIR as a text file in the same per-kernel output
         # dir as sdsc's bundle.

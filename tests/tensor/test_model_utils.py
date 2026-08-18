@@ -30,6 +30,12 @@ from torch_spyre.model_utils import (
     patch_module_to_for_spyre,
 )
 
+# fp16 lands on device as DLFLOAT16 (SEN169_FP16, 9 mantissa bits), so a
+# round-trip is never bit-exact: 2**-10 half-ULP, and fp16 subnormals come
+# back halved (abs error <= 3.1e-5).
+DLFLOAT16_RTOL = 2e-3
+DLFLOAT16_ATOL = 1e-4
+
 
 @instantiate_parametrized_tests
 class TestLoadModelToSpyre(TestCase):
@@ -68,6 +74,12 @@ class TestLoadModelToSpyre(TestCase):
         dev = _dma_to_spyre_indirect_access(w)
         layout = get_spyre_tensor_layout(dev)
         self.assertEqual(list(layout.device_size), [1000, 4, 64])
+        # device_size only checks the block shape; round-trip through the
+        # layout so a wrong stride_map entry (correct shape, scrambled data)
+        # fails loudly instead of passing silently.
+        torch.testing.assert_close(
+            dev.cpu(), w, rtol=DLFLOAT16_RTOL, atol=DLFLOAT16_ATOL
+        )
 
     def test_embedding_stick_size_is_dtype_aware(self):
         """elems_per_stick is 32 at fp32, so a (1000, 256) fp32 table splits
@@ -78,6 +90,10 @@ class TestLoadModelToSpyre(TestCase):
         dev = _dma_to_spyre_indirect_access(w)
         layout = get_spyre_tensor_layout(dev)
         self.assertEqual(list(layout.device_size), [1000, 8, 32])
+        # Round-trip so a wrong stride_map entry fails loudly, not just a
+        # device_size check (the fp32 stick split is 8x32, not 4x64). fp32 maps
+        # to IEEE_FP32, so this round-trip is lossless -- defaults suffice.
+        torch.testing.assert_close(dev.cpu(), w)
 
     def test_embedding_non_tiling_hidden_dim_warns_and_falls_back(self):
         """A hidden dim that isn't a multiple of the stick size warns and
