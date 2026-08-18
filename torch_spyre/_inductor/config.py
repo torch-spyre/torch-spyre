@@ -167,4 +167,12 @@ layout_solver: Literal[
     "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
 ] = os.environ.get("LAYOUT_SOLVER", "greedy")  # type: ignore[assignment]
 
+# Use the C++ (native) permutation-layout packer accelerator, which the
+# simulated-annealing layout solver drives. The native and Python packers are
+# behaviourally identical (verified bit-for-bit); the native one is faster. Set
+# False (or ``TORCH_SPYRE_NATIVE_PACKER=0``/``false``, which backs this default)
+# to force the pure-Python packer. A missing native class is a stale or
+# incomplete build, not a supported mode, and raises rather than falling back.
+native_layout_packer: bool = _get_env_bool("TORCH_SPYRE_NATIVE_PACKER", True)
+
 install_config_module(sys.modules[__name__])

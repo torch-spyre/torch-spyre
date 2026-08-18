@@ -1219,21 +1219,37 @@ def test_softmax_2d_512x256_dim1_A4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
 def test_softmax_2d_512x256_dim1_B4():
-    """softmax(x, dim=1) on [512,256] tiled B÷4 → 64 elems/tile (1 stick)."""
+    """softmax(x, dim=1) on [512,256] tiled B÷4 → 64 elems/tile (1 stick).
+
+    Same follow-on layout-solver bug as test_softmax_2d_512x256_dim1_A4_B4:
+    div's new full-buffer read of exp's copy-out has no feasible restickify
+    path. See that test's docstring.
+    """
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
         with spyre_hint(num_tiles_per_dim={"B": 4}):
             return torch.softmax(x, dim=1)
 
-    run_coarse_tile_test(fn, inputs)
+    with pytest.raises(
+        InductorError,
+        match="finalize_layouts: restickify needed but infeasible for op=",
+    ):
+        run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
 def test_softmax_2d_512x256_dim1_A4_B4():
-    """softmax(x, dim=1) on [512,256] tiled A÷4 B÷4."""
+    """softmax(x, dim=1) on [512,256] tiled A÷4 B÷4.
+
+    coarse_tile now correctly classifies exp's copy-out (div reads sum's
+    tiled-reduction result, forcing div into a separate loop nest, so exp
+    can no longer stay loop_internal — see _consumers_reading_incomplete_
+    reduction). That surfaces a distinct, still-unresolved layout-solver
+    bug: finalize_layouts can't find a restickify path for div's new
+    full-buffer read of exp's copy-out. Track the follow-on bug here until
+    it's root-caused.
+    """
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
@@ -1241,7 +1257,11 @@ def test_softmax_2d_512x256_dim1_A4_B4():
             with spyre_hint(num_tiles_per_dim={"B": 4}):
                 return torch.softmax(x, dim=1)
 
-    run_coarse_tile_test(fn, inputs)
+    with pytest.raises(
+        InductorError,
+        match="finalize_layouts: restickify needed but infeasible for op=",
+    ):
+        run_coarse_tile_test(fn, inputs)
 
 
 @pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
@@ -2733,7 +2753,6 @@ def test_flash_tile_H():
     )
 
 
-@pytest.mark.skip(reason="KeyError: 0 — B tiling not yet supported")
 def test_flash_tile_B():
     """Flash v1: tile B÷2 only. B=2."""
     run_coarse_tile_test(
