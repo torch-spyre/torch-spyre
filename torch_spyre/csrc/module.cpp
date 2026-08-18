@@ -79,7 +79,9 @@ void set_downcast_warn_enabled(bool enabled) {
 // emits no cross-stream event steps of its own. SPYRE_HAZARD_TRACKER=0 keeps
 // every step on S_dev: the single-stream floor, byte-identical to the
 // pre-overlap path (the STATIC event-step path was retired). Read once from the
-// env in init_from_env; applied to the flex RuntimeContext in _startRuntime.
+// env in init_from_env; latched into each torch-spyre-managed stream's
+// track_hazards at creation (see spyre_stream.cpp). Nothing is applied to the
+// flex RuntimeContext at _startRuntime.
 std::atomic<bool> g_hazard_tracker_enabled{true};  // default ON (HAZARD)
 
 bool get_hazard_tracker_enabled() {
@@ -90,9 +92,12 @@ void set_hazard_tracker_enabled(bool enabled) {
   // Global source of truth for whether torch-spyre registers its own streams with
   // flex's per-region hazard tracker. Registration happens at stream CREATION (via the
   // track_hazards flag threaded into RuntimeContext::createStream), so flipping this
-  // after a stream is created affects only streams created afterward. This is a
-  // TEST/tuning hook; the production value is latched from SPYRE_HAZARD_TRACKER in
-  // init_from_env before any stream is created.
+  // after a stream is created affects only streams created afterward. In particular
+  // the default stream is fixed at RuntimeContext construction, so flipping this on
+  // after startup will NOT register the already-created default stream (a
+  // post-startup off->on flip is only partial). This is a TEST/tuning hook; the
+  // production value is latched from SPYRE_HAZARD_TRACKER in init_from_env before any
+  // stream is created.
   g_hazard_tracker_enabled.store(enabled, std::memory_order_relaxed);
 }
 
@@ -370,16 +375,20 @@ PYBIND11_MODULE(_C, m) {
         "Whether the flex per-region hazard tracker is enabled.");
   m.def("set_hazard_tracker_enabled", &spyre::set_hazard_tracker_enabled,
         py::arg("enabled"),
-        "Enable/disable the flex hazard-tracker path (TEST/tuning hook; the "
-        "production value is latched from SPYRE_HAZARD_TRACKER at runtime "
-        "start). Flips torch-spyre's plan-shaping + routing global AND "
-        "re-drives flex's RuntimeContext when the runtime is live, so the "
-        "two cannot diverge; a no-op on flex before _startRuntime. "
-        "CONTRACT: call only single-threaded and NOT concurrent with an "
-        "in-flight launch -- the two-atomic update (this global + flex's) "
-        "is not atomic as a pair, so a flip racing a multi-op launch on "
-        "another thread can drop the H2D->Compute RAW edge. Flipping freely "
-        "between launches on one thread (what the tests do) is safe.");
+        "Enable/disable the flex per-region hazard-tracker path (TEST/tuning "
+        "hook; the production value is latched from SPYRE_HAZARD_TRACKER at "
+        "runtime start). Sets torch-spyre's plan-shaping + routing global "
+        "only; nothing is pushed to flex. The value is read when a stream is "
+        "created (threaded into RuntimeContext::createStream as "
+        "track_hazards), so it affects only streams created afterward -- and "
+        "the default stream is fixed at RuntimeContext construction, so a "
+        "post-startup off->on flip will not register it. CONTRACT: call only "
+        "single-threaded and NOT concurrent with an in-flight launch -- the "
+        "flag is read at several points across a launch (the split decision "
+        "and each stream creation), so a flip racing a multi-op launch on "
+        "another thread can be observed inconsistently and drop the "
+        "H2D->Compute RAW edge. Flipping between launches on one thread (what "
+        "the tests do) is safe.");
   m.def("get_elem_in_stick", &spyre::get_elem_in_stick);
   m.def("get_device_dtype", &spyre::get_device_dtype);
 
