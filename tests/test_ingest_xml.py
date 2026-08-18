@@ -42,8 +42,7 @@ def _write_xml(tmp_path, testcases: str) -> Path:
 
 def _case(name: str, time: str) -> str:
     return (
-        f'<testcase classname="perf.benchmark" name="{name}" time="{time}">'
-        "</testcase>"
+        f'<testcase classname="perf.benchmark" name="{name}" time="{time}"></testcase>'
     )
 
 
