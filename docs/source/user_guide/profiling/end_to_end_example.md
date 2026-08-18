@@ -13,13 +13,13 @@ The Granite end-to-end path on Spyre today goes through the
 exists on the `eager_spyre` branch of each repo, so install them from
 source off that branch rather than from PyPI.
 
-This example profiles Granite 3.3-8B-Instruct on Spyre in eager mode so torch.compile is not required.
+This example profiles Granite 3.3-8B-Instruct on Spyre in eager mode so `torch.compile` is not required.
 
 ## What you need
 
 **Prerequisites Step**
 
-Ensure that you have access to a pod with Spyre accelerator and torch-spyre and spyre software stack installed.
+Ensure that you have access to a pod with a Spyre accelerator and the torch-spyre and Spyre software stack installed.
 
 | Piece | Source | Sample install (verify against the upstream README) |
 |---|---|---|
@@ -73,7 +73,6 @@ export SENCORES=32                 # full accelerator (1–32; default 32)
 Save as `profile_granite.py`.
 
 ```python
-import os
 import time
 import torch
 from statistics import mean, median
@@ -116,6 +115,9 @@ ids, kwargs = pad_input_ids(
     pad_token_id=pad_token_id,
 )
 
+# NOTE: Precomputing the rotary frequencies and passing selected_freqs=
+# as a forward kwarg is a temporary workaround. It reaches into FMS
+# internals and will be removed once the upstream fix lands.
 position_ids = kwargs["position_ids"]
 alpha = model.base_model.rot_emb.compute_freqs_cis(DEVICE, ids.shape[1])
 selected_freqs = model.base_model.rot_emb.cached_freqs[0][alpha][position_ids].to(DEVICE)
@@ -151,9 +153,9 @@ with profile(
         wall_clock_ms.append((time.perf_counter() - t0) * 1000)
         prof.step()
 
-# 5. Two timing signals: wall-clock (what the user feels) and
-#    profiler-derived CPU time (host-side overhead). The gap between
-#    them ≈ device-side work.
+# 5. Two timing signals: wall-clock (end-to-end latency) and
+#    profiler-derived CPU time (host-side activity). Comparing them
+#    shows whether latency is host-bound or device-bound.
 cpu_per_run_ms = sum(e.self_cpu_time_total for e in prof.events()) / 1000 / N_RUNS
 
 print("=" * 42)
@@ -173,8 +175,7 @@ Three patterns to call out:
 
 - **Run warmup iterations outside the timed loop**. The first runs carry one-time runtime and device initialization. Excluding them keeps the steady-state numbers representative.
 - **Use two orthogonal timing signals**. Wall-clock from time.perf_counter() is end-to-end latency; profiler-derived CPU time is host-side activity. Comparing them shows whether latency is host-bound or device-bound, though the difference is not a direct measurement of device time.
-- **`tensorboard_trace_handler(log_dir)` over `export_chrome_trace`.** Per-step JSON files make it easier to distinguish warmup executions from steady-state runs and inspect each profiler step independently.
-  runs and open in TensorBoard *and* Chrome / Perfetto.
+- **`tensorboard_trace_handler(log_dir)` over `export_chrome_trace`.** Per-step JSON files make it easier to distinguish warmup executions from steady-state runs, and they open in TensorBoard as well as Chrome / Perfetto.
 
 See [PyTorch Profiler](pytorch_profiler.md).
 
@@ -223,11 +224,11 @@ For a Granite-class transformer the typical signals are:
 
 | Symptom | Likely cause | Where to dig |
 |---|---|---|
-| First iteration much slower than the rest | the first iterations as runtime/device initialization or general warmup.|
+| First iteration much slower than the rest | Runtime and device initialization or general warmup | Expected. Discard the early iterations. |
 | Wall-clock ≫ profiler CPU | Device-side work dominates (good for compute-bound layers like MLP / large matmul) | Cross-check with `aiu-smi` PT-array util. |
 | Wall-clock ≈ profiler CPU | Host-side bottleneck — Python or Dynamo overhead | `TORCH_LOGS="+inductor"` |
 | Per-layer kernel gaps | Tile staging between LPDDR5 and LX scratchpad | [Performance analysis methodology](performance_analysis_methodology.md) |
-| Low PT-array utilization in `aiu-smi` | Work-division inefficiency, stick-alignment padding | |
+| Low PT-array utilization in `aiu-smi` | Work-division inefficiency, stick-alignment padding | [Compiler work division](../../compiler/work_division_planning.md) |
 | Idle bubbles between consecutive kernels | Reconfiguration latency or DMA stalls | `aiu-trace-analyzer` gap analysis |
 
 ## See also
