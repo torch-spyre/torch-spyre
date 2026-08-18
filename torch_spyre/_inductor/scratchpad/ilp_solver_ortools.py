@@ -93,6 +93,7 @@ else:
         cp_model = None
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
+    single_tile_idx as _single_tile_idx,
     CoreDivisionBuffer,
     ceil_div,
     CoreDivisionLayoutSolver,
@@ -263,7 +264,15 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
         b = self.buffer
         m = self.model
 
-        per_core = [ceil_div(b.size, cd.output_partition) for cd in b.core_divisions]
+        # Sized through the buffer's own edge helper, which is the single
+        # definition of the divisor (core partition x output tile count).
+        # ``_single_tile_idx`` is where this model's one-tiling assumption is
+        # stated and checked: with a real tiling variable the table becomes
+        # per-edge and is selected by a channelled (tile, div) pair.
+        tile_idx = _single_tile_idx(b)
+        per_core = [
+            b.per_core_footprint(tile_idx, d) for d in range(len(b.core_divisions))
+        ]
         # Total cores the op runs on under each division -- includes any
         # reduction-axis split, so a reduction-parallel division counts its full
         # parallelism (``output_partition`` alone would score it as 1 core).
@@ -317,8 +326,7 @@ class _CoreDivisionBufferWithCpVars(_LifetimeBufferWithCpVars[CoreDivisionBuffer
 
     def footprint(self, solver: "cp_model.CpSolver") -> int:
         t = self.buffer
-        cd = t.core_divisions[solver.Value(self.division)]
-        return ceil_div(t.size, cd.output_partition)
+        return t.per_core_footprint(_single_tile_idx(t), solver.Value(self.division))
 
     def record_division(self, solver: "cp_model.CpSolver") -> None:
         self.buffer.chosen_division = solver.Value(self.division)

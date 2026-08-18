@@ -223,26 +223,35 @@ class TileSpec:
 
 @dataclass
 class CoreDivision:
-    """One permissible partition config of a buffer's producing op: a core
-    division paired with the coarse tiling it is legal under.
+    """One permissible core division of a buffer's producing op.
 
     ``output_splits`` / ``reduction_splits`` are the stride/coeff-keyed encoding
     produced by :func:`pass_utils.splits_by_index_coeff` -- exactly the shape
-    stored in ``op.op_it_space_splits``. Solvers are expected to use these to size
-    the buffer (per-core footprint = total / ``output_partition``).
+    stored in ``op.op_it_space_splits``. Solvers use these to size the buffer
+    (per-core footprint = total / ``output_partition``).
 
-    ``tiling`` is *part of the candidate*, not a parallel choice: a division is
-    only meaningful relative to a tiling. Tiling changes both the legal split
-    set (per-dim divisibility and per-core span move in opposite directions)
-    and the coeff-keyed encoding itself (``_divide_ranges`` rewrites the index
-    expressions the keys come from), so a division carried across tilings is
-    uninterpretable. The empty spec is the untiled candidate, and with
-    auto coarse tiling off the field is inert.
+    Carries no tiling. A division and a tiling are separate candidate lists
+    related many-to-many (see :class:`TilingCandidate`), because the legal
+    division set is tiling-relative: tiling shrinks a dim's extent, admitting
+    fewer factors, while shrinking its per-core span, admitting more splits, so
+    the per-spec sets are neither subsets nor supersets of one another.
+
+    **One division may only be referenced by several tiling candidates once the
+    encoding is tiling-invariant, which it is not yet.** ``splits_by_index_coeff``
+    keys each symbol by its *coefficient in the write index*, and coarse tiling
+    rewrites exactly those coefficients (``_divide_ranges`` / ``_rescale_index``),
+    so the same dict denotes different physical splits under different tilings --
+    the conflation shape the co-optimizing path already shipped once. Re-keying
+    positionally (``data.ranges`` / ``reduction_ranges`` positions, which
+    ``_divide_ranges`` leaves untouched) is the prerequisite for a second
+    candidate, and belongs with the enumerator that first produces one. Until
+    then every buffer carries exactly one, untiled candidate, and
+    :func:`single_tile_idx` is what makes a second fail loudly rather than
+    silently share a division across frames.
     """
 
     output_splits: dict[int, int] = field(default_factory=dict)
     reduction_splits: dict[int, int] = field(default_factory=dict)
-    tiling: TileSpec = TileSpec()
 
     @property
     def cores_used(self) -> int:
@@ -271,10 +280,46 @@ class CoreDivision:
     def label(self) -> str:
         out = ",".join(f"s{s}/{f}" for s, f in sorted(self.output_splits.items()))
         red = ",".join(f"~s{s}/{f}" for s, f in sorted(self.reduction_splits.items()))
-        base = " ".join(p for p in (out, red) if p) or "whole"
-        if self.tiling.is_untiled:
-            return base
-        return f"{base} tile[{self.tiling.label}]"
+        return " ".join(p for p in (out, red) if p) or "whole"
+
+
+@dataclass(frozen=True)
+class TilingCandidate:
+    """One coarse tiling an op could take, plus the divisions legal under it.
+
+    The two candidate lists on a :class:`CoreDivisionBuffer` -- ``tile_specs``
+    and ``core_divisions`` -- are the two node sets of a **many-to-many**
+    relation, and ``division_idxs`` is this spec's slice of the edge set: the
+    indices into ``core_divisions`` that are legal *on this spec's frame*.
+
+    Many-to-many because the per-spec legal sets are neither subsets nor
+    supersets of one another: tiling shrinks a dim's extent (admitting fewer
+    factors) while shrinking its per-core span (admitting more splits), so the
+    adjacency is irregular and has to be stored rather than recovered from a
+    predicate at solve time.
+
+    The relation is **totally participating in both directions** -- a spec with
+    no legal division can never be chosen, and a division no spec references is
+    unreachable. Both are asserted in
+    :meth:`CoreDivisionBuffer.__post_init__`; violating either is a build bug,
+    not a plan the solver should be asked to reject.
+
+    Anything that depends on *both* endpoints belongs on the edge, not on
+    either list -- the per-core footprint
+    (:meth:`CoreDivisionBuffer.per_core_footprint`) and the per-core view,
+    which is only valid on this spec's predicted frame.
+    """
+
+    spec: TileSpec = TileSpec()
+    division_idxs: tuple[int, ...] = ()
+
+    def __post_init__(self):
+        if not isinstance(self.division_idxs, tuple):
+            object.__setattr__(self, "division_idxs", tuple(self.division_idxs))
+
+    @property
+    def label(self) -> str:
+        return self.spec.label
 
 
 @dataclass
@@ -283,9 +328,19 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
 
     The placement-only solvers (greedy/first-fit/best-fit) never look at these
     fields, so they stay on this subclass rather than the shared base.
+
+    ``core_divisions`` and ``tile_specs`` are two lists, related many-to-many
+    through :attr:`TilingCandidate.division_idxs` (see that class). A plan is
+    one *edge*: ``(chosen_tiling, chosen_division)``. ``None`` on either means
+    undecided, which is distinct from a chosen candidate whose tiling is the
+    empty spec -- undecided is a bug, untiled is a plan.
     """
 
     core_divisions: list[CoreDivision] = field(default_factory=list)
+    # Coarse tilings this op could take, each naming the divisions legal under
+    # it. Defaults to the single untiled candidate over every division, which
+    # is the inert shape every pre-coarse-tiling caller gets.
+    tile_specs: list[TilingCandidate] = field(default_factory=list)
     # Producer buffer names; defines the producer->consumer edges for matching.
     parents: list[str] = field(default_factory=list[str])
     # parent_buf_name -> (parent_div_idx, this_div_idx) pairs that induce the
@@ -294,26 +349,110 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # across reductions/reshapes). These are the sole slicing-match predicate;
     # an absent/empty entry means no compatible division, so the gate forbids
     # the merge/residency across that edge.
+    #
+    # Keyed on division indices alone, which is what the two-list form buys:
+    # residency across an intra-group edge forces producer and consumer onto
+    # the *same* spec, so the spec is shared across the edge rather than
+    # ranging freely on both sides.
     cd_parent_matches: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
     chosen_division: Optional[int] = None
+    chosen_tiling: Optional[int] = None
     boundary: BufferType = BufferType.Intermediate
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not self.tile_specs and self.core_divisions:
+            self.tile_specs = [
+                TilingCandidate(TileSpec(), tuple(range(len(self.core_divisions))))
+            ]
+        self.assert_relation_total()
+
+    def assert_relation_total(self) -> None:
+        """Assert the spec/division relation participates totally both ways.
+
+        Re-runnable, because the allocator fills these lists in stages; every
+        mutation of either list has to leave this true.
+        """
+        n = len(self.core_divisions)
+        referenced: set[int] = set()
+        for t, cand in enumerate(self.tile_specs):
+            assert cand.division_idxs, (
+                f"buffer {self.name} tiling candidate {t} ({cand.label}) lists no "
+                "legal core division, so it can never be chosen; it must not be "
+                "offered to the solver"
+            )
+            for d in cand.division_idxs:
+                assert 0 <= d < n, (
+                    f"buffer {self.name} tiling candidate {t} ({cand.label}) "
+                    f"references division {d}, out of range for {n} divisions"
+                )
+            referenced.update(cand.division_idxs)
+        assert len(referenced) == n, (
+            f"buffer {self.name} has core divisions "
+            f"{sorted(set(range(n)) - referenced)} that no tiling candidate "
+            "references, so they are unreachable"
+        )
+
+    def edges(self) -> list[tuple[int, int]]:
+        """Every legal ``(tile_idx, div_idx)`` pair, in list order.
+
+        This is the domain a solver selects one element from, and the index
+        space its per-edge tables (footprint, view) are built over.
+        """
+        return [
+            (t, d) for t, cand in enumerate(self.tile_specs) for d in cand.division_idxs
+        ]
+
+    def per_core_footprint(self, tile_idx: int, div_idx: int) -> int:
+        """Per-core LX footprint of this buffer under one edge.
+
+        The single definition of the divisor, because it is the one quantity
+        that depends on *both* endpoints: ``output_partition`` is spatial (how
+        many cores hold a slice concurrently) and ``output_tile_count`` is
+        temporal (how many sequential tiles the op's own output write is cut
+        into, reduction levels excluded -- a tiled reduction keeps the full
+        output extent as its accumulator). Anything that sizes a buffer for
+        placement must come through here; splitting the two divisors across
+        call sites is how one of them gets forgotten.
+        """
+        cd = self.core_divisions[div_idx]
+        spec = self.tile_specs[tile_idx].spec
+        return ceil_div(self.size, cd.output_partition * spec.output_tile_count)
 
     @property
     def min_footprint(self) -> int:
-        """Smallest per-core footprint any candidate division allows. With no
-        candidates there is nothing to divide by, so it falls back to ``size``
-        (the placement-only case ``_wrap`` also dispatches on).
+        """Smallest per-core footprint any legal edge allows. With no candidates
+        there is nothing to divide by, so it falls back to ``size`` (the
+        placement-only case ``_wrap`` also dispatches on).
 
-        A tiled candidate's own buffer is per-tile scratch, so its footprint
-        divides by the output tile count as well as the core partition -- this
-        is where coarse tiling's LX-residency win enters the capacity math.
+        Minimised over *edges*, not over divisions: a division's footprint is
+        not defined without the spec it is taken under.
         """
         if not self.core_divisions:
             return self.size
-        return min(
-            ceil_div(self.size, cd.output_partition * cd.tiling.output_tile_count)
-            for cd in self.core_divisions
-        )
+        return min(self.per_core_footprint(t, d) for t, d in self.edges())
+
+
+def single_tile_idx(buf: "CoreDivisionBuffer") -> int:
+    """The index of ``buf``'s only tiling candidate, asserting there is one.
+
+    Every solver in the tree today chooses a *division* but not a *tiling*, so
+    it prices each division under one spec. That is sound only while the buffer
+    offers exactly one, and this is where that assumption is stated and checked
+    rather than assumed at each sizing site. When a solver gains a real tiling
+    variable, its per-candidate tables become per-*edge*
+    (:meth:`CoreDivisionBuffer.edges`) selected by a channelled ``(tile, div)``
+    pair, and these call sites are exactly the ones that have to change --
+    which is what the assert makes impossible to miss.
+    """
+    assert buf.tile_specs, f"buffer {buf.name} offers no tiling candidate"
+    assert len(buf.tile_specs) == 1, (
+        f"buffer {buf.name} offers {len(buf.tile_specs)} tiling candidates, but "
+        "this solver models only a core-division choice; pricing every division "
+        "under one spec would be wrong. The model needs a tiling variable and "
+        "per-edge tables before it can accept these candidates."
+    )
+    return 0
 
 
 def assert_in_place_parent_is_read(

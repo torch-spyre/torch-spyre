@@ -29,6 +29,8 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionLayoutSolver,
     MemoryPlanSolver,
     CoreDivision,
+    TilingCandidate,
+    single_tile_idx,
     CoreDivisionBuffer,
     LifetimeBoundBuffer,
     TileAxis,
@@ -1485,11 +1487,14 @@ class TestTopologicalSort(TestCase):
 
 
 class TestTileSpecRepresentation(TestCase):
-    """R2.1: a coarse tiling is candidate data paired onto the division.
+    """R2.1: tilings and core divisions are two lists in a many-to-many relation.
 
-    ``TileAxis``/``TileSpec`` and ``CoreDivision.tiling`` are the stage-1
-    representation of draft-unified-tiling-implementation-plan.md — one
-    candidate list whose element pairs division and tiling, not two lists.
+    ``tile_specs`` and ``core_divisions`` are the two node sets;
+    ``TilingCandidate.division_idxs`` is the edge set — the divisions legal on
+    that spec's frame. A plan is one edge. What makes the shared division list
+    sound is that ``CoreDivision`` is keyed *positionally* (``data.ranges``
+    positions), which coarse tiling leaves untouched; the coeff-keyed form it
+    replaced denoted different physical splits under different tilings.
     """
 
     def test_untiled_default(self):
@@ -1527,45 +1532,125 @@ class TestTileSpecRepresentation(TestCase):
         with self.assertRaises(AssertionError):
             TileAxis(0, 1)
 
-    def test_core_division_defaults_untiled(self):
-        cd = CoreDivision(output_splits={256: 4})
-        self.assertTrue(cd.tiling.is_untiled)
-
-    def test_min_footprint_divides_by_output_tile_count(self):
+    def test_two_lists_related_many_to_many(self):
+        # R2.1: the relation is stored, not derived. Two specs may share a
+        # division (the same positional split legal under both) and one spec
+        # may admit several — neither list is a partition of the other.
         buf = CoreDivisionBuffer(
             "b",
             1024,
             [0, 3],
-            core_divisions=[
-                CoreDivision(
-                    output_splits={256: 2},
-                    tiling=TileSpec((TileAxis(0, 4),)),
-                ),
+            core_divisions=[CoreDivision(), CoreDivision(output_splits={0: 2})],
+            tile_specs=[
+                TilingCandidate(TileSpec(), (0, 1)),
+                TilingCandidate(TileSpec((TileAxis(0, 4),)), (0,)),
             ],
         )
-        self.assertEqual(buf.min_footprint, 1024 // (2 * 4))
+        self.assertEqual(buf.edges(), [(0, 0), (0, 1), (1, 0)])
 
-    def test_min_footprint_reduction_tiling_keeps_output_extent(self):
+    def test_default_tiling_candidate_is_untiled_over_every_division(self):
+        # The inert shape: a caller that knows nothing of tiling gets one
+        # untiled candidate spanning every division, so the relation is total
+        # without the caller doing anything.
+        buf = CoreDivisionBuffer(
+            "b", 1024, [0, 3], core_divisions=[CoreDivision(), CoreDivision()]
+        )
+        self.assertEqual(len(buf.tile_specs), 1)
+        self.assertTrue(buf.tile_specs[0].spec.is_untiled)
+        self.assertEqual(buf.tile_specs[0].division_idxs, (0, 1))
+
+    def test_spec_with_no_legal_division_rejected(self):
+        # Total participation, T side: a spec nothing is legal under can never
+        # be chosen and must not reach the solver.
+        with self.assertRaises(AssertionError):
+            CoreDivisionBuffer(
+                "b",
+                1024,
+                [0, 3],
+                core_divisions=[CoreDivision()],
+                tile_specs=[TilingCandidate(TileSpec(), ())],
+            )
+
+    def test_unreachable_division_rejected(self):
+        # Total participation, D side: a division no spec references is dead
+        # weight in every per-candidate table.
+        with self.assertRaises(AssertionError):
+            CoreDivisionBuffer(
+                "b",
+                1024,
+                [0, 3],
+                core_divisions=[CoreDivision(), CoreDivision(output_splits={0: 2})],
+                tile_specs=[TilingCandidate(TileSpec(), (0,))],
+            )
+
+    def test_out_of_range_division_idx_rejected(self):
+        with self.assertRaises(AssertionError):
+            CoreDivisionBuffer(
+                "b",
+                1024,
+                [0, 3],
+                core_divisions=[CoreDivision()],
+                tile_specs=[TilingCandidate(TileSpec(), (0, 1))],
+            )
+
+    def test_per_core_footprint_is_an_edge_property(self):
+        # The divisor depends on *both* endpoints: spatial core partition and
+        # temporal output tile count. One division, two specs, two footprints.
         buf = CoreDivisionBuffer(
             "b",
             1024,
             [0, 3],
-            core_divisions=[
-                CoreDivision(
-                    tiling=TileSpec((TileAxis(0, 4, is_reduction=True),)),
-                ),
+            core_divisions=[CoreDivision(output_splits={0: 2})],
+            tile_specs=[
+                TilingCandidate(TileSpec(), (0,)),
+                TilingCandidate(TileSpec((TileAxis(0, 4),)), (0,)),
+            ],
+        )
+        self.assertEqual(buf.per_core_footprint(0, 0), 1024 // 2)
+        self.assertEqual(buf.per_core_footprint(1, 0), 1024 // (2 * 4))
+        # min_footprint minimises over edges, not over divisions.
+        self.assertEqual(buf.min_footprint, 1024 // (2 * 4))
+
+    def test_reduction_tiling_keeps_output_extent(self):
+        # A reduction level chunks the input walk; the per-tile output scratch
+        # is the accumulator and keeps the full extent.
+        buf = CoreDivisionBuffer(
+            "b",
+            1024,
+            [0, 3],
+            core_divisions=[CoreDivision()],
+            tile_specs=[
+                TilingCandidate(TileSpec((TileAxis(0, 4, is_reduction=True),)), (0,))
             ],
         )
         self.assertEqual(buf.min_footprint, 1024)
 
-    def test_no_parallel_tiling_candidate_list(self):
-        # Negative (R2.1): the tiling pairs with the division on ONE indexed
-        # candidate list. A second list beside core_divisions would imply a
-        # free cross product, which the coeff-keyed split encoding cannot
-        # support — the same conflation shape as the shipped signature bug.
-        field_names = {f.name for f in dataclasses.fields(CoreDivisionBuffer)}
-        self.assertIn("core_divisions", field_names)
-        self.assertFalse({"tilings", "tile_specs", "tiling_candidates"} & field_names)
+    def test_division_carries_no_tiling(self):
+        # Negative: a division must not name a tiling. Pairing them on one
+        # object is what made the per-spec legal sets inexpressible and let the
+        # tile factor be forgotten at the sites that size a buffer.
+        field_names = {f.name for f in dataclasses.fields(CoreDivision)}
+        self.assertEqual(field_names, {"output_splits", "reduction_splits"})
+
+    def test_single_tile_idx_rejects_a_second_candidate(self):
+        # The division encoding is still coeff-keyed, so a division is only
+        # interpretable on the frame it was encoded against. Until it is
+        # re-keyed positionally, a second tiling candidate must not reach a
+        # solver that prices every division under one spec.
+        one = CoreDivisionBuffer("b", 1024, [0, 3], core_divisions=[CoreDivision()])
+        self.assertEqual(single_tile_idx(one), 0)
+        two = CoreDivisionBuffer(
+            "b",
+            1024,
+            [0, 3],
+            core_divisions=[CoreDivision()],
+            tile_specs=[
+                TilingCandidate(TileSpec(), (0,)),
+                TilingCandidate(TileSpec((TileAxis(0, 4),)), (0,)),
+            ],
+        )
+        with self.assertRaises(AssertionError):
+            single_tile_idx(two)
 
 
 if __name__ == "__main__":

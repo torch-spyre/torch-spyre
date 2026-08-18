@@ -18,11 +18,11 @@ from collections.abc import Sequence
 from typing import Callable, Optional, cast
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
+    single_tile_idx as _tile_idx,
     CoreDivisionBuffer,
     CoreDivisionLayoutSolver,
     LifetimeBoundBuffer,
     MemoryPlanSolver,
-    ceil_div,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
@@ -123,7 +123,7 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
             Only include parents whose per-core size is >= the child's under the
             respective chosen divisions so the assertion in the inner solver holds.
             """
-            b_per_core = ceil_div(b.size, b.core_divisions[ci].output_partition)
+            b_per_core = b.per_core_footprint(_tile_idx(b), ci)
             valid = []
             for p_name in b.in_place_parents:
                 p = buf_by_name.get(p_name)
@@ -131,7 +131,7 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
                     valid.append(p_name)
                     continue
                 pi = chosen[p_name]
-                p_per_core = ceil_div(p.size, p.core_divisions[pi].output_partition)
+                p_per_core = p.per_core_footprint(_tile_idx(p), pi)
                 if b_per_core <= p_per_core:
                     valid.append(p_name)
             return valid
@@ -140,9 +140,7 @@ class ExhaustiveSearchSolver(CoreDivisionLayoutSolver):
             return [
                 LifetimeBoundBuffer(
                     name=b.name,
-                    size=ceil_div(
-                        b.size, b.core_divisions[chosen[b.name]].output_partition
-                    ),
+                    size=b.per_core_footprint(_tile_idx(b), chosen[b.name]),
                     uses=b.uses,
                     first_use_is_read=b.first_use_is_read,
                     in_place_parents=_valid_inplace_parents(b, chosen[b.name]),
