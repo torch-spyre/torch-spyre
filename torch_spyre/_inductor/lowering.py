@@ -34,6 +34,7 @@ from .constants import (
     FP8_E4M3FN_MAX,
     QUANTSCALEPERTOKENFP8_CLIP_MAX,
     QUANTSCALEPERTOKENFP8_CLIP_MIN,
+    QUANTSCALEPERTOKENFP8_OP,
 )
 from . import config
 import torch_spyre._inductor.customops  # noqa: F401
@@ -1860,13 +1861,14 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3FN_MAX):
     """
     Lower quantscalepertokenfp8 as a Reduction operation.
 
-    Maps to the deeptools quantscalepertokenfp8 fused operator.
-    Uses standard reduction inner_fn pattern like exx2 and mean.
+    Maps to the deeptools ``quantscalepertokenfp8`` fused operator
+    (``quant_scale_per_token.ddl``). Uses standard reduction inner_fn pattern
+    like exx2 and mean.
 
     Constants forwarded to the DDL template:
     - mulConst: 1/scale_ub, passed as a float and FP16-encoded by generate_constant_info
-    - clipMin: QUANTSCALEPERTOKENFP8_CLIP_MIN (4096 / 0x1000), a raw DDL template integer
-    - clipMax: QUANTSCALEPERTOKENFP8_CLIP_MAX (32255 / 0x7DFF), a raw DDL template integer
+    - clipMin: QUANTSCALEPERTOKENFP8_CLIP_MIN (4096 / 0x1000), raw integer, lower clamp bound
+    - clipMax: QUANTSCALEPERTOKENFP8_CLIP_MAX (32255 / 0x7DFF), raw integer, upper clamp bound
 
     clipMin and clipMax are in constants_raw so they bypass encode_constant.
     """
@@ -1905,7 +1907,7 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3FN_MAX):
 
     # Use same pattern as exx2 - pass all kwargs including inner_fn
     result = SpyreReduction.create(
-        reduction_type="quantscalepertokenfp8", input_node=x, op_info=op_info, **kwargs
+        reduction_type=QUANTSCALEPERTOKENFP8_OP, input_node=x, op_info=op_info, **kwargs
     )
 
     result.realize()

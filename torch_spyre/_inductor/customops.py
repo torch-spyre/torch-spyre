@@ -826,29 +826,37 @@ def quantscalepertokenfp8(
     """
     Compute per-token quantization scale for FP8 conversion.
 
-    Computes the scale for each token (row) as:
-    scale = amax(abs(input), dim=-1, keepdim=True) / scale_ub
+    Maps to the deeptools ``quantscalepertokenfp8`` fused operator
+    (``quant_scale_per_token.ddl``).  The hardware executes the following
+    sequence of FP16 operations per token:
 
-    This operation computes per-token quantization scales for FP8 conversion.
-    It performs a reduction from [batch, seq, hidden] to [batch, seq, 1].
+    1. ``amax = max(abs(input), dim=-1, keepdim=True)``
+       — absolute-maximum reduction over the hidden (stick) dimension.
+    2. ``scale = amax * mulConst``
+       — multiply by ``mulConst`` (= ``1 / scale_ub``, FP16-encoded).
+    3. ``scale = max(scale, clipMin)``
+       — clamp from below; ``clipMin`` = ``QUANTSCALEPERTOKENFP8_CLIP_MIN``.
+    4. ``scale = min(scale, clipMax)``
+       — clamp from above; ``clipMax`` = ``QUANTSCALEPERTOKENFP8_CLIP_MAX``.
+
+    The FP16 encoding of ``mulConst`` introduces up to one ULP of rounding
+    relative to a float32 reference, so device output may differ from a plain
+    ``amax / scale_ub`` by up to ~2 × FP16 epsilon (≈ 9.8e-4 relative error).
 
     Args:
-        input: Input tensor (FP16) to compute scales for, shape [batch, seq, hidden]
-        scale_ub: Upper bound for scaling (default: FP8_E4M3FN_MAX = 448.0, FP8 E4M3 max value)
+        input: Input tensor (FP16), shape [*, hidden].
+        scale_ub: Upper bound for scaling; ``mulConst = 1 / scale_ub`` is
+            FP16-encoded before use on device.
+            Default: ``FP8_E4M3FN_MAX`` (448.0).
 
     Returns:
-        Per-token scale tensor (FP16), shape [batch, seq, 1]
+        Per-token scale tensor (FP16), shape [*, 1].
 
     Example:
         >>> x = torch.randn(2, 4, 4096, dtype=torch.float16, device='spyre')
         >>> scale = torch.ops.spyre.quantscalepertokenfp8(x)
         >>> # scale.shape = [2, 4, 1]
         >>> x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
-
-    Note:
-        - Computes absolute maximum per token (last dimension)
-        - Returns scale = amax / scale_ub for direct use in quantization
-        - Maps to deeptools "quantscalepertokenfp8" operation
     """
     pass
 

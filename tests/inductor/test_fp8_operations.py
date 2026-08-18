@@ -309,7 +309,9 @@ class TestFP8Operations:
         def pytorch_fn(x):
             return torch.amax(torch.abs(x), dim=-1, keepdim=True) / FP8_E4M3FN_MAX
 
-        compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=1e-3, rtol=1e-3)
+        # rtol=2e-3: FP16 encoding of mulConst + device multiply each contribute up to
+        # ~4.9e-4 relative error; 2e-3 gives a safe margin over the ~9.8e-4 worst case.
+        compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=1e-3, rtol=2e-3)
 
     @pytest.mark.parametrize(
         "shape,mean,std",
@@ -342,7 +344,7 @@ class TestFP8Operations:
         def pytorch_fn(x):
             return torch.amax(torch.abs(x), dim=-1, keepdim=True) / FP8_E4M3FN_MAX
 
-        compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=1e-3, rtol=1e-3)
+        compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=1e-3, rtol=2e-3)
 
     @pytest.mark.parametrize(
         "shape,scale_ub",
@@ -369,7 +371,7 @@ class TestFP8Operations:
         def pytorch_fn(x):
             return torch.amax(torch.abs(x), dim=-1, keepdim=True) / scale_ub
 
-        compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=1e-3, rtol=1e-3)
+        compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=1e-3, rtol=2e-3)
 
     @pytest.mark.parametrize(
         "shape",
@@ -396,7 +398,7 @@ class TestFP8Operations:
         def pytorch_fn(x):
             return torch.amax(torch.abs(x), dim=-1, keepdim=True) / FP8_E4M3FN_MAX
 
-        compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=1e-3, rtol=1e-3)
+        compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=1e-3, rtol=2e-3)
 
     def test_quantscalepertokenfp8_zero_input_handling(self):
         """Verify quantscalepertokenfp8 handles zero input without crashing.
@@ -504,11 +506,12 @@ class TestFP8Operations:
         # 1. Hardware adds small epsilon (~2.4e-6) to prevent division by zero
         # 2. This epsilon is implementation-specific and may vary across hardware versions
         # 3. The relaxed tolerance accounts for this hardware-level numerical stability mechanism
-        # 4. Standard tolerance (atol=1e-3, rtol=1e-3) is used for all other cases
+        # 4. rtol=2e-3 for all other cases: FP16 encoding of mulConst + device multiply
+        #    each contribute up to ~4.9e-4 relative error (worst case ~9.8e-4).
         if input_type in ["zeros", "near_zero"]:
             atol, rtol = 1e-5, 1e-2
         else:
-            atol, rtol = 1e-3, 1e-3
+            atol, rtol = 1e-3, 2e-3
 
         compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=atol, rtol=rtol)
 
@@ -542,7 +545,7 @@ class TestFP8Operations:
                 compare_with_pytorch(spyre_fn, pytorch_fn, x)
         else:
             # Use compare_with_pytorch for proper value correctness validation
-            compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=1e-3, rtol=1e-3)
+            compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=1e-3, rtol=2e-3)
 
 
 # Test utilities for FP8 operations
