@@ -230,10 +230,10 @@ class TestCoordinates(TestCase):
         # is a whole row, so it must land entirely on the row coordinate and the
         # stick coordinate must stay offset-free (p1 % 64):
         #     correct: [p1 // 64, p0 + 1, p1 % 64]
-        # Today compute_coordinates decomposes the host offset against the raw
-        # unpadded row stride (100) with no notion of per-row padding, so 100 % 64
-        # leaks a residual onto the stick coordinate:
-        #     current (buggy): [p1 // 64, p0 + 1, p1 % 64 + 36]
+        # Before this fix compute_coordinates decomposed the host offset against
+        # the raw unpadded row stride (100) with no notion of per-row padding, so
+        # 100 % 64 leaked a residual onto the stick coordinate:
+        #     before: [p1 // 64, p0 + 1, p1 % 64 + 36]
         cx = compute_coordinates(
             [2, 4, 64],
             [64, 100, 1],
