@@ -92,6 +92,13 @@ from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
 from .wsr.coarse_tile import coarse_tile_post_stickify, coarse_tile_pre_stickify
+from .dump_cost_model import dump_cost_model
+
+# The module as well as the names: ``LAST_REPORT`` is per-thread storage resolved
+# through a module ``__getattr__``, so it has to be read as an attribute at call time.
+# ``from .cost_model_pass import LAST_REPORT`` would bind one thread's value forever.
+from . import cost_model_pass as cost_model_pass_module
+from .cost_model_pass import CostReport, cost_model_pass
 from .split_multi_ops import split_multi_ops, validate_ops
 
 
@@ -285,8 +292,10 @@ class CustomPostFusionPasses(_SpyreNodePassPipeline):
         # demote_incoherent_lx_buffers runs first: it re-checks LX core->slice
         # coherence now that loop orders are final, and anything it demotes must
         # still be visible to hbm_pool_planning as an unclaimed intermediate.
+        # hbm_pool_planning runs after spyre_fuse_nodes so it can compute
+        # bundle-scoped live ranges.
         super().__init__(
-            [demote_incoherent_lx_buffers, hbm_pool_planning, spyre_fuse_nodes]
+            [demote_incoherent_lx_buffers, spyre_fuse_nodes, hbm_pool_planning]
         )
 
 
@@ -421,6 +430,19 @@ class CustomPreSchedulingPasses:
     in order, and the inherited :meth:`uuid` keys the cache on their sources.
     """
 
+    @property
+    def last_cost_report(self) -> CostReport | None:
+        """Predicted runtime for the graph THIS THREAD most recently compiled.
+
+        None when the cost model is disabled, which is the default. A property
+        rather than an attribute because Inductor reuses one pipeline instance
+        across compiles: storing the report on ``self`` would let a concurrent
+        compile overwrite another's. The read goes to per-thread storage in
+        ``cost_model_pass`` instead. Being on the class also means it resolves on
+        an instance built without ``__init__`` -- test_log_passes.py does that.
+        """
+        return cost_model_pass_module.LAST_REPORT
+
     def __init__(self):
         self.passes = [
             deadcode_elimination,
@@ -500,6 +522,18 @@ class CustomPreSchedulingPasses:
 
         if logger.isEnabledFor(logging.INFO):
             logger.info("AFTER PRE-SCHEDULING\n%s", format_operations(graph.operations))
+        # Predicted runtime for this graph, or None when config.cost_model is off.
+        # Kept OUTSIDE self.passes on purpose: it only reads the IR, so hashing it
+        # into the Inductor cache key (see _uuid) would invalidate caches for a
+        # report that cannot change the compiled result. The pass stores the report
+        # per-thread, readable as `last_cost_report`, so another pass or an external
+        # tool can compare two plans by total_us without compiling or running either.
+        #
+        # BEFORE the per-op dump on purpose: the report is the answer -- one number and
+        # a per-kernel breakdown -- while the dump is the evidence behind it, hundreds
+        # of lines on a real graph. Printing the evidence first buries the answer.
+        cost_model_pass(graph)
+        dump_cost_model(graph.operations)
 
     def uuid(self) -> Any | None:
         return _uuid(self.passes)

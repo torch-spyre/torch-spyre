@@ -17,6 +17,7 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 import functools
 import itertools
+from types import SimpleNamespace
 from typing import Callable, TypeVarTuple, Unpack, Optional, override
 
 import unittest
@@ -30,6 +31,7 @@ from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor import passes
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor.pass_utils import op_read_writes
+from torch_spyre._inductor.patches import enable_spyre_context
 from torch_spyre._inductor.scratchpad.utils import calculate_liveness
 
 try:
@@ -38,6 +40,7 @@ try:
     _HAS_ORTOOLS = True
 except ImportError:
     _HAS_ORTOOLS = False
+    CpSatLayoutSolver = None  # type: ignore[assignment,misc]
 
 
 Ts = TypeVarTuple("Ts")
@@ -47,6 +50,25 @@ Ts = TypeVarTuple("Ts")
 # where each split list is a sorted tuple of (iteration_space_stride, factor).
 _Splits = tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]
 _AllocEntry = tuple[str, int, _Splits]
+
+
+def test_nested_spyre_context_runs_pre_scheduling_once():
+    calls = []
+
+    class CountingPreSchedulingPasses:
+        def __call__(self, graph):
+            calls.append(graph)
+
+    graph = SimpleNamespace()
+    with (
+        patch.object(passes, "CustomPreSchedulingPasses", CountingPreSchedulingPasses),
+        patch.object(GraphLowering, "_update_scheduler", lambda _self: None),
+        enable_spyre_context([]),
+        enable_spyre_context([]),
+    ):
+        GraphLowering._update_scheduler(graph)
+
+    assert calls == [graph]
 
 
 class CustomPreSchedulingPassesWithOurPasses(CustomPreSchedulingPasses):
@@ -765,14 +787,14 @@ class TestCloneAtGraphBoundaries(
 class CoOptAllocatorIntegrationTests(BaseTestScratchpadUsage):
     """Generic real-graph coverage for the co-optimising allocator.
 
-    ``StrategyBCoOptimizingAllocator`` (``co_optimizing_lx_planning=True``) seeds
-    from the core-division work-distribution, commits the winning splits onto
+    DFS-based co-optimizing allocator (``co_optimizing_lx_planning=True``) searches
+    over candidate core divisions, commits the winning splits onto
     ``op_it_space_splits``, then places buffers. These tests put real compiled
     graphs through that path.
 
     The prescribed-allocation tests encode the *desired* plan, which is the one
-    StrategyB produces. These plans are brittle and are not unique but are
-    plans which achieve desirable performance. New plans should be profiled
+    the DFS co-optimizer produces. These plans are brittle and are not unique but
+    are plans which achieve desirable performance. New plans should be profiled
     before making these test more permissive.
 
     NOTE: this suite is intentionally *disabled* today. Unlike
@@ -1340,13 +1362,17 @@ class TestSelectAllocator(unittest.TestCase):
     def test_dispatch_by_config(self):
         from torch_spyre._inductor.scratchpad.allocator import (
             CoOptimizingAllocator,
+            ExhaustiveSearchSolver,
             ScratchpadAllocator,
-            StrategyBCoOptimizingAllocator,
+            _make_cpsat_solver,
             select_allocator,
         )
         from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
         from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
             BestFitLayoutSolver,
+        )
+        from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
+            CpSatLayoutSolver,
         )
 
         with ts_inductor_config.patch(
@@ -1366,37 +1392,38 @@ class TestSelectAllocator(unittest.TestCase):
         with ts_inductor_config.patch(
             layout_solver="greedy", co_optimizing_lx_planning=True
         ):
-            self.assertIsInstance(select_allocator(), StrategyBCoOptimizingAllocator)
+            a = select_allocator()
+            self.assertIsInstance(a, CoOptimizingAllocator)
+            solver = a.layout_planning([], a.size)
+            self.assertIsInstance(solver, ExhaustiveSearchSolver)
+            self.assertIs(solver._inner_factory, GreedyLayoutSolver)
 
-        # cpsat + co-optimization routes to the joint allocator when ortools is
-        # present, else degrades to greedy placement (the fallback now lives in
-        # select_allocator, not inside CoOptimizingAllocator).
+        # cpsat + co-optimization always routes to the joint allocator: when
+        # ortools is present the cpsat factory is core-division-capable and is
+        # used directly, else it degrades to an ExhaustiveSearchSolver wrapping
+        # the cpsat factory's own greedy fallback.
         with ts_inductor_config.patch(
             layout_solver="cpsat", co_optimizing_lx_planning=True
         ):
             a = select_allocator()
+            self.assertIsInstance(a, CoOptimizingAllocator)
+            solver = a.layout_planning([], a.size)
             if _HAS_ORTOOLS:
-                self.assertIsInstance(a, CoOptimizingAllocator)
+                self.assertIs(a.layout_planning, _make_cpsat_solver)
+                self.assertIsInstance(solver, CpSatLayoutSolver)
             else:
-                self.assertIs(type(a), ScratchpadAllocator)
-                self.assertEqual(a.layout_planning, GreedyLayoutSolver)
+                self.assertIsInstance(solver, ExhaustiveSearchSolver)
+                self.assertIs(solver._inner_factory, _make_cpsat_solver)
 
         # cpsat without co-optimization is placement-only: a ScratchpadAllocator
-        # driven by the CP-SAT solver on the pre-determined core divisions.
+        # driven by the cpsat factory (which falls back to greedy internally
+        # when ortools is absent) on the pre-determined core divisions.
         with ts_inductor_config.patch(
             layout_solver="cpsat", co_optimizing_lx_planning=False
         ):
             a = select_allocator()
             self.assertIs(type(a), ScratchpadAllocator)
-            if _HAS_ORTOOLS:
-                from torch_spyre._inductor.scratchpad.ilp_solver_ortools import (
-                    CpSatLayoutSolver,
-                )
-
-                self.assertEqual(a.layout_planning, CpSatLayoutSolver)
-            else:
-                # ortools absent: falls back to greedy placement.
-                self.assertEqual(a.layout_planning, GreedyLayoutSolver)
+            self.assertIs(a.layout_planning, _make_cpsat_solver)
 
         with ts_inductor_config.patch(
             layout_solver="bogus", co_optimizing_lx_planning=False
@@ -1667,10 +1694,8 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         consumer ``p`` (whose result is itself read, so it is a realized candidate)
         reuses ``y``'s slot -- i.e. the output-feeding buffer is an in-place parent.
         This is a regression guard: if output in-place ever breaks, it fails here."""
-        from torch_spyre._inductor.scratchpad.allocator import (
-            ScratchpadAllocator,
-            _op_short_name,
-        )
+        from torch_spyre._inductor.pass_utils import op_short_name
+        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
 
         x = self.rand_device((64, 1024))
 
@@ -1695,7 +1720,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                 output_feeders.add(name)
                 op = by_name.get(name)
                 # A graph output that is a clone pins the buffer it copies.
-                if op is not None and _op_short_name(op) == "clone":
+                if op is not None and op_short_name(op) == "clone":
                     output_feeders.update(d.name for d in op.get_read_writes().reads)
 
         with self.pre_scheduling_iterating_pass(collect_feeders):
@@ -1741,10 +1766,8 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         returned ``y`` is captured before its slot is overwritten. We assert the
         reuse edge is actually offered (the hazard is exercised, not vacuous) and
         that both returned values are correct."""
-        from torch_spyre._inductor.scratchpad.allocator import (
-            ScratchpadAllocator,
-            _op_short_name,
-        )
+        from torch_spyre._inductor.pass_utils import op_short_name
+        from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
 
         x = self.rand_device((64, 1024))
 
@@ -1770,7 +1793,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             for name in graph.get_output_names():
                 output_feeders.add(name)
                 op = by_name.get(name)
-                if op is not None and _op_short_name(op) == "clone":
+                if op is not None and op_short_name(op) == "clone":
                     output_feeders.update(d.name for d in op.get_read_writes().reads)
 
         with self.pre_scheduling_iterating_pass(collect_feeders):
@@ -1804,10 +1827,8 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         """Same aliasing hazard as the sibling test, exercised on the co-optimizing
         (joint CP-SAT) path: a returned buffer whose LX slot is reused in place must
         still be handed back to the caller intact (#3212)."""
-        from torch_spyre._inductor.scratchpad.allocator import (
-            CoOptimizingAllocator,
-            _op_short_name,
-        )
+        from torch_spyre._inductor.pass_utils import op_short_name
+        from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
 
         x = self.rand_device((64, 1024))
 
@@ -1833,7 +1854,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
             for name in graph.get_output_names():
                 output_feeders.add(name)
                 op = by_name.get(name)
-                if op is not None and _op_short_name(op) == "clone":
+                if op is not None and op_short_name(op) == "clone":
                     output_feeders.update(d.name for d in op.get_read_writes().reads)
 
         with self.pre_scheduling_iterating_pass(collect_feeders):
@@ -1872,7 +1893,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
         it in place, so it does not occupy a dedicated slot. We read the final LX
         allocations after the allocator runs and assert the input clone's address is
         shared by another LX buffer (and values are correct)."""
-        from torch_spyre._inductor.scratchpad.allocator import _op_short_name
+        from torch_spyre._inductor.pass_utils import op_short_name
 
         x = self.rand_device((64, 1024))
 
@@ -1889,7 +1910,7 @@ class TestBoundaryCloneInPlace(BaseTestScratchpadUsage):
                     graph.get_buffer(op.name).get_layout(), "allocation", {}
                 )
                 per_op[op.name] = {
-                    "short": _op_short_name(op),
+                    "short": op_short_name(op),
                     "lx": alloc.get("lx"),
                     "reads": [d.name for d in op.get_read_writes().reads],
                 }

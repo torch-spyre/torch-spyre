@@ -29,6 +29,8 @@ logger = get_inductor_logger("scratchpad.greedy_solver")
 
 
 class GreedyLayoutSolver(MemoryPlanSolver):
+    supports_paired_buffers = True
+
     def __init__(
         self, buffers: Sequence[LifetimeBoundBuffer], size: int, alignment: int = 128
     ):
@@ -41,6 +43,8 @@ class GreedyLayoutSolver(MemoryPlanSolver):
         # that child, so a second child declaring the same parent must be placed
         # on its own slot instead of landing on top of the first.
         self.reused_parents: set[str] = set()
+        self.paired_group_by_name: dict[str, tuple[LifetimeBoundBuffer, ...]] = {}
+        self.rejected_paired_buffers: set[str] = set()
 
     def _get_lowest_addr_in_use(self):
         return min(
@@ -98,7 +102,7 @@ class GreedyLayoutSolver(MemoryPlanSolver):
 
         return None
 
-    def _try_allocate(self, buffer: LifetimeBoundBuffer):
+    def _try_allocate_one(self, buffer: LifetimeBoundBuffer) -> None:
         # Check if the current buffer can be in-placed
         for in_place_opt in buffer.in_place_parents:
             if in_place_opt in self.reused_parents:
@@ -124,6 +128,30 @@ class GreedyLayoutSolver(MemoryPlanSolver):
             self.usage.append(buffer)
         else:
             buffer.address = None
+
+    def _try_allocate(self, buffer: LifetimeBoundBuffer) -> None:
+        if buffer.address is not None or buffer.name in self.rejected_paired_buffers:
+            return
+
+        group = self.paired_group_by_name.get(buffer.name)
+        if group is None:
+            self._try_allocate_one(buffer)
+            return
+
+        # Keep each tentative member in usage so the next member sees its
+        # reservation. A failure restores the exact pre-group solver state.
+        previous_usage = list(self.usage)
+        previous_reused_parents = set(self.reused_parents)
+        for member in group:
+            self._try_allocate_one(member)
+            if member.address is not None:
+                continue
+            self.usage = previous_usage
+            self.reused_parents = previous_reused_parents
+            self.rejected_paired_buffers.update(item.name for item in group)
+            for item in group:
+                item.address = None
+            return
 
     def _try_deallocate(self, bufs: list[LifetimeBoundBuffer] | LifetimeBoundBuffer):
         if isinstance(bufs, LifetimeBoundBuffer):
@@ -174,6 +202,29 @@ class GreedyLayoutSolver(MemoryPlanSolver):
 
         self.usage = []
         self.reused_parents = set()
+        self.paired_group_by_name = {}
+        self.rejected_paired_buffers = set()
+        buffer_by_name = {buffer.name: buffer for buffer in buffers}
+        placeable_names = {buffer.name for buffer in placeable}
+        # paired_with lives only on the root; expand it so the first member
+        # encountered by the time walk triggers the complete group.
+        for root in buffers:
+            if not root.paired_with:
+                continue
+            group = (root, *root.paired_with)
+            assert len({member.name for member in group}) == len(group), (
+                f"paired-buffer group for {root.name} contains duplicates"
+            )
+            for member in group:
+                assert buffer_by_name.get(member.name) is member, (
+                    f"paired buffer {member.name} is not in this solve"
+                )
+                assert member.name not in self.paired_group_by_name, (
+                    f"buffer {member.name} belongs to multiple paired groups"
+                )
+                self.paired_group_by_name[member.name] = group
+            if any(member.name not in placeable_names for member in group):
+                self.rejected_paired_buffers.update(member.name for member in group)
 
         # Walk through all transition points in chronological order.
         # Include end_time + 1 so deallocation fires even when no other

@@ -1,5 +1,6 @@
 ### Sample YAML config for testing CpuMixin integration ###
 test_suite_config:
+  labels: [trunk]
   files:
     - path: ${TORCH_ROOT}/test/test_prims.py
       unlisted_test_mode: skip

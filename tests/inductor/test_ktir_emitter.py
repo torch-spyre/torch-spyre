@@ -102,6 +102,12 @@ def _add_op_specs() -> list:
 # The emitter only supports the single-core (SENCORES=1) grid so far; pin it so
 # these tests exercise their intended guards rather than the multi-core guard,
 # which would otherwise fire first on the default SENCORES=32.
+#
+# ``bundle_symbolic_args`` is pinned True for the same reason
+# ``TestKtirBakedAddresses`` pins it False: _EXPECTED_ADD_KTIR is the symbolic
+# form, so leaving it to ambient BUNDLE_SYMBOLIC_ARGS makes the golden fail under
+# BUNDLE_SYMBOLIC_ARGS=0 -- which is exactly how the device path is run.
+@mock.patch("torch_spyre._inductor.config.bundle_symbolic_args", True)
 @mock.patch("torch_spyre._inductor.config.sencores", 1)
 @unittest.skipUnless(
     _mlir_ktdp_available(),
@@ -140,6 +146,67 @@ class TestKtirCapabilityGuards(unittest.TestCase):
 
         with self.assertRaises(NotImplementedError):
             generate_ktir("ktir_fused_add_0", _add_op_specs())
+
+
+def _mlir_ktdp_linalg_available() -> bool:
+    # The baked form additionally needs the linalg/tensor bindings.
+    try:
+        from mlir_ktdp.dialects import linalg, tensor  # noqa: F401
+    except ImportError:
+        return False
+    return _mlir_ktdp_available()
+
+
+@mock.patch("torch_spyre._inductor.config.bundle_symbolic_args", False)
+@mock.patch("torch_spyre._inductor.config.sencores", 1)
+class TestKtirBakedAddresses(unittest.TestCase):
+    @staticmethod
+    def _arg(allocation):
+        arg = _add_op_specs()[0].args[1]
+        arg.allocation = allocation
+        return arg
+
+    @unittest.skipUnless(_mlir_ktdp_linalg_available(), "no mlir_ktdp linalg")
+    def test_baked_form_deltas(self):
+        """The baked form (dataflow-scheduler#65) vs ``_EXPECTED_ADD_KTIR``.
+
+        Asserted as deltas rather than a second golden: the two texts differ in
+        5 of 24 lines, so a full copy would be 19 lines of duplication that churn
+        together, and this form is deleted outright when #65 is fixed.  The
+        loads / tiles / views the two share are already pinned by
+        ``_EXPECTED_ADD_KTIR``.
+        """
+        from torch_spyre._inductor.codegen.ktir import generate_ktir
+
+        specs = _add_op_specs()
+        for arg in specs[0].args:
+            arg.allocation = {"hbm": arg.arg_index << 34}
+        emitted = generate_ktir("ktir_fused_add_0", specs)
+
+        # 1. No address is a runtime value: zero-arg func, no %arg anywhere.
+        self.assertIn("func.func @ktir_fused_add_0() attributes {grid = [1]}", emitted)
+        self.assertNotIn("%arg", emitted)
+        # 2. Each base is a constant, in ELEMENTS (the byte slot >> 1 for fp16).
+        for arg_index in range(3):
+            with self.subTest(arg_index=arg_index):
+                base = (arg_index << 34) // 2
+                self.assertIn(f"arith.constant {base} : index", emitted)
+        # 3. linalg over tensor.empty, never arith on tensors -- required for the
+        #    memref offset to fold to static, which ktdp.load's verifier needs.
+        self.assertIn("tensor.empty()", emitted)
+        self.assertIn("linalg.add ins(", emitted)
+        self.assertNotIn("arith.addf", emitted)
+
+    def test_addresses_resolved_without_the_dialect(self):
+        from torch_spyre._inductor.codegen.ktir import _base_address_elements
+
+        # fp16: 2 bytes per element.  Zero is a real address, not "unset".
+        self.assertEqual(_base_address_elements(self._arg({"hbm": 1 << 34})), 1 << 33)
+        self.assertEqual(_base_address_elements(self._arg({"hbm": 0})), 0)
+        # Unassigned, and outside HBM (every memory view hardcodes HBM):
+        for allocation in ({"hbm": None}, {"lx": 0x1000}, {"hbm_pool": 0x1000}, {}):
+            with self.subTest(alloc=allocation), self.assertRaises(NotImplementedError):
+                _base_address_elements(self._arg(allocation))
 
 
 if __name__ == "__main__":

@@ -8,9 +8,9 @@ the primary tool for answering *"what did the compiler actually do with
 my model?"*.
 
 :::{tip}
-For a step-by-step debugging workflow that uses these artifacts (plus
-the `sendnn` backend bisect), see [Debugging](index.md). This page is a
-reference for the artifact layout itself.
+For a step-by-step debugging workflow that uses these artifacts (and
+FFDC on compile/runtime failures), see [Debugging](index.md). This page
+is a reference for the artifact layout itself.
 :::
 
 ## Enabling artifact dumps

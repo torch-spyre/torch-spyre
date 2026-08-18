@@ -284,6 +284,10 @@ def _tensor_and_(x: torch.Tensor, other):
     return x.and_(other)
 
 
+def _tensor_or_(x: torch.Tensor, other):
+    return x.or_(other)
+
+
 def _tensor_copy_(x: torch.Tensor, source: torch.Tensor):
     return x.copy_(source)
 
@@ -339,6 +343,7 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.sigmoid": OpAdapter("torch.sigmoid", torch.sigmoid),
     "torch.sin": OpAdapter("torch.sin", torch.sin),
     "torch.cos": OpAdapter("torch.cos", torch.cos),
+    "torch.tanh": OpAdapter("torch.tanh", torch.tanh),
     "torch.clamp": OpAdapter("torch.clamp", torch.clamp),
     "torch.floor": OpAdapter("torch.floor", torch.floor),
     "torch.where": OpAdapter("torch.where", torch.where),
@@ -408,6 +413,8 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.ne": OpAdapter("torch.ne", _torch_ne),
     "torch.gt": OpAdapter("torch.gt", _torch_gt),
     "torch.logical_and": OpAdapter("torch.logical_and", torch.logical_and),
+    "torch.bitwise_or": OpAdapter("torch.bitwise_or", torch.bitwise_or),
+    "torch.or_": OpAdapter("torch.or_", _tensor_or_, is_inplace=True),
     # Type/device conversions
     "torch.float": OpAdapter("torch.float", _tensor_float),
     "float": OpAdapter("torch.float", _tensor_float),

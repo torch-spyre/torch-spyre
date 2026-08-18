@@ -8,6 +8,7 @@ import torch
 import typing
 
 __all__: list[str] = [
+    "AIUPTI_ACTIVITY_NAME_MAX_BYTES",
     "DataFormats",
     "JobPlan",
     "ElementArrangement",
@@ -28,19 +29,32 @@ __all__: list[str] = [
     "copy_tensor",
     "fill_tensor",
     "encode_constant",
+    "extract_kernel_provenance_key",
     "free_runtime",
     "get_device_dtype",
     "get_downcast_warning",
     "get_elem_in_stick",
     "get_spyre_tensor_layout",
+    "kernel_provenance_registry_stats",
     "launch_jobplan",
+    "lookup_kernel_provenance",
     "prepare_kernel",
+    "register_kernel_provenance",
     "set_downcast_warning",
     "set_spyre_tensor_layout",
     "spyre_empty_with_layout",
     "start_runtime",
     "to_with_layout",
 ]
+
+AIUPTI_ACTIVITY_NAME_MAX_BYTES: int
+
+def extract_kernel_provenance_key(event_name: str) -> str | None: ...
+def kernel_provenance_registry_stats() -> dict[str, int]: ...
+def lookup_kernel_provenance(key: str) -> list[str] | None: ...
+def register_kernel_provenance(
+    event_base_name: str, debug_handle_ids: collections.abc.Sequence[str]
+) -> bool: ...
 
 class DataFormats:
     """
@@ -351,6 +365,10 @@ class JobPlan:
         """Get the type of step at the given index (H2D, D2H, Compute, or HostCompute)"""
         ...
 
+    def get_step_name(self, idx: int) -> str | None:
+        """Get the profiler-visible name for a compute step, or None"""
+        ...
+
 def launch_jobplan(
     job_plan: JobPlan, args: collections.abc.Sequence[torch.Tensor]
 ) -> None:
@@ -364,7 +382,9 @@ def launch_jobplan(
     ...
 
 def prepare_kernel(
-    spyrecode_dir: str, stream: _SpyreStreamBase | None = None
+    spyrecode_dir: str,
+    stream: _SpyreStreamBase | None = None,
+    profiler_name: str | None = None,
 ) -> JobPlan:
     """
     Prepare a kernel from a SpyreCode directory and return a JobPlan.
@@ -373,6 +393,8 @@ def prepare_kernel(
         spyrecode_dir: Path to the SpyreCode directory
         stream: Stream to use for initialization transfers.
             If None, uses the current stream. Defaults to None.
+        profiler_name: Bounded base name for profiler-visible compute events.
+            If None, uses the existing SpyreCode or directory-derived name.
 
     Returns:
         Prepared JobPlan ready for execution
