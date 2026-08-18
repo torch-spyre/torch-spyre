@@ -65,6 +65,7 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     buf_id,
     core_divisions,
     per_core_extent,
+    reduced_axes,
     row_major_strides,
 )
 from torch_spyre._inductor.constants import STAGGERED_EAS
@@ -309,7 +310,8 @@ class ComputeStep:
 
     ``ins`` is one ``(buf_id, Access)`` per operand, in the op's operand order.
     ``store`` is ``False`` for an internal result, which is bound in scope for a
-    later step instead of being stored through ``out``.
+    later step instead of being stored through ``out``.  ``reduce_dims`` is the
+    input tile axes a REDUCTION consumes, and empty for every other family.
     """
 
     op: str  # a KtirBuilder.RECIPES key
@@ -318,6 +320,7 @@ class ComputeStep:
     out: Access
     out_buf_id: str
     store: bool
+    reduce_dims: tuple[int, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -614,6 +617,22 @@ def _divide(
         for symbol in symbols
     ]
     return tuple(per_core), rows
+
+
+def _squeezed(arg: TensorArg, axes: Sequence[int]) -> TensorArg:
+    """``arg`` without ``axes``: same buffer, same bytes, fewer device axes.
+
+    Dropping a unit axis renames nothing and moves nothing -- it contributes no
+    elements and no stride -- so every later derivation sees an arg of the rank
+    the emitted tile actually has, and ``buf_id`` still identifies one buffer.
+    """
+    drop = set(axes)
+    keep = [axis for axis in range(len(arg.device_size)) if axis not in drop]
+    return dataclasses.replace(
+        arg,
+        device_size=[arg.device_size[axis] for axis in keep],
+        device_coordinates=[arg.device_coordinates[axis] for axis in keep],
+    )
 
 
 def _access(
@@ -919,12 +938,16 @@ class KernelPlan:
                     f"OpSpec->KTIR: op {entry.op!r} is not supported yet "
                     f"(registered: {sorted(KtirBuilder.RECIPES)})"
                 )
-            if entry.is_reduction:
-                # A reduction is a second emission shape (an accumulator, and
-                # axes that do not survive), not a second binding: refused until
-                # ``Family.REDUCTION`` has a builder method behind it.
+            family = Family.of(entry)
+            if family is not KtirBuilder.RECIPES[entry.op].family:
+                # The spec asks for a shape this op's recipe does not implement
+                # (an 'add' as a reduction, a 'sum' as elementwise).  The recipe
+                # is what has an emission behind it, so the request is refused
+                # rather than emitted in the shape that happens to exist.
                 raise NotImplementedError(
-                    "OpSpec->KTIR: reductions are not supported yet"
+                    f"OpSpec->KTIR: op {entry.op!r} is registered as "
+                    f"{KtirBuilder.RECIPES[entry.op].family.name} but this spec "
+                    f"asks for {family.name}"
                 )
             steps.append(self._compute_step(entry, loops))
         return tuple(steps)
@@ -939,27 +962,51 @@ class KernelPlan:
         """
         out, inputs = validated_roles(spec)
         out_extents = [int(s) for s in out.device_size]
-        args = list(spec.args)
+        family = Family.of(spec)
         for arg in inputs:
             # In-place (input buffer aliases the output) is not supported yet.
             if buf_id(arg) == buf_id(out):
                 raise NotImplementedError(
                     "OpSpec->KTIR: in-place ops (input aliases output) not supported"
                 )
-            # Reject broadcast / transpose operands: only operands whose device
-            # axes already match the output tile exactly are supported.
-            if (
-                align_reshape_plan(
-                    list(arg.device_coordinates),
-                    [int(s) for s in arg.device_size],
-                    list(out.device_coordinates),
-                    out_extents,
-                )
-                is not None
-            ):
-                raise NotImplementedError(
-                    "OpSpec->KTIR: broadcast / reshape operands not supported yet"
-                )
+        reduce_dims: tuple[int, ...] = ()
+        args = list(spec.args)
+        if family is Family.REDUCTION:
+            # Which axes a reduction consumes is a fact about its operands, so it
+            # is derived here (once) and carried on the step, not re-derived from
+            # the op name at emit time.
+            [source] = inputs
+            reduce_dims, placeholder = reduced_axes(
+                source.device_coordinates,
+                [int(s) for s in source.device_size],
+                out.device_coordinates,
+                out_extents,
+            )
+            if placeholder:
+                # The projection leaves each reduced axis in the output as a unit
+                # extent; the reduced tile does not have it at all.  Squeezing the
+                # arg here, once, is what keeps every derivation after this point
+                # unaware that a reduction is different: the output's view, tile
+                # and stored tensor are all the same (lower) rank.
+                squeezed = _squeezed(out, placeholder)
+                args = [squeezed if arg is out else arg for arg in args]
+                out = squeezed
+        else:
+            for arg in inputs:
+                # Reject broadcast / transpose operands: only operands whose
+                # device axes already match the output tile exactly are supported.
+                if (
+                    align_reshape_plan(
+                        list(arg.device_coordinates),
+                        [int(s) for s in arg.device_size],
+                        list(out.device_coordinates),
+                        out_extents,
+                    )
+                    is not None
+                ):
+                    raise NotImplementedError(
+                        "OpSpec->KTIR: broadcast / reshape operands not supported yet"
+                    )
         levels = _levels(spec, loops)
         accesses = {buf_id(arg): self._access_of(arg, levels) for arg in args}
         # Every division must move this op's output: cores divide work by writing
@@ -979,10 +1026,11 @@ class KernelPlan:
                 )
         return ComputeStep(
             op=spec.op,
-            family=Family.of(spec),
+            family=family,
             ins=tuple((buf_id(arg), accesses[buf_id(arg)]) for arg in inputs),
             out=accesses[buf_id(out)],
             out_buf_id=buf_id(out),
+            reduce_dims=reduce_dims,
             # An internal buffer never reaches memory: it is threaded as a value,
             # so it gets no store, no func parameter, no view and no address.
             store=not is_internal(out),
@@ -1099,12 +1147,13 @@ class Family(enum.Enum):
     ``Family.of`` reads the one a spec asks for."""
 
     ELEMENTWISE = enum.auto()
+    REDUCTION = enum.auto()
 
     @classmethod
     def of(cls, spec: OpSpec) -> Family:
         """The family ``spec`` asks for, read from the spec rather than the op
         name: the same binding can be wanted in more than one shape."""
-        return cls.ELEMENTWISE
+        return cls.REDUCTION if spec.is_reduction else cls.ELEMENTWISE
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1496,6 +1545,7 @@ class KtirBuilder:
     RECIPES: ClassVar[dict[str, Recipe]] = {
         "add": Recipe(arity=2, family=Family.ELEMENTWISE, binding=lambda: linalg.add),
         "mul": Recipe(arity=2, family=Family.ELEMENTWISE, binding=lambda: linalg.mul),
+        "sum": Recipe(arity=1, family=Family.REDUCTION, binding=lambda: arith.addf),
     }
 
     def elementwise(self, recipe: Recipe, ins: Sequence, step: ComputeStep):
@@ -1515,6 +1565,40 @@ class KtirBuilder:
             outs=[dest],
             result_tensors=[ir.RankedTensorType.get(extents, elt_t)],
         )
+
+    def reduction(self, recipe: Recipe, ins: Sequence, step: ComputeStep):
+        """``linalg.reduce`` over ``step.reduce_dims``, combining with ``recipe``.
+
+        The recipe contributes the *combiner* here rather than a whole-op builder
+        (``arith.addf`` for a sum), because ``linalg.reduce`` is one op for every
+        reduction and the payload is what differs between them.
+
+        The accumulator is a bare ``tensor.empty``, not a filled one: the identity
+        belongs to whoever materialises the accumulator, and on this path that is
+        the scheduler's reduction passes -- a ``linalg.fill`` here becomes a second
+        compute op they have to unpick.  Reducing in place also means no reshape:
+        keeping the surviving axes in the output tile makes the result the shape
+        the store's access tile already has.
+        """
+        [source] = ins
+        extents = list(step.out.extent)
+        elt_t = self.named_type(step.out.elems.value)
+        dest = self.val(tensor.EmptyOp(extents, elt_t))
+        combine = recipe.binding()
+
+        def body(accumulated, element):
+            return combine(accumulated, element)
+
+        # The region builder reads the block argument types off the annotations,
+        # and the element type is only known here, so they are set rather than
+        # written.
+        body.__annotations__ = {"accumulated": elt_t, "element": elt_t}
+        return linalg.reduce(
+            result=[ir.RankedTensorType.get(extents, elt_t)],
+            inputs=[source],
+            inits=[dest],
+            dimensions=list(step.reduce_dims),
+        )(body)
 
     # -- attributes --------------------------------------------------------
 

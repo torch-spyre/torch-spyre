@@ -5,6 +5,7 @@
 :maxdepth: 2
 
 inductor_artifacts
+op_spec_lab
 ```
 
 **Scope:** correctness — *why is the result wrong?* For performance
@@ -28,6 +29,9 @@ from the outside in:
    the report files are still available
 4. **Inspect compiler artifacts** — trace the issue through the
    compilation pipeline (FX Graph → Loop IR → `sdsc_<index>.json`)
+5. **Replay the OpSpec on its own** — capture the failing kernel as a
+   standalone script and run just the back-end half of the compile
+   ([The OpSpec Lab](op_spec_lab.md))
 
 ---
 
