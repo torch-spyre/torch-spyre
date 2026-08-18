@@ -248,9 +248,9 @@ def generate_bundle(
         else:
             f.write("\tfunc.func @sdsc_bundle() {\n")
 
-        assert not has_pool or 0 < pool_size < MAX_POOL_SIZE, (
+        assert not has_pool or 0 < pool_size <= MAX_POOL_SIZE, (
             f"generate_bundle: pool_size={pool_size} out of range "
-            f"(0, {MAX_POOL_SIZE}) for a bundle with a pool symbol present"
+            f"(0, {MAX_POOL_SIZE}] for a bundle with a pool symbol present"
         )
         if has_pool:
             f.write(

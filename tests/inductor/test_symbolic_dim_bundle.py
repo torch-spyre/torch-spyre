@@ -373,8 +373,8 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
         with self.assertRaises(AssertionError):
             self._run_bundle([entry], pool_size=0)
 
-    def test_pool_size_at_or_above_max_raises(self):
-        """A pool symbol with pool_size >= MAX_POOL_SIZE must fail loudly."""
+    def test_pool_size_above_max_raises(self):
+        """A pool symbol with pool_size > MAX_POOL_SIZE must fail loudly."""
         pool_kind = SymbolKind.pool()
         entry = (
             _make_sdsc_json(hbm_sym_ids_per_core={"[0, 0, 0]": -1}),
@@ -384,4 +384,23 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
         )
 
         with self.assertRaises(AssertionError):
-            self._run_bundle([entry], pool_size=MAX_POOL_SIZE)
+            self._run_bundle([entry], pool_size=MAX_POOL_SIZE + 1)
+
+    def test_pool_size_at_max_succeeds(self):
+        """A pool symbol with pool_size == MAX_POOL_SIZE (the exact budget
+        boundary) must be accepted, not rejected -- MAX_POOL_SIZE is itself
+        an in-budget value, and Allocator can legitimately return an offset
+        whose pool_end lands exactly there."""
+        pool_kind = SymbolKind.pool()
+        entry = (
+            _make_sdsc_json(hbm_sym_ids_per_core={"[0, 0, 0]": -1}),
+            [0],
+            [],
+            [pool_kind],
+        )
+
+        bundle = self._run_bundle([entry], pool_size=MAX_POOL_SIZE)
+        self.assertIn(
+            f"%pool = sdscbundle.device_mem_allocate {MAX_POOL_SIZE} bytes : index",
+            bundle,
+        )

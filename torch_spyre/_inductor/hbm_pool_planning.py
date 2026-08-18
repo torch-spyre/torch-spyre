@@ -38,7 +38,10 @@ class Allocator:
     whose live ranges do not overlap share the same region. Each block is a
     (offset, size) pair measured in bytes.
 
-    Ensures peak concurrent memory usage does not exceed the segment size limit.
+    Ensures the pool's high-water mark (`pool_end`, a bump pointer that never
+    decreases even after `free()`) never exceeds the segment size limit --
+    this is the same quantity `generate_bundle` reserves via
+    `sdscbundle.device_mem_allocate`, so the two must agree.
     """
 
     def __init__(self, segment_size: int) -> None:
@@ -53,8 +56,13 @@ class Allocator:
         `size` bytes. Reuses an existing free block when possible.
 
         Returns None, leaving all internal state untouched, if `size` would
-        push peak concurrent usage past the segment size limit -- callers
-        fall back to standalone HBM allocation for that buffer instead.
+        push the pool's high-water mark (`pool_end`) past the segment size
+        limit -- callers fall back to standalone HBM allocation for that
+        buffer instead. Gating on `pool_end` rather than concurrent usage
+        matters because `pool_end` -- not peak concurrent usage -- is the
+        quantity `generate_bundle` reserves via
+        `sdscbundle.device_mem_allocate`; free-list fragmentation can push
+        `pool_end` past the limit even while concurrent usage stays low.
         """
         for i, (blk_offset, blk_size) in enumerate(self._free):
             if blk_size >= size:
@@ -67,8 +75,7 @@ class Allocator:
             new_pool_end = self._pool_end + size
             i = None
 
-        new_currently_allocated = self._currently_allocated + size
-        if new_currently_allocated > self._segment_size:
+        if new_pool_end > self._segment_size:
             return None
 
         if i is not None:
@@ -77,7 +84,7 @@ class Allocator:
             if remainder > 0:
                 self._free.append((blk_offset + size, remainder))
         self._pool_end = new_pool_end
-        self._currently_allocated = new_currently_allocated
+        self._currently_allocated += size
         self._peak_usage = max(self._currently_allocated, self._peak_usage)
 
         return offset
@@ -281,6 +288,17 @@ def hbm_pool_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]
     # that allocation dict.  Populated alongside buffer_writer_bundles so
     # aliased names (see _alloc_id) are attributed to the same underlying
     # storage even though they share no name-based dependency edge.
+    #
+    # Deliberately write-keyed only: the sole Inductor mechanism that makes
+    # two distinct buffer names share the literal id(layout.allocation)
+    # object is MutationLayoutSHOULDREMOVE, which always attaches to a
+    # write (set via `src.data.layout = MutationLayoutSHOULDREMOVE(dst)` in
+    # Inductor's realize_into/mark_buffer_mutated) -- so walking .writes
+    # alone is provably complete. Inductor's read-only aliasing mechanism
+    # (NonOwningLayout, used for views) builds a new Layout object rather
+    # than sharing one, and such buffers are excluded from pool eligibility
+    # entirely by the isinstance(layout, FixedTiledLayout) checks in
+    # _is_intermediate/_alloc_id, independent of bundle analysis.
     alloc_id_bundles: dict[int, set[str]] = {}
 
     for bundle in nodes:

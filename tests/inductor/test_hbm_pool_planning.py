@@ -63,29 +63,49 @@ class TestAllocator(unittest.TestCase):
         self.assertEqual(allocator.get_pool_end(), 90)
 
     def test_failed_allocate_does_not_consume_free_block(self):
-        """A rejected allocate() that would have reused a free block must
-        leave that block in the free list for a later, smaller request."""
+        """A rejected allocate() that would have extended pool_end past the
+        budget must leave an existing free block untouched for a later,
+        smaller request."""
         allocator = Allocator(100)
         allocator.allocate(50)
-        allocator.free(0, 50)  # currently_allocated back to 0; free: [(0, 50)]
+        allocator.free(0, 50)  # pool_end stays 50; free: [(0, 50)]
 
-        # allocate(60) finds no free block big enough (50 < 60), so it
-        # extends the pool instead, leaving (0, 50) untouched in the free
-        # list. currently_allocated is now 60.
-        grown = allocator.allocate(60)
-        self.assertEqual(grown, 50)
-
-        # Reusing (0, 50) would bring currently_allocated to 60 + 50 = 110,
-        # over budget -- rejected without consuming the free block.
-        rejected = allocator.allocate(50)
+        # allocate(60) finds no free block big enough (50 < 60), so it would
+        # need to extend pool_end to 110 -- over the 100 budget. Rejected
+        # without consuming the (0, 50) free block.
+        rejected = allocator.allocate(60)
         self.assertIsNone(rejected)
 
-        # Freeing the 60-byte block drops currently_allocated back to 0, so
-        # the same (0, 50) free block -- never consumed by the rejection --
-        # is still available and now fits.
-        allocator.free(50, 60)
+        # The free block is still available and now fits.
         fits = allocator.allocate(50)
         self.assertEqual(fits, 0)
+
+    def test_exact_boundary_allocation_succeeds(self):
+        """An allocation that brings pool_end exactly to the segment size
+        limit must succeed, not be rejected."""
+        allocator = Allocator(100)
+        offset = allocator.allocate(100)
+        self.assertEqual(offset, 0)
+        self.assertEqual(allocator.get_pool_end(), 100)
+
+    def test_fragmentation_rejected_even_under_concurrent_usage_budget(self):
+        """A free/reallocate sequence whose peak concurrent usage never
+        exceeds the budget must still be rejected once it would push
+        pool_end (the bump-pointer high-water mark) past the segment size
+        -- concurrent usage alone is not the quantity generate_bundle's
+        assert checks."""
+        allocator = Allocator(100)
+        first = allocator.allocate(40)
+        second = allocator.allocate(40)
+        allocator.free(first, 40)
+        allocator.free(second, 40)  # currently_allocated back to 0
+
+        # No free block of exactly 50 bytes exists ((0, 40) and (40, 40) are
+        # both too small), so this would extend pool_end to 130 -- over
+        # budget, even though concurrent usage would only be 50.
+        rejected = allocator.allocate(50)
+        self.assertIsNone(rejected)
+        self.assertEqual(allocator.get_pool_end(), 80)
 
 
 def _make_ftl_buffer(name, host_size=(64,), dim_order=(0,)):
