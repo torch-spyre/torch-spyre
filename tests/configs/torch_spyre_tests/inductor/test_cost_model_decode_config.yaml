@@ -1,0 +1,5 @@
+test_suite_config:
+  labels: [core, full]
+  files:
+    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_cost_model_decode.py
+      unlisted_test_mode: mandatory_success

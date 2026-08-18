@@ -100,36 +100,34 @@ class GraphEditor:
 
         raise KeyError(f"could not find buffer {old_name} to replace as output")
 
+    @staticmethod
+    def _clone_output_splits(name: str, consumer: ComputedBuffer) -> dict:
+        splits: tuple[dict, dict] = getattr(consumer, "op_it_space_splits", ({}, {}))
+        if not any(n > 1 for values in splits for n in values.values()):
+            return {}
+        rw = op_read_writes(consumer)
+        read = next((dep for dep in rw.reads if dep.name == name), None)
+        if read is None:
+            return {}
+        write_index = next(iter(rw.writes)).index
+        reference_index = next((dep.index for dep in rw.reads), write_index)
+        by_symbol = apply_splits_from_index_coeff(
+            splits,
+            write_index,
+            reference_index,
+            iteration_space_from_op(consumer),
+        )
+        return splits_by_index_coeff(by_symbol, read.index, read.index)[0]
+
     def push_allocation_with_clone(
         self,
         buffer: ComputedBuffer | TensorBox,
-        address: int,
         buffer_users: list[Operation],
         *,
         input: bool,
+        private: bool = False,
     ) -> ComputedBuffer:
-        """
-        Insert an operation using clone_lowering in GraphLowering.operations list after the given op
-        (buffer, a TensorBox or a ComputedBuffer). Will update GraphLowering FX graph and the
-        operations list. If update_downstream is True, then update any operations following the
-        given buffer to refer to the clone instead.
-
-        The clone will be inserted after buf. For example, the original ops list may look like this
-        (with buf0 taking the role of buf):
-            buf0 -> buf1 -> buf2
-        Insert a clone of buf0 and let buf1 read from it: this will become
-            buf0 ->(clone) buf3 -> buf1 ->buf2
-
-        Returns the new buffer so that either it or the original node can be allocated on the
-        scratchpad.
-
-        NOTE:
-        - Even though it is not a necessary condition, we assume FX graph and Operations are fully
-          consistent and we will try to maintain it that way.
-        - To update existing users of the old buffer -> hack the inner_fn then refresh LoopIR.
-
-        """
-        # Step 1: Add a new FX node for clone and update dependencies
+        """Insert a clone; private clones rewire only ``buffer_users``."""
         if isinstance(buffer, TensorBox):
             buf_name = buffer.data.data.name  # type: ignore
         else:
@@ -140,128 +138,106 @@ class GraphEditor:
         assert isinstance(buf_name, str)
         buf_fx = list(buffer.origins)[0]  # .origin_node may not exist
         old_users = list(buf_fx.users.keys())
+        if private:
+            old_users = list(
+                dict.fromkeys(
+                    getattr(consumer, "origin_node", None)
+                    or next(iter(consumer.origins))
+                    for consumer in buffer_users
+                )
+            )
         self.fx_graph.inserting_after(buf_fx)
         new_fx_node = self.fx_graph.create_node(
             "call_function", self.clone_aten_op, (buf_fx,)
         )
         for user in old_users:
-            user.args = tuple(new_fx_node if ar is buf_fx else ar for ar in user.args)
+            user.replace_input_with(buf_fx, new_fx_node)
         self.lowering.orig_gm.recompile()
 
-        # Step 2: Create a new ComBuf of a Pointwise IR (need to support Reduction?)
-        pw_ir_tb = clone_lowering(buffer)  # a TensorBox wrapping a PointwiseIR
         layout = buffer.layout
         assert isinstance(layout, FixedTiledLayout)
+        clone_layout = FixedTiledLayout(
+            layout.device,
+            layout.dtype,
+            list(layout.size),
+            list(layout.stride),
+            layout.device_layout,
+            offset=layout.offset,
+        )
+        # Input buffers have no loop metadata, so input clones inherit it from
+        # their consumer. Output clones inherit it from their producer.
+        metadata_source = buffer_users[0] if input else buffer
+        assert isinstance(metadata_source, ComputedBuffer)
+        clone_tb = clone_lowering(buffer)
         new_com_buf = ComputedBuffer(
             name=None,
-            layout=FixedTiledLayout(
-                layout.device,
-                layout.dtype,
-                layout.size,  # pyright: ignore[reportArgumentType]
-                layout.stride,  # pyright: ignore[reportArgumentType]
-                layout.device_layout,
-                offset=layout.offset,
-            ),  # create a new copy of FixedTiledLayout from buffer's layout
-            data=pw_ir_tb.data.data,  # type: ignore
+            layout=clone_layout,
+            data=clone_tb.data.data,  # type: ignore[union-attr]
         )
+        new_com_buf.data.origins.add(new_fx_node)
         new_com_buf.origins.add(new_fx_node)
         new_com_buf.origin_node = new_fx_node
-        # Copy loop-group metadata so the clone stays in the same coarse-tile
-        # group as its neighbours and doesn't split a contiguous run.
-        # For input clones the original buffer is an InputBuffer (no metadata),
-        # so we inherit from the first consumer instead. For output clones the
-        # original ComputedBuffer already carries the right metadata.
-        copy_op_metadata(src=buffer_users[0] if input else buffer, dst=new_com_buf)
-        # TODO why arg0 ComputedBuffer doesn't have this attr?
+        copy_op_metadata(metadata_source, new_com_buf)
         new_com_buf.name = self.lowering.register_buffer(new_com_buf)
         self.lowering.register_operation(new_com_buf)
-        new_buf_name = new_com_buf.name
+        new_buf_name = new_com_buf.get_name()
 
-        # Propagate per-core splits to the clone. Users share one per_core_view
-        # (core_div_mismatch guard), so the first user is representative.
-        first_user = buffer_users[0]
-        fu_splits: tuple[dict, dict] = getattr(
-            first_user, "op_it_space_splits", ({}, {})
+        # Ordinary input clones have compatible consumers; private clones have one.
+        first_consumer = buffer_users[0]
+        consumer_splits: tuple[dict, dict] = getattr(
+            first_consumer, "op_it_space_splits", ({}, {})
         )
-        clone_out_splits: dict = fu_splits[0]
+        clone_out_splits: dict = consumer_splits[0]
         if input:
-            # An input clone is inserted *before* its consumers and they read
-            # the clone, so the clone's split must match how they read it.
-            # op_it_space_splits keys are stride coefficients in the consumer's
-            # index space -- NOT layout-invariant: a key maps to the same
-            # physical dim only when the consumer's output shape matches the
-            # clone's (== the buffer's) shape. A reduction consumer's output
-            # drops the reduced dim, so copying its keys verbatim splits the
-            # wrong axis of the full-shape clone (wrong values / SDSC abort at
-            # multi-core).
-            #
-            # Re-key: recover the consumer's {symbol: split}, then encode it
-            # against the consumer's READ index on this buffer. The clone is a
-            # Pointwise copy writing the buffer with that same (identity) index,
-            # so buffer-stride coeffs are valid clone output-split keys. Every
-            # per-core split -- output-dim or reduction/k-split -- lands on the
-            # matching buffer axis.
-            fu_rw = op_read_writes(first_user)
-            read_dep = next((d for d in fu_rw.reads if d.name == buf_name), None)
-            clone_out_splits = {}
-            if read_dep is not None and any(
-                n > 1 for d in fu_splits for n in d.values()
-            ):
-                fu_write_index = next(iter(fu_rw.writes)).index
-                fu_read_index = next((d.index for d in fu_rw.reads), fu_write_index)
-                per_sym = apply_splits_from_index_coeff(
-                    fu_splits,
-                    fu_write_index,
-                    fu_read_index,
-                    iteration_space_from_op(first_user),
-                )
-                clone_out_splits, _ = splits_by_index_coeff(
-                    per_sym, read_dep.index, read_dep.index
-                )
-        # An output clone copies the produced buffer 1:1 (same shape/layout), so
-        # the consumer's output splits transfer directly without re-keying.
+            # Re-key consumer splits against this read. Copying output keys is
+            # wrong for reductions because their output drops reduced axes.
+            assert isinstance(first_consumer, ComputedBuffer)
+            clone_out_splits = self._clone_output_splits(buf_name, first_consumer)
         new_com_buf.op_it_space_splits = (clone_out_splits, {})
 
         if input:
-            # Step 3: Update self.graph.name_to_users (a list of TensorBox), e.g., existing users of
-            # arg0, other than InpBuf and new_buf, should become users of new_buf.
-            users_of_inp = []
-            users_of_new_buf = []
+            source_users = []
+            clone_users = []
+            private_user_names = {user.get_name() for user in buffer_users}
             for node in self.lowering.name_to_users[buf_name]:
                 while not isinstance(node, Buffer):
                     assert hasattr(node, "data"), (
                         f"unexpected node type {type(node)} ({node})"
                     )
                     node = node.data
-                if node.name in [buf_name, new_buf_name]:  # type: ignore
-                    users_of_inp.append(node)
+                keep_source = node.name in [buf_name, new_buf_name] or (
+                    private and node.name not in private_user_names
+                )
+                if keep_source:
+                    source_users.append(node)
                 else:
-                    users_of_new_buf.append(node)
-            self.lowering.name_to_users[buf_name] = users_of_inp
-            self.lowering.name_to_users[new_buf_name] = users_of_new_buf
+                    clone_users.append(node)
+            self.lowering.name_to_users[buf_name] = source_users
+            self.lowering.name_to_users[new_buf_name] = clone_users
 
-            # Step 4: Hack user nodes' inner_fn
-            for old_com_buf in buffer_users:
-                if GraphEditor.is_rewritable_consumer(old_com_buf):
-                    self._swap_loops_input(old_com_buf, buf_name, new_buf_name)
+            for consumer in buffer_users:
+                if GraphEditor.is_rewritable_consumer(consumer):
+                    self._replace_loop_input(consumer, buf_name, new_buf_name)
                 else:
                     raise NotImplementedError(
-                        f"unexpected buffer user type {type(old_com_buf)} ({old_com_buf})"
+                        f"unexpected buffer user type {type(consumer)} ({consumer})"
                     )
 
-        # NOTE: operations is a reference to graph.operations, which is already
-        # updated when we call graph.register_operation() earlier. But the new Op
-        # was appended at the end of the list, need to insert at the correct position.
-        first_user = buffer_users[0]
-        idx_to_first_user = self.lowering.operations.index(first_user)
-        assert self.lowering.operations[-1].name == new_com_buf.name, (
-            f"removing {new_com_buf.name} from "
-            f"{[op.name for op in self.lowering.operations]}"
+        self.lowering.operations.remove(new_com_buf)
+        self.lowering.operations.insert(
+            self.lowering.operations.index(buffer_users[0]), new_com_buf
         )
-        self.lowering.operations.pop()
-        self.lowering.operations.insert(idx_to_first_user, new_com_buf)
 
         return new_com_buf
+
+    def insert_clone_before_consumers(
+        self,
+        buffer: ComputedBuffer,
+        consumers: list[ComputedBuffer],
+    ) -> ComputedBuffer:
+        return self.push_allocation_with_clone(
+            buffer, consumers, input=True, private=True
+        )
 
     @staticmethod
     def all_uses_are_rewritable(graph: GraphLowering, uses: list[int]) -> bool:
@@ -290,17 +266,16 @@ class GraphEditor:
         """
         return hasattr(op, "data") and isinstance(op.data, Pointwise | Reduction)
 
-    def _swap_loops_input(self, old_loop: Operation, old_name: str, new_name: str):
-        """Hack inner_fn with a nameSwapper ops handler and make a new LoopIR."""
+    def _replace_loop_input(
+        self, old_loop: Operation, old_name: str, new_name: str
+    ) -> None:
+        """Replace one buffer load in a pointwise or reduction loop."""
         assert isinstance(old_loop.data, Pointwise | Reduction)
         new_loop = self._create_loop_hack_inner_fn(
             old_loop.data, name_map={old_name: new_name}
         )
         old_loop.data = new_loop
-        # inner_fn now loads new_name in place of old_name, so this op's
-        # get_read_writes() changes; drop its memoized entry so any later
-        # op_read_writes() re-traces instead of returning the pre-swap reads.
-        # TODO: Contemplate automating there to make the cache opaque.
+        # The dependency set changed; force the next query to retrace the loop.
         invalidate_op_read_writes(old_loop)
 
     class _NameSwapHandler(WrapperHandler):

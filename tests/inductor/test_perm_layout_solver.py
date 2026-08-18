@@ -14,6 +14,8 @@
 
 """Tests for the capacity-bounded allocation plans."""
 
+import copy
+import gc
 import itertools
 import os
 import random
@@ -29,6 +31,7 @@ from torch_spyre._inductor.scratchpad.permutation_layout import (
     PermutationBasedLayoutSolver,
     ReferencePermutationBasedLayoutSolver,
 )
+from torch_spyre._C import NativePermutationLayoutSolver
 
 ALIGNMENT = 128
 
@@ -116,10 +119,11 @@ def _check_contact_faithful(test, plan, tag=""):
     pos = plan.position
 
     def top(w):
-        # Exclusive top of a placed buffer; +inf for an evicted (None) one.
+        # Exclusive top of a placed buffer; +inf for an evicted (None) one. Uses
+        # the plan-local size so a resize is reflected.
         if plan.addresses[w] is None:
             return float("inf")
-        return plan.addresses[w] + plan.buffers[w].size
+        return plan.addresses[w] + plan._sizes[w]
 
     def alive(w):
         return plan.buffers[w].start_time <= t < plan.buffers[w].end_time
@@ -127,13 +131,19 @@ def _check_contact_faithful(test, plan, tag=""):
     for c in range(n):
         bc = plan.buffers[c]
         if plan.addresses[c] is None:
-            # c is evicted: it has no concrete geometry to validate. (Its
-            # order-based contact relation is still checked via _check_consistency
-            # and the placed buffers below.)
+            # c is evicted (or ineligible / in HBM): no concrete geometry to
+            # validate. (Its order-based contact relation is still checked via
+            # _check_consistency and the placed buffers below.)
             continue
         for t in range(bc.start_time, bc.end_time):
             contact = plan.contact_at(c, t)
-            cand = [w for w in plan.overlap_dict[c] if pos[w] < pos[c] and alive(w)]
+            # Only eligible earlier buffers are in the stack (an ineligible one is
+            # transparent), matching the candidate set placement actually uses.
+            cand = [
+                w
+                for w in plan.overlap_dict[c]
+                if pos[w] < pos[c] and alive(w) and plan._eligible[w]
+            ]
             if not cand:
                 test.assertIsNone(contact, f"{tag} c={c} t={t}")
                 continue
@@ -198,6 +208,36 @@ def _buf(name, size, start, end, in_place_parents=None):
         size=size,
         uses=uses,
         in_place_parents=in_place_parents or [],
+    )
+
+
+def _rebuilt_with_state(plan, capacity, alignment):
+    """A fresh ``PermutationBasedLayoutSolver`` reproducing ``plan``'s current
+    permutation, *sizes*, and *eligibility* -- the from-scratch oracle for the
+    resize / set_eligible differential checks.
+
+    ``resize`` mutates the plan-local ``_sizes`` (never the shared buffer
+    objects), so the rebuild is fed fresh buffers carrying those sizes; the live
+    eligibility is passed through the constructor. This is the analogue of the
+    ``rebuilt = PermutationBasedLayoutSolver(buffers, fast.permutation, ...)``
+    oracle the swap/rotate tests use, extended to the co-opt state.
+    """
+    fresh = [
+        LifetimeBoundBuffer(
+            name=b.name,
+            size=plan._sizes[i],
+            uses=list(b.uses),
+            first_use_is_read=b.first_use_is_read,
+            in_place_parents=list(b.in_place_parents),
+        )
+        for i, b in enumerate(plan.buffers)
+    ]
+    return PermutationBasedLayoutSolver(
+        fresh,
+        list(plan.permutation),
+        capacity,
+        alignment,
+        eligible=list(plan._eligible),
     )
 
 
@@ -1097,6 +1137,363 @@ class FastRotateTests(TestCase):
             self.assertEqual(fast.inplace_reuse, chain.inplace_reuse, tag)
 
 
+class EligibilityConstructionTests(TestCase):
+    """Constructing a plan with some buffers ineligible up front."""
+
+    def plan(self, buffers, permutation, eligible, capacity=10_000, alignment=1):
+        return PermutationBasedLayoutSolver(
+            buffers, permutation, capacity, alignment, eligible=eligible
+        )
+
+    def test_default_all_eligible(self):
+        buffers = [_buf("a", 64, 0, 2), _buf("b", 50, 0, 2)]
+        plan = PermutationBasedLayoutSolver(buffers, [0, 1], 10_000, 1)
+        self.assertEqual(plan._eligible, [True, True])
+
+    def test_bad_eligible_length_rejected(self):
+        buffers = [_buf("a", 64, 0, 2)]
+        with self.assertRaises(AssertionError):
+            self.plan(buffers, [0], eligible=[True, False])
+
+    def test_ineligible_buffer_is_transparent(self):
+        # b ineligible: routed to HBM (no address, no quality), and c stacks
+        # directly on a as if b were absent -- not on b.
+        buffers = [_buf("a", 64, 0, 3), _buf("b", 50, 0, 3), _buf("c", 40, 0, 3)]
+        plan = self.plan(buffers, [0, 1, 2], eligible=[True, False, True])
+        self.assertEqual(_addr(plan, "a"), 0)
+        self.assertIsNone(_addr(plan, "b"))
+        self.assertEqual(_addr(plan, "c"), 64)  # rests on a, not on b
+        self.assertEqual(plan.quality(), 2.5 * (64 + 40))
+        self.assertEqual(plan.count_allocated(), 2)
+        self.assertEqual(_below_named(plan, "c"), [(0, 3, "a")])
+        # b's own profile is a trivial "nothing here" step function.
+        self.assertEqual(_below_named(plan, "b"), [(0, 3, None)])
+        self.assertEqual(_above_named(plan, "b"), [(0, 3, None)])
+        _check_consistency(self, plan)
+        _check_contact_faithful(self, plan)
+
+    def test_matches_reference_with_initial_eligibility(self):
+        buffers = [_buf("a", 64, 0, 3), _buf("b", 50, 0, 3), _buf("c", 40, 0, 3)]
+        elig = [True, False, True]
+        fast = self.plan(buffers, [0, 1, 2], eligible=elig)
+        ref = ReferencePermutationBasedLayoutSolver(
+            buffers, [0, 1, 2], 10_000, 1, eligible=list(elig)
+        )
+        self.assertEqual(fast.addresses, ref.addresses)
+        self.assertEqual(fast.quality(), ref.quality())
+
+
+class ResizeTests(TestCase):
+    """resize(idx, new_size): change a footprint in place and re-place."""
+
+    def plan(self, buffers, permutation, capacity=10_000, alignment=1):
+        return PermutationBasedLayoutSolver(buffers, permutation, capacity, alignment)
+
+    def test_resize_shifts_stacked_neighbour(self):
+        buffers = [_buf("a", 64, 0, 3), _buf("b", 50, 0, 3)]
+        plan = self.plan(buffers, [0, 1])
+        self.assertEqual([_addr(plan, "a"), _addr(plan, "b")], [0, 64])
+        delta = plan.resize(0, 100)  # a grows -> b moves up
+        self.assertEqual([_addr(plan, "a"), _addr(plan, "b")], [0, 100])
+        # a's quality rises (2.5 * (100 - 64)); b's is unchanged.
+        self.assertEqual(delta, 2.5 * (100 - 64))
+        self.assertEqual(plan.quality(), 2.5 * (100 + 50))
+        # The shared buffer object is NOT mutated.
+        self.assertEqual(buffers[0].size, 64)
+
+    def test_resize_over_capacity_evicts_and_uneviction(self):
+        buffers = [_buf("a", 40, 0, 2), _buf("b", 40, 0, 2)]
+        plan = self.plan(buffers, [0, 1], capacity=100)
+        self.assertEqual([_addr(plan, "a"), _addr(plan, "b")], [0, 40])
+        plan.resize(0, 80)  # a@0..80, b@80..120 > 100 -> b evicted
+        self.assertEqual(_addr(plan, "a"), 0)
+        self.assertIsNone(_addr(plan, "b"))
+        self.assertEqual(plan.count_allocated(), 1)
+        plan.resize(0, 40)  # shrink back -> b re-fits
+        self.assertEqual([_addr(plan, "a"), _addr(plan, "b")], [0, 40])
+        self.assertEqual(plan.count_allocated(), 2)
+
+    def test_resize_ineligible_is_bookkeeping_only(self):
+        buffers = [_buf("a", 64, 0, 3), _buf("b", 50, 0, 3)]
+        plan = PermutationBasedLayoutSolver(
+            buffers, [0, 1], 10_000, 1, eligible=[True, False]
+        )
+        before = list(plan.addresses)
+        delta = plan.resize(1, 5000)  # b is in HBM: nothing observable changes
+        self.assertEqual(delta, 0.0)
+        self.assertEqual(plan.addresses, before)
+        self.assertEqual(plan._sizes[1], 5000)  # but the size is recorded
+
+    def test_resize_crosses_inplace_fit_boundary(self):
+        # child reuses parent while it fits; growing it past the parent forces a
+        # stack, and shrinking it back restores the reuse.
+        parent = _buf("p", 128, 0, 5)
+        child = _buf("c", 64, 4, 10, in_place_parents=["p"])
+        plan = self.plan([parent, child], [0, 1])
+        self.assertEqual(_addr(plan, "c"), 0)  # reuses p
+        plan.resize(1, 200)  # c no longer fits in p
+        self.assertEqual(_addr(plan, "c"), 128)  # stacks on p
+        plan.resize(1, 64)
+        self.assertEqual(_addr(plan, "c"), 0)  # reuse restored
+
+
+class SetEligibleTests(TestCase):
+    """set_eligible(idx, flag): toggle a buffer in/out of LX."""
+
+    def plan(self, buffers, permutation, capacity=10_000, alignment=1):
+        return PermutationBasedLayoutSolver(buffers, permutation, capacity, alignment)
+
+    def test_toggle_out_then_in_restores(self):
+        buffers = [_buf("a", 64, 0, 3), _buf("b", 50, 0, 3), _buf("c", 40, 0, 3)]
+        plan = self.plan(buffers, [0, 1, 2])
+        self.assertEqual([_addr(plan, n) for n in "abc"], [0, 64, 114])
+        d_out = plan.set_eligible(1, False)  # b -> HBM
+        self.assertEqual(_addr(plan, "a"), 0)
+        self.assertIsNone(_addr(plan, "b"))
+        self.assertEqual(_addr(plan, "c"), 64)  # c drops onto a
+        self.assertEqual(d_out, -2.5 * 50)
+        d_in = plan.set_eligible(1, True)  # b -> LX at its slot
+        self.assertEqual([_addr(plan, n) for n in "abc"], [0, 64, 114])
+        self.assertEqual(d_in, 2.5 * 50)
+        # Profiles match a fresh build after the round trip.
+        rebuilt = _rebuilt_with_state(plan, 10_000, 1)
+        self.assertEqual(plan.below_profile, rebuilt.below_profile)
+        self.assertEqual(plan.above_profile, rebuilt.above_profile)
+        _check_consistency(self, plan)
+        _check_contact_faithful(self, plan)
+
+    def test_toggle_unchanged_flag_is_noop(self):
+        buffers = [_buf("a", 64, 0, 2)]
+        plan = self.plan(buffers, [0])
+        before = list(plan.addresses)
+        self.assertEqual(plan.set_eligible(0, True), 0.0)  # already eligible
+        self.assertEqual(plan.addresses, before)
+
+    def test_toggle_out_uneviction(self):
+        # a@0(60); b rests on a -> 120 > 100 evicted. Making a ineligible frees
+        # the floor so b re-fits at 0.
+        buffers = [_buf("a", 60, 0, 3), _buf("b", 60, 0, 3)]
+        plan = self.plan(buffers, [0, 1], capacity=100)
+        self.assertEqual(_addr(plan, "a"), 0)
+        self.assertIsNone(_addr(plan, "b"))
+        plan.set_eligible(0, False)
+        self.assertIsNone(_addr(plan, "a"))
+        self.assertEqual(_addr(plan, "b"), 0)  # un-evicted
+        self.assertEqual(plan.count_allocated(), 1)
+
+
+class ResizeEligibilityDifferentialTests(TestCase):
+    """Randomized differential coverage for resize + set_eligible interleaved
+    with swap / rotate, against both the from-scratch reference (O(n^2) scan) and
+    a fresh rebuild carrying the same size/eligibility state."""
+
+    def _assert_matches(self, fast, ref, cap, align, delta, before, tag):
+        # Live reference (independent O(n^2) scan of the current state).
+        self.assertEqual(fast.addresses, ref.addresses, tag)
+        self.assertEqual(fast.quality(), ref.quality(), tag)
+        self.assertEqual(fast.count_allocated(), ref.count_allocated(), tag)
+        self.assertEqual(delta, fast.quality() - before, tag)
+        # Fresh rebuild reproducing the current sizes + eligibility: profiles and
+        # in-place reuse (both size/eligibility dependent) must match exactly.
+        rebuilt = _rebuilt_with_state(fast, cap, align)
+        self.assertEqual(fast.addresses, rebuilt.addresses, tag)
+        # Quality against the *rebuild*, not just ``ref``: ``_sync_reference``
+        # copies ``_qualities`` into ``ref``, so ``ref.quality()`` only re-sums
+        # whatever ``fast`` already computed and cannot catch a wrong size ->
+        # quality formula in ``resize``. The rebuild derives it independently by
+        # feeding the current ``_sizes`` through a fresh constructor.
+        self.assertEqual(fast.quality(), rebuilt.quality(), tag)
+        self.assertEqual(fast.below_profile, rebuilt.below_profile, tag)
+        self.assertEqual(fast.above_profile, rebuilt.above_profile, tag)
+        self.assertEqual(fast.inplace_reuse, rebuilt.inplace_reuse, tag)
+        _check_consistency(self, fast, tag)
+        _check_contact_faithful(self, fast, tag)
+
+    def _apply(self, op, plan, rng, n):
+        """Apply a random instance of ``op`` to ``plan``; return its delta."""
+        if op == "swap":
+            return plan.swap(rng.randrange(n - 1))
+        if op == "rotate":
+            return plan.rotate(rng.randrange(n), rng.randrange(n))
+        if op == "resize":
+            idx = rng.randrange(n)
+            # A mix of shrink, grow-in-bounds, and grow-past-capacity (evicts).
+            new = rng.choice([1, rng.randint(1, 300), rng.randint(300, 1200)])
+            return plan.resize(idx, new)
+        # toggle-eligibility
+        idx = rng.randrange(n)
+        return plan.set_eligible(idx, not plan._eligible[idx])
+
+    def _sync_reference(self, ref, fast):
+        """Rebuild ``ref`` to reproduce ``fast``'s post-move state, giving an
+        independent O(n^2) oracle regardless of how the move was chosen."""
+        ref.permutation = list(fast.permutation)
+        ref._sizes = list(fast._sizes)
+        ref._qualities = list(fast._qualities)
+        ref._eligible = list(fast._eligible)
+        ref._build()
+
+    def test_random_mixed_sequences_match_oracles(self):
+        seeds = 4000 if _STRESS else 800
+        for seed in range(seeds):
+            rng = random.Random(seed)
+            n = rng.randint(1, 9)
+            buffers = _random_buffers(rng, n)
+            perm = list(range(n))
+            rng.shuffle(perm)
+            cap = rng.choice([150, 400, 10_000])
+            align = rng.choice([1, 64, 128])
+            fast = PermutationBasedLayoutSolver(buffers, perm, cap, align)
+            fast._rotate_remove_insert_threshold = 1  # exercise the fast path
+            ref = ReferencePermutationBasedLayoutSolver(buffers, perm, cap, align)
+
+            ops = ["swap", "rotate", "resize", "toggle"]
+            for step in range(rng.randint(1, 3 * n + 3)):
+                op = rng.choice(ops)
+                if op == "swap" and n < 2:
+                    op = "resize"  # no adjacent pair to swap
+                before = fast.quality()
+                d_fast = self._apply(op, fast, rng, n)
+                self._sync_reference(ref, fast)
+                tag = f"seed={seed} step={step} op={op} elig={fast._eligible}"
+                self._assert_matches(fast, ref, cap, align, d_fast, before, tag)
+
+
+class NativeSolverDifferentialTests(TestCase):
+    """Differential coverage for the C++ ``NativePermutationLayoutSolver``
+    accelerator against the canonical Python ``PermutationBasedLayoutSolver``.
+
+    The C++ class is an opt-in accelerator; the Python packer stays canonical
+    and is the correctness oracle. This drives the SAME random interleaved
+    swap / rotate / resize / set_eligible sequences (the ``_apply`` mix from
+    :class:`ResizeEligibilityDifferentialTests`) through both and asserts
+    observable equality -- bit-for-bit identical ``addresses`` (None ==
+    evicted / HBM), ``quality()`` and ``count_allocated()`` -- after every op,
+    plus that the per-op quality delta each returns agrees.
+    """
+
+    def _apply_both(self, op, py_plan, cpp_plan, rng, n):
+        """Apply one random instance of ``op`` identically to both plans.
+
+        Returns ``(delta_py, delta_cpp)``. Every random parameter is drawn once
+        and reused, so the two plans receive byte-identical operations.
+        """
+        if op == "swap":
+            i = rng.randrange(n - 1)
+            return py_plan.swap(i), cpp_plan.swap(i)
+        if op == "rotate":
+            i, j = rng.randrange(n), rng.randrange(n)
+            return py_plan.rotate(i, j), cpp_plan.rotate(i, j)
+        if op == "resize":
+            idx = rng.randrange(n)
+            new = rng.choice([1, rng.randint(1, 300), rng.randint(300, 1200)])
+            return py_plan.resize(idx, new), cpp_plan.resize(idx, new)
+        # toggle-eligibility: the Python plan is the source of truth for the
+        # current flag; flip the same (idx, flag) on both.
+        idx = rng.randrange(n)
+        flag = not py_plan._eligible[idx]
+        return py_plan.set_eligible(idx, flag), cpp_plan.set_eligible(idx, flag)
+
+    def _assert_equal(self, py_plan, cpp_plan, tag):
+        self.assertEqual(list(cpp_plan.addresses), list(py_plan.addresses), tag)
+        self.assertEqual(cpp_plan.quality(), py_plan.quality(), tag)
+        self.assertEqual(cpp_plan.count_allocated(), py_plan.count_allocated(), tag)
+
+    def test_fast_path_reads_pokethrough_top_not_dead_parent(self):
+        """The aggregate fast path's boundary case, pinned deterministically.
+
+        ``RecomputeAll`` takes the interval-aggregate fast path for a buffer with
+        no in-place partner and the gather + ``PlaceDecision`` path for one with,
+        so the discriminating state is a partner-free buffer resting on a
+        *poke-through*: ``c`` co-locates into ``p``'s slot, so its top (64) sits
+        below ``p``'s (128), and ``h`` starts at 5 -- after ``p`` dies -- so its
+        only candidate is ``c``. Its floor must therefore be 64, not 128.
+
+        ``h`` overlapping ``p`` as well (as in the contact-profile poke-through
+        test) makes both answers 128, which is why that case cannot distinguish a
+        correct aggregate from one that folds in a dead-but-taller buffer. The
+        alignment must stay 1: at 128-byte alignment ``align_up(64) ==
+        align_up(128)`` and the discrimination vanishes.
+        """
+        p = _buf("p", 128, 0, 5)
+        c = _buf("c", 64, 4, 10, in_place_parents=["p"])
+        h = _buf("h", 32, 5, 10)
+        buffers = [p, c, h]
+        perm = [0, 1, 2]
+
+        cpp_plan = NativePermutationLayoutSolver(buffers, perm, 10_000, 1)
+        self.assertEqual(list(cpp_plan.addresses), [0, 0, 64])
+
+        # Both Python packers agree, so the expectation is the specification's,
+        # not just this implementation's. The from-scratch reference is the
+        # independent oracle the randomized native tests never consult.
+        py_plan = PermutationBasedLayoutSolver(buffers, perm, 10_000, 1)
+        ref_plan = ReferencePermutationBasedLayoutSolver(buffers, perm, 10_000, 1)
+        self._assert_equal(py_plan, cpp_plan, "pokethrough fast path")
+        self._assert_equal(ref_plan, cpp_plan, "pokethrough fast path vs reference")
+
+    def test_random_mixed_sequences_match_python(self):
+        seeds = 4000 if _STRESS else 800
+        for seed in range(seeds):
+            rng = random.Random(seed)
+            n = rng.randint(1, 9)
+            buffers = _random_buffers(rng, n)
+            perm = list(range(n))
+            rng.shuffle(perm)
+            cap = rng.choice([150, 400, 10_000])
+            align = rng.choice([1, 64, 128])
+            py_plan = PermutationBasedLayoutSolver(buffers, perm, cap, align)
+            py_plan._rotate_remove_insert_threshold = 1  # exercise the fast path
+            cpp_plan = NativePermutationLayoutSolver(buffers, perm, cap, align)
+
+            self._assert_equal(py_plan, cpp_plan, f"seed={seed} init")
+
+            ops = ["swap", "rotate", "resize", "toggle"]
+            for step in range(rng.randint(1, 3 * n + 3)):
+                op = rng.choice(ops)
+                if op == "swap" and n < 2:
+                    op = "resize"  # no adjacent pair to swap
+                d_py, d_cpp = self._apply_both(op, py_plan, cpp_plan, rng, n)
+                tag = f"seed={seed} step={step} op={op}"
+                self.assertEqual(d_cpp, d_py, tag)
+                self._assert_equal(py_plan, cpp_plan, tag)
+
+    def test_copy_is_independent_and_matches_python(self):
+        # copy() yields an independent snapshot: mutating the clone leaves the
+        # source observably unchanged, and the mutated clone still matches a
+        # Python plan driven through the same swaps.
+        for seed in range(400):
+            rng = random.Random(seed)
+            n = rng.randint(2, 9)
+            buffers = _random_buffers(rng, n)
+            perm = list(range(n))
+            rng.shuffle(perm)
+            cap = rng.choice([150, 400, 10_000])
+            align = rng.choice([1, 64, 128])
+            cpp_plan = NativePermutationLayoutSolver(buffers, perm, cap, align)
+            src_addr = list(cpp_plan.addresses)
+            src_q = cpp_plan.quality()
+
+            clone = cpp_plan.copy()
+            py_plan = PermutationBasedLayoutSolver(buffers, perm, cap, align)
+            swaps = [rng.randrange(n - 1) for _ in range(rng.randint(1, 2 * n))]
+            for i in swaps:
+                clone.swap(i)
+                py_plan.swap(i)
+
+            # Source untouched by clone mutations.
+            self.assertEqual(list(cpp_plan.addresses), src_addr, f"seed={seed}")
+            self.assertEqual(cpp_plan.quality(), src_q, f"seed={seed}")
+            # Mutated clone matches the Python plan run through the same swaps.
+            self.assertEqual(
+                list(clone.addresses), list(py_plan.addresses), f"seed={seed}"
+            )
+            self.assertEqual(clone.quality(), py_plan.quality(), f"seed={seed}")
+            self.assertEqual(
+                clone.count_allocated(), py_plan.count_allocated(), f"seed={seed}"
+            )
+
+
 class CopyTests(TestCase):
     """copy() makes an independent layout snapshot sharing static structures."""
 
@@ -1362,3 +1759,166 @@ class ProfileTests(TestCase):
         p.splice(3, 7, [3, 7], [2])
         self.assertEqual(p, Profile([0, 3, 7, 10], [None, 2, None]))
         p.validate()
+
+
+class NativeGuardTests(TestCase):
+    """The C++ accelerator validates out-of-range / degenerate arguments and
+    raises (like ``swap()`` already did, and like the Python packer's fail-fast
+    asserts) instead of corrupting the heap or crashing. Regression coverage for
+    the memory-safety review's ASan-confirmed findings (bad ``idx``/``i``/``j``
+    into resize/rotate/set_eligible, empty ``uses``, zero alignment)."""
+
+    def _plan(self, n=3):
+        bufs = [_buf(f"b{i}", 64, 0, 3) for i in range(n)]
+        return NativePermutationLayoutSolver(bufs, list(range(n)), 10_000, 128)
+
+    def test_resize_index_out_of_range_raises(self):
+        p = self._plan()
+        for bad in (-1, 3, 999):
+            with self.assertRaises(ValueError):
+                p.resize(bad, 100)
+
+    def test_rotate_index_out_of_range_raises(self):
+        p = self._plan()
+        for i, j in ((5, 0), (0, 5), (-1, 0), (0, -1)):
+            with self.assertRaises(ValueError):
+                p.rotate(i, j)
+
+    def test_set_eligible_index_out_of_range_raises(self):
+        p = self._plan()
+        for bad in (-1, 3, 999):
+            with self.assertRaises(ValueError):
+                p.set_eligible(bad, False)
+
+    def test_empty_uses_raises(self):
+        bad = LifetimeBoundBuffer(name="x", size=64, uses=[], in_place_parents=[])
+        with self.assertRaises(ValueError):
+            NativePermutationLayoutSolver([bad], [0], 10_000, 128)
+
+    def test_zero_alignment_raises(self):
+        with self.assertRaises(ValueError):
+            NativePermutationLayoutSolver([_buf("a", 64, 0, 3)], [0], 10_000, 0)
+
+
+class NativePermutationViewTests(TestCase):
+    """Lifetime and reference semantics of the native ``permutation`` view.
+
+    ``plan.permutation`` returns a ``PermutationView`` that *borrows* its solver
+    and reads straight through to the solver's ``std::vector``. Two opposite
+    things must hold, and the rest of the suite establishes neither:
+
+    - It must stay **valid**. Nothing else in these tests lets a view outlive its
+      solver, so a view left reading freed memory would go unnoticed -- and did:
+      the ``py::keep_alive`` securing this was initially attached to the property
+      rather than to the getter, where it silently does nothing, and the whole
+      suite passed regardless.
+    - It must stay **live**. ``annealing_step_swap`` captures the view once and
+      re-reads it after each ``swap``, so a snapshot would make the search read
+      pre-swap values. That degrades rather than breaks: the search would simply
+      explore a different trajectory and still return a feasible layout, so only
+      the cross-packer equivalence test could notice, and only because it demands
+      bit-identical trajectories.
+
+    These are failures where the program keeps running and produces plausible
+    output, which is why they are asserted against the mechanism directly.
+    """
+
+    def _bufs(self):
+        return [_buf("a", 64, 0, 4), _buf("c", 96, 0, 4), _buf("d", 32, 0, 4)]
+
+    def _plan(self, perm=(0, 1, 2), capacity=200, alignment=1):
+        return NativePermutationLayoutSolver(
+            self._bufs(), list(perm), capacity, alignment
+        )
+
+    def test_view_outlives_its_solver(self):
+        """keep_alive must make the view retain the solver it borrows."""
+        plan = self._plan()
+        view = plan.permutation
+        del plan
+        for _ in range(3):
+            gc.collect()
+        self.assertEqual(list(view), [0, 1, 2])
+
+    def test_view_survives_reuse_of_the_solver_s_memory(self):
+        """Stronger than the above: reading freed memory often *appears* to work
+        because the block has not been handed out again. Force it to be reused."""
+        plan = self._plan(perm=(2, 1, 0))
+        view = plan.permutation
+        del plan
+        gc.collect()
+        churn = [self._plan(perm=(1, 0, 2)) for _ in range(200)]
+        self.assertEqual(list(view), [2, 1, 0])
+        self.assertEqual(len(churn), 200)  # keep the churn alive to this point
+
+    def test_captured_view_observes_later_mutation(self):
+        """The liveness half: ``annealing_step_swap`` depends on this exactly."""
+        plan = self._plan()
+        view = plan.permutation  # captured ONCE, before the mutation
+        plan.swap(0)
+        self.assertEqual(list(view), [1, 0, 2])
+        plan.rotate(0, 2)
+        self.assertEqual(list(view), [0, 2, 1])
+
+    def test_copy_detaches_from_the_live_order(self):
+        """The mirror image of liveness. The search stores its best-so-far
+        permutation with a copy and later compares the live order against it; were
+        the copy to track the original, that test would be vacuously equal and
+        "commit the best permutation seen" would quietly stop working."""
+        plan = self._plan()
+        view = plan.permutation
+        snapshot = copy.copy(view)
+        deep = copy.deepcopy(view)
+        plan.swap(0)
+        self.assertIsInstance(snapshot, list)
+        self.assertIsInstance(deep, list)
+        self.assertEqual(snapshot, [0, 1, 2])
+        self.assertEqual(deep, [0, 1, 2])
+        self.assertEqual(list(view), [1, 0, 2])
+        self.assertNotEqual(snapshot, list(view))
+
+    def test_clone_view_tracks_the_clone_not_the_original(self):
+        """``copy()`` deep-copies the order, and the search clones plans."""
+        original = self._plan()
+        clone = original.copy()
+        clone.swap(0)
+        self.assertEqual(list(original.permutation), [0, 1, 2])
+        self.assertEqual(list(clone.permutation), [1, 0, 2])
+
+    def test_view_is_read_only(self):
+        """Read-only by construction, so Python cannot reorder the permutation
+        behind the solver's back (which would desync it from the addresses)."""
+        view = self._plan().permutation
+        with self.assertRaises(TypeError):
+            view[0] = 5
+        with self.assertRaises(TypeError):
+            del view[0]
+
+    def test_view_sequence_protocol(self):
+        """len / indexing / negative offsets / equality against a plain list, and
+        IndexError past the end so ``list(view)`` and iteration terminate."""
+        plan = self._plan(perm=(2, 0, 1))
+        view = plan.permutation
+        self.assertEqual(len(view), 3)
+        self.assertEqual(view[0], 2)
+        self.assertEqual(view[-1], 1)
+        self.assertEqual(list(view), [2, 0, 1])
+        self.assertEqual([x for x in view], [2, 0, 1])
+        self.assertEqual(view, [2, 0, 1])
+        self.assertNotEqual(view, [0, 1, 2])
+        self.assertEqual(view, plan.permutation)
+        for bad in (3, 99, -4):
+            with self.assertRaises(IndexError):
+                view[bad]
+
+    def test_finalize_writes_addresses_back_including_none(self):
+        """``finalize`` writes to EVERY buffer, so an evicted one is cleared to
+        ``None`` rather than left holding a stale address."""
+        buffers = [_buf("x", 150, 0, 3), _buf("y", 150, 0, 3)]
+        plan = NativePermutationLayoutSolver(buffers, [0, 1], 200, 1)
+        plan.finalize()
+        self.assertEqual(
+            [(b.name, b.address) for b in buffers], [("x", 0), ("y", None)]
+        )
+        # The retained list is the caller's, not a copy.
+        self.assertEqual([b.name for b in plan.buffers], ["x", "y"])

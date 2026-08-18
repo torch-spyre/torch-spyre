@@ -255,7 +255,7 @@ class TestTorchLogsIntegration:
     """Verify TORCH_LOGS env var propagates to C++ LoggingConfig."""
 
     def test_torch_logs_configures_cpp_level(self):
-        """TORCH_LOGS=spyre.runtime:DEBUG must set C++ config to DEBUG."""
+        """TORCH_LOGS=+torch_spyre.runtime must set C++ config to DEBUG."""
         script = """
             import os
             _saved = os.environ.pop("TORCH_LOGS", None)
@@ -272,13 +272,13 @@ class TestTorchLogsIntegration:
             print(f"ENABLED={enabled}")
             print(f"LEVEL={cpp_logging.log_level_to_string(level)}")
         """
-        result = _run_subprocess(script, {"TORCH_LOGS": "spyre.runtime:DEBUG"})
+        result = _run_subprocess(script, {"TORCH_LOGS": "+torch_spyre.runtime"})
         assert result.returncode == 0, f"Subprocess failed: {result.stderr}"
         assert "ENABLED=True" in result.stdout
         assert "LEVEL=DEBUG" in result.stdout
 
     def test_torch_logs_info_level(self):
-        """TORCH_LOGS=spyre.inductor:INFO must set C++ config to INFO."""
+        """TORCH_LOGS=torch_spyre.inductor (no prefix) must set C++ config to INFO."""
         script = """
             import os
             _saved = os.environ.pop("TORCH_LOGS", None)
@@ -301,7 +301,7 @@ class TestTorchLogsIntegration:
             print(f"DEBUG_ENABLED={enabled_debug}")
             print(f"INFO_ENABLED={enabled_info}")
         """
-        result = _run_subprocess(script, {"TORCH_LOGS": "spyre.inductor:INFO"})
+        result = _run_subprocess(script, {"TORCH_LOGS": "torch_spyre.inductor"})
         assert result.returncode == 0, f"Subprocess failed: {result.stderr}"
         assert "LEVEL=INFO" in result.stdout
         assert "DEBUG_ENABLED=False" in result.stdout
@@ -327,7 +327,7 @@ class TestLoggerOutput:
             config.set_log_level("spyre.runtime", cpp_logging.LogLevel.DEBUG)
             print("READY")
         """
-        result = _run_subprocess(script, {"TORCH_LOGS": "spyre.runtime:DEBUG"})
+        result = _run_subprocess(script, {"TORCH_LOGS": "+torch_spyre.runtime"})
         assert result.returncode == 0, f"Subprocess failed: {result.stderr}"
         pattern = re.compile(
             r"\[(DEBUG|INFO|WARNING|ERROR|CRITICAL)\] "
@@ -390,7 +390,7 @@ class TestLoggerOutput:
             )
             print("DONE")
         """
-        result = _run_subprocess(script, {"TORCH_LOGS": "spyre.runtime:CRITICAL"})
+        result = _run_subprocess(script, {"TORCH_LOGS": "-torch_spyre.runtime"})
         assert result.returncode == 0, f"Subprocess failed: {result.stderr}"
         assert "DONE" in result.stdout
         critical_lines = [
@@ -463,14 +463,14 @@ class TestMultipleComponents:
         """
         result = _run_subprocess(
             script,
-            {"TORCH_LOGS": "spyre.runtime:DEBUG,spyre.inductor:ERROR"},
+            {"TORCH_LOGS": "+torch_spyre.runtime,-torch_spyre.inductor"},
         )
         assert result.returncode == 0, f"Subprocess failed: {result.stderr}"
         assert "RUNTIME=DEBUG" in result.stdout
         assert "INDUCTOR=ERROR" in result.stdout
 
-    def test_plus_syntax_enables_info(self):
-        """TORCH_LOGS=+spyre.runtime must enable the component at INFO."""
+    def test_plus_syntax_enables_debug(self):
+        """TORCH_LOGS=+torch_spyre.runtime must enable the component at DEBUG."""
         script = """
             import os
             _saved = os.environ.pop("TORCH_LOGS", None)
@@ -485,9 +485,9 @@ class TestMultipleComponents:
             level = config.get_log_level("spyre.runtime")
             print(f"LEVEL={cpp_logging.log_level_to_string(level)}")
         """
-        result = _run_subprocess(script, {"TORCH_LOGS": "+spyre.runtime"})
+        result = _run_subprocess(script, {"TORCH_LOGS": "+torch_spyre.runtime"})
         assert result.returncode == 0, f"Subprocess failed: {result.stderr}"
-        assert "LEVEL=INFO" in result.stdout
+        assert "LEVEL=DEBUG" in result.stdout
 
 
 class TestEmitTestLog:
@@ -510,7 +510,7 @@ class TestEmitTestLog:
             cpp_logging.emit_test_log("spyre.emit_test", 10, "debug via int")
             print("DONE")
         """
-        result = _run_subprocess(script, {"TORCH_LOGS": "spyre.emit_test:DEBUG"})
+        result = _run_subprocess(script, {"TORCH_LOGS": "+torch_spyre.emit_test"})
         assert result.returncode == 0, f"Subprocess failed: {result.stderr}"
         assert "DONE" in result.stdout
         debug_lines = [
@@ -536,7 +536,7 @@ class TestEmitTestLog:
             cpp_logging.emit_test_log("spyre.emit_test", 50, "critical via int")
             print("DONE")
         """
-        result = _run_subprocess(script, {"TORCH_LOGS": "spyre.emit_test:CRITICAL"})
+        result = _run_subprocess(script, {})
         assert result.returncode == 0, f"Subprocess failed: {result.stderr}"
         assert "DONE" in result.stdout
         critical_lines = [
