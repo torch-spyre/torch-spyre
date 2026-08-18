@@ -26,8 +26,6 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("lxml", reason="ingest_xml.py parses with lxml.etree")
-
 INGEST_PATH = (
     Path(__file__).resolve().parents[1] / ".github" / "scripts" / "ingest_xml.py"
 )

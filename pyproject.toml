@@ -67,7 +67,6 @@ test = [
     "pytest~=9.0",
     "pydantic",             # needed by test framework to support pydantic models for config
     "pytest-xdist",         # -n1 worker isolation for segfault resilience
-    "lxml",                 # .github/scripts/ingest_xml.py parses with lxml.etree
 #    "torch_sendnn",        # must be installed manually
 ]
 lint = [

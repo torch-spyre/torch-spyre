@@ -28,7 +28,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from lxml import etree
+import xml.etree.ElementTree as etree
 import clickhouse_connect
 
 # ---------------------------------------------------------------------------
