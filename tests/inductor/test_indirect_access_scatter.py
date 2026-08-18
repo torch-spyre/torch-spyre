@@ -105,6 +105,82 @@ class TestScatter(IndirectAccessTestCase):
 
         self._stage_and_e2e(kernel, out, src, idx, expect=SCATTER_OP_SPEC, op="exp")
 
+    def test_index_put_batched_dim1(self):
+        """y[:, i] = src -- batched scatter indexing a non-leading dim.
+
+        y[B,M,N], src[B,P,N], 1-D idx[P] shared across the batch: every batch
+        slice scatters its P rows into the same M-dim positions.
+        """
+        Bn, M, N, P = 4, 16, 1024, 6
+        y = torch.rand(Bn, M, N, dtype=torch.float16).to("spyre")
+        src = torch.rand(Bn, P, N, dtype=torch.float16).to("spyre")
+        idx = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
+        self.name_dims(y, {"B": Bn, "M": M, "N": N})
+        self.name_dims(src, {"B": Bn, "P": P, "N": N})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(y, src, idx):
+            y[:, idx] = src
+            return y
+
+        self._stage_and_e2e(kernel, y, src, idx, expect=SCATTER_OP_SPEC)
+
+    def test_index_put_p7(self):
+        """y[idx] = src -- 1-D scatter with an odd (non-power-of-2) P=7."""
+        M, N, P = 16, 1024, 7
+        y = torch.rand(M, N, dtype=torch.float16).to("spyre")
+        src = torch.rand(P, N, dtype=torch.float16).to("spyre")
+        idx = torch.arange(P, dtype=torch.int32).to("spyre")
+        self.name_dims(y, {"M": M, "N": N})
+        self.name_dims(src, {"P": P, "N": N})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(y, src, idx):
+            y[idx] = src
+            return y
+
+        self._stage_and_e2e(kernel, y, src, idx, expect=SCATTER_OP_SPEC)
+
+    def test_index_put_3d_dim0(self):
+        """y[idx] = src -- 3-D scatter on dim 0.
+
+        y[M,N,K], src[P,N,K], 1-D idx[P]: scatter P rows into M dimension
+        of a 3-D tensor.
+        """
+        M, N, K, P = 32, 64, 128, 8
+        y = torch.rand(M, N, K, dtype=torch.float16).to("spyre")
+        src = torch.rand(P, N, K, dtype=torch.float16).to("spyre")
+        idx = torch.arange(P, dtype=torch.int32).to("spyre")
+        self.name_dims(y, {"M": M, "N": N, "K": K})
+        self.name_dims(src, {"P": P, "N": N, "K": K})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(y, src, idx):
+            y[idx] = src
+            return y
+
+        self._stage_and_e2e(kernel, y, src, idx, expect=SCATTER_OP_SPEC)
+
+    def test_index_put_4d_dim0(self):
+        """y[idx] = src -- 4-D scatter on dim 0.
+
+        y[M,N,K,L], src[P,N,K,L], 1-D idx[P]: scatter P rows into M dimension
+        of a 4-D tensor.
+        """
+        M, N, K, L, P = 16, 32, 64, 256, 6
+        y = torch.rand(M, N, K, L, dtype=torch.float16).to("spyre")
+        src = torch.rand(P, N, K, L, dtype=torch.float16).to("spyre")
+        idx = torch.arange(P, dtype=torch.int32).to("spyre")
+        self.name_dims(y, {"M": M, "N": N, "K": K, "L": L})
+        self.name_dims(src, {"P": P, "N": N, "K": K, "L": L})
+        self.name_dims(idx, {"P": P})
+
+        def kernel(y, src, idx):
+            y[idx] = src
+            return y
+
+        self._stage_and_e2e(kernel, y, src, idx, expect=SCATTER_OP_SPEC)
+
     def test_scatter(self):
         """torch.scatter(out, 0, index, src)"""
         out, src, index = self._full_index_store(dtype=torch.int64)

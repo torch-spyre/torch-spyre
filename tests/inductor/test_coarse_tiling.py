@@ -17,8 +17,11 @@
 Covers six areas, each in its own class group:
   1. LoopSpec data structure and codegen_kernel serialization (TestLoopSpec*,
      TestIterOpSpecs, TestCodegenOpSpecListRoundtrip)
-  2. coarse_tile IR pass: range rewriting, attribute stamping, nested groups
-     (TestDivideRanges, TestCoarseTile, TestCoarseTileNested)
+  2. coarse_tile IR pass: range rewriting, attribute stamping, nested groups,
+     and consumer-redirect index rewriting (TestDivideRanges, TestCoarseTile,
+     TestCoarseTileNested, TestRetileLoadIndexFromStrides,
+     TestSqueezedRetileDims, TestIndexVarPrefix, TestConsumerOwnDimSymbol,
+     TestRetileLoadIndexWithConsumer)
   3. CountedLoopSchedulerNode, build_loop_scheduler_nodes,
      _tiled_syms_for_sched_node_at_depth, and spyre_fuse_nodes loop fusion
      (TestHelpers, TestBuildLoopSchedulerNodes, TestTiledSymsForSchedNode,
@@ -77,12 +80,15 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _RetiledBufferInfo,
     _apply_plan,
     _compute_fill_loop_info_planned,
+    _consumer_own_dim_symbol,
     _divide_ranges,
     _full_buffer_read_deps,
+    _index_var_prefix,
     _replace_group_op,
     _rescale_index,
     _retile_load_index,
     _should_patch_retiled_load_indexes,
+    _squeezed_retile_dims,
     coarse_tile_post_stickify,
     coarse_tile_pre_stickify,
     plan_coarse_tile_groups,
@@ -945,6 +951,204 @@ class TestRetileLoadIndexFromStrides(unittest.TestCase):
 
         self.assertEqual(simplify(result_c0 - 64 * c0), 0)
         self.assertEqual(simplify(result_c1 - 32 * c1), 0)
+
+
+def _make_consumer_with_ranges(ranges):
+    """Return a fake ComputedBuffer whose ``.data.ranges`` is ``ranges``.
+
+    Used to drive ``_squeezed_retile_dims``/``_consumer_own_dim_symbol``,
+    which only inspect ``consumer.data.ranges`` -- no other ComputedBuffer
+    attribute is touched by either function.
+    """
+    return _make_op(_make_pointwise(ranges))
+
+
+class TestSqueezedRetileDims(unittest.TestCase):
+    """Unit tests for which raw dims need a re-minted symbol on redirect.
+
+    See coarse_tile.py's module docstring / _squeezed_retile_dims's own
+    docstring for the two-bug history this guards: a dim only needs a
+    minted term when it was squeezed out of the *old* (tile-local) buffer's
+    layout (old_size[d] == 1, new_stride[d] != 0) AND the consumer's own
+    output for that same raw dim is non-unit (data.ranges[d] != 1) -- i.e a
+    real loop variable actually exists for it somewhere in the trace.
+    """
+
+    def test_squeezed_dim_with_nonunit_consumer_output_included(self):
+        # old_size=1 (squeezed out of the read), new_stride != 0 (real in the
+        # new buffer), consumer's own dim 0 is non-unit (size 8) -- a real
+        # loop var exists for this dim, so it belongs in the result.
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(0), Integer(1)),
+            new_stride=(Integer(256), Integer(1)),
+            old_size=(Integer(1), Integer(256)),
+        )
+        consumer = _make_consumer_with_ranges([8, 256])
+
+        self.assertEqual(_squeezed_retile_dims(info, consumer), [0])
+
+    def test_unit_consumer_output_dim_excluded(self):
+        # Same squeeze/stride shape as above, but the consumer's own output
+        # for dim 0 is ALSO unit-size (e.g. B=1 when only H is tiled) -- no
+        # real loop variable exists for this dim anywhere in the trace, so
+        # it must be excluded. This is the exact regression this guard
+        # fixes: omitting it causes _consumer_own_dim_symbol to mint a
+        # symbol that collides with an unrelated, already-present symbol
+        # under sympy's automatic term-merging (see _retile_load_index's
+        # already_present comment).
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(0), Integer(1)),
+            new_stride=(Integer(256), Integer(1)),
+            old_size=(Integer(1), Integer(256)),
+        )
+        consumer = _make_consumer_with_ranges([1, 256])
+
+        self.assertEqual(_squeezed_retile_dims(info, consumer), [])
+
+    def test_nonsqueezed_dim_excluded(self):
+        # old_size != 1: this dim was never squeezed out of the read in the
+        # first place, so compute_tile_index already rescales its existing
+        # coefficient -- no term needs to be added back.
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(128), Integer(1)),
+            new_stride=(Integer(64), Integer(1)),
+            old_size=(Integer(2), Integer(256)),
+        )
+        consumer = _make_consumer_with_ranges([2, 256])
+
+        self.assertEqual(_squeezed_retile_dims(info, consumer), [])
+
+    def test_strideless_new_dim_excluded(self):
+        # new_stride == 0: the dim stays size-1/strideless in the new buffer
+        # too, so it contributes nothing regardless of the consumer's shape.
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(0), Integer(1)),
+            new_stride=(Integer(0), Integer(1)),
+            old_size=(Integer(1), Integer(256)),
+        )
+        consumer = _make_consumer_with_ranges([8, 256])
+
+        self.assertEqual(_squeezed_retile_dims(info, consumer), [])
+
+
+class TestIndexVarPrefix(unittest.TestCase):
+    """Unit tests for inferring the live loop-var naming prefix from an index."""
+
+    def test_infers_d_prefix(self):
+        d0, d1 = sympy.symbols("d0 d1")
+        self.assertEqual(_index_var_prefix({d0, d1}), "d")
+
+    def test_infers_q_prefix(self):
+        q0, q2 = sympy.symbols("q0 q2")
+        self.assertEqual(_index_var_prefix({q0, q2}), "q")
+
+    def test_infers_underscore_i_prefix(self):
+        i0 = sympy.Symbol("_i0")
+        self.assertEqual(_index_var_prefix({i0}), "_i")
+
+    def test_empty_set_falls_back_to_d(self):
+        self.assertEqual(_index_var_prefix(set()), "d")
+
+    def test_symbol_with_no_trailing_digits_falls_back_to_d(self):
+        # A symbol with no trailing digits at all (e.g. a shape symbol, not
+        # a dense loop var) never matches "name[:i] with i < len(name)", so
+        # it contributes nothing usable and the function falls back to "d".
+        s = sympy.Symbol("s")
+        self.assertEqual(_index_var_prefix({s}), "d")
+
+
+class TestConsumerOwnDimSymbol(unittest.TestCase):
+    """Unit tests for mapping a raw output dim to the consumer's own loop var."""
+
+    def test_no_preceding_unit_dim_maps_identity(self):
+        # No unit dims at all: dense numbering over non-unit dims is just
+        # the identity, so raw dim 1 maps to loop var d1.
+        consumer = _make_consumer_with_ranges([8, 256])
+
+        sym = _consumer_own_dim_symbol(consumer, dim=1, prefix="d")
+
+        self.assertEqual(sym, sympy_index_symbol("d1"))
+
+    def test_preceding_unit_dim_shifts_mapping(self):
+        # ranges=[1, 8, 256]: dim 0 is unit-size and squeezed out of the
+        # dense numbering entirely, so raw dim 1 (the first non-unit dim)
+        # maps to loop var d0, not d1.
+        consumer = _make_consumer_with_ranges([1, 8, 256])
+
+        sym = _consumer_own_dim_symbol(consumer, dim=1, prefix="d")
+
+        self.assertEqual(sym, sympy_index_symbol("d0"))
+
+    def test_uses_given_prefix(self):
+        consumer = _make_consumer_with_ranges([8, 256])
+
+        sym = _consumer_own_dim_symbol(consumer, dim=0, prefix="q")
+
+        self.assertEqual(sym, sympy_index_symbol("q0"))
+
+
+class TestRetileLoadIndexWithConsumer(unittest.TestCase):
+    """End-to-end unit tests for _retile_load_index's consumer-aware path.
+
+    Covers the two real bugs fixed in this area: a foreign loop-var prefix
+    surviving into the rewritten index (bug 1), and a minted symbol
+    colliding with an unrelated symbol already present in the index when
+    the consumer's own output dim is unit-size (bug 2).
+    """
+
+    def test_squeezed_dim_added_back_with_matching_prefix(self):
+        # old_size[0]==1: dim 0 was squeezed out of the incoming index
+        # entirely (no c0 term at all). The consumer's own dim 0 is
+        # non-unit (size 4), so a term must be added back, using whatever
+        # prefix is already live in the index (here "q", not the default
+        # "d") -- this is bug 1's fix.
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(0), Integer(1)),
+            new_stride=(Integer(256), Integer(1)),
+            old_size=(Integer(1), Integer(256)),
+        )
+        q1 = sympy.Symbol("q1")
+        consumer = _make_consumer_with_ranges([4, 256])
+
+        result = _retile_load_index("buf", q1, info, consumer)
+
+        self.assertEqual(simplify(result - (256 * sympy_index_symbol("q0") + q1)), 0)
+
+    def test_unit_consumer_dim_adds_no_term_and_does_not_collide(self):
+        # Same squeeze shape as above, but the consumer's own dim 0 is ALSO
+        # unit-size (e.g. B=1 when only H is tiled) -- no real loop variable
+        # exists for it, so no term must be added. Before the fix, this
+        # minted a d0 that collided with the unrelated, already-present d0
+        # below (coefficient 16384) via sympy's automatic term-merging,
+        # silently corrupting it to 16384*d0 + 256*d0 instead of raising or
+        # leaving 16384*d0 alone -- this is bug 2's exact regression.
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(0), Integer(1)),
+            new_stride=(Integer(256), Integer(1)),
+            old_size=(Integer(1), Integer(256)),
+        )
+        d0 = sympy_index_symbol("d0")
+        consumer = _make_consumer_with_ranges([1, 8, 256])
+
+        result = _retile_load_index("buf", 16384 * d0, info, consumer)
+
+        self.assertEqual(simplify(result - 16384 * d0), 0)
+
+    def test_no_consumer_leaves_squeezed_dim_unaugmented(self):
+        # consumer=None (the _RetileLoadIndexHandler / full->tile direction)
+        # skips the whole squeezed-dim augmentation path unconditionally --
+        # confirms the default argument's behavior matches every existing
+        # call site that never passes consumer at all.
+        info = _RetiledBufferInfo(
+            old_stride=(Integer(0), Integer(1)),
+            new_stride=(Integer(256), Integer(1)),
+            old_size=(Integer(1), Integer(256)),
+        )
+        q1 = sympy.Symbol("q1")
+
+        result = _retile_load_index("buf", q1, info)
+
+        self.assertEqual(simplify(result - q1), 0)
 
 
 class TestShouldPatchRetiledLoadIndexes(unittest.TestCase):
