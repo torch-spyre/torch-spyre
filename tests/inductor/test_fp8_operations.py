@@ -330,8 +330,9 @@ class TestFP8Operations:
     def test_quantscalepertokenfp8_numerical_correctness(self, shape, mean, std):
         """Test quantscalepertokenfp8 numerical correctness across value ranges.
 
-        Validates the scale computation formula:
-        scale = amax(abs(input), dim=-1, keepdim=True) / scale_ub
+        Validates the scale computation:
+        scale = clamp(amax(abs(input), dim=-1) * mulConst, clipMin, clipMax)
+        where mulConst = 1/scale_ub FP16-encoded.
 
         Tests various input distributions to ensure correctness across
         typical activation ranges, moderate ranges, and boundary cases.
@@ -473,8 +474,8 @@ class TestFP8Operations:
         """Test quantscalepertokenfp8 with edge case inputs.
 
         Validates behavior with boundary conditions:
-        - zeros: All zero tensor (scale should be 0)
-        - near_zero: Very small values (numerical stability)
+        - zeros: All zero tensor (scale clamped to clipMin, not zero)
+        - near_zero: Very small values (scale clamped to clipMin)
         - large: Values near FP16 max (65504)
         - mixed_signs: Positive and negative values
         - large_hidden: Very large hidden dimension
