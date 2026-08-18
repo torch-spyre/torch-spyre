@@ -46,6 +46,7 @@ __all__ = [
     "buf_id",
     "core_divisions",
     "per_core_extent",
+    "reduced_axes",
     "row_major_strides",
 ]
 
@@ -237,6 +238,70 @@ def align_reshape_plan(
         )
     broadcast_to = out_block if reshape_to != out_block else None
     return (reshape_to, broadcast_to)
+
+
+def reduced_axes(
+    in_coords: Sequence[sympy.Expr],
+    in_extent: Sequence[int],
+    out_coords: Sequence[sympy.Expr],
+    out_extent: Sequence[int],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """``(reduced, placeholder)`` axes for one reduction.
+
+    ``reduced`` is the input device axes the reduction consumes, in increasing
+    order, and ``placeholder`` is the output axes that are only standing in for
+    them: the projection keeps a reduced axis in the output's ``device_size`` as a
+    unit extent with a constant coordinate, so the output is the same rank as the
+    input even though it carries less.  A consumer wants the reduced axis gone
+    (the accepted KTIR form stores a rank-2 tile into a rank-2 view), so a
+    consumer of this helper drops those axes.
+
+    Which axes survive is read from the coordinates -- an output axis matches an
+    input axis when their ``(kind, sym)`` classifications agree (see
+    ``_dim_info``) -- rather than from the op name or a position convention, so a
+    reduction over the middle axis of a stick-tiled tile is described as exactly
+    that.
+
+    Raises ``NotImplementedError`` when the surviving axes are permuted (which
+    needs a transpose, not a reduce) or when a surviving extent changes, either
+    of which would make the reduce silently read the wrong elements.
+    """
+    in_info = [_dim_info(c) for c in in_coords]
+    placeholder = tuple(
+        axis
+        for axis, coord in enumerate(out_coords)
+        if _dim_info(coord)[0] == _DIM_CONST and int(out_extent[axis]) == 1
+    )
+    surviving = [axis for axis in range(len(out_coords)) if axis not in placeholder]
+    out_info = [_dim_info(out_coords[axis]) for axis in surviving]
+    kept: list[int] = []
+    position = 0
+    for axis, info in enumerate(out_info):
+        while position < len(in_info) and in_info[position] != info:
+            position += 1
+        if position == len(in_info):
+            raise NotImplementedError(
+                f"OpSpec reduction: output device axis {surviving[axis]} "
+                f"({out_coords[surviving[axis]]!r}) does not match a later input "
+                "axis; the surviving axes are permuted, which needs a transpose "
+                "rather than a reduction"
+            )
+        kept.append(position)
+        position += 1
+    for axis, source in enumerate(kept):
+        if int(out_extent[surviving[axis]]) != int(in_extent[source]):
+            raise NotImplementedError(
+                f"OpSpec reduction: surviving axis {surviving[axis]} has extent "
+                f"{out_extent[surviving[axis]]} but its input axis {source} has "
+                f"extent {in_extent[source]}; a reduction does not resize a kept axis"
+            )
+    reduced = tuple(axis for axis in range(len(in_info)) if axis not in set(kept))
+    if not reduced:
+        raise NotImplementedError(
+            "OpSpec reduction: the output carries every input device axis, so "
+            "there is no axis to reduce"
+        )
+    return reduced, placeholder
 
 
 # ---------------------------------------------------------------------------

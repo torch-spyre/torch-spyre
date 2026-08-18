@@ -1314,14 +1314,7 @@ class SpyreKernel(Kernel[CSEVariable]):
 
     def _kernel_uses_hbm_pool(self) -> bool:
         """Return True if any op in this kernel references an HBM-pool-allocated tensor."""
-        from torch_spyre._inductor.op_spec import TensorArg
-
-        return any(
-            "hbm_pool" in arg.allocation
-            for op in _iter_op_specs(self.op_specs)
-            for arg in op.args
-            if isinstance(arg, TensorArg)
-        )
+        return uses_hbm_pool(self.op_specs)
 
     def call_kernel(self, name: str, node=None):
         """Codegen a call to this kernel, allocating/freeing this kernel's
@@ -1422,6 +1415,21 @@ def _iter_op_specs(specs):
             yield from _iter_op_specs(item.body)
         elif isinstance(item, OpSpec):
             yield item
+
+
+def uses_hbm_pool(specs) -> bool:
+    """Return True if any op in ``specs`` references an HBM-pool-allocated tensor.
+
+    This decides whether ``call_kernel`` passes the pool ahead of the kernel
+    args, so anything reading a kernel's ``.run()`` arguments has to agree with
+    it -- hence a shared function rather than a copy per caller.
+    """
+    return any(
+        "hbm_pool" in arg.allocation
+        for op in _iter_op_specs(specs)
+        for arg in op.args
+        if isinstance(arg, TensorArg)
+    )
 
 
 def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
