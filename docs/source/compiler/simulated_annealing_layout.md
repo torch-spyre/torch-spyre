@@ -25,8 +25,27 @@ which contains the following files.
   orders (following a paper by Imanishi & Xu) that drives the permutation solver by composition. It
   is wired in as the opt-in `layout_solver = "simulated_annealing"` config option; the default stays
   `greedy`.
-- **`benchmarks/`** and **`examples/scratchpad/`** — profiling scripts, result docs, and runnable
-  examples.
+
+Runnable examples that drive the solver in isolation — a fixed-ordering layout plot,
+a first-fit vs simulated-annealing quality comparison, and an in-place convergence
+study — live in
+[`docs/source/user_guide/examples/scratchpad/`](../user_guide/examples/index.md).
+
+**Native packer.** The permutation packer the search drives has two
+interchangeable implementations: the canonical Python
+`PermutationBasedLayoutSolver` and a C++ accelerator
+(`csrc/perm_layout_native.cpp`) that is the default. They are behaviourally
+identical — the differential and SA-equivalence tests assert bit-for-bit
+agreement on addresses, quality, allocation count, and per-operation deltas —
+and the C++ one is substantially faster: measured at roughly 14× end-to-end on
+mid-sized problems at representative capacity, though the margin depends on
+capacity pressure and narrows as the problem grows. See
+[Native packer performance](native_packer_performance.md) for the measurements
+and the harness that produced them. Select the Python packer explicitly with
+`config.native_layout_packer = False` or `TORCH_SPYRE_NATIVE_PACKER=0`. Because
+the `_C` extension is required for torch-spyre to function at all, a missing
+native packer means a stale or incomplete build and raises rather than silently
+falling back to Python.
 
 **Validation philosophy:** every incremental operation is checked against the
 from-scratch reference oracle — randomized *differential* tests, a gated *stress* suite

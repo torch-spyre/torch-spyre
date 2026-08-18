@@ -57,6 +57,10 @@ ktir_emitter: bool = os.environ.get("TORCH_SPYRE_KTIR", "0") == "1"
 # A .mlir declaring the target device, passed to the backend compiler.
 ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR", "")
 
+# Materialize compatible producer/consumer LX ownership changes as identity copies.
+# Set SPYRE_LX_PLANNER_RELAYOUT=0 to disable this optimization.
+lx_planner_relayout: bool = _get_env_bool("SPYRE_LX_PLANNER_RELAYOUT", True)
+
 allow_all_ops_in_lx_planning: bool = False
 
 dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
@@ -88,6 +92,20 @@ ignore_wsr_hints: bool = os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "
 # pass function names (e.g., "split_multi_ops,insert_restickify") to log only
 # after specific passes. Set via SPYRE_LOG_PASSES env var or programmatically.
 log_passes: str = os.environ.get("SPYRE_LOG_PASSES", "")
+
+# Predicted-runtime reporting from the analytical cost model (cost_model.py,
+# cost_model_pass.py).  NOT related to work_division.cost_model_matmul_division,
+# which is a separate model used to choose a matmul work division.
+#   ""/"0"/"false"  disabled -- the pass returns before touching the graph, so
+#                   leaving it off costs one attribute read per compilation
+#   "1"/"true"/"yes"/"on"  print a per-kernel breakdown and the program total after
+#                   pre-scheduling, and expose them as
+#                   CustomPreSchedulingPasses.last_cost_report
+# Reads SPYRE_DUMP_COST so existing sweep scripts keep working.  NOTE that value is
+# ALSO read directly by dump_cost_model.cost_dump_enabled(); both accept the same
+# spellings, so one value drives this pass and that older per-op dump together.
+# Tests override with config.patch({"cost_model": "1"}) rather than the environment.
+cost_model: str = os.environ.get("SPYRE_DUMP_COST", "")
 
 # Disable compiler-generated span-overflow coarse-tiling hints.  The global
 # SPYRE_INDUCTOR_IGNORE_HINTS flag also disables these so one switch can still
@@ -130,8 +148,9 @@ disable_copy_opt: bool = os.environ.get("DISABLE_COPY_OPT", "0") == "1"
 # When True (default), HBM tensor addresses are emitted as runtime symbols
 # with !sdscbundle.input_arg<index> parameters and input_arg_extract ops
 # in the bundle.mlir.
-# When False, HBM tensor addresses are baked as concrete integers
-# into the SDSC JSON and bundle.mlir emits sdsc_execute with no operands.
+# When False, HBM tensor addresses are baked as concrete integers.
+# (SDSC path always symbolic as of #3741; baked mode only via the KTIR
+# emitter, i.e. also requires ktir_emitter=True / TORCH_SPYRE_KTIR=1.)
 bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 
 # Layout solver class used by default in scratchpad.allocator.ScratchpadAllocator.
@@ -147,5 +166,13 @@ bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 layout_solver: Literal[
     "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
 ] = os.environ.get("LAYOUT_SOLVER", "greedy")  # type: ignore[assignment]
+
+# Use the C++ (native) permutation-layout packer accelerator, which the
+# simulated-annealing layout solver drives. The native and Python packers are
+# behaviourally identical (verified bit-for-bit); the native one is faster. Set
+# False (or ``TORCH_SPYRE_NATIVE_PACKER=0``/``false``, which backs this default)
+# to force the pure-Python packer. A missing native class is a stale or
+# incomplete build, not a supported mode, and raises rather than falling back.
+native_layout_packer: bool = _get_env_bool("TORCH_SPYRE_NATIVE_PACKER", True)
 
 install_config_module(sys.modules[__name__])

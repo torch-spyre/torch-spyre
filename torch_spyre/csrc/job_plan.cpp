@@ -18,6 +18,7 @@
 
 #include <iostream>
 #include <memory>
+#include <string>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -159,6 +160,7 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   // Case 1: input_buffer_ is provided
   if (input_buffer_ != nullptr) {
     launch_host_callback([this](void*) {
+      // Use regular path - input_buffer_ is already properly formatted
       deeptools::processComputeOnHostCommand(*hcm_, output_buffer_,
                                              input_buffer_);
     });
@@ -170,6 +172,7 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   // and it's {0}, it's for fake symbols
   if (ishape_.size() == 1 && ishape_[0] == 0) {
     launch_host_callback([this](void*) {
+      // Fake symbols don't need fast path - use regular path
       deeptools::processComputeOnHostCommand(*hcm_, output_buffer_, nullptr);
     });
     return;
@@ -187,7 +190,10 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   }
 
   launch_host_callback([this, addresses](void*) {
-    deeptools::processComputeOnHostCommand(*hcm_, output_buffer_, &addresses);
+    // Use fast path with all tensor addresses
+    // Returns true if fast path was actually used, false if fell back
+    bool used_fast_path = deeptools::processComputeOnHostCommandFast(
+        fast_plan_, *hcm_, output_buffer_, addresses.data(), addresses.size());
   });
 }
 
@@ -195,6 +201,16 @@ void JobPlanStepHostCompute::write(std::ostream& os) const {
   os << "  Host Compute\n";
   os << "    Output buffer: " << output_buffer_ << "\n";
   os << "    HCM metadata: " << (hcm_ ? "present" : "null") << "\n";
+  os << "    Fast path: "
+     << (fast_plan_.valid
+             ? "enabled"
+             : (fast_plan_.output_size == UINT32_MAX ? "disabled" : "building"))
+     << "\n";
+  if (fast_plan_.valid) {
+    os << "    Fast plan: " << fast_plan_.patches.size() << " patches, "
+       << fast_plan_.num_input_symbols << " input symbols, "
+       << fast_plan_.output_size << " bytes output\n";
+  }
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")
      << "\n";
 }

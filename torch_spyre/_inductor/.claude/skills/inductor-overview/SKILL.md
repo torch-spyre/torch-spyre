@@ -68,11 +68,11 @@ a consumer from a tile-local scratch buffer to a full-size buffer after
 promoting the consumer's own iteration space). `_patch_consumers` in
 `wsr/coarse_tile.py` hit exactly this bug historically and now carries the
 fix as its documented pattern: it computes a stride-coefficient rewrite
-map (`_stride_rewrite_map`) and applies it via
-`_retile_load_index_from_strides`/`_NameAndIndexSwapHandler` whenever the
-old and new buffer strides differ, falling back to plain `NameSwapHandler`
-only when they don't. Any new pass that swaps a buffer name/identity under
-a consumer's `inner_fn` should check whether this applies — a bare rename
+via `_retile_load_index` (parameterized by a `_RetiledBufferInfo`) and
+applies it through `_NameAndIndexSwapHandler` whenever the old and new
+buffer strides differ, falling back to plain `NameSwapHandler` only when
+they don't. Any new pass that swaps a buffer name/identity under a
+consumer's `inner_fn` should check whether this applies — a bare rename
 is only safe when the swap is addressing-equivalent.
 
 ## Test execution conventions

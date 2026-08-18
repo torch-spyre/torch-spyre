@@ -37,6 +37,7 @@ from torch_spyre._inductor.op_spec import (
     OpSpec,
     SourceLoc,
     TensorArg,
+    TensorWorkDivision,
 )
 from torch_spyre._inductor.kernel_provenance import (
     build_kernel_provenance_descriptor,
@@ -237,6 +238,11 @@ class TestKernelProvenanceDescriptor:
                 dataclasses.replace(arg, element_arrangement=ElementArrangement.EXX2)
             ],
         )
+        owned_arg = dataclasses.replace(
+            arg,
+            work_division=TensorWorkDivision({c0: 2}, {c0: Symbol("core_id")}),
+        )
+        changed_owner = dataclasses.replace(first, args=[owned_arg])
 
         first_descriptor = build_kernel_provenance_descriptor([first])
         reordered_descriptor = build_kernel_provenance_descriptor([reordered_metadata])
@@ -244,14 +250,17 @@ class TestKernelProvenanceDescriptor:
         changed_arrangement_descriptor = build_kernel_provenance_descriptor(
             [changed_arrangement]
         )
+        changed_owner_descriptor = build_kernel_provenance_descriptor([changed_owner])
 
         assert first_descriptor is not None
         assert reordered_descriptor is not None
         assert changed_descriptor is not None
         assert changed_arrangement_descriptor is not None
+        assert changed_owner_descriptor is not None
         assert reordered_descriptor.key == first_descriptor.key
         assert changed_descriptor.key != first_descriptor.key
         assert changed_arrangement_descriptor.key != first_descriptor.key
+        assert changed_owner_descriptor.key != first_descriptor.key
 
     def test_pins_rich_canonical_bundle_key(self):
         c0 = Symbol("c0")
@@ -337,7 +346,9 @@ class TestKernelProvenanceDescriptor:
         assert original is not None
         assert reconstructed == original
 
-    @pytest.mark.parametrize("changed_schema", [OpSpec, TensorArg, LoopSpec])
+    @pytest.mark.parametrize(
+        "changed_schema", [OpSpec, TensorArg, TensorWorkDivision, LoopSpec]
+    )
     def test_rejects_finalized_schema_drift(self, changed_schema):
         real_fields = dataclasses.fields
 
@@ -367,6 +378,7 @@ class TestKernelProvenanceDescriptor:
         [
             (OpSpec, "iteration_space"),
             (TensorArg, "device_coordinates"),
+            (TensorWorkDivision, "work_slices"),
             (LoopSpec, "body"),
         ],
     )

@@ -1180,11 +1180,42 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         ("test_topk", "test_topk_cpu"): {
             "param_sets": {
+                "2d_k1_dim0": (unique_randn_along_dim((64, 256), dim=0), 1, 0),
                 "2d_k4_dim0": (unique_randn_along_dim((64, 256), dim=0), 4, 0),
                 "2d_k4_dim_minusone": (
                     unique_randn_along_dim((64, 256), dim=-1),
                     4,
                     -1,
+                ),
+                "3d_k2_dim1": (
+                    unique_randn_along_dim((64, 71, 256), dim=1),
+                    2,
+                    1,
+                ),
+                "3d_k3_dim1": (
+                    unique_randn_along_dim((67, 71, 256), dim=1),
+                    3,
+                    1,
+                ),
+                "3d_k4_dim0": (
+                    unique_randn_along_dim((67, 71, 256), dim=0),
+                    4,
+                    0,
+                ),
+                "4d_k2_dim1": (
+                    unique_randn_along_dim((6, 17, 7, 64), dim=1),
+                    2,
+                    1,
+                ),
+                "4d_k3_dim2": (
+                    unique_randn_along_dim((6, 17, 7, 64), dim=2),
+                    3,
+                    2,
+                ),
+                "4d_k4_dim0": (
+                    unique_randn_along_dim((6, 17, 7, 64), dim=0),
+                    4,
+                    0,
                 ),
                 # "2d_k4_dim0_lessthanstick": (unique_randn_along_dim((8, 32), dim=0), 4, 0),
                 # "2d_k4_dim_minusone_lessthanstick": (unique_randn_along_dim((1, 32), dim=-1), 4, -1),
@@ -5972,6 +6003,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(
             lambda x: torch.topk(x, k, dim=dim)[0], x, run_eager=False
         )
+
+    def test_topk_largest_false_rejected(self):
+        # largest=False cannot be served by the topkvalue/topkindex reduction
+        # (it always returns the largest elements), so compile must raise.
+        x = unique_randn_along_dim((64, 256), dim=0)
+        with pytest.raises(Exception, match="Unsupported"):
+            _compile_and_run(
+                lambda x: torch.topk(x, 4, dim=0, largest=False)[0],
+                [x],
+                "spyre",
+            )
 
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
