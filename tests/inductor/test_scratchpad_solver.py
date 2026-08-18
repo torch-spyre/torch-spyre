@@ -14,7 +14,6 @@
 
 """Tests for layout solvers"""
 
-import dataclasses
 import json
 import os
 import subprocess
@@ -29,12 +28,8 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionLayoutSolver,
     MemoryPlanSolver,
     CoreDivision,
-    TilingCandidate,
-    single_tile_idx,
     CoreDivisionBuffer,
     LifetimeBoundBuffer,
-    TileAxis,
-    TileSpec,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 
