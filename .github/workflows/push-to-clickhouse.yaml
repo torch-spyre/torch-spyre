@@ -112,13 +112,8 @@ jobs:
             .github/scripts/ingest_xml.py
           sparse-checkout-cone-mode: false
 
-      - name: Install gh CLI
-        run: |
-          wget -q https://github.com/cli/cli/releases/download/v2.92.0/gh_2.92.0_linux_amd64.tar.gz
-          tar -xzf gh_2.92.0_linux_amd64.tar.gz
-          echo "$PWD/gh_2.92.0_linux_amd64/bin" >> "${GITHUB_PATH}"
-          gh_2.92.0_linux_amd64/bin/gh --version
-
+      - name: Setup the GitHub CLI
+        uses: actions4gh/setup-gh@v1.0.2
 
       - name: Resolve PR number
         id: resolve-pr

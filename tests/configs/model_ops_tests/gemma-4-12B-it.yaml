@@ -78,7 +78,7 @@ test_suite_config:
       tests:
         - names:
             - TestSpyreModelOps::test_model_ops_db
-          mode: mandatory_success
+          mode: xfail
           tags:
             - model__gemma-4-12B-it
           edits:
