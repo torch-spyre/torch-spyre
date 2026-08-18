@@ -196,15 +196,14 @@ class ScratchpadAllocator:
         self.post_optimization_passes = post_optimization_passes
         self.layout_planning: Optional[LayoutSolverFactory] = layout_planning
         self.size = size
-        self._lx_relayout_plans: dict[tuple[str, str], LXRelayoutPlan] = {}
-        self._accepted_lx_relayouts: list[LXRelayoutPlan] = []
 
-    def _planned_lx_buffers(self) -> set[str]:
-        return {
-            name
-            for plan in self._lx_relayout_plans.values()
-            for name in (plan.source_name, plan.destination_name)
-        }
+    @staticmethod
+    def _planned_lx_buffer_names(
+        plans: Sequence[LXRelayoutPlan],
+    ) -> frozenset[str]:
+        return frozenset(
+            name for plan in plans for name in (plan.source_name, plan.destination_name)
+        )
 
     def _build_solver(self, buffers: Sequence[Any]) -> MemoryPlanSolver:
         """Build a fresh solver over ``buffers`` from :attr:`layout_planning`."""
@@ -229,10 +228,10 @@ class ScratchpadAllocator:
         buffers = self._prepare_buffers(graph)
         solver = self._build_solver(buffers)
         allocation = self._solve(solver)
-        self._finalize_lx_relayout_allocation(allocation)
+        accepted_lx_relayouts = self._finalize_lx_relayout_allocation(allocation)
         self._post_solve(graph, allocation)
         reasons = self._get_spill_reasons(solver, allocation)
-        self._push_allocation(graph, allocation)
+        self._push_allocation(graph, allocation, accepted_lx_relayouts)
         self._log_lx_pinning(graph, reasons)
         self._run_passes(self.post_optimization_passes, graph)
 
@@ -257,12 +256,9 @@ class ScratchpadAllocator:
                     "LX relayout is not supported by %s; continuing without relayout",
                     solver_name,
                 )
-            self._lx_relayout_plans = {}
             return self._generate_buffers(graph)
-        self._lx_relayout_plans = {
-            plan.edge: plan for plan in collect_lx_relayout_plans(graph)
-        }
-        buffers = self._generate_buffers(graph)
+        plans = collect_lx_relayout_plans(graph)
+        buffers = self._generate_buffers(graph, lx_relayout_plans=plans)
         self._append_lx_relayout_destinations(graph, buffers)
         return buffers
 
@@ -273,20 +269,18 @@ class ScratchpadAllocator:
     def _finalize_lx_relayout_allocation(
         self,
         allocation: Sequence[LifetimeBoundBuffer],
-    ) -> None:
-        if not self._lx_relayout_plans:
-            self._accepted_lx_relayouts = []
-            return
+    ) -> list[LXRelayoutPlan]:
+        plans = [plan for buffer in allocation for plan in buffer.lx_relayout_plans]
+        if not plans:
+            return []
         complete = self._allocated_lx_relayout_sources(allocation)
-        rejected = {
-            plan.source_name for plan in self._lx_relayout_plans.values()
-        } - complete
+        rejected = {plan.source_name for plan in plans} - complete
         if rejected:
             by_name = {buffer.name: buffer for buffer in allocation}
             for source_name in sorted(rejected):
                 destinations = sorted(
                     plan.destination_name
-                    for plan in self._lx_relayout_plans.values()
+                    for plan in plans
                     if plan.source_name == source_name
                 )
                 allocations = {
@@ -301,7 +295,7 @@ class ScratchpadAllocator:
                     allocations,
                 )
             self._clear_lx_relayout_groups(allocation, rejected)
-        self._accepted_lx_relayouts = self._accepted_plans(allocation)
+        return self._accepted_plans(allocation)
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
         """Hook run after the solve, before reasons/push. Base: nothing to commit."""
@@ -329,7 +323,9 @@ class ScratchpadAllocator:
     def _get_op_name(self, op: Any) -> str:
         return op_short_name(op)
 
-    def _op_output_good_for_lx_reuse(self, op: Any) -> bool:
+    def _op_output_good_for_lx_reuse(
+        self, op: Any, planned_lx_buffers: frozenset[str] = frozenset()
+    ) -> bool:
         if not isinstance(op, ComputedBuffer):
             return False
         if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
@@ -342,7 +338,7 @@ class ScratchpadAllocator:
         # the relayout planner has already applied its stricter structural gates.
         return config.allow_all_ops_in_lx_planning or (
             self._get_op_name(op) in OP_OUTPUT_GOOD_FOR_LX_REUSE
-            or op.get_name() in self._planned_lx_buffers()
+            or op.get_name() in planned_lx_buffers
         )
 
     @staticmethod
@@ -404,6 +400,7 @@ class ScratchpadAllocator:
         ncores_reasons: dict[str, str],
         division_is_fixed: bool,
         buf_user_deps: dict[str, list[tuple[Operation, MemoryDep]]],
+        planned_lx_buffers: frozenset[str] = frozenset(),
     ) -> Optional[str]:
         """The first check ``name`` fails, or ``None`` if it clears them all.
 
@@ -427,7 +424,7 @@ class ScratchpadAllocator:
             buf_user_deps: every buffer's ``(op, dep)`` users, from
                 :func:`_get_buffer_user_deps`, for the read-side advancing check.
         """
-        if op is None or not self._op_output_good_for_lx_reuse(op):
+        if op is None or not self._op_output_good_for_lx_reuse(op, planned_lx_buffers):
             return "op not allowed"
         if not hasattr(getattr(op, "layout", None), "device_layout"):
             # No device layout => no computable footprint (e.g. a
@@ -532,6 +529,7 @@ class ScratchpadAllocator:
         lifetimes: Optional[dict[str, list[int]]] = None,
         ncores: Optional[dict[str, int]] = None,
         ncores_reasons: Optional[dict[str, str]] = None,
+        planned_lx_buffers: frozenset[str] = frozenset(),
     ) -> dict[str, Optional[str]]:
         """:meth:`_buffer_residency_reason` over ``names``, as ``name -> reason``.
 
@@ -576,6 +574,7 @@ class ScratchpadAllocator:
                 ncores_reasons=ncores_reasons,
                 division_is_fixed=division_is_fixed,
                 buf_user_deps=buf_user_deps,
+                planned_lx_buffers=planned_lx_buffers,
             )
             for name in names
         }
@@ -859,6 +858,7 @@ class ScratchpadAllocator:
         cache: Optional[dict] = None,
         timings: Optional[dict[str, float]] = None,
         lifetimes: Optional[dict[str, list[int]]] = None,
+        lx_relayout_plans: Sequence[LXRelayoutPlan] = (),
     ) -> list[LifetimeBoundBuffer]:
         # Compute the graph-wide residency facts + mem_usage once and share; the
         # helpers below treat them read-only. `lifetimes` is split-invariant, so
@@ -872,7 +872,7 @@ class ScratchpadAllocator:
         ncores, ncores_reasons = get_ncores_for_buffers(graph)
         t1 = time.perf_counter()
         mem_usage = mem_usage_by_buf(graph, cache)
-        for plan in self._lx_relayout_plans.values():
+        for plan in lx_relayout_plans:
             for name in (plan.source_name, plan.destination_name):
                 if name not in mem_usage:
                     continue
@@ -889,6 +889,7 @@ class ScratchpadAllocator:
 
         # Divisions are already committed on this path, so a core-division
         # mismatch between a buffer's users is fatal and is checked here.
+        planned_lx_buffers = self._planned_lx_buffer_names(lx_relayout_plans)
         reasons = self._residency_reasons(
             graph,
             list(mem_usage),
@@ -896,9 +897,10 @@ class ScratchpadAllocator:
             lifetimes=lifetimes,
             ncores=ncores,
             ncores_reasons=ncores_reasons,
+            planned_lx_buffers=planned_lx_buffers,
         )
         in_place = self._determine_in_place(graph, mem_usage, lifetimes, reasons)
-        return self._build_bound_buffers(
+        buffers = self._build_bound_buffers(
             graph,
             in_place,
             mem_usage,
@@ -907,28 +909,30 @@ class ScratchpadAllocator:
             ncores=ncores,
             ncores_reasons=ncores_reasons,
         )
+        if lx_relayout_plans:
+            by_name = {buffer.name: buffer for buffer in buffers}
+            for plan in lx_relayout_plans:
+                by_name[plan.source_name].lx_relayout_plans.append(plan)
+        return buffers
 
     def _append_lx_relayout_destinations(
         self, graph: GraphLowering, buffers: list[LifetimeBoundBuffer]
     ) -> None:
-        by_name = {buffer.name: buffer for buffer in buffers}
         op_index = {op.get_name(): i for i, op in enumerate(graph.operations)}
         entries = []
         invalid = set()
-        for plan in self._lx_relayout_plans.values():
-            source = by_name[plan.source_name]
-            consumer_ticks = [op_index[name] for name in plan.consumer_names]
-            assert all(tick in source.uses for tick in consumer_ticks)
-            if source.residency_reason is not None:
-                invalid.add(plan.source_name)
-            else:
-                entries.append((source, plan, consumer_ticks))
+        for source in buffers:
+            for plan in source.lx_relayout_plans:
+                consumer_ticks = [op_index[name] for name in plan.consumer_names]
+                assert all(tick in source.uses for tick in consumer_ticks)
+                if source.residency_reason is not None:
+                    invalid.add(plan.source_name)
+                else:
+                    entries.append((source, plan, consumer_ticks))
         if invalid:
             entries = [entry for entry in entries if entry[0].name not in invalid]
             self._clear_lx_relayout_groups(buffers, invalid)
-        planned_sources = {
-            plan.source_name for plan in self._lx_relayout_plans.values()
-        }
+        planned_sources = {source.name for source, _, _ in entries}
         for buffer in buffers:
             buffer.in_place_parents = [
                 parent
@@ -961,12 +965,12 @@ class ScratchpadAllocator:
         self, allocation: Sequence[LifetimeBoundBuffer]
     ) -> set[str]:
         by_name = {buffer.name: buffer for buffer in allocation}
-        groups: dict[str, list[LXRelayoutPlan]] = {}
-        for plan in self._lx_relayout_plans.values():
-            groups.setdefault(plan.source_name, []).append(plan)
         complete = set()
-        for source_name, plans in groups.items():
-            source = by_name[source_name]
+        for source in allocation:
+            if not source.lx_relayout_plans:
+                continue
+            source_name = source.name
+            plans = source.lx_relayout_plans
             destinations = [by_name[plan.destination_name] for plan in plans]
             allocated = [
                 buffer.address is not None for buffer in (source, *destinations)
@@ -993,20 +997,15 @@ class ScratchpadAllocator:
         allocation: Sequence[LifetimeBoundBuffer],
         sources: set[str],
     ) -> None:
+        by_name = {buffer.name: buffer for buffer in allocation}
         names = set(sources)
-        names.update(
-            plan.destination_name
-            for plan in self._lx_relayout_plans.values()
-            if plan.source_name in sources
-        )
+        for source_name in sources:
+            source = by_name[source_name]
+            names.update(plan.destination_name for plan in source.lx_relayout_plans)
+            source.lx_relayout_plans = []
         for buffer in allocation:
             if buffer.name in names:
                 buffer.address = None
-        self._lx_relayout_plans = {
-            edge: plan
-            for edge, plan in self._lx_relayout_plans.items()
-            if plan.source_name not in sources
-        }
 
     def _accepted_plans(
         self, allocation: Sequence[LifetimeBoundBuffer]
@@ -1018,7 +1017,8 @@ class ScratchpadAllocator:
                 source_address=by_name[plan.source_name].address,
                 destination_address=by_name[plan.destination_name].address,
             )
-            for plan in self._lx_relayout_plans.values()
+            for buffer in allocation
+            for plan in buffer.lx_relayout_plans
         ]
 
     def _log_lx_pinning(self, graph: GraphLowering, reasons: dict) -> None:
@@ -1036,7 +1036,10 @@ class ScratchpadAllocator:
             )
 
     def _push_allocation(
-        self, graph: GraphLowering, buffers: Sequence[LifetimeBoundBuffer]
+        self,
+        graph: GraphLowering,
+        buffers: Sequence[LifetimeBoundBuffer],
+        accepted_lx_relayouts: list[LXRelayoutPlan],
     ):
         """Push the allocation into the code generation. This includes cloning graph inputs and
         graph outputs:
@@ -1080,7 +1083,7 @@ class ScratchpadAllocator:
 
         # Keep graph mutation last and in pre-scheduling: solver retries require
         # the original graph, and post-grad no-op elimination has already run.
-        materialize_lx_relayouts(graph, self._accepted_lx_relayouts)
+        materialize_lx_relayouts(graph, accepted_lx_relayouts)
 
     def _set_one_allocation(self, buf: TensorBox | ComputedBuffer, address: int):
         layout = buf.get_layout()
@@ -1546,7 +1549,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     def _solve(self, solver: MemoryPlanSolver) -> Sequence[Any]:
         assert isinstance(solver, CoreDivisionLayoutSolver)
         result = solver.plan_layout_and_core_divisions()
-        assert not self._lx_relayout_plans
+        assert not any(buffer.lx_relayout_plans for buffer in result), (
+            "CoOptimizingAllocator does not support LX relayout"
+        )
         return result
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:

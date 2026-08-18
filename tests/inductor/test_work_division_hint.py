@@ -765,7 +765,6 @@ def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
         ),
     ]
     allocator = ScratchpadAllocator(GreedyLayoutSolver, 256)
-    allocator._lx_relayout_plans = {plan.edge: plan for plan in plans}
     graph = SimpleNamespace(
         operations=[
             SimpleNamespace(get_name=lambda name=name: name)
@@ -779,6 +778,7 @@ def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
         ]
     )
     source = LifetimeBoundBuffer("source", 128, [0, 1, 2, 3])
+    source.lx_relayout_plans = list(plans)
     ordinary = LifetimeBoundBuffer("ordinary", 128, [0, 4])
     buffers = [source, ordinary]
     allocator._append_lx_relayout_destinations(graph, buffers)
@@ -795,7 +795,7 @@ def test_lx_relayout_allocation_is_atomic_in_one_greedy_solve(caplog):
     assert by_name["ordinary"].address == 0
     assert by_name["source"].address is None
     assert all(by_name[plan.destination_name].address is None for plan in plans)
-    assert allocator._lx_relayout_plans == {}
+    assert not by_name["source"].lx_relayout_plans
     assert any(
         "rejected LX relayout group source=source" in record.message
         for record in caplog.records
