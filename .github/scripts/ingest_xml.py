@@ -358,29 +358,49 @@ def _null_tag(value):
 
 
 def insert_benchmark_run(client, run_id: int, run_meta: dict) -> None:
+    values = {
+        "run_id": run_id,
+        "source_file": run_meta["source_file"],
+        "version_info": run_meta.get("version_info"),
+        "created_at": run_meta["created_at"].replace(tzinfo=None),
+        "workflow": run_meta.get("workflow", ""),
+        "platform": run_meta.get("platform", ""),
+        # Marks the two kernel rows so they don't read as runs that measured
+        # nothing. Dropped when the migration adding it has not been applied.
+        "run_type": run_meta.get("run_type", "benchmark"),
+    }
+    columns = list(values)
+    if _absent_columns(client, "benchmark_runs", ("run_type",)):
+        print(
+            "  [warn] benchmark_runs has no run_type — storing this run without "
+            "it. Apply the spyre-dashboard migration to capture it.",
+            file=sys.stderr,
+        )
+        columns.remove("run_type")
     client.insert(
         "benchmark_runs",
-        [
-            [
-                run_id,
-                run_meta["source_file"],
-                run_meta.get("version_info"),
-                run_meta["created_at"].replace(tzinfo=None),
-                run_meta.get("workflow", ""),
-                run_meta.get("platform", ""),
-                run_meta.get("run_type", "benchmark"),
-            ]
-        ],
-        column_names=[
-            "run_id",
-            "source_file",
-            "version_info",
-            "created_at",
-            "workflow",
-            "platform",
-            "run_type",
-        ],
+        [[values[c] for c in columns]],
+        column_names=columns,
     )
+
+
+def _absent_columns(client, table: str, columns) -> set[str]:
+    rows = client.query(
+        "SELECT name FROM system.columns "
+        "WHERE database = currentDatabase() AND table = {t:String}",
+        parameters={"t": table},
+    ).result_rows
+    present = {r[0] for r in rows}
+    return {c for c in columns if c not in present}
+
+
+def _table_exists(client, table: str) -> bool:
+    rows = client.query(
+        "SELECT count() FROM system.tables "
+        "WHERE database = currentDatabase() AND name = {t:String}",
+        parameters={"t": table},
+    ).result_rows
+    return bool(rows and rows[0][0])
 
 
 def insert_perf_benchmarks(client, run_id: int, benchmarks: list[dict]) -> None:
@@ -436,34 +456,11 @@ def insert_perf_benchmarks(client, run_id: int, benchmarks: list[dict]) -> None:
     )
 
 
-# perf_kernels is created here rather than in the dashboard's schema.py so a
-# fresh ClickHouse gets it without a coordinated deploy; IF NOT EXISTS makes it
-# a no-op once the dashboard owns it too.
-PERF_KERNELS_DDL = """
-CREATE TABLE IF NOT EXISTS perf_kernels (
-    kernel_id       UInt64          DEFAULT rand64(),
-    run_id          UInt64,
-    record_type     String,
-    operation_name  Nullable(String),
-    kernel_name     String,
-    is_total        UInt8           DEFAULT 0,
-    metric          Nullable(String),
-    config_name     Nullable(String),
-    batch_size      Nullable(Int32),
-    prompt_length   Nullable(Int32),
-    run_mode        Nullable(String),
-    input_shapes    Nullable(String),
-    duration_ms     Nullable(Float64),
-    torch_spyre_ms  Nullable(Float64),
-    sendnn_ms       Nullable(Float64),
-    ratio           Nullable(Float64),
-    pt_util_percent Nullable(Float64),
-    num_runs        Nullable(Int32),
-    created_at      DateTime        DEFAULT now()
-) ENGINE = MergeTree()
-ORDER BY (run_id, kernel_id)
-"""
-
+# perf_kernels and benchmark_runs.run_type come from a spyre-dashboard migration,
+# not from this script. The two repos deploy independently, so the inserts below
+# check what the target database actually has and degrade with a warning rather
+# than raise: the benchmark_runs row is committed before the kernel insert and the
+# dedup check keys on it, so raising would skip the run on every retry.
 _PERF_KERNEL_COLUMNS = [
     "kernel_id",
     "run_id",
@@ -876,12 +873,6 @@ def main():
     client.command(
         "ALTER TABLE benchmark_runs ADD COLUMN IF NOT EXISTS platform String DEFAULT ''"
     )
-    # A CI run now writes three benchmark_runs rows (report + 2 kernel files);
-    # without this the two kernel ones look like runs that measured nothing.
-    client.command(
-        "ALTER TABLE benchmark_runs ADD COLUMN IF NOT EXISTS run_type String DEFAULT 'benchmark'"
-    )
-    client.command(PERF_KERNELS_DDL)
 
     total_cases = 0
     total_benchmarks = 0
@@ -897,6 +888,25 @@ def main():
         # Kernel first: is_benchmark_xml() also matches these.
         if is_kernel_benchmark_xml(root):
             print("  Detected: per-kernel breakdown XML")
+            # Both halves of the migration are required, and it can land partially.
+            # Without perf_kernels there is nowhere to put the kernels; without
+            # run_type the run row cannot be marked as a kernel run. Either way the
+            # result would be a benchmark_runs row with nothing behind it and no
+            # marker — the "run that measured nothing" this branch exists to stop.
+            # Checked before anything is written, so the skip stays retryable: no
+            # source_file is recorded, and a later run re-ingests the file.
+            missing = []
+            if not _table_exists(client, "perf_kernels"):
+                missing.append("no perf_kernels table")
+            if _absent_columns(client, "benchmark_runs", ("run_type",)):
+                missing.append("no benchmark_runs.run_type column")
+            if missing:
+                print(
+                    f"  [warn] {' and '.join(missing)} — skipping this kernel XML. "
+                    "Apply the spyre-dashboard migration to capture it.",
+                    file=sys.stderr,
+                )
+                continue
             run_meta, kernels = parse_kernel_xml(
                 xml_path, args.workflow, args.run_id, args.platform
             )
