@@ -5136,6 +5136,172 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_conv1d", "test_conv1d_cpu"): {
+            "param_sets": {
+                "1x6x128_patch16_bias": (
+                    cached_randn((1, 6, 128)),
+                    cached_randn((64, 6, 16)),
+                    cached_randn((64,)),
+                    0,
+                    16,
+                    1,
+                ),
+                "1x3x32_ksize3_no_pad": (
+                    cached_randn((1, 3, 32)),
+                    cached_randn((16, 3, 3)),
+                    None,
+                    0,
+                    1,
+                    1,
+                ),
+                "1x3x64_ksize3_pad1": (
+                    cached_randn((1, 3, 64)),
+                    cached_randn((16, 3, 3)),
+                    None,
+                    1,
+                    1,
+                    1,
+                ),
+                "2x3x32_ksize1": (
+                    cached_randn((2, 3, 32)),
+                    cached_randn((8, 3, 1)),
+                    None,
+                    0,
+                    1,
+                    1,
+                ),
+                "1x16x64_ksize3_pad1": (
+                    cached_randn((1, 16, 64)),
+                    cached_randn((32, 16, 3)),
+                    None,
+                    1,
+                    1,
+                    1,
+                ),
+                "mistral_model": (
+                    cached_randn((1, 3, 532)),
+                    cached_randn((1024, 3, 14)),
+                    None,
+                    0,
+                    1,
+                    1,
+                ),
+                "2x32_ksize1_stride2": (
+                    cached_randn((2, 32, 64)),
+                    cached_randn((16, 32, 1)),
+                    None,
+                    0,
+                    2,
+                    1,
+                ),
+                "1x3x128_ksize5": (
+                    cached_randn((1, 3, 128)),
+                    cached_randn((8, 3, 5)),
+                    None,
+                    2,
+                    1,
+                    1,
+                ),
+            },
+        },
+        ("test_dwise_conv1d", "test_dwise_conv1d_cpu"): {
+            "expect_fail": ["8x64_ksize3_pad1"],
+            "param_sets": {
+                "1x64_ksize3": (
+                    cached_randn((1, 64, 32)),
+                    cached_randn((64, 1, 3)),
+                    None,
+                    0,
+                    1,
+                    64,
+                    [[32, 1, 1, 64], [3, 1, 1, 64]],
+                    [[1, -1, 2048, 32], [1, -1, 3, 3]],
+                ),
+                "8x64_ksize3": (
+                    cached_randn((8, 64, 128)),
+                    cached_randn((64, 1, 3)),
+                    None,
+                    0,
+                    1,
+                    64,
+                    [[128, 1, 8, 64], [3, 1, 1, 64]],
+                    [[1, -1, 8192, 128], [1, -1, 3, 3]],
+                ),
+                # Same shape/layouts as 8x64_ksize3, padding=(1, 1): xfail, see
+                # the expect_fail note above.  The layouts are inherited from the
+                # zero-padding case, which passes with them.
+                "8x64_ksize3_pad1": (
+                    cached_randn((8, 64, 128)),
+                    cached_randn((64, 1, 3)),
+                    None,
+                    1,
+                    1,
+                    64,
+                    [[128, 1, 8, 64], [3, 1, 1, 64]],
+                    [[1, -1, 8192, 128], [1, -1, 3, 3]],
+                ),
+                "1x3x64_ksize3": (
+                    cached_randn((1, 3, 64)),
+                    cached_randn((3, 1, 3)),
+                    None,
+                    0,
+                    1,
+                    3,
+                    [[64, 1, 1, 64], [3, 1, 1, 64]],
+                    [[1, -1, 4096, 64], [1, -1, 3, 3]],
+                ),
+                "1x3x64_ksize_1": (
+                    cached_randn((1, 3, 64)),
+                    cached_randn((3, 1, 1)),
+                    None,
+                    0,
+                    1,
+                    3,
+                    [[64, 1, 1, 64], [1, 1, 1, 64]],
+                    [[1, -1, 192, 64], [ 1, -1, 1, 1]],
+                ),
+                "2x3x32_ksize1": (
+                    cached_randn((2, 3, 32)),
+                    cached_randn((3, 1, 1)),
+                    None,
+                    0,
+                    1,
+                    3,
+                    [[32, 1, 2, 64], [1, 1, 1, 64]],
+                    [[1, -1, 96, 32], [1, -1, 1, 1]],
+                ),
+                "1x16x64_ksize3": (
+                    cached_randn((1, 16, 64)),
+                    cached_randn((16, 1, 3)),
+                    None,
+                    0,
+                    1,
+                    16,
+                    [[64, 1, 1, 64], [3, 1, 1, 64]],
+                    [[1, -1, 1024, 64], [1, -1, 3, 3]],
+                ),
+                "2x32_ksize1_stride2": (
+                    cached_randn((2, 32, 64)),
+                    cached_randn((32, 1, 1)),
+                    None,
+                    0,
+                    2,
+                    32,
+                    [[64, 1, 2, 64], [1, 1, 1, 64]],
+                    [[1, -1, 2048, 64], [1, -1, 1, 1]],
+                ),
+                "1x3x128_ksize5": (
+                    cached_randn((1, 3, 128)),
+                    cached_randn((3, 1, 5)),
+                    None,
+                    0,
+                    1,
+                    3,
+                    [[128, 1, 1, 64], [5, 1, 1, 64]],
+                    [[1, -1, 384, 128], [1, -1, 5, 5]],
+                ),
+            },
+        },
         # conv2d exercising the native conv2d SDSC path (lower_convolution) with
         # the direct-lowering flag on (config.conv2d_direct_lowering). Only a
         # true 1x1 kernel falls back: it has size-1 window taps on *both* axes,
@@ -5225,11 +5391,23 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     None,
                     (2, 2),
                 ),
+                "1x64x13x1_k3x1_s2": (
+                    cached_randn((1, 64, 1, 13)),
+                    cached_randn((64, 64, 1, 3)),
+                    None,
+                    (1, 2),
+                ),
                 "1x64x17x17_k3_s2": (
                     cached_randn((1, 64, 17, 17)),
                     cached_randn((64, 64, 3, 3)),
                     None,
                     (2, 2),
+                ),
+                "1x64x17x1_k3x1_s2": (
+                    cached_randn((1, 64, 1, 17)),
+                    cached_randn((64, 64, 1, 3)),
+                    None,
+                    (1, 2),
                 ),
                 # Ragged HEIGHT, clean width (H:(8-3)%2=1, W:(9-3)%2=0). Height
                 # is untiled, so a ragged height is harmless -- this still
@@ -5248,6 +5426,69 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # whose custom-op reshape does not handle this test's
                 # channel-last weight layout (a separate, pre-existing issue
                 # unrelated to direct lowering).
+            },
+        },
+        ("test_conv1d_direct", "test_conv1d_direct_base"): {
+            "param_sets": {
+                # k2, zero padding -- smallest direct-lowered window.
+                "1x64x8_k2": (
+                    cached_randn((1, 64, 8)),
+                    cached_randn((64, 64, 2)),
+                    None,
+                    1,
+                ),
+                # k3, zero padding -- the reference "working conv with
+                # zero padding" shape.
+                "1x64x8_k3": (
+                    cached_randn((1, 64, 8)),
+                    cached_randn((64, 64, 3)),
+                    None,
+                    1,
+                ),
+                # Batch N>1 with k3
+                "2x64x8_k3": (
+                    cached_randn((2, 64, 8)),
+                    cached_randn((64, 64, 3)),
+                    None,
+                    1,
+                ),
+                # Bias present: lowered as a separate channel-wise pointwise add.
+                "1x64x8_k3_bias": (
+                    cached_randn((1, 64, 8)),
+                    cached_randn((64, 64, 3)),
+                    cached_randn((64,)),
+                    1,
+                ),
+                # C_out != C_in (32 output channels), k3
+                "1x64x8_k3_cout32": (
+                    cached_randn((1, 64, 8)),
+                    cached_randn((32, 64, 3)),
+                    None,
+                    1,
+                ),
+                # --- Strided convolutions (stride 2). 
+                "1x64x13_k3_s2": (
+                    cached_randn((1, 64, 13)),
+                    cached_randn((64, 64, 3)),
+                    None,
+                    2,
+                ),
+                "1x64x17_k3_s2": (
+                    cached_randn((1, 64, 17)),
+                    cached_randn((64, 64, 3)),
+                    None,
+                    2,
+                ),
+                # Ragged HEIGHT, clean width (H:(8-3)%2=1, W:(9-3)%2=0). Height
+                # is untiled, so a ragged height is harmless -- this still
+                # direct-lowers and matches CPU (proves the width-tiling
+                # constraint is on width only, not either spatial dim).
+                "1x64x9_k3_s2": (
+                    cached_randn((1, 64, 9)),
+                    cached_randn((64, 64, 3)),
+                    None,
+                    2,
+                ),
             },
         },
         ("test_avg_pool2d", "test_avg_pool2d_base"): {
@@ -7437,6 +7678,24 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         x_nhwc = x.permute(0, 2, 3, 1).contiguous()
         self.compare_with_cpu(fn, x_nhwc, atol=0.1, rtol=0.1, run_eager=False)
 
+    def test_conv1d_cpu(self, x, weight, bias, padding, stride, groups):
+        def fn(x, weight, bias, padding, stride, groups):
+            return torch.conv1d(
+                x, weight, bias, stride=stride, padding=padding, groups=groups
+            )
+
+        self.compare_with_cpu(
+            fn,
+            x,
+            weight,
+            bias,
+            padding,
+            stride,
+            groups,
+            atol=0.5,
+            rtol=0.1,
+        )
+
     def test_conv2d_cpu(self, x, weight, bias, padding, stride, groups):
         def fn(x, weight, bias, padding, stride, groups):
             return torch.conv2d(
@@ -7482,6 +7741,27 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             self.compare_with_cpu(
                 fn,
                 x_nhwc,
+                w_dev,
+                bias,
+                atol=0.5,
+                rtol=0.1,
+                run_eager=False,
+            )
+
+    def test_conv1d_direct_base(self, x, weight, bias, stride):
+        x_nwc = x.permute(0, 2, 1).contiguous()  # [N, W, C_in]
+        w_dev = weight.permute(1, 2, 0).contiguous()  # [C_in, kW, C_out]
+
+        def fn(xc, wc, b):
+            xn = xc.permute(0, 2, 1)  # NWC -> NCW
+            wn = wc.permute(2, 0, 1)  # [C_in,kW,C_out] -> [C_out,C_in,kW]
+            out = torch.conv1d(xn, wn, b, stride=stride, padding=0, groups=1)
+            return out.permute(0, 2, 1)  # NCW -> NWC
+
+        with mock.patch.object(inductor_config, "conv2d_direct_lowering", True):
+            self.compare_with_cpu(
+                fn,
+                x_nwc,
                 w_dev,
                 bias,
                 atol=0.5,
@@ -7560,6 +7840,51 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         def fn(x, weight, bias, padding, stride, groups):
             return torch.conv2d(
+                x, weight, bias, stride=stride, padding=padding, groups=groups
+            )
+
+        cpu_result = fn(x, weight, bias, padding, stride, groups)
+
+        spyre_compiled = torch.compile(fn)(
+            x_dev, weight_dev, bias, padding, stride, groups
+        ).cpu()
+        spyre_eager = fn(x_dev, weight_dev, bias, padding, stride, groups).cpu()
+        torch.testing.assert_close(
+            spyre_compiled,
+            cpu_result,
+            equal_nan=True,
+            atol=0.5,
+            rtol=0.1,
+            msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
+        )
+        torch.testing.assert_close(
+            spyre_eager,
+            cpu_result,
+            equal_nan=True,
+            atol=0.5,
+            rtol=0.1,
+            msg=lambda msg: f"eager mode spyre <-> cpu mismatch\n\n{msg}\n",
+        )
+
+    def test_dwise_conv1d_cpu(
+        self, x, weight, bias, padding, stride, groups, dev_layout, dev_stride
+    ):
+        from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+        torch._dynamo.reset()
+        torch._inductor.codecache.FxGraphCache.clear()
+
+        device_dtype_fp16 = get_device_dtype(torch.float16)
+        x_layout = SpyreTensorLayout(dev_layout[0], dev_stride[0], device_dtype_fp16)
+        weight_layout = SpyreTensorLayout(
+            dev_layout[1], dev_stride[1], device_dtype_fp16
+        )
+
+        x_dev = x.to(device_layout=x_layout)
+        weight_dev = weight.to(device_layout=weight_layout)
+
+        def fn(x, weight, bias, padding, stride, groups):
+            return torch.conv1d(
                 x, weight, bias, stride=stride, padding=padding, groups=groups
             )
 
