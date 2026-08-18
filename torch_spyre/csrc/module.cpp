@@ -46,6 +46,7 @@
 #include "logging.h"
 #include "logging_bindings.h"
 #include "logging_config.h"
+#include "perm_layout_native.h"
 #include "prepare_kernel.h"
 #include "spyre_allocator.h"
 #include "spyre_device_enum.h"
@@ -92,15 +93,25 @@ void _startRuntime() {
   //   1. tls_idx (non-zero) — set via explicit set_device() call
   //   2. LOCAL_RANK env var — set by torchrun per process
   //   3. 0 — single-device / non-torchrun default
+  //
+  // tls_idx is initialised to parse_local_rank() at thread-local init time
+  // in spyre_guard.cpp (covering cases 2 and 3 automatically). The if/else
+  // here only distinguishes "tls_idx is non-zero (either from TLS init or
+  // from a set_device() call)" from "tls_idx is zero". There is no way at
+  // this point to distinguish a set_device() call from a LOCAL_RANK-seeded
+  // TLS init.
   int logical_device_id = 0;
   int tls_idx = static_cast<int>(SpyreGuardImpl::tls_idx);
   if (tls_idx != 0) {
     logical_device_id = tls_idx;
-  } else if (const char* lr = std::getenv("LOCAL_RANK")) {
-    logical_device_id = std::atoi(lr);
+  } else {
+    // parse_local_rank() returns 0 when LOCAL_RANK is unset, and throws on
+    // invalid / out-of-range values.
+    const c10::DeviceIndex rank = parse_local_rank();
+    logical_device_id = static_cast<int>(rank);
     // Match the current (c10) device to the rank so unqualified stream/pool
     // lookups don't fall back to spyre:0.
-    SpyreGuardImpl::tls_idx = static_cast<c10::DeviceIndex>(logical_device_id);
+    SpyreGuardImpl::tls_idx = rank;
   }
 
   const int num_devices = getVisibleDeviceCount();
@@ -236,6 +247,9 @@ PYBIND11_MODULE(_C, m) {
 
   // Initialize logging bindings
   torch_spyre::logging::init_logging_bindings(m);
+
+  // Register the native scratchpad layout packer accelerator.
+  torch_spyre::scratchpad::register_perm_layout_native(m);
 
   py::enum_<spyre::ElementArrangement>(m, "ElementArrangement")
       .value("STANDARD", spyre::ElementArrangement::STANDARD)

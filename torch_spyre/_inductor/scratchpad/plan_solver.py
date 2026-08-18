@@ -15,11 +15,14 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 from abc import ABC, abstractmethod
 import math
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from enum import Enum
+
+if TYPE_CHECKING:
+    from torch_spyre._inductor.scratchpad.lx_relayout import LXRelayoutPlan
 
 logger = get_inductor_logger("scratchpad.plan_solver")
 
@@ -77,6 +80,15 @@ class LifetimeBoundBuffer:
     # define the reason for excluding the buffer based on allocator
     # or solver logic paths.
     residency_reason: Optional[str] = None
+    # Buffers that must be placed atomically with this one. Despite the name,
+    # this is one-to-many: only the group root carries the complete partner list.
+    paired_with: list["LifetimeBoundBuffer"] = field(
+        default_factory=list, repr=False, compare=False
+    )
+    # LX relayout plans for which this buffer is the source.
+    lx_relayout_plans: list["LXRelayoutPlan"] = field(
+        default_factory=list, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         # Not also asserted non-empty: buffers are sometimes registered before
@@ -271,6 +283,8 @@ class MemoryPlanSolver(ABC):
     solvers that can also choose the division.
     """
 
+    supports_paired_buffers = False
+
     def __init__(
         self, buffers: Sequence["LifetimeBoundBuffer"], size: int, alignment: int = 128
     ):
@@ -294,6 +308,9 @@ class MemoryPlanSolver(ABC):
                 defaults to.
         """
         self.buffers: list["LifetimeBoundBuffer"] = list(buffers)
+        assert self.supports_paired_buffers or not any(
+            buffer.paired_with for buffer in self.buffers
+        ), f"{type(self).__name__} does not support paired-buffer placement"
         self.limit = size
         self.alignment = alignment
         self.spill_reasons: dict[str, str] = {}

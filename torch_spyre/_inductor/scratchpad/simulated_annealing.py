@@ -64,7 +64,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.permutation_layout import (
-    PermutationBasedLayoutSolver,
+    make_permutation_packer,
 )
 
 
@@ -162,9 +162,7 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
             convertor = SolverToPermutation(initial)
             self.initial = convertor.permutation(self.buffers)
 
-        self.plan = PermutationBasedLayoutSolver(
-            self.buffers, self.initial, size, alignment
-        )
+        self.plan = make_permutation_packer(self.buffers, self.initial, size, alignment)
         self.quality_logs: list[list[float]] = []
         self.temperature_logs: list[list[float]] = []
         self.best_quality = self.plan.quality()
@@ -223,7 +221,7 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
         # Commit the best permutation seen, so finalize() writes it rather than
         # whatever state annealing happened to end in.
         if self.plan.permutation != self.best_permutation:
-            self.plan = PermutationBasedLayoutSolver(
+            self.plan = make_permutation_packer(
                 self.buffers, list(self.best_permutation), self.size, self.alignment
             )
 
@@ -242,7 +240,11 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
             temperature_log.append(temperature)
             if quality > self.best_quality:
                 self.best_quality = quality
-                self.best_permutation = copy.copy(self.plan.permutation)
+                # ``list(...)``, not ``copy.copy(...)``: ``plan.permutation`` is a
+                # live view of the packer's order, so the best-so-far snapshot has
+                # to be detached or the comparison in :meth:`solve` that decides
+                # whether to rebuild would be vacuously equal.
+                self.best_permutation = list(self.plan.permutation)
 
             if self._is_optimal():
                 # All buffers fit: quality is maximal, so stop cooling early --
@@ -280,22 +282,19 @@ class SimulatedAnnealingLayoutSolver(MemoryPlanSolver):
         if j == len(perm) - 1:
             j = len(perm) - 2
 
-        def _top_or_inf(p: int) -> float:
-            # Exclusive top (address + size) of buffer ``p``, or +inf when ``p``
-            # is evicted (address is None). An evicted buffer sorts as if it sits
-            # arbitrarily high, so it is treated as "above" any placed buffer and
-            # is never reordered below one; two placed buffers compare by their
-            # real tops, unchanged from before eviction used None.
-            addr = plan.addresses[p]
-            if addr is None:
-                return math.inf
-            return addr + self.buffers[p].size
+        # ``plan.top_or_inf`` is the packer's own accessor: the exclusive top
+        # (address + size) of a buffer, or +inf when it is evicted. An evicted
+        # buffer sorts as if it sits arbitrarily high, so it is treated as "above"
+        # any placed buffer and never reordered below one. It reads the plan-local
+        # size rather than ``self.buffers[p].size``, so it stays correct once a
+        # co-optimizer drives ``resize``.
+        top_or_inf = plan.top_or_inf
 
         while i <= j:
             pi = perm[i]
             pi1 = perm[i + 1]
 
-            if (not plan.overlaps(pi, pi1)) and _top_or_inf(pi) > _top_or_inf(pi1):
+            if (not plan.overlaps(pi, pi1)) and top_or_inf(pi) > top_or_inf(pi1):
                 # Swap buffers pi and pi1. This makes no difference for the quality
                 # of the result *now*, but it makes it easier to rotate to an
                 # improved state.

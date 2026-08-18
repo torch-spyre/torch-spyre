@@ -223,6 +223,40 @@ class CoarseTileInfo:
     output_tiled_dims:
         The analogous per-level ``(op_dim_index, extent)`` list for this
         op's own write dependency. Defaults to ``[]`` (no levels tiled).
+    squeezed_advance_per_read:
+        One entry per read dependency, parallel to ``tiled_dims_per_read``.
+        Each entry is a list of per-nesting-level ``(host_stride, extent)``
+        pairs for dims tiled down to extent 1 in this dep's own iteration
+        space -- Inductor's ``SqueezeView.squeezer`` unconditionally drops
+        any such dim from ``dep.index`` (called via
+        ``ComputedBuffer.get_read_writes()`` -> ``extract_read_writes`` ->
+        ``index_vars_squeeze``), so no ``d{i}`` symbol survives for
+        ``_host_dim_to_index_symbol`` to substitute into -- unlike a dim
+        merely absent from one read among several (genuine broadcast),
+        which ``tiled_dims_per_read`` already handles correctly via
+        substitution. ``host_stride`` is the dim's canonical index
+        coefficient in the *squeezed* iteration space of the op whose
+        ``data.ranges`` sizes this dim (product of that op's own
+        ``data.ranges`` sizes strictly to the dim's right) -- the same units
+        every surviving ``d{i}`` symbol in ``dep.index`` already carries,
+        since Inductor mints those coefficients over the unsqueezed
+        ``data.ranges`` and squeeze only renumbers/drops symbols, never
+        rescales them. This is deliberately NOT the buffer's real PyTorch
+        memory stride (``full_buf.layout.stride``) -- that is a different
+        unit system that ``tiling_expr_to_device_expr``'s ``stride_map``-
+        based dimension selection cannot be compared against, and picking
+        the wrong device axis when the two happen to diverge silently
+        advances the wrong dimension (see issue surfaced by
+        ``test_flash_tile_B``). Independent of ``dep.index`` entirely, so
+        ``SpyreKernel._general_tile_advance`` can add its device-address
+        contribution as an extra term via ``tiling_expr_to_device_expr``
+        rather than by substitution. Empty list means no such dims for this
+        read (the common case).
+    squeezed_advance_output:
+        The analogous per-level ``(host_stride, extent)`` list for this op's
+        own write dependency, parallel to ``output_tiled_dims`` the same way
+        ``squeezed_advance_per_read`` is parallel to ``tiled_dims_per_read``.
+        Defaults to ``[]`` (no levels tiled).
     propagation:
         Planned decision for how this op's result crosses its loop
         boundary, computed by ``_plan_tiling_propagation``. ``None`` until
@@ -237,6 +271,12 @@ class CoarseTileInfo:
         default_factory=list
     )
     output_tiled_dims: list[list[tuple[int, sympy.Expr]]] = field(default_factory=list)
+    squeezed_advance_per_read: list[list[list[tuple[sympy.Expr, sympy.Expr]]]] = field(
+        default_factory=list
+    )
+    squeezed_advance_output: list[list[tuple[sympy.Expr, sympy.Expr]]] = field(
+        default_factory=list
+    )
     propagation: "PropagationPlan | None" = None
 
 

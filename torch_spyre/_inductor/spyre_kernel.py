@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+import math
 from typing import Any, Callable, Self, Sequence, Tuple, Union
 from abc import ABC
 
@@ -47,6 +48,7 @@ from .constants import (
 from . import config as _spyre_config
 from .errors import Unsupported
 from .ir import FixedTiledLayout
+from .scratchpad.lx_relayout import work_division_from_view
 from .pass_utils import (
     concretize_expr,
     concretize_index,
@@ -64,8 +66,10 @@ from .op_spec import (
     LoopSpec,
     OpSpec,
     TensorArg,
+    TensorWorkDivision,
     UnimplementedOp as OpSpecUnimplementedOp,
     format_op_spec_list,
+    is_lx_relayout_identity,
 )
 from torch_spyre._inductor.provenance import build_debug_handle
 import logging
@@ -654,6 +658,15 @@ class SpyreKernel(Kernel[CSEVariable]):
         every level into one combined Expr -- preserving the single-Expr-
         per-arg contract compute_ops.py/superdsc.py/bundle.py depend on.
 
+        A read dim tiled down to extent 1 in dep's own iteration space has
+        no d{i} symbol at all (Inductor's SqueezeView.squeezer drops it
+        unconditionally -- see CoarseTileInfo.squeezed_advance_per_read's
+        docstring), so it cannot contribute via substitution into dep.index
+        like every other tiled dim here. Its (host_stride, extent) pairs
+        are added as independent terms (level_symbol * extent * host_stride,
+        already in host-element space) through the same
+        tiling_expr_to_device_expr projection instead.
+
         This is the sole tile-advance mechanism. Returns None for ops
         without loop_info/coarse tiling.
         """
@@ -663,6 +676,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             return None
 
         op_name = ir_node.get_operation_name()
+        squeezed_advance_per_level: list[list[tuple[sympy.Expr, sympy.Expr]]] = []
 
         if is_input:
             read_deps = [
@@ -686,6 +700,11 @@ class SpyreKernel(Kernel[CSEVariable]):
                 return None
             dep = read_deps[dep_idx]
             per_level_dims = loop_info.tiled_dims_per_read[dep_idx]
+            squeezed_advance_per_read = getattr(
+                loop_info, "squeezed_advance_per_read", None
+            )
+            if squeezed_advance_per_read and dep_idx < len(squeezed_advance_per_read):
+                squeezed_advance_per_level = squeezed_advance_per_read[dep_idx]
         else:
             write_deps = [
                 dep
@@ -696,31 +715,47 @@ class SpyreKernel(Kernel[CSEVariable]):
                 return None
             dep = write_deps[0]
             per_level_dims = loop_info.output_tiled_dims
+            squeezed_advance_per_level = (
+                getattr(loop_info, "squeezed_advance_output", None) or []
+            )
 
-        if not per_level_dims:
+        if not per_level_dims and not any(squeezed_advance_per_level):
             return None
 
         device_size = tensor.layout.device_layout.device_size
         stride_map = tensor.layout.device_layout.stride_map
 
         total_device_expr: "sympy.Expr | None" = None
-        for level_idx, dim_extent_pairs in enumerate(per_level_dims):
-            if not dim_extent_pairs:
+        n_levels = max(len(per_level_dims), len(squeezed_advance_per_level))
+        for level_idx in range(n_levels):
+            dim_extent_pairs = (
+                per_level_dims[level_idx] if level_idx < len(per_level_dims) else []
+            )
+            squeezed_pairs = (
+                squeezed_advance_per_level[level_idx]
+                if level_idx < len(squeezed_advance_per_level)
+                else []
+            )
+            if not dim_extent_pairs and not squeezed_pairs:
                 continue
             level_symbol = self._get_or_mint_level_symbol(level_idx, op_name)
-            tiled_dim_extents = {
-                self._host_dim_to_index_symbol(ir_node, d): extent * level_symbol
-                for d, extent in dim_extent_pairs
-            }
-            subs = dict(tiled_dim_extents)
-            subs.update(
-                {
-                    sym: sympy.Integer(0)
-                    for sym in dep.index.free_symbols
-                    if sym not in subs
+            host_expr = sympy.S.Zero
+            if dim_extent_pairs:
+                tiled_dim_extents = {
+                    self._host_dim_to_index_symbol(ir_node, d): extent * level_symbol
+                    for d, extent in dim_extent_pairs
                 }
-            )
-            host_expr = dep.index.subs(subs)
+                subs = dict(tiled_dim_extents)
+                subs.update(
+                    {
+                        sym: sympy.Integer(0)
+                        for sym in dep.index.free_symbols
+                        if sym not in subs
+                    }
+                )
+                host_expr += dep.index.subs(subs)
+            for host_stride, extent in squeezed_pairs:
+                host_expr += level_symbol * extent * host_stride
             device_expr = tiling_expr_to_device_expr(device_size, stride_map, host_expr)
             total_device_expr = (
                 device_expr
@@ -768,6 +803,11 @@ class SpyreKernel(Kernel[CSEVariable]):
             index,
             self.indirect_sizes,
         )
+        work_division = work_division_from_view(
+            tensor.layout.lx_view if "lx" in tensor.layout.allocation else None,
+            device_coords,
+            tuple(it_space),
+        )
         device_tile_advance_expr = self._general_tile_advance(tensor, is_input, name)
         tensor_arg = TensorArg(
             is_input,
@@ -779,6 +819,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             element_arrangement=tensor.layout.device_layout.element_arrangement,
             name=opspec_name,
             device_tile_advance_expr=device_tile_advance_expr,
+            work_division=work_division,
         )
         if (
             "lx" not in tensor.layout.allocation
@@ -942,6 +983,10 @@ class SpyreKernel(Kernel[CSEVariable]):
             and hasattr(ir_node.data, "ranges")
             else None
         )
+        if not is_lx_relayout_identity(op, args):
+            for arg in args:
+                arg.work_division = None
+
         return OpSpec(
             op,
             is_reduction,
@@ -1487,9 +1532,63 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 buf.writeline(
                                     f"element_arrangement={arg.element_arrangement},"
                                 )
+                            if arg.work_division is not None:
+                                splits = ", ".join(
+                                    f"{sympy_str(dim)}: {split}"
+                                    for dim, split in arg.work_division.work_slices.items()
+                                )
+                                core_map = ", ".join(
+                                    f"{sympy_str(dim)}: {sympy_str(slot)}"
+                                    for dim, slot in arg.work_division.core_id_to_work_slice.items()
+                                )
+                                buf.writeline(
+                                    "work_division=TensorWorkDivision("
+                                    f"work_slices={{{splits}}}, "
+                                    f"core_id_to_work_slice={{{core_map}}}),"
+                                )
                         buf.writeline("),")
                 buf.writeline("]")
             buf.writeline("),")
+
+
+def _remap_work_division(arg: TensorArg, work_division_remap) -> None:
+    """Carry tensor ownership through iteration-space normalization."""
+
+    if arg.work_division is None:
+        return
+    new_splits: dict[sympy.Symbol, int] = {}
+    new_core_map: dict[sympy.Symbol, sympy.Expr] = {}
+    for old_dim, split in arg.work_division.work_slices.items():
+        new_dims = work_division_remap[old_dim]
+        remaining_split = int(split)
+        split_factors = []
+        if len(new_dims) == 1:
+            split_factors = [(new_dims[0][0], remaining_split)]
+            remaining_split = 1
+        else:
+            for new_dim, basis in reversed(new_dims):
+                factor = math.gcd(remaining_split, basis)
+                split_factors.append((new_dim, factor))
+                remaining_split //= factor
+            split_factors.reverse()
+        if remaining_split != 1:
+            raise ValueError(f"cannot normalize {split}-way split on {old_dim}")
+
+        slot = arg.work_division.core_id_to_work_slice[old_dim]
+        slot_stride = 1
+        for new_dim, factor in split_factors:
+            if factor == 1:
+                continue
+            new_slot = sympy.Mod(sympy.floor(slot / slot_stride), factor)
+            if new_dim in new_splits and (
+                new_splits[new_dim],
+                new_core_map[new_dim],
+            ) != (factor, new_slot):
+                raise ValueError(f"conflicting normalized ownership on {new_dim}")
+            new_splits[new_dim] = factor
+            new_core_map[new_dim] = new_slot
+            slot_stride *= factor
+    arg.work_division = TensorWorkDivision(new_splits, new_core_map)
 
 
 def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
@@ -1497,7 +1596,7 @@ def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
     # decomposes symbols in align_tensors; indirect_access_subs replaces them with IndirectAccess.
     it_space = op_spec.iteration_space
 
-    new_op_space_splits, new_tensors = align_tensors(
+    new_op_space_splits, new_tensors, work_division_remap = align_tensors(
         it_space,
         [
             {"size": arg.device_size, "coordinates": arg.device_coordinates}
@@ -1508,6 +1607,7 @@ def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
     op_spec.iteration_space = new_op_space_splits
 
     for arg, t in zip(op_spec.args, new_tensors):
+        _remap_work_division(arg, work_division_remap)
         arg.device_size = t["size"]
         arg.device_coordinates = t["coordinates"]
 
