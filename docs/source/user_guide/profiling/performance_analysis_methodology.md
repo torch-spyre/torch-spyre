@@ -76,8 +76,8 @@ to the hardware bound.
 
 The numerator comes from a compiler artifact. When the compiler runs
 with `SENPERFORMANCE=2`, it writes an `ideal_cycles.json` file per
-kernel under `inductor-spyre/<kernel>/perf/` in the Inductor cache
-directory (`TORCHINDUCTOR_CACHE_DIR`). The `TOTAL` entry in that file
+kernel under `inductor-spyre/sdsc.bundle.mlir/perf/` in the Inductor
+cache directory (`TORCHINDUCTOR_CACHE_DIR`). The `TOTAL` entry in that file
 gives the kernel's ideal cycle count. Convert cycles to time with the
 core clock frequency:
 

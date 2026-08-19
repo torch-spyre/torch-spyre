@@ -87,27 +87,6 @@ If a feature genuinely cannot be split, flag that in the PR description
 and in the matching sub-issue so reviewers know what they are signing up
 for.
 
-## Building with the profiler enabled
-
-The C++ profiler and aiupti path builds by default. Set
-`USE_SPYRE_PROFILER=0` to build without it, which lets torch-spyre still
-import cleanly on a toolchain that lacks the profiler dependencies:
-
-```bash
-USE_SPYRE_PROFILER=0 pip install -e . --no-build-isolation
-```
-
-When the profiler is **off**, every profiler import path must still
-succeed (the import test below covers this). When it is **on** (the
-default), install the kineto-spyre wheel:
-
-```bash
-pip install kineto-spyre
-```
-
-If you change build wiring, verify both the default (on) and the
-`USE_SPYRE_PROFILER=0` (off) paths build and import.
-
 ## Testing profiler changes
 
 The profiler test suite lives at `tests/profiler/`. Tests that need the
@@ -132,7 +111,8 @@ pytest tests/profiler/test_spyre_profiler.py -k trace
 Smoke test validation before you open a PR:
 
 1. `import torch_spyre.profiler` succeeds with `USE_SPYRE_PROFILER=0`.
-2. `tests/profiler/` passes with the kineto-spyre wheel installed.
+2. `tests/profiler/` passes with the default build (`USE_SPYRE_PROFILER=1`)
+   on Spyre hardware.
 3. If you touched trace emission, capture a small trace and open it in
    Perfetto. See [Trace analysis](../user_guide/profiling/trace_analysis.md).
 4. If you touched device telemetry, sanity-check against `aiu-smi`. See
