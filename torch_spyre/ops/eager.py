@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import torch
-from torch_spyre._C import fill_tensor, copy_tensor
+from torch_spyre._C import fill_tensor, copy_tensor, SpyreTensorLayout
 import torch_spyre.ops.fallbacks  # noqa: F401
 from .fallbacks import _get_op_overloads
 import warnings
@@ -89,6 +89,69 @@ def _materialize_offset_view(x):
     return x
 
 
+class RetileWarning(UserWarning):
+    """Warning issued when an eager result had to be re-tiled to the layout a
+    compiled graph assumes for it."""
+
+
+warnings.simplefilter("once", RetileWarning)
+
+
+def _normalize_result_layout(x):
+    """Return a copy of a Spyre tensor whose device layout is the *canonical* one
+    for its logical shape.
+
+    ``propagate_layouts`` stamps a fallback's output with ``generic_layout(op)``,
+    i.e. the size-only ``SpyreTensorLayout(size, dtype)``, and inserts no
+    restickify to make that assumption true — so an eager kernel returning a
+    differently-tiled buffer is read by the wrong tiling, silently. Rebuilding
+    the result here makes the assumption hold.
+
+    Only whole buffers are considered. ``device_tensor_layout()`` describes the
+    tensor's BASE allocation, not the view, so for any view it reports a layout
+    for a different logical shape and would compare unequal no matter how the
+    bytes are tiled — rebuilding on that basis corrupts a buffer that was
+    already self-consistent (see ``TestPermutedEagerResultNotNormalized``).
+    ``_base is None`` restricts us to freshly allocated kernel results, which is
+    exactly the case the assumed layout is stamped on. Note also that
+    ``dim_order`` is not reachable from Python (the binding exposes only
+    ``device_size``/``stride_map``/``device_dtype``/``element_arrangement``), so
+    comparing whole layouts is the only way to detect the mismatch.
+    """
+
+    if not isinstance(x, torch.Tensor) or x.device.type != "spyre":
+        return x
+    if x._base is not None or not x.is_contiguous():
+        return x
+    real = x.device_tensor_layout()
+    if real is None:
+        # No layout to compare (e.g. a FakeTensor under tracing): leave it alone
+        # rather than force a copy on a tensor we cannot reason about.
+        return x
+    if real == SpyreTensorLayout([int(s) for s in x.shape], x.dtype):
+        return x
+
+    warnings.warn(
+        f"re-tiling a {tuple(x.shape)} {x.dtype} eager result whose device "
+        f"layout is not the one a compiled graph assumes for its shape",
+        category=RetileWarning,
+        stacklevel=2,
+    )
+    out = torch.zeros(x.shape, dtype=x.dtype, device=x.device)
+    # The host round-trip reads the source by its own real layout and writes the
+    # destination by the canonical one, which is the re-tiling we want.
+    #
+    # A device-to-device copy_ would re-tile without leaving the device, but it
+    # routes through spyre::copy_from_d2d, i.e. a nested torch.compile from
+    # inside the eager kernel we are already compiling. That nesting raises
+    # InductorError from optimize_restickify.beam_global_min_cost and breaks
+    # test_reduction_reads_correct_slice[2|32] (measured). Revisit once a
+    # cross-layout D2D copy is available without re-entering the compiler — see
+    # the same TODO at csrc/spyre_mem.cpp:759.
+    out.copy_(x.to("cpu"))
+    return out
+
+
 def _write_arg_slots(op):
     """Positions and names of an op's mutated (write-aliased) arguments.
 
@@ -107,6 +170,32 @@ def _write_arg_slots(op):
     return positions, names
 
 
+def _map_result(result, fn):
+    """Apply ``fn`` to every tensor in an op's return value, rebuilding the
+    containers around them.
+
+    The two tuple subclasses a multi-output aten schema can return are rebuilt as
+    themselves, and they need different calls: a namedtuple's ``__new__`` takes
+    the fields positionally so it must go through ``_make``, while a structseq
+    (``torch.return_types.*``) has no ``_make`` and its ``__new__`` takes the
+    iterable directly. Anything else becomes a plain ``tuple``, since an
+    arbitrary subclass's ``__init__`` need not accept either form.
+    """
+    if isinstance(result, torch.Tensor):
+        return fn(result)
+    if isinstance(result, tuple):
+        mapped = [_map_result(r, fn) for r in result]
+        cls = type(result)
+        if hasattr(cls, "_make"):  # namedtuple
+            return cls._make(mapped)
+        if hasattr(cls, "n_fields"):  # structseq, e.g. torch.return_types.max
+            return cls(mapped)
+        return tuple(mapped)
+    if isinstance(result, list):
+        return [_map_result(r, fn) for r in result]
+    return result
+
+
 def _remap_result(result, lookup):
     """Swap substituted clones back to the caller's originals in a return value.
 
@@ -115,16 +204,7 @@ def _remap_result(result, lookup):
     same object), so an in-place/out op returns the clone we substituted;
     restore the caller's tensor identity so aliasing is preserved.
     """
-    if isinstance(result, torch.Tensor):
-        return lookup.get(id(result), result)
-    if isinstance(result, tuple):
-        mapped = [_remap_result(r, lookup) for r in result]
-        if hasattr(type(result), "_make"):  # namedtuple / structseq
-            return type(result)._make(mapped)
-        return tuple(mapped)
-    if isinstance(result, list):
-        return [_remap_result(r, lookup) for r in result]
-    return result
+    return _map_result(result, lambda t: lookup.get(id(t), t))
 
 
 def _make_offset_safe_dispatch(op):
@@ -136,10 +216,16 @@ def _make_offset_safe_dispatch(op):
     - Write (mutated) args: read-modify-write. Clone the offset view to an
       offset-0 buffer, run the kernel against the clone, then ``copy_`` the
       result back into the caller's view.
+    - Results: rebuild any output whose device tiling is not the canonical one
+      for its shape (``_normalize_result_layout``), since a compiled graph
+      consuming this op as a fallback will assume the canonical tiling.
 
-    Everything is a no-op for the common offset-0 case.
+    Everything is a no-op for the common offset-0, canonical-layout case.
     """
     write_positions, write_names = _write_arg_slots(op)
+    # In-place/out variants return the caller's own buffer; rebuilding it would
+    # break the aliasing the schema promises, so leave their results alone.
+    normalize_results = not (write_positions or write_names)
 
     def dispatch(*args, compiled=None, **kwargs):
         write_back = []  # (clone, original) for each substituted write view
@@ -165,6 +251,9 @@ def _make_offset_safe_dispatch(op):
         }
 
         result = compiled(*args, **kwargs)
+
+        if normalize_results:
+            result = _map_result(result, _normalize_result_layout)
 
         if write_back:
             for local, original in write_back:

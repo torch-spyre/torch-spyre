@@ -77,7 +77,7 @@ precommit: ## Run all pre-commit hooks against every file
 # ---------------------------------------------------------------------------
 
 .PHONY: tests
-tests: ## Run torch spyre tests. Narrow scope with TEST_TYPE=smoke|unit|integration|regression|trunk|perf|suite_<group>. TEST_CONFIGS may point at a config directory (filtered by TEST_TYPE) or a single config yaml file (run directly); ignored when TEST_TYPE=trunk (scans tests/configs/ directly, filtered by the trunk label).
+tests: ## Run torch spyre tests, fanning out into tests-single-card + tests-multi-card (see below) so distributed configs always run on the right card count. Narrow scope with TEST_TYPE=smoke|unit|integration|regression|trunk|perf|suite_<group>. TEST_CONFIGS may point at a config directory (filtered by TEST_TYPE, then split by card count) or a single config yaml file (run directly, no split); ignored when TEST_TYPE=trunk (scans tests/configs/ directly, filtered by the trunk label).
 # TEST_TYPE=perf is a benchmark mode, not a pytest-config suite: it does not
 # run the OOT config machinery below. It shells out to the installed
 # spyre-perf-suite console script (a wheel dependency of the dev image) and
@@ -91,23 +91,11 @@ ifeq ($(TEST_TYPE),perf)
 	@test -f "$(RESULTS_DIR)/report.xml" || \
 		{ echo "ERROR: spyre-perf-suite did not emit $(RESULTS_DIR)/report.xml" >&2; \
 		  exit 1; }
-else ifeq ($(TEST_TYPE),trunk)
-	$(eval _PATHS := $(shell python3 $(FILTER_SCRIPT) --config-dir tests/configs --test-type trunk --format paths))
-	@if [ -z "$(_PATHS)" ]; then \
-		echo "ERROR: no configs matched TEST_TYPE=trunk under tests/configs" >&2; \
-		exit 1; \
-	fi
-	@TORCH_SPYRE_TEST_TYPE="$(TEST_TYPE)" bash tests/run_test.sh $(_PATHS) $(PYTEST_ARGS)
 else ifneq ($(wildcard $(TEST_CONFIGS)/.),)
-	$(eval _PATHS := $(shell python3 $(FILTER_SCRIPT) \
-		--config-dir $(TEST_CONFIGS) \
-		--test-type "$(TEST_TYPE)" \
-		--format paths))
-	@if [ -z "$(_PATHS)" ]; then \
-		echo "ERROR: no configs matched TEST_TYPE=$(TEST_TYPE) under $(TEST_CONFIGS)" >&2; \
-		exit 1; \
-	fi
-	@TORCH_SPYRE_TEST_TYPE="$(TEST_TYPE)" bash tests/run_test.sh $(_PATHS) $(PYTEST_ARGS)
+	@rc=0; \
+	$(MAKE) tests-single-card TEST_TYPE="$(TEST_TYPE)" TEST_CONFIGS="$(TEST_CONFIGS)" PYTEST_ARGS="$(PYTEST_ARGS)" || rc=1; \
+	$(MAKE) tests-multi-card TEST_TYPE="$(TEST_TYPE)" PYTEST_ARGS="$(PYTEST_ARGS)" || rc=1; \
+	exit $$rc
 else
 	@if [ ! -f "$(TEST_CONFIGS)" ]; then \
 		echo "ERROR: TEST_CONFIGS not found (expected a directory or a config file): $(TEST_CONFIGS)" >&2; \
@@ -115,6 +103,36 @@ else
 	fi
 	@TORCH_SPYRE_TEST_TYPE="$(TEST_TYPE)" bash tests/run_test.sh $(TEST_CONFIGS) $(PYTEST_ARGS)
 endif
+
+# Single-card / multi-card split, by scoping the scan to (or excluding) tests/configs/distributed_tests/.
+#   make tests-single-card TEST_TYPE=integration  # 45 configs, torch_spyre_tests, 1 card
+#   make tests-multi-card  TEST_TYPE=integration  # 9 configs, distributed_tests, 2 cards
+#   make tests-single-card TEST_TYPE=regression   # 103 configs, torch_spyre_tests, 1 card
+#   make tests-multi-card  TEST_TYPE=regression   # 9 configs, distributed_tests, 2 cards
+#   make tests-single-card TEST_TYPE=trunk        # 177 configs, full tree minus distributed_tests, 1 card
+#   make tests-multi-card  TEST_TYPE=trunk        # 9 configs, distributed_tests, 2 cards
+.PHONY: tests-single-card tests-multi-card
+tests-single-card: ## Run TEST_TYPE's non-distributed slice only (distributed_tests excluded from the scan). Needs 1 card.
+ifeq ($(TEST_TYPE),trunk)
+	$(eval _ALL := $(shell python3 $(FILTER_SCRIPT) --config-dir tests/configs --test-type trunk --format paths))
+else
+	$(eval _ALL := $(shell python3 $(FILTER_SCRIPT) --config-dir $(TEST_CONFIGS) --test-type "$(TEST_TYPE)" --format paths))
+endif
+	$(eval _DISTRIBUTED := $(abspath $(wildcard tests/configs/distributed_tests/*.yaml)))
+	$(eval _PATHS := $(filter-out $(_DISTRIBUTED),$(_ALL)))
+	@if [ -z "$(_PATHS)" ]; then \
+		echo "ERROR: no non-distributed configs matched TEST_TYPE=$(TEST_TYPE)" >&2; \
+		exit 1; \
+	fi
+	@TORCH_SPYRE_TEST_TYPE="$(TEST_TYPE)" bash tests/run_test.sh $(_PATHS) $(PYTEST_ARGS)
+
+tests-multi-card: ## Run TEST_TYPE's distributed slice only (tests/configs/distributed_tests). Needs 2 cards.
+	$(eval _PATHS := $(shell python3 $(FILTER_SCRIPT) --config-dir tests/configs/distributed_tests --test-type "$(TEST_TYPE)" --format paths))
+	@if [ -z "$(_PATHS)" ]; then \
+		echo "ERROR: no configs matched TEST_TYPE=$(TEST_TYPE) under tests/configs/distributed_tests" >&2; \
+		exit 1; \
+	fi
+	@TORCH_SPYRE_TEST_TYPE="$(TEST_TYPE)" bash tests/run_test.sh $(_PATHS) $(PYTEST_ARGS)
 
 
 # ---------------------------------------------------------------------------

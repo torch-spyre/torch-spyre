@@ -839,7 +839,10 @@ class SuperDSCScheduling(BaseScheduling):
             buf.writeline(f"async_compile.{method}('{kernel_name}',")
             with buf.indent():
                 buf.splice(f"{src_code}")
-            buf.writeline(")")
+            if method == "sdsc" and kernel._kernel_uses_hbm_pool():
+                buf.writeline(f", pool_size={kernel.pool_size})")
+            else:
+                buf.writeline(")")
             origins, detailed_origins = get_kernel_metadata(node_schedule, wrapper)
             metadata_comment = f"{origins}\n{detailed_origins}"
             wrapper.define_kernel(kernel_name, buf.getvalue(), metadata_comment)

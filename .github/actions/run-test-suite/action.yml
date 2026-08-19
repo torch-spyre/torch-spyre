@@ -42,6 +42,14 @@ inputs:
     description: How often (seconds) the stall watcher polls
     required: false
     default: '30'
+  card_release_timeout_secs:
+    description: >-
+      Grace period before retrying an attempt that failed because the AIU card
+      was still held (VFIO device busy). Longer than the plain retry backoff:
+      the holder is a leftover process from the previous attempt in this pod,
+      and the pod's VFIO devices are fixed at admission.
+    required: false
+    default: '60'
   junit_xml_path:
     description: Full path for the --junit-xml report (leave empty to skip)
     required: false
@@ -70,6 +78,7 @@ runs:
         MAX_ATTEMPTS: ${{ inputs.max_attempts }}
         STALL_TIMEOUT_SECS: ${{ inputs.stall_timeout_secs }}
         STALL_CHECK_INTERVAL: ${{ inputs.stall_check_interval }}
+        CARD_RELEASE_TIMEOUT_SECS: ${{ inputs.card_release_timeout_secs }}
       run: |-
         set +e
         set +o pipefail
@@ -123,6 +132,24 @@ runs:
         # Previous attempt's TEST_PID (also its PGID, via `set -m`); empty
         # until the first attempt has run.
         TEST_PID=""
+
+        # PIDs holding a /dev/vfio device, excluding this shell's own tree.
+        # Reads /proc directly: lsof/fuser are not guaranteed on the runner
+        # image, and this must never fail the job when it cannot tell.
+        _vfio_holder_pids() {
+          local pid comm found=""
+          for fd_dir in /proc/[0-9]*/fd; do
+            pid="${fd_dir#/proc/}"; pid="${pid%/fd}"
+            [[ "$pid" == "$$" ]] && continue
+            # Only report a device node under /dev/vfio (skip the container's
+            # own /dev/vfio/vfio group container fd, which is not a card).
+            if ls -l "$fd_dir" 2>/dev/null | grep -qE '/dev/vfio/[0-9]+'; then
+              comm="$(cat "/proc/$pid/comm" 2>/dev/null || echo '?')"
+              found="${found}${found:+ }${pid}(${comm})"
+            fi
+          done
+          printf '%s' "$found"
+        }
         while [[ $attempt -lt $MAX_ATTEMPTS ]]; do
           attempt=$(( attempt + 1 ))
           echo "=== Attempt ${attempt}/${MAX_ATTEMPTS}: ${{ inputs.suite_name }} ==="
@@ -134,6 +161,29 @@ runs:
             kill -KILL -- "$TEST_PID" "-$TEST_PID" 2>/dev/null || true
           fi
 
+          # A killed holder does not drop its VFIO fd synchronously: torchrun's
+          # per-rank children can outlive the PGID kill above, and a process
+          # blocked in a VFIO ioctl stays in D state until the driver returns.
+          # The pod's cards are fixed at admission, so retrying while one is
+          # still held is guaranteed to fail with RAS::VFIO::DeviceOpenFail.
+          # Wait for the fds to actually close before starting the next attempt.
+          if [[ $attempt -gt 1 ]]; then
+            _waited=0
+            while [[ $_waited -lt $CARD_RELEASE_TIMEOUT_SECS ]]; do
+              _holders="$(_vfio_holder_pids)"
+              [[ -z "$_holders" ]] && break
+              [[ $_waited -eq 0 ]] && echo "Waiting for AIU card release; still held by PID(s): ${_holders}"
+              sleep 2
+              _waited=$(( _waited + 2 ))
+            done
+            _holders="$(_vfio_holder_pids)"
+            if [[ -n "$_holders" ]]; then
+              echo "::warning::AIU card still held by PID(s) ${_holders} after ${CARD_RELEASE_TIMEOUT_SECS}s — attempt ${attempt} may fail to open the device"
+            elif [[ $_waited -gt 0 ]]; then
+              echo "AIU card released after ${_waited}s"
+            fi
+          fi
+
           LOG_FILE="$(mktemp /tmp/test_output_XXXXXX.log)"
           STALL_FLAG="$(mktemp /tmp/stall_flag_XXXXXX.tmp)"
 
@@ -142,6 +192,18 @@ runs:
             local prev_lines=0
             while [[ ! -f "${STALL_FLAG}.done" ]]; do
               sleep "$STALL_CHECK_INTERVAL"
+              # Once pytest has printed its terminal summary line the suite has
+              # finished executing; any silence after that is teardown, not a
+              # hang. Distributed suites are the motivating case: torchrun's
+              # elastic agent can linger silently after every rank passed, and
+              # counting that window as a stall kills a run that already passed
+              # (spurious exit 147). Stop watching as soon as a terminal summary
+              # appears; the parent's `wait "$TEST_PID"` (plus the bounded
+              # torchrun teardown in run_test.sh) collects the real exit code.
+              if grep -qE '^=+ (.*[0-9]+ (passed|failed|error|skipped|xfailed|xpassed|deselected)|no tests ran)' "$LOG_FILE" 2>/dev/null; then
+                echo "[stall-watcher] pytest summary seen — teardown may be quiet, stopping stall watch"
+                return
+              fi
               current_lines=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
               if [[ "$current_lines" -eq "$prev_lines" ]]; then
                 elapsed_stall=$(( elapsed_stall + STALL_CHECK_INTERVAL ))
@@ -213,6 +275,18 @@ runs:
             _PARALLEL_FLAG="--parallel"
           fi
 
+          # Print the exact command before running it. When run_test.sh fails
+          # early (e.g. "No YAML config file(s) found"), the log otherwise does
+          # not show what was actually passed, so the flag/config expansion is
+          # invisible. printf '%q' renders each word shell-quoted, so the line is
+          # copy-pasteable and cannot itself execute anything if a flag holds
+          # quotes or $(...). The unquoted vars split into words exactly as they
+          # do in the invocation below, so the printed and run word lists match.
+          printf '  command       :'
+          printf ' %q' env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" \
+            ${_PARALLEL_FLAG} ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} ${_XDIST_FLAG}
+          printf '\n'
+
           env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" ${_PARALLEL_FLAG} ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} ${_XDIST_FLAG} \
             >&"$FIFO_FD" 2>&1 &
           TEST_PID=$!
@@ -244,8 +318,16 @@ runs:
           fi
 
           echo "=== Attempt ${attempt} FAILED (exit=${TEST_EXIT}) ==="
+          # Backoff before the next attempt. Card contention needs longer than a
+          # plain rerun: the holder is a leftover process of the *previous*
+          # attempt inside this same pod, and the VFIO devices are fixed at pod
+          # admission, so there is no second card to fall back to.
+          _RETRY_SLEEP=10
           if grep -qE "ResponseTimeout|Exceeded max iterations|Fatal Python error: Aborted|LX logout" "$LOG_FILE"; then
             echo "    --> Hardware RAS timeout detected — will retry"
+          elif grep -qE 'RAS::VFIO::DeviceOpenFail|"code":"0x332b"|Device or resource busy' "$LOG_FILE"; then
+            echo "    --> Card still held (VFIO device busy) — will retry after ${CARD_RELEASE_TIMEOUT_SECS}s grace"
+            _RETRY_SLEEP=$CARD_RELEASE_TIMEOUT_SECS
           elif [[ $_STALLED_LAST_ATTEMPT -eq 1 ]]; then
             echo "    --> Stall detected — will retry with -n1 (xdist worker isolation)"
           else
@@ -253,7 +335,7 @@ runs:
           fi
 
           rm -f "$LOG_FILE" "$STALL_FLAG" "${STALL_FLAG}.done" "${STALL_FLAG}.stalled"
-          [[ $attempt -lt $MAX_ATTEMPTS ]] && sleep 10
+          [[ $attempt -lt $MAX_ATTEMPTS ]] && sleep "$_RETRY_SLEEP"
         done
 
         echo "=== All ${MAX_ATTEMPTS} attempts failed for ${{ inputs.suite_name }} ==="
