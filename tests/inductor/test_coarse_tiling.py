@@ -4351,7 +4351,7 @@ def _make_consumer_op(name, reads_buf):
 
 def _make_inside_consumer_op(name, reads_buf, loop_group_id):
     """Return a ComputedBuffer mock inside the same loop group that reads reads_buf."""
-    from torch._inductor.ir import ComputedBuffer, Pointwise
+    from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
 
     data = MagicMock(spec=Pointwise)
     data.ranges = [Integer(16)]
@@ -4359,6 +4359,12 @@ def _make_inside_consumer_op(name, reads_buf, loop_group_id):
 
     op = MagicMock(spec=ComputedBuffer)
     op.data = data
+    # Ordinary (non-mutation) layout, so _plan_tiling_propagation's
+    # isinstance(op.layout, MutationLayoutSHOULDREMOVE) check on this op
+    # resolves to False instead of raising AttributeError -- layout is an
+    # instance attribute ComputedBuffer sets in __init__, not a class
+    # attribute, so spec=ComputedBuffer alone doesn't expose it.
+    op.layout = MagicMock(spec=FixedLayout)
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
     op.loop_info = CoarseTileInfo(

@@ -1445,6 +1445,25 @@ def _target_device_layout(target, name: str):
     # candidate layouts on the TensorBox rather than a finalized committed_stl.
     graph_input = V.graph.graph_inputs.get(name)
     layouts = getattr(graph_input, "layouts", None)
+    if not layouts:
+        # Also check candidate layouts set by propagate_layouts on the producing
+        # ComputedBuffer (e.g. a constant-fill op that precedes the copy_forced).
+        # Exclude SpyreEmptyFallback and SpyreConstantFallback: those are
+        # synthetic buffers whose layouts must be derived from their first
+        # writer, not locked here. Only use this when the producer has a
+        # single unambiguous candidate: with multiple candidates, arbitrarily
+        # picking next(iter(...)) here would lock the mutation op (and
+        # everything downstream of it) onto one candidate even when the
+        # beam search needs the freedom to pick a different one -- mirrors
+        # the same single-candidate guard in the copy-back elision pass
+        # above.
+        buf = V.graph.get_buffer(name) if name else None
+        if buf is not None and not isinstance(
+            buf, (SpyreEmptyFallback, SpyreConstantFallback)
+        ):
+            buf_layouts = getattr(buf, "layouts", None)
+            if buf_layouts and len(buf_layouts) == 1:
+                layouts = buf_layouts
 
     if not layouts:
         return None

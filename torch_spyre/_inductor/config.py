@@ -139,12 +139,6 @@ core_id_k_fast_emission: bool = (
     os.environ.get("SPYRE_CORE_ID_K_FAST_EMISSION", "1") == "1"
 )
 
-# When True, disable PyTorch's remove_noop_ops elimination of aten.copy.default.
-# Required for WSR variants that intentionally insert copies (e.g. flash_v2)
-# inside WSR loops. Off by default — enabling this for models that don't need
-# it may prevent harmless copy removal and hurt performance.
-disable_copy_opt: bool = os.environ.get("DISABLE_COPY_OPT", "0") == "1"
-
 # When True (default), HBM tensor addresses are emitted as runtime symbols
 # with !sdscbundle.input_arg<index> parameters and input_arg_extract ops
 # in the bundle.mlir.

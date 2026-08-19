@@ -1264,10 +1264,66 @@ def lower_spyre_from_d2d(src, dst, src_off, dst_off):
     lowering.mutate_to(dst, src)
 
 
-@register_spyre_lowering(torch.ops.spyre.copy_)
-def lower_spyre_copy_(src, dst):
-    lowering.mutate_to(dst, src)
+@register_spyre_lowering(torch.ops.spyre.copy_forced)
+def lower_spyre_copy_forced(src, dst):
+    # Custom lowering for copy_forced to ensure it creates
+    # a mutation layout in all cases.  mutate_to()
+    # has multiple code paths and does not always
+    # mutate
+
+    src = lowering.to_dtype(src, dst.get_dtype())
+    src = lowering.expand(src, dst.get_size())
+
+    pw = Pointwise.create(
+        device=dst.get_device(),
+        dtype=dst.get_dtype(),
+        inner_fn=src.make_loader(),
+        ranges=list(dst.get_size()),
+    )
+
+    dst.realize()
+
+    buffer = ir.ComputedBuffer(
+        name=None,
+        layout=ir.MutationLayoutSHOULDREMOVE(dst),
+        data=pw.data.data,
+    )
+    buffer.name = V.graph.register_buffer(buffer)
+    V.graph.register_operation(buffer)
+
     return dst
+
+
+@register_spyre_lowering(torch.ops.spyre.opaque_copy_)
+def lower_spyre_opaque_copy_(value, acc):
+    # opaque_copy_ is functional at the FX/AOTAutograd level (see customops.py)
+    # so that assert_functional_graph never sees a mutation. The real
+    # mutating write into acc is introduced here, at lowering time, by
+    # building the same MutationLayoutSHOULDREMOVE(acc) buffer that
+    # lower_spyre_copy_forced builds for copy_forced. Everything downstream
+    # that keys off MutationLayoutSHOULDREMOVE (e.g. wsr/coarse_tile.py)
+    # treats this identically to a copy_forced write.
+    value = lowering.to_dtype(value, acc.get_dtype())
+    value = lowering.expand(value, acc.get_size())
+
+    pw = Pointwise.create(
+        device=acc.get_device(),
+        dtype=acc.get_dtype(),
+        inner_fn=value.make_loader(),
+        ranges=list(acc.get_size()),
+    )
+
+    acc.realize()
+
+    buffer = ir.ComputedBuffer(
+        name=None,
+        layout=ir.MutationLayoutSHOULDREMOVE(acc),
+        data=pw.data.data,
+    )
+    buffer.name = V.graph.register_buffer(buffer)
+    V.graph.register_operation(buffer)
+
+    return acc
 
 
 @register_spyre_lowering(torch.ops.spyre.overwrite)

@@ -411,7 +411,7 @@ def finalize_layouts(graph: GraphLowering) -> None:
             if isinstance(in_layout, MutationLayoutSHOULDREMOVE):
                 # Reading real_layout() through a mutation layout is only valid
                 # once the target buffer's own layout is a committed
-                # FixedTiledLayout. Two producers of this shape:
+                # FixedTiledLayout. Three producers of this shape:
                 #  - the copy-back elision optimization (propagate_layouts.py),
                 #    which stamps ELIDED_COPY_BACK_ATTR on the producer; or
                 #  - coarse_tile.py's nested output-dim + reduction-dim tiling
@@ -419,13 +419,20 @@ def finalize_layouts(graph: GraphLowering) -> None:
                 #    SpyreEmptyFallback accumulator (accum_tile) — a legitimate
                 #    in-group consumer (e.g. the next outer-tile iteration's
                 #    copy-in) reads that copy op's own output the same way an
-                #    ordinary producer's output would be read.
+                #    ordinary producer's output would be read; or
+                #  - coarse_tile.py's copy_out path for a MutationLayoutSHOULDREMOVE
+                #    op whose target is a locally-created graph-output buffer
+                #    (e.g. copy_forced(src, c) where c is returned directly) --
+                #    _insert_copy_op's inserted coarse_tile_copy_* op reads the
+                #    mutation op's own output the same way. The mutation target
+                #    there is an ordinary ComputedBuffer, not a SpyreEmptyFallback,
+                #    so this case is recognized by layout alone.
                 mutation_target = in_layout.get_buffer()
                 is_elided = getattr(input_buf, ELIDED_COPY_BACK_ATTR, False)
-                is_carry_into_accum = isinstance(
-                    mutation_target, SpyreEmptyFallback
-                ) and isinstance(mutation_target.get_layout(), FixedTiledLayout)
-                assert is_elided or is_carry_into_accum, (
+                is_committed_target = isinstance(
+                    mutation_target.get_layout(), FixedTiledLayout
+                )
+                assert is_elided or is_committed_target, (
                     f"unexpected mutation layout on {edge.dep.name}"
                 )
                 in_layout = in_layout.real_layout()
