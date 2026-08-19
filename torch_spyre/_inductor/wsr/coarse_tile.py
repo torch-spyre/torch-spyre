@@ -648,7 +648,7 @@ def _plan_tiling_propagation(
                             operations,
                             name_to_group_outer_key,
                         )
-                    except Exception:
+                    except (AttributeError, TypeError):
                         target_is_graph_input = False
                         target_is_output = False
                         mut_target = None
