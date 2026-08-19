@@ -1693,6 +1693,10 @@ Path(out_path).write_text(merged)
 print(f"[torch_oot_device_tests_run] Merged {len(shard_paths)} XML shard(s) -> {out_path}", flush=True)
 '
 
+# Command prefix _run_pytest_isolated applies to the pytest/torchrun invocation.
+# Empty for normal runs; the signal-retry path sets it to bound its re-run.
+_OOT_TIMEOUT_PREFIX=()
+
 # ---------------------------------------------------------------------------
 # _run_pytest_isolated <run_dir> <run_basename> <exit_tmp> <output_tmp> \
 #                      [pytest_args...]
@@ -1710,6 +1714,10 @@ _run_pytest_isolated() {
     local _dir="$1" _base="$2" _exit_tmp="$3" _out_tmp="$4"
     shift 4
     local _args=("$@")
+    # Empty unless the caller is the signal-retry path, which bounds its re-run
+    # against a wedged device (see _run_xdist_fallback). Normal runs are unbounded
+    # so a legitimately long suite is never cut short.
+    local _tmo=("${_OOT_TIMEOUT_PREFIX[@]+"${_OOT_TIMEOUT_PREFIX[@]}"}")
     (
         set +euo pipefail
         cd "$_dir"
@@ -1740,15 +1748,66 @@ _run_pytest_isolated() {
             # Create log directory
             mkdir -p "${_LOGDIR}"
 
-            # Run with split_output.sh wrapper
-            _run_cmd torchrun --nproc-per-node "$_NPROC" --no-python bash "${_dir}/split_output.sh" python3 -u -m pytest "$_base" "${_args[@]}"
+            # Run with split_output.sh wrapper.
+            #
+            # torchrun's elastic agent can keep running for a while AFTER every
+            # rank's pytest worker has already exited (rendezvous / c10d store
+            # teardown), emitting no stdout during that window. The run-test
+            # harness stall-watcher only sees "no new output" and, on a suite
+            # that has actually finished (e.g. "13 passed"), kills the whole
+            # process group at STALL_TIMEOUT_SECS and reports a spurious
+            # exit 147 for a run that passed. Bound the agent so a lingering
+            # teardown is reaped in seconds instead of stalling for minutes.
+            #
+            # The optional _tmo prefix is the signal-retry path's own tighter
+            # bound (empty on a normal run); the two nest and the inner one
+            # here bounds teardown for every distributed run.
+            #
+            # The limit only guards the POST-completion teardown: it is set far
+            # above any real distributed test runtime, and the harness
+            # stall-watcher still guards genuine mid-test hangs, so this never
+            # truncates a test that is doing work. timeout returns the child's
+            # own exit code when the child exits first, so a passing run stays
+            # passing; a real timeout surfaces as 124 (and --kill-after forces
+            # SIGKILL if the agent ignores SIGTERM).
+            _DIST_RUN_TIMEOUT="${TORCH_SPYRE_DIST_RUN_TIMEOUT:-30m}"
+            _DIST_KILL_AFTER="${TORCH_SPYRE_DIST_KILL_AFTER:-30s}"
+            _run_cmd "${_tmo[@]+"${_tmo[@]}"}" timeout --kill-after="${_DIST_KILL_AFTER}" "${_DIST_RUN_TIMEOUT}" \
+                torchrun --nproc-per-node "$_NPROC" --no-python bash "${_dir}/split_output.sh" python3 -u -m pytest "$_base" "${_args[@]}"
+
+            # split_output.sh tees only rank 0 to stdout, so on failure the
+            # non-zero ranks' output is the only record of the root cause --
+            # torchrun reports their exit code but not why (e.g. a card that
+            # failed to open). Emit them before the directory is removed.
+            if [[ "$(cat "$_exit_tmp" 2>/dev/null || echo 1)" != "0" ]]; then
+                for _rank_log in "${_LOGDIR}"/output-at-rank-*.txt; do
+                    [[ -f "$_rank_log" ]] || continue
+                    [[ "$_rank_log" == *output-at-rank-0.txt ]] && continue
+                    echo "===== BEGIN $(basename "$_rank_log") ====="
+                    cat "$_rank_log"
+                    echo "===== END $(basename "$_rank_log") ====="
+                done
+            fi
 
             # Clean up log directory
             rm -rf "${_LOGDIR}"
         else
             echo "[torch_oot_device_tests_run] Running serial test"
-            # Regular pytest for non-distributed tests
-            _run_cmd python3 -m pytest "$_base" "${_args[@]}"
+            # Regular pytest for non-distributed tests.
+            #
+            # Wall-clock cap. The harness stall-watcher only fires after N seconds
+            # of NO output, so a suite wedged while still emitting -- or stuck
+            # before pytest prints anything -- runs to GitHub's 6h job timeout and
+            # blocks the merge queue on an otherwise-green run. Set far above any
+            # real suite runtime, so a healthy run is never truncated; timeout
+            # passes the child's own exit code through when it exits first.
+            _SERIAL_RUN_TIMEOUT="${TORCH_SPYRE_SERIAL_RUN_TIMEOUT:-60m}"
+            _SERIAL_KILL_AFTER="${TORCH_SPYRE_SERIAL_KILL_AFTER:-30s}"
+            _serial_tmo=()
+            if [[ -n "$_SERIAL_RUN_TIMEOUT" ]] && command -v timeout >/dev/null 2>&1; then
+                _serial_tmo=(timeout --kill-after="$_SERIAL_KILL_AFTER" "$_SERIAL_RUN_TIMEOUT")
+            fi
+            _run_cmd "${_tmo[@]+"${_tmo[@]}"}" "${_serial_tmo[@]+"${_serial_tmo[@]}"}" python3 -m pytest "$_base" "${_args[@]}"
         fi
     ) || true
 }
@@ -1814,8 +1873,22 @@ _run_xdist_fallback() {
     local _xdist_args=("-n1" "${_extra[@]+"${_extra[@]}"}")
     [[ -n "$_shard_xml" ]] && _xdist_args+=("--junit-xml=${_shard_xml}")
 
+    # This retry re-runs on the SAME device that just killed pytest with a signal.
+    # When the cause is a wedged AIU card (VFIO/RAS stall) rather than a software
+    # crash, the re-run blocks on the device forever: no output, and on CI the
+    # /dev/vfio card stays locked for the whole outer job cap. Bound it so a dead
+    # card costs one shard instead of the pool. Override via OOT_FALLBACK_TIMEOUT
+    # (0 or "" disables); SIGKILL because a VFIO-blocked process ignores SIGTERM.
+    local _fb_timeout="${OOT_FALLBACK_TIMEOUT-15m}"
     local _xdist_out_tmp="/tmp/_spyre_xdist_out_${$}_$$.tmp"
+    if [[ -n "$_fb_timeout" && "$_fb_timeout" != "0" ]] && command -v timeout >/dev/null 2>&1; then
+        echo "[torch_oot_device_tests_run]     Retry bounded to ${_fb_timeout} (wedged-device guard)."
+        _OOT_TIMEOUT_PREFIX=("timeout" "--signal=KILL" "$_fb_timeout")
+    else
+        _OOT_TIMEOUT_PREFIX=()
+    fi
     _run_pytest_isolated "$_dir" "$_base" "$_exit_tmp" "$_xdist_out_tmp" "${_xdist_args[@]}"
+    _OOT_TIMEOUT_PREFIX=()
 
     local _xexit=139
     if [[ -f "$_exit_tmp" ]]; then
@@ -2675,6 +2748,11 @@ for i in "${!RUN_FILES[@]}"; do
     # triggered the fallback path below, which handles XML injection itself).
     if [[ -n "$_SHARD_XML" && -f "$_SHARD_XML" && $_exit -lt 128 ]]; then
         python3 -c "$_XML_INJECT_PY" "$_SHARD_XML" "$YAML_CONFIG" || true
+    elif [[ -n "$_SHARD_XML" && -f "$_SHARD_XML" && $_exit -ge 128 ]]; then
+        # Say so explicitly. Otherwise a signal exit is visible only as a MISSING
+        # "Tags injected" line for one shard, which reads as a hang in the injector
+        # rather than as pytest having been killed.
+        echo "[torch_oot_device_tests_run] XML tag injection SKIPPED for $(basename "$_SHARD_XML") (signal exit $_exit) — retrying below."
     fi
 
     # -----------------------------------------------------------------------
