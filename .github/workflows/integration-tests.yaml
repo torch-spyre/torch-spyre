@@ -99,11 +99,38 @@ on:
         required: false
         type: boolean
         default: true
+      clickhouse_env:
+        description: >-
+          Which ClickHouse instance the perf job's inline ingest writes to:
+          "dev" (the CLICKHOUSE_*_DEV secret set) or "prod" (the CLICKHOUSE_*
+          set). Defaults to dev so a manual/test dispatch never writes to the
+          production perf tables by accident. The scheduled/orchestrator
+          production perf run passes prod explicitly. A no-op when the selected
+          secret set is unset (the perf ingest step self-skips on empty host).
+        required: false
+        type: string
+        default: dev
 
 concurrency:
+  # PR-context runs (native pull_request, or workflow_dispatch carrying a
+  # pr_url_hash) key on the PR itself, so re-triggering the same PR cancels its
+  # own stale in-flight run -- unchanged from before.
+  #
+  # A non-PR dispatch (scheduled/main-push/nightly/weekly -- pr_url_hash empty)
+  # previously fell back to bare github.ref, so EVERY such dispatch of this
+  # workflow on the same ref shared one group regardless of test_type. Two
+  # unrelated dispatches landing close together (e.g. a nightly trunk run while
+  # a push-triggered trunk run is still going) then cancelled each other via
+  # cancel-in-progress, silently killing a run mid-job with no test failure and
+  # no error -- see the run/job-level symptoms this fixes. Disambiguating by
+  # test_type stops different suites from colliding at all.
   group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.html_url) || (github.event_name == 'workflow_dispatch'
-    && inputs.pr_url_hash != '' && inputs.pr_url_hash) || github.ref }}
-  cancel-in-progress: true
+    && inputs.pr_url_hash != '' && inputs.pr_url_hash) || format('{0}-{1}', github.ref, inputs.test_type) }}
+  # Only cancel for a PR-context run (re-running the same PR should supersede
+  # its own stale run). A non-PR dispatch is never "the same PR re-triggered" --
+  # cancelling it destroys a run that has nothing superseding it, so a same
+  # test_type/ref collision QUEUES behind the in-flight run instead of killing it.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.pr_url_hash != '') }}
 
 permissions:
   contents: read
@@ -151,6 +178,22 @@ jobs:
       repository: ${{ inputs.repository || '' }}
       test_type: ${{ inputs.test_type || 'integration' }}
       prebaked_image: ${{ inputs.prebaked_image }}
+    # ClickHouse connection for the perf job's inline benchmark ingest. Passed
+    # explicitly (not `secrets: inherit`) so only what _test_matrix declares is
+    # forwarded. Absent on a repo without these secrets => perf ingest no-ops.
+    #
+    # clickhouse_env selects the instance HERE (the only place both secret sets
+    # are readable): dev -> the *_DEV set, prod -> the plain set. _test_matrix
+    # stays instance-agnostic; it just receives "the ClickHouse to use". A secret
+    # context key must be a literal name, so this is a per-name ternary rather
+    # than a computed `secrets[...]` lookup. An unset selected secret forwards as
+    # empty and the perf ingest step self-skips.
+    secrets:
+      CLICKHOUSE_HOST: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_HOST || secrets.CLICKHOUSE_HOST_DEV }}
+      CLICKHOUSE_PORT: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_PORT || secrets.CLICKHOUSE_PORT_DEV }}
+      CLICKHOUSE_USER: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_USER || secrets.CLICKHOUSE_USER_DEV }}
+      CLICKHOUSE_PASS: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_PASS || secrets.CLICKHOUSE_PASS_DEV }}
+      CLICKHOUSE_DB: ${{ inputs.clickhouse_env == 'prod' && secrets.CLICKHOUSE_DB || secrets.CLICKHOUSE_DB_DEV }}
 
   # ----------------------------------------------------------------------------------
   # Fan-in gate job which is similar to run-spyre-unit-tests in torch_spyre_tests.yaml
