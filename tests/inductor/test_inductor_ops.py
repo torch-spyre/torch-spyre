@@ -7032,6 +7032,58 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(fn, q, k, v, attn_mask, is_causal, enable_gqa)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_sdpa_bf16_gqa_noncontiguous_query_pool_planning(self):
+        """Regression test for issue #3775: a bf16 GQA SDPA result with a
+        non-contiguous query (the `view(...).transpose(1, 2)` layout normal
+        transformer attention blocks produce) and an in-bundle consumer (the
+        trailing `+ 0`) previously returned finite but catastrophically wrong
+        values under HBM pool planning, because the SDPA output buffer's
+        cross-bundle allocation-dict aliasing was not detected as pool-
+        ineligible. Adapted from the standalone reproducer posted on PR #3707
+        by arielge, which traced this to 0/5 matching generation tokens on
+        Qwen2.5-1.5B in bf16."""
+        generator = torch.Generator().manual_seed(1337)
+        q_source = (
+            torch.randn((1, 64, 1536), dtype=torch.bfloat16, generator=generator) * 0.1
+        )
+        k_source = (
+            torch.randn((1, 64, 256), dtype=torch.bfloat16, generator=generator) * 0.1
+        )
+        v_source = (
+            torch.randn((1, 64, 256), dtype=torch.bfloat16, generator=generator) * 0.1
+        )
+        q = q_source.view(1, 64, 12, 128).transpose(1, 2)
+        k = k_source.view(1, 64, 2, 128).transpose(1, 2).contiguous()
+        v = v_source.view(1, 64, 2, 128).transpose(1, 2).contiguous()
+        mask = torch.zeros((1, 1, 64, 64), dtype=torch.bfloat16)
+        upper = torch.triu(torch.ones(64, 64, dtype=torch.bool), 1)
+        mask[:, :, upper] = torch.finfo(torch.bfloat16).min
+
+        def fn(q, k, v, mask):
+            attention = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=mask,
+                dropout_p=0.0,
+                scale=1 / 128**0.5,
+                enable_gqa=True,
+            )
+            return attention + 0
+
+        expected = fn(q, k, v, mask)
+        actual = torch.compile(fn, dynamic=False)(
+            q.to("spyre"), k.to("spyre"), v.to("spyre"), mask.to("spyre")
+        ).cpu()
+
+        expected = expected.float().flatten()
+        actual = actual.float().flatten()
+        cosine = F.cosine_similarity(actual, expected, dim=0).item()
+        assert torch.isfinite(actual).all() and cosine >= 0.99, (
+            f"cosine={cosine:.8f} max_abs={(actual - expected).abs().max().item():.8f}"
+        )
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_implicit_loading(self):
         def test(end, device=None):
             return torch.arange(end, device=device, dtype=torch.float16)
