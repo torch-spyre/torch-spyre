@@ -35,7 +35,6 @@ void JobPlanStepH2D::construct(LaunchContext&,
       flex::createDmaParams(host_address_, device_address_.total_size(),
                             /*to_device=*/true, &device_address_);
   params->pipeline_barrier = pipeline_barrier_;
-  params->skip_hazard = false;
   stream.launchH2D(params);
   flex::destroyDmaParams(params);
 }
@@ -57,7 +56,6 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
         flex::createDmaParams(host_address_, device_address.total_size(),
                               /*to_device=*/false, &device_address);
     params->pipeline_barrier = pipeline_barrier_;
-    params->skip_hazard = false;
     stream.launchD2H(params);
     flex::destroyDmaParams(params);
   } else {
@@ -91,7 +89,6 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
         flex::createDmaParams(host_address_, device_address->total_size(),
                               /*to_device=*/false, device_address.get());
     params->pipeline_barrier = pipeline_barrier_;
-    params->skip_hazard = false;
     params->callback = [device_address](void*) {};
     stream.launchD2H(params);
     flex::destroyDmaParams(params);
@@ -126,7 +123,6 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
   auto* params = flex::createComputeParams(
       &program_address_, std::move(tensor_allocs), name_, bootstrap_offset_);
   params->pipeline_barrier = pipeline_barrier_;
-  params->skip_hazard = false;
   stream.launchCompute(params);
   flex::destroyComputeParams(params);
 }
