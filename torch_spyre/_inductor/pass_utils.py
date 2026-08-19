@@ -42,7 +42,7 @@ from torch_spyre._inductor.op_spec import IndirectAccess
 from . import config
 from .core_mapping import core_to_slice_mapping
 from .constants import ELIDED_COPY_BACK_ATTR, MATMUL_REDUCTION_OPS
-from .ir import FixedTiledLayout, SpyreConstantFallback, SpyreEmptyFallback
+from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
 from .provenance import preserve_provenance
@@ -62,8 +62,8 @@ def _fixed_read_layout(buf) -> "FixedTiledLayout":
     layout = buf.get_layout()
     if isinstance(layout, MutationLayoutSHOULDREMOVE):
         # Reading real_layout() through a mutation layout is only valid once
-        # the target buffer's own layout is a committed FixedTiledLayout. Two
-        # producers of this shape:
+        # the target buffer's own layout is a committed FixedTiledLayout.
+        # Three producers of this shape:
         #  - the copy-back elision optimization (propagate_layouts.py), which
         #    stamps ELIDED_COPY_BACK_ATTR on the producer; or
         #  - coarse_tile.py's nested output-dim + reduction-dim tiling
@@ -71,13 +71,18 @@ def _fixed_read_layout(buf) -> "FixedTiledLayout":
         #    SpyreEmptyFallback accumulator (accum_tile) — a legitimate
         #    in-group consumer (e.g. the next outer-tile iteration's copy-in)
         #    reads that copy op's own output the same way an ordinary
-        #    producer's output would be read.
+        #    producer's output would be read; or
+        #  - coarse_tile.py's copy_out path for a MutationLayoutSHOULDREMOVE op
+        #    whose target is a locally-created graph-output buffer (e.g.
+        #    copy_forced(src, c) where c is returned directly) -- _insert_copy_op's
+        #    inserted coarse_tile_copy_* op reads the mutation op's own output
+        #    the same way. The mutation target there is an ordinary
+        #    ComputedBuffer, not a SpyreEmptyFallback, so this case is
+        #    recognized by layout alone.
         mutation_target = layout.get_buffer()
         is_elided = getattr(buf, ELIDED_COPY_BACK_ATTR, False)
-        is_carry_into_accum = isinstance(
-            mutation_target, SpyreEmptyFallback
-        ) and isinstance(mutation_target.get_layout(), FixedTiledLayout)
-        if not (is_elided or is_carry_into_accum):
+        is_committed_target = isinstance(mutation_target.get_layout(), FixedTiledLayout)
+        if not (is_elided or is_committed_target):
             raise RuntimeError(f"unexpected mutation layout on read buffer {buf}")
         layout = layout.real_layout()
     if not isinstance(layout, FixedTiledLayout):
