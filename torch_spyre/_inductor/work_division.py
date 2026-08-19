@@ -41,7 +41,7 @@ from torch._inductor.graph import GraphLowering
 from torch_spyre._C import ElementArrangement
 
 from .errors import Unsupported
-from .constants import BATCH_MATMUL_OP, DEVICE_NAME, TOPK_OPS, BATCH_MATMUL_FP8_OP
+from .constants import BATCH_MATMUL_OP, DEVICE_NAME, BATCH_MATMUL_FP8_OP
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
@@ -52,6 +52,7 @@ from .pass_utils import (
     get_mem_deps_from_rw,
     device_coordinates,
     iteration_space_from_op,
+    is_topk,
     splits_by_index_coeff,
     apply_splits_from_index_coeff,
     op_read_writes,
@@ -704,7 +705,7 @@ def enumerate_work_division_candidates(
     # work division where HBM bandwidth can saturate compute.
 
     it_space = iteration_space_from_op(op)
-    is_topk = isinstance(op.data, Reduction) and op.data.reduction_type in TOPK_OPS
+    op_is_topk = is_topk(op)
 
     input_tds, output_td = collect_tensor_deps(
         op, get_mem_deps_from_rw(op_read_writes(op))
@@ -722,7 +723,7 @@ def enumerate_work_division_candidates(
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
 
     topk_k_sym = None
-    if is_topk:
+    if op_is_topk:
         output_dims, _ = prioritize_dimensions(output_td, it_space_adjusted)
         topk_k_sym = _find_topk_k_symbol(output_dims, input_tds)
 
@@ -744,7 +745,7 @@ def enumerate_work_division_candidates(
     # Per-dim candidate factors, mirroring must_split_vars.valid_splits but with
     # no ``>= current_min`` floor (we want the full set, including 1).
     def factors(v: Symbol) -> list[int]:
-        if is_topk and v == topk_k_sym:
+        if op_is_topk and v == topk_k_sym:
             k_val = concretize_expr(it_space[v])
             return _topk_valid_k_splits(k_val, max_cores) or [1]
         if v in symbol_meta:

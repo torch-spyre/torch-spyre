@@ -41,7 +41,7 @@ from torch_spyre._inductor.op_spec import IndirectAccess
 
 from . import config
 from .core_mapping import core_to_slice_mapping
-from .constants import ELIDED_COPY_BACK_ATTR, MATMUL_REDUCTION_OPS
+from .constants import ELIDED_COPY_BACK_ATTR, MATMUL_REDUCTION_OPS, TOPK_OPS
 from .ir import FixedTiledLayout, SpyreConstantFallback, SpyreEmptyFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
@@ -1591,6 +1591,15 @@ def _is_matmul_op(op: Operation) -> bool:
     )
 
 
+def is_topk(op: Operation) -> bool:
+    """Return True iff ``op`` is a ``ComputedBuffer`` computing a topk reduction."""
+    return (
+        isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Reduction)
+        and op.data.reduction_type in TOPK_OPS
+    )
+
+
 # TODO: Select and store the core mapping before LX planning, then pass the
 # winning mapping to codegen.
 class _ViewPrep(NamedTuple):
@@ -1654,6 +1663,10 @@ def _prepare_per_core_view(
     buf_layout = buf_op.layout
     if not isinstance(buf_layout, FixedTiledLayout):
         return None
+
+    if is_topk(op):
+        return None
+
     dev_layout = buf_layout.device_layout
     device_size = dev_layout.device_size
     stride_map = dev_layout.stride_map
@@ -1712,6 +1725,7 @@ def _per_core_view_from_prep(
     # can't be placed on a device dim); cross-op view comparisons must treat it
     # as "no match", since its empty view means "couldn't tell", not "whole".
     unrepresentable = (PerCoreView(work_slice_dims=(), core_to_slot=()), False, False)
+
     # No real split -> whole-buffer view, representable regardless of layout. Must
     # precede the ``prep is None`` guard to match the original ordering.
     if not any(n > 1 for d in coeff_splits for n in d.values()):

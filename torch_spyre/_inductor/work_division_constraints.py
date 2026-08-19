@@ -35,7 +35,7 @@ from torch_spyre._C import ElementArrangement
 
 from .constants import BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP
 from .errors import Unsupported
-from .pass_utils import concretize_expr, indirect_info_from_op, op_read_writes
+from .pass_utils import concretize_expr, indirect_info_from_op, is_topk, op_read_writes
 from .logging_utils import get_inductor_logger
 from . import config
 
@@ -241,11 +241,7 @@ def topk_pinned_search_space_vars(ctx: WorkDivConstraintContext) -> ConstraintRe
     the top-k results. Splitting the search-space would require merging
     partial top-k results across cores, which the hardware does not support.
     """
-    from .constants import TOPK_OPS
-
-    if not isinstance(ctx.op.data, Reduction):
-        return ConstraintResult()
-    if ctx.op.data.reduction_type not in TOPK_OPS:
+    if not is_topk(ctx.op):
         return ConstraintResult()
 
     return ConstraintResult(pinned={v: 1 for v in ctx.reduction_vars})
@@ -260,12 +256,9 @@ def topk_k_split_constraint(ctx: WorkDivConstraintContext) -> ConstraintResult:
     work_distribution planner picks the minimal k-split rather than a
     larger one that leaves more cores for other dims.
     """
-    from .constants import TOPK_OPS
     from sympy import divisors
 
-    if not isinstance(ctx.op.data, Reduction):
-        return ConstraintResult()
-    if ctx.op.data.reduction_type not in TOPK_OPS:
+    if not is_topk(ctx.op):
         return ConstraintResult()
 
     # Find k's symbol (output dim absent from every input's device coords).
