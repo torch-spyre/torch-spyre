@@ -46,7 +46,8 @@ and dispatched from `CustomPreSchedulingPasses` in
 [passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py).
 
 The planner only sees ops whose IR data is `Pointwise` or `Reduction`
-(and excluding TopK reductions, which return early). `FallbackKernel`,
+(TopK reductions use dedicated constraints; see [TopK work
+division](#topk-work-division)). `FallbackKernel`,
 `ExternKernel`, `SpyreConstantFallback`, and `SpyreEmptyFallback`
 allocation kernels are filtered out earlier and never reach the passes.
 
@@ -415,6 +416,22 @@ may include at most one reduction variable. If more than one reduction
 variable would have to be split to satisfy the 255.996 MiB span limit, the
 compiler raises an error.
 
+(topk-work-division)=
+
+## TopK work division
+
+TopK reductions use constraint-based work division:
+
+1. **k is split, capped at 4 rows per core.** The hardware can only produce
+   up to 4 top-k rows per core, so the smallest divisor `d` of `k` with
+   `k / d <= 4` is chosen. If no valid divisor exists within max_cores, the
+   compiler raises `Unsupported`.
+2. **The search-space dimension is never split.** The dimension being
+   searched (the `dim` argument to `torch.topk`) must stay whole on one core.
+
+Other output/batch dimensions are distributed across the remaining core budget
+under the constraint that total cores used is `k_cores * product(other_dims) <= max_cores`.
+
 ## Worked example: large matmul on 32 cores
 
 Take a single matmul with `A: [8192, 32768]`, `W: [32768, 4096]`,
@@ -591,8 +608,8 @@ annotations and use the automatic work-distribution planner.
   the requested component yet.
 - Only `Pointwise` and `Reduction` IR nodes are dispatched for work
   division. `ExternKernel` and `FallbackKernel` nodes are skipped.
-- TOPK reductions currently run single-core, so `work_div` hints on TOPK
-  operations are ignored with a warning.
+- TopK reductions use constraint-based work division, so `work_div` hints
+  are not supported for TopK operations.
 - Each pass plans one op at a time. Adjacent ops can pick incompatible
   per-core splits for a shared tensor, which the LX scratchpad planner
   then treats as a core-division mismatch.

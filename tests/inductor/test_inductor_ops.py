@@ -1217,8 +1217,51 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     4,
                     0,
                 ),
-                # "2d_k4_dim0_lessthanstick": (unique_randn_along_dim((8, 32), dim=0), 4, 0),
-                # "2d_k4_dim_minusone_lessthanstick": (unique_randn_along_dim((1, 32), dim=-1), 4, -1),
+                "2d_k8_dim0": (
+                    unique_randn_along_dim((256, 256), dim=0),
+                    8,
+                    0,
+                ),
+                "2d_k32_dim0": (
+                    unique_randn_along_dim((256, 32), dim=0, dtype=torch.float32),
+                    32,
+                    0,
+                ),
+                "3d_k12_dim1": (
+                    unique_randn_along_dim((2, 64, 32), dim=1, dtype=torch.float32),
+                    12,
+                    1,
+                ),
+                "3d_k20_dim1": (
+                    unique_randn_along_dim((6, 256, 32), dim=1, dtype=torch.float32),
+                    20,
+                    1,
+                ),
+                "4d_k32_dim2": (
+                    unique_randn_along_dim((2, 8, 128, 32), dim=2, dtype=torch.float32),
+                    32,
+                    2,
+                ),
+                "2d_k8_dim_0_fp16": (
+                    unique_randn_along_dim((32, 192), dim=0),
+                    8,
+                    0,
+                ),
+                "3d_k16_dim_1_fp16": (
+                    unique_randn_along_dim((4, 64, 192), dim=1),
+                    16,
+                    1,
+                ),
+                "4d_k10_dim2_fp16": (
+                    unique_randn_along_dim((2, 4, 64, 64), dim=2),
+                    10,
+                    2,
+                ),
+                "2d_k128_dim_0": (
+                    unique_randn_along_dim((256, 64), dim=0),
+                    128,
+                    0,
+                ),
             },
         },
         ("test_reduce_keepdim0", "test_reduce_keepdim0_cpu"): {
@@ -6011,6 +6054,17 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         with pytest.raises(Exception, match="Unsupported"):
             _compile_and_run(
                 lambda x: torch.topk(x, 4, dim=0, largest=False)[0],
+                [x],
+                "spyre",
+            )
+
+    def test_topk_unsplittable_k_rejected(self):
+        # k=35's divisors are 1, 5, 7, 35: none give k // d <= 4 with
+        # d <= SENCORES (32), so no valid multi-core split exists.
+        x = unique_randn_along_dim((64, 35), dim=-1)
+        with pytest.raises(Exception, match="Unsupported"):
+            _compile_and_run(
+                lambda x: torch.topk(x, 35, dim=-1)[0],
                 [x],
                 "spyre",
             )

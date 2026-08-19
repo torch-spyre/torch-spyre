@@ -275,6 +275,18 @@ runs:
             _PARALLEL_FLAG="--parallel"
           fi
 
+          # Print the exact command before running it. When run_test.sh fails
+          # early (e.g. "No YAML config file(s) found"), the log otherwise does
+          # not show what was actually passed, so the flag/config expansion is
+          # invisible. printf '%q' renders each word shell-quoted, so the line is
+          # copy-pasteable and cannot itself execute anything if a flag holds
+          # quotes or $(...). The unquoted vars split into words exactly as they
+          # do in the invocation below, so the printed and run word lists match.
+          printf '  command       :'
+          printf ' %q' env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" \
+            ${_PARALLEL_FLAG} ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} ${_XDIST_FLAG}
+          printf '\n'
+
           env ${_DTLOG_PREFIX} bash tests/run_test.sh "$CONFIG" ${_PARALLEL_FLAG} ${{ inputs.extra_test_flags }} ${_SLOW_FLAG} ${_JUNIT_FLAG} ${_XDIST_FLAG} \
             >&"$FIFO_FD" 2>&1 &
           TEST_PID=$!

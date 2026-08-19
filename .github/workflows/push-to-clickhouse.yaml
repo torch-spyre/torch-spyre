@@ -112,8 +112,22 @@ jobs:
             .github/scripts/ingest_xml.py
           sparse-checkout-cone-mode: false
 
+      # actions4gh/setup-gh@v1.0.2 extracts the gh tarball but never lands
+      # the binary on PATH before it calls `gh auth login`, so every job
+      # fails with "spawn gh ENOENT" (upstream actions4gh/setup-gh#7, #11,
+      # unresolved). Install gh directly instead; downstream steps already
+      # set GH_TOKEN, which `gh` picks up implicitly, so no `gh auth login`
+      # call is needed here.
       - name: Setup the GitHub CLI
-        uses: actions4gh/setup-gh@v1.0.2
+        env:
+          GH_CLI_VERSION: 2.97.0
+        run: |
+          curl -fsSL \
+            "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.tar.gz" \
+            -o "${RUNNER_TEMP}/gh-cli.tar.gz"
+          mkdir -p "${RUNNER_TEMP}/gh-cli"
+          tar -xzf "${RUNNER_TEMP}/gh-cli.tar.gz" -C "${RUNNER_TEMP}/gh-cli" --strip-components=1
+          echo "${RUNNER_TEMP}/gh-cli/bin" >> "${GITHUB_PATH}"
 
       - name: Resolve PR number
         id: resolve-pr
@@ -133,15 +147,23 @@ jobs:
       # name — a `select(.name | endswith(".xml"))` here dropped every artifact.
       # The ingest step globs *.xml in the unzip dir, so non-XML files that come
       # along are simply ignored.
+      #
+      # `--paginate` is required: the artifacts endpoint defaults to 30 per
+      # page, and a run with more jobs than that (e.g. the model-ops-tests /
+      # integration-tests matrices) silently lost every artifact past the
+      # first page, with no error — rows just never showed up in ClickHouse.
+      # `--paginate` applies `--jq` per page, so `--slurp` collects the raw
+      # per-page responses into an array first; the filter then flattens
+      # `.artifacts[]` across all of them.
       # ---------------------------------------------------------------------------
       - name: List artifacts from triggering run
         id: list-artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ARTIFACTS=$(gh api \
-            "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/artifacts" \
-            --jq '[.artifacts[] | {id: .id, name: .name}]')
+          ARTIFACTS=$(gh api --paginate --slurp \
+            "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/artifacts?per_page=100" \
+            --jq '[.[] | .artifacts[] | {id: .id, name: .name}]')
           echo "artifacts=$ARTIFACTS" >> "$GITHUB_OUTPUT"
           echo "Found artifacts:"
           echo "$ARTIFACTS" | python3 -c "import json,sys; [print(' •', a['name']) for a in json.load(sys.stdin)]"

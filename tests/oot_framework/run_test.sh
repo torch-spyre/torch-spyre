@@ -1793,8 +1793,21 @@ _run_pytest_isolated() {
             rm -rf "${_LOGDIR}"
         else
             echo "[torch_oot_device_tests_run] Running serial test"
-            # Regular pytest for non-distributed tests
-            _run_cmd "${_tmo[@]+"${_tmo[@]}"}" python3 -m pytest "$_base" "${_args[@]}"
+            # Regular pytest for non-distributed tests.
+            #
+            # Wall-clock cap. The harness stall-watcher only fires after N seconds
+            # of NO output, so a suite wedged while still emitting -- or stuck
+            # before pytest prints anything -- runs to GitHub's 6h job timeout and
+            # blocks the merge queue on an otherwise-green run. Set far above any
+            # real suite runtime, so a healthy run is never truncated; timeout
+            # passes the child's own exit code through when it exits first.
+            _SERIAL_RUN_TIMEOUT="${TORCH_SPYRE_SERIAL_RUN_TIMEOUT:-60m}"
+            _SERIAL_KILL_AFTER="${TORCH_SPYRE_SERIAL_KILL_AFTER:-30s}"
+            _serial_tmo=()
+            if [[ -n "$_SERIAL_RUN_TIMEOUT" ]] && command -v timeout >/dev/null 2>&1; then
+                _serial_tmo=(timeout --kill-after="$_SERIAL_KILL_AFTER" "$_SERIAL_RUN_TIMEOUT")
+            fi
+            _run_cmd "${_tmo[@]+"${_tmo[@]}"}" "${_serial_tmo[@]+"${_serial_tmo[@]}"}" python3 -m pytest "$_base" "${_args[@]}"
         fi
     ) || true
 }
