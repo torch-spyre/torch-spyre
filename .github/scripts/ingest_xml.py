@@ -62,9 +62,13 @@ def _opt_float(d: dict, key: str):
 #  BENCHMARK XML detection & parsing
 # ---------------------------------------------------------------------------
 
-# Pattern:  perf_{op_name}_{metric}_ms_{input_shapes}
+# Pattern:  perf_{op_name}_{metric}_{ms|MB}_{input_shapes}
+# `compiler?` accepts both spellings the perf suite emits: op reports label the
+# row "compiler_ms", Granite reports "compile_ms".
 _PERF_NAME_RE = re.compile(
-    r"^perf_(?P<op>.+?)_(?P<metric>wall_clock|cpu|spyre|kernel|memory_transfer)_ms(?:_(?P<shapes>.+))?$"
+    r"^perf_(?P<op>.+?)"
+    r"_(?P<metric>wall_clock|cpu|spyre|kernel|memory_transfer|runtime|compiler?|mem_size)"
+    r"_(?:ms|MB)(?:_(?P<shapes>.+))?$"
 )
 
 _GRANITE_CONFIG_RE = re.compile(r"bs(?P<batch_size>\d+)(?:_pl(?P<prompt_length>\d+))?")
@@ -100,7 +104,7 @@ def parse_benchmark_xml(
     """
     Parse a performance-benchmark XML into (run_meta, list[benchmark_row]).
 
-    Groups the 5 per-op-shape metric cases into one perf_benchmarks row each,
+    Groups the per-op-shape metric cases into one perf_benchmarks row each,
     pivoting the metric values into the appropriate columns.
 
     Returns:
@@ -143,6 +147,8 @@ def parse_benchmark_xml(
             continue
         op = m.group("op")
         metric = m.group("metric")
+        if metric == "compiler":  # normalise the op-report spelling to Granite's
+            metric = "compile"
         shapes = m.group("shapes") or ""
         groups[(op, shapes)][metric] = tc
 
@@ -175,6 +181,20 @@ def parse_benchmark_xml(
         mem_ms = None
         if "memory_transfer" in metric_cases:
             mem_ms = float(metric_cases["memory_transfer"].get("time", 0) or 0)
+
+        compile_ms = None
+        if "compile" in metric_cases:
+            compile_ms = float(metric_cases["compile"].get("time", 0) or 0)
+
+        runtime_ms = None
+        if "runtime" in metric_cases:
+            runtime_ms = float(metric_cases["runtime"].get("time", 0) or 0)
+
+        # mem_size is a footprint in MB, not a duration, but it still travels in
+        # the testcase `time` attribute like every other metric.
+        mem_size_mb = None
+        if "mem_size" in metric_cases:
+            mem_size_mb = float(metric_cases["mem_size"].get("time", 0) or 0)
 
         # torch_spyre_ms lives in tags of individual cases
         torch_spyre_ms = _opt_float(tags, "torch_spyre_ms")
@@ -223,6 +243,9 @@ def parse_benchmark_xml(
                 "spyre_ms": spyre_ms,
                 "kernel_mean_ms": kernel_ms,
                 "memory_transfer_mean_ms": mem_ms,
+                "compile_ms": compile_ms,
+                "runtime_ms": runtime_ms,
+                "mem_size_mb": mem_size_mb,
                 "pt_util_percent": pt_util,
                 "num_runs": num_runs_int,
                 "custom_op_file": None,
@@ -384,6 +407,36 @@ def insert_benchmark_run(client, run_id: int, run_meta: dict) -> None:
     )
 
 
+_PERF_BENCHMARK_COLUMNS = [
+    "benchmark_id",
+    "run_id",
+    "record_type",
+    "operation_name",
+    "config_name",
+    "input_shapes",
+    "batch_size",
+    "prompt_length",
+    "run_mode",
+    "total_duration_ms",
+    "cpu_ms",
+    "spyre_ms",
+    "kernel_mean_ms",
+    "memory_transfer_mean_ms",
+    "compile_ms",
+    "runtime_ms",
+    "mem_size_mb",
+    "pt_util_percent",
+    "num_runs",
+    "custom_op_file",
+    "regression_status",
+    "created_at",
+]
+
+# Added to perf_benchmarks by a spyre-dashboard migration, which deploys
+# independently of this script. See insert_perf_benchmarks.
+_PERF_BENCHMARK_OPTIONAL_COLUMNS = ("compile_ms", "runtime_ms", "mem_size_mb")
+
+
 def _absent_columns(client, table: str, columns) -> set[str]:
     rows = client.query(
         "SELECT name FROM system.columns "
@@ -406,53 +459,36 @@ def _table_exists(client, table: str) -> bool:
 def insert_perf_benchmarks(client, run_id: int, benchmarks: list[dict]) -> None:
     if not benchmarks:
         return
+
+    columns = list(_PERF_BENCHMARK_COLUMNS)
+
+    # Drop the op-cost columns rather than failing when the migration adding them
+    # has not been applied to this database. The benchmark_runs row is already
+    # committed by now and the dedup check keys on it, so raising here would skip
+    # the run on every retry and lose its metrics for good.
+    absent = _absent_columns(
+        client, "perf_benchmarks", _PERF_BENCHMARK_OPTIONAL_COLUMNS
+    )
+    if absent:
+        print(
+            f"  [warn] perf_benchmarks has no {', '.join(sorted(absent))} — "
+            f"storing this run without them. Apply the spyre-dashboard migration "
+            f"to capture them.",
+            file=sys.stderr,
+        )
+        columns = [c for c in columns if c not in absent]
+
+    def cell(b: dict, column: str):
+        if column == "run_id":
+            return run_id
+        if column == "created_at":
+            return b["created_at"].replace(tzinfo=None)
+        return b[column]
+
     client.insert(
         "perf_benchmarks",
-        [
-            [
-                b["benchmark_id"],
-                run_id,
-                b["record_type"],
-                b["operation_name"],
-                b["config_name"],
-                b["input_shapes"],
-                b["batch_size"],
-                b["prompt_length"],
-                b["run_mode"],
-                b["total_duration_ms"],
-                b["cpu_ms"],
-                b["spyre_ms"],
-                b["kernel_mean_ms"],
-                b["memory_transfer_mean_ms"],
-                b["pt_util_percent"],
-                b["num_runs"],
-                b["custom_op_file"],
-                b["regression_status"],
-                b["created_at"].replace(tzinfo=None),
-            ]
-            for b in benchmarks
-        ],
-        column_names=[
-            "benchmark_id",
-            "run_id",
-            "record_type",
-            "operation_name",
-            "config_name",
-            "input_shapes",
-            "batch_size",
-            "prompt_length",
-            "run_mode",
-            "total_duration_ms",
-            "cpu_ms",
-            "spyre_ms",
-            "kernel_mean_ms",
-            "memory_transfer_mean_ms",
-            "pt_util_percent",
-            "num_runs",
-            "custom_op_file",
-            "regression_status",
-            "created_at",
-        ],
+        [[cell(b, c) for c in columns] for b in benchmarks],
+        column_names=columns,
     )
 
 
@@ -938,6 +974,17 @@ def main():
                 xml_path, args.workflow, args.run_id, args.platform
             )
             if run_meta is None:
+                continue
+
+            # A perf run uploads report.xml alongside the spyre/cpu kernel-report
+            # XMLs. Those kernel reports are benchmark XMLs (classname carries
+            # "benchmark") but their testcase names do not match _PERF_NAME_RE, so
+            # they parse to zero rows. Inserting a run header for them creates an
+            # empty benchmark_runs entry that shows as a "run" with 0 ops/models on
+            # the dashboard. Skip the header when there is nothing to record; the
+            # kernel timings are already folded into report.xml's kernel_mean_ms.
+            if not benchmarks:
+                print(f"  No benchmark records in {xml_path.name} — skipping header")
                 continue
 
             # Deduplication: skip if source_file already in benchmark_runs
