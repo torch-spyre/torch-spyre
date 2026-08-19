@@ -23,16 +23,16 @@ Tests cover:
 
 import pytest
 import torch
-
 from torch._inductor.exc import InductorError
+from utils_inductor import (
+    cached_randn,
+    compare_with_pytorch,
+)
+
 from torch_spyre._inductor.constants import (
     FP8_E4M3FN_MAX,
     FP8_E4M3FN_MIN,
     QUANTSCALEPERTOKENFP8_CLIP_MIN_VALUE,
-)
-from utils_inductor import (
-    cached_randn,
-    compare_with_pytorch,
 )
 
 # Maximum spacing between adjacent representable values in FP8 E4M3

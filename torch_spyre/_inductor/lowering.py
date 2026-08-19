@@ -13,18 +13,26 @@
 # limitations under the License.
 
 
+import logging
 import math
+import threading
 from contextlib import contextmanager
+from typing import Any, Callable, Union
 from warnings import warn
 
 import sympy
 import torch
-
-from torch._inductor.ir import Reduction, Pointwise, StorageBox
-import torch._inductor.lowering as lowering
 import torch._inductor.ir as ir
-from typing import Any, Callable, Union
+import torch._inductor.lowering as lowering
+from torch._inductor.ir import Pointwise, Reduction, StorageBox
+from torch._inductor.virtualized import V
+from torch.utils._ordered_set import OrderedSet
 
+import torch_spyre._inductor.customops  # noqa: F401
+from torch_spyre._C import get_elem_in_stick
+from torch_spyre.ops.fallbacks import fallback_ops
+
+from . import config
 from .constants import (
     AVGPOOL2D_OP,
     BATCH_MATMUL_FP8_OP,
@@ -37,26 +45,17 @@ from .constants import (
     QUANTSCALEPERTOKENFP8_CLIP_MIN,
     QUANTSCALEPERTOKENFP8_OP,
 )
-from . import config
-import torch_spyre._inductor.customops  # noqa: F401
-import torch_spyre._inductor.distributed.spyre_library  # noqa: F401
-from torch_spyre.ops.fallbacks import fallback_ops
+from .errors import Unsupported
 from .ir import (
-    SpyreReduction,
-    SpyreConstantFallback,
-    SpyreEmptyFallback,
-    BroadcastAsyncFallback,
-    WaitWorkFallback,
     AllGatherAsyncFallback,
     AllReduceAsyncFallback,
+    BroadcastAsyncFallback,
+    SpyreConstantFallback,
+    SpyreEmptyFallback,
+    SpyreReduction,
+    WaitWorkFallback,
 )
-from torch_spyre._C import get_elem_in_stick
-from torch._inductor.virtualized import V
-from torch.utils._ordered_set import OrderedSet
-from .errors import Unsupported
-import threading
 from .logging_utils import get_inductor_logger
-import logging
 
 logger = get_inductor_logger("lowering")
 
@@ -1875,8 +1874,8 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3FN_MAX):
     """
     if x.get_size() == [] or len(x.get_size()) < 1:
         raise ValueError(
-            f"quantscalepertokenfp8 requires input with at least 1 dimension "
-            f"(the hidden dim to reduce), got a scalar (ndim=0)."
+            "quantscalepertokenfp8 requires input with at least 1 dimension "
+            "(the hidden dim to reduce), got a scalar (ndim=0)."
         )
 
     # Validate scale_ub: must be a finite positive value whose reciprocal

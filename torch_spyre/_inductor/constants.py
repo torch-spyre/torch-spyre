@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import torch
+
 from torch_spyre._C import ElementArrangement
 
 BATCH_MATMUL_OP = "batchmatmul"

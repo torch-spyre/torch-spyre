@@ -20,9 +20,8 @@ from typing import Any
 from sympy import Expr, Integer, Symbol
 from torch._inductor.virtualized import V
 
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor import config as _spyre_config
-from torch_spyre._C import ElementArrangement
 from torch_spyre._inductor.constants import (
     CONV2D_DIM_LABELS,
     CONV2D_FWD_OP,

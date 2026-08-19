@@ -13,15 +13,17 @@
 # limitations under the License.
 
 from typing import Optional, Sequence
+
 import torch
 import torch._dynamo
 import torch._higher_order_ops.effects
-from torch._inductor.fx_passes.reinplace import inplaceable_ops, InplaceableOp
+from torch._inductor.fx_passes.reinplace import InplaceableOp, inplaceable_ops
+
 from torch_spyre.ops.eager import compile_once
 from torch_spyre.ops.fallbacks import warn_fallback
 
-from .errors import Unsupported
 from .constants import FP8_E4M3FN_MAX
+from .errors import Unsupported
 
 aten = torch.ops.aten
 
@@ -867,8 +869,8 @@ def quantscalepertokenfp8(
 def _(input: torch.Tensor, scale_ub: float = FP8_E4M3FN_MAX) -> torch.Tensor:
     if input.ndim < 1:
         raise ValueError(
-            f"quantscalepertokenfp8 requires input with at least 1 dimension "
-            f"(the hidden dim to reduce), got a scalar (ndim=0)."
+            "quantscalepertokenfp8 requires input with at least 1 dimension "
+            "(the hidden dim to reduce), got a scalar (ndim=0)."
         )
     out_shape = list(input.shape)
     out_shape[-1] = 1
