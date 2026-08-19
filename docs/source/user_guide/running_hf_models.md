@@ -14,13 +14,16 @@ generation loop. Weights, tokenizer, and config come straight from
 hf-adapters is a separate Apache-2.0 project in the same
 [torch-spyre](https://github.com/torch-spyre) GitHub organization. It depends
 on `torch_spyre` for the Spyre device. The `spyre` dependency group resolves
-`torch-spyre` from Git at the revision pinned in the hf-adapters
-`pyproject.toml` (currently `main`), so a separate local Torch-Spyre checkout
-is not used by default. For development against a specific Torch-Spyre
-revision, pin that rev in `[tool.uv.sources]` or add a local uv source
-override that points at your Torch-Spyre checkout. See
-[Installation](../getting_started/installation.md) for the Torch-Spyre
-install options.
+`torch-spyre` from Git at the ref set in the hf-adapters `pyproject.toml`
+`[tool.uv.sources]` table, which is currently the `main` branch. Because
+`main` is a moving ref, a `uv sync` resolves to whatever `torch-spyre` commit
+is at the tip of `main` at that time, and the adapters track the current
+`torch-spyre` API rather than any single tagged release. A separate local
+Torch-Spyre checkout is not used by default. For a reproducible resolve, set
+that entry to an immutable commit SHA; for development against a specific
+Torch-Spyre revision, point it at your local checkout with a uv source
+override. See [Installation](../getting_started/installation.md) for the
+Torch-Spyre install options.
 
 ![How hf-adapters runs a stock HuggingFace checkpoint on Spyre: the loader selects an adapter by config type, keeps weights, tokenizer, embeddings, projections, and the MLP from transformers, and replaces only the operations Spyre cannot run natively.](../_static/images/hf-adapters/fig-hf-adapters-approach.svg)
 
@@ -37,14 +40,16 @@ caches, the attention mask is built on CPU as a `float16` tensor, and
 documented in the project's
 [ARCHITECTURE.md](https://github.com/torch-spyre/hf-adapters/blob/main/ARCHITECTURE.md#how-the-adapters-work).
 
-Coverage spans three kinds of model: generative causal-LMs, embedding models
-through sentence-transformers, and speculative-decoding drafters. That is
-Llama, Qwen, Granite, Mistral, Phi, Gemma, OLMo, and GPT decoders; and BERT,
-XLM-RoBERTa, MPNet, and ModernBERT encoders. Vision-language checkpoints such
-as Granite Vision, Mistral3 Vision, and Gemma 4 run as well, but only their
-text backbone: the adapter extracts the language model, discards the vision
-encoder and projection layers, and loads it through `AutoSpyreModelForCausalLM`
-like any other decoder. Image input is not supported. The canonical
+Coverage spans four kinds of model: generative causal-LMs, embedding models
+through sentence-transformers, vision-language models that take an image and
+produce text, and speculative-decoding drafters. That is Llama, Qwen, Granite,
+Mistral, Phi, Gemma, OLMo, and GPT decoders; BERT, XLM-RoBERTa, MPNet, and
+ModernBERT encoders; and the Granite Vision, Mistral3 Vision, and Gemma 4
+multimodal models. A multimodal checkpoint registers under two entry points:
+`AutoSpyreModelForImageTextToText` loads the full VLM and prepares both the
+vision tower and the text decoder for Spyre, so it accepts image input;
+`AutoSpyreModelForCausalLM` loads only the text backbone and discards the
+vision tower, for text-only inference on the same checkpoint. The canonical
 per-adapter list of verified checkpoints is in the project's
 [ARCHITECTURE.md](https://github.com/torch-spyre/hf-adapters/blob/main/ARCHITECTURE.md#verified-checkpoints).
 
@@ -118,17 +123,78 @@ embeddings = model.encode(["hello world", "how are you"])
 The standard `SentenceTransformer` methods, `encode()`, `similarity()`, and
 the rest, work unchanged.
 
+## Vision-language models
+
+For image-text-to-text models, use `AutoSpyreModelForImageTextToText`. It
+loads the full VLM through `AutoModelForImageTextToText`, prepares both the
+vision tower and the text decoder for Spyre, and attaches a multimodal
+`generate`. Pair it with the checkpoint's `AutoProcessor`, which tokenizes the
+prompt and produces the image tensors.
+
+```python
+from hf_adapters import AutoSpyreModelForImageTextToText
+from transformers import AutoProcessor
+from PIL import Image
+
+model = AutoSpyreModelForImageTextToText.from_pretrained(
+    "ibm-granite/granite-vision-4.1-4b"
+)
+processor = AutoProcessor.from_pretrained("ibm-granite/granite-vision-4.1-4b")
+processor.tokenizer.padding_side = "left"  # matches the decode loop
+
+# Build the batch through the chat template, which tokenizes the prompt and
+# expands the image tokens in one call. The two-step text/images path
+# mis-tiles anyres images, so the single-call path is used instead.
+image = Image.open("cat.jpg").convert("RGB")
+conversation = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "image", "image": image},
+            {"type": "text", "text": "Briefly describe this image."},
+        ],
+    }
+]
+batch = processor.apply_chat_template(
+    conversation,
+    add_generation_prompt=True,
+    tokenize=True,
+    return_dict=True,
+    return_tensors="pt",
+)
+
+texts = model.generate(
+    processor,
+    batch["input_ids"],
+    batch["attention_mask"],
+    batch["pixel_values"],
+    batch["image_sizes"],
+    max_new_tokens=64,
+)
+print(texts[0])
+```
+
+The multimodal `generate` takes the processor, the tokenized `input_ids` and
+`attention_mask`, and the image tensors, then runs the same padded decode loop
+as the text path. The extra image inputs vary by model: Granite Vision and
+Mistral3 Vision take `image_sizes` for anyres tiling, and Gemma 4 takes
+`image_position_ids` and `mm_token_type_ids`. Pass whatever the processor
+produced. To run only the text backbone of a multimodal checkpoint, load it
+with `AutoSpyreModelForCausalLM` instead, which discards the vision tower.
+
 ## A note on numerical accuracy
 
-Greedy decoding on Spyre can diverge from the same model on CPU. Prefill and
-the first decode token often match, but later tokens can drift, and once a
-token differs the rest of the sequence can become incoherent. The cause is not
-a single missing feature. Spyre uses dtype conversions that differ slightly
-from CPU, and greedy decoding is sensitive to small numerical differences: a
-tiny gap in the logits flips the argmax, and the error compounds token by
-token. Because the `torch_spyre` stack changes often, both the severity and
-the set of affected models shift over time, so it is worth checking multi-token
-output against CPU for a checkpoint before you rely on it.
+Greedy decoding on Spyre can diverge from the same checkpoint run with stock
+HuggingFace on CPU. Even single-token decode can produce a greedy-token
+mismatch: prefill and the first decode token often match, but they are not
+guaranteed to, and once one token differs the rest of the sequence can drift
+and become incoherent. The cause is not a single missing feature. Spyre uses
+dtype conversions that differ slightly from CPU, and greedy decoding is
+sensitive to small numerical differences: a tiny gap in the logits flips the
+argmax, and the error compounds token by token. Because the `torch_spyre`
+stack changes often, both the severity and the set of affected models shift
+over time, so it is worth comparing output against the same checkpoint on CPU
+before you rely on it.
 
 The hf-adapters test suite accounts for this. The causal-LM accuracy tests
 assert the same top-1 token at each step against stock HF, and the embedding
