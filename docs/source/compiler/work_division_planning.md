@@ -420,10 +420,11 @@ compiler raises an error.
 
 TopK reductions use constraint-based work division:
 
-1. **k is split, capped at 4 rows per core.** The hardware can only produce
-   up to 4 top-k rows per core, so the smallest divisor `d` of `k` with
-   `k / d <= 4` is chosen. If no valid divisor exists within max_cores, the
-   compiler raises `Unsupported`.
+1. **k is split, capped at 4 rows per core.** The legal splits are divisors
+   `d` of `k` with `k / d <= 4`. The default planner reserves the smallest
+   legal divisor; LX co-optimization may choose any legal divisor to improve
+   layout reuse. If no valid divisor exists within max_cores, the compiler
+   raises `Unsupported`.
 2. **The search-space dimension is never split.** The dimension being
    searched (the `dim` argument to `torch.topk`) must stay whole on one core.
 

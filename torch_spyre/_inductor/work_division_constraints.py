@@ -28,21 +28,20 @@ every rule.
 
 import dataclasses
 import typing
-from sympy import Expr, Symbol
+from sympy import Expr, Symbol, divisors
 
 from torch._inductor.ir import ComputedBuffer, Reduction
+from torch._inductor.dependencies import MemoryDep
 from torch_spyre._C import ElementArrangement
 
-from .constants import BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP
-from .errors import Unsupported
-from .pass_utils import (
-    concretize_expr,
-    is_keep_by_index,
-    indirect_forbidden_split_syms,
-    indirect_store_entry_syms,
-    is_topk,
-    op_read_writes,
+from .constants import (
+    BATCH_MATMUL_OP,
+    BATCH_MATMUL_FP8_OP,
+    TOPK_MAX_K_PER_CORE,
+    TOPK_OPS,
 )
+from .errors import Unsupported
+from .pass_utils import concretize_expr, indirect_info_from_op, op_read_writes
 from .logging_utils import get_inductor_logger
 from . import config
 
@@ -73,27 +72,14 @@ class ConstraintResult:
     """A constraint's verdict on the iteration space in a WorkDivConstraintContext.
 
     ``blocked`` dims must not be split beyond whatever split they already
-    carry (composes by union across constraints). ``pinned`` dims must equal
-    exactly the given split (composes by equality; two constraints pinning the
-    same dim to different values is a modeling conflict, not something to
-    silently resolve — see collect_work_division_constraints).
-
-    ``forbidden`` dims must NEVER be split anywhere — a hard correctness rule
-    stronger than ``blocked``. Unlike ``blocked`` (which the distribution passes
-    honour but span reduction may still override to satisfy the memory-span
-    limit), a ``forbidden`` dim is filtered out of the span-reduction candidate
-    set too, so it is never split under any circumstance. Used for shared
-    gather/scatter table data dims.
-
-    ``force_output`` dims are promoted to output-split priority even when they
-    don't appear in the output coordinates (a scatter's index-entry dim, whose
-    destination row is runtime-chosen). Composes by union.
+    carry (composes by union across constraints). ``allowed_splits`` maps each
+    dim to its hard legal factors (composes by intersection).
     """
 
     blocked: set[Symbol] = dataclasses.field(default_factory=set)
-    pinned: dict[Symbol, int] = dataclasses.field(default_factory=dict)
-    forbidden: set[Symbol] = dataclasses.field(default_factory=set)
-    force_output: set[Symbol] = dataclasses.field(default_factory=set)
+    allowed_splits: dict[Symbol, frozenset[int]] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 def collect_work_division_constraints(
@@ -106,23 +92,18 @@ def collect_work_division_constraints(
     e.g. span_reduction satisfying the hardware span limit — outranks a
     constraint's preference not to split that dim further.
 
-    Raises Unsupported if a pin conflicts with a prior span-limit commitment,
-    or if two constraints pin the same dim to different values.
+    Raises Unsupported if a hard domain conflicts with a prior span-limit
+    commitment, or intersections between domains are empty.
     """
     blocked: set[Symbol] = set()
-    pinned: dict[Symbol, int] = {}
-    forbidden: set[Symbol] = set()
-    force_output: set[Symbol] = set()
+    allowed_splits: dict[Symbol, frozenset[int]] = {}
     for constraint in (
         coordinate_mask_blocked_vars,
         conv_spatial_blocked_vars,
         qfp8wt_pinned_vars,
         qfp8wt_matmul_k_pinned,
-        topk_pinned_search_space_vars,
-        topk_k_split_constraint,
-        keep_by_index_pinned_search_space_vars,
-        keep_by_index_k_split_constraint,
-        indirect_access_constraints,
+        topk_split_domains,
+        indirect_access_pinned_vars,
     ):
         result = constraint(ctx)
 
@@ -136,31 +117,31 @@ def collect_work_division_constraints(
                 f"the constraint is not honoured for those dims."
             )
         blocked |= result.blocked - forced
-        forbidden |= result.forbidden
-        force_output |= result.force_output
 
-        for sym, split in result.pinned.items():
+        for sym, allowed in result.allowed_splits.items():
+            allowed = frozenset(allowed)
+            if not allowed:
+                raise Unsupported(
+                    f"{ctx.op.get_name()}: empty legal split domain for {sym} "
+                    f"({constraint.__name__})."
+                )
+            if sym in allowed_splits:
+                allowed &= allowed_splits[sym]
+                if not allowed:
+                    raise Unsupported(
+                        f"{ctx.op.get_name()}: conflicting legal split domains "
+                        f"for {sym} ({constraint.__name__})."
+                    )
             committed_split = ctx.committed_splits.get(sym)
-            if committed_split is not None and committed_split != split:
+            if committed_split is not None and committed_split not in allowed:
                 raise Unsupported(
-                    f"{ctx.op.get_name()}: pinned split for {sym} is {split} "
-                    f"({constraint.__name__}), but hardware memory-span limit "
-                    f"committed {committed_split}."
+                    f"{ctx.op.get_name()}: legal split domain for {sym} is "
+                    f"{sorted(allowed)} ({constraint.__name__}), but hardware "
+                    f"memory-span limit committed {committed_split}."
                 )
-            if sym in pinned and pinned[sym] != split:
-                raise Unsupported(
-                    f"{ctx.op.get_name()}: conflicting pinned split for {sym}: "
-                    f"{pinned[sym]} (from an earlier constraint) vs {split} "
-                    f"(from {constraint.__name__})."
-                )
-            pinned[sym] = split
+            allowed_splits[sym] = allowed
 
-    return ConstraintResult(
-        blocked=blocked,
-        pinned=pinned,
-        forbidden=forbidden,
-        force_output=force_output,
-    )
+    return ConstraintResult(blocked=blocked, allowed_splits=allowed_splits)
 
 
 def coordinate_mask_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
@@ -203,11 +184,13 @@ def conv_spatial_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult
     if (stride_i or 1) <= 1 and (stride_j or 1) <= 1:
         return ConstraintResult()
 
-    write_ranges = list(next(iter(op_read_writes(ctx.op).writes)).ranges)
+    write = typing.cast(MemoryDep, next(iter(op_read_writes(ctx.op).writes)))
     blocked = {
         sym
-        for sym in write_ranges[-2:]
-        if sym in ctx.it_space and concretize_expr(ctx.it_space[sym]) > 1
+        for sym in list(write.ranges)[-2:]
+        if isinstance(sym, Symbol)
+        and sym in ctx.it_space
+        and concretize_expr(ctx.it_space[sym]) > 1
     }
     return ConstraintResult(blocked=blocked)
 
@@ -232,19 +215,21 @@ def qfp8wt_pinned_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
     if not has_qfp8wt_tensor(all_tds):
         return ConstraintResult()
 
-    pinned: dict[Symbol, int] = {}
+    allowed_splits: dict[Symbol, frozenset[int]] = {}
 
     if len(ctx.input_tds) > 1:
         kernel_td = ctx.input_tds[1]
         if len(kernel_td.device_coords) > 1 and has_qfp8wt_tensor([kernel_td]):
             for var in kernel_td.device_coords[-2].free_symbols:
-                pinned[var] = 1
+                if isinstance(var, Symbol):
+                    allowed_splits[var] = frozenset({1})
 
     if len(ctx.output_td.device_coords) > 1 and has_qfp8wt_tensor([ctx.output_td]):
         for var in ctx.output_td.device_coords[-2].free_symbols:
-            pinned[var] = 1
+            if isinstance(var, Symbol):
+                allowed_splits[var] = frozenset({1})
 
-    return ConstraintResult(pinned=pinned)
+    return ConstraintResult(allowed_splits=allowed_splits)
 
 
 def qfp8wt_matmul_k_pinned(ctx: WorkDivConstraintContext) -> ConstraintResult:
@@ -262,174 +247,64 @@ def qfp8wt_matmul_k_pinned(ctx: WorkDivConstraintContext) -> ConstraintResult:
     if not has_qfp8wt_tensor(all_tds):
         return ConstraintResult()
 
-    return ConstraintResult(pinned={v: 1 for v in ctx.reduction_vars})
-
-
-def topk_pinned_search_space_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Pin the search-space (reduction) dim to split=1 for topk ops.
-
-    The topk hardware op searches the full dimension on one core to compute
-    the top-k results. Splitting the search-space would require merging
-    partial top-k results across cores, which the hardware does not support.
-    """
-    if not is_topk(ctx.op):
-        return ConstraintResult()
-
-    return ConstraintResult(pinned={v: 1 for v in ctx.reduction_vars})
-
-
-# Each core can produce at most this many top-k/keep_by_index results per
-# pass — a shared hardware constraint, not a coincidence.
-_MAX_K_PER_CORE = 4
-
-
-def _min_k_split_constraint(
-    op_label: str, k_sym_candidates: list[Symbol], it_space: dict[Symbol, Expr]
-) -> ConstraintResult:
-    """Pin k to the smallest split satisfying the per-core k limit.
-
-    The smallest valid k-split is ceil(k / _MAX_K_PER_CORE), chosen to
-    minimize core usage while satisfying the hardware constraint. This is
-    pinned as a hard constraint to ensure the work_distribution planner picks
-    the minimal k-split rather than a larger one that leaves more cores for
-    other dims.
-    """
-    from sympy import divisors
-
-    if len(k_sym_candidates) != 1:
-        # k=1 or malformed; no constraint needed.
-        return ConstraintResult()
-
-    k_sym = k_sym_candidates[0]
-    k_val = concretize_expr(it_space[k_sym])
-
-    # Find the smallest divisor d of k such that k / d <= _MAX_K_PER_CORE.
-    max_cores = config.sencores
-    min_k_split = None
-    for d in sorted(divisors(k_val)):
-        if k_val // d <= _MAX_K_PER_CORE and d <= max_cores:
-            min_k_split = d
-            break
-
-    if min_k_split is None:
-        raise Unsupported(
-            f"{op_label}(k={k_val}): no divisor of k in [1, {max_cores}] gives "
-            f"k_per_core <= {_MAX_K_PER_CORE}, so k cannot be split across at "
-            f"most {max_cores} cores"
-        )
-
-    if min_k_split > 1:
-        return ConstraintResult(pinned={k_sym: min_k_split})
-
-    return ConstraintResult()
-
-
-def topk_k_split_constraint(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Pin k to the smallest valid split for topk ops."""
-    if not is_topk(ctx.op):
-        return ConstraintResult()
-
-    # Find k's symbol: output dim absent from every input's device coords
-    coord_vars = {
-        s for td in ctx.input_tds for e in td.device_coords[:-1] for s in e.free_symbols
-    }
-    output_vars = {s for e in ctx.output_td.device_coords[:-1] for s in e.free_symbols}
-    k_sym_candidates = [s for s in output_vars if s not in coord_vars]
-
-    return _min_k_split_constraint("topk", k_sym_candidates, ctx.it_space)
-
-
-def keep_by_index_k_split_constraint(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Pin k to the smallest valid split for keep_by_index ops."""
-    if not is_keep_by_index(ctx.op):
-        return ConstraintResult()
-
-    if len(ctx.input_tds) < 2:
-        return ConstraintResult()
-
-    # Find k's symbol: dim in second input (indices) absent from output's
-    # device coords
-    indices_vars = {
-        s for e in ctx.input_tds[1].device_coords[:-1] for s in e.free_symbols
-    }
-    output_vars = {s for e in ctx.output_td.device_coords[:-1] for s in e.free_symbols}
-    k_sym_candidates = [s for s in indices_vars if s not in output_vars]
-
-    return _min_k_split_constraint("keep_by_index", k_sym_candidates, ctx.it_space)
-
-
-def keep_by_index_pinned_search_space_vars(
-    ctx: WorkDivConstraintContext,
-) -> ConstraintResult:
-    """Pin the search-space dim to split=1 for keep_by_index ops.
-
-    The search dimension (in output but not in indices) must be searched on
-    a single core, similar to topk. This is the dimension being masked.
-    """
-    if not is_keep_by_index(ctx.op):
-        return ConstraintResult()
-
-    if len(ctx.input_tds) < 2:
-        return ConstraintResult()
-
-    # Find the search dimension: output coordinate NOT in indices
-    # For 3D+ cases, iterate through all output coords and find any that
-    # aren't in indices. Prefer the one that maps to a single iteration var
-    # (not a complex expression).
-    search_space_coord = None
-    candidates = []
-    for coord in ctx.output_td.device_coords[:-1]:
-        if not coord.free_symbols:
-            continue
-        # Is this coordinate in indices?
-        is_in_indices = any(
-            coord.equals(i_coord) for i_coord in ctx.input_tds[1].device_coords[:-1]
-        )
-        if not is_in_indices:
-            candidates.append(coord)
-
-    if candidates:
-        # Pick the simplest candidate (fewest free symbols, typically just one var)
-        search_space_coord = min(
-            candidates, key=lambda c: (len(c.free_symbols), str(c))
-        )
-
-    if search_space_coord is None:
-        return ConstraintResult()
-
-    # Map this coordinate to the iteration_space symbol
-    search_space_it_var = None
-    for it_var in ctx.it_space:
-        if it_var in search_space_coord.free_symbols:
-            search_space_it_var = it_var
-            break
-
-    if search_space_it_var is None:
-        return ConstraintResult()
-
-    return ConstraintResult(pinned={search_space_it_var: 1})
-
-
-def indirect_access_constraints(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Split rules for indirect (gather/scatter-style) access. Empty for other ops.
-
-    ``forbidden`` — a gather value table / scatter destination stays at the same
-    base address on every core, its row chosen at runtime by IndirectAccess.
-    Splitting a data (non-row) dimension would give each core a different base
-    into that shared table and miscompile, so those dims must NEVER be split — a
-    hard constraint : span reduction must not split them either. Also covers the
-    partial-last-stick index-entry dim.
-
-    ``force_output`` — a scatter's destination row is runtime-chosen, so its
-    index-entry dim never appears in the output coordinates and would otherwise
-    be classed as a reduction dim and left unsplit. Promoting it lets each core
-    write a disjoint set of source rows in parallel.
-
-    Together these supersede the old blanket single-core pin: the entry/output
-    dims stay splittable, enabling multicore indirect access.
-    """
-    forbidden = indirect_forbidden_split_syms(ctx.op)
     return ConstraintResult(
-        forbidden=forbidden,
-        force_output=indirect_store_entry_syms(ctx.op, forbidden),
+        allowed_splits={v: frozenset({1}) for v in ctx.reduction_vars}
+    )
+
+
+def _topk_output_k_var(ctx: WorkDivConstraintContext) -> Symbol | None:
+    """Return TopK k var, absent from every input index expression."""
+    input_vars = {
+        var
+        for td in ctx.input_tds
+        for var in td.dep.index.free_symbols
+        if isinstance(var, Symbol)
+    }
+    output_vars = {
+        var for var in ctx.output_td.dep.index.free_symbols if isinstance(var, Symbol)
+    }
+    candidates = output_vars - input_vars
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
+def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
+    """Restrict TopK search-space and result dims to hardware-legal factors."""
+    if (
+        not isinstance(ctx.op.data, Reduction)
+        or ctx.op.data.reduction_type not in TOPK_OPS
+    ):
+        return ConstraintResult()
+
+    allowed_splits = {var: frozenset({1}) for var in ctx.reduction_vars}
+    k_var = _topk_output_k_var(ctx)
+    if k_var is None:
+        return ConstraintResult(allowed_splits=allowed_splits)
+
+    k_size = concretize_expr(ctx.it_space[k_var])
+    legal_k_splits = frozenset(
+        split
+        for split in divisors(k_size)
+        if split <= config.sencores and k_size // split <= TOPK_MAX_K_PER_CORE
+    )
+    if not legal_k_splits:
+        raise Unsupported(
+            f"topk(k={k_size}): no divisor within {config.sencores} cores gives "
+            f"k_per_core <= {TOPK_MAX_K_PER_CORE}."
+        )
+    allowed_splits[k_var] = legal_k_splits
+    return ConstraintResult(allowed_splits=allowed_splits)
+
+
+def indirect_access_pinned_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
+    """Pin every dim to split=1 for ops with indirect (gather/scatter-style) access.
+
+    The backend's indirect-addressing path runs single-core: an indexed
+    dimension's coordinate depends on runtime data, not a static per-core
+    offset, so the generic per-core span/coordinate arithmetic does not apply.
+    """
+    dep_names, _, _ = indirect_info_from_op(ctx.op)
+    if not dep_names:
+        return ConstraintResult()
+    return ConstraintResult(
+        allowed_splits={v: frozenset({1}) for v in ctx.it_space_adjusted}
     )

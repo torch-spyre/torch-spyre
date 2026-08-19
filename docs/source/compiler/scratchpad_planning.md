@@ -19,8 +19,9 @@ defaults to off. It enlarges each op's set of candidate splits — pointwise
 dim-flips, the matmuls' tilings offered to neighbours, cross-matmul split
 transfer, a shared batch-major `B/M` tiling for matmuls and reductions —
 then searches the cross-product for the assignment that minimizes HBM
-traffic. The seed (work-division's choice) is always retained, so the
-result is never worse than work division alone.
+traffic. Every candidate, including work division's seed, must satisfy
+stick and hard split-domain constraints; an op with no legal candidate raises
+`Unsupported`.
 :::
 
 **Quick navigation:**
@@ -495,12 +496,11 @@ the winning assignment back before the standard allocator flow.
 :::
 
 Each op's candidate list is built by `_enum_split_options`, dispatching
-on op type. The seed (work division's choice) is always option 0 and is
-always retained, so the worst case matches work division. Every non-seed
-candidate is deduped by canonical key and filtered through
-`_split_fits_sticks`, which rejects factors that overflow a stickified
-dim's stick count (those would abort the SuperDSC bundler) or that land on
-a collapsed/broadcast dim.
+on op type. Candidates are deduped by canonical key and filtered through
+`_split_fits_sticks`, which rejects factors that overflow a stickified dim's
+stick count (those would abort the SuperDSC bundler) or that land on a
+collapsed/broadcast dim. Every candidate, including the seed (work division's
+choice), must also satisfy hard split-domain constraints.
 
 **Pointwise ops** get their seed, dim-flip variants (move the seed's
 single output-dim factor onto each compatible alternative output dim,

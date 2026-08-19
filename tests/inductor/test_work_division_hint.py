@@ -12,46 +12,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Sequence
-from dataclasses import replace
 import logging
 import logging.handlers
-import regex as re
+from collections.abc import Sequence
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch as mock_patch
 
 import pytest
-from sympy import floor, Integer, Mod, Symbol
+import regex as re
 import torch
 import torch.fx.traceback
-from torch.fx.graph_module import GraphModule
+from sympy import Integer, Mod, Symbol, floor
 from torch._decomp import get_decompositions
 from torch._dynamo.test_case import (
     TestCase as DynamoTestCase,
 )
-from torch._functorch.aot_autograd import aot_module_simplified
 from torch._functorch._aot_autograd.utils import make_boxed_func
+from torch._functorch.aot_autograd import aot_module_simplified
 from torch._inductor.test_case import TestCase as InductorTestCase
-from torch._inductor.utils import run_and_get_code, InputType
+from torch._inductor.utils import InputType, run_and_get_code
+from torch.fx.graph_module import GraphModule
 
-
-from torch_spyre._inductor import config, spyre_hint
-import torch_spyre._inductor.scratchpad.lx_relayout as lx_relayout_module
 import torch_spyre._inductor.scheduler as scheduler_module
+import torch_spyre._inductor.scratchpad.lx_relayout as lx_relayout_module
 import torch_spyre._inductor.work_division as _wd
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 from torch_spyre._C import DataFormats
+from torch_spyre._inductor import config, spyre_hint
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec, parse_op_spec
 from torch_spyre._inductor.constants import IDENTITY_OP
-from torch_spyre._inductor.scratchpad.lx_relayout import (
-    LXRelayoutPlan,
-    work_division_from_view,
-)
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg, TensorWorkDivision
 from torch_spyre._inductor.pass_utils import PerCoreView
 from torch_spyre._inductor.scratchpad.allocator import ScratchpadAllocator
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
+from torch_spyre._inductor.scratchpad.lx_relayout import (
+    LXRelayoutPlan,
+    work_division_from_view,
+)
 from torch_spyre._inductor.scratchpad.plan_solver import LifetimeBoundBuffer
 from torch_spyre._inductor.spyre_kernel import _remap_work_division, simplify_op_spec
 
@@ -241,18 +240,18 @@ class TestNamedWorkDivisionHint(InductorTestCase):
                 max_cores=32,
             )
 
-    def test_apply_work_div_hint_rejects_pinned_split(self):
+    def test_apply_work_div_hint_rejects_illegal_split(self):
         m = Symbol("M")
         op = self._fake_op({m: ["M"]})
 
-        with self.assertRaisesRegex(Exception, "pinned to split=1"):
+        with self.assertRaisesRegex(Exception, "legal splits are"):
             _wd._apply_user_hint(
                 op,
                 {m: 2},
                 {m: 64},
                 self._fake_output_td([m]),
                 max_cores=32,
-                pinned={m: 1},
+                allowed_splits={m: frozenset({1})},
             )
 
     @config.patch({"sencores": 8})

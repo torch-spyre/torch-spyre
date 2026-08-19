@@ -47,7 +47,10 @@ from torch_spyre._inductor.pass_utils import (
     _is_matmul_op,
     op_short_name,
 )
-from torch_spyre._inductor.work_division import enumerate_work_division_candidates
+from torch_spyre._inductor.work_division import (
+    enumerate_work_division_candidates,
+    work_division_split_is_legal,
+)
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivision,
@@ -1188,6 +1191,12 @@ def _fixed_core_division(op: Operation) -> CoreDivision:
     return _core_division(op, ownership.work_slices if ownership is not None else {})
 
 
+def _split_option_is_legal(op: Operation, splits: tuple[dict, dict]) -> bool:
+    return not isinstance(op, ComputedBuffer) or work_division_split_is_legal(
+        op, splits
+    )
+
+
 DEFAULT_VARIANT_CAP = 6
 # Try larger batch factors first. Keeping more of the batch axis whole offers
 # the same reconciliation benefit with fewer co-optimization candidates.
@@ -1603,6 +1612,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 ]
             else:
                 divs = self._enumerate_core_divisions(op, max_cores)
+            if not divs:
+                raise Unsupported(f"{op.name}: no legal core-division candidates.")
             result[op.name] = divs
 
         return result
