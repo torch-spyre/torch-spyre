@@ -1505,6 +1505,20 @@ def _ref_arg(op_spec):
     return op_spec.args[-1]
 
 
+def _round_up_to_stick(
+    sdsc_iteration_space: dict,
+    sym,
+    stick_size: int,
+    caller: str,
+) -> None:
+    """Round ``sdsc_iteration_space[sym]`` up to the next stick boundary."""
+    cur = sdsc_iteration_space[sym]
+    padded = ((cur + stick_size - 1) // stick_size) * stick_size
+    if padded > cur:
+        logger.debug("%s: extending %s %d -> %d", caller, sym, cur, padded)
+        sdsc_iteration_space[sym] = padded
+
+
 def _extend_matmul_k_to_padded(
     op_spec: OpSpec,
     sdsc_iteration_space: dict,
@@ -1566,17 +1580,34 @@ def _extend_matmul_k_to_padded(
     # allocation's K extent, not the slice's logical K, so it can be larger
     # than the matmul's actual K and would over-extend the iteration space.
     stick_size = y_arg.device_dtype.elems_per_stick()
-    k_current = sdsc_iteration_space[k_sym]
-    k_padded = ((k_current + stick_size - 1) // stick_size) * stick_size
+    _round_up_to_stick(
+        sdsc_iteration_space, k_sym, stick_size, "_extend_matmul_k_to_padded"
+    )
 
-    if k_padded > k_current:
-        logger.debug(
-            "_extend_matmul_k_to_padded: extending K %d -> %d (sym=%s)",
-            k_current,
-            k_padded,
-            k_sym,
+
+def _extend_restickify_to_padded(
+    op_spec: OpSpec,
+    sdsc_iteration_space: dict,
+    symbol_mapping: dict,
+) -> None:
+    """Round sdsc_iteration_space[stick_sym] up to a stick boundary for each
+    restickify arg.  Both input (old stick) and output (new stick) may carry
+    the unaligned iter, so we extend per-arg.
+
+    Running before ``_create_sdsc_tensors`` keeps backGap correct: the
+    unaligned-stick arg gets dev_dim_size==it_dim_size on the within-stick
+    axis (no backGap), and the other arg's outer-split strides are computed
+    against the padded extent (no stale-stride mismatch with the later
+    widening done by ``_get_padded_iteration_space``).
+    """
+    for arg in op_spec.args:
+        _, stick_sym = _get_device_dim_order(arg, symbol_mapping)
+        if stick_sym is None or stick_sym not in sdsc_iteration_space:
+            continue
+        stick_size = arg.device_dtype.elems_per_stick()
+        _round_up_to_stick(
+            sdsc_iteration_space, stick_sym, stick_size, "_extend_restickify_to_padded"
         )
-        sdsc_iteration_space[k_sym] = k_padded
 
 
 def _inject_implicit_conv_kernel_dims(
@@ -1659,6 +1690,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     is_matmul = _is_matmul(op_spec.op)
     is_conv2d = _is_conv(op_spec.op)
     is_relayout = is_lx_relayout_identity(op_spec.op, op_spec.args)
+    is_restickify = op_spec.op == RESTICKIFY_OP
     is_pool = _is_pool(op_spec.op)
     is_conv = _is_conv(op_spec.op)
     ndim = len(op_spec.iteration_space)
@@ -1889,6 +1921,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     if is_matmul:
         _extend_matmul_k_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
+    elif is_restickify:
+        _extend_restickify_to_padded(op_spec, sdsc_iteration_space, symbol_mapping)
 
     # For topk: if all output dims are in the input, add a missing dimension.
     injected_dims = {"mb_sym": mb_sym} if mb_sym else {}
@@ -1941,7 +1975,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             [args[0]],
             [args[0].dim_order],
         )
-    elif op_spec.op == RESTICKIFY_OP:
+    elif is_restickify:
         # Pad iteration space using all args so both the old stick (input) and
         # new stick (output) are rounded up to the nearest stick boundary.
         pad_args, pad_sdsc_args, dim_order = (
@@ -1961,7 +1995,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
 
     # For restickify, update backGaps based on the padded iteration space,
     # since non-stick dimensions may now have it_dim_size > dev_dim_size.
-    if op_spec.op == RESTICKIFY_OP:
+    if is_restickify:
         for sdsc_arg, op_spec_arg in zip(args, op_spec.args):
             layout = layouts[sdsc_arg.layout]
             stick_dim = layout["stick_dim_order"]

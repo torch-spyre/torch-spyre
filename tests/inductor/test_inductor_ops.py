@@ -7172,11 +7172,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         """Test that offset-stick slice mutation raises Unsupported when no alt dim is divisible by stick_size."""
 
         def fn(x, y):
-            x[:, 32:96].copy_(y)
+            x[32:96].copy_(y)
             return x.clone()
 
-        x = torch.randn(63, 128, dtype=torch.float16, device="spyre")
-        y = torch.randn(63, 64, dtype=torch.float16, device="spyre")
+        x = torch.randn(128, dtype=torch.float16, device="spyre")
+        y = torch.randn(64, dtype=torch.float16, device="spyre")
 
         compiled = torch.compile(fn, backend="inductor", fullgraph=True, dynamic=False)
         with pytest.raises(Exception) as exc_info:

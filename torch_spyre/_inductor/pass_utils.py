@@ -32,6 +32,7 @@ from torch._inductor.ir import (
     Pointwise,
     Reduction,
 )
+from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.dependencies import MemoryDep, ReadWrites, StarDep, is_indirect
 from torch._inductor.virtualized import V
@@ -381,6 +382,22 @@ def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
     """Return host coordinates for the output dep of a ComputedBuffer."""
     output_dep = next(iter(op.get_read_writes().writes))
     return host_coordinates(op.get_layout(), output_dep, indirect_sizes_from_op(op))
+
+
+def is_restickify_coords(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
+    """Return whether a single-input pointwise copy is a RESTICKIFY (vs IDENTITY).
+
+    ``in_coords`` / ``out_coords`` are the operands' device-space coordinates.
+    It is a restickify iff a *different* host dim lands within the stick (the
+    within-stick coords carry different free symbols) -- except a broadcast (an
+    all-zero input expanding to non-scalar output), which is an identity fill.
+
+    The authoritative test, shared by the codegen store side and the padding
+    pass matcher (``is_restickify_op``) so the two cannot disagree.
+    """
+    if all(e == 0 for e in in_coords) and not all(e == 0 for e in out_coords):
+        return False  # broadcast: scalar input expanding to non-scalar output
+    return in_coords[-1].free_symbols != out_coords[-1].free_symbols
 
 
 def _scatter_index_buf_names_ordered(op: ComputedBuffer) -> list[str]:
@@ -1346,6 +1363,79 @@ def replace_computed_buffer_body(
 
     op_idx = operations.index(op)
     operations[op_idx] = new_buf
+    return new_buf
+
+
+class NameSwapHandler(WrapperHandler):
+    """Patch an inner_fn's ``load`` calls to read renamed buffers.
+
+    Used after inserting a producer upstream (e.g. a restickify or an identity
+    clone) that supersedes an existing input: the consumer's inner_fn still
+    names the old buffer, so wrap it to remap each ``load(old_name, ...)`` to
+    ``load(new_name, ...)``.
+
+    This is the canonical WrapperHandler wrapping pattern for compiler passes:
+    wrap, never rebuild index expressions from scratch (they go stale — see
+    CLAUDE.md "Compiler Pass Conventions" and issue #2797).
+    """
+
+    def __init__(self, inner, name_map: dict[str, str]):
+        super().__init__(inner)
+        self._name_map = name_map
+
+    def load(self, name, index):
+        return super().load(self._name_map.get(name, name), index)
+
+
+def redirect_computed_buffer_reads(
+    op: ComputedBuffer,
+    name_map: dict[str, str],
+    operations: list[Operation],
+    *,
+    pass_name: str,
+    reason: str | None = None,
+) -> ComputedBuffer:
+    """Redirect ``op``'s reads through ``name_map`` and reconstruct the buffer.
+
+    Wraps ``op.data.inner_fn`` with ``NameSwapHandler`` so every ``load`` of a
+    remapped buffer resolves to its replacement, then reconstructs the frozen
+    ``ComputedBuffer`` so the instance-keyed ``get_default_sizes_body`` cache is
+    cleanly invalidated (the reconstruct is the reason both this helper and
+    ``replace_computed_buffer_body`` rebuild rather than mutate in place).
+
+    Returns the replacement ComputedBuffer.
+    """
+    # Patch inner_fn once with the full name_map covering all remapped args.
+    orig_inner = op.data.inner_fn
+
+    def new_inner_fn(*args, _map=name_map, _orig_inner=orig_inner):
+        with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
+            return _orig_inner(*args)
+
+    object.__setattr__(op.data, "inner_fn", new_inner_fn)
+
+    # Reconstruct ComputedBuffer as a fresh object so the instance-keyed cache
+    # on get_default_sizes_body can be cleanly invalidated below.
+    new_buf = ComputedBuffer(
+        name=op.get_name(),
+        layout=op.layout,
+        data=op.data,
+        _split_size=op._split_size,
+        _original_inner_fn=op._original_inner_fn,
+        _original_ranges=op._original_ranges,
+        _original_reduction_ranges=op._original_reduction_ranges,
+    )
+    new_buf.operation_name = op.operation_name
+    preserve_provenance(op, new_buf, pass_name=pass_name, reason=reason)
+    copy_op_metadata(op, new_buf)
+
+    op_idx = operations.index(op)
+    operations[op_idx] = new_buf
+    V.graph.name_to_buffer[new_buf.get_name()] = new_buf
+
+    # Invalidate the sizes/body cache so it is recomputed on next access with
+    # the patched inner_fn.
+    ComputedBuffer.get_default_sizes_body.clear_cache(new_buf)
     return new_buf
 
 
