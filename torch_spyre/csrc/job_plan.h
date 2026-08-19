@@ -294,17 +294,6 @@ class JobPlanStep {
     return role_;
   }
 
-  /**
-   * @brief Set the stream role for this step.
-   *
-   * Used by PrepareKernel to override the subclass default when assembling the
-   * two-stream plan (e.g. to force a D2H onto Prep if profiling ever requires
-   * it).
-   */
-  void setRole(StreamRole role) {
-    role_ = role;
-  }
-
  protected:
   // true by default: every step is a potential consumer that should wait for
   // prior ops. With the two-stream topology EVERY step keeps this true (strict
