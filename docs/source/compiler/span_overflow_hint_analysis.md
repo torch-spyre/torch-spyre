@@ -359,22 +359,24 @@ def fn(x):
     return x.sum(dim=-1)
 ```
 
-If the only overflowing input coordinate is controlled by the reduction symbol
-`k`, output-range tiling cannot fix it.  This pass intentionally skips that
-candidate.
+If the only overflowing input coordinate is controlled by a generic reduction
+symbol, output-range tiling cannot fix it and the output-range input scan skips
+that candidate.  BMM is the special case: when the reduction symbol is the
+single identifiable matmul `k`, the planner can use the BMM K fallback to emit
+an independent reduction-range tile plan.
 
-Code flow:
+Code flow for generic reductions:
 
 ```text
 _input_span_infos_controlled_by_output_dims
-  -> coordinate free symbols include k
-  -> k is not in output_symbol_to_dim
-  -> reduction_syms is non-empty
+  -> coordinate free symbols include reduction-only symbol
+  -> symbol is not in output_symbol_to_dim
+  -> reduction_syms is non-empty and not the BMM K special case
   -> continue
 ```
 
-This is not solved by the current pass.  It needs reduction-range tiling and
-partial accumulation.
+Generic reduction-range tiling and combined output+reduction tiling remain
+future work.
 
 ### 9. Coordinate Jointly Controlled by Two Output Symbols
 
@@ -462,11 +464,13 @@ for each op (without assigning them — that is left to the caller, see
 groups:
 
 ```python
-[([op], [(hint_id, split_count, is_reduction_level), ...])]
+[([op], [(hint_id, split_count), ...])]
 ```
 
-`is_reduction_level` is currently `False` for automatic span-overflow hints;
-they tile output ranges, not reduction ranges.
+Whether a level tiles an output range or the BMM K reduction range is stored on
+the per-op `DimHint` (`is_reduction`), not in the group-level `levels` list.
+Output-range automatic hints have `is_reduction=False`; BMM K fallback hints
+have `is_reduction=True` and are emitted as independent singleton groups.
 
 ## Scope
 
@@ -477,6 +481,8 @@ The production planner handles:
 - output layout span overflow;
 - reduction/BMM input span overflow when the span is controlled by output
   symbols;
+- BMM input span overflow controlled only by the single K reduction symbol,
+  using an independent K-only fallback plan;
 - one or more output host dimensions per op, bounded by `_MAX_TILE_DIMS`;
 - static `FixedTiledLayout` metadata only.
 
@@ -487,7 +493,8 @@ The planner skips:
 - symbolic/dynamic layout metadata;
 - scalar/full reductions where `op.data.ranges` is empty;
 - Pointwise or Reduction ops with indirect/gather/scatter-style reads;
-- input spans controlled only by reduction symbols.
+- input spans controlled only by reduction symbols for non-BMM reductions;
+- combined output-range plus reduction-range tiling, such as M+K.
 
 ### Support Matrix
 
@@ -498,9 +505,10 @@ The planner skips:
 | Reduction output span overflow | Yes | Emit output-range tile levels if post-tile layout validates |
 | Reduction input span controlled by output dim | Yes | Emit tile for the matching output dim |
 | Coordinate jointly controlled by 2+ output symbols | Yes | Emit a candidate for each contributing dim |
-| Reduction input span controlled by reduction dim | No | Skip candidate; reduction-range tiling is future work |
+| Reduction input span controlled by reduction dim | No | Skip candidate; generic reduction-range tiling is future work |
 | BMM input span controlled by `b`, `m`, or `n` | Yes | Emit tile for matching output dim |
-| BMM input span controlled by `k` | No | Skip candidate; `k` is reduction-only |
+| BMM input span controlled by `k` | Yes | Emit independent K reduction-range tile if K-only validation clears every span |
+| BMM input spans needing both output dim and `k` tiling | No | Raise `Unsupported`; combined output+K plans are future work |
 | BMM with ambiguous reduction symbols | No | Return no BMM input candidates |
 | Scalar/full reduction | No | Return `None` |
 | Symbolic layout metadata | No | Return `None` |
@@ -568,14 +576,16 @@ tiling can reduce that input span, so the planner creates one input-derived
 candidate per contributing output symbol -- one for a coordinate driven by a
 single output dim, or several for a coordinate that jointly mixes multiple
 output dims onto one physical stride.  If a coordinate involves a reduction
-symbol, the planner skips that coordinate entirely and continues scanning
-later device coordinates.  That `continue` behavior is important: a
+symbol, the output-range candidate scan skips that coordinate and continues
+scanning later device coordinates.  That `continue` behavior is important: a
 reduction-controlled outer coordinate must not prevent discovery of a
 more-inner output-controlled overflowing coordinate.
 
-Reduction-only input span overflow remains a known limitation.  It requires
-reduction-range tiling and partial accumulation, which this pass does not
-implement.
+BMM `k` is the special supported reduction symbol.  The output-range scan does
+not create B/M/N candidates for pure K-controlled spans; instead the later BMM
+K fallback can emit an independent reduction-range plan.  Generic
+reduction-only input span overflow remains a known limitation because it needs
+reduction-range tiling and partial accumulation outside the BMM-specific path.
 
 ## BMM-Specific Symbol Mapping
 
@@ -592,7 +602,8 @@ there is not exactly one such symbol, it returns `{}` and the BMM input-span
 path produces no candidates.
 
 BMM input spans controlled by `b`, `m`, or `n` can be fixed by output-range
-tiling.  Spans controlled by `k` are skipped as reduction-range-only.
+tiling.  Pure `k` spans are handled by the BMM K fallback, which emits an
+independent reduction-range tile only when K-only validation clears every span.
 
 ## Span Calculation
 
@@ -870,6 +881,7 @@ automatic output-range tile plan.  Common reasons:
 - selected host dim is not in `op.data.ranges`;
 - selected range is size 1 or non-integral;
 - no legal exact divisor exists;
+- BMM K-only candidates still leave non-K span overflows;
 - stick alignment rejects all candidates;
 - `_resize_device_layout` cannot reconstruct the post-tile layout;
 - every tried combination still leaves output/input spans above the limit;

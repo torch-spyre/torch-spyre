@@ -5352,6 +5352,249 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             " divide Lq ranges on each op using that op's own dim role",
         )
 
+    def _run_kv_chunked_flash(
+        self,
+        *,
+        h_tiles=4,
+        lq_tiles=2,
+        B=1,
+        H=8,
+        Lq=256,
+        Lk=256,
+        D=64,
+        kv_block=128,
+    ):
+        """Flash attention with K/V chunking in PYTHON and WSR tiling only H/Lq.
+
+        Shared by the two tests below so the h_tiles == H degenerate-tile case
+        can reuse the graph rather than duplicate it.  Asserts inline.
+
+        WSR's reduction-dim carry propagation is unimplemented (#3432), so every
+        flash variant that hints Lk is xfailed.  Here the K/V sweep is an ordinary
+        Python ``for`` loop that torch.compile unrolls into the graph, so the
+        online-softmax recurrence becomes explicit dataflow.  WSR is then only
+        asked to tile H and Lq -- non-reduction dims -- and never sees a carry.
+
+        Complements test_hint_flash_attention_v2_divide_in_scope (#3429), which
+        tiles H/Lq over a SINGLE K block.  This covers more than one K block,
+        which that test does not reach.
+
+        Four things are load-bearing; each one produced a wrong answer or a hard
+        error while this was being written:
+
+        1.  **The K loop must be INSIDE a single H/Lq scope.**  Wrapping each
+            chunk in its own scope instead makes the scheduler interleave the
+            chunks, so a scope's ops are no longer contiguous and
+            validate_coarse_tile_groups rejects it with "hint_id=N appears in
+            both group X and group Y".  Measured op order for 2 chunks was
+            chunk0-main, chunk1-main, chunk0-tail, chunk1-tail.
+        2.  **K/V chunks are sliced by the CALLER and passed in as named
+            tensors.**  Slicing inside the graph and naming the slice output with
+            spyre_hint(named_dims=...) does not work and fails SILENTLY: the hint
+            branch of propagate_named_dims sets _dim_prop_info and returns, so
+            the read of the unnamed full tensor never gets an H mapping, and the
+            _untracked warning that would have said so disappears.  Naming the
+            full tensor does not work either -- slicing Lk shrinks the axis, so
+            _consume_names finds no prefix matching it and drops the binding.
+            Symptom either way: H tile 0 correct, every later tile ~85% wrong.
+        3.  **Carry inits use the sparse idiom** ``full((B,H,Lq,64)).amax(-1)``.
+            A plain 3-D ``full((B,H,Lq))`` raises "no mechanism to resolve stick
+            incompatibility".
+        4.  **The final divide is inside the innermost scope** (#3429): read past
+            the loop group it becomes a full buffer plus a copy op whose target a
+            second consumer also reads, and finalize_layouts overwrites it.
+
+        h_tiles=4 and lq_tiles=2 differ deliberately so the LoopSpec assertions
+        can tell the two levels apart; equal counts would pass even if one level
+        were dropped.  No causal mask here on purpose: with K chunking a fully
+        masked chunk gives block_max == -inf and exp(-inf - -inf) is NaN, which
+        is a real trap but a separate one from what this test pins down.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        n_chunks = Lk // kv_block
+        self.assertEqual(Lk % kv_block, 0, "chunks must divide Lk")
+        scale = 1.0 / math.sqrt(math.sqrt(D))
+
+        torch.manual_seed(42)
+        queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
+        keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        values_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+
+        def flash(queries, k_chunks, v_chunks):
+            with spyre_hint(named_dims=["B", "H", "Lq"]):
+                running_max = torch.full(
+                    (B, H, Lq, 64),
+                    float("-inf"),
+                    device=queries.device,
+                    dtype=torch.float16,
+                ).amax(dim=-1)
+            with spyre_hint(named_dims=["B", "H", "Lq"]):
+                denom = torch.full(
+                    (B, H, Lq, 64), 0.0, device=queries.device, dtype=torch.float16
+                ).amax(dim=-1)
+            with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
+                acc = torch.zeros_like(queries)
+
+            def sweep(running_max, denom, acc):
+                """The unrolled K/V sweep.
+
+                Carries are parameters so they can be rebound locally without a
+                nonlocal declaration.
+                """
+                out = None
+                for kb in range(n_chunks):  # unrolled into the graph
+                    k_c, v_c = k_chunks[kb], v_chunks[kb]
+                    keys_T = (k_c * scale).transpose(-1, -2).contiguous()
+                    # A matmul output inherits no names from its inputs, so both
+                    # matmuls need an explicit named_dims hint.
+                    with spyre_hint(named_dims=["B", "H", "Lq", "Lkc"]):
+                        scores = torch.matmul(queries * scale, keys_T)
+                    block_max = torch.amax(scores, dim=-1)
+                    new_max = torch.maximum(running_max, block_max)
+                    correction = torch.exp(running_max - new_max)
+                    exp_scores = torch.exp(scores - new_max.unsqueeze(-1))
+                    new_denom = denom * correction + exp_scores.sum(dim=-1)
+                    with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
+                        weighted = torch.matmul(exp_scores, v_c)
+                    new_acc = acc * correction.unsqueeze(-1) + weighted
+                    if kb == n_chunks - 1:
+                        out = new_acc / new_denom.unsqueeze(-1)
+                    else:
+                        running_max, denom, acc = new_max, new_denom, new_acc
+                return out
+
+            # Lq cannot be tiled at Lq == 1 (decode), so that hint is optional.
+            # Written as two branches rather than a stand-in context manager: a
+            # contextlib.nullcontext() inside a traced function has previously
+            # produced spurious dynamo errors in this suite.
+            with spyre_hint(num_tiles_per_dim={"H": h_tiles}):
+                if lq_tiles:
+                    with spyre_hint(num_tiles_per_dim={"Lq": lq_tiles}):
+                        return sweep(running_max, denom, acc)
+                return sweep(running_max, denom, acc)
+
+        def chunk(t):
+            return [
+                t[..., i * kv_block : (i + 1) * kv_block, :].contiguous()
+                for i in range(n_chunks)
+            ]
+
+        # CPU reference first, then device setup -- matching the driver pattern.
+        k_chunks_t, v_chunks_t = chunk(keys_t), chunk(values_t)
+        ref = flash(queries_t, k_chunks_t, v_chunks_t)
+
+        queries_dev = queries_t.to("spyre")
+        k_chunks = [t.to("spyre") for t in k_chunks_t]
+        v_chunks = [t.to("spyre") for t in v_chunks_t]
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("D", D)
+        # The per-chunk key extent: what the scores' last axis really is.
+        _declare_tensor_dim("Lkc", kv_block)
+        _name_tensor_dims(queries_dev, ["B", "H", "Lq", "D"])
+        for t in k_chunks + v_chunks:
+            _name_tensor_dims(t, ["B", "H", "Lkc", "D"])
+
+        result, source_codes = run_and_get_code(
+            torch.compile(flash), queries_dev, k_chunks, v_chunks
+        )
+        torch.testing.assert_close(
+            result.cpu(),
+            ref,
+            equal_nan=True,
+            atol=0.01,
+            rtol=0.1,
+            msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
+        )
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "expected coarse tiling to survive codegen")
+        self.assertEqual(
+            src.count("LoopSpec("),
+            2 if lq_tiles else 1,
+            "expected one loop level per tiled dim (H, plus Lq when tiled)",
+        )
+        self.assertIn(
+            f"count=sympify('{h_tiles}')",
+            src,
+            f"expected the H loop count (h_tiles={h_tiles})",
+        )
+        if lq_tiles:
+            self.assertIn(
+                f"count=sympify('{lq_tiles}')",
+                src,
+                f"expected the Lq loop count (lq_tiles={lq_tiles})",
+            )
+
+    def test_hint_flash_attention_kv_chunked_python_loop(self):
+        """K/V chunked in Python, WSR tiling H (4) and Lq (2). See impl docstring."""
+        self._run_kv_chunked_flash(h_tiles=4, lq_tiles=2)
+
+    def test_hint_flash_attention_kv_chunked_prefill_8k(self):
+        """Chunked prefill: a 512-token query block against an 8k K/V cache.
+
+        This is the production shape -- vLLM-style chunked prefill -- not a
+        scaled-down proxy.  Both H and Lq are WSR-tiled; Lk is not hinted.
+
+        kv_block is 2048 (4 chunks) rather than 512 (16) because the 16-chunk
+        graph at Lq=512 takes significantly longer to compile.  Lq stays at the
+        query-block size deliberately: the same 4-chunk graph at Lq=8192
+        compiled for over two hours without finishing, while at Lq=512 it takes
+        well under a minute, so compile cost is driven by Lq extent rather than
+        by chunk count or cache length.
+        """
+        self._run_kv_chunked_flash(
+            h_tiles=4, lq_tiles=2, B=1, H=8, Lq=512, Lk=8192, D=128, kv_block=2048
+        )
+
+    def test_hint_flash_attention_kv_chunked_decode_8k(self):
+        """Decode: one query token, batch 4, against a full 8k K/V cache.
+
+        Lq == 1 cannot be tiled, so H tiling is the only level and there is a
+        single LoopSpec.  A full cache means every key is valid, so no mask is
+        needed and the fully-masked-chunk case (block_max == -inf, making
+        exp(-inf - -inf) NaN) does not arise here -- that remains untested.
+        """
+        self._run_kv_chunked_flash(
+            h_tiles=4, lq_tiles=None, B=4, H=8, Lq=1, Lk=8192, D=128, kv_block=2048
+        )
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "h_tiles == H gives a 1-element H tile, and a unit-size tiled dim is "
+            "squeezed out of _insert_one_read_copy's squeeze_pos map (built by "
+            "skipping ranges where int(r) == 1), so the subsequent "
+            "squeeze_pos[d] lookup raises KeyError. Reproduced at 2 and 4 chunks "
+            "on main; h_tiles of 2 and 4 are numerically exact. Compile-time "
+            "error only -- it does not leave the device in an error state."
+        ),
+    )
+    def test_hint_flash_attention_kv_chunked_unit_h_tile(self):
+        """h_tiles == H (one head per tile) crashes in read-copy insertion."""
+        self._run_kv_chunked_flash(h_tiles=8, lq_tiles=2)
+
+    def test_hint_flash_attention_kv_chunked_8_chunks(self):
+        """8 unrolled K/V chunks: now succeeds with optimized layouts for constants"""
+        self._run_kv_chunked_flash(
+            h_tiles=4, lq_tiles=None, B=1, H=8, Lq=256, Lk=4096, D=128, kv_block=512
+        )
+
+    @pytest.mark.skip(reason="Long test - takes ~6 mins to complete")
+    def test_hint_flash_attention_kv_chunked_16_chunks(self):
+        """16 unrolled K/V chunks: now succeeds with optimized layouts for constants"""
+        self._run_kv_chunked_flash(
+            h_tiles=4, lq_tiles=None, B=1, H=8, Lq=256, Lk=4096, D=128, kv_block=256
+        )
+
+    @pytest.mark.skip(reason="Long test - takes ~40 mins to complete")
+    def test_hint_flash_attention_kv_chunked_32_chunks(self):
+        """32 unrolled K/V chunks: now succeeds with optimized layouts for constants"""
+        self._run_kv_chunked_flash(
+            h_tiles=4, lq_tiles=None, B=1, H=8, Lq=256, Lk=4096, D=128, kv_block=128
+        )
+
     def test_hint_h_tiling_elementwise(self):
         """spyre_hint(num_tiles_per_dim={"H": 2}) tiles elementwise multiply over the H dimension.
 

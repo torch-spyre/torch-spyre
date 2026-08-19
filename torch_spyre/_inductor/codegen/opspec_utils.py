@@ -35,69 +35,29 @@ something to build on.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
 
 import sympy
 from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
-from torch_spyre._inductor.op_spec import Expr, OpSpec, TensorArg
+from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 
 __all__ = [
     "align_reshape_plan",
     "buf_id",
+    "core_divisions",
+    "per_core_extent",
+    "reduced_axes",
     "row_major_strides",
-    "symbolic_dim_max",
 ]
 
 
-def row_major_strides(device_size: Sequence[Any]) -> list[Any]:
-    """Row-major (C-contiguous) strides for a device-size list.
-
-    A symbolic extent is carried through rather than rejected: a stride is the
-    product of the extents inside it, so a symbolic extent leaves every stride
-    *inside* it an integer and makes the ones outside it expressions.  An
-    all-integer size therefore still gets plain ``int`` strides.
-    """
+def row_major_strides(device_size: Sequence[int]) -> list[int]:
+    """Row-major (C-contiguous) strides for a device-size list."""
     n = len(device_size)
-    strides: list[Any] = [1] * n
+    strides = [1] * n
     for i in range(n - 2, -1, -1):
-        product = strides[i + 1] * device_size[i + 1]
-        try:
-            strides[i] = int(product)
-        except TypeError:  # a sympy expression over an unresolved dim
-            strides[i] = product
+        strides[i] = strides[i + 1] * int(device_size[i + 1])
     return strides
-
-
-def symbolic_dim_max(expr: Expr, symbolic_dim_bounds: dict) -> int:
-    """``expr`` with every symbolic dim replaced by its maximum, as an int.
-
-    ``OpSpec.symbolic_dim_bounds`` maps a PyTorch symbol *name* to
-    ``(max, granularity)``, computed from the ShapeEnv at codegen time and
-    serialized as plain ints, so this works during the reload phase when the
-    ShapeEnv is gone.  Baking the max over-allocates but needs nothing at run
-    time, which is why both emitters offer it.
-
-    Note for anyone unifying this with ``superdsc._resolve_sdsc_size``: that one
-    returns the first symbol's max *directly* (so it answers ``s0`` for ``s0 + 1``)
-    and falls back to a live-ShapeEnv hint when the symbol is unbounded.  This one
-    substitutes into the whole expression and raises instead of guessing, so the
-    two are not interchangeable without deciding which behaviour is wanted.
-    """
-    resolved = expr
-    for symbol in {str(s) for s in getattr(expr, "free_symbols", ())}:
-        if symbol not in symbolic_dim_bounds:
-            raise NotImplementedError(
-                f"extent {expr} has no bound for {symbol!r} in symbolic_dim_bounds"
-            )
-        resolved = resolved.subs({symbol: int(symbolic_dim_bounds[symbol][0])})
-    try:
-        return int(resolved)
-    except TypeError:
-        raise NotImplementedError(
-            f"extent {expr} does not become an integer under its bounds "
-            f"{symbolic_dim_bounds!r}"
-        ) from None
 
 
 def buf_id(arg: TensorArg) -> str:
@@ -278,3 +238,147 @@ def align_reshape_plan(
         )
     broadcast_to = out_block if reshape_to != out_block else None
     return (reshape_to, broadcast_to)
+
+
+def reduced_axes(
+    in_coords: Sequence[sympy.Expr],
+    in_extent: Sequence[int],
+    out_coords: Sequence[sympy.Expr],
+    out_extent: Sequence[int],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """``(reduced, placeholder)`` axes for one reduction.
+
+    ``reduced`` is the input device axes the reduction consumes, in increasing
+    order, and ``placeholder`` is the output axes that are only standing in for
+    them: the projection keeps a reduced axis in the output's ``device_size`` as a
+    unit extent with a constant coordinate, so the output is the same rank as the
+    input even though it carries less.  A consumer wants the reduced axis gone
+    (the accepted KTIR form stores a rank-2 tile into a rank-2 view), so a
+    consumer of this helper drops those axes.
+
+    Which axes survive is read from the coordinates -- an output axis matches an
+    input axis when their ``(kind, sym)`` classifications agree (see
+    ``_dim_info``) -- rather than from the op name or a position convention, so a
+    reduction over the middle axis of a stick-tiled tile is described as exactly
+    that.
+
+    Raises ``NotImplementedError`` when the surviving axes are permuted (which
+    needs a transpose, not a reduce) or when a surviving extent changes, either
+    of which would make the reduce silently read the wrong elements.
+    """
+    in_info = [_dim_info(c) for c in in_coords]
+    placeholder = tuple(
+        axis
+        for axis, coord in enumerate(out_coords)
+        if _dim_info(coord)[0] == _DIM_CONST and int(out_extent[axis]) == 1
+    )
+    surviving = [axis for axis in range(len(out_coords)) if axis not in placeholder]
+    out_info = [_dim_info(out_coords[axis]) for axis in surviving]
+    kept: list[int] = []
+    position = 0
+    for axis, info in enumerate(out_info):
+        while position < len(in_info) and in_info[position] != info:
+            position += 1
+        if position == len(in_info):
+            raise NotImplementedError(
+                f"OpSpec reduction: output device axis {surviving[axis]} "
+                f"({out_coords[surviving[axis]]!r}) does not match a later input "
+                "axis; the surviving axes are permuted, which needs a transpose "
+                "rather than a reduction"
+            )
+        kept.append(position)
+        position += 1
+    for axis, source in enumerate(kept):
+        if int(out_extent[surviving[axis]]) != int(in_extent[source]):
+            raise NotImplementedError(
+                f"OpSpec reduction: surviving axis {surviving[axis]} has extent "
+                f"{out_extent[surviving[axis]]} but its input axis {source} has "
+                f"extent {in_extent[source]}; a reduction does not resize a kept axis"
+            )
+    reduced = tuple(axis for axis in range(len(in_info)) if axis not in set(kept))
+    if not reduced:
+        raise NotImplementedError(
+            "OpSpec reduction: the output carries every input device axis, so "
+            "there is no axis to reduce"
+        )
+    return reduced, placeholder
+
+
+# ---------------------------------------------------------------------------
+# Work division: the core grid, as the iteration space states it
+# ---------------------------------------------------------------------------
+
+
+def core_divisions(
+    iteration_space: dict[sympy.Symbol, tuple[sympy.Expr, int]],
+) -> tuple[list[tuple[sympy.Symbol, int, int]], int]:
+    """``(divisions, total_cores)`` for one iteration space.
+
+    ``OpSpec.iteration_space`` maps each symbol to ``(range, work_division)``,
+    where the division is the number of cores that symbol's range is split
+    across -- decided upstream by ``work_division.py`` from ``config.sencores``.
+    The core grid is one flat index in ``[0, total_cores)``, read as a mixed-radix
+    number over the divided symbols, so each division is returned as
+    ``(sym, div, inner)`` **innermost-first**: that symbol's portion of the grid
+    is ``(core_id // inner) % div``.
+
+    ``total_cores`` is the product of the divisions, so an undivided space gives
+    ``([], 1)`` -- a single-core kernel, stated by the contract rather than
+    assumed.
+    """
+    split = [
+        (sym, int(div)) for sym, (_range, div) in iteration_space.items() if div > 1
+    ]
+    total_cores = 1
+    for _sym, div in split:
+        total_cores *= div
+    divisions: list[tuple[sympy.Symbol, int, int]] = []
+    inner = 1
+    for sym, div in reversed(split):  # innermost first
+        divisions.append((sym, div, inner))
+        inner *= div
+    return divisions, total_cores
+
+
+def per_core_extent(
+    arg: TensorArg, divisors: dict[sympy.Symbol, int]
+) -> tuple[list[int], list[sympy.Symbol | None]]:
+    """``(extent, symbol)`` per device axis: one core's share, and what divides it.
+
+    Each device axis carries at most one iteration symbol -- a bare ``c_i`` or an
+    outer-stick ``c_i // stick`` -- so at most one divisor applies to it, and the
+    axis' per-core extent is its full extent divided by that divisor.  The
+    trailing axis is the within-stick one and is never divided: a stick is the
+    unit of transfer, so splitting it across cores would split a stick.
+
+    The returned symbol list says which division each axis follows (``None`` for
+    an axis no division touches), which is what turns a division into a step
+    along that axis.
+    """
+    extent = [int(s) for s in arg.device_size]
+    coords = list(arg.device_coordinates)
+    if divisors and len(coords) != len(extent):
+        raise NotImplementedError(
+            f"OpSpec work division: {arg.name!r} carries {len(coords)} device "
+            f"coordinate(s) for {len(extent)} device axes, so which axis a "
+            "divided symbol walks cannot be told"
+        )
+    per_core: list[int] = []
+    symbols: list[sympy.Symbol | None] = []
+    last = len(extent) - 1
+    for axis, size in enumerate(extent):
+        symbol = None
+        if divisors and axis != last:
+            kind, symbol = _dim_info(coords[axis])
+            if kind == _DIM_CONST:
+                symbol = None
+        divisor = divisors.get(symbol, 1) if symbol is not None else 1
+        if divisor > 1 and size % divisor:
+            raise NotImplementedError(
+                f"OpSpec work division: device axis {axis} of {arg.name!r} has "
+                f"extent {size}, which {divisor} cores do not divide evenly; a "
+                "ragged per-core tile is not supported"
+            )
+        per_core.append(size // divisor)
+        symbols.append(symbol if divisor > 1 else None)
+    return per_core, symbols

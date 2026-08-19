@@ -163,7 +163,12 @@ RE_PCI_DEV_ID = re.compile(
 RE_OPENED = re.compile(r"Opened:\s*SEN:VFIO:TYPE1:(?P<v>[0-9a-f:.]+)")
 
 # Chip identifiers (also final-attempt only)
-RE_RAW_ECID = re.compile(r"Raw ECID\s*=\s*(?P<v>0x[0-9a-fA-F]+\s+0x[0-9a-fA-F]+)")
+# vfio_hal_mnt.cpp prints the first ECID word with a doubled prefix
+# ("Raw ECID = 0x0x0000000002038000 0x03e3..."), so `0x` must be repeatable —
+# a single-`0x` pattern matches nothing at all.
+RE_RAW_ECID = re.compile(
+    r"Raw ECID\s*=\s*(?P<v>(?:0x)+[0-9a-fA-F]+\s+(?:0x)+[0-9a-fA-F]+)"
+)
 RE_CHIP_COORDS = re.compile(
     r"CHIPY=(?P<chipy>0x[0-9a-fA-F]+)\s+CHIPX=(?P<chipx>0x[0-9a-fA-F]+)"
 )
@@ -171,7 +176,14 @@ RE_WAFER_ID = re.compile(r"Mfg WaferID\s*=\s*(?P<v>\S+)")
 RE_MFG_XY = re.compile(r"Mfg \(X,Y\)\s*=\s*\((?P<x>\d+),(?P<y>\d+)\)")
 RE_CARD_SERIAL = re.compile(r"Card 11S S/N\s*=\s*(?P<v>\S+)")
 
-# Log-line timestamps
+# Log-line timestamps.
+#
+# GHA prefixes virtually every log line with its own ISO-8601 stamp, so that is
+# the reliable source. RE_LOG_TS matches the runtime's DTLOG format instead,
+# which only appears once the device layer starts talking (~line 1600 of a
+# typical job log) — it is kept as a fallback for logs captured without the
+# GHA prefix.
+RE_GHA_TS = re.compile(r"^\ufeff?(?P<iso>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)\s")
 RE_LOG_TS = re.compile(
     r"(?:ERRR|WARN|INFO|DBUG)\s+"
     r"(?P<day>\d{2})\.(?P<month>\d{2})\.(?P<year>\d{4})\s+"
@@ -215,6 +227,16 @@ def _ras_name_to_reason(name: str) -> str:
 
 
 def _parse_log_ts(line: str) -> str | None:
+    """Timestamp for a log line: GHA's ISO-8601 prefix, else the DTLOG stamp."""
+    m = RE_GHA_TS.match(line)
+    if m:
+        # GHA stamps are always UTC; drop the trailing Z so the value stays
+        # naive-UTC like the DTLOG branch below and the ClickHouse column.
+        try:
+            return datetime.fromisoformat(m["iso"].removesuffix("Z")).isoformat()
+        except ValueError:
+            pass
+
     m = RE_LOG_TS.search(line)
     if not m:
         return None
@@ -465,7 +487,9 @@ def parse_log(text: str, run_id: str, suite_hint: str = "") -> list[dict[str, An
         }
 
         # -------------------- Attempt start timestamp ----------------------------------------
-        for line in chunk_lines[:20]:
+        # Scan the whole chunk, not a leading window: a chunk opens with GHA
+        # setup output and the first parseable stamp can be far in.
+        for line in chunk_lines:
             ts = _parse_log_ts(line)
             if ts:
                 rec["attempt_start_ts"] = ts
@@ -575,16 +599,21 @@ def parse_log(text: str, run_id: str, suite_hint: str = "") -> list[dict[str, An
             or _first_env(RE_OPENED, chunk)
         )
         rec["aiu_world_rank0"] = _first_env(RE_AIU_RANK0, text)
-        rec["card_serial"] = _first_env(RE_CARD_SERIAL, chunk)
-        rec["chip_ecid_raw"] = _first_env(RE_RAW_ECID, chunk)
-        rec["chip_wafer_id"] = _first_env(RE_WAFER_ID, chunk)
 
-        m_xy = RE_MFG_XY.search(chunk)
+        # Same job-wide-constant reasoning as node_name/pci_device above: the
+        # card and chip identity block is printed once by the device-setup step,
+        # usually outside any attempt window, so it must be read from `text`.
+        # Scoping these to `chunk` populated them in only ~1% of rows.
+        rec["card_serial"] = _first_env(RE_CARD_SERIAL, text)
+        rec["chip_ecid_raw"] = _first_env(RE_RAW_ECID, text)
+        rec["chip_wafer_id"] = _first_env(RE_WAFER_ID, text)
+
+        m_xy = RE_MFG_XY.search(text)
         if m_xy:
             rec["chip_mfg_x"] = m_xy["x"]
             rec["chip_mfg_y"] = m_xy["y"]
 
-        m_coords = RE_CHIP_COORDS.search(chunk)
+        m_coords = RE_CHIP_COORDS.search(text)
         if m_coords:
             rec["chip_chipy"] = m_coords["chipy"]
             rec["chip_chipx"] = m_coords["chipx"]

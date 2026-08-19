@@ -1,5 +1,5 @@
 test_suite_config:
   labels: [unit, regression, trunk]
   files:
-    - path: ${TORCH_DEVICE_ROOT}/tests/inductor/test_hbm_pool_planning.py
+    - path: ${TORCH_DEVICE_ROOT}/tests/test_ingest_kernel_xml.py
       unlisted_test_mode: mandatory_success
