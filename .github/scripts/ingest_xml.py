@@ -689,6 +689,17 @@ def main():
             if run_meta is None:
                 continue
 
+            # A perf run uploads report.xml alongside the spyre/cpu kernel-report
+            # XMLs. Those kernel reports are benchmark XMLs (classname carries
+            # "benchmark") but their testcase names do not match _PERF_NAME_RE, so
+            # they parse to zero rows. Inserting a run header for them creates an
+            # empty benchmark_runs entry that shows as a "run" with 0 ops/models on
+            # the dashboard. Skip the header when there is nothing to record; the
+            # kernel timings are already folded into report.xml's kernel_mean_ms.
+            if not benchmarks:
+                print(f"  No benchmark records in {xml_path.name} — skipping header")
+                continue
+
             # Deduplication: skip if source_file already in benchmark_runs
             existing = client.query(
                 "SELECT count() FROM benchmark_runs WHERE source_file = {sf:String}",
