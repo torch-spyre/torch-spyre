@@ -1851,7 +1851,7 @@ def test_copy_rmw_correction_512x256_A4_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-# --- copy after reduction: copy_forced(x.amin(dim=0, out)) ---
+# --- copy after reduction: copy_forced(x.amin(dim=0), out) ---
 # copies sparse reduction result into a dense buffer
 
 
@@ -1890,7 +1890,7 @@ def test_copy_not_deleted():
 
 
 def test_copy_after_reduction_512x256_A4():
-    """copy_forced(x.amin(dim=0, out)) on [512,256] tiled A÷4 must be rejected."""
+    """copy_forced(x.amin(dim=0), out) on [512,256] tiled A÷4 must be rejected."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
@@ -1909,7 +1909,7 @@ def test_copy_after_reduction_512x256_A4():
 
 
 def test_copy_after_reduction_512x256_B4():
-    """copy_forced(x.amin(dim=0, out)) on [512,256] tiled B÷4."""
+    """copy_forced(x.amin(dim=0), out) on [512,256] tiled B÷4."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
@@ -1926,7 +1926,7 @@ def test_copy_after_reduction_512x256_B4():
 
 
 def test_copy_after_reduction_512x256_A4_B4():
-    """copy_forced(x.amin(dim=0, out)) on [512,256] tiled A÷4 B÷4 must be rejected."""
+    """copy_forced(x.amin(dim=0), out) on [512,256] tiled A÷4 B÷4 must be rejected."""
     inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
 
     def fn(x):
@@ -1952,10 +1952,10 @@ def test_copy_after_reduction_512x256_A4_B4():
     "mutation_write_back copy_out fix (39.7% mismatch) -- distinct/deeper bug"
 )
 def test_copy_running_max_4d_H4_Lq4():
-    """copy_forced(maximum(real_max, amax(scores,dim=-2, running_max))) on [B,H,Lk,Lq] tiled H÷4 Lq÷4.
+    """copy_forced(maximum(real_max, amax(scores,dim=-2)), real_max) on [B,H,Lk,Lq] tiled H÷4 Lq÷4.
 
     Minimal flash-attention-style reproducer: 4D scores [B,H,Lk,Lq] reduced over
-    dim=-2 (Lk), then max with a running accumulator, then copy_ back.
+    dim=-2 (Lk), then max with a running accumulator, then copy_forced back.
     """
     B, H, Lk, Lq = 2, 32, 4096, 4096
     h_block_size = 4
@@ -1981,7 +1981,7 @@ def test_copy_running_max_4d_H4_Lq4():
     run_coarse_tile_test(fn, inputs)
 
 
-# --- copy + restickify: copy_forced(a.t(, c) + b) ---
+# --- copy + restickify: copy_forced(a.t() + b, c) ---
 # copy target receives a restickified input — tests copy layout after restickify
 
 
@@ -1990,7 +1990,7 @@ def test_copy_running_max_4d_H4_Lq4():
     "beam search when target has multiple candidates -- see issue #3845"
 )
 def test_copy_restickify_512x256_A4():
-    """copy_forced(a.t(, c)+b) on [256,512] result tiled A÷4 — copy of restickified add."""
+    """copy_forced(a.t()+b, c) on [256,512] result tiled A÷4 — copy of restickified add."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["B", "A"]),
         tensor("b", shape=(256, 512), dims=["A", "B"]),
@@ -2012,7 +2012,7 @@ def test_copy_restickify_512x256_A4():
     "beam search when target has multiple candidates -- see issue #3845"
 )
 def test_copy_restickify_512x256_B4():
-    """copy_forced(a.t(, c)+b) on [256,512] result tiled B÷4."""
+    """copy_forced(a.t()+b, c) on [256,512] result tiled B÷4."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["B", "A"]),
         tensor("b", shape=(256, 512), dims=["A", "B"]),
@@ -2034,7 +2034,7 @@ def test_copy_restickify_512x256_B4():
     "beam search when target has multiple candidates -- see issue #3845"
 )
 def test_copy_restickify_512x256_A4_B4():
-    """copy_forced(a.t(, c)+b) on [256,512] result tiled A÷4 B÷4."""
+    """copy_forced(a.t()+b, c) on [256,512] result tiled A÷4 B÷4."""
     inputs = [
         tensor("a", shape=(512, 256), dims=["B", "A"]),
         tensor("b", shape=(256, 512), dims=["A", "B"]),
@@ -2057,7 +2057,7 @@ def test_copy_restickify_512x256_A4_B4():
 
 
 def test_copy_accum_with_reduction_512x256_A4():
-    """copy_forced(acc * scale + x.amin(dim=1,keepdim=True, acc)) tiled A÷4."""
+    """copy_forced(acc * scale + x.amin(dim=1, keepdim=True), acc) tiled A÷4."""
     inputs = [
         tensor("acc", shape=(512, 256), dims=["A", "B"]),
         tensor("scale", shape=(512, 1), dims=["A", "B"]),
@@ -2082,7 +2082,7 @@ def test_copy_accum_with_reduction_512x256_A4():
     )
 )
 def test_copy_accum_with_reduction_512x256_B4():
-    """copy_forced(acc * scale + x.amin(dim=1,keepdim=True, acc)) tiled B÷4."""
+    """copy_forced(acc * scale + x.amin(dim=1, keepdim=True), acc) tiled B÷4."""
     inputs = [
         tensor("acc", shape=(512, 256), dims=["A", "B"]),
         tensor("scale", shape=(512, 1), dims=["A", "B"]),
@@ -2107,7 +2107,7 @@ def test_copy_accum_with_reduction_512x256_B4():
     )
 )
 def test_copy_accum_with_reduction_512x256_A4_B4():
-    """copy_forced(acc * scale + x.amin(dim=1,keepdim=True, acc)) tiled A÷4 B÷4."""
+    """copy_forced(acc * scale + x.amin(dim=1, keepdim=True), acc) tiled A÷4 B÷4."""
     inputs = [
         tensor("acc", shape=(512, 256), dims=["A", "B"]),
         tensor("scale", shape=(512, 1), dims=["A", "B"]),
@@ -2333,7 +2333,8 @@ def test_outside_consumer_copy_then_read_512x256_A4_B4():
 
 
 def test_outside_consumer_two_accum_512x256_A4():
-    """Flash-style: out=zeros, denom=zeros; tiled copy_; return out/denom — A÷4."""
+    """out=zeros, denom=zeros; tiled copy_forced(denom+amin(dim=0), denom) on
+    [512,512] A÷4 — reducing and tiling over the same dim must be rejected."""
     inputs = [
         tensor("x", shape=(512, 512), dims=["A", "B"]),
         tensor("scale", shape=(512, 512), dims=["A", "B"]),
