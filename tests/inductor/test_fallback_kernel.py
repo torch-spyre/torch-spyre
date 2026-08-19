@@ -136,6 +136,44 @@ if not _ns_has_op("test_fk_pool", "norm_inplace"):
     _LIB_POOL._register_fake("norm_inplace", lambda x, r: None)
 
 
+# A gather whose eager kernel returns a non-canonically-tiled result when the
+# index is size-1 (see TestFallbackResultNonCanonicalTiling).
+_LIB_GATHER = torch.library.Library("test_fk_gather", "FRAGMENT")
+if not _ns_has_op("test_fk_gather", "gather"):
+    _LIB_GATHER.define("gather(Tensor cache, Tensor positions) -> Tensor")
+    _LIB_GATHER.impl(
+        "gather",
+        lambda cache, positions: cache.index_select(0, positions.flatten()),
+        dispatch_key="CompositeExplicitAutograd",
+    )
+    _LIB_GATHER._register_fake(
+        "gather",
+        lambda cache, positions: torch.empty(
+            (positions.numel(), *cache.shape[1:]),
+            dtype=cache.dtype,
+            device=cache.device,
+        ),
+    )
+
+
+# A concat whose eager result tiles to a different *rank* than the assumed
+# layout, on a shape with no size-1 dim at all.
+_LIB_CAT = torch.library.Library("test_fk_cat", "FRAGMENT")
+if not _ns_has_op("test_fk_cat", "cat_two"):
+    _LIB_CAT.define("cat_two(Tensor a, Tensor b) -> Tensor")
+    _LIB_CAT.impl(
+        "cat_two",
+        lambda a, b: torch.cat([a, b], dim=0),
+        dispatch_key="CompositeExplicitAutograd",
+    )
+    _LIB_CAT._register_fake(
+        "cat_two",
+        lambda a, b: torch.empty(
+            (a.shape[0] + b.shape[0], *a.shape[1:]), dtype=a.dtype, device=a.device
+        ),
+    )
+
+
 class TestFallbackKernelShape1Single(unittest.TestCase):
     """Shape 1: op(...) -> Tensor.
 
@@ -391,6 +429,192 @@ class TestInGraphCpuComputedBuffers(unittest.TestCase):
         `_build_cd_bound_buffers` / `_determine_in_place_division_invariant`,
         bypassing the gate -> exercises the defensive sentinel."""
         self._run_and_check(self)
+
+
+class TestFallbackResultNonCanonicalTiling(unittest.TestCase):
+    """A fallback whose eager kernel returns a non-canonically-tiled buffer.
+
+    `propagate_layouts` stamps every `MultiOutput` with `generic_layout(op)` --
+    the size-only `SpyreTensorLayout(size, dtype)` ctor, which derives
+    `dim_order` from the generic stick order and strides from a dense row-major
+    assumption. Consumers then index the fallback's buffer by *that* assumed
+    tiling. Because the node also gets `AnyInNode` (whose
+    `required_input_stls()` is empty), no restickify is ever inserted to make
+    the assumption true, so the graph's layout contract rests entirely on the
+    eager op returning a canonically-tiled result.
+
+    `aten.index_select` on a size-1 index does not: a size-1 dim has an
+    arbitrary stride, so nothing pins where it sorts in `dim_order` and the real
+    tiling permutes relative to the canonical one. Consumers then read the wrong
+    elements -- silently, with no error and (for a pure tile permutation)
+    plausible-looking magnitudes.
+
+    Shape mirrors the vLLM RoPE cos/sin cache gather that surfaced this
+    (`(T, 2, 2, head_size // 2)` gathered from a position cache, then
+    broadcast-multiplied and reduced): T == 1 is the single-token decode step,
+    where the bug bites. T == 8 is the control -- there the assumed and real
+    tilings coincide, so it passed throughout and is what made the bug look
+    shape-dependent rather than layout-dependent.
+    """
+
+    INNER = 64  # == elems_per_stick at fp16
+    HEADS = 4
+    MAXPOS = 16
+
+    def _run(self, num_tokens: int):
+        cache = torch.randn(self.MAXPOS, 2, 2, self.INNER, dtype=DTYPE)
+        x = torch.randn(num_tokens, self.HEADS * 2 * self.INNER, dtype=DTYPE) * 0.5
+        pos = torch.arange(num_tokens, dtype=torch.int64)
+
+        def fn(x, cache, pos):
+            # index_select is the fallback; its result feeds a broadcast
+            # multiply + reduction that reads it by the assumed tiling.
+            rot = torch.ops.test_fk_gather.gather(cache, pos)
+            pairs = x.view(num_tokens, -1, 2, self.INNER)
+            out = (rot.unsqueeze(1) * pairs.unsqueeze(-3)).sum(dim=-2)
+            return out.flatten(-2).view(x.shape)
+
+        expected = fn(x.float(), cache.float(), pos)
+
+        args = [t.to(DEVICE) for t in (x, cache)] + [pos.to(DEVICE)]
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")
+        out = compiled(*args).cpu().float()
+
+        # A tile permutation preserves norms, so compare elementwise. Tolerance
+        # is the fp16 accumulation floor; the bug produced errors of O(1..7).
+        torch.testing.assert_close(out, expected, atol=5e-2, rtol=5e-2)
+
+    def test_single_token_gather(self):
+        """T == 1: assumed and real tilings disagree (the regression)."""
+        self._run(1)
+
+    def test_multi_token_gather(self):
+        """T == 8: they coincide -- guards the control arm too."""
+        self._run(8)
+
+    def test_cat_disagrees_in_rank_without_size_one_dim(self):
+        """`aten.cat(dim=0)` at (8, 2, 2, 64): a second, distinct instance.
+
+        Kept separate because it refutes the obvious-looking shape heuristic
+        ("flag size-1 axes outside the stick dim"): this shape has no size-1 dim
+        at all, and the two layouts disagree in *rank* (the eager result tiles to
+        6 dims, `generic_layout` assumes 5). Any fix must therefore compare the
+        real layout against the assumed one directly rather than infer ambiguity
+        from the logical shape.
+        """
+        half = torch.randn(4, 2, 2, self.INNER, dtype=DTYPE)
+        scale = torch.randn(8, 2, 2, self.INNER, dtype=DTYPE)
+
+        def fn(half, scale):
+            joined = torch.ops.test_fk_cat.cat_two(half, half)
+            return joined * scale
+
+        expected = fn(half.float(), scale.float())
+        out = torch.compile(fn, fullgraph=True, dynamic=False, backend="inductor")(
+            half.to(DEVICE), scale.to(DEVICE)
+        )
+        torch.testing.assert_close(out.cpu().float(), expected, atol=5e-2, rtol=5e-2)
+
+
+class TestPermutedEagerResultNotNormalized(unittest.TestCase):
+    """A permuted eager result must be left alone, not forced to dense tiling.
+
+    `_normalize_result_layout` compares against `SpyreTensorLayout(size, dtype)`,
+    which synthesizes *dense row-major* strides. That is only the layout a
+    consumer would assume for a tensor that is itself dense row-major. A permuted
+    result is not: TensorIterator propagates its inputs' strides through
+    elementwise ops, so adding two permuted views yields a permuted output whose
+    real tiling legitimately differs from the size-only one. Normalizing it
+    rewrites a buffer that was already self-consistent, corrupting it.
+
+    These ran green before the normalization existed and regressed the moment it
+    was added without a contiguity gate (six `permute` cases in
+    `test_inductor_ops_lx_planning.py`); they are duplicated here, in the suite
+    that owns the fix, so a future change to the predicate fails locally rather
+    than only in CI.
+    """
+
+    # (base shape, permutation) -- the permuted result is non-contiguous, and its
+    # real device tiling differs from the size-only layout for its logical shape.
+    CASES = (
+        ((2, 1024, 844), (0, 2, 1)),
+        ((64, 128, 256), (2, 0, 1)),
+        ((2, 7, 11, 13), (0, 2, 1, 3)),
+    )
+
+    def test_permuted_addition_is_not_corrupted(self):
+        for base, perm in self.CASES:
+            with self.subTest(base=base, perm=perm):
+                a = torch.randn(base, dtype=DTYPE)
+                b = torch.randn(base, dtype=DTYPE)
+                av, bv = a.permute(*perm), b.permute(*perm)
+                self.assertFalse(av.is_contiguous())
+
+                expected = av.float() + bv.float()
+                out = a.to(DEVICE).permute(*perm) + b.to(DEVICE).permute(*perm)
+                torch.testing.assert_close(
+                    out.cpu().float(), expected, atol=5e-2, rtol=5e-2
+                )
+
+
+class TestMapResultReconstruction(unittest.TestCase):
+    """`_map_result` must rebuild every container an aten schema can return.
+
+    The end-to-end tests above only reach single-tensor results: no op currently
+    registered by `register_torch_compile_kernel` declares more than one return
+    (116 overloads, none multi-tensor), so the tuple/list branches are reachable
+    only if that list grows. They are exercised directly here rather than left to
+    a future registration to discover.
+
+    The interesting case is a tuple SUBCLASS. `structseq` -- what the multi-output
+    aten schemas (`aten.max.dim`, `aten.sort`, ...) actually return -- and
+    namedtuple both rebuild from an iterable via `_make`, but not by calling the
+    type with a list. `_map_result` must therefore not reconstruct via
+    `type(result)(mapped)`.
+    """
+
+    def _fn(self, t):
+        return t + 1
+
+    def test_tensor_and_passthrough(self):
+        from torch_spyre.ops.eager import _map_result
+
+        self.assertEqual(_map_result(torch.zeros(2), self._fn).tolist(), [1.0, 1.0])
+        # Non-tensor leaves are returned untouched.
+        for leaf in (None, 3, "s"):
+            self.assertIs(_map_result(leaf, self._fn), leaf)
+
+    def test_tuple_list_and_nesting(self):
+        from torch_spyre.ops.eager import _map_result
+
+        out = _map_result((torch.zeros(1), torch.zeros(1)), self._fn)
+        self.assertIsInstance(out, tuple)
+        self.assertEqual([t.item() for t in out], [1.0, 1.0])
+
+        out = _map_result([torch.zeros(1), None], self._fn)
+        self.assertIsInstance(out, list)
+        self.assertEqual(out[0].item(), 1.0)
+        self.assertIsNone(out[1])
+
+        out = _map_result(((torch.zeros(1),), [torch.zeros(1)]), self._fn)
+        self.assertEqual(out[0][0].item(), 1.0)
+        self.assertEqual(out[1][0].item(), 1.0)
+
+    def test_structseq_and_namedtuple_are_rebuilt_as_their_own_type(self):
+        from collections import namedtuple
+
+        from torch_spyre.ops.eager import _map_result
+
+        # structseq: the real return type of multi-output aten ops.
+        real = torch.max(torch.zeros(2, 2), dim=0)
+        out = _map_result(real, lambda t: t)
+        self.assertIsInstance(out, type(real))
+        self.assertEqual(out.values.shape, real.values.shape)
+
+        Pair = namedtuple("Pair", "first second")
+        out = _map_result(Pair(torch.zeros(1), torch.zeros(1)), self._fn)
+        self.assertIsInstance(out, Pair)
+        self.assertEqual(out.first.item(), 1.0)
 
 
 if __name__ == "__main__":
