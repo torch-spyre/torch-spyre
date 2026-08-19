@@ -339,10 +339,9 @@ def spyre_topk(
         raise Unsupported(f"topk with k={k} is not supported (max k=128)")
     if not largest:
         raise Unsupported("topk with largest=False")
-    # sorted=False only relaxes the ordering guarantee (any order of the top-k
-    # elements is a valid answer); our topkvalue/topkindex reduction always
-    # returns sorted output, which satisfies that relaxed contract, so
-    # sorted=False can be served as a no-op.
+    # sorted=False is a no-op: our reduction always returns sorted output.
+    # Index stays in the input dtype (not int64) all the way out; topkindex's
+    # fake reports it so Dynamo traces it with no meta conflict.
     return torch.ops.spyre.topkvalue(input, k, dim), torch.ops.spyre.topkindex(
         input, k, dim
     )

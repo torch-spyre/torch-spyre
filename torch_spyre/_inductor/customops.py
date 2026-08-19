@@ -151,7 +151,9 @@ def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
     norm_dim = dim % len(x.size())
     out_size = list(x.size())
     out_size[norm_dim] = k
-    return x.new_empty(out_size, dtype=torch.int64)
+    # Index materializes in the input dtype, not int64: a float that lies it
+    # is an index. Matches lower_topkindex (dst_dtype = x.get_dtype()).
+    return x.new_empty(out_size, dtype=x.dtype)
 
 
 @torch.library.custom_op("spyre::gelu", mutates_args=(), device_types="spyre")
