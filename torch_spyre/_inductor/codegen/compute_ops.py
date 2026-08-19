@@ -238,13 +238,12 @@ def generate_constant_info(
         # Example: clipMin in quantscalepertokenfp8 is a DDL template constant (value: 4096)
         # that must be passed as a raw integer, not FP16-encoded.
         if name in constants_raw:
-            try:
-                encoded_value = int(value)
-            except (ValueError, TypeError) as e:
+            if not isinstance(value, int):
                 raise ValueError(
-                    f"Cannot convert constant '{name}' with value {value} (type: {type(value).__name__}) "
-                    f"to int: {e}"
-                ) from e
+                    f"Raw constant '{name}' must be an int, got {type(value).__name__} ({value!r}). "
+                    f"Non-integer values would be silently truncated."
+                )
+            encoded_value = value
         else:
             try:
                 encoded_value = encode_constant(value, data_format)

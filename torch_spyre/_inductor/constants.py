@@ -187,9 +187,13 @@ FP8_E4M3FN_MIN = float(FP8_E4M3FN_INFO.min)
 
 # DDL template constant for quantscalepertokenfp8 clipMin parameter
 # Required by the DeepTools DDL template (quant_scale_per_token.ddl) for operation compilation.
-# Value: 4096 (0x1000) - Raw DDL template constant, not an FP16-encoded value.
-# Corresponds to encode_constant(1.1920928955078125e-07, SEN169_FP16).
+# Value: 4096 (0x1000) - the SEN169_FP16 encoding of 1.1920928955078125e-07
+# (encode_constant(1.1920928955078125e-07, SEN169_FP16) == 4096).
+# The hardware clamps the computed scale from below to this value.
 QUANTSCALEPERTOKENFP8_CLIP_MIN = 4096
+
+# The float value that QUANTSCALEPERTOKENFP8_CLIP_MIN represents in SEN169_FP16.
+QUANTSCALEPERTOKENFP8_CLIP_MIN_VALUE = 1.1920928955078125e-07
 
 # DDL template constant for quantscalepertokenfp8 clipMax parameter
 # Required by the DeepTools DDL template (quant_scale_per_token.ddl) for operation compilation.

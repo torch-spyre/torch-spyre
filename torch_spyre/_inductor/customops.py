@@ -865,7 +865,11 @@ def quantscalepertokenfp8(
 
 @quantscalepertokenfp8.register_fake
 def _(input: torch.Tensor, scale_ub: float = FP8_E4M3FN_MAX) -> torch.Tensor:
-    # Output has same shape as input except last dim becomes 1
+    if input.ndim < 1:
+        raise ValueError(
+            f"quantscalepertokenfp8 requires input with at least 1 dimension "
+            f"(the hidden dim to reduce), got a scalar (ndim=0)."
+        )
     out_shape = list(input.shape)
     out_shape[-1] = 1
     return torch.empty(out_shape, dtype=input.dtype, device=input.device)

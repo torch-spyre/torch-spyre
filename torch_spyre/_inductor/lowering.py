@@ -1873,10 +1873,16 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3FN_MAX):
 
     clipMin and clipMax are in constants_raw so they bypass encode_constant.
     """
+    if x.get_size() == [] or len(x.get_size()) < 1:
+        raise ValueError(
+            f"quantscalepertokenfp8 requires input with at least 1 dimension "
+            f"(the hidden dim to reduce), got a scalar (ndim=0)."
+        )
+
     # Validate scale_ub: must be a finite positive value whose reciprocal
-    # (mulConst = 1/scale_ub) is representable as a non-zero FP16 value.
-    # FP16 range: [6.104e-5, 65504.0], so scale_ub must be in [1/65504, 1/6.104e-5]
-    # i.e. [~1.53e-5, 16384.0].
+    # (mulConst = 1/scale_ub) is representable as a non-zero SEN169_FP16 value.
+    # SEN169_FP16 range mirrors FP16: [6.104e-5, 65504.0], so scale_ub must be
+    # in [1/65504, 1/6.104e-5] i.e. [~1.53e-5, 16384.0].
     _fp16_max = torch.finfo(torch.float16).max  # 65504.0
     _fp16_tiny = torch.finfo(torch.float16).tiny  # 6.103515625e-05
 
