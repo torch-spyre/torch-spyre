@@ -137,6 +137,15 @@ jobs:
       rpm_names: ${{ inputs.rpm_names || '' }}
       build_torch_spyre: ${{ inputs.build_torch_spyre == true }}
       test_type: ${{ inputs.test_type || (github.event_name == 'push' && 'trunk' || 'regression') }}
+    # ClickHouse connection for the perf job's inline ingest (a no-op here in
+    # practice: perf is non-PR-gated and this workflow's test_type is never
+    # perf). Forwarded for consistency with the other _test_matrix callers.
+    secrets:
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
 
   # ---------------------------------------------------------------------------
   # Job 3: run-spyre-unit-tests (required check gate)

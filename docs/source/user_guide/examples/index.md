@@ -41,6 +41,7 @@ resulting buffer layouts. They require `matplotlib` and `numpy`.
 | `scratchpad/toy_layout.py` | Plot the layout for a fixed ordering of four buffers, with no annealing |
 | `scratchpad/random_buffers.py` | Compare first-fit against simulated-annealing quality on a set of random buffers |
 | `scratchpad/inplace_annealing.py` | Convergence study on an 18-buffer workload with in-place reuse |
+| `scratchpad/profile_native_packer.py` | Paired A/B benchmark of the C++ packer against the Python one, with dispersion statistics (needs neither `matplotlib` nor `numpy`; see [results](../../compiler/native_packer_performance.md)) |
 
 ## Provenance Audit
 

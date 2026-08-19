@@ -1,0 +1,56 @@
+name: retry-failed-tests
+
+# On failure of "tests"/"tests-nightly", reruns the failed jobs via `gh run rerun --failed` so ARC gives them a fresh pod/card (unlike run-test-suite's same-pod in-suite retry).
+# Separate workflow_run workflow, like push-to-clickhouse.yaml (gh run rerun needs a completed run; workflow_run keeps base-repo perms for fork PRs); only picks up changes from the default branch.
+on:
+  workflow_run:
+    workflows:
+      - tests # torch_spyre_tests.yaml: PR / push / merge-queue
+      - tests-nightly
+    types: [completed]
+
+concurrency:
+  # One retry decision per triggering run; never cancel a rerun in flight.
+  group: retry-failed-tests-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write # required by `gh run rerun`
+
+jobs:
+  retry:
+    name: Retry failed jobs on a fresh pod
+    # Cardless pool (like push-to-clickhouse.yaml's ingest job) -- only calls the GitHub API.
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - linux
+      - image_spyre_backend
+    # Only on an actual failure (not cancelled/superseded); run_attempt < 2 caps this at one retry.
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.run_attempt < 2
+    steps:
+      - name: Setup the GitHub CLI
+        env:
+          GH_CLI_VERSION: 2.97.0
+        run: |
+          curl -fsSL \
+            "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.tar.gz" \
+            -o "${RUNNER_TEMP}/gh-cli.tar.gz"
+          mkdir -p "${RUNNER_TEMP}/gh-cli"
+          tar -xzf "${RUNNER_TEMP}/gh-cli.tar.gz" -C "${RUNNER_TEMP}/gh-cli" --strip-components=1
+          echo "${RUNNER_TEMP}/gh-cli/bin" >> "${GITHUB_PATH}"
+
+      - name: Rerun failed jobs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Triggering workflow : ${{ github.event.workflow_run.name }}"
+          echo "Run                 : ${{ github.event.workflow_run.id }} (attempt ${{ github.event.workflow_run.run_attempt }})"
+          echo "Conclusion          : ${{ github.event.workflow_run.conclusion }}"
+          echo "Rerunning failed jobs on a fresh pod..."
+          gh run rerun "${{ github.event.workflow_run.id }}" \
+            --repo "${{ github.repository }}" \
+            --failed
