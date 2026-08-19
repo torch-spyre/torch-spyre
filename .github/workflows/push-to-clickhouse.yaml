@@ -89,6 +89,8 @@ jobs:
       # run-name: — this is the only way a workflow_run-triggered job can recover the
       # original dispatch tier (integration/regression/smoke/etc) without an extra API call.
       TRIGGERING_DISPLAY_TITLE: ${{ github.event.workflow_run.display_title || '' }}
+      # Triggering event (push/pull_request/schedule/workflow_dispatch/merge_group; empty on manual re-ingest) -- gates the PR-number lookup below.
+      TRIGGERING_EVENT: ${{ github.event.workflow_run.event || '' }}
 
 
     steps:
@@ -134,10 +136,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PR=$(gh api \
-            "/repos/${{ github.repository }}/commits/${TRIGGERING_SHA}/pulls" \
-            --jq '.[0].number // 0')
-          echo "Resolved PR number: ${PR}"
+          # An unconditional commit->PR lookup stamped a trunk/scheduled run with whatever PR previously merged that commit; only trust it for an actual pull_request-triggered run.
+          if [[ "${TRIGGERING_EVENT}" == "pull_request" ]]; then
+            PR=$(gh api \
+              "/repos/${{ github.repository }}/commits/${TRIGGERING_SHA}/pulls" \
+              --jq '.[0].number // 0')
+          else
+            PR=0
+          fi
+          echo "Resolved PR number: ${PR} (triggering event: ${TRIGGERING_EVENT:-<manual dispatch>})"
           echo "pr_number=${PR}" >> "${GITHUB_OUTPUT}"
 
       # ---------------------------------------------------------------------------
