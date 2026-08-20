@@ -442,7 +442,7 @@ dim `K`.
 
 | Tensor | Unsplit per-core span | Violating dim | Pass 1 commit | After Pass 3 | Cores reading it |
 |---|---|---|---|---|---|
-| A `[8192, 32768]` fp16 | 512 MB | K (outermost) | K split = 2 | M = 16, K = 2 | each core reads (512 rows) × (16384 K) = 16 MB |
+| A `[8192, 32768]` fp16 | 512 MB | K (outermost) | K minimum = 2 | M = 16, K = 2 | each core reads (512 rows) × (16384 K) = 16 MB |
 | W `[32768, 4096]` fp16 | 255.996 MiB | none (at limit) | — | M = 16, K = 2 | each core reads (16384 K) × (4096 N) = 128 MB |
 | O `[8192, 4096]` fp16 | 64 MB | none | — | M = 16, K = 2 | each core writes (512 rows) × 4096 = 4 MB |
 
@@ -452,9 +452,10 @@ and Pass 3 distributes the remaining cores. Without the Pass-1 commit,
 the planner would enumerate divisors of `(B, M, N, K)` and price each
 feasible combination with the cost equation.
 
-Pass 3 inherits the 2-way K split from Pass 1. With 16 cores remaining
-per K-slice, it ranks output dims by size (`M = 8192`, `N = 4096`) and
-assigns all 16 cores to `M`. Final split: `{M: 16, N: 1, K: 2}`.
+Pass 3 retains Pass 1's K=2 lower bound. A committed factor may grow only to
+a legal multiple, preserving its existing work partition. With 16 cores
+remaining per K-slice, it ranks output dims by size (`M = 8192`, `N = 4096`)
+and assigns all 16 cores to `M`. Final split: `{M: 16, N: 1, K: 2}`.
 
 | Dim | Size | Split | Per-core |
 |---|---|---|---|

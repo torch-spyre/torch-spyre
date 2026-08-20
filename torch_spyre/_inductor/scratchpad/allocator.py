@@ -1191,6 +1191,16 @@ def _fixed_core_division(op: Operation) -> CoreDivision:
     return _core_division(op, ownership.work_slices if ownership is not None else {})
 
 
+def _legal_fixed_division(
+    op: Operation, fixed: list[CoreDivision], reason: str
+) -> list[CoreDivision]:
+    """Return upstream division when it satisfies hard constraints."""
+    if _split_option_is_legal(op, _division_splits(op, fixed[0])):
+        logger.debug("keep upstream division for %s: %s", op.name, reason)
+        return fixed
+    raise Unsupported(f"{op.name}: no legal core-division candidates.")
+
+
 def _split_option_is_legal(
     op: Operation, splits: dict[sympy.Symbol, int]
 ) -> bool:
@@ -1599,7 +1609,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         least one valid candidate"``), the root cause of the
         ``slice_stick_mutation_*`` failures. Keeping the fixed division there
         matches the schedulable slicing the greedy path uses; it costs only a
-        division optimization, never correctness. See
+        division optimization when that division also satisfies hard
+        work-division constraints. Otherwise LX planning raises ``Unsupported``
+        rather than committing an illegal division. See
         ``utils.ops_in_offset_mutation_component``.
         """
         max_cores = config.sencores
@@ -1609,7 +1621,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         result = {}
         for op in graph.operations:
             if op.name in fixed_division_ops:
-                divs = [_fixed_core_division(op)]
+                divs = _legal_fixed_division(
+                    op, [_fixed_core_division(op)], "offset mutation component"
+                )
             elif self.prune and isinstance(op, ComputedBuffer):
                 divs = [
                     _core_division(op, splits)
@@ -1641,8 +1655,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         try:
             candidates = enumerate_work_division_candidates(op, max_cores)
         except Unsupported as exc:
-            logger.debug("skip joint division for %s: %s", op.name, exc)
-            return fixed
+            return _legal_fixed_division(op, fixed, str(exc))
         cds: list[CoreDivision] = []
         seen: set[tuple] = set()
         for candidate in candidates:
@@ -1662,7 +1675,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if key not in seen:
                 seen.add(key)
                 cds.append(division)
-        return cds or fixed
+        return cds or _legal_fixed_division(op, fixed, "no enumerable candidate")
 
     def _commit_divisions(
         self,

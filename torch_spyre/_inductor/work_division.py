@@ -268,7 +268,8 @@ def multi_dim_iteration_space_split(
     ``mandatory_splits`` is a local merge of ``min_splits`` and the smallest
     legal factor for every domain that excludes one. It never mutates
     ``min_splits``; each selected factor reserves core budget before greedy
-    distribution and may grow to a larger legal factor.
+    distribution and may grow only to a larger legal multiple, preserving its
+    already-partitioned work.
 
     The product of all splits will be <= max_cores.
     """
@@ -518,6 +519,7 @@ def must_split_vars(
     max_cores: int,
     symbol_meta: SymbolMeta,
     allowed_splits: dict[Symbol, frozenset[int]] | None = None,
+    blocked: set[Symbol] | None = None,
 ) -> dict[Symbol, int]:
     """Return the minimum splits per iteration variable to keep each tensor's
     memory span within MAX_SPAN_BYTES.
@@ -545,12 +547,14 @@ def must_split_vars(
         max_cores: Maximum number of cores available
         symbol_meta: Per-symbol (max_size, granularity) for symbolic dims
         allowed_splits: Optional hard legal split factors per symbol
+        blocked: Dimensions that must remain unsplit
 
     Returns a dict mapping Symbol -> number of slices.
     """
     # TODO: use compute_max_size(...) / compute_granularity(...) from pass_utils.py
     # for symbolic path. Refer to #2287 for details.
     accumulated_splits: dict[Symbol, int] = {}
+    blocked = blocked or set()
 
     for td in tensor_deps:
         if (
@@ -574,6 +578,8 @@ def must_split_vars(
                 continue
 
             def valid_splits(v: Symbol) -> list[int]:
+                if v in blocked:
+                    return [1]
                 current_min = accumulated_splits.get(v, 1)
                 if v in symbol_meta:
                     basis = symbol_meta[v][1]
@@ -1090,7 +1096,7 @@ def span_reduction_pass(
         if isinstance(v, Symbol)
     }
     reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
-    allowed_splits = collect_work_division_constraints(
+    constraints = collect_work_division_constraints(
         WorkDivConstraintContext(
             op=op,
             it_space=it_space,
@@ -1101,7 +1107,7 @@ def span_reduction_pass(
             reduction_vars=reduction_vars,
             committed_splits={},
         )
-    ).allowed_splits
+    )
     min_splits = must_split_vars(
         all_tds,
         it_space,
@@ -1109,7 +1115,8 @@ def span_reduction_pass(
         stick_vars,
         max_cores,
         symbol_meta,
-        allowed_splits,
+        constraints.allowed_splits,
+        constraints.blocked,
     )
     collect_work_division_constraints(
         WorkDivConstraintContext(

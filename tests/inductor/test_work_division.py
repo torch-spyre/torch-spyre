@@ -32,7 +32,10 @@ from torch_spyre._C import ElementArrangement, SpyreTensorLayout
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.pass_utils import SchedNodeArg
-from torch_spyre._inductor.scratchpad.allocator import CoOptimizingAllocator
+from torch_spyre._inductor.scratchpad.allocator import (
+    CoOptimizingAllocator,
+    CoreDivision,
+)
 from torch_spyre._inductor.work_division import (
     TensorDep,
     _default_split,
@@ -590,7 +593,7 @@ class TestCollectWorkDivisionConstraints(unittest.TestCase):
 class TestSpanReductionConstraints(unittest.TestCase):
     _PATCH_TARGET = "torch_spyre._inductor.work_division"
 
-    def test_multidim_indirect_reduction_stays_single_core(self):
+    def test_span_search_excludes_blocked_dimensions(self):
         o, r0, r1 = (_isym(name) for name in ("o", "r0", "r1"))
         op = _computed_buffer((8,), name="indirect_reduction")
         output_td = _tensor_dep("indirect_reduction", (8,), (o,))
@@ -607,17 +610,18 @@ class TestSpanReductionConstraints(unittest.TestCase):
                 f"{self._PATCH_TARGET}.adjust_it_space_for_sticks",
                 return_value=({o: 8, r0: 8, r1: 8}, {}),
             ),
-            patch(f"{self._PATCH_TARGET}.must_split_vars", return_value={}),
+            patch(
+                f"{self._PATCH_TARGET}.must_split_vars", return_value={}
+            ) as must_split,
             patch(
                 f"{self._PATCH_TARGET}.collect_work_division_constraints",
-                return_value=ConstraintResult(
-                    allowed_splits={r0: frozenset({1}), r1: frozenset({1})}
-                ),
+                return_value=ConstraintResult(blocked={r0, r1}),
             ),
             patch(f"{self._PATCH_TARGET}.apply_splits") as apply_splits,
         ):
             span_reduction_pass(op, [], 32)
         self.assertEqual(apply_splits.call_args.args[1], {})
+        self.assertEqual(must_split.call_args.args[-1], {r0, r1})
 
 
 class TestCoOptimizingAllocator(unittest.TestCase):
@@ -651,7 +655,7 @@ class TestCoOptimizingAllocator(unittest.TestCase):
             ):
                 allocator._division_map(graph)
 
-    def test_no_legal_core_division_candidates_raises_unsupported(self):
+    def test_no_enumerable_candidates_keeps_legal_fixed_division(self):
         op = MagicMock(spec=ComputedBuffer)
         op.name = "empty_candidates"
         op.data = MagicMock(spec=Pointwise)
@@ -660,21 +664,29 @@ class TestCoOptimizingAllocator(unittest.TestCase):
         rw.reads = []
         allocator = CoOptimizingAllocator(MagicMock(), size=1)
 
+        fixed = CoreDivision(output_splits={1: 2}, reduction_splits={})
         with (
             patch(
                 "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
                 return_value=rw,
             ),
             patch(
+                "torch_spyre._inductor.scratchpad.allocator._fixed_core_division",
+                return_value=fixed,
+            ),
+            patch(
                 "torch_spyre._inductor.scratchpad.allocator."
                 "enumerate_work_division_candidates",
                 return_value=[],
             ),
+            patch(
+                "torch_spyre._inductor.scratchpad.allocator._split_option_is_legal",
+                return_value=True,
+            ),
         ):
-            with self.assertRaisesRegex(
-                Unsupported, "no legal core-division candidates"
-            ):
-                allocator._enumerate_core_divisions(op, max_cores=32)
+            self.assertEqual(
+                allocator._enumerate_core_divisions(op, max_cores=32), [fixed]
+            )
 
 
 class TestTopKConstraints(unittest.TestCase):
