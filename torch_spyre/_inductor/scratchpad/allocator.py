@@ -17,7 +17,7 @@ import logging
 import math
 import time
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from typing import Any, Callable, cast, Optional
 
@@ -1191,16 +1191,27 @@ def _fixed_core_division(op: Operation) -> CoreDivision:
     return _core_division(op, ownership.work_slices if ownership is not None else {})
 
 
-def _split_option_is_legal(op: Operation, splits: tuple[dict, dict]) -> bool:
-    """Return whether ``splits`` satisfy ``op``'s hard work-division domains.
-
-    Domains derive from a ComputedBuffer's dependencies and tiled layouts.
-    Other operation types participate only as fixed allocator graph nodes, so
-    they have no applicable work-division domain.
-    """
+def _split_option_is_legal(
+    op: Operation, splits: dict[sympy.Symbol, int]
+) -> bool:
+    """Return whether symbol-keyed ``splits`` satisfy hard work-division domains."""
     if not isinstance(op, ComputedBuffer):
         return True
-    return work_division_split_is_legal(op, splits)
+    division = _core_division(op, splits)
+    return work_division_split_is_legal(
+        op, (division.output_splits, division.reduction_splits)
+    )
+
+
+def _legal_split_options(
+    op: Operation, options: Iterable[dict[sympy.Symbol, int]]
+) -> list[dict[sympy.Symbol, int]]:
+    """Return stick-valid candidates satisfying hard work-division domains."""
+    return [
+        option
+        for option in options
+        if _split_fits_sticks(op, option) and _split_option_is_legal(op, option)
+    ]
 
 
 DEFAULT_VARIANT_CAP = 6
@@ -1443,11 +1454,7 @@ def _check_and_add_matmul_options(
         full_candidate = {sym: 1 for sym in iteration_space_from_op(op)}
         full_candidate.update(candidate)
         options.setdefault(_candidate_key(full_candidate), full_candidate)
-    return [
-        candidate
-        for candidate in options.values()
-        if candidate == seed or _split_fits_sticks(op, candidate)
-    ]
+    return _legal_split_options(op, options.values())
 
 
 def _enum_split_options(
@@ -1478,11 +1485,7 @@ def _enum_split_options(
             full_candidate = {sym: 1 for sym in iteration_space_from_op(op)}
             full_candidate.update(candidate)
             options.setdefault(_candidate_key(full_candidate), full_candidate)
-        return [
-            candidate
-            for candidate in options.values()
-            if candidate == seed or _split_fits_sticks(op, candidate)
-        ]
+        return _legal_split_options(op, options.values())
     if not is_computed or not seed_profile:
         return [seed]
 
@@ -1509,11 +1512,7 @@ def _enum_split_options(
     for profile in extra_profiles:
         candidate = _from_output_profile(op, profile)
         options.setdefault(_candidate_key(candidate), candidate)
-    return [
-        candidate
-        for candidate in options.values()
-        if candidate == seed or _split_fits_sticks(op, candidate)
-    ]
+    return _legal_split_options(op, options.values())
 
 
 class CoOptimizingAllocator(ScratchpadAllocator):
