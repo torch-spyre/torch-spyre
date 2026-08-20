@@ -59,7 +59,7 @@ def test_nested_spyre_context_runs_pre_scheduling_once():
         def __call__(self, graph):
             calls.append(graph)
 
-    graph = SimpleNamespace()
+    graph = SimpleNamespace(graph=SimpleNamespace(owning_module=None))
     with (
         patch.object(passes, "CustomPreSchedulingPasses", CountingPreSchedulingPasses),
         patch.object(GraphLowering, "_update_scheduler", lambda _self: None),
@@ -301,6 +301,7 @@ class _ParameterizedScratchpadMeta(type):
     # added to ``parameter_axes`` work without editing this method.
     _AXIS_LABELS = {
         "solver_method": lambda v: str(v),
+        "hint_mode": lambda v: str(v),
         "sencores": lambda v: f"sc{v}",
         "co_optimization": lambda v: "coopt" if v else "nocoopt",
     }

@@ -130,6 +130,12 @@ SEGMENT_OFFSETS = [
 INTERMEDIATES_SEGMENT = 0x0
 SEGMENT_SIZE = 0x400000000
 
+# The intermediates pool must leave headroom below the full segment size --
+# 2 GiB is reserved for other segment-7 consumers (e.g. kernel-address/dim
+# symbol bookkeeping), so the pool itself may never grow to claim the whole
+# segment.
+MAX_POOL_SIZE_BYTES = SEGMENT_SIZE - 2 * 1024**3
+
 SPYRE_FP32_OPS = [
     "add",
     "sub",

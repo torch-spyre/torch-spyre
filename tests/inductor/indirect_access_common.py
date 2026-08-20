@@ -130,7 +130,7 @@ def capture_op_specs():
     """
     captured: list[list] = []
 
-    def _spy(self, kernel_name, specs):  # noqa: ARG001
+    def _spy(self, kernel_name, specs, pool_size=0):  # noqa: ARG001
         captured.append(list(specs))
         return _NoopRunner()
 
@@ -146,7 +146,7 @@ def capture_sdsc_calls():
     """
     calls: list[tuple[str, list]] = []
 
-    def _spy(self, kernel_name, specs):  # noqa: ARG001
+    def _spy(self, kernel_name, specs, pool_size=0):  # noqa: ARG001
         calls.append((kernel_name, list(specs)))
         return _NoopRunner()
 
@@ -314,7 +314,10 @@ def generate_sdsc_jsons(kernel, *dev_args) -> dict:
     for ci, specs in enumerate(captured):
         sub = os.path.join(out, f"kernel{ci}")
         os.makedirs(sub, exist_ok=True)
-        generate_bundle(f"kernel{ci}", sub, specs)
+        # This exercises SDSC JSON generation, not hardware pool sizing, so a
+        # placeholder non-zero size satisfies generate_bundle's pool_size
+        # validation whenever a pool symbol happens to be present.
+        generate_bundle(f"kernel{ci}", sub, specs, pool_size=1024)
         for path in sorted(glob.glob(os.path.join(sub, "sdsc_*.json"))):
             with open(path) as f:
                 jsons[os.path.relpath(path, out)] = json.load(f)
@@ -500,7 +503,10 @@ def bundle_jsons_from_captured(captured) -> dict:
         sub = os.path.join(out, f"kernel{ci}")
         os.makedirs(sub, exist_ok=True)
         try:
-            generate_bundle(f"kernel{ci}", sub, specs)
+            # This call only inspects SDSC JSON structure, not hardware pool
+            # sizing, so a placeholder non-zero size satisfies generate_bundle's
+            # pool_size validation whenever a pool symbol happens to be present.
+            generate_bundle(f"kernel{ci}", sub, specs, pool_size=1024)
         except Exception:  # noqa: BLE001 - absence of jsons is itself an outcome
             continue
         for path in sorted(glob.glob(os.path.join(sub, "sdsc_*.json"))):

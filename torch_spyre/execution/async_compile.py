@@ -110,7 +110,10 @@ class SpyreAsyncCompile(AsyncCompile):
         )
 
     def sdsc(
-        self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]
+        self,
+        kernel_name: str,
+        specs: Sequence[OpSpec | LoopSpec | UnimplementedOp],
+        pool_size: int = 0,
     ):
         unimp = find_unimplemented(list(specs))
         if unimp is not None:
@@ -121,7 +124,7 @@ class SpyreAsyncCompile(AsyncCompile):
 
         # Generate SDSC Bundle from OpSpecs
         output_dir = get_output_dir(kernel_name)
-        generate_bundle(kernel_name, output_dir, specs)
+        generate_bundle(kernel_name, output_dir, specs, pool_size=pool_size)
 
         self._provenance_attempt_count += 1
         try:
@@ -195,7 +198,16 @@ class SpyreAsyncCompile(AsyncCompile):
 
         # Emit before opening the file: if generate_ktir raises we must not
         # leave a truncated/empty .ktir behind.
-        ktir_text = generate_ktir(kernel_name, specs)
+        #
+        # Canonical KTIR spells base addresses as func arguments.  dbo-opt needs
+        # them baked into constants (dataflow-scheduler#65), so this path -- the
+        # one that runs dbo-opt -- asks for that form; the emitter itself has no
+        # opinion about the backend.  Drop the argument when #65 is fixed.
+        ktir_text = generate_ktir(
+            kernel_name,
+            specs,
+            bake_addresses=not _spyre_config.bundle_symbolic_args,
+        )
 
         # Persist the emitted KTIR as a text file in the same per-kernel output
         # dir as sdsc's bundle.

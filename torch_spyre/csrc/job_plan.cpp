@@ -18,6 +18,7 @@
 
 #include <iostream>
 #include <memory>
+#include <string>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -136,6 +137,36 @@ void JobPlanStepCompute::write(std::ostream& os) const {
      << "\n";
 }
 
+std::vector<int64_t> JobPlanStepHostCompute::resolveSymbolicArgs(
+    const std::vector<at::Tensor>& tensors,
+    const std::vector<SymbolicArg>& symbolic_args) {
+  auto& allocator = SpyreAllocator::instance();
+  std::vector<int64_t> resolved(symbolic_args.size());
+  for (size_t i = 0; i < symbolic_args.size(); ++i) {
+    const SymbolicArg& arg = symbolic_args[i];
+    TORCH_CHECK(arg.tensor_id >= 0 &&
+                    static_cast<size_t>(arg.tensor_id) < tensors.size(),
+                "SymbolicArg[", i, "].tensor_id=", arg.tensor_id,
+                " out of range [0, ", tensors.size(), ")");
+    switch (arg.kind) {
+      case SymbolicArgKind::kAddress:
+        resolved[i] = static_cast<int64_t>(allocator.compositeAddressToDmva(
+            static_cast<SharedOwnerCtx*>(
+                tensors[arg.tensor_id].storage().data_ptr().get_context())
+                ->composite_addr));
+        break;
+      case SymbolicArgKind::kDimension:
+        TORCH_CHECK(false,
+                    "SymbolicArgKind::kDimension is not yet implemented");
+        break;
+      default:
+        TORCH_CHECK(false, "Unknown SymbolicArgKind value: ",
+                    static_cast<int32_t>(arg.kind));
+    }
+  }
+  return resolved;
+}
+
 void JobPlanStepHostCompute::construct(LaunchContext& ctx,
                                        const SpyreStream& stream) const {
   // Helper lambda to build HostCallbackParams and launch on the stream.
@@ -159,6 +190,7 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   // Case 1: input_buffer_ is provided
   if (input_buffer_ != nullptr) {
     launch_host_callback([this](void*) {
+      // Use regular path - input_buffer_ is already properly formatted
       deeptools::processComputeOnHostCommand(*hcm_, output_buffer_,
                                              input_buffer_);
     });
@@ -170,24 +202,49 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   // and it's {0}, it's for fake symbols
   if (ishape_.size() == 1 && ishape_[0] == 0) {
     launch_host_callback([this](void*) {
+      // Fake symbols don't need fast path - use regular path
       deeptools::processComputeOnHostCommand(*hcm_, output_buffer_, nullptr);
     });
     return;
   }
 
-  // Case 3: extract addresses from context tensors
+  // Typed symbolic payload present — resolve each slot by kind.
+  if (!ctx.symbolic_args.empty()) {
+    std::vector<int64_t> resolved_addresses =
+        resolveSymbolicArgs(ctx.inputs_outputs, ctx.symbolic_args);
+
+    // Wrong symbolic_args count is an OOB read inside deeptools
+    // (DT_CHECK_MSG_OPT is compiled out by default).
+    TORCH_CHECK(resolved_addresses.size() == hcm_->vdci.inputSym_.size(),
+                "symbolic_args count (", resolved_addresses.size(),
+                ") does not match compiled symbol count (",
+                hcm_->vdci.inputSym_.size(), ") for this host-compute step");
+
+    launch_host_callback([this, resolved_addresses](void*) {
+      deeptools::processComputeOnHostCommand(*hcm_, output_buffer_,
+                                             &resolved_addresses);
+    });
+    return;
+  }
+
+  // Case 3b: no payload — legacy path: treat every context tensor as an
+  // address source in iteration order.  Back-compat for callers that pass no
+  // symbolic_args (empty payload).
   std::vector<int64_t> addresses(ctx.inputs_outputs.size());
   int addr_idx = 0;
   auto& allocator = SpyreAllocator::instance();
   for (auto& tensor : ctx.inputs_outputs) {
-    int64_t addr = allocator.compositeAddressToDmva(
+    int64_t addr = static_cast<int64_t>(allocator.compositeAddressToDmva(
         (static_cast<SharedOwnerCtx*>(tensor.storage().data_ptr().get_context())
-             ->composite_addr));
+             ->composite_addr)));
     addresses[addr_idx++] = addr;
   }
 
   launch_host_callback([this, addresses](void*) {
-    deeptools::processComputeOnHostCommand(*hcm_, output_buffer_, &addresses);
+    // Use fast path with all tensor addresses
+    // Returns true if fast path was actually used, false if fell back
+    bool used_fast_path = deeptools::processComputeOnHostCommandFast(
+        fast_plan_, *hcm_, output_buffer_, addresses.data(), addresses.size());
   });
 }
 
@@ -195,6 +252,16 @@ void JobPlanStepHostCompute::write(std::ostream& os) const {
   os << "  Host Compute\n";
   os << "    Output buffer: " << output_buffer_ << "\n";
   os << "    HCM metadata: " << (hcm_ ? "present" : "null") << "\n";
+  os << "    Fast path: "
+     << (fast_plan_.valid
+             ? "enabled"
+             : (fast_plan_.output_size == UINT32_MAX ? "disabled" : "building"))
+     << "\n";
+  if (fast_plan_.valid) {
+    os << "    Fast plan: " << fast_plan_.patches.size() << " patches, "
+       << fast_plan_.num_input_symbols << " input symbols, "
+       << fast_plan_.output_size << " bytes output\n";
+  }
   os << "    Pipeline barrier: " << (pipeline_barrier_ ? "enabled" : "disabled")
      << "\n";
 }

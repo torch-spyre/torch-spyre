@@ -22,7 +22,6 @@ from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
     InputBuffer,
-    MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
     Reduction,
@@ -411,8 +410,6 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
         if op.is_no_op():
             _set_no_named_dims(op)
         elif isinstance(op, ComputedBuffer):
-            if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-                continue
             hint = False
             for hint_dict in get_op_hints(op).values():
                 if "named_dims" in hint_dict:

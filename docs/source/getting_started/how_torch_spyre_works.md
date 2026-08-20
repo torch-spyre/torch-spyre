@@ -26,7 +26,7 @@ import torch
 from fms.models import get_model
 
 model = get_model("granite", "3.3-8b-instruct", device_type="spyre")
-compiled = torch.compile(model, backend="spyre")
+compiled = torch.compile(model)
 output = compiled(input_ids.to("spyre"))
 ```
 

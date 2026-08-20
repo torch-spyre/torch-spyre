@@ -335,14 +335,13 @@ def spyre_topk(
     largest: bool = True,
     sorted: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if k > 4:
-        raise Unsupported("Topk is not supported for this config")
+    if k > 128:
+        raise Unsupported(f"topk with k={k} is not supported (max k=128)")
     if not largest:
         raise Unsupported("topk with largest=False")
-    # sorted=False only relaxes the ordering guarantee (any order of the top-k
-    # elements is a valid answer); our topkvalue/topkindex reduction always
-    # returns sorted output, which satisfies that relaxed contract, so
-    # sorted=False can be served as a no-op.
+    # sorted=False is a no-op: our reduction always returns sorted output.
+    # Index stays in the input dtype (not int64) all the way out; topkindex's
+    # fake reports it so Dynamo traces it with no meta conflict.
     return torch.ops.spyre.topkvalue(input, k, dim), torch.ops.spyre.topkindex(
         input, k, dim
     )
@@ -505,22 +504,22 @@ def spyre__sdpa_overrideable(
                             M - max_running
                         )  # batch_size, num_heads, max_seqlen_q sparse
 
-                        denominator = torch.ops.spyre.copy_f(
+                        denominator = torch.ops.spyre.opaque_copy_(
                             denominator * correction + exp_scores.sum(dim=-1),
                             denominator,
                         )  # batch_size, num_heads, max_seqlen_q sparse
-                        output = torch.ops.spyre.copy_f(
+                        output = torch.ops.spyre.opaque_copy_(
                             output * correction.unsqueeze(-1)
                             + torch.matmul(exp_scores, value),
                             output,
                         )  # batch_size, num_heads, max_seqlen_q, head_dim
 
-                        M = torch.ops.spyre.copy_f(
+                        M = torch.ops.spyre.opaque_copy_(
                             max_running,
                             M,
                         )  # batch_size, num_heads, max_seqlen_q sparse
 
-    output = torch.ops.spyre.copy_f(output / denominator.unsqueeze(-1), output)
+    output = torch.ops.spyre.opaque_copy_(output / denominator.unsqueeze(-1), output)
     # The reference meta kernel for this op
     # (torch._meta_registrations.meta__scaled_dot_product_fused_attention_
     # overrideable -> alloc_with_matching_layout) declares the output layout to
