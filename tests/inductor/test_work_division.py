@@ -47,10 +47,10 @@ from torch_spyre._inductor.work_division_constraints import (
     collect_work_division_constraints,
     conv_spatial_blocked_vars,
     coordinate_mask_blocked_vars,
-    indirect_access_pinned_vars,
-    qfp8wt_matmul_k_pinned,
+    indirect_access_split_domains,
+    qfp8wt_matmul_k_split_domains,
     topk_split_domains,
-    qfp8wt_pinned_vars,
+    qfp8wt_split_domains,
 )
 
 
@@ -394,7 +394,7 @@ class TestConvSpatialBlockedVars(unittest.TestCase):
 
 
 class TestQfp8wtConstraints(unittest.TestCase):
-    def test_output_second_stick_coord_pinned_for_qfp8wt_output(self):
+    def test_output_second_stick_coord_restricted_for_qfp8wt_output(self):
         b, m, n = _isym("b"), _isym("m"), _isym("n")
         op = _computed_buffer((4, 8, 128), name="qfp8_out")
         output_td = _tensor_dep(
@@ -404,10 +404,10 @@ class TestQfp8wtConstraints(unittest.TestCase):
             element_arrangement=ElementArrangement.QFP8WT,
         )
         ctx = _make_context(op, output_td, it_space={b: 4, m: 8, n: 128})
-        result = qfp8wt_pinned_vars(ctx)
-        pinned_vars = set(output_td.device_coords[-2].free_symbols)
-        self.assertTrue(pinned_vars)
-        for v in pinned_vars:
+        result = qfp8wt_split_domains(ctx)
+        restricted_vars = set(output_td.device_coords[-2].free_symbols)
+        self.assertTrue(restricted_vars)
+        for v in restricted_vars:
             self.assertEqual(result.allowed_splits[v], frozenset({1}))
 
     def test_standard_output_yields_no_pins(self):
@@ -415,10 +415,10 @@ class TestQfp8wtConstraints(unittest.TestCase):
         op = _computed_buffer((4, 8, 128), name="std_out")
         output_td = _tensor_dep("std_out", (4, 8, 128), (b, m, n))
         ctx = _make_context(op, output_td, it_space={b: 4, m: 8, n: 128})
-        result = qfp8wt_pinned_vars(ctx)
+        result = qfp8wt_split_domains(ctx)
         self.assertEqual(result.allowed_splits, {})
 
-    def test_matmul_k_pinned_for_batchmatmulfp8_with_qfp8wt_kernel(self):
+    def test_matmul_k_restricted_for_batchmatmulfp8_with_qfp8wt_kernel(self):
         from torch_spyre._inductor.constants import BATCH_MATMUL_FP8_OP
 
         b, m, n, k = _isym("b"), _isym("m"), _isym("n"), _isym("k")
@@ -445,10 +445,10 @@ class TestQfp8wtConstraints(unittest.TestCase):
             it_space={b: 4, m: 8, n: 128, k: 64},
             reduction_vars=[k],
         )
-        result = qfp8wt_matmul_k_pinned(ctx)
+        result = qfp8wt_matmul_k_split_domains(ctx)
         self.assertEqual(result.allowed_splits, {k: frozenset({1})})
 
-    def test_matmul_k_not_pinned_for_plain_batchmatmul(self):
+    def test_matmul_k_unrestricted_for_plain_batchmatmul(self):
         from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 
         b, m, n, k = _isym("b"), _isym("m"), _isym("n"), _isym("k")
@@ -469,7 +469,7 @@ class TestQfp8wtConstraints(unittest.TestCase):
             it_space={b: 4, m: 8, n: 128, k: 64},
             reduction_vars=[k],
         )
-        result = qfp8wt_matmul_k_pinned(ctx)
+        result = qfp8wt_matmul_k_split_domains(ctx)
         self.assertEqual(result.allowed_splits, {})
 
 
@@ -484,9 +484,9 @@ class TestCollectWorkDivisionConstraints(unittest.TestCase):
         rules = (
             "coordinate_mask_blocked_vars",
             "conv_spatial_blocked_vars",
-            "qfp8wt_pinned_vars",
-            "qfp8wt_matmul_k_pinned",
-            "indirect_access_pinned_vars",
+            "qfp8wt_split_domains",
+            "qfp8wt_matmul_k_split_domains",
+            "indirect_access_split_domains",
         )
         with ExitStack() as stack:
             for rule, result in zip(rules, results):
@@ -712,7 +712,7 @@ class TestTopKConstraints(unittest.TestCase):
         self.assertEqual(splits[search], 1)
 
 
-class TestIndirectAccessPinnedVars(unittest.TestCase):
+class TestIndirectAccessSplitDomains(unittest.TestCase):
     _PATCH_TARGET = (
         "torch_spyre._inductor.work_division_constraints.indirect_info_from_op"
     )
@@ -730,7 +730,7 @@ class TestIndirectAccessPinnedVars(unittest.TestCase):
             it_space_adjusted={i0: 4, i1: 8},
         )
         with patch(self._PATCH_TARGET, return_value=(["value"], None, None)):
-            result = indirect_access_pinned_vars(ctx)
+            result = indirect_access_split_domains(ctx)
         self.assertEqual(
             result.allowed_splits, {i0: frozenset({1}), i1: frozenset({1})}
         )
@@ -743,5 +743,5 @@ class TestIndirectAccessPinnedVars(unittest.TestCase):
             it_space_adjusted={i0: 4, i1: 8},
         )
         with patch(self._PATCH_TARGET, return_value=([], None, None)):
-            result = indirect_access_pinned_vars(ctx)
+            result = indirect_access_split_domains(ctx)
         self.assertEqual(result.allowed_splits, {})

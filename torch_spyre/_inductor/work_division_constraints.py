@@ -95,10 +95,10 @@ def collect_work_division_constraints(
     for constraint in (
         coordinate_mask_blocked_vars,
         conv_spatial_blocked_vars,
-        qfp8wt_pinned_vars,
-        qfp8wt_matmul_k_pinned,
+        qfp8wt_split_domains,
+        qfp8wt_matmul_k_split_domains,
         topk_split_domains,
-        indirect_access_pinned_vars,
+        indirect_access_split_domains,
     ):
         result = constraint(ctx)
 
@@ -198,13 +198,13 @@ def has_qfp8wt_tensor(tds: "list[TensorDep]") -> bool:
     )
 
 
-def qfp8wt_pinned_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Pin QFP8WT tensors' second stick dimension to split=1.
+def qfp8wt_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
+    """Restrict QFP8WT tensors' second stick dimension to split=1.
 
     QFP8WT uses a 2D stick layout (2x64 elements, 128 bytes); both stick dims
     must stay atomic 128-byte units, so any iteration var indexing the second
     stick coordinate of the matmul kernel tensor (second input) or the output
-    is pinned to exactly 1.
+    has the singleton legal domain ``{1}``.
     """
     all_tds = ctx.input_tds + [ctx.output_td]
     if not has_qfp8wt_tensor(all_tds):
@@ -227,8 +227,8 @@ def qfp8wt_pinned_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
     return ConstraintResult(allowed_splits=allowed_splits)
 
 
-def qfp8wt_matmul_k_pinned(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Pin the reduction (K) dim to split=1 for batchmatmulfp8 with a QFP8WT kernel.
+def qfp8wt_matmul_k_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
+    """Restrict reduction K to split=1 for QFP8WT batchmatmul.
 
     Splitting K would require partial-sum accumulation across cores, which the
     QFP8WT matmul kernel does not support.
@@ -290,8 +290,8 @@ def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
     return ConstraintResult(allowed_splits=allowed_splits)
 
 
-def indirect_access_pinned_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Pin every dim to split=1 for ops with indirect (gather/scatter-style) access.
+def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
+    """Restrict every dim to split=1 for indirect-access operations.
 
     The backend's indirect-addressing path runs single-core: an indexed
     dimension's coordinate depends on runtime data, not a static per-core
