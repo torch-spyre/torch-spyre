@@ -6857,6 +6857,93 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
         self.assertIn("sympify('4')", src, "Expected loop count 4")
 
 
+class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
+    """Correctness test for a MoE-style unsqueeze-broadcast matmul tiled over
+    the broadcast-only expert dim.
+
+    Pattern: x [T,H] is unsqueezed to [1,T,H] and matmul'd against w
+    [E,H,F], broadcasting over E to produce [E,T,F]. E appears only in the
+    output and in w (not in x), and is tiled at full width (num_tiles == E),
+    i.e. one tile per expert. Reported by a teammate as currently failing.
+    """
+
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0xB055)
+        _pnd.reset()
+
+    def test_unsqueeze_broadcast_matmul_tile_E_correct(self):
+        """[1,T,H]@[E,H,F] -> [E,T,F] tiled over E (one tile per expert).
+
+        NOTE: passes in isolation, but has been observed to fail with a
+        numerical mismatch (~29% elements wrong) when run after the full
+        test_coarse_tile_e2e.py suite -- order-dependent state leak between
+        tests, cause not yet isolated. Run this test alone if it fails
+        unexpectedly as part of a full-suite run.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        E, T, H, F = 128, 64, 64, 64
+        x = torch.randn(T, H, dtype=torch.float16) * 0.01
+        w = torch.randn(E, H, F, dtype=torch.float16) * 0.01
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("F", F)
+
+        def fn(x, w):
+            _name_tensor_dims(x, ["T", "H"])
+            _name_tensor_dims(w, ["E", "H", "F"])
+            with spyre_hint(num_tiles_per_dim={"E": E}):
+                return torch.matmul(x.unsqueeze(0), w)
+
+        compare_with_cpu(
+            fn, x, w, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
+        )
+
+    @pytest.mark.skip(
+        reason=(
+            "Unsupported: expected exactly 1 generated variable, got {d0, d2}. "
+            "find_matmul_generated_var (pass_utils.py) identifies the matmul's "
+            "N dim as 'in y and the output, absent from x' -- but here E is "
+            "also 'in y and the output, absent from x' (a broadcast batch dim "
+            "with no corresponding dim in x at all), and with tile size 2 its "
+            "per-tile loop var (d0) still appears in y's/the output's index, "
+            "so it satisfies the same set membership as the true N dim (F, "
+            "d2). The two are structurally indistinguishable by pure "
+            "set-arithmetic on MemoryDep.index.free_symbols once x lacks a "
+            "batch dim outright; d0 and d2 both have real nonzero coefficients "
+            "in y_dep/out_dep and are absent from x_dep.index.free_symbols. "
+            "At tile size 1 (see test_unsqueeze_broadcast_matmul_tile_E_correct) "
+            "E's per-tile loop var is constant-folded away entirely, so the "
+            "ambiguity never arises -- this is a distinct, real bug in "
+            "propagate_layouts.py/pass_utils.py, not in coarse_tile.py. "
+            "See issue #3613 comments."
+        )
+    )
+    def test_unsqueeze_broadcast_matmul_tile_E_64_correct(self):
+        """[1,T,H]@[E,H,F] -> [E,T,F] tiled over E with 64 tiles (2 experts/tile)."""
+        from torch_spyre._inductor import spyre_hint
+
+        E, T, H, F = 128, 64, 64, 64
+        x = torch.randn(T, H, dtype=torch.float16) * 0.01
+        w = torch.randn(E, H, F, dtype=torch.float16) * 0.01
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("F", F)
+
+        def fn(x, w):
+            _name_tensor_dims(x, ["T", "H"])
+            _name_tensor_dims(w, ["E", "H", "F"])
+            with spyre_hint(num_tiles_per_dim={"E": 64}):
+                return torch.matmul(x.unsqueeze(0), w)
+
+        compare_with_cpu(
+            fn, x, w, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
+        )
+
+
 class TestCoarseTileNestedReductionE2E(InductorTestCase):
     """Correctness and LoopSpec tests for nested output-dim + reduction-dim tiling.
 
