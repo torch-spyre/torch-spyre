@@ -28,6 +28,7 @@ from torch_spyre._inductor.codegen.bundle import (
     generate_bundle,
 )
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
+from torch_spyre._inductor.constants import MAX_POOL_SIZE_BYTES
 from torch_spyre._inductor.op_spec import OpSpec
 
 
@@ -153,7 +154,7 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
         with open(os.path.join(self.output_dir, "bundle.mlir")) as f:
             return f.read()
 
-    def _run_bundle(self, compiled_entries, op_specs=None):
+    def _run_bundle(self, compiled_entries, op_specs=None, pool_size=0):
         """Run generate_bundle with mocked compile_op_spec, return bundle.mlir text."""
         if op_specs is None:
             op_specs = [_minimal_op_spec() for _ in compiled_entries]
@@ -167,6 +168,7 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
                 "test",
                 self.output_dir,
                 op_specs,
+                pool_size=pool_size,
             )
         return self._read_bundle()
 
@@ -302,3 +304,103 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
         # list and in the symbol_ids attribute).
         self.assertIn("sdscbundle.sdsc_execute (%sym_0_1, %arg_0)", bundle)
         self.assertIn('"symbol_ids"=[-1, -2]', bundle)
+
+    def test_pool_device_mem_allocate_emitted(self):
+        """A pool symbol triggers device_mem_allocate with the right byte
+        count, and no %pool_base_addr parameter."""
+        pool_kind = SymbolKind.pool()
+        entry = (
+            _make_sdsc_json(hbm_sym_ids_per_core={"[0, 0, 0]": -1}),
+            [0],
+            [],
+            [pool_kind],
+        )
+
+        bundle = self._run_bundle([entry], pool_size=65536)
+
+        self.assertIn(
+            "%pool = sdscbundle.device_mem_allocate 65536 bytes : index",
+            bundle,
+        )
+        self.assertNotIn("%pool_base_addr", bundle)
+        self.assertNotIn("input_arg_extract value from %pool_base_addr", bundle)
+
+    def test_pool_absent_when_no_pool_symbols(self):
+        """A bundle with no pool symbols emits no device_mem_allocate at all,
+        regardless of the pool_size argument passed in."""
+        dim_kind = SymbolKind.dimension(granularity=56, max_value=616, pytorch_sym="s0")
+        entry = (_make_sdsc_json(dim_sym_ids={"mb": [-1]}), [0], [], [dim_kind])
+
+        bundle = self._run_bundle([entry], pool_size=65536)
+
+        self.assertNotIn("device_mem_allocate", bundle)
+        self.assertNotIn("%pool", bundle)
+
+    def test_pool_and_kernel_address_combination(self):
+        """A pool symbol and a kernel-address symbol coexist: device_mem_allocate
+        appears in the body, %arg_0_base_addr is still the only signature param."""
+        pool_kind = SymbolKind.pool()
+        kernel_kind = SymbolKind.kernel(arg_index=0)
+        entry = (
+            _make_sdsc_json(hbm_sym_ids_per_core={"[0, 0, 0]": -1}),
+            [0, 0],
+            [],
+            [kernel_kind, pool_kind],
+        )
+
+        bundle = self._run_bundle([entry], pool_size=4096)
+
+        self.assertIn(
+            "func.func @sdsc_bundle(%arg_0_base_addr: !sdscbundle.input_arg<index>)",
+            bundle,
+        )
+        self.assertIn(
+            "%pool = sdscbundle.device_mem_allocate 4096 bytes : index",
+            bundle,
+        )
+
+    def test_pool_size_zero_with_pool_symbol_raises(self):
+        """A pool symbol with pool_size=0 must fail loudly rather than emit a
+        useless zero-byte device_mem_allocate."""
+        pool_kind = SymbolKind.pool()
+        entry = (
+            _make_sdsc_json(hbm_sym_ids_per_core={"[0, 0, 0]": -1}),
+            [0],
+            [],
+            [pool_kind],
+        )
+
+        with self.assertRaises(AssertionError):
+            self._run_bundle([entry], pool_size=0)
+
+    def test_pool_size_above_max_raises(self):
+        """A pool symbol with pool_size > MAX_POOL_SIZE_BYTES must fail loudly."""
+        pool_kind = SymbolKind.pool()
+        entry = (
+            _make_sdsc_json(hbm_sym_ids_per_core={"[0, 0, 0]": -1}),
+            [0],
+            [],
+            [pool_kind],
+        )
+
+        with self.assertRaises(AssertionError):
+            self._run_bundle([entry], pool_size=MAX_POOL_SIZE_BYTES + 1)
+
+    def test_pool_size_at_max_succeeds(self):
+        """A pool symbol with pool_size == MAX_POOL_SIZE_BYTES (the exact budget
+        boundary) must be accepted, not rejected -- MAX_POOL_SIZE_BYTES is itself
+        an in-budget value, and Allocator can legitimately return an offset
+        whose pool_end lands exactly there."""
+        pool_kind = SymbolKind.pool()
+        entry = (
+            _make_sdsc_json(hbm_sym_ids_per_core={"[0, 0, 0]": -1}),
+            [0],
+            [],
+            [pool_kind],
+        )
+
+        bundle = self._run_bundle([entry], pool_size=MAX_POOL_SIZE_BYTES)
+        self.assertIn(
+            f"%pool = sdscbundle.device_mem_allocate {MAX_POOL_SIZE_BYTES} bytes : index",
+            bundle,
+        )

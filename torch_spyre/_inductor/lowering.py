@@ -43,6 +43,7 @@ from .ir import (
     SpyreEmptyFallback,
     BroadcastAsyncFallback,
     WaitWorkFallback,
+    AllGatherAsyncFallback,
     AllReduceAsyncFallback,
 )
 from torch_spyre._C import get_elem_in_stick
@@ -1264,10 +1265,50 @@ def lower_spyre_from_d2d(src, dst, src_off, dst_off):
     lowering.mutate_to(dst, src)
 
 
-@register_spyre_lowering(torch.ops.spyre.copy_)
-def lower_spyre_copy_(src, dst):
-    lowering.mutate_to(dst, src)
+def _build_mutation_lowering(src, dst):
+    # Shared lowering body for copy_forced and opaque_copy_: builds an
+    # explicit MutationLayoutSHOULDREMOVE buffer so the mutation into dst
+    # survives regardless of what the scheduler would otherwise decide.
+    # mutate_to() has multiple code paths and does not always mutate, so
+    # the buffer is constructed by hand here instead.
+    src = lowering.to_dtype(src, dst.get_dtype())
+    src = lowering.expand(src, dst.get_size())
+
+    pw = Pointwise.create(
+        device=dst.get_device(),
+        dtype=dst.get_dtype(),
+        inner_fn=src.make_loader(),
+        ranges=list(dst.get_size()),
+    )
+
+    dst.realize()
+
+    buffer = ir.ComputedBuffer(
+        name=None,
+        layout=ir.MutationLayoutSHOULDREMOVE(dst),
+        data=pw.data.data,
+    )
+    buffer.name = V.graph.register_buffer(buffer)
+    V.graph.register_operation(buffer)
+
     return dst
+
+
+@register_spyre_lowering(torch.ops.spyre.copy_forced)
+def lower_spyre_copy_forced(src, dst):
+    return _build_mutation_lowering(src, dst)
+
+
+@register_spyre_lowering(torch.ops.spyre.opaque_copy_)
+def lower_spyre_opaque_copy_(value, acc):
+    # opaque_copy_ is functional at the FX/AOTAutograd level (see customops.py)
+    # so that assert_functional_graph never sees a mutation. The real
+    # mutating write into acc is introduced here, at lowering time, via the
+    # same MutationLayoutSHOULDREMOVE(acc) buffer that lower_spyre_copy_forced
+    # builds for copy_forced. Everything downstream that keys off
+    # MutationLayoutSHOULDREMOVE (e.g. wsr/coarse_tile.py) treats this
+    # identically to a copy_forced write.
+    return _build_mutation_lowering(value, acc)
 
 
 @register_spyre_lowering(torch.ops.spyre.overwrite)
@@ -1845,6 +1886,37 @@ def lower_c10d_wait_tensor_async(tensor):
         WaitWorkFallback(
             torch.ops.spyre.wait_work.default,
             tensor,
+        )
+    )
+
+
+@register_spyre_lowering(torch.ops._c10d_functional.all_gather_into_tensor.default)
+def lower_c10d_all_gather_async(tensor, group_size, group_name):
+    """
+    Direct lowering for _c10d_functional.all_gather_into_tensor using ASYNC pattern.
+
+    Creates an async all_gather operation that returns immediately without blocking.
+    Output tensor has shape[0] = input.shape[0] * group_size (concatenation of all ranks).
+
+    Flow:
+      _c10d_functional.all_gather_into_tensor → This lowering
+      → AllGatherAsyncFallback → Generated code:
+      torch.ops.spyre.all_gather_async() → C++ → spyre-comms (non-blocking)
+    """
+    logger.info(
+        "Lowering _c10d_functional.all_gather_into_tensor to "
+        "SpyreAllGatherAsyncFallback (group_size=%s, group_name='%s')",
+        group_size,
+        group_name,
+    )
+
+    tensor.realize()
+    return ir.TensorBox.create(
+        AllGatherAsyncFallback(
+            torch.ops.spyre.all_gather_async.default,
+            tensor,
+            group_size,
+            group_name,
         )
     )
 

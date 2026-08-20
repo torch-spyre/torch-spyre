@@ -21,14 +21,12 @@
 
 #include <vector>
 
+#include "job_plan.h"
 #include "module.h"
 #include "spyre_error.h"
 #include "spyre_kernel.h"
 
 namespace spyre {
-
-// Forward declaration
-struct JobPlan;
 
 class SpyreStream {
  private:
@@ -51,7 +49,8 @@ class SpyreStream {
   void copyProgramAsync(void* prog_cpu_ptr,
                         const flex::CompositeAddress* device_address) const;
 
-  void launch(const JobPlan& plan, const std::vector<at::Tensor>& args) const;
+  void launch(const JobPlan& plan, const std::vector<at::Tensor>& args,
+              std::vector<SymbolicArg> symbolic_args = {}) const;
 
   // Typed flex operation launches. These are the single chokepoint through
   // which torch-spyre submits work to the underlying flex stream; the raw

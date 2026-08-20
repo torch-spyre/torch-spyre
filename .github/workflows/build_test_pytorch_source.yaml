@@ -228,8 +228,22 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
 
+      # actions4gh/setup-gh@v1.0.2 extracts the gh tarball but never lands
+      # the binary on PATH before it calls `gh auth login`, so every job
+      # fails with "spawn gh ENOENT" (upstream actions4gh/setup-gh#7, #11,
+      # unresolved). Install gh directly instead; downstream steps already
+      # set GH_TOKEN, which `gh` picks up implicitly, so no `gh auth login`
+      # call is needed here.
       - name: Setup the GitHub CLI
-        uses: actions4gh/setup-gh@v1.0.2
+        env:
+          GH_CLI_VERSION: 2.97.0
+        run: |
+          curl -fsSL \
+            "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.tar.gz" \
+            -o "${RUNNER_TEMP}/gh-cli.tar.gz"
+          mkdir -p "${RUNNER_TEMP}/gh-cli"
+          tar -xzf "${RUNNER_TEMP}/gh-cli.tar.gz" -C "${RUNNER_TEMP}/gh-cli" --strip-components=1
+          echo "${RUNNER_TEMP}/gh-cli/bin" >> "${GITHUB_PATH}"
 
       - name: Write dispatch payload to file
         env:
