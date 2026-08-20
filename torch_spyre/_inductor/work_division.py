@@ -1538,6 +1538,7 @@ def _cost_model_matmul_planner(
     committed_splits: dict[Symbol, int],
     max_cores: int,
     input_tds: list[TensorDep],
+    blocked: set[Symbol],
     allowed_splits: dict[Symbol, frozenset[int]],
 ) -> dict[Symbol, int]:
     """Override the default split for a matmul / bmm with the lowest-cost
@@ -1607,21 +1608,23 @@ def _cost_model_matmul_planner(
     batch_sizes = [concretize_expr(it_space_adjusted[bd]) for bd in batch_dims]
     B_total = math.prod(batch_sizes)
 
+    def factors(dim: Symbol, size: int) -> list[int]:
+        return (
+            [1] if dim in blocked else _legal_split_factors(dim, size, allowed_splits)
+        )
+
     b_combos = (
         list(
             itertools.product(
-                *(
-                    _legal_split_factors(dim, size, allowed_splits)
-                    for dim, size in zip(batch_dims, batch_sizes)
-                )
+                *(factors(dim, size) for dim, size in zip(batch_dims, batch_sizes))
             )
         )
         if batch_dims
         else [()]
     )
-    m_divs = _legal_split_factors(m_dim, M_e, allowed_splits)
-    n_divs = _legal_split_factors(n_dim, n_sticks, allowed_splits)
-    k_divs = _legal_split_factors(k_dim, k_sticks, allowed_splits)
+    m_divs = factors(m_dim, M_e)
+    n_divs = factors(n_dim, n_sticks)
+    k_divs = factors(k_dim, k_sticks)
 
     best = None
     best_cost = math.inf
@@ -1877,6 +1880,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
         committed_splits,
         max_cores,
         input_tds,
+        blocked,
         allowed_splits,
     )
     if splits == default_splits:
