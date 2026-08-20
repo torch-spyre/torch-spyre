@@ -3910,6 +3910,7 @@ def _collapse_loop_carried_unit_sum(
         isinstance(data, Reduction)
         and data.reduction_type == "sum"
         and data.src_dtype == data.dtype
+        and info is not None
         and getattr(propagation, "kind", None) == "reduction"
         and reduction_plan is not None
         and reduction_plan.reduction_type == "sum"
