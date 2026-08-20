@@ -121,7 +121,7 @@ class TestMemoryPressureGC:
                 # without depending on data-init time on Spyre hardware.
                 tensors = []
                 for i in range(4):
-                    t = torch.randn(256 * 1024 * 1024, device="spyre")  # 1GB each
+                    t = torch.empty(256 * 1024 * 1024, device="spyre")  # 1GB each
                     tensors.append(t)
 
                 # Drop refs to allow GC
@@ -265,7 +265,7 @@ class TestMemoryPressureGC:
                 # without depending on data-init time on Spyre hardware.
                 # Each thread allocates 2GB
                 for i in range(2):
-                    t = torch.randn(512 * 1024 * 1024, device="spyre")
+                    t = torch.empty(512 * 1024 * 1024, device="spyre")
                     tensors.append(t)
 
                 # Drop some refs to allow GC to help
