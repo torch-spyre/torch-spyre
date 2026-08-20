@@ -202,22 +202,6 @@ def _largest_legal_split(
     return 1
 
 
-def core_split(size: int, max_cores: int) -> int:
-    """
-    Find the largest divisor of size that doesn't exceed max_cores.
-    Args:
-        size: The dimension size to split
-        max_cores: Maximum number of cores to use for this dimension
-
-    Returns:
-        Number of cores to use (always divides size evenly)
-    """
-    for i in range(max_cores, 0, -1):
-        if size % i == 0:
-            return i
-    return 1
-
-
 def _largest_legal_split_from(
     v: Symbol,
     basis: int,
@@ -338,7 +322,7 @@ def multi_dim_iteration_space_split(
             logger.info(
                 f"[work_division/symbolic] dim {v} (symbolic, max="
                 f"{symbol_meta[v][0]}, gran={symbol_meta[v][1]}): "
-                f"core_split(basis={basis}, n_cores={n_cores_remaining}) = "
+                f"selected_split(basis={basis}, n_cores={n_cores_remaining}) = "
                 f"{best_split}"
             )
         if best_split > splits[v]:
