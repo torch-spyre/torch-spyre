@@ -35,7 +35,7 @@ from torch_spyre._C import ElementArrangement
 
 from .constants import BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP
 from .errors import Unsupported
-from .pass_utils import concretize_expr, indirect_info_from_op, op_read_writes
+from .pass_utils import concretize_expr, indirect_info_from_op, is_topk, op_read_writes
 from .logging_utils import get_inductor_logger
 from . import config
 
@@ -96,6 +96,8 @@ def collect_work_division_constraints(
         conv_spatial_blocked_vars,
         qfp8wt_pinned_vars,
         qfp8wt_matmul_k_pinned,
+        topk_pinned_search_space_vars,
+        topk_k_split_constraint,
         indirect_access_pinned_vars,
     ):
         result = constraint(ctx)
@@ -230,6 +232,68 @@ def qfp8wt_matmul_k_pinned(ctx: WorkDivConstraintContext) -> ConstraintResult:
         return ConstraintResult()
 
     return ConstraintResult(pinned={v: 1 for v in ctx.reduction_vars})
+
+
+def topk_pinned_search_space_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
+    """Pin the search-space (reduction) dim to split=1 for topk ops.
+
+    The topk hardware op searches the full dimension on one core to compute
+    the top-k results. Splitting the search-space would require merging
+    partial top-k results across cores, which the hardware does not support.
+    """
+    if not is_topk(ctx.op):
+        return ConstraintResult()
+
+    return ConstraintResult(pinned={v: 1 for v in ctx.reduction_vars})
+
+
+def topk_k_split_constraint(ctx: WorkDivConstraintContext) -> ConstraintResult:
+    """Pin k to the smallest valid split for topk ops.
+
+    Each core can produce at most 4 top-k results per pass. The smallest valid
+    k-split is ceil(k / 4), chosen to minimize core usage while satisfying the
+    hardware constraint. This is pinned as a hard constraint to ensure the
+    work_distribution planner picks the minimal k-split rather than a
+    larger one that leaves more cores for other dims.
+    """
+    from sympy import divisors
+
+    if not is_topk(ctx.op):
+        return ConstraintResult()
+
+    # Find k's symbol (output dim absent from every input's device coords).
+    coord_vars = {
+        s for td in ctx.input_tds for e in td.device_coords[:-1] for s in e.free_symbols
+    }
+    output_vars = {s for e in ctx.output_td.device_coords[:-1] for s in e.free_symbols}
+    k_sym_candidates = [s for s in output_vars if s not in coord_vars]
+    if len(k_sym_candidates) != 1:
+        # k=1 or malformed; no constraint needed.
+        return ConstraintResult()
+
+    k_sym = k_sym_candidates[0]
+    k_val = concretize_expr(ctx.it_space[k_sym])
+
+    # Find the smallest divisor d of k such that k / d <= 4.
+    _TOPK_MAX_K_PER_CORE = 4
+    max_cores = config.sencores
+    min_k_split = None
+    for d in sorted(divisors(k_val)):
+        if k_val // d <= _TOPK_MAX_K_PER_CORE and d <= max_cores:
+            min_k_split = d
+            break
+
+    if min_k_split is None:
+        raise Unsupported(
+            f"topk(k={k_val}): no divisor of k in [1, {max_cores}] gives "
+            f"k_per_core <= {_TOPK_MAX_K_PER_CORE}, so k cannot be split "
+            f"across at most {max_cores} cores"
+        )
+
+    if min_k_split > 1:
+        return ConstraintResult(pinned={k_sym: min_k_split})
+
+    return ConstraintResult()
 
 
 def indirect_access_pinned_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:

@@ -54,7 +54,6 @@ from .wsr.coarse_tile_hints import (
 from . import config
 from .propagate_hints import (
     collect_spyre_hints,
-    recover_spyre_hints,
 )
 from .wsr.propagate_named_dims import (
     propagate_named_dims,
@@ -238,7 +237,6 @@ class CustomPostPasses(_SpyreGraphPassPipeline):
     def __init__(self):
         super().__init__(
             [
-                recover_spyre_hints,
                 # Undo the post-grad re-fusion of add(input, mm(a, b)) back into
                 # aten.addmm, so the resulting mul.Scalar alpha/beta nodes (whose
                 # constants are materialized later by the LoopLevel IR multi-ops

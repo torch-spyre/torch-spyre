@@ -110,7 +110,10 @@ class SpyreAsyncCompile(AsyncCompile):
         )
 
     def sdsc(
-        self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]
+        self,
+        kernel_name: str,
+        specs: Sequence[OpSpec | LoopSpec | UnimplementedOp],
+        pool_size: int = 0,
     ):
         unimp = find_unimplemented(list(specs))
         if unimp is not None:
@@ -121,7 +124,7 @@ class SpyreAsyncCompile(AsyncCompile):
 
         # Generate SDSC Bundle from OpSpecs
         output_dir = get_output_dir(kernel_name)
-        generate_bundle(kernel_name, output_dir, specs)
+        generate_bundle(kernel_name, output_dir, specs, pool_size=pool_size)
 
         self._provenance_attempt_count += 1
         try:
