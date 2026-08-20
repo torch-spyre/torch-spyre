@@ -1192,9 +1192,15 @@ def _fixed_core_division(op: Operation) -> CoreDivision:
 
 
 def _split_option_is_legal(op: Operation, splits: tuple[dict, dict]) -> bool:
-    return not isinstance(op, ComputedBuffer) or work_division_split_is_legal(
-        op, splits
-    )
+    """Return whether ``splits`` satisfy ``op``'s hard work-division domains.
+
+    Domains derive from a ComputedBuffer's dependencies and tiled layouts.
+    Other operation types participate only as fixed allocator graph nodes, so
+    they have no applicable work-division domain.
+    """
+    if not isinstance(op, ComputedBuffer):
+        return True
+    return work_division_split_is_legal(op, splits)
 
 
 DEFAULT_VARIANT_CAP = 6
