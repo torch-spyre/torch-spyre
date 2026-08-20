@@ -6918,7 +6918,7 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
             "E's per-tile loop var is constant-folded away entirely, so the "
             "ambiguity never arises -- this is a distinct, real bug in "
             "propagate_layouts.py/pass_utils.py, not in coarse_tile.py. "
-            "See issue #3613 comments."
+            "See issue #3888."
         )
     )
     def test_unsqueeze_broadcast_matmul_tile_E_64_correct(self):
