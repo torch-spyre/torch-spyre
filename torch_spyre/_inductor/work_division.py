@@ -326,6 +326,8 @@ def multi_dim_iteration_space_split(
                 f"{best_split}"
             )
         if best_split > splits[v]:
+            # Mandatory splits already consumed their factor from the budget.
+            # Growing one consumes only its incremental multiplier.
             n_cores_remaining = n_cores_remaining // (best_split // splits[v])
             splits[v] = best_split
 
@@ -340,6 +342,7 @@ def multi_dim_iteration_space_split(
         )
         if result is not None:
             best_dim, best_split = result
+            # ``best_dim`` may have a mandatory split; charge only growth.
             n_cores_remaining = n_cores_remaining // (best_split // splits[best_dim])
             splits[best_dim] = best_split
 
