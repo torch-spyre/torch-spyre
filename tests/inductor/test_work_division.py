@@ -678,7 +678,7 @@ class TestCoOptimizingAllocator(unittest.TestCase):
 
 
 class TestTopKConstraints(unittest.TestCase):
-    def test_topk_uses_legal_split_domains(self):
+    def test_topk_uses_minimum_supported_split_domains(self):
         k, search = _isym("k"), _isym("search")
         op = _computed_buffer(
             (8, 16),
@@ -697,18 +697,18 @@ class TestTopKConstraints(unittest.TestCase):
             )
         )
         self.assertEqual(result.allowed_splits[search], frozenset({1}))
-        self.assertEqual(result.allowed_splits[k], frozenset({2, 4, 8}))
+        self.assertEqual(result.allowed_splits[k], frozenset({2}))
 
-    def test_default_planner_grows_legal_k_split(self):
+    def test_default_planner_uses_minimum_supported_k_split(self):
         k, search = _isym("k"), _isym("search")
         splits = multi_dim_iteration_space_split(
             {k: 8, search: 16},
             32,
             [k],
             [search],
-            allowed_splits={search: frozenset({1}), k: frozenset({2, 4, 8})},
+            allowed_splits={search: frozenset({1}), k: frozenset({2})},
         )
-        self.assertEqual(splits[k], 8)
+        self.assertEqual(splits[k], 2)
         self.assertEqual(splits[search], 1)
 
 
