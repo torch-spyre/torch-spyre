@@ -177,16 +177,23 @@ class TestMultiDimIterationSpaceSplit(unittest.TestCase):
         )
         self.assertEqual(splits, {o0: 4, o1: 2})
 
-    def test_reserves_mandatory_legal_factor(self):
+    def test_mandatory_legal_factor_can_grow(self):
         o0, o1 = Symbol("o0"), Symbol("o1")
         splits = multi_dim_iteration_space_split(
             {o0: 16, o1: 16},
             32,
             [o0, o1],
             [],
-            allowed_splits={o0: frozenset({4}), o1: frozenset({1, 2})},
+            allowed_splits={o0: frozenset({4, 8}), o1: frozenset({1, 2})},
         )
-        self.assertEqual(splits[o0], 4)
+        self.assertEqual(splits[o0], 8)
+
+    def test_committed_minimum_split_can_grow(self):
+        o0, o1 = Symbol("o0"), Symbol("o1")
+        splits = multi_dim_iteration_space_split(
+            {o0: 16, o1: 16}, 32, [o0, o1], [], min_splits={o0: 2}
+        )
+        self.assertEqual(splits[o0], 16)
 
 
 class TestWorkDivisionCandidates(unittest.TestCase):
@@ -359,13 +366,14 @@ class TestConvSpatialBlockedVars(unittest.TestCase):
         ctx, _, _ = self._context((1, 1))
         self.assertEqual(conv_spatial_blocked_vars(ctx).blocked, set())
 
-    def test_span_commit_overrides_spatial_block(self):
+    def test_span_commit_conflicting_with_spatial_block_raises_unsupported(self):
         ctx, i, j = self._context((2, 1))
         ctx.committed_splits = {i: 2}
         rw = MagicMock()
         rw.writes = [MagicMock(ranges=(_isym("mb"), _isym("out"), i, j))]
         with patch(self._PATCH_TARGET, return_value=rw):
-            self.assertEqual(collect_work_division_constraints(ctx).blocked, {j})
+            with self.assertRaisesRegex(Unsupported, "blocked dim"):
+                collect_work_division_constraints(ctx)
 
     def test_blocked_spatial_dims_are_not_distributed(self):
         mb, out, i, j = (_isym(name) for name in ("mb", "out", "i", "j"))
@@ -494,19 +502,19 @@ class TestCollectWorkDivisionConstraints(unittest.TestCase):
                 )
             )
 
-    def test_drops_blocked_var_with_committed_split(self):
+    def test_blocked_var_with_committed_split_raises_unsupported(self):
         r0 = _isym("r0")
-        result = self._collect(
-            (
-                ConstraintResult(blocked={r0}),
-                ConstraintResult(),
-                ConstraintResult(),
-                ConstraintResult(),
-                ConstraintResult(),
-            ),
-            committed_splits={r0: 2},
-        )
-        self.assertEqual(result.blocked, set())
+        with self.assertRaisesRegex(Unsupported, "blocked dim"):
+            self._collect(
+                (
+                    ConstraintResult(blocked={r0}),
+                    ConstraintResult(),
+                    ConstraintResult(),
+                    ConstraintResult(),
+                    ConstraintResult(),
+                ),
+                committed_splits={r0: 2},
+            )
 
     def test_intersects_legal_split_domains(self):
         r0 = _isym("r0")
@@ -691,7 +699,7 @@ class TestTopKConstraints(unittest.TestCase):
         self.assertEqual(result.allowed_splits[search], frozenset({1}))
         self.assertEqual(result.allowed_splits[k], frozenset({2, 4, 8}))
 
-    def test_default_planner_reserves_smallest_legal_k_split(self):
+    def test_default_planner_grows_legal_k_split(self):
         k, search = _isym("k"), _isym("search")
         splits = multi_dim_iteration_space_split(
             {k: 8, search: 16},
@@ -700,7 +708,7 @@ class TestTopKConstraints(unittest.TestCase):
             [search],
             allowed_splits={search: frozenset({1}), k: frozenset({2, 4, 8})},
         )
-        self.assertEqual(splits[k], 2)
+        self.assertEqual(splits[k], 8)
         self.assertEqual(splits[search], 1)
 
 

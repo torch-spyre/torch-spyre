@@ -71,9 +71,9 @@ class WorkDivConstraintContext:
 class ConstraintResult:
     """A constraint's verdict on the iteration space in a WorkDivConstraintContext.
 
-    ``blocked`` dims must not be split beyond whatever split they already
-    carry (composes by union across constraints). ``allowed_splits`` maps each
-    dim to its hard legal factors (composes by intersection).
+    ``blocked`` dims must remain unsplit (composes by union across
+    constraints). ``allowed_splits`` maps each dim to its hard legal factors
+    (composes by intersection).
     """
 
     blocked: set[Symbol] = dataclasses.field(default_factory=set)
@@ -87,13 +87,8 @@ def collect_work_division_constraints(
 ) -> ConstraintResult:
     """Run every constraint below against ``ctx`` and merge the results.
 
-    A blocked dim that ``ctx.committed_splits`` has already split beyond 1 is
-    dropped from the result (with a warning): a mandatory prior commitment —
-    e.g. span_reduction satisfying the hardware span limit — outranks a
-    constraint's preference not to split that dim further.
-
-    Raises Unsupported if a hard domain conflicts with a prior span-limit
-    commitment, or intersections between domains are empty.
+    Raises Unsupported if a blocked dimension or hard domain conflicts with a
+    prior span-limit commitment, or intersections between domains are empty.
     """
     blocked: set[Symbol] = set()
     allowed_splits: dict[Symbol, frozenset[int]] = {}
@@ -109,14 +104,14 @@ def collect_work_division_constraints(
 
         forced = {s for s in result.blocked if ctx.committed_splits.get(s, 1) > 1}
         if forced:
-            logger.warning(
-                f"{ctx.op.get_name()}: constraint {constraint.__name__} would "
-                f"block dim(s) {sorted(str(s) for s in forced)} from being "
-                f"split, but the hardware memory-span limit already committed "
-                f"split(s) {[(str(s), ctx.committed_splits[s]) for s in forced]}; "
-                f"the constraint is not honoured for those dims."
+            raise Unsupported(
+                f"{ctx.op.get_name()}: blocked dim(s) "
+                f"{sorted(str(s) for s in forced)} conflict with hardware "
+                f"memory-span split(s) "
+                f"{[(str(s), ctx.committed_splits[s]) for s in forced]} "
+                f"({constraint.__name__})."
             )
-        blocked |= result.blocked - forced
+        blocked |= result.blocked
 
         for sym, allowed in result.allowed_splits.items():
             allowed = frozenset(allowed)

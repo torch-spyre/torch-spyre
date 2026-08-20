@@ -218,29 +218,45 @@ def core_split(size: int, max_cores: int) -> int:
     return 1
 
 
+def _largest_legal_split_from(
+    v: Symbol,
+    basis: int,
+    current_split: int,
+    n_cores: int,
+    allowed_splits: dict[Symbol, frozenset[int]] | None = None,
+) -> int:
+    """Largest legal split reachable from ``current_split`` within ``n_cores``."""
+    return next(
+        (
+            split
+            for split in reversed(_legal_split_factors(v, basis, allowed_splits))
+            if split % current_split == 0 and split // current_split <= n_cores
+        ),
+        current_split,
+    )
+
+
 def _most_splittable_dim(
     dims: list[Symbol],
     iteration_space: dict[Symbol, Expr],
+    splits: dict[Symbol, int],
     n_cores: int,
     symbol_meta: SymbolMeta,
     allowed_splits: dict[Symbol, frozenset[int]] | None = None,
 ) -> tuple[Symbol, int] | None:
-    """Return (dim, split) for the dim in dims that maximises core_split(size, n_cores).
-
-    Returns None if no dim yields a split > 1. ``symbol_meta`` is required —
-    pass an empty dict for fully-concrete iteration spaces.
-    """
+    """Return dim and largest reachable split, or None if no dim can grow."""
     best_dim, best_split = None, 0
     for d in dims:
-        s = _largest_legal_split(
+        split = _largest_legal_split_from(
             d,
             _valid_divisor_basis(d, iteration_space, symbol_meta),
+            splits[d],
             n_cores,
             allowed_splits,
         )
-        if s > best_split:
-            best_dim, best_split = d, s
-    return (best_dim, best_split) if best_split > 1 else None
+        if split > splits[d] and split > best_split:
+            best_dim, best_split = d, split
+    return (best_dim, best_split) if best_dim is not None else None
 
 
 def multi_dim_iteration_space_split(
@@ -267,8 +283,8 @@ def multi_dim_iteration_space_split(
 
     ``mandatory_splits`` is a local merge of ``min_splits`` and the smallest
     legal factor for every domain that excludes one. It never mutates
-    ``min_splits``; each selected factor is fixed for this planning call before
-    remaining cores are distributed greedily.
+    ``min_splits``; each selected factor reserves core budget before greedy
+    distribution and may grow to a larger legal factor.
 
     The product of all splits will be <= max_cores.
     """
@@ -307,8 +323,6 @@ def multi_dim_iteration_space_split(
         n_cores_remaining = n_cores_remaining // min_split
 
     for v in output_dims:
-        if v in mandatory_splits:
-            continue
         if n_cores_remaining <= 1:
             break
         # Symbolic dims use granularity (divisibility invariant); concrete
@@ -317,7 +331,9 @@ def multi_dim_iteration_space_split(
         #                   symbolic work division is end-to-end, this comment
         #                   can be dropped.
         basis = _valid_divisor_basis(v, iteration_space, symbol_meta)
-        best_split = _largest_legal_split(v, basis, n_cores_remaining, allowed_splits)
+        best_split = _largest_legal_split_from(
+            v, basis, splits[v], n_cores_remaining, allowed_splits
+        )
         if v in symbol_meta:
             logger.info(
                 f"[work_division/symbolic] dim {v} (symbolic, max="
@@ -325,20 +341,22 @@ def multi_dim_iteration_space_split(
                 f"core_split(basis={basis}, n_cores={n_cores_remaining}) = "
                 f"{best_split}"
             )
-        if best_split > 1:
+        if best_split > splits[v]:
+            n_cores_remaining = n_cores_remaining // (best_split // splits[v])
             splits[v] = best_split
-            n_cores_remaining = n_cores_remaining // best_split
 
     if is_reduction_included and n_cores_remaining > 1:
         result = _most_splittable_dim(
-            [v for v in reduction_dims if v not in mandatory_splits],
+            reduction_dims,
             iteration_space,
+            splits,
             n_cores_remaining,
             symbol_meta,
             allowed_splits,
         )
         if result is not None:
             best_dim, best_split = result
+            n_cores_remaining = n_cores_remaining // (best_split // splits[best_dim])
             splits[best_dim] = best_split
 
     return splits
@@ -1156,40 +1174,28 @@ def _default_split(
     max_cores: int,
     symbol_meta: SymbolMeta,
     blocked: set[Symbol],
-    forbidden_split_syms: set[Symbol] | None = None,
-    force_output_syms: set[Symbol] | None = None,
-    op: Operation | None = None,
+    allowed_splits: dict[Symbol, frozenset[int]],
 ) -> tuple[dict[Symbol, int], list[Symbol], list[Symbol]]:
     """Distribute max_cores by priority on top of span_reduction's commits.
 
     Returns the chosen splits and the (output, reduction) priority dims the
     caller logs. Shared by work_distribution_pass and cost_model_matmul_division.
     """
-    # TODO: The final dim committed by span_reduction_pass holds the minimum
-    #       split that gets the span under the limit, so it may have headroom
-    #       for additional parallelism (outer dims committed before it are
-    #       already maximally split and have no headroom). Excluding it here
-    #       leaves that parallelism on the table when other dims can't absorb
-    #       the remaining cores.
-    it_space_remaining = {
-        s: e for s, e in it_space_adjusted.items() if s not in committed_splits
-    }
     output_dims, reduction_dims = prioritize_dimensions(
-        output_td, it_space_remaining, symbol_meta
+        output_td, it_space_adjusted, symbol_meta
     )
 
-    # If span_reduction_pass already committed a reduction split, suppress further
-    # reduction splitting so the final result never exceeds one reduction dim split.
-    # Exception: keep_by_index has constraint-based reduction splits that must be
-    # honored, so don't suppress for that op.
-    coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
-    # Note: span_reduction_pass merges both must_split_vars AND constraints into
-    # committed_splits, so we can't distinguish them here. Only suppress for
-    # ops where we know the reduction split came from span_reduction, not constraints.
-    has_reduction_split = any(v not in coord_vars for v in committed_splits)
-    is_kbi = is_keep_by_index(op) if op else False
-    if has_reduction_split and not is_kbi:
-        reduction_dims = []
+    # If span reduction already committed a reduction split, grow only that
+    # dimension; backend supports one reduction dimension split per op.
+    coord_vars = {
+        v
+        for e in output_td.device_coords[:-1]
+        for v in e.free_symbols
+        if isinstance(v, Symbol)
+    }
+    committed_reduction_vars = {v for v in committed_splits if v not in coord_vars}
+    if committed_reduction_vars:
+        reduction_dims = [v for v in reduction_dims if v in committed_reduction_vars]
 
     # Drop blocked dims before the greedy distributor commits them. Coordinate
     # masking only blocks reduction dims; strided conv also blocks output dims.
