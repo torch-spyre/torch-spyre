@@ -725,8 +725,8 @@ class TestSpyre(TestCase):
             (torch.float32, torch.float16),
         }
 
-        # H2D/D2H conversions not supported by DCI
-        skip_h2d_conversions = {
+        # DCI doesn't support either direction for these conversions.
+        skip_eager_conversions = {
             (torch.float32, torch.int32),
             (torch.int32, torch.float32),
         }
@@ -745,7 +745,7 @@ class TestSpyre(TestCase):
             ):
                 continue
 
-            if (src_dtype, dst_dtype) in skip_h2d_conversions:
+            if (src_dtype, dst_dtype) in skip_eager_conversions:
                 continue
 
             ctx = f"H2D {src_dtype}->{dst_dtype}"

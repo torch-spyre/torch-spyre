@@ -368,8 +368,8 @@ def _cached_fp32_for_int32_cast(shape):
     we generate int32 values (0-512), cast to fp32, ensuring the truncation
     test covers meaningful value ranges.
     """
-    torch.manual_seed(3)
-    src_int = torch.randint(0, 512, shape, dtype=torch.int32)
+    gen = utils_inductor._make_generator(shape, torch.int32)
+    src_int = torch.randint(0, 512, shape, dtype=torch.int32, generator=gen)
     return src_int.to(torch.float32)
 
 
@@ -410,7 +410,13 @@ TO_DTYPE_OP_EXPECT_FAIL = [
             and (src, dst)
             not in [(torch.float32, torch.int32), (torch.int32, torch.float32)]
         )
-        or (src == torch.float32 and shape[-1] < 32)
+        # Sub-stick guard doesn't apply to fp32<->int32 — both are 32-bit,
+        # so there's no width change to trip the fp16-stick boundary.
+        or (
+            src == torch.float32
+            and shape[-1] < 32
+            and (src, dst) != (torch.float32, torch.int32)
+        )
     )
 ]
 

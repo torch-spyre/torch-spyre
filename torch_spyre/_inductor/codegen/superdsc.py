@@ -1055,8 +1055,9 @@ def _get_data_format(op, device_dtype):
 def _get_sdsc_spec_data_format(op, arg_data_format):
     """Re-label int32 ops' SDSC spec data_format to fp32 for backend compatibility.
 
-    For int32 dtype-conversion ops, the SDSC spec itself must report fp32 as the
-    data format, even though the arguments (tensors) are relabeled separately.
+    For fp32<->int32 dtype-conversion ops, the SDSC spec must report fp32 as
+    the op's data format, but unlike `_get_data_format`'s IDENTITY_OP case,
+    the int32 tensor descriptor itself stays int32.
     See backend issue deeptools#4307.
     """
     if op in (FP32TOINT32_OP, INT32TOFP32_OP):
