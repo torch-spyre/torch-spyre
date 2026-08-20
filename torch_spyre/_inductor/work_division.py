@@ -265,6 +265,11 @@ def multi_dim_iteration_space_split(
     the concretised size so the chosen split divides every admissible runtime
     bucket evenly.
 
+    ``mandatory_splits`` is a local merge of ``min_splits`` and the smallest
+    legal factor for every domain that excludes one. It never mutates
+    ``min_splits``; each selected factor is fixed for this planning call before
+    remaining cores are distributed greedily.
+
     The product of all splits will be <= max_cores.
     """
     symbol_meta = symbol_meta or {}
