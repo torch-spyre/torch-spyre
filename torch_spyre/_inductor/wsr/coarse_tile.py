@@ -4192,6 +4192,11 @@ def _propagate_tiled_reduction_op(
     )
     use_loop_carried_accumulator = (
         loop_info.hint_driven
+        # Carrying one physical value through the loop requires a stable
+        # ownership contract.  A tiling-only hint does not provide one and
+        # must retain the ordinary reduction path; the persistent expert
+        # schedule supplies an explicit work_div hint for its row ownership.
+        and bool(getattr(op, "work_div_loop_info", None))
         and not is_nested
         and is_graph_output
         and not outside_consumers
