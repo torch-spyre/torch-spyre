@@ -2834,11 +2834,17 @@ def test_flash_tile_B():
 
 @pytest.mark.skip(
     reason=(
-        "validate_writer_tile_advance now catches this at compile time: "
-        "squeeze-position bug in _insert_copy_op's write-side "
-        "_tiled_dims_for_dep (raw d{N} numbering breaks when a unit dim is "
-        "squeezed out of the index). Same root cause as issue #3613; "
-        "deferred until PR #3622's tile.py helpers land."
+        "Compiles now (the squeeze-position crash from issue #3613 is "
+        "fixed), but produces numerically wrong results: ~93% of output "
+        "elements mismatched, spread across both Lq tiles and all H heads. "
+        "Root cause not yet isolated -- ruled out so far: the "
+        "_tiled_dims_for_dep raw->squeezed fix (removing it causes an "
+        "immediate validate_writer_tile_advance failure, so it's necessary "
+        "and unrelated), the _insert_one_read_copy active_full_sizes fix "
+        "(reverting it does not change the mismatch), and the loop_internal "
+        "output_tiled_dims-clearing for op8/op9 (un-clearing it does not "
+        "change the mismatch either). See issue #3613 for the ongoing "
+        "investigation."
     )
 )
 def test_flash_tile_Lq():

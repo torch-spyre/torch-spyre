@@ -298,10 +298,10 @@ def plan_coarse_tile_groups(
             )
 
             tiled_dims_per_read = [
-                _tiled_dims_for_dep(dep, per_level_extents) for dep in read_deps
+                _tiled_dims_for_dep(dep, per_level_extents, op) for dep in read_deps
             ]
             output_tiled_dims = (
-                _tiled_dims_for_dep(write_deps[0], per_level_extents)
+                _tiled_dims_for_dep(write_deps[0], per_level_extents, op)
                 if write_deps
                 else []
             )
@@ -958,9 +958,50 @@ def _advancing_level_extents(
     return extents
 
 
+def _raw_to_squeezed_pos(ir_node: ComputedBuffer) -> dict[int, int]:
+    """Map ir_node's raw host-range positions to their squeezed d{i} number.
+
+    Mirrors SpyreKernel._host_dim_to_index_symbol's own squeeze arithmetic
+    (same source of truth, duplicated here because that method maps one
+    dim at a time and _tiled_dims_for_dep needs the whole table to build a
+    dep_dims membership test): output dims are numbered densely over
+    ir_node.data.ranges, skipping unit-size (==1) entries; reduction dims
+    continue the same counter, offset by n_output_dims, over
+    ir_node.data.reduction_ranges. A raw dim squeezed out entirely (range
+    == 1) has no entry -- it has no d{i} symbol for any dep.index to
+    reference.
+    """
+    pos: dict[int, int] = {}
+    it_idx = 0
+    ranges = getattr(getattr(ir_node, "data", None), "ranges", None)
+    if ranges is None:
+        return pos
+    for host_idx, r in enumerate(ranges):
+        if int(r) != 1:
+            pos[host_idx] = it_idx
+            it_idx += 1
+    # Raw reduction-dim keys are stored offset by the RAW (un-squeezed)
+    # output-dim count -- see _planned_tile_extents_per_level's
+    # n_output_dims = len(op.data.ranges). But the d{i} symbol they map to
+    # continues from the SQUEEZED output-dim count (it_idx above) -- see
+    # SpyreKernel._host_dim_to_index_symbol's n_output_dims = it_idx. These
+    # two offsets differ whenever ranges contains a unit dim, so they must
+    # not be conflated.
+    raw_n_output_dims = len(ranges)
+    squeezed_n_output_dims = it_idx
+    reduction_ranges = getattr(ir_node.data, "reduction_ranges", None) or []
+    red_it_idx = 0
+    for host_idx, r in enumerate(reduction_ranges):
+        if int(r) != 1:
+            pos[raw_n_output_dims + host_idx] = squeezed_n_output_dims + red_it_idx
+            red_it_idx += 1
+    return pos
+
+
 def _tiled_dims_for_dep(
     dep: MemoryDep,
     per_level_extents: list[dict[int, Expr]],
+    ir_node: ComputedBuffer,
 ) -> list[list[tuple[int, Expr]]]:
     """Filter per-level tiled-dim extents down to dims dep.index actually reads.
 
@@ -968,14 +1009,34 @@ def _tiled_dims_for_dep(
     on (broadcast, or simply not one of its dims) must not appear in its
     per-level list -- matching the implicit zeroing _tile_advance_expr_from_dep
     performs today for any free symbol absent from tiled_dim_extents.
+
+    per_level_extents' keys are RAW positional indices into ir_node's own
+    host-range space (ir_node.data.ranges / .reduction_ranges) -- the same
+    convention every loop_tiled_dims/output_tiled_dims producer in this file
+    uses, and the convention SpyreKernel._host_dim_to_index_symbol expects
+    on its way out (see its docstring). But dep.index's free symbols are
+    minted by Inductor's extract_read_writes -> index_vars_squeeze, which
+    drops unit-size dims and renumbers the rest densely -- SQUEEZED-space
+    numbers, not raw positions. Comparing a raw key directly against a
+    squeezed symbol number silently mismatches whenever a lower-numbered
+    dim was squeezed out ahead of it (issue #3613). Translate each raw key
+    through ir_node's own raw->squeezed table before the membership test;
+    the returned tuples keep the ORIGINAL raw key, since that -- not the
+    squeezed number -- is what every caller stores and what
+    _host_dim_to_index_symbol re-squeezes for itself later.
     """
     dep_dims = {
         int(str(sym)[1:])
         for sym in dep.index.free_symbols
         if str(sym).startswith("d") and str(sym)[1:].isdigit()
     }
+    raw_to_squeezed = _raw_to_squeezed_pos(ir_node)
     return [
-        [(d, extent) for d, extent in level.items() if d in dep_dims]
+        [
+            (d, extent)
+            for d, extent in level.items()
+            if raw_to_squeezed.get(d, d) in dep_dims
+        ]
         for level in per_level_extents
     ]
 
@@ -1953,7 +2014,9 @@ def _propagate_mutation_write_back(
         dep for dep in op.get_read_writes().writes if isinstance(dep, MemoryDep)
     ]
     output_tiled_dims = (
-        _tiled_dims_for_dep(write_deps[0], write_level_extents) if write_deps else []
+        _tiled_dims_for_dep(write_deps[0], write_level_extents, op)
+        if write_deps
+        else []
     )
     loop_info.output_tiled_dims = output_tiled_dims
 
@@ -2442,10 +2505,12 @@ def _insert_copy_op(
         dep for dep in copy_buf.get_read_writes().writes if isinstance(dep, MemoryDep)
     ]
     tiled_dims_per_read = [
-        _tiled_dims_for_dep(dep, read_level_extents) for dep in copy_reads
+        _tiled_dims_for_dep(dep, read_level_extents, copy_buf) for dep in copy_reads
     ]
     output_tiled_dims = (
-        _tiled_dims_for_dep(copy_writes[0], write_level_extents) if copy_writes else []
+        _tiled_dims_for_dep(copy_writes[0], write_level_extents, copy_buf)
+        if copy_writes
+        else []
     )
     copy_buf.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
         tiled_op_info,
@@ -2702,9 +2767,22 @@ def _insert_one_read_copy(
     # may have higher rank than the tensor (e.g. for a Reduction reading
     # a[M,K], dep.size=[M,N,K_tile] while the tensor has rank 2).
     # Use dep.index.coeff(v) to identify active dims (non-zero coeff) vs
-    # broadcast/absent dims (zero coeff, e.g. N above).  dep.size[i] is the
-    # full range for each active dim — the correct size to pass to
-    # compute_tile_stride without any lookup into full_buf's layout.
+    # broadcast/absent dims (zero coeff, e.g. N above).
+    #
+    # dep.size[i] is NOT the buffer's full range for an active dim: when
+    # sizing_op's own loop is already tiled (the common case -- this
+    # function copies a full-size buffer INTO a tile), dep.size reflects the
+    # reader's tile-local extent (e.g. 128 for a Lq-tiled read), not the
+    # buffer's true full/untiled extent (e.g. 256).  Passing that tile-local
+    # value as both the "full size" and "tile size" arguments makes
+    # compute_tile_stride's size//tile_size ratio 1 for every dim, a no-op
+    # that leaves full_buf's own (too-large) stride on the physically
+    # smaller copy buffer.  Look up each active dim's true full size from
+    # full_buf.layout instead, matched by stride VALUE (full_coeff), not by
+    # position -- dep.var_names/active_idx are in dep's squeezed iteration
+    # space, while full_buf.layout.size/stride are in the buffer's own raw
+    # space, and the two do not line up positionally in general (broadcast
+    # inputs, reductions with more loop vars than the tensor has dims, etc).
     full_coeff = [dep.index.coeff(v) for v in dep.var_names]
     # Positions with non-zero coeff are active tensor dims; zero coeff means
     # broadcast/absent (e.g. the N dim in a Reduction reading a[M,K]).
@@ -2714,8 +2792,33 @@ def _insert_one_read_copy(
     if not active_idx:
         tile_strides = [sympy.Integer(0)] * len(tile_ranges)
     else:
-        active_full_sizes = [dep.size[i] for i in active_idx]
+        # full_buf.layout.size/stride cannot be used to look up each active
+        # dim's full size: full_buf is the RAW graph buffer dep.name names,
+        # but dep.index's coefficients (full_coeff) are expressed in
+        # whatever coordinate space the read was indexed in, which may be a
+        # reshape/view of full_buf with no corresponding entry in
+        # full_buf.layout at all (e.g. a 1D [Lq*D] input .view()-ed to
+        # [Lq, D] before being read -- full_buf stays 1D/stride=[1] forever,
+        # so no stride in its layout equals the viewed coordinate space's
+        # per-dim strides). Derive full sizes purely from the active
+        # strides themselves instead: in a dense coordinate space, each
+        # dim's full size is (stride of the next-larger active dim) /
+        # (this dim's own stride), and the outermost active dim's full size
+        # is full_buf's total element count / its own stride -- true
+        # regardless of any reshape, since numel is view-invariant.
         active_full_strides = [full_coeff[i] for i in active_idx]
+        order = sorted(range(len(active_idx)), key=lambda k: active_full_strides[k])
+        total_elems = sympy.prod(full_buf.get_size())
+        active_full_sizes = [None] * len(active_idx)
+        for pos, k in enumerate(order):
+            next_stride = (
+                active_full_strides[order[pos + 1]] if pos + 1 < len(order) else None
+            )
+            active_full_sizes[k] = (
+                total_elems // active_full_strides[k]
+                if next_stride is None
+                else next_stride // active_full_strides[k]
+            )
         active_tile_ranges = [tile_ranges[i] for i in active_idx]
         active_tile_strides = compute_tile_stride(
             active_full_sizes, active_full_strides, active_tile_ranges
@@ -3037,10 +3140,12 @@ def _insert_one_read_copy(
         w for w in copy_buf.get_read_writes().writes if isinstance(w, MemoryDep)
     ]
     tiled_dims_per_read = [
-        _tiled_dims_for_dep(r, read_level_extents) for r in copy_reads
+        _tiled_dims_for_dep(r, read_level_extents, copy_buf) for r in copy_reads
     ]
     output_tiled_dims = (
-        _tiled_dims_for_dep(copy_writes[0], write_level_extents) if copy_writes else []
+        _tiled_dims_for_dep(copy_writes[0], write_level_extents, copy_buf)
+        if copy_writes
+        else []
     )
     # copy_buf is its own op, not sizing_op under another name -- it must
     # not inherit sizing_op_info.propagation. That plan was computed for
@@ -3178,7 +3283,7 @@ def _patch_consumer_to_read_copy(
         fixed_level_extents = _fixed_level_extents(new_loop_info.loop_tiled_dims)
         new_tiled_dims_per_read = [
             (
-                _tiled_dims_for_dep(read_dep, fixed_level_extents)
+                _tiled_dims_for_dep(read_dep, fixed_level_extents, new_op)
                 if read_dep.name == copy_name
                 else per_level
             )
@@ -3455,11 +3560,12 @@ def _insert_combine_op(
             fixed_level_extents
             if dep.name == tiled_op.get_name()
             else accum_level_extents,
+            combine_buf,
         )
         for dep in combine_reads
     ]
     output_tiled_dims = (
-        _tiled_dims_for_dep(combine_writes[0], accum_level_extents)
+        _tiled_dims_for_dep(combine_writes[0], accum_level_extents, combine_buf)
         if combine_writes
         else []
     )
@@ -3548,7 +3654,9 @@ def _insert_reduction_copy_op(
         dep for dep in copy_buf.get_read_writes().writes if isinstance(dep, MemoryDep)
     ]
     output_tiled_dims = (
-        _tiled_dims_for_dep(copy_writes[0], write_level_extents) if copy_writes else []
+        _tiled_dims_for_dep(copy_writes[0], write_level_extents, copy_buf)
+        if copy_writes
+        else []
     )
     copy_buf.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
         outer_loop_info, output_tiled_dims=output_tiled_dims
@@ -3965,7 +4073,7 @@ def _patch_consumers(
             )
             new_tiled_dims_per_read = [
                 (
-                    _tiled_dims_for_dep(read_dep, advancing_level_extents)
+                    _tiled_dims_for_dep(read_dep, advancing_level_extents, new_consumer)
                     if read_dep.name == new_name
                     else per_level
                 )
