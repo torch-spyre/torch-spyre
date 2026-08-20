@@ -6953,6 +6953,66 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
             fn, x, w, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
         )
 
+    def test_hinted_dense_expert_loop_keeps_one_body(self):
+        """The complete dense expert body is emitted once inside an E loop."""
+
+        E, T, H, F = 2, 64, 64, 64
+        x = torch.randn(T, H, dtype=torch.float16) * 0.01
+        gate_backing = torch.randn(H, E, F, dtype=torch.float16) * 0.01
+        up_backing = torch.randn(H, E, F, dtype=torch.float16) * 0.01
+        down_backing = torch.randn(F, E, H, dtype=torch.float16) * 0.01
+        route_backing = torch.randn(T, E, 1, dtype=torch.float16) * 0.01
+        for name, extent in {"E": E, "T": T, "H": H, "F": F, "ONE": 1}.items():
+            _declare_tensor_dim(name, extent)
+
+        def fn(x, gate_backing, up_backing, down_backing, route_backing):
+            gate_w = gate_backing.permute(1, 0, 2)
+            up_w = up_backing.permute(1, 0, 2)
+            down_w = down_backing.permute(1, 0, 2)
+            route = route_backing.permute(1, 0, 2)
+            _name_tensor_dims(x, ["T", "H"])
+            _name_tensor_dims(gate_w, ["E", "H", "F"])
+            _name_tensor_dims(up_w, ["E", "H", "F"])
+            _name_tensor_dims(down_w, ["E", "F", "H"])
+            _name_tensor_dims(route, ["E", "T", "ONE"])
+            with spyre_hint(
+                num_tiles_per_dim={"E": E},
+                work_div={"T": 32},
+            ):
+                gate = torch.matmul(x.unsqueeze(0), gate_w)
+                up = torch.matmul(x.unsqueeze(0), up_w)
+                hidden = torch.nn.functional.gelu(gate, approximate="tanh") * up
+                down = torch.matmul(hidden, down_w)
+                return (down * route).sum(dim=0)
+
+        def check_source(source):
+            self.assertEqual(source.count("LoopSpec("), 1)
+            self.assertEqual(source.count("device_tile_advance_expr="), 4)
+            self.assertNotIn("'hbm_pool'", source)
+            self.assertNotIn("ReStickifyOpHBM", source)
+            self.assertIn("coarse_tile_reduction_drain", source)
+
+        with config.patch(
+            {
+                "sencores": 32,
+                "lx_planning": True,
+                "allow_all_ops_in_lx_planning": True,
+            }
+        ):
+            compare_with_cpu(
+                fn,
+                x,
+                gate_backing,
+                up_backing,
+                down_backing,
+                route_backing,
+                run_compile=True,
+                run_eager=False,
+                source_check=check_source,
+                atol=0.05,
+                rtol=0.05,
+            )
+
     @pytest.mark.skip(
         reason=(
             "Unsupported: expected exactly 1 generated variable, got {d0, d2}. "

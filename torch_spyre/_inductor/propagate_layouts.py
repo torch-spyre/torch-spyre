@@ -16,6 +16,7 @@
 from collections import Counter
 from typing import NamedTuple
 
+import dataclasses
 import logging
 import math
 
@@ -85,6 +86,7 @@ from .pass_utils import (
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
+    replace_computed_buffer_body,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .views import compute_coordinates, matching_dim
@@ -869,7 +871,16 @@ def _matmul_layouts(
     #   Input2 (y): stick on generated_var (loop var present in output, absent from x)
     #   Output:     stick on generated_var
     reduction_var = find_reduction_var(x.dep, output_dep)
-    generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep)
+    generated_var = find_matmul_generated_var(
+        y.dep,
+        x.dep,
+        output_dep,
+        output_n_coord=(
+            out_coords[-1]
+            if getattr(op, "_coarse_tile_direct_read_candidate", None) is not None
+            else None
+        ),
+    )
 
     x_req_stl = find_stick_compatible_input_layout(
         x, reduction_var, data.reduction_type, "x"
@@ -1632,6 +1643,181 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
         operations.remove(op)
 
 
+def _resolve_direct_read_copy_candidates(operations: list[Operation]) -> None:
+    """Remove a tiled matmul's staging copy when its HBM slice is usable directly.
+
+    Coarse tiling keeps the copy during layout propagation so the existing
+    full-buffer/tile-size machinery can find layouts normally.  It also saves
+    the matmul body and loop metadata from before that rewrite.  Here, after
+    layouts are known, reconstruct the direct read and commit it only when the
+    graph-input weight already carries the matmul's required stick dimension.
+    """
+    removed_copies: list[Operation] = []
+
+    for consumer in list(operations):
+        candidate = getattr(consumer, "_coarse_tile_direct_read_candidate", None)
+        if not isinstance(consumer, ComputedBuffer) or candidate is None:
+            continue
+
+        copy_op = next(
+            (
+                op
+                for op in operations
+                if isinstance(op, ComputedBuffer)
+                and op.get_name() == candidate.copy_name
+            ),
+            None,
+        )
+        if copy_op is None or not isinstance(copy_op.data, Pointwise):
+            continue
+
+        # A shared staging copy cannot be removed for only one consumer.
+        readers = [
+            op
+            for op in operations
+            if isinstance(op, ComputedBuffer)
+            and any(
+                isinstance(read, MemoryDep) and read.name == candidate.copy_name
+                for read in op.get_read_writes().reads
+            )
+        ]
+        if readers != [consumer]:
+            continue
+
+        direct_data = dataclasses.replace(
+            consumer.data, inner_fn=candidate.original_inner_fn
+        )
+        direct_op = ComputedBuffer(
+            name=consumer.get_name(),
+            layout=consumer.layout,
+            data=direct_data,
+            _split_size=consumer._split_size,
+            _original_inner_fn=consumer._original_inner_fn,
+            _original_ranges=consumer._original_ranges,
+            _original_reduction_ranges=consumer._original_reduction_ranges,
+        )
+        direct_op.operation_name = consumer.operation_name
+
+        read_writes = direct_op.get_read_writes()
+        output_dep = _one_mem_dep(read_writes.writes)
+        if output_dep is None:
+            continue
+        args = _get_prop_args(read_writes.reads)
+        x_dep, weight_dep = identify_matmul_inputs(
+            [arg.dep for arg in args], output_dep
+        )
+        if (
+            x_dep is None
+            or weight_dep is None
+            or weight_dep.name != candidate.source_name
+        ):
+            continue
+
+        weight_arg = next(arg for arg in args if arg.dep is weight_dep)
+        if len(weight_arg.layouts) != 1:
+            continue
+        out_coords = host_coordinates(direct_op.get_layout(), output_dep, None)
+        generated_var = find_matmul_generated_var(
+            weight_dep,
+            x_dep,
+            output_dep,
+            output_n_coord=out_coords[-1],
+        )
+        weight_stick = device_coordinates(weight_arg.layouts[0], weight_dep, None)[-1]
+        if generated_var not in weight_stick.free_symbols:
+            continue
+
+        # The copy's input metadata is the authoritative description of how
+        # to move from expert e to expert e+1. The direct matmul read has
+        # already squeezed that unit expert dimension from its index, so its
+        # ordinary tiled-dimension entry alone evaluates to zero. Transfer
+        # the copy's preserved host stride to the direct weight-read slot.
+        direct_reads = [dep for dep in read_writes.reads if isinstance(dep, MemoryDep)]
+        copy_reads = [
+            dep for dep in copy_op.get_read_writes().reads if isinstance(dep, MemoryDep)
+        ]
+        direct_weight_idx = next(
+            (
+                i
+                for i, dep in enumerate(direct_reads)
+                if dep.name == candidate.source_name
+            ),
+            None,
+        )
+        copy_source_idx = next(
+            (
+                i
+                for i, dep in enumerate(copy_reads)
+                if dep.name == candidate.source_name
+            ),
+            None,
+        )
+        copy_loop_info = getattr(copy_op, "loop_info", None)
+        if (
+            direct_weight_idx is None
+            or copy_source_idx is None
+            or copy_loop_info is None
+            or copy_source_idx >= len(copy_loop_info.tiled_dims_per_read)
+            or copy_source_idx >= len(copy_loop_info.squeezed_advance_per_read)
+            or not any(copy_loop_info.squeezed_advance_per_read[copy_source_idx])
+        ):
+            continue
+
+        direct_tiled_dims = list(candidate.original_loop_info.tiled_dims_per_read)
+        if direct_weight_idx >= len(direct_tiled_dims):
+            continue
+        direct_tiled_dims[direct_weight_idx] = copy_loop_info.tiled_dims_per_read[
+            copy_source_idx
+        ]
+        direct_squeezed = list(candidate.original_loop_info.squeezed_advance_per_read)
+        direct_squeezed.extend(
+            [] for _ in range(len(direct_reads) - len(direct_squeezed))
+        )
+        direct_squeezed[direct_weight_idx] = copy_loop_info.squeezed_advance_per_read[
+            copy_source_idx
+        ]
+        resolved_loop_info = dataclasses.replace(
+            candidate.original_loop_info,
+            tiled_dims_per_read=direct_tiled_dims,
+            squeezed_advance_per_read=direct_squeezed,
+        )
+
+        # Re-run only this matmul's layout rule against the real HBM input.
+        # This builds the downstream restickify-cost contract from the direct
+        # operand rather than retaining the temporary copy's contract.
+        try:
+            direct_layouts = compute_layouts(
+                direct_op, direct_op.get_layout(), output_dep, args
+            )
+        except Unsupported:
+            continue
+
+        replacement = replace_computed_buffer_body(
+            consumer,
+            direct_data,
+            operations,
+            pass_name="copy_elision",
+            reason="read advancing expert weight directly from HBM",
+        )
+        replacement.loop_info = resolved_loop_info  # type: ignore[attr-defined]
+        replacement.layouts = direct_layouts  # type: ignore[attr-defined]
+        replacement.restick_cost_fn = direct_op.restick_cost_fn  # type: ignore[attr-defined]
+        if hasattr(replacement, "_coarse_tile_direct_read_candidate"):
+            delattr(replacement, "_coarse_tile_direct_read_candidate")
+        V.graph.name_to_buffer[replacement.get_name()] = replacement
+        removed_copies.append(copy_op)
+        logger.info(
+            "removed tiled read copy %s; %s reads %s directly",
+            copy_op.get_name(),
+            replacement.get_name(),
+            candidate.source_name,
+        )
+
+    for copy_op in removed_copies:
+        V.graph.removed_buffers.add(copy_op.get_name())
+        operations.remove(copy_op)
+
+
 def _eager_view_input_layout(
     real_input: torch.Tensor,
     ptl: FixedLayout,
@@ -2045,6 +2231,7 @@ def propagate_spyre_tensor_layouts(
         else:
             logger.warning(f"unhandled operation type {type(op)}")
 
+    _resolve_direct_read_copy_candidates(operations)
     _resolve_copy_back_candidates(operations)
 
 

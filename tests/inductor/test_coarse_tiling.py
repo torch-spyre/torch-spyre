@@ -705,6 +705,8 @@ class TestCoarseTileInfo(unittest.TestCase):
         )
         self.assertEqual(info.tiled_dims_per_read, [])
         self.assertEqual(info.output_tiled_dims, [])
+        self.assertFalse(info.hint_driven)
+        self.assertEqual(info.predivision_host_advance_per_read, [])
 
     def test_tile_advance_explicit(self):
         info = CoarseTileInfo(
@@ -2074,6 +2076,26 @@ class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
         self.assertEqual(len(op.loop_info.tiled_dims_per_read), 2)
         for tiled_dims in op.loop_info.tiled_dims_per_read:
             self.assertEqual(tiled_dims, [[(0, Integer(512))], [(1, Integer(1024))]])
+
+    def test_predivision_advances_are_explicit_hint_only(self):
+        op = _make_real_pointwise_op(
+            ranges=[Integer(8), Integer(16)],
+            input_shapes_strides=[([8, 16], [16, 1])],
+            name="buf0",
+            hints=((1, 0),),
+        )
+        levels = [(1, Integer(2))]
+
+        automatic = plan_coarse_tile_groups([op], [([op], levels)])
+        explicit = plan_coarse_tile_groups([op], [([op], levels)], hint_driven=True)
+
+        self.assertFalse(automatic[id(op)].hint_driven)
+        self.assertEqual(automatic[id(op)].predivision_host_advance_per_read, [])
+        self.assertTrue(explicit[id(op)].hint_driven)
+        self.assertEqual(
+            explicit[id(op)].predivision_host_advance_per_read,
+            [[[(0, Integer(64))]]],
+        )
 
     def test_broadcast_input_has_zero_advance(self):
         # a (tiled input) + b (broadcast scalar-row input, stride [0, 1]).

@@ -905,7 +905,10 @@ def find_reduction_var(x_dep: MemoryDep, out_dep: MemoryDep) -> sympy.Symbol:
 
 
 def find_matmul_generated_var(
-    y_dep: MemoryDep, x_dep: MemoryDep, out_dep: MemoryDep
+    y_dep: MemoryDep,
+    x_dep: MemoryDep,
+    out_dep: MemoryDep,
+    output_n_coord: sympy.Expr | None = None,
 ) -> sympy.Symbol:
     """Return the single loop variable that appears in y's and the output's index but not in x's.
 
@@ -915,6 +918,11 @@ def find_matmul_generated_var(
     generated_vars = (
         y_dep.index.free_symbols & out_dep.index.free_symbols
     ) - x_dep.index.free_symbols
+    # A broadcasted batch dimension is also present in y and the output but
+    # absent from x.  For matmul, N is the last logical output coordinate, so
+    # use that coordinate to distinguish N from broadcasted batch dimensions.
+    if len(generated_vars) > 1 and output_n_coord is not None:
+        generated_vars &= output_n_coord.free_symbols
     if len(generated_vars) != 1:
         raise Unsupported(
             f"expected exactly 1 generated variable, got {generated_vars}"

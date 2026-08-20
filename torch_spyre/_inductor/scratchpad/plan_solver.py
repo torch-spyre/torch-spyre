@@ -80,6 +80,10 @@ class LifetimeBoundBuffer:
     # define the reason for excluding the buffer based on allocator
     # or solver logic paths.
     residency_reason: Optional[str] = None
+    # Optional exclusive lifetime end for storage reused by a counted loop.
+    # Keep this separate from ``uses``: it changes address overlap, but must not
+    # manufacture a read or inflate residency/spill benefit.
+    lifetime_end_override: Optional[int] = None
     # Buffers that must be placed atomically with this one. Despite the name,
     # this is one-to-many: only the group root carries the complete partner list.
     paired_with: list["LifetimeBoundBuffer"] = field(
@@ -104,6 +108,12 @@ class LifetimeBoundBuffer:
             f"buffer {self.name} has uses={self.uses}, which is not strictly "
             "increasing; uses carries one distinct index per accessing operation"
         )
+        if self.lifetime_end_override is not None and self.uses:
+            assert self.lifetime_end_override >= self.uses[-1] + 1, (
+                f"buffer {self.name} has lifetime_end_override="
+                f"{self.lifetime_end_override} before nominal exclusive end "
+                f"{self.uses[-1] + 1}"
+            )
 
     @property
     def read_count(self) -> int:
@@ -126,7 +136,8 @@ class LifetimeBoundBuffer:
 
     @property
     def end_time(self) -> int:
-        return self.uses[-1] + 1
+        nominal = self.uses[-1] + 1
+        return max(nominal, self.lifetime_end_override or nominal)
 
     @property
     def min_footprint(self) -> int:

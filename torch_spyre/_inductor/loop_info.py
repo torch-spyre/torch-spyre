@@ -268,6 +268,12 @@ class CoarseTileInfo:
         contribution as an extra term via ``tiling_expr_to_device_expr``
         rather than by substitution. Empty list means no such dims for this
         read (the common case).
+    predivision_host_advance_per_read:
+        Original input-address advance for each read and loop level, captured
+        while the tiled dimension still exists.  Parallel to
+        ``tiled_dims_per_read``; each item is ``(op_dim_index, host_elements)``.
+        This is used only when later range division squeezes that dimension
+        from the read dependency.
     squeezed_advance_output:
         The analogous per-level ``(host_stride, extent)`` list for this op's
         own write dependency, parallel to ``output_tiled_dims`` the same way
@@ -282,12 +288,18 @@ class CoarseTileInfo:
     loop_group_id: tuple[int, ...]
     loop_count: list[sympy.Expr]
     loop_tiled_dims: list[list[int]]
+    # True only for a loop requested by an explicit spyre_hint. Automatic
+    # span-overflow tiling must retain the existing compiler behavior.
+    hint_driven: bool = False
     loop_tiled_reduction_dims: list[list[int]] = field(default_factory=list)
     tiled_dims_per_read: list[list[list[tuple[int, sympy.Expr]]]] = field(
         default_factory=list
     )
     output_tiled_dims: list[list[tuple[int, sympy.Expr]]] = field(default_factory=list)
     squeezed_advance_per_read: list[list[list[tuple[sympy.Expr, sympy.Expr]]]] = field(
+        default_factory=list
+    )
+    predivision_host_advance_per_read: list[list[list[tuple[int, sympy.Expr]]]] = field(
         default_factory=list
     )
     squeezed_advance_output: list[list[tuple[sympy.Expr, sympy.Expr]]] = field(
@@ -311,6 +323,13 @@ _SPYRE_METADATA_ATTRS = (
     # coarse_tile._propagate_tiled_reduction_op, read by finalize_layouts in
     # insert_restickify.py to overwrite accum_full's generic layout.
     "_tiled_reduction_accum_name",
+    # Marks the ordinary fill output used as a fixed-address running sum.
+    # Scratchpad planning may admit this mutation target because a suffix
+    # drain, rather than the accumulator itself, is the graph output.
+    "_coarse_tile_loop_carried_lx",
+    # Temporary candidate consumed by layout propagation when a tiled matmul
+    # can read its advancing graph-input slice without the staging copy.
+    "_coarse_tile_direct_read_candidate",
 )
 
 
