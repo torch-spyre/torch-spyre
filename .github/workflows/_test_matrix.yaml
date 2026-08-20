@@ -693,6 +693,8 @@ jobs:
             config: distributed_tests/test_reduce.yaml
           - name: Test Multi-Spyre Broadcast Compiled
             config: distributed_tests/test_broadcast_compiled.yaml
+          - name: Test Multi-Spyre Allgather Compiled
+            config: distributed_tests/test_allgather_compiled.yaml
           - name: Test Multi-Spyre Allreduce Compiled
             config: distributed_tests/test_allreduce_compiled.yaml
 

@@ -43,6 +43,7 @@ from .ir import (
     SpyreEmptyFallback,
     BroadcastAsyncFallback,
     WaitWorkFallback,
+    AllGatherAsyncFallback,
     AllReduceAsyncFallback,
 )
 from torch_spyre._C import get_elem_in_stick
@@ -1885,6 +1886,37 @@ def lower_c10d_wait_tensor_async(tensor):
         WaitWorkFallback(
             torch.ops.spyre.wait_work.default,
             tensor,
+        )
+    )
+
+
+@register_spyre_lowering(torch.ops._c10d_functional.all_gather_into_tensor.default)
+def lower_c10d_all_gather_async(tensor, group_size, group_name):
+    """
+    Direct lowering for _c10d_functional.all_gather_into_tensor using ASYNC pattern.
+
+    Creates an async all_gather operation that returns immediately without blocking.
+    Output tensor has shape[0] = input.shape[0] * group_size (concatenation of all ranks).
+
+    Flow:
+      _c10d_functional.all_gather_into_tensor → This lowering
+      → AllGatherAsyncFallback → Generated code:
+      torch.ops.spyre.all_gather_async() → C++ → spyre-comms (non-blocking)
+    """
+    logger.info(
+        "Lowering _c10d_functional.all_gather_into_tensor to "
+        "SpyreAllGatherAsyncFallback (group_size=%s, group_name='%s')",
+        group_size,
+        group_name,
+    )
+
+    tensor.realize()
+    return ir.TensorBox.create(
+        AllGatherAsyncFallback(
+            torch.ops.spyre.all_gather_async.default,
+            tensor,
+            group_size,
+            group_name,
         )
     )
 

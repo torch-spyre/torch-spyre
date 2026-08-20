@@ -64,6 +64,7 @@ from .constants import (
     STAGGERED_EAS,
 )
 from .ir import (
+    AllGatherAsyncFallback,
     AllReduceAsyncFallback,
     FixedTiledLayout,
     SpyreConstantFallback,
@@ -1991,6 +1992,9 @@ def propagate_spyre_tensor_layouts(
             input_name = op.inputs[0].get_name()
             input_buf = V.graph.get_buffer(input_name)
             op.layouts = list(input_buf.layouts)
+            op.restick_cost_fn = AnyInNode.from_args()
+        elif isinstance(op, AllGatherAsyncFallback):
+            op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ExternKernel):
             logger.warning(f"unhandled node type {type(op)}")
