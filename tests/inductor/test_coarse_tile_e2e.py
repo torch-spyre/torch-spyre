@@ -2052,7 +2052,7 @@ def test_copy_restickify_512x256_A4_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-# --- nested copy + reduction: copy_forced(acc * scale + x.amin(dim=1, keepdim=True, acc)) ---
+# --- nested copy + reduction: copy_forced(acc * scale + x.amin(dim=1, keepdim=True), acc) ---
 # flash attention accumulator pattern: correction * running value + new contribution
 
 
