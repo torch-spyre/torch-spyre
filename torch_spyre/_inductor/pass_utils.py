@@ -1476,6 +1476,31 @@ def _coeff_splits_from_index(
     return result
 
 
+def _validate_split_coefficients(
+    splits: dict[sympy.Symbol, int], index: sympy.Expr, namespace: str
+) -> None:
+    """Reject distinct non-unity splits sharing one coefficient key."""
+    by_coeff: dict[sympy.Expr, list[tuple[sympy.Symbol, int]]] = {}
+    for sym, split in splits.items():
+        coeff = index.coeff(sym)
+        if coeff == 0:
+            if split > 1:
+                raise Unsupported(
+                    f"Cannot encode split {split} for {sym}: it has no {namespace} "
+                    "index coefficient."
+                )
+            continue
+        by_coeff.setdefault(coeff, []).append((sym, split))
+
+    for coeff, symbol_splits in by_coeff.items():
+        non_unity = [(sym, split) for sym, split in symbol_splits if split > 1]
+        if len({split for _, split in non_unity}) > 1:
+            raise Unsupported(
+                f"Cannot encode distinct splits for symbols sharing {namespace} "
+                f"index coefficient {coeff}: {symbol_splits}."
+            )
+
+
 def splits_by_index_coeff(
     splits: dict[sympy.Symbol, int],
     write_index: sympy.Expr,
@@ -1484,17 +1509,25 @@ def splits_by_index_coeff(
     """Encode a symbol→split dict as scheduler coefficient transport.
 
     This is intentionally a boundary representation: pre-scheduler passes keep
-    symbol-keyed ownership.  Coefficients are stable across scheduler renaming,
-    but are not generally unique.  In iteration-space order, the last symbol
-    for a coefficient wins, matching the legacy dictionary behavior.
+    symbol-keyed ownership. Coefficients are stable across scheduler renaming,
+    but distinct non-unity splits sharing one coefficient are ambiguous and
+    rejected.
 
     Only non-unity splits are stored; 1 is the default on the apply side.
     """
     skip = lambda v: v <= 1  # noqa: E731
-    output_splits = _coeff_splits_from_index(splits, write_index, skip=skip)
+    output_splits_by_symbol = {
+        sym: val for sym, val in splits.items() if write_index.coeff(sym) != 0
+    }
+    _validate_split_coefficients(output_splits_by_symbol, write_index, "output")
+    output_splits = _coeff_splits_from_index(
+        output_splits_by_symbol, write_index, skip=skip
+    )
+    # Reduction splits: symbols with coeff==0 in write_index but coeff!=0 in read_index
     reduction_only = {
         sym: val for sym, val in splits.items() if write_index.coeff(sym) == 0
     }
+    _validate_split_coefficients(reduction_only, read_index, "reduction")
     reduction_splits = _coeff_splits_from_index(reduction_only, read_index, skip=skip)
     return output_splits, reduction_splits
 
