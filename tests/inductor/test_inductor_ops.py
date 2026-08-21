@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 
 
+
 from utils_inductor import (
     ParameterizedTestMeta,
     _compile_and_run,
@@ -401,6 +402,7 @@ TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
     for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
 ]
 
+
 TO_DTYPE_REDUCTION_DTYPES = [torch.float16, torch.float32]
 
 TO_DTYPE_REDUCTION_PARAMS_SETS = {
@@ -413,6 +415,7 @@ TO_DTYPE_REDUCTION_PARAMS_SETS = {
     if src != dst
     for shape in TO_DTYPE_OP_SHAPES_ALIGNED
 }
+
 
 # Mixed element arrangements across a graph boundary: one operand is a native
 # fp32 (STANDARD) input, the other is fp16 upcast to fp32 in-graph (staggered
@@ -468,6 +471,22 @@ _SCALED_MM_SHAPES = [
     (1, 4096, 4096),
     (2, 4096, 4096),
     (4, 4096, 4096),
+
+    # --- Unaligned K (NOT a multiple of 128) — exercises pad_fp8_weight_input ---
+    (2, 2, 128),
+    (2, 65, 128),
+    (2, 100, 128),
+    (3, 127, 128),
+    (4, 129, 128),
+    (2, 200, 256),
+    (5, 255, 256),
+    (2, 4097, 4096),
+    (4, 4095, 4096),
+]
+
+# scale_a, scale_b, bias
+_SCALED_MM_PARAMS = [
+    (1.0, 1.0, 0.0),
 ]
 
 # scale_a, scale_b
@@ -491,6 +510,7 @@ SCALED_MM_TESTS = {
     for shape in _SCALED_MM_SHAPES
     for sa, sb, b in _SCALED_MM_PARAMS
 }
+
 FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
 FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
 
@@ -6567,6 +6587,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         import torch._inductor.lowering as inductor_lowering
         from torch._inductor.utils import fresh_cache
 
+        lib = torch.library.Library("spyre_test", "FRAGMENT")  # noqa: TOR901
         lib = torch.library.Library("spyre_test", "FRAGMENT")
         lib.define("clone_identity(Tensor x) -> Tensor")
         op = torch.ops.spyre_test.clone_identity.default
@@ -7853,6 +7874,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             q_a = torch.ops.spyre.quantize_fp8_with_scale(a, scale_a)
             q_b = torch.ops.spyre.quantize_weight_fp8_with_scale(b, scale_b)
             return torch.ops.aten._scaled_mm(
+                q_a, q_b, scale_a, scale_b, bias=bias, out_dtype=torch.float16
+            )
+
+        def pytorch_fn(a, b, scale_a, scale_b, bias=None):
                 q_a,
                 q_b,
                 scale_a=scale_a,

@@ -38,7 +38,7 @@ from torch._inductor.scheduler import BaseSchedulerNode
 from .logging_utils import get_inductor_logger
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
-from .padding import insert_bmm_padding
+from .padding import insert_bmm_padding, pad_fp8_weight_input
 from .temp_passes import (
     bmm_unflatten_pass,
     decompose_addmm,
@@ -225,7 +225,7 @@ class CustomPrePasses(_SpyreGraphPassPipeline):
     """
 
     def __init__(self):
-        super().__init__([collect_spyre_hints])
+        super().__init__([pad_fp8_weight_input, collect_spyre_hints])
 
 
 class CustomPostPasses(_SpyreGraphPassPipeline):
