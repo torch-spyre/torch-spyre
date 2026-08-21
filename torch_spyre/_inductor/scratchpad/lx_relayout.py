@@ -218,16 +218,32 @@ def _is_activation_source(operations: dict[str, Operation], op: Operation) -> bo
 def _has_restickify_consumer(
     consumer_reads: Sequence[tuple[Operation, MemoryDep]],
 ) -> bool:
+    """Keep restickify input buffers out of relayout candidate analysis.
+
+    Restickify changes physical ownership frames, so its inputs are already a
+    cross-frame barrier for LX residency (see
+    ``ScratchpadAllocator._restickify_barrier``). Apply the same source-wide
+    rule before relayout analysis can attach ownership plans to the buffer.
+    """
+
     return any(
         op_short_name(consumer) == "restickify" for consumer, _ in consumer_reads
     )
 
 
 def _unsupported_relayout_transition_reason(
-    source_work_division: TensorWorkDivision | None,
-    destination_work_division: TensorWorkDivision | None,
+    source_work_division: TensorWorkDivision,
+    destination_work_division: TensorWorkDivision,
 ) -> str | None:
-    """Reject ownership changes that cannot be represented safely."""
+    """Reject ownership changes that the identity-copy emitter cannot represent.
+
+    ``op_spec.is_lx_relayout_identity`` recognizes a physical reshuffle only
+    when the two tensor work divisions differ. If distinct per-core views
+    project to the same work division, codegen would lower the materialized
+    copy as an ordinary identity and silently omit the required cross-core
+    movement. Dropping the optimization keeps consumers on the original,
+    correctly addressed buffer.
+    """
 
     if source_work_division == destination_work_division:
         return "distinct physical ownerships collapse to the same logical work division"
@@ -264,7 +280,7 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
             producer, write, source_name, cache
         )
         num_cores = _op_num_cores(producer)
-        if partial or not representable:
+        if source_view is None or partial or not representable:
             continue
 
         # Activation eligibility belongs to the producer, not to an individual
@@ -286,6 +302,9 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
         except ValueError:
             continue
 
+        # Relayout copies sharing one source are allocated and materialized as
+        # one atomic group. Any unsupported consumer therefore rejects the
+        # group; supported consumers keep using the original buffer instead.
         consumers_by_view: dict[PerCoreView, list[str]] = {}
         seen_consumers = set()
         rejection_reason = None
@@ -310,7 +329,8 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                 consumer, dep, source_name, cache
             )
             if (
-                consumer_partial
+                view is None
+                or consumer_partial
                 or not representable
                 or _op_num_cores(consumer) != num_cores
             ):
@@ -333,6 +353,7 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
             except ValueError:
                 rejection_reason = "source ownership cannot be projected to consumer"
                 break
+            assert source_work_division is not None
             if view == source_view:
                 continue
             is_matmul = _is_matmul_op(consumer)
@@ -354,6 +375,7 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                     "destination ownership cannot be projected to consumer"
                 )
                 break
+            assert destination_work_division is not None
             if reason := _unsupported_relayout_transition_reason(
                 source_work_division, destination_work_division
             ):
