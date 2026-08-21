@@ -547,14 +547,6 @@ def _enforce_scatter_destination_layout(
         )
         return
 
-    # Shortcut: if target and output have the same device layout, they're compliant.
-    if target_stl == output_stl:
-        logger.debug(
-            "scatter_destination_check: %s target and output layouts match, compliant",
-            scatter_op.get_name(),
-        )
-        return
-
     # Compute write coordinates against the target's layout and find positions
     # of IndirectAccess markers.
     write_coords = device_coordinates(target_stl, write_dep, None)

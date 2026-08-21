@@ -125,6 +125,36 @@ class TestScatter(IndirectAccessTestCase):
 
         self._stage_and_e2e(kernel, y, src, idx, expect=SCATTER_OP_SPEC)
 
+    def test_index_put_4d_dim2_default_layout_destination(self):
+        """Scatter on dim 2 of a 4-D destination that has the DEFAULT device layout.
+
+        Indirect access addresses the indexed dimension through the *device* layout and
+        requires it at device position 0. A destination allocated plainly --
+        ``torch.zeros(...).to("spyre")`` -- puts dim 2 elsewhere, so unless the layout
+        is enforced the scatter writes the wrong rows **silently, with no error**
+        (torch-spyre#3705).
+
+        The existing dim-0 and dim-1 scatter tests above do not cover this: their
+        shapes happen to place the indexed dim at device position 0 already. This is
+        the shape a decode-time query stick uses (``[batch, heads, 64, head_dim]``,
+        writing one row), which is where the silent corruption was first observed.
+        """
+        Bn, H, M, N, P = 1, 4, 64, 256, 1
+        dst = torch.zeros(Bn, H, M, N, dtype=torch.float16)
+        src = torch.rand(Bn, H, P, N, dtype=torch.float16)
+        # int64: index_copy_ requires a long index, unlike the index_put tests above.
+        idx = torch.tensor([7], dtype=torch.int64)
+
+        def kernel(dst, src, idx):
+            dst.index_copy_(2, idx, src)
+            return dst
+
+        expected = kernel(dst.clone(), src.clone(), idx.clone())
+        actual = torch.compile(kernel, dynamic=False)(
+            dst.clone().to("spyre"), src.to("spyre"), idx.to("spyre")
+        ).to("cpu")
+        torch.testing.assert_close(actual, expected)
+
     def test_index_put_p7(self):
         """y[idx] = src -- 1-D scatter with an odd (non-power-of-2) P=7."""
         M, N, P = 16, 1024, 7

@@ -73,7 +73,6 @@ class TestSdscJsonLogging:
                             sdsc_counter=[0],
                             symbol_id_offset_counter=[0],
                             output_dir=tmpdir,
-                            use_symbols=False,
                         )
 
                 info_calls = mock_info.call_args_list
@@ -107,7 +106,6 @@ class TestSdscJsonLogging:
                             sdsc_counter=[0],
                             symbol_id_offset_counter=[0],
                             output_dir=tmpdir,
-                            use_symbols=False,
                         )
 
                 sdsc_json_calls = [
@@ -148,7 +146,6 @@ class TestBundleMlirLogging:
                             kernel_name="test_kernel",
                             output_dir=tmpdir,
                             specs=[],
-                            use_symbols=False,
                         )
 
                 mlir_calls = [
@@ -186,7 +183,6 @@ class TestBundleMlirLogging:
                             kernel_name="test_kernel",
                             output_dir=tmpdir,
                             specs=[],
-                            use_symbols=False,
                         )
 
                 mlir_calls = [

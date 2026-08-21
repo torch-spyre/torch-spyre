@@ -337,8 +337,15 @@ jobs:
     # That would make the `== 'skipped'` branch dead code and silently skip
     # every test on the RPM path. (The OR group must stay parenthesised because
     # `&&` binds tighter than `||`.)
+    #
+    # Skip cleanly in perf mode: generate_matrix emits an empty suite matrix
+    # for perf (the work runs in the `perf` job). An eligible job with a
+    # zero-entry matrix poisons this reusable workflow's aggregate result to
+    # `failure`, which then fails the caller's gate even though the perf job
+    # passed. A clean `if:`-false skip does not.
     if: >-
       !cancelled() &&
+      needs.generate_matrix.outputs.resolved_test_type != 'perf' &&
       (needs.build_torch_spyre.result == 'success' ||
        needs.build_torch_spyre.result == 'skipped')
     # Don't let one failed suite fail this job -- test_result (below) decides pass/fail after test_retry gets a shot on a fresh pod, so a merge-queue entry isn't evicted before the retry runs.
@@ -693,6 +700,8 @@ jobs:
             config: distributed_tests/test_reduce.yaml
           - name: Test Multi-Spyre Broadcast Compiled
             config: distributed_tests/test_broadcast_compiled.yaml
+          - name: Test Multi-Spyre Allgather Compiled
+            config: distributed_tests/test_allgather_compiled.yaml
           - name: Test Multi-Spyre Allreduce Compiled
             config: distributed_tests/test_allreduce_compiled.yaml
 
@@ -814,9 +823,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p failed_suites
-          ARTIFACTS=$(gh api \
-            "/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
-            --jq '[.artifacts[] | select(.name | startswith("failed-suite-")) | {id: .id, name: .name}]')
+          # --paginate: the artifacts endpoint defaults to 30 per page. A
+          # regression run uploads one XML per suite plus the wheel, well over
+          # one page, and an un-paginated query silently drops every descriptor
+          # past page 1: a suite whose failed-suite-<jobid> descriptor lands
+          # later is never retried and the gate reports green. --paginate
+          # applies --jq per page and concatenates the results (gh rejects
+          # --slurp combined with --jq), so emit a per-object JSON stream, not
+          # a wrapped array, and let python3 slurp the stream into one array.
+          # Same idiom as push-to-clickhouse.yaml.
+          ARTIFACTS=$(gh api --paginate \
+            "/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name | startswith("failed-suite-")) | {id: .id, name: .name}' \
+            | python3 -c "import json,sys; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()]))")
 
           ARTIFACTS="$ARTIFACTS" python3 <<'PYEOF'
           import json, os, subprocess
@@ -1092,9 +1111,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p xml_artifacts
-          ARTIFACTS=$(gh api \
-            "/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
-            --jq '[.artifacts[] | select(.name | endswith(".xml")) | {id: .id, name: .name}]')
+          # --paginate: same page-cap trap as collect_failed_suites; an
+          # un-paginated query would miss XML reports past the first page and
+          # under-report the empty-suite check. Emit a per-object JSON stream
+          # (gh rejects --slurp with --jq) and slurp it into one array.
+          ARTIFACTS=$(gh api --paginate \
+            "/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name | endswith(".xml")) | {id: .id, name: .name}' \
+            | python3 -c "import json,sys; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()]))")
 
           ARTIFACTS="$ARTIFACTS" python3 <<'PYEOF'
           import json, os, subprocess

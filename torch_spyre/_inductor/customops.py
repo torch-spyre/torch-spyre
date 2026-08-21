@@ -234,7 +234,16 @@ def _(input: torch.Tensor):
 @torch.library.custom_op(
     "spyre::copy_from_d2d", mutates_args=("dst",), device_types="spyre"
 )
-@compile_once("spyre.copy_from_d2d")
+# dynamic=False: dynamo's auto-dynamic promotes a SIZE to a symbol after the
+# second distinct value, exactly as it does for ints (fought off below with
+# specialize_int) -- and the Spyre lowering then silently bakes ONE concrete
+# extent into the SDSC while dynamo reuses the "dynamic" graph for every later
+# size. A d2d copy of a prefix view then writes the baked extent, not the
+# view's (#3826: overran dst and corrupted attention write-back downstream).
+# Static per-shape traces are the codebase's standing pattern -- every other
+# compile_once site already passes dynamic=False -- and cache_size_limit is
+# bumped to 1024 for precisely this one-binary-per-variant regime.
+@compile_once("spyre.copy_from_d2d", dynamic=False)
 def copy_from_d2d(
     src: torch.Tensor,
     dst: torch.Tensor,
@@ -324,7 +333,10 @@ def opaque_copy__cpu(value: torch.Tensor, acc: torch.Tensor) -> torch.Tensor:
 @torch.library.custom_op(
     "spyre::overwrite", mutates_args=("output",), device_types="spyre"
 )
-@compile_once("spyre.overwrite")
+# dynamic=False for the same reason as copy_from_d2d above (#3826): a varying
+# input size must trigger a fresh static trace, never an auto-dynamic graph
+# whose frozen extent scatters the wrong number of elements.
+@compile_once("spyre.overwrite", dynamic=False)
 def overwrite(
     input: torch.Tensor,
     output: torch.Tensor,
