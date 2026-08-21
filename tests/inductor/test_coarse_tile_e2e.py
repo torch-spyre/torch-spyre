@@ -42,6 +42,7 @@ ORIGINAL TESTS (below the boundary marker)
 """
 
 import dataclasses
+import gc
 import math
 import os
 import sys
@@ -6875,15 +6876,73 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
     def test_unsqueeze_broadcast_matmul_tile_E_correct(self):
         """[1,T,H]@[E,H,F] -> [E,T,F] tiled over E (one tile per expert).
 
-        NOTE: passes in isolation, but has been observed to fail with a
-        numerical mismatch (~29% elements wrong) when run after the full
-        test_coarse_tile_e2e.py suite -- order-dependent state leak between
-        tests, cause not yet isolated. Run this test alone if it fails
-        unexpectedly as part of a full-suite run.
+        Was observed to fail with a numerical mismatch (~29% elements wrong)
+        when run after the full test_coarse_tile_e2e.py suite, but pass in
+        isolation. That was NOT an order-dependent state leak between tests:
+        it was two bugs (fixed by issue #3613's follow-up) that both caused
+        this kernel to read uninitialized HBM. On a virgin device that HBM
+        happens to read back as zero, so the bug was masked whenever this
+        test ran first; running after other tests left nonzero data behind
+        for it to read instead. See
+        test_unsqueeze_broadcast_matmul_tile_E_poisoned_correct for a
+        regression test that reproduces this deterministically without
+        relying on test order/leftover device state.
         """
         from torch_spyre._inductor import spyre_hint
 
         E, T, H, F = 128, 64, 64, 64
+        x = torch.randn(T, H, dtype=torch.float16) * 0.01
+        w = torch.randn(E, H, F, dtype=torch.float16) * 0.01
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("F", F)
+
+        def fn(x, w):
+            _name_tensor_dims(x, ["T", "H"])
+            _name_tensor_dims(w, ["E", "H", "F"])
+            with spyre_hint(num_tiles_per_dim={"E": E}):
+                return torch.matmul(x.unsqueeze(0), w)
+
+        compare_with_cpu(
+            fn, x, w, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
+        )
+
+    def test_unsqueeze_broadcast_matmul_tile_E_poisoned_correct(self):
+        """Same pattern as test_unsqueeze_broadcast_matmul_tile_E_correct,
+        but forces the device HBM this kernel will read to hold nonzero
+        "poison" values before compiling/running it, instead of relying on
+        being scheduled after other tests (or not) to expose the same bug.
+
+        Root cause (issue #3613 follow-up): two independent bugs both let
+        this kernel read uninitialized HBM instead of the intended operand
+        data. On a freshly-initialized device (all-zero HBM) the bad reads
+        happen to come back as zero, silently producing the right answer by
+        accident and masking the bug -- which is exactly what made this test
+        pass when run first/in isolation and fail only after other tests had
+        left nonzero data in the same HBM region.
+
+        Technique: allocate device tensors filled with a large, easily
+        recognized sentinel value, `del` them and force a `gc.collect()` so
+        the allocator is free to reuse their HBM, then run this test's exact
+        logic as the first thing to compile in the process. If either bug
+        regresses, the kernel reads back stale sentinel-derived garbage
+        (scaled through the matmul) instead of zero, and the mismatch is
+        deterministic rather than dependent on what any other test happened
+        to leave behind.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        E, T, H, F = 128, 64, 64, 64
+
+        sentinel_shapes = [(E, H, F), (1, T, H), (E, H, F), (E, H, F), (E, H, F)]
+        poison_tensors = [
+            torch.full(shape, 1234.0, dtype=torch.float16, device="spyre")
+            for shape in sentinel_shapes
+        ]
+        del poison_tensors
+        gc.collect()
+
         x = torch.randn(T, H, dtype=torch.float16) * 0.01
         w = torch.randn(E, H, F, dtype=torch.float16) * 0.01
         _declare_tensor_dim("E", E)

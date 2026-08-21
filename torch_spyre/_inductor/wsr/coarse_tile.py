@@ -3086,6 +3086,30 @@ def _insert_one_read_copy(
             # find -- unlike a dim genuinely absent from *this* read among
             # several (broadcast), which tiled_dims_per_read/
             # _tiled_dims_for_dep already handle correctly.
+            #
+            # But this raw dim being squeezed out of *sizing_op's own*
+            # iteration space says nothing about whether *this specific
+            # dep* (this copy's tensor) actually has that dimension at all.
+            # sizing_op is one op reading potentially several tensors (e.g.
+            # a matmul's x and w): a genuinely broadcast operand (x, with
+            # no E dim in its own shape whatsoever, not even a squeezed-to-1
+            # one) must NOT get a squeezed_advance term for E just because
+            # E happens to be squeezed to a per-tile extent of 1 in the
+            # *matmul's* own ranges (issue #3613's E-tiling case). Since d
+            # has no d{i} symbol for ANY dep of sizing_op (it is squeezed
+            # out globally, not per-dep), dep.index's coefficients cannot
+            # answer this -- unlike the squeeze_pos branch below, which can
+            # lean on _tiled_dims_for_dep's free-symbol check. Instead,
+            # check dep's own buffer: d's full (pre-tile) extent is
+            # `running`'s value after the accumulation below; the buffer
+            # genuinely has dim d iff its total element count is divisible
+            # by host_stride with quotient equal to that full extent --
+            # numel is view-invariant (unlike full_buf.layout.stride, which
+            # a reshape/view can leave with no entry matching host_stride
+            # at all -- see the active_full_strides comment above), so this
+            # holds regardless of any reshape/view between the graph input
+            # and this read.
+            #
             # The canonical (squeezed-space) index coefficient for this raw
             # dim -- product of sizing_op.data.ranges sizes strictly to its
             # right, matching the units dep.index's surviving d{i} symbols
@@ -3101,6 +3125,17 @@ def _insert_one_read_copy(
             # against (see _insert_copy_op's write-side analogue for the
             # collision this caused when the two happened to diverge).
             host_stride = sympy.prod(sizing_op.data.ranges[d + 1 :])
+            d_full_size = sympy.Integer(1)
+            for level_idx in reversed(levels_tiling_d):
+                d_full_size = d_full_size * sizing_op_info.loop_count[level_idx]
+            total_elems = sympy.prod(full_buf.get_size())
+            dep_has_dim_d = (
+                host_stride != 0
+                and total_elems % host_stride == 0
+                and total_elems // host_stride == d_full_size
+            )
+            if not dep_has_dim_d:
+                continue
             running = sympy.Integer(1)
             for level_idx in reversed(levels_tiling_d):
                 squeezed_advance[level_idx].append((host_stride, running))
