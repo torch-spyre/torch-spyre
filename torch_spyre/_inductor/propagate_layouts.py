@@ -66,9 +66,9 @@ from .constants import (
     ELIDED_COPY_BACK_ATTR,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
-    TOPK_OPS,
 )
 from .ir import (
+    AllGatherAsyncFallback,
     AllReduceAsyncFallback,
     FixedTiledLayout,
     SpyreConstantFallback,
@@ -87,6 +87,7 @@ from .pass_utils import (
     try_device_coordinates,
     indirect_info_from_op,
     is_stick_expr_offset_free,
+    is_topk,
     iter_var_id,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
@@ -469,8 +470,12 @@ def _single_arg_op_layout(
             input_ea = stl.element_arrangement
 
             # Determine output EA based on conversion direction and input EA
-            if in_layout.dtype == torch.float16 and output.dtype == torch.float32:
-                # FP16 → FP32 conversion
+            if (
+                in_layout.dtype in (torch.float16, torch.bfloat16)
+                and output.dtype == torch.float32
+            ):
+                # FP16/BF16 → FP32 conversion. Both share SEN169_FP16 physical
+                # storage and the DL16TOFP32 hardware op.
                 if input_ea == ElementArrangement.STANDARD:
                     # Case 1: STANDARD → DL16_TO_FP32 (creates staggered layout)
                     fmt = ElementArrangement.DL16_TO_FP32
@@ -1301,7 +1306,7 @@ def compute_layouts(
     if isinstance(data, Reduction) and data.reduction_type == "exx2":
         return _exx2_layout(op, output, output_dep, args)
 
-    if isinstance(data, Reduction) and data.reduction_type in TOPK_OPS:
+    if is_topk(op):
         return _topk_layouts(op, output, output_dep, args)
 
     aten_op = next(iter(data.origins)).target if data.origins else None
@@ -1348,6 +1353,13 @@ def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
     is correct.  Offering all valid choices lets the optimizer pick whichever
     is compatible with the rest of the graph at zero cost, avoiding a needless
     restickify.
+
+    NOTE: constant-fill ops in the main propagation loop currently use
+    generic_layout instead (a single default-layout candidate) to avoid
+    exponential beam-state growth in loop-unrolled graphs.  This function is
+    still used for the accumulator fallback path (in-place update ops with no
+    real inputs) where the enumeration is bounded and correct.  It will also be
+    restored for the single-consumer constant case once that optimization lands.
     """
     output: FixedLayout = op.get_layout()
     c_size = [concretize_expr(s) for s in output.size]
@@ -1402,9 +1414,27 @@ def _target_device_layout(target, name: str):
     # candidate layouts on the TensorBox rather than a finalized committed_stl.
     graph_input = V.graph.graph_inputs.get(name)
     layouts = getattr(graph_input, "layouts", None)
+    if not layouts:
+        # Also check candidate layouts on the producing ComputedBuffer —
+        # graph intermediates are not in graph_inputs.
+        # Exclude SpyreEmptyFallback and SpyreConstantFallback: those are
+        # synthetic buffers whose layouts are derived via separate paths.
+        # Exactly one candidate is required; the assert below enforces this.
+        buf = V.graph.get_buffer(name) if name else None
+        if buf is not None and not isinstance(
+            buf, (SpyreEmptyFallback, SpyreConstantFallback)
+        ):
+            buf_layouts = getattr(buf, "layouts", None)
+            if buf_layouts:
+                layouts = buf_layouts
 
     if not layouts:
         return None
+    assert len(layouts) == 1, (
+        f"_target_device_layout: {name!r} has {len(layouts)} candidate layouts; "
+        f"multiple mutation ops writing the same target with different layouts "
+        f"is not yet supported"
+    )
     return next(iter(layouts))
 
 
@@ -1879,7 +1909,11 @@ def propagate_spyre_tensor_layouts(
                     for r in mem_reads
                 )
                 if is_constant_fill:
-                    op.layouts = _all_constant_layouts(op)
+                    # Constant-fill ops (zeros_like, full, ones_like, ...) have no real
+                    # memory layout — they can materialize in any stick orientation.
+                    # For now, using a single generic layout candidate to reduce beam
+                    # state space explosion.  Optimizations to follow.
+                    op.layouts = [generic_layout(op)]
                 else:
                     logger.warning(
                         f"{op.get_name()} has no propagatable args but reads non-constant "
@@ -1933,6 +1967,9 @@ def propagate_spyre_tensor_layouts(
             input_name = op.inputs[0].get_name()
             input_buf = V.graph.get_buffer(input_name)
             op.layouts = list(input_buf.layouts)
+            op.restick_cost_fn = AnyInNode.from_args()
+        elif isinstance(op, AllGatherAsyncFallback):
+            op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ExternKernel):
             logger.warning(f"unhandled node type {type(op)}")

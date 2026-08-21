@@ -1748,15 +1748,66 @@ _run_pytest_isolated() {
             # Create log directory
             mkdir -p "${_LOGDIR}"
 
-            # Run with split_output.sh wrapper
-            _run_cmd "${_tmo[@]+"${_tmo[@]}"}" torchrun --nproc-per-node "$_NPROC" --no-python bash "${_dir}/split_output.sh" python3 -u -m pytest "$_base" "${_args[@]}"
+            # Run with split_output.sh wrapper.
+            #
+            # torchrun's elastic agent can keep running for a while AFTER every
+            # rank's pytest worker has already exited (rendezvous / c10d store
+            # teardown), emitting no stdout during that window. The run-test
+            # harness stall-watcher only sees "no new output" and, on a suite
+            # that has actually finished (e.g. "13 passed"), kills the whole
+            # process group at STALL_TIMEOUT_SECS and reports a spurious
+            # exit 147 for a run that passed. Bound the agent so a lingering
+            # teardown is reaped in seconds instead of stalling for minutes.
+            #
+            # The optional _tmo prefix is the signal-retry path's own tighter
+            # bound (empty on a normal run); the two nest and the inner one
+            # here bounds teardown for every distributed run.
+            #
+            # The limit only guards the POST-completion teardown: it is set far
+            # above any real distributed test runtime, and the harness
+            # stall-watcher still guards genuine mid-test hangs, so this never
+            # truncates a test that is doing work. timeout returns the child's
+            # own exit code when the child exits first, so a passing run stays
+            # passing; a real timeout surfaces as 124 (and --kill-after forces
+            # SIGKILL if the agent ignores SIGTERM).
+            _DIST_RUN_TIMEOUT="${TORCH_SPYRE_DIST_RUN_TIMEOUT:-30m}"
+            _DIST_KILL_AFTER="${TORCH_SPYRE_DIST_KILL_AFTER:-30s}"
+            _run_cmd "${_tmo[@]+"${_tmo[@]}"}" timeout --kill-after="${_DIST_KILL_AFTER}" "${_DIST_RUN_TIMEOUT}" \
+                torchrun --nproc-per-node "$_NPROC" --no-python bash "${_dir}/split_output.sh" python3 -u -m pytest "$_base" "${_args[@]}"
+
+            # split_output.sh tees only rank 0 to stdout, so on failure the
+            # non-zero ranks' output is the only record of the root cause --
+            # torchrun reports their exit code but not why (e.g. a card that
+            # failed to open). Emit them before the directory is removed.
+            if [[ "$(cat "$_exit_tmp" 2>/dev/null || echo 1)" != "0" ]]; then
+                for _rank_log in "${_LOGDIR}"/output-at-rank-*.txt; do
+                    [[ -f "$_rank_log" ]] || continue
+                    [[ "$_rank_log" == *output-at-rank-0.txt ]] && continue
+                    echo "===== BEGIN $(basename "$_rank_log") ====="
+                    cat "$_rank_log"
+                    echo "===== END $(basename "$_rank_log") ====="
+                done
+            fi
 
             # Clean up log directory
             rm -rf "${_LOGDIR}"
         else
             echo "[torch_oot_device_tests_run] Running serial test"
-            # Regular pytest for non-distributed tests
-            _run_cmd "${_tmo[@]+"${_tmo[@]}"}" python3 -m pytest "$_base" "${_args[@]}"
+            # Regular pytest for non-distributed tests.
+            #
+            # Wall-clock cap. The harness stall-watcher only fires after N seconds
+            # of NO output, so a suite wedged while still emitting -- or stuck
+            # before pytest prints anything -- runs to GitHub's 6h job timeout and
+            # blocks the merge queue on an otherwise-green run. Set far above any
+            # real suite runtime, so a healthy run is never truncated; timeout
+            # passes the child's own exit code through when it exits first.
+            _SERIAL_RUN_TIMEOUT="${TORCH_SPYRE_SERIAL_RUN_TIMEOUT:-60m}"
+            _SERIAL_KILL_AFTER="${TORCH_SPYRE_SERIAL_KILL_AFTER:-30s}"
+            _serial_tmo=()
+            if [[ -n "$_SERIAL_RUN_TIMEOUT" ]] && command -v timeout >/dev/null 2>&1; then
+                _serial_tmo=(timeout --kill-after="$_SERIAL_KILL_AFTER" "$_SERIAL_RUN_TIMEOUT")
+            fi
+            _run_cmd "${_tmo[@]+"${_tmo[@]}"}" "${_serial_tmo[@]+"${_serial_tmo[@]}"}" python3 -m pytest "$_base" "${_args[@]}"
         fi
     ) || true
 }

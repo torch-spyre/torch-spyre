@@ -130,7 +130,7 @@ def capture_op_specs():
     """
     captured: list[list] = []
 
-    def _spy(self, kernel_name, specs):  # noqa: ARG001
+    def _spy(self, kernel_name, specs, pool_size=0):  # noqa: ARG001
         captured.append(list(specs))
         return _NoopRunner()
 
@@ -146,7 +146,7 @@ def capture_sdsc_calls():
     """
     calls: list[tuple[str, list]] = []
 
-    def _spy(self, kernel_name, specs):  # noqa: ARG001
+    def _spy(self, kernel_name, specs, pool_size=0):  # noqa: ARG001
         calls.append((kernel_name, list(specs)))
         return _NoopRunner()
 
@@ -314,7 +314,10 @@ def generate_sdsc_jsons(kernel, *dev_args) -> dict:
     for ci, specs in enumerate(captured):
         sub = os.path.join(out, f"kernel{ci}")
         os.makedirs(sub, exist_ok=True)
-        generate_bundle(f"kernel{ci}", sub, specs)
+        # This exercises SDSC JSON generation, not hardware pool sizing, so a
+        # placeholder non-zero size satisfies generate_bundle's pool_size
+        # validation whenever a pool symbol happens to be present.
+        generate_bundle(f"kernel{ci}", sub, specs, pool_size=1024)
         for path in sorted(glob.glob(os.path.join(sub, "sdsc_*.json"))):
             with open(path) as f:
                 jsons[os.path.relpath(path, out)] = json.load(f)
@@ -500,7 +503,10 @@ def bundle_jsons_from_captured(captured) -> dict:
         sub = os.path.join(out, f"kernel{ci}")
         os.makedirs(sub, exist_ok=True)
         try:
-            generate_bundle(f"kernel{ci}", sub, specs)
+            # This call only inspects SDSC JSON structure, not hardware pool
+            # sizing, so a placeholder non-zero size satisfies generate_bundle's
+            # pool_size validation whenever a pool symbol happens to be present.
+            generate_bundle(f"kernel{ci}", sub, specs, pool_size=1024)
         except Exception:  # noqa: BLE001 - absence of jsons is itself an outcome
             continue
         for path in sorted(glob.glob(os.path.join(sub, "sdsc_*.json"))):
@@ -706,7 +712,14 @@ class IndirectAccessTestCase(InductorTestCase):
 
     # -- one driver: validate every stage, then run on the real backend ---
     def _stage_and_e2e(
-        self, kernel, *dev_args, expect, op=None, detected=None, expect_close=None
+        self,
+        kernel,
+        *dev_args,
+        expect,
+        op=None,
+        detected=None,
+        expect_close=None,
+        sdsc=True,
     ):
         """Validate every capture-path stage with check(), then run end-to-end.
 
@@ -716,9 +729,18 @@ class IndirectAccessTestCase(InductorTestCase):
         support lands. Pass expect_close=True for ops whose result must match
         the CPU reference (e.g. a supported direct op) once e2e is enabled.
 
+        `sdsc=False` skips assert_indirect_sdsc_fields (still classifies the
+        op spec + runs e2e). Needed for a bundle that is simultaneously a gather
+        AND a scatter -- e.g. index_add's gather+add+overwrite-scatter
+        decomposition -- where the scatter-only invariant "every indirect value
+        tensor is the output" does not hold (the gather's value tensor is an
+        input).
+
         Returns check()'s ScenarioResult for any further per-test assertions.
         """
-        r = self.check(kernel, *dev_args, expect=expect, op=op, detected=detected)
+        r = self.check(
+            kernel, *dev_args, expect=expect, op=op, detected=detected, sdsc=sdsc
+        )
         run_e2e(self, kernel, *dev_args, expect_close=expect_close)
         return r
 

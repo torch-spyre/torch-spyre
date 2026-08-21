@@ -3,6 +3,11 @@
 This page explains how to run full PyTorch models on the Spyre device
 using `torch.compile` and the Torch-Spyre backend.
 
+To run a stock HuggingFace Transformers checkpoint without writing your own
+model code, see [Running HuggingFace models on Spyre](running_hf_models.md),
+which covers the [hf-adapters](https://github.com/torch-spyre/hf-adapters)
+project.
+
 ## Using `torch.compile`
 
 Torch-Spyre registers itself as an Inductor backend for the `spyre`

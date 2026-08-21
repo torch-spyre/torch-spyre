@@ -48,6 +48,7 @@ DEFAULT_LOG_LEVELS = {
     "spyre.inductor.stickify": LogLevel.WARNING,
     "spyre.inductor.codegen": LogLevel.WARNING,
     "spyre.inductor.passes": LogLevel.WARNING,
+    "spyre.inductor.sdsc": LogLevel.WARNING,
     "spyre.runtime": LogLevel.WARNING,
     "spyre.execution": LogLevel.WARNING,
     "spyre.device": LogLevel.WARNING,

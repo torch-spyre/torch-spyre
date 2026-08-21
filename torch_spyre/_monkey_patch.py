@@ -280,6 +280,71 @@ def _patch_tensor_for_spyre():
             guard.user_stack,
         )
 
+    # ── invoke_subgraph reuse support ────────────────────────────────────
+    # Because we replace GuardBuilder.TENSOR_MATCH, guards it builds report
+    # their type (via Guard.create_fn_name(), i.e. create_fn.__name__) as
+    # "_spyre_TENSOR_MATCH" rather than "TENSOR_MATCH". torch's
+    # invoke_subgraph subgraph-reuse path (torch._dynamo.variables.
+    # invoke_subgraph) looks each guard's type up in GUARD_VALUE_DISPATCH to
+    # re-evaluate it mid-trace; an unknown type there is a hard error
+    # ("subgraph_reuse: unsupported guard type ..."). So any use of
+    # torch.compiler.nested_compile_region would abort once this patch is
+    # installed.
+    #
+    # Register a spec under our name that mirrors stock TENSOR_MATCH's
+    # metadata check AND additionally compares SpyreTensorLayout, matching
+    # what the runtime lambda guard above actually enforces — so a subgraph
+    # is only reused when both the standard tensor metadata and the device
+    # layout still match. Guarded behind availability so older torch without
+    # the reuse machinery is unaffected.
+    try:
+        from torch._dynamo.guards import (
+            GUARD_VALUE_DISPATCH,
+            GuardCheckSpec,
+            extract_tensor_metadata,
+        )
+    except ImportError:
+        # torch predates invoke_subgraph reuse — nothing to register.
+        pass
+    else:
+
+        def _spyre_tensor_reuse_metadata(guard, value):
+            # Standard tensor metadata (shape/stride/dtype/device/
+            # requires_grad), plus the device layout for Spyre tensors
+            # (None otherwise). Mirrors extract_tensor_metadata so the
+            # comparison is identical to stock TENSOR_MATCH on the metadata
+            # axis.
+            layout = None
+            if getattr(value, "device", None) is not None and (
+                value.device.type == DEVICE_NAME
+            ):
+                layout = value.device_tensor_layout()
+            return (extract_tensor_metadata(value), layout)
+
+        def _spyre_tensor_reuse_eval(value, metadata):
+            base_metadata, expected_layout = metadata
+            if not isinstance(value, torch.Tensor):
+                return False
+            if extract_tensor_metadata(value) != base_metadata:
+                return False
+            # Layout only constrains Spyre tensors; mirror the runtime
+            # lambda guard: non-Spyre value OR layout matches.
+            if value.device.type != DEVICE_NAME:
+                return expected_layout is None
+            return value.device_tensor_layout() == expected_layout
+
+        _spyre_reuse_spec = GuardCheckSpec(
+            get_metadata_fn=_spyre_tensor_reuse_metadata,
+            eval_fn=_spyre_tensor_reuse_eval,
+        )
+        # Attach for the auto-dispatch scan, and register directly under the
+        # name Guard.create_fn_name() produces for guards this builder makes.
+        # GUARD_VALUE_DISPATCH is built once (at torch import, before this
+        # patch runs), so a direct insert is required — the scan does not
+        # re-run.
+        _spyre_TENSOR_MATCH.guard_check_spec = _spyre_reuse_spec
+        GUARD_VALUE_DISPATCH["_spyre_TENSOR_MATCH"] = _spyre_reuse_spec
+
     GuardBuilder.TENSOR_MATCH = _spyre_TENSOR_MATCH
     # ───────────────────FxGraph Cache Key Extension ───────────────────
     # Extends FxGraphHashDetails to include SpyreTensorLayout in the cache key

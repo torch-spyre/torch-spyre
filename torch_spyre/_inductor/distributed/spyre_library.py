@@ -37,3 +37,12 @@ if torch._C._dispatch_has_kernel("spyre::broadcast_async"):
     def _(x: torch.Tensor) -> torch.Tensor:
         """Fake implementation — pass through the tensor."""
         return x
+
+    @torch.library.register_fake("spyre::all_gather_async")
+    def _(
+        x: torch.Tensor, group_size: int = 1, group_name: str = "default"
+    ) -> torch.Tensor:
+        """Fake implementation for shape inference during compilation."""
+        output_size = list(x.shape)
+        output_size[0] *= group_size
+        return torch.empty(output_size, dtype=x.dtype, device=x.device)

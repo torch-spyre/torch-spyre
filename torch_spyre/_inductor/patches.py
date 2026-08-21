@@ -17,11 +17,10 @@ from functools import wraps
 
 import torch
 from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
-
-import torch_spyre._inductor.config as spyre_config
 
 
 @contextmanager
@@ -76,6 +75,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
         CustomPostFusionPasses,
         CustomPreSchedulingPasses,
     )
+    from torch_spyre._inductor.propagate_hints import recover_spyre_hints
 
     # *) Inductor config tweaks (saved/restored)
     new_config = {
@@ -106,8 +106,6 @@ def enable_spyre_context(example_inputs: list[InputType]):
     # disable mul_softmax_pattern and div_softmax_pattern for now
     joint_graph.pass_patterns.pop()
 
-    # Inject the pre_scheduling_passes before the Scheduler is constructed,
-    # allowing the passes to modify the graph IR (buffers, inputs, constants).
     old_update_scheduler = GraphLowering._update_scheduler
 
     _pre_scheduling_pass = CustomPreSchedulingPasses()
@@ -116,6 +114,15 @@ def enable_spyre_context(example_inputs: list[InputType]):
         # Nested compiler contexts may wrap this hook more than once. The
         # graph-mutating pre-scheduling pipeline runs once per GraphLowering.
         if not getattr(self, "_spyre_pre_scheduling_complete", False):
+            # recover_spyre_hints runs here (after all post-grad FX passes including
+            # decompose_auto_functionalized) rather than in CustomPostPasses.
+            # decompose_auto_functionalized replaces auto_functionalized_v2 nodes
+            # via make_fx retracing, which creates new FX nodes whose meta["custom"]
+            # only contains hints from the innermost scope. Running recovery here
+            # ensures the final FX graph (post-decomposition) gets the full hint set.
+            gm = self.graph.owning_module
+            if gm is not None and "__spyre_dim_hints" in gm.meta:
+                recover_spyre_hints(self.graph)
             _pre_scheduling_pass(self)
             setattr(self, "_spyre_pre_scheduling_complete", True)
         old_update_scheduler(self)
@@ -139,22 +146,17 @@ def enable_spyre_context(example_inputs: list[InputType]):
     def _spyre_scheduler_node_has_side_effects(self: SchedulerNode) -> bool:
         if getattr(self.node, "_coarse_tile_force_live", False):
             return True
+        # ComputedBuffers with MutationLayoutSHOULDREMOVE write into a
+        # pre-existing buffer (e.g. copy_forced dst). The scheduler's own DCE
+        # doesn't know about this layout convention and marks them dead when
+        # no downstream op reads the output name. Keep them live.
+        if isinstance(self.node, ComputedBuffer) and isinstance(
+            self.node.layout, MutationLayoutSHOULDREMOVE
+        ):
+            return True
         return old_scheduler_node_has_side_effects(self)
 
     SchedulerNode.has_side_effects = _spyre_scheduler_node_has_side_effects  # type: ignore[method-assign]
-
-    # Prevent remove_noop_ops from eliminating aten.copy.default nodes.
-    # That pass treats copy.default as an alias no-op and replaces copy(dst, src)
-    # with src, discarding the copy before it reaches lowering.
-    # Guarded by DISABLE_COPY_OPT so models that don't need preserved copies
-    # (e.g. granite) are not affected.
-    from torch._inductor.fx_passes.post_grad import noop_registry
-
-    _saved_copy_noop = (
-        noop_registry.pop(torch.ops.aten.copy.default, None)
-        if spyre_config.disable_copy_opt
-        else None
-    )
 
     with (
         spyre_data_types(),
@@ -170,8 +172,6 @@ def enable_spyre_context(example_inputs: list[InputType]):
             Loops.has_large_inner_fn = old_loop
             GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]
             SchedulerNode.has_side_effects = old_scheduler_node_has_side_effects  # type: ignore[method-assign]
-            if _saved_copy_noop is not None:
-                noop_registry[torch.ops.aten.copy.default] = _saved_copy_noop
 
 
 OBSERVER_HOOKS_KEY = "__spyre_hooks_meta"
