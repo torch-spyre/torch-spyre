@@ -161,6 +161,9 @@ layout_solver: Literal[
     "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
 ] = os.environ.get("LAYOUT_SOLVER", "greedy")  # type: ignore[assignment]
 
+# OpSpec validation at pipeline stage boundaries. Enabled by default to catch
+# invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.
+validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
 # Use the C++ (native) permutation-layout packer accelerator, which the
 # simulated-annealing layout solver drives. The native and Python packers are
 # behaviourally identical (verified bit-for-bit); the native one is faster. Set

@@ -524,6 +524,29 @@ PYBIND11_MODULE(_C, m) {
                " pinned_buffers=" + std::to_string(plan.pinned_buffers.size()) +
                ">";
       });
+  // Symbolic argument payload types
+  py::enum_<spyre::SymbolicArgKind>(m, "SymbolicArgKind")
+      .value("kAddress", spyre::SymbolicArgKind::kAddress)
+      .value("kDimension", spyre::SymbolicArgKind::kDimension);
+
+  py::class_<spyre::SymbolicArg>(m, "SymbolicArg")
+      .def(py::init([](spyre::SymbolicArgKind kind, int64_t tensor_id,
+                       int64_t dim_index, int64_t value) {
+             return spyre::SymbolicArg{kind, tensor_id, dim_index, value};
+           }),
+           py::arg("kind"), py::arg("tensor_id"),
+           py::arg("dim_index") = int64_t{-1}, py::arg("value") = int64_t{-1})
+      .def_readwrite("kind", &spyre::SymbolicArg::kind)
+      .def_readwrite("value", &spyre::SymbolicArg::value)
+      .def_readwrite("tensor_id", &spyre::SymbolicArg::tensor_id)
+      .def_readwrite("dim_index", &spyre::SymbolicArg::dim_index)
+      .def("__repr__", [](const spyre::SymbolicArg& a) {
+        return "<SymbolicArg kind=" +
+               std::to_string(static_cast<int32_t>(a.kind)) +
+               " tensor_id=" + std::to_string(a.tensor_id) +
+               " dim_index=" + std::to_string(a.dim_index) + ">";
+      });
+
   m.def("prepare_kernel", &spyre::prepareKernel, py::arg("spyrecode_dir"),
         py::arg("stream") = nullptr, py::arg("profiler_name") = std::nullopt,
         "Prepare a kernel from a SpyreCode directory and return a JobPlan.\n\n"
@@ -537,15 +560,35 @@ PYBIND11_MODULE(_C, m) {
         "Returns:\n"
         "    Prepared JobPlan ready for execution");
   // Bind the current-stream overload (resolves the current stream internally).
-  m.def("launch_jobplan",
-        static_cast<void (*)(const spyre::JobPlan&,
-                             const std::vector<at::Tensor>&)>(
-            &spyre::launchJobPlan),
-        py::arg("job_plan"), py::arg("args"),
-        "Launch a prepared JobPlan with the given tensor arguments.\n\n"
-        "Args:\n"
-        "    job_plan: The JobPlan to execute\n"
-        "    args: Sequence of input/output tensors");
+  // Without symbolic_args (back-compat, empty payload → legacy address loop).
+  m.def(
+      "launch_jobplan",
+      static_cast<void (*)(  // NOLINT(whitespace/parens)
+          const spyre::JobPlan&, const std::vector<at::Tensor>&,
+          std::vector<spyre::SymbolicArg>)>(&spyre::launchJobPlan),
+      py::arg("job_plan"), py::arg("args"),
+      py::arg("symbolic_args") = std::vector<spyre::SymbolicArg>{},
+      "Launch a prepared JobPlan with the given tensor arguments.\n\n"
+      "Args:\n"
+      "    job_plan: The JobPlan to execute\n"
+      "    args: Sequence of input/output tensors\n"
+      "    symbolic_args: Optional typed per-symbol payload. When non-empty,\n"
+      "        JobPlanStepHostCompute resolves each correction slot by kind\n"
+      "        rather than blindly iterating tensors. Empty (default)\n"
+      "        preserves today's legacy behavior.");
+
+  // Test-only seam: exposes JobPlanStepHostCompute::resolveSymbolicArgs so
+  // that Python tests can assert on the ordered int64 vector that would be
+  // handed to deeptools, without needing a live HCM or device execution.
+  // The "_" prefix signals this is not part of the stable public API.
+  m.def("_resolve_symbolic_args",
+        &spyre::JobPlanStepHostCompute::resolveSymbolicArgs, py::arg("tensors"),
+        py::arg("symbolic_args"),
+        "Test-only: resolve a symbolic_args payload to a list of int64 DMVA "
+        "addresses.\n\n"
+        "Calls JobPlanStepHostCompute::resolveSymbolicArgs — the same function "
+        "used by the typed-payload resolution path at launch time — so the "
+        "result is identical to what would be passed to deeptools.");
 
   // Allocator statistics functions
   m.def(

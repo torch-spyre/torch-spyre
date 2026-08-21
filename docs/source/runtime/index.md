@@ -183,7 +183,7 @@ Streams are implemented in `torch_spyre/streams.py` (Python) and
 
 ### Stream Pool
 
-Each device keeps a fixed pool of streams (see `csrc/spyre_stream.cpp`). Stream `0` is the default. Streams `1` through `32` form the low-priority pool (`priority == 0`); streams `33` through `64` form the high-priority pool (any non-zero priority). Each pool holds 32 streams per device and allocates round-robin.
+Each device keeps a fixed pool of streams (see `csrc/spyre_stream.cpp`). Stream `0` is the default. Streams `1` through `32` form the low-priority pool (`priority == 0`); streams `33` through `64` form the high-priority pool (any non-zero priority). Each pool holds 32 streams per device and allocates round-robin. Stream IDs `65` and above are reserved for the host-compute pool that program correction runs on; its size is set by `TORCH_SPYRE_NUM_HOST_COMPUTE_STREAMS` (default 4, maximum 8).
 
 On input, `priority` is a binary switch: `0` selects the low-priority pool and any non-zero value selects the high-priority pool. The `Stream.priority` getter does not echo the constructor value back. It reports `0` for low-priority streams and `-1` for high-priority streams, matching `torch.cuda.Stream.priority`. The asymmetry is implemented in `csrc/spyre_stream.cpp` `SpyreStream::priority`.
 

@@ -637,6 +637,12 @@ Environment Variables
        (see ``torch_spyre.logging_config``)
    * - ``TORCH_SPYRE_DOWNCAST_WARN=0``
      - Suppress int64 → int32 downcast warnings
+   * - ``TORCH_SPYRE_FFDC=1``
+     - Enable first-failure data capture at write time. Retrieve the report
+       with :func:`torch.spyre.get_diagnostic_report`
+   * - ``TORCH_SPYRE_NUM_HOST_COMPUTE_STREAMS``
+     - Size of the host-compute stream pool used by program correction
+       (default ``4``, maximum ``8``)
    * - ``SPYRE_INDUCTOR_LOG=1``
      - *Deprecated*. Use ``TORCH_LOGS='torch_spyre.inductor'``. Enables Spyre
        Inductor logging (INFO level)
@@ -692,6 +698,10 @@ Environment Variables
    * - ``SPYRE_LOG_PASSES``
      - Comma-separated list of pass names after which to log the
        op-spec IR at pipeline stage boundaries (default empty)
+   * - ``SPYRE_DUMP_COST``
+     - Print the predicted-runtime report after pre-scheduling: one total
+       plus a per-kernel breakdown (default ``0``).
+       See :doc:`/compiler/cost_model`
    * - ``TORCH_SPYRE_NATIVE_PACKER``
      - Use the C++ permutation-layout packer accelerator in the
        simulated-annealing layout solver (default ``1``; set ``0`` to force

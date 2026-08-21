@@ -648,7 +648,7 @@ def _plan_tiling_propagation(
                             operations,
                             name_to_group_outer_key,
                         )
-                    except Exception:
+                    except (AttributeError, TypeError):
                         target_is_graph_input = False
                         target_is_output = False
                         mut_target = None
@@ -3880,8 +3880,7 @@ def _patch_consumers(
     if not consumers or old_name == new_name:
         return
 
-    from ..insert_restickify import NameSwapHandler
-    from ..pass_utils import replace_computed_buffer_body
+    from ..pass_utils import NameSwapHandler, replace_computed_buffer_body
 
     name_map = {old_name: new_name}
     has_retile = (

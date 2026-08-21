@@ -24,11 +24,13 @@ from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec
 from torch_spyre._inductor.constants import MAX_POOL_SIZE_BYTES
-from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, format_op_spec_list
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, format_op_spec_list
+from torch_spyre._inductor.op_spec_validation import validate_op_specs
 
 
 logger = get_inductor_logger("sdsc_compile")
+sdsc_log = get_inductor_logger("sdsc")
 
 # ---------------------------------------------------------------------------
 # Types
@@ -96,6 +98,8 @@ def generate_bundle(
 
     specs_list: list = list(specs)
 
+    if _spyre_config.validate_op_specs:
+        validate_op_specs(specs_list, stage="before_bundle_generation")
     if logger.isEnabledFor(logging.INFO):
         logger.info(
             "OP SPECS FOR BUNDLE GENERATION\n%s",
@@ -418,6 +422,11 @@ def generate_bundle(
         f.write("\t}\n")
         f.write("}\n")
 
+    if sdsc_log.isEnabledFor(logging.INFO):
+        bundle_path = os.path.join(output_dir, "bundle.mlir")
+        with open(bundle_path, "r") as bf:
+            sdsc_log.info("BUNDLE MLIR [bundle.mlir]\n%s", bf.read())
+
 
 # ---------------------------------------------------------------------------
 # Pass 1 helpers
@@ -462,6 +471,12 @@ def _compile_specs(
             with open(os.path.join(output_dir, file_name), "w") as f:
                 logger.info(f"Generating {f.name}")
                 json.dump(sdsc_json, f, indent=2)
+            if sdsc_log.isEnabledFor(logging.INFO):
+                sdsc_log.info(
+                    "SDSC JSON [%s]\n%s",
+                    file_name,
+                    json.dumps(sdsc_json, indent=2),
+                )
         # UnimplementedOp and other types are silently skipped.
 
 
