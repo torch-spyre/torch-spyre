@@ -257,6 +257,13 @@ DIRECT_OP_SPEC = "op_spec_no_indirect"  # Generated OpSpec without indirect acce
 UNIMPLEMENTED = "unimplemented_op"  # Hit an UnimplementedOp
 NO_SPYRE_OP = "no_spyre_op_spec"  # Fell back to CPU
 
+# Core counts to sweep in the multicore variants of the indirect-access suites.
+# 1 keeps the original single-core coverage; the rest exercise the work-division
+# planner (index-dim splitting, shared-table / scatter-row never-split
+# constraints) at every supported SENCORES value. 6 is included as a
+# non-power-of-two count so uneven core-vs-stick divisions are covered too.
+MULTICORE_SENCORES = (1, 2, 4, 6, 8, 16, 32)
+
 
 def _label_for(exc, op_specs, entries) -> str:
     """Map a compilation outcome to one of the classification constants."""
@@ -586,6 +593,84 @@ class IndirectAccessTestCase(InductorTestCase):
         # Recompile from scratch so our sdsc spy always sees the op specs.
         torch._dynamo.reset()
 
+    # -- Work-division split-map assertion -------------------------------
+    # An int32 index packs 32 elements per 128-byte stick, so an index/entry dim
+    # of size `S` exposes `S // 32` sticks — the ceiling on how many cores
+    # can split it.
+    INDEX_ELEMS_PER_STICK = 32
+
+    def assert_indexed_dim_split(self, code, index_size, data_size):
+        """Assert the work-division split map at the current SENCORES.
+
+        For a gather `out = x[i]` or overwrite-scatter `dest[i] = src`, the
+        planner MUST split the index/entry dim (c0) and MUST NOT split the
+        value-table / destination data dim (c1). The entry dim is the index
+        tensor's stick dim, so it splits in whole 32-entry sticks: the split is
+        the planner's ``core_split`` -- the largest divisor of the stick count
+        ``ceil(index_size / 32)`` that does not exceed SENCORES (so it always
+        divides evenly, and a non-power-of-two core count like 6 rounds down to
+        the nearest divisor, e.g. 8 sticks over 6 cores -> 4). The ceiling
+        handles a NON-stick-aligned count, whose partial last stick is padded up
+        to a whole stick (enforce_indirect_access_layout) so the dim still
+        splits, e.g. 40 -> 2 sticks. c1 always stays 1. Skips at sencores=1.
+
+        For power-of-two stick counts and core counts (the historical sweep)
+        ``core_split`` equals ``min(sencores, sticks)`` -- this generalises it to
+        the odd stick counts (6, 7, ...) and odd core counts the padded / 6-core
+        variants introduce.
+        """
+        from torch_spyre._inductor import config
+        from torch_spyre._inductor.work_division import core_split
+
+        n = config.sencores
+        if n == 1:
+            self.skipTest("no work division at sencores=1")
+        sticks = -(-index_size // self.INDEX_ELEMS_PER_STICK)  # ceil division
+        expected = core_split(sticks, n)
+        self.assertIn(
+            f"sympify('c0'): (sympify('{index_size}'), {expected})",
+            code,
+            f"index/entry dim {index_size} must split by {expected} at {n} cores "
+            f"(largest divisor of {sticks} sticks not exceeding {n})",
+        )
+        self.assertIn(
+            f"sympify('c1'): (sympify('{data_size}'), 1)",
+            code,
+            f"data dim {data_size} must stay unsplit (split=1) at {n} cores; "
+            "splitting a shared table/destination dim silently corrupts results",
+        )
+
+    def assert_entry_dim_unsplit(self, code, index_size):
+        """Assert the index/entry dim is NOT core-split at the current SENCORES.
+
+        The correct outcome when a stick-aligned split is forbidden and cannot be
+        made safe by padding -- e.g. a partial-last-stick SCATTER, whose in-place
+        destination cannot be grown to a whole stick the way a gather output can
+        (enforce_indirect_access_layout). If the dim were splittable it would
+        split by ``core_split(ceil(index_size/32), sencores)``; assert that split
+        is absent, so the guard kept the op on a single core rather than letting
+        an even slice straddle the index stick boundary. Skips at sencores=1, and
+        is a no-op when the count could not split anyway (would-be split of 1).
+        """
+        from torch_spyre._inductor import config
+        from torch_spyre._inductor.work_division import core_split
+
+        n = config.sencores
+        if n == 1:
+            self.skipTest("no work division at sencores=1")
+        sticks = -(-index_size // self.INDEX_ELEMS_PER_STICK)  # ceil division
+        would_be = core_split(sticks, n)
+        if would_be <= 1:
+            return  # nothing could split even if allowed; nothing to assert
+        self.assertNotIn(
+            f"sympify('c0'): (sympify('{index_size}'), {would_be})",
+            code,
+            f"partial-stick entry dim {index_size} must NOT be core-split "
+            f"(would be {would_be} at {n} cores if allowed); its in-place scatter "
+            "destination can't be padded to a whole stick, so the guard must keep "
+            "it single-core rather than straddle the index stick boundary",
+        )
+
     # -- Dimension naming helpers ----------------------------------------
     def name_dims(self, tensor, dims: dict):
         """Declare and attach named dimensions to a tensor.
@@ -712,7 +797,14 @@ class IndirectAccessTestCase(InductorTestCase):
 
     # -- one driver: validate every stage, then run on the real backend ---
     def _stage_and_e2e(
-        self, kernel, *dev_args, expect, op=None, detected=None, expect_close=None
+        self,
+        kernel,
+        *dev_args,
+        expect,
+        op=None,
+        detected=None,
+        expect_close=None,
+        sdsc=True,
     ):
         """Validate every capture-path stage with check(), then run end-to-end.
 
@@ -722,9 +814,18 @@ class IndirectAccessTestCase(InductorTestCase):
         support lands. Pass expect_close=True for ops whose result must match
         the CPU reference (e.g. a supported direct op) once e2e is enabled.
 
+        `sdsc=False` skips assert_indirect_sdsc_fields (still classifies the
+        op spec + runs e2e). Needed for a bundle that is simultaneously a gather
+        AND a scatter -- e.g. index_add's gather+add+overwrite-scatter
+        decomposition -- where the scatter-only invariant "every indirect value
+        tensor is the output" does not hold (the gather's value tensor is an
+        input).
+
         Returns check()'s ScenarioResult for any further per-test assertions.
         """
-        r = self.check(kernel, *dev_args, expect=expect, op=op, detected=detected)
+        r = self.check(
+            kernel, *dev_args, expect=expect, op=op, detected=detected, sdsc=sdsc
+        )
         run_e2e(self, kernel, *dev_args, expect_close=expect_close)
         return r
 
@@ -926,3 +1027,37 @@ class IndirectAccessTestCase(InductorTestCase):
 
         self.assertTrue(saw_index, "no index_tensor nodes anywhere in the SDSC bundle")
         self.assertTrue(saw_value, "no value_tensor nodes anywhere in the SDSC bundle")
+
+
+def register_multicore_variants(
+    scenario_mixin,
+    base_name: str,
+    module_globals: dict,
+    counts=MULTICORE_SENCORES,
+):
+    """Register one concrete TestCase per core count from a scenario mixin.
+
+    `scenario_mixin` is a plain class (NOT a TestCase, so neither pytest nor
+    unittest collects it directly) that holds the `test_*` methods and their
+    helpers. For each `n` in `counts` this builds
+    `{base_name}_cores{n}` = `@config.patch({"sencores": n})` applied to a
+    class combining the mixin with `IndirectAccessTestCase`, so the whole
+    scenario set runs at every SENCORES value. The classes are inserted into
+    `module_globals` (pass the caller's `globals()`) for test discovery.
+
+    Returns the list of generated class names.
+    """
+    from torch_spyre._inductor import config
+
+    module_name = module_globals.get("__name__", scenario_mixin.__module__)
+    names: list[str] = []
+    for n in counts:
+        name = f"{base_name}_cores{n}"
+        cls = config.patch({"sencores": n})(
+            type(name, (scenario_mixin, IndirectAccessTestCase), {})
+        )
+        cls.__module__ = module_name
+        cls.__qualname__ = name
+        module_globals[name] = cls
+        names.append(name)
+    return names

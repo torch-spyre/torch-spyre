@@ -476,11 +476,18 @@ jobs:
           ${{ toJSON(matrix.suite) }}
           JSONEOF
 
+      # The name carries github.run_attempt: the artifacts REST API is
+      # run-scoped, not attempt-scoped (there is no /attempts/N/artifacts
+      # endpoint and no attempt field on the artifact object), and a re-run
+      # keeps the earlier attempt's descriptors until they expire. Without the
+      # attempt in the name, collect_failed_suites on a later attempt reads a
+      # stale descriptor from a prior attempt and retries a suite that already
+      # passed. See retention-days:1 below -- it does not help within 24h.
       - name: Upload failed-suite descriptor
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: failed-suite-${{ strategy.job-index }}
+          name: failed-suite-${{ github.run_attempt }}-${{ strategy.job-index }}
           path: ${{ runner.temp }}/failed_suite/suite.json
           if-no-files-found: error
           retention-days: 1
@@ -794,11 +801,12 @@ jobs:
           ${{ toJSON(matrix.suite) }}
           JSONEOF
 
+      # github.run_attempt in the name: see the single-card upload above.
       - name: Upload failed-suite descriptor
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: failed-suite-multi-${{ strategy.job-index }}
+          name: failed-suite-multi-${{ github.run_attempt }}-${{ strategy.job-index }}
           path: ${{ runner.temp }}/failed_suite/suite.json
           if-no-files-found: error
           retention-days: 1
@@ -832,9 +840,18 @@ jobs:
           # --slurp combined with --jq), so emit a per-object JSON stream, not
           # a wrapped array, and let python3 slurp the stream into one array.
           # Same idiom as push-to-clickhouse.yaml.
+          #
+          # startswith("failed-suite-<attempt>-"): the artifacts endpoint is
+          # run-scoped, not attempt-scoped, and returns descriptors from every
+          # attempt of this run (a re-run keeps the prior attempt's artifacts
+          # until they expire). Selecting only the current attempt's descriptors
+          # stops a re-run from retrying a suite that failed on an earlier
+          # attempt but passed on this one. The upload steps stamp
+          # github.run_attempt into the name for exactly this filter.
+          ATTEMPT="${{ github.run_attempt }}"
           ARTIFACTS=$(gh api --paginate \
             "/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?per_page=100" \
-            --jq '.artifacts[] | select(.name | startswith("failed-suite-")) | {id: .id, name: .name}' \
+            --jq ".artifacts[] | select(.name | startswith(\"failed-suite-${ATTEMPT}-\") or startswith(\"failed-suite-multi-${ATTEMPT}-\")) | {id: .id, name: .name}" \
             | python3 -c "import json,sys; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()]))")
 
           ARTIFACTS="$ARTIFACTS" python3 <<'PYEOF'
@@ -865,9 +882,14 @@ jobs:
                       suites.append(json.load(f))
               return suites
 
-          # "failed-suite-multi-N" (multi) vs "failed-suite-N" (single) -- the digit class keeps the single-card glob from also matching multi-card descriptors.
-          multi = load("failed_suites/failed-suite-multi-*/suite.json")
-          single = load("failed_suites/failed-suite-[0-9]*/suite.json")
+          # Names are failed-suite-<attempt>-<idx> (single) and
+          # failed-suite-multi-<attempt>-<idx> (multi); the --jq select above
+          # already scoped the download to this attempt. The single glob starts
+          # with a digit class so it matches "failed-suite-3-*" but never the
+          # "failed-suite-multi-*" descriptors (which start with a letter).
+          attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+          multi = load(f"failed_suites/failed-suite-multi-{attempt}-*/suite.json")
+          single = load(f"failed_suites/failed-suite-{attempt}-[0-9]*/suite.json")
 
           print(f"Single-card suites to retry: {[s.get('name') for s in single]}")
           print(f"Multi-card suites to retry : {[s.get('name') for s in multi]}")

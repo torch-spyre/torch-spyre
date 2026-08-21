@@ -28,14 +28,15 @@ from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
 
 
 @pytest.mark.parametrize("device", ["spyre"])
-def test_fp16_to_fp32_standard_input(device):
-    """Test FP16→FP32 with STANDARD input creates DL16_TO_FP32."""
+@pytest.mark.parametrize("src_dtype", [torch.float16, torch.bfloat16])
+def test_fp16_to_fp32_standard_input(device, src_dtype):
+    """Test FP16/BF16→FP32 with STANDARD input creates DL16_TO_FP32 (#2843)."""
 
     @torch.compile
     def fn(x):
         return x.to(torch.float32)
 
-    x = torch.randn(4, 128, device=device, dtype=torch.float16)
+    x = torch.randn(4, 128, device=device, dtype=src_dtype)
     result = fn(x)
 
     # Verify output EA
@@ -47,7 +48,22 @@ def test_fp16_to_fp32_standard_input(device):
     # Note: Cannot compare tensors with non-STANDARD EA directly with CPU
     # The result has DL16_TO_FP32 EA which differs from CPU's STANDARD EA
 
-    print("✓ FP16→FP32 with STANDARD input produces DL16_TO_FP32")
+    print(f"✓ {src_dtype}→FP32 with STANDARD input produces DL16_TO_FP32")
+
+
+@pytest.mark.parametrize("device", ["spyre"])
+def test_mixed_bf16_fp32_add_rejects_ea_mismatch(device):
+    """A bf16/fp32 add must raise on EA mismatch instead of silently executing (#2843)."""
+
+    @torch.compile
+    def fn(x, y):
+        return torch.add(x, y)
+
+    x_fp32 = torch.randn(5120, dtype=torch.float32, device=device)
+    y_bf16 = torch.randn(5120, dtype=torch.bfloat16, device=device)
+
+    with pytest.raises(Exception, match="element arrangement|EA"):
+        fn(x_fp32, y_bf16)
 
 
 @pytest.mark.parametrize("device", ["spyre"])

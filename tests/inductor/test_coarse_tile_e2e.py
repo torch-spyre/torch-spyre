@@ -1678,10 +1678,6 @@ def test_restickify_pointwise_unsqueeze_mul_Lq2():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
-    reason="mutation op and mutation target diverge on device layout in the "
-    "beam search when target has multiple candidates -- see issue #3845"
-)
 def test_copy_into_preallocated_512x256_A4():
     """copy_forced(a+b, c) on [512,256] tiled A÷4 — result written into zeros buffer."""
     inputs = [
@@ -1699,10 +1695,6 @@ def test_copy_into_preallocated_512x256_A4():
     run_coarse_tile_test(fn, inputs, loopspec=None)
 
 
-@pytest.mark.skip(
-    reason="mutation op and mutation target diverge on device layout in the "
-    "beam search when target has multiple candidates -- see issue #3845"
-)
 def test_copy_into_preallocated_512x256_B4():
     """copy_forced(a+b, c) on [512,256] tiled B÷4."""
     inputs = [
@@ -1721,10 +1713,6 @@ def test_copy_into_preallocated_512x256_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="mutation op and mutation target diverge on device layout in the "
-    "beam search when target has multiple candidates -- see issue #3845"
-)
 def test_copy_into_preallocated_512x256_A4_B4():
     """copy_forced(a+b, c) on [512,256] tiled A÷4 B÷4."""
     inputs = [
@@ -1986,10 +1974,6 @@ def test_copy_running_max_4d_H4_Lq4():
 # copy target receives a restickified input — tests copy layout after restickify
 
 
-@pytest.mark.skip(
-    reason="mutation op and mutation target diverge on device layout in the "
-    "beam search when target has multiple candidates -- see issue #3845"
-)
 def test_copy_restickify_512x256_A4():
     """copy_forced(a.t()+b, c) on [256,512] result tiled A÷4 — copy of restickified add."""
     inputs = [
@@ -2008,10 +1992,6 @@ def test_copy_restickify_512x256_A4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="mutation op and mutation target diverge on device layout in the "
-    "beam search when target has multiple candidates -- see issue #3845"
-)
 def test_copy_restickify_512x256_B4():
     """copy_forced(a.t()+b, c) on [256,512] result tiled B÷4."""
     inputs = [
@@ -2030,10 +2010,6 @@ def test_copy_restickify_512x256_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="mutation op and mutation target diverge on device layout in the "
-    "beam search when target has multiple candidates -- see issue #3845"
-)
 def test_copy_restickify_512x256_A4_B4():
     """copy_forced(a.t()+b, c) on [256,512] result tiled A÷4 B÷4."""
     inputs = [
@@ -2132,10 +2108,6 @@ def test_copy_accum_with_reduction_512x256_A4_B4():
 # --- two copies in same hint scope: copy_forced(a+b, c1); copy_forced(a*b, c2) ---
 
 
-@pytest.mark.skip(
-    reason="mutation op and mutation target diverge on device layout in the "
-    "beam search when target has multiple candidates -- see issue #3845"
-)
 def test_copy_two_copies_same_scope_512x256_A4():
     """Two copy_ ops in same hint scope tiled A÷4."""
     inputs = [
@@ -2157,10 +2129,6 @@ def test_copy_two_copies_same_scope_512x256_A4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="mutation op and mutation target diverge on device layout in the "
-    "beam search when target has multiple candidates -- see issue #3845"
-)
 def test_copy_two_copies_same_scope_512x256_B4():
     """Two copy_ ops in same hint scope tiled B÷4."""
     inputs = [
@@ -2182,10 +2150,6 @@ def test_copy_two_copies_same_scope_512x256_B4():
     run_coarse_tile_test(fn, inputs)
 
 
-@pytest.mark.skip(
-    reason="mutation op and mutation target diverge on device layout in the "
-    "beam search when target has multiple candidates -- see issue #3845"
-)
 def test_copy_two_copies_same_scope_512x256_A4_B4():
     """Two copy_ ops in same hint scope tiled A÷4 B÷4."""
     inputs = [
@@ -5944,11 +5908,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         compare_with_cpu(fn, x, y, run_compile=True, run_eager=False)
 
-    @pytest.mark.skip(
-        reason="mutation op and mutation target diverge on device layout in "
-        "the beam search when target has multiple candidates -- see issue "
-        "#3845"
-    )
     def test_hint_nested_tiling_copy_mutation_correct(self):
         """Nested Lq/D tiling into a direct copy_forced() mutation (Case 3 rewire)."""
         from torch_spyre._inductor import spyre_hint
@@ -5971,11 +5930,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
 
-    @pytest.mark.skip(
-        reason="mutation op and mutation target diverge on device layout in "
-        "the beam search when target has multiple candidates -- see issue "
-        "#3845"
-    )
     def test_hint_nested_tiling_copy_mutation_divergent_input_layout(self):
         """Case 3 nested coarse-tiling where `a`'s device layout genuinely
         diverges from `b`'s -- exercises per-arg tile_advance_expr (each arg
