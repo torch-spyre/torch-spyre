@@ -221,6 +221,45 @@ def _(
     return torch.empty(size, dtype=dtype, device="spyre")
 
 
+# No device_types="spyre" here: unlike sibling ops, this op must also handle
+# CPU execution (spyre_full routes through it unconditionally). The manual
+# device.type check below is the intentional CPU-fallback path; don't add
+# device_types= to clean up the asymmetry, it would break that fallback.
+@torch.library.custom_op("spyre::full_with_layout", mutates_args=())
+def spyre_full_with_layout(
+    size: Sequence[int],
+    fill_value: float,
+    device: torch.device,
+    dtype: torch.dtype,
+    device_size: Sequence[int],
+    stride_map: Sequence[int],
+    device_dtype: int,
+) -> torch.Tensor:
+    if device.type != "spyre":
+        return torch.full(list(size), fill_value, dtype=dtype, device=device)
+    from torch_spyre._C import DataFormats, SpyreTensorLayout, empty_with_layout
+
+    stl = SpyreTensorLayout(
+        list(device_size), list(stride_map), DataFormats(device_dtype)
+    )
+    t = empty_with_layout(tuple(size), stl, dtype, device, False, None)
+    t.fill_(fill_value)
+    return t
+
+
+@spyre_full_with_layout.register_fake
+def _(
+    size: Sequence[int],
+    fill_value: float,
+    device: torch.device,
+    dtype: torch.dtype,
+    device_size: Sequence[int],
+    stride_map: Sequence[int],
+    device_dtype: int,
+) -> torch.Tensor:
+    return torch.empty(size, dtype=dtype, device=device)
+
+
 @torch.library.custom_op("spyre::logical_not", mutates_args=(), device_types="spyre")
 def logical_not(input: torch.Tensor) -> torch.Tensor:
     pass

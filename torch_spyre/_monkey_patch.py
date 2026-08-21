@@ -227,6 +227,40 @@ def _patch_tensor_for_spyre():
     torch._dynamo.allow_in_graph(torch.Tensor.to)
     torch.empty = spyre_empty
 
+    orig_full = torch.full
+
+    def spyre_full(size, fill_value, *, device_layout=None, **kwargs):
+        if device_layout is None:
+            return orig_full(size, fill_value, **kwargs)
+        device = kwargs.get("device")
+        # device_layout= only supports float16/float32; default to float16 (Spyre
+        # default dtype) rather than inferring from fill_value like real torch.full
+        # would — callers using device_layout= are explicitly targeting Spyre and
+        # must pass dtype= if they want float32.
+        dtype = kwargs.get("dtype") or torch.float16
+        if dtype not in (torch.float16, torch.float32):
+            raise TypeError(
+                f"torch.full with device_layout= only supports float16 and float32, got {dtype}"
+            )
+        device_size, stride_map, device_dtype = device_layout
+        return torch.ops.spyre.full_with_layout(
+            list(size),
+            float(fill_value),
+            device if device is not None else torch.device("spyre"),
+            dtype,
+            list(device_size),
+            list(stride_map),
+            int(device_dtype),
+        )
+
+    # spyre_full (unlike spyre_empty) calls DataFormats(device_dtype) — a pybind11 enum
+    # constructor — when device_layout= is provided.  Dynamo cannot trace through pybind11
+    # constructors and graph-breaks.  allow_in_graph makes Dynamo treat spyre_full as an
+    # opaque leaf (frontend only); AOTAutograd/Inductor still trace into it normally and
+    # see the torch.ops.spyre.full_with_layout call.
+    torch._dynamo.allow_in_graph(spyre_full)
+    torch.full = spyre_full
+
     # ── Optimal weight loading (issue #1339) ──────────────
     # Patch dim_order=[1,0] transfer + nn.Module.to override (issue #1339).
     try:

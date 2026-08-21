@@ -33,6 +33,7 @@ from torch.spyre import SpyreTensorLayout
 
 import torch_spyre._inductor.optimize_restickify as _optimize_restickify
 from torch._inductor.exc import InductorError
+from torch_spyre._C import DataFormats
 from utils_inductor import _compile_and_run, compare_with_cpu
 
 DEVICE = torch.device("spyre")
@@ -809,6 +810,91 @@ def test_full_plus_xt():
         lambda x: torch.full((S, S), 0.5, dtype=torch.float16, device=x.device) + x.t(),
         x,
     )
+
+
+def test_full_with_layout_plus_xt():
+    """torch.full with device_layout= arg (patched spyre_full) — layout pinned via the
+    monkey-patched torch.full; the hint is applied automatically — cost 0."""
+
+    def fn(x):
+        c = torch.full(
+            (S, S),
+            0.5,
+            dtype=torch.float16,
+            device=x.device,
+            device_layout=([2, S, 64], [S * S // 2, 1, S], DataFormats.SEN169_FP16),
+        )
+        return c + x.t()
+
+    x = torch.randn((S, S), dtype=torch.float16)
+    _compare(fn, x, optimal_cost=0)
+
+
+def test_full_with_layout_int_fill_value():
+    """Integer fill value with device_layout= — dtype defaults to float16, value silently
+    cast to float.  Correctness: result should equal torch.full(..., 1, dtype=float16)."""
+
+    def fn(x):
+        c = torch.full(
+            (S, S),
+            1,
+            device=x.device,
+            device_layout=([2, S, 64], [S * S // 2, 1, S], DataFormats.SEN169_FP16),
+        )
+        return c + x.t()
+
+    x = torch.randn((S, S), dtype=torch.float16)
+    _compare(fn, x, optimal_cost=0)
+
+
+def test_full_with_layout_unsupported_dtype():
+    """dtype=int32 with device_layout= must raise TypeError at the monkey-patch layer."""
+    with pytest.raises(TypeError):
+        torch.full(
+            (S, S),
+            1,
+            dtype=torch.int32,
+            device="spyre",
+            device_layout=([2, S, 64], [S * S // 2, 1, S], DataFormats.SEN169_FP16),
+        )
+
+
+def test_full_with_layout_unsupported_dtype_lowering():
+    """spyre::full_with_layout with dtype=int32 must raise at the lowering layer.
+
+    Exercises the Unsupported() guard in lower_full_with_layout directly,
+    bypassing the monkey-patch dtype check in spyre_full.
+    """
+
+    device_dtype = int(DataFormats.SEN169_FP16)
+
+    def fn(x):
+        return torch.ops.spyre.full_with_layout(
+            [S, S],
+            1.0,
+            x.device,
+            torch.int32,
+            [2, S, 64],
+            [S * S // 2, 1, S],
+            device_dtype,
+        )
+
+    x = torch.randn((S, S), dtype=torch.float16)
+    torch._dynamo.reset()
+    with pytest.raises(InductorError):
+        _compile_and_run(fn, (x,), DEVICE)
+
+
+def test_full_with_layout_bad_tuple():
+    """device_layout= with wrong arity must raise at the Python wrapper level."""
+    with pytest.raises((ValueError, TypeError)):
+        torch.full(
+            (S, S),
+            0.5,
+            dtype=torch.float16,
+            device="cpu",
+            device_layout=([2, S, 64], [S * S // 2, 1, S]),  # missing device_dtype
+        )
 
 
 def test_fill_plus_xt():

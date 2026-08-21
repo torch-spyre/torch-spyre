@@ -1935,9 +1935,14 @@ def propagate_spyre_tensor_layouts(
                 if is_constant_fill:
                     # Constant-fill ops (zeros_like, full, ones_like, ...) have no real
                     # memory layout — they can materialize in any stick orientation.
-                    # For now, using a single generic layout candidate to reduce beam
-                    # state space explosion.  Optimizations to follow.
-                    op.layouts = [generic_layout(op)]
+                    # spyre::full_with_layout stamps a FixedTiledLayout on the buffer
+                    # during lowering to pin it to a specific layout; otherwise fall back
+                    # to the generic single candidate.
+                    existing = op.get_layout()
+                    if isinstance(existing, FixedTiledLayout):
+                        op.layouts = [existing.device_layout]
+                    else:
+                        op.layouts = [generic_layout(op)]
                 else:
                     logger.warning(
                         f"{op.get_name()} has no propagatable args but reads non-constant "

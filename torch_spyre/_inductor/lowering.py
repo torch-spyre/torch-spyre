@@ -38,6 +38,7 @@ from . import config
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import (
+    FixedTiledLayout,
     SpyreReduction,
     SpyreConstantFallback,
     SpyreEmptyFallback,
@@ -46,7 +47,7 @@ from .ir import (
     AllGatherAsyncFallback,
     AllReduceAsyncFallback,
 )
-from torch_spyre._C import get_elem_in_stick
+from torch_spyre._C import DataFormats, SpyreTensorLayout, get_elem_in_stick
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from .errors import Unsupported
@@ -1416,6 +1417,35 @@ def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memor
         inner_fn=inner_fn,
         ranges=list(size),
     )
+
+
+@register_spyre_lowering(
+    torch.ops.spyre.full_with_layout.default, type_promotion_kind=None
+)
+def lower_full_with_layout(
+    size, fill_value, device, dtype, device_size, stride_map, device_dtype
+):
+    if dtype not in (torch.float16, torch.float32):
+        raise Unsupported(
+            f"spyre::full_with_layout: unsupported dtype {dtype}; "
+            "device_layout= requires float16 or float32"
+        )
+    stl = SpyreTensorLayout(
+        list(device_size), list(stride_map), DataFormats(device_dtype)
+    )
+    result = lower_full(size, fill_value, dtype=dtype, device=device)
+    # Unwrap to the ComputedBuffer and stamp the FixedTiledLayout so
+    # propagate_layouts can read it via get_layout() in the is_constant_fill branch.
+    buf = result.data.data
+    assert isinstance(buf, ir.ComputedBuffer), (
+        f"lower_full returned unexpected IR structure: {type(buf)}; "
+        "expected TensorBox(StorageBox(ComputedBuffer))"
+    )
+    # Host strides are placeholders — finalize_layouts overwrites them later;
+    # only device_layout matters here.
+    contiguous_strides = ir.FlexibleLayout.contiguous_strides(list(size))
+    buf.layout = FixedTiledLayout(device, dtype, list(size), contiguous_strides, stl)
+    return result
 
 
 @register_spyre_lowering(torch.ops.spyre.constant.default, type_promotion_kind=None)
