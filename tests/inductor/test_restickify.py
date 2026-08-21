@@ -595,21 +595,19 @@ def test_bmm_with_inplace_mutation():
     _compare(func, x, weight, cache)
 
 
-def test_mutation_target_multi_candidate_layout_unsupported():
+def test_mutation_target_multi_candidate_layout():
     """Issue #3845: a mutation op and its target can diverge on device layout in
     the beam search.  ``c = a + b`` is an ordinary ComputedBuffer with two
     genuine candidate STLs (row-stick vs. column-stick, since 128x256 is
     non-square); ``copy_forced(d, c)`` then mutates it.  Unlike the
     SpyreEmptyFallback accumulator case above (test_bmm_with_inplace_mutation,
     where the target starts as a fresh torch.zeros() buffer and already has
-    working multi-candidate coupling), propagate_layouts has no mechanism to
-    couple an ordinary pre-existing ComputedBuffer target's eventual layout
-    choice to the mutation op's -- so _target_device_layout hits its
-    ``assert len(layouts) == 1`` guard (added by #3884) instead of silently
-    picking a possibly-wrong layout.  This reproducer is independent of
+    working multi-candidate coupling), the mutation op here has no genuine
+    MemoryDep read-edge to its target at all -- propagate_layouts synthesizes
+    a coupling edge from the target's own write MemoryDep so the beam search
+    can price the constraint that this op's output STL must match whatever
+    the target eventually commits to.  This reproducer is independent of
     coarse_tiling and spyre_hint, isolating the root propagate_layouts gap.
-    Once the beam-search coupling is implemented, this should compile and
-    match CPU -- update this test to a correctness check at that point.
     """
     M, N = 128, 256
     a = torch.randn((M, N), dtype=torch.float16) * 0.01
@@ -621,11 +619,7 @@ def test_mutation_target_multi_candidate_layout_unsupported():
         torch.ops.spyre.copy_forced(d, c)
         return c
 
-    with pytest.raises(
-        InductorError,
-        match=r"has 2 candidate layouts",
-    ):
-        _compile_and_run(fn, (a, b, d), DEVICE)
+    _compare(fn, a, b, d)
 
 
 # Optimizer correctness + optimality tests: verify both output values and

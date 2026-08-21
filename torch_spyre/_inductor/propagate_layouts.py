@@ -1493,13 +1493,8 @@ def _target_device_layout(target, name: str):
             if buf_layouts:
                 layouts = buf_layouts
 
-    if not layouts:
+    if not layouts or len(layouts) != 1:
         return None
-    assert len(layouts) == 1, (
-        f"_target_device_layout: {name!r} has {len(layouts)} candidate layouts; "
-        f"multiple mutation ops writing the same target with different layouts "
-        f"is not yet supported"
-    )
     return next(iter(layouts))
 
 
@@ -1783,6 +1778,42 @@ def propagate_spyre_tensor_layouts(
                 target_buf = V.graph.get_buffer(target_name) if target_name else None
                 target_stl = _target_device_layout(target, target_name)
                 if target_stl is None:
+                    target_buf_layouts = getattr(target_buf, "layouts", None)
+                    if not isinstance(target_buf, SpyreEmptyFallback) and (
+                        target_buf_layouts and len(target_buf_layouts) > 1
+                    ):
+                        # target_buf is an ordinary multi-candidate ComputedBuffer
+                        # (issue #3845): the mutation op (e.g. copy_forced) has no
+                        # genuine MemoryDep read-edge to target_buf, so none of the
+                        # existing per-arg propagation machinery can see or price
+                        # the constraint that this op's output STL must match
+                        # whatever target_buf eventually commits to. Synthesize a
+                        # coupling edge by reusing target_buf's own write MemoryDep
+                        # (real index/shape, since copy_forced requires identical
+                        # shapes) as an extra "input" arg, and let AllSameNode price
+                        # it exactly like any other input alongside the real reads.
+                        assert target_buf is not None
+                        target_write_dep = _one_mem_dep(
+                            target_buf.get_read_writes().writes
+                        )
+                        assert target_write_dep is not None, (
+                            f"{op.get_name()}: mutation target {target_name!r} "
+                            f"must have exactly one write MemoryDep to synthesize "
+                            f"a coupling edge"
+                        )
+                        rw = op.get_read_writes()
+                        output_dep = next(iter(rw.writes))
+                        args = _get_prop_args(rw.reads)
+                        target_arg = PropArg(
+                            target_write_dep,
+                            target_buf.get_layout(),
+                            list(target_buf_layouts),
+                        )
+                        op.layouts = list(target_buf_layouts)
+                        op.restick_cost_fn = AllSameNode.from_args(
+                            [*args, target_arg], op.layouts, output_dep, op
+                        )
+                        continue
                     if not isinstance(target_buf, SpyreEmptyFallback):
                         # op gets no .layouts/.restick_cost_fn at all; any
                         # downstream consumer that requires them (e.g.
