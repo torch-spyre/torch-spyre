@@ -869,7 +869,7 @@ def _matmul_layouts(
     #   Input2 (y): stick on generated_var (loop var present in output, absent from x)
     #   Output:     stick on generated_var
     reduction_var = find_reduction_var(x.dep, output_dep)
-    generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep)
+    generated_var = find_matmul_generated_var(y.dep, x.dep, output_dep, op)
 
     x_req_stl = find_stick_compatible_input_layout(
         x, reduction_var, data.reduction_type, "x"
