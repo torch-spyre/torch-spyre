@@ -59,6 +59,7 @@ this file's rewrite sites depend on.
 from __future__ import annotations
 
 
+import collections
 import dataclasses
 import logging
 from typing import NamedTuple
@@ -2809,7 +2810,7 @@ def _insert_one_read_copy(
         active_full_strides = [full_coeff[i] for i in active_idx]
         order = sorted(range(len(active_idx)), key=lambda k: active_full_strides[k])
         total_elems = sympy.prod(full_buf.get_size())
-        active_full_sizes = [None] * len(active_idx)
+        active_full_sizes: list[Expr] = [sympy.Integer(0)] * len(active_idx)
         for pos, k in enumerate(order):
             next_stride = (
                 active_full_strides[order[pos + 1]] if pos + 1 < len(order) else None
@@ -3128,11 +3129,37 @@ def _insert_one_read_copy(
             d_full_size = sympy.Integer(1)
             for level_idx in reversed(levels_tiling_d):
                 d_full_size = d_full_size * sizing_op_info.loop_count[level_idx]
-            total_elems = sympy.prod(full_buf.get_size())
+            # A bare numel check (total_elems // host_stride == d_full_size)
+            # is not sound: host_stride/d_full_size are properties of
+            # sizing_op alone, and a genuinely-broadcast dep's own numel is
+            # unrelated to either -- it is possible (if unlikely for any
+            # one kernel) for a broadcast tensor's real numel to coincide
+            # with host_stride * d_full_size purely by chance, wrongly
+            # granting it an advance for a dim it does not have. Instead,
+            # use full_buf's own RANK: active_idx (computed above from this
+            # same dep) already gives every dim of full_buf that dep.index
+            # can see; d, if present at all, is the ONE dim invisible to
+            # dep.index (squeezed out of sizing_op's whole space, per the
+            # comment above) -- so full_buf has dim d iff its rank exceeds
+            # active_idx's count by exactly 1, AND the one dim not
+            # accounted for by active_full_sizes actually has size
+            # d_full_size (guards against an unrelated extra dim of some
+            # other size, e.g. a genuine size-1 dim of full_buf's own that
+            # active_idx also does not see). Rank and per-dim sizes are
+            # exact structural properties of full_buf, unlike a numel
+            # product, so this cannot collide the way the numel check can.
+            full_sizes = list(full_buf.get_size())
+            rank_excess = len(full_sizes) - len(active_idx)
+            leftover_counts = collections.Counter(full_sizes)
+            if active_idx:
+                for s in active_full_sizes:
+                    leftover_counts[s] -= 1
+            leftover_sizes = [s for s, c in leftover_counts.items() if c > 0]
             dep_has_dim_d = (
                 host_stride != 0
-                and total_elems % host_stride == 0
-                and total_elems // host_stride == d_full_size
+                and rank_excess == 1
+                and len(leftover_sizes) == 1
+                and leftover_sizes[0] == d_full_size
             )
             if not dep_has_dim_d:
                 continue

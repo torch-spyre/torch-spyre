@@ -6935,7 +6935,59 @@ class TestCoarseTileMoEBroadcastMatmulE2E(InductorTestCase):
 
         E, T, H, F = 128, 64, 64, 64
 
+        # 4 copies of w's shape (E,H,F), not 1: the allocator's free-list
+        # ordering for a given size class isn't guaranteed to hand back the
+        # single most-recently-freed region first, so poisoning only one
+        # (E,H,F)-shaped tensor risks missing whichever HBM slot this
+        # kernel's own w read actually lands on. Over-poisoning multiple
+        # same-shape regions raises confidence that the slot in question is
+        # covered.
         sentinel_shapes = [(E, H, F), (1, T, H), (E, H, F), (E, H, F), (E, H, F)]
+        poison_tensors = [
+            torch.full(shape, 1234.0, dtype=torch.float16, device="spyre")
+            for shape in sentinel_shapes
+        ]
+        del poison_tensors
+        gc.collect()
+
+        x = torch.randn(T, H, dtype=torch.float16) * 0.01
+        w = torch.randn(E, H, F, dtype=torch.float16) * 0.01
+        _declare_tensor_dim("E", E)
+        _declare_tensor_dim("T", T)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("F", F)
+
+        def fn(x, w):
+            _name_tensor_dims(x, ["T", "H"])
+            _name_tensor_dims(w, ["E", "H", "F"])
+            with spyre_hint(num_tiles_per_dim={"E": E}):
+                return torch.matmul(x.unsqueeze(0), w)
+
+        compare_with_cpu(
+            fn, x, w, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
+        )
+
+    def test_unsqueeze_broadcast_matmul_tile_E_numel_collision_correct(self):
+        """Same pattern as test_unsqueeze_broadcast_matmul_tile_E_correct, but
+        with E,T,H,F chosen so x's own numel (T*H) exactly equals
+        host_stride * d_full_size (T*F * E) for this kernel's tiled E dim --
+        the coincidence that a bare numel-ratio check for "does this dep
+        have dim E" (an earlier, rejected draft of the coarse_tile.py fix
+        for issue #3613's uninitialized-HBM-read bug) cannot distinguish
+        from x genuinely having an E dim. With H == F * E (here 128 ==
+        64 * 2), x:[T,H]=[64,128] has numel 8192, matching
+        host_stride*d_full_size = (T*F)*E = (64*64)*2 = 8192 -- despite x
+        having no E dimension at all. A numel-only check would wrongly
+        grant x a per-tile E-advance here, making it read past its own
+        8192 elements into whatever HBM follows (uninitialized on a
+        virgin device). Poisons that HBM region so any regression back to
+        a numel-only check is caught deterministically.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        E, T, H, F = 2, 64, 128, 64
+
+        sentinel_shapes = [(E, H, F), (1, T, H)]
         poison_tensors = [
             torch.full(shape, 1234.0, dtype=torch.float16, device="spyre")
             for shape in sentinel_shapes
