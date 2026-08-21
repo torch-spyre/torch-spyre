@@ -215,6 +215,25 @@ def _is_activation_source(operations: dict[str, Operation], op: Operation) -> bo
     )
 
 
+def _has_restickify_consumer(
+    consumer_reads: Sequence[tuple[Operation, MemoryDep]],
+) -> bool:
+    return any(
+        op_short_name(consumer) == "restickify" for consumer, _ in consumer_reads
+    )
+
+
+def _unsupported_relayout_transition_reason(
+    source_work_division: TensorWorkDivision | None,
+    destination_work_division: TensorWorkDivision | None,
+) -> str | None:
+    """Reject ownership changes that cannot be represented safely."""
+
+    if source_work_division == destination_work_division:
+        return "distinct physical ownerships collapse to the same logical work division"
+    return None
+
+
 def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
     if not config.lx_planner_relayout or config.ktir_emitter:
         return []
@@ -232,6 +251,8 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
 
     result: list[LXRelayoutPlan] = []
     for source_name, consumer_reads in reads.items():
+        if _has_restickify_consumer(consumer_reads):
+            continue
         producer = operations.get(source_name)
         if (
             not isinstance(producer, ComputedBuffer)
@@ -306,7 +327,7 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                 break
             consumer_symbols = tuple(iteration_space_from_op(consumer))
             try:
-                work_division_from_view(
+                source_work_division = work_division_from_view(
                     source_view, consumer_coordinates, consumer_symbols
                 )
             except ValueError:
@@ -325,11 +346,18 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
                 rejection_reason = "source and destination partitions are incompatible"
                 break
             try:
-                work_division_from_view(view, consumer_coordinates, consumer_symbols)
+                destination_work_division = work_division_from_view(
+                    view, consumer_coordinates, consumer_symbols
+                )
             except ValueError:
                 rejection_reason = (
                     "destination ownership cannot be projected to consumer"
                 )
+                break
+            if reason := _unsupported_relayout_transition_reason(
+                source_work_division, destination_work_division
+            ):
+                rejection_reason = reason
                 break
             consumers_by_view.setdefault(view, []).append(consumer_name)
         else:

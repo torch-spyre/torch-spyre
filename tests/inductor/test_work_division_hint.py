@@ -586,6 +586,44 @@ def test_lx_relayout_activation_policy_is_source_wide():
         assert lx_relayout_module._is_activation_source({"input": dep}, producer)
 
 
+def test_lx_relayout_rejects_unrepresentable_ownership_transitions():
+    m = Symbol("m")
+    restickify = SimpleNamespace()
+    pointwise = SimpleNamespace()
+    dep = SimpleNamespace()
+    source = TensorWorkDivision(
+        {m: 2},
+        {m: Mod(_CORE_ID, 2)},
+    )
+    destination = TensorWorkDivision(
+        {m: 4},
+        {m: Mod(_CORE_ID, 4)},
+    )
+
+    with mock_patch.object(
+        lx_relayout_module,
+        "op_short_name",
+        side_effect=lambda consumer: "restickify"
+        if consumer is restickify
+        else "pointwise",
+    ):
+        assert lx_relayout_module._has_restickify_consumer([(restickify, dep)])
+        assert not lx_relayout_module._has_restickify_consumer([(pointwise, dep)])
+
+    with mock_patch.object(
+        lx_relayout_module, "op_short_name", return_value="pointwise"
+    ):
+        assert lx_relayout_module._unsupported_relayout_transition_reason(
+            source, source
+        ) == ("distinct physical ownerships collapse to the same logical work division")
+        assert (
+            lx_relayout_module._unsupported_relayout_transition_reason(
+                source, destination
+            )
+            is None
+        )
+
+
 def _compile_spec(spec, normalize=True):
     if normalize:
         simplify_op_spec(spec)
