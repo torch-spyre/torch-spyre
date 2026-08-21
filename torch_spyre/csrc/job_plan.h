@@ -28,6 +28,7 @@
 #include <variant>
 #include <vector>
 
+#include "spyrecode-host-functions/fast_process_hcm.h"
 #include "spyrecode-host-functions/spyrecode.h"
 
 namespace spyre {
@@ -178,6 +179,47 @@ class HostBuffer {
 // function is defined as deeptools::processComputeOnHostCommand
 
 /**
+ * @brief Discriminator for SymbolicArg entries.
+ *
+ * kAddress  – the slot carries the HBM device address of a tensor.
+ *             value is resolved via compositeAddressToDmva() on
+ *             inputs_outputs[tensor_id].
+ * kDimension – the slot carries a runtime tensor dimension size,
+ *             resolved by the frontend and stored in SymbolicArg::value.
+ *             The consumer will TORCH_CHECK-fail on this kind until it
+ *             is implemented.
+ */
+enum class SymbolicArgKind : int32_t {
+  kAddress = 0,
+  kDimension = 1,
+};
+
+/**
+ * @brief One entry in the per-launch symbolic argument payload.
+ *
+ * Consumed positionally by JobPlanStepHostCompute::construct (Case 3):
+ * slot i in the correction vector is resolved from symbolic_args[i].
+ * Wrong count → loud TORCH_CHECK failure.
+ * Wrong order with right count → silent wrong numerics, so callers must
+ * preserve the backend's compile-time symbol order exactly.
+ *
+ * Fields:
+ *   kind       – how to resolve the value.
+ *   tensor_id  – index into LaunchContext::inputs_outputs.
+ *   dim_index  – for kDimension: which dimension of that tensor.
+ *                for kAddress:   unused (set to -1 by convention).
+ *   value      – for kDimension: the front-end-resolved concrete dimension
+ *                size. for kAddress:   unused (set to -1 by convention).
+ *
+ */
+struct SymbolicArg {
+  SymbolicArgKind kind;
+  int64_t tensor_id;
+  int64_t dim_index = -1;
+  int64_t value = -1;
+};
+
+/**
  * @brief Context passed to JobPlanStep::construct() at launch time
  *
  * Carries runtime data available at LaunchKernel time that was not available
@@ -189,6 +231,20 @@ struct LaunchContext {
    *
    */
   const std::vector<at::Tensor>& inputs_outputs;
+
+  /**
+   * @brief Per-argument typed symbolic payload (optional).
+   *
+   * When non-empty, JobPlanStepHostCompute::construct uses this vector to
+   * drive Case 3 resolution instead of the legacy tensor-iteration loop.
+   * Each entry maps one correction-vector slot to a tensor and a resolution
+   * kind.  The vector is consumed positionally: slot i ↔ symbolic_args[i].
+   *
+   * Empty means "use today's behavior" — the legacy loop over all context
+   * tensors, treating each as an address source.  This preserves back-compat
+   * for existing callers that pass no payload.
+   */
+  std::vector<SymbolicArg> symbolic_args;
 };
 
 /**
@@ -437,19 +493,53 @@ class JobPlanStepHostCompute final : public JobPlanStep {
       : hcm_(std::move(hcm)),
         output_buffer_(output_buffer),
         input_buffer_(input_buffer),
-        ishape_(ishape) {
+        ishape_(std::move(ishape)) {
     pipeline_barrier_ = false;  // host callbacks are overlap-eligible
+
+    // Try to build fast plan at construction time (prepare time)
+    if (hcm_) {
+      fast_plan_.valid = deeptools::buildFastHcmPatchPlan(fast_plan_, *hcm_);
+      if (!fast_plan_.valid) {
+        // Mark as permanently invalid so we don't retry
+        fast_plan_.output_size = UINT32_MAX;
+      }
+    }
   }
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
   void write(std::ostream& os) const override;
 
+  /**
+   * @brief Resolve a symbolic_args payload to a vector of int64 values.
+   *
+   * Each entry is resolved according to its kind: kAddress entries yield the
+   * HBM device address of the corresponding tensor; kDimension entries yield
+   * the pre-resolved dimension size stored in SymbolicArg::value.
+   *
+   * Extracted from the typed-payload resolution path in construct() so that
+   * the resolution logic has a single definition shared by both the hot path
+   * and the _C._resolve_symbolic_args test seam. Keeping it as a static
+   * member of this class makes the ownership clear without exposing it as a
+   * top-level public symbol.
+   *
+   * Preconditions (enforced via TORCH_CHECK):
+   *   - Every symbolic_args[i].tensor_id is a valid index into tensors.
+   *   - Every symbolic_args[i].kind is kAddress (kDimension not yet
+   *     implemented).
+   */
+  static std::vector<int64_t> resolveSymbolicArgs(
+      const std::vector<at::Tensor>& tensors,
+      const std::vector<SymbolicArg>& symbolic_args);
+
  private:
   std::unique_ptr<Hcm> hcm_;
   void* output_buffer_;       // Non-owning pointer (JobPlan owns the buffer)
   const void* input_buffer_;  // Non-owning pointer (JobPlan owns the buffer)
   std::vector<int64_t> ishape_;
+
+  // Pre-compiled patch plan for fast execution
+  mutable deeptools::FastHcmPatchPlan fast_plan_;
 };
 
 /**

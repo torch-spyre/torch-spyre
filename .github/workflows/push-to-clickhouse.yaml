@@ -89,6 +89,8 @@ jobs:
       # run-name: — this is the only way a workflow_run-triggered job can recover the
       # original dispatch tier (integration/regression/smoke/etc) without an extra API call.
       TRIGGERING_DISPLAY_TITLE: ${{ github.event.workflow_run.display_title || '' }}
+      # Triggering event (push/pull_request/schedule/workflow_dispatch/merge_group; empty on manual re-ingest) -- gates the PR-number lookup below.
+      TRIGGERING_EVENT: ${{ github.event.workflow_run.event || '' }}
 
 
     steps:
@@ -112,23 +114,37 @@ jobs:
             .github/scripts/ingest_xml.py
           sparse-checkout-cone-mode: false
 
-      - name: Install gh CLI
+      # actions4gh/setup-gh@v1.0.2 extracts the gh tarball but never lands
+      # the binary on PATH before it calls `gh auth login`, so every job
+      # fails with "spawn gh ENOENT" (upstream actions4gh/setup-gh#7, #11,
+      # unresolved). Install gh directly instead; downstream steps already
+      # set GH_TOKEN, which `gh` picks up implicitly, so no `gh auth login`
+      # call is needed here.
+      - name: Setup the GitHub CLI
+        env:
+          GH_CLI_VERSION: 2.97.0
         run: |
-          wget -q https://github.com/cli/cli/releases/download/v2.92.0/gh_2.92.0_linux_amd64.tar.gz
-          tar -xzf gh_2.92.0_linux_amd64.tar.gz
-          echo "$PWD/gh_2.92.0_linux_amd64/bin" >> "${GITHUB_PATH}"
-          gh_2.92.0_linux_amd64/bin/gh --version
-
+          curl -fsSL \
+            "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.tar.gz" \
+            -o "${RUNNER_TEMP}/gh-cli.tar.gz"
+          mkdir -p "${RUNNER_TEMP}/gh-cli"
+          tar -xzf "${RUNNER_TEMP}/gh-cli.tar.gz" -C "${RUNNER_TEMP}/gh-cli" --strip-components=1
+          echo "${RUNNER_TEMP}/gh-cli/bin" >> "${GITHUB_PATH}"
 
       - name: Resolve PR number
         id: resolve-pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PR=$(gh api \
-            "/repos/${{ github.repository }}/commits/${TRIGGERING_SHA}/pulls" \
-            --jq '.[0].number // 0')
-          echo "Resolved PR number: ${PR}"
+          # An unconditional commit->PR lookup stamped a trunk/scheduled run with whatever PR previously merged that commit; only trust it for an actual pull_request-triggered run.
+          if [[ "${TRIGGERING_EVENT}" == "pull_request" ]]; then
+            PR=$(gh api \
+              "/repos/${{ github.repository }}/commits/${TRIGGERING_SHA}/pulls" \
+              --jq '.[0].number // 0')
+          else
+            PR=0
+          fi
+          echo "Resolved PR number: ${PR} (triggering event: ${TRIGGERING_EVENT:-<manual dispatch>})"
           echo "pr_number=${PR}" >> "${GITHUB_OUTPUT}"
 
       # ---------------------------------------------------------------------------
@@ -138,15 +154,25 @@ jobs:
       # name — a `select(.name | endswith(".xml"))` here dropped every artifact.
       # The ingest step globs *.xml in the unzip dir, so non-XML files that come
       # along are simply ignored.
+      #
+      # `--paginate` is required: the artifacts endpoint defaults to 30 per
+      # page, and a run with more jobs than that (e.g. the model-ops-tests /
+      # integration-tests matrices) silently lost every artifact past the
+      # first page, with no error — rows just never showed up in ClickHouse.
+      # `--paginate` applies `--jq` per page and concatenates the filtered
+      # results across pages (`gh api` rejects `--slurp` combined with
+      # `--jq`), so the per-artifact objects come out as a JSON stream, not
+      # a single array; python3 slurps that stream into one array below.
       # ---------------------------------------------------------------------------
       - name: List artifacts from triggering run
         id: list-artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ARTIFACTS=$(gh api \
-            "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/artifacts" \
-            --jq '[.artifacts[] | {id: .id, name: .name}]')
+          ARTIFACTS=$(gh api --paginate \
+            "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/artifacts?per_page=100" \
+            --jq '.artifacts[] | {id: .id, name: .name}' \
+            | python3 -c "import json,sys; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()]))")
           echo "artifacts=$ARTIFACTS" >> "$GITHUB_OUTPUT"
           echo "Found artifacts:"
           echo "$ARTIFACTS" | python3 -c "import json,sys; [print(' •', a['name']) for a in json.load(sys.stdin)]"

@@ -164,8 +164,8 @@ The eager path: the PyTorch dispatcher looks up the `SPYRE` entry in
 its dispatch table for each op and calls the registered Spyre kernel.
 :::
 
-**Compiled path.** When you wrap a model with
-`torch.compile(model, backend="spyre")`, the FX graph passes through
+**Compiled path.** When you place a model on the Spyre device and wrap
+it with `torch.compile(model)`, the FX graph passes through
 the Torch-Spyre Inductor backend, which runs layout propagation,
 work division, and scratchpad planning, then emits a SuperDSC artifact
 that the Deeptools backend turns into a device binary.
@@ -176,7 +176,7 @@ import torch_spyre  # registers the device
 
 model = ...                     # any nn.Module
 model = model.to("spyre")
-compiled = torch.compile(model, backend="spyre")
+compiled = torch.compile(model)  # routed to the Spyre backend by device
 out = compiled(x.to("spyre"))   # this is the fast path
 ```
 
@@ -316,7 +316,7 @@ implementations. Granite 3.3 8B runs in production this way:
 ```python
 from fms.models import get_model
 model = get_model("granite", "3.3-8b-instruct", device_type="spyre")
-compiled = torch.compile(model, backend="spyre")
+compiled = torch.compile(model)
 ```
 
 This describes the state of the stack today and will change as the

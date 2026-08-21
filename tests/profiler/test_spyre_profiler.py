@@ -230,8 +230,8 @@ def test_compiled_kernel_event_keys_match_captured_debug_handles(monkeypatch):
     captures = []
     original_sdsc = SpyreAsyncCompile.sdsc
 
-    def capture_sdsc(self, kernel_name, specs):
-        runner = original_sdsc(self, kernel_name, specs)
+    def capture_sdsc(self, kernel_name, specs, pool_size=0):
+        runner = original_sdsc(self, kernel_name, specs, pool_size=pool_size)
         handles = []
 
         def collect(spec_list):

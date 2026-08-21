@@ -620,6 +620,68 @@ def _plan_tiling_propagation(
                 n for n in reduction_consumer_names if n not in consumer_names
             ]
             if not all_consumer_names and not is_graph_output:
+                # A MutationLayoutSHOULDREMOVE op whose own buffer name isn't
+                # a graph output may still write directly into a graph-input
+                # buffer that is also a graph output (e.g. copy_forced(src, acc)
+                # where acc is both a graph input and the graph output — the
+                # op's own buffer is buf1, but arg0_1/acc is the graph output).
+                # Detect that case and classify as mutation_write_back so
+                # Pass 3 sets output_tiled_dims on the op itself rather than
+                # inserting a separate copy-out.
+                #
+                # IMPORTANT: only trigger for graph-INPUT targets.  A locally-
+                # created buffer that happens to be a graph output must still
+                # go through the normal copy_out path (_insert_copy_op inserts
+                # a coarse_tile_copy_* that advances through the full buffer).
+                # If we classify that as mutation_write_back instead, the op
+                # writes advancing tiles into the local scratch buffer while
+                # the copy-out still reads from it — wrong values every tile
+                # after the first.
+                if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+                    try:
+                        mut_target = op.layout.get_buffer()
+                        mut_target_name = mut_target.get_name()
+                        target_is_graph_input = mut_target_name in V.graph.graph_inputs
+                        _, target_is_output = _find_outside_consumers_planned(
+                            mut_target_name,
+                            info.loop_group_id,
+                            operations,
+                            name_to_group_outer_key,
+                        )
+                    except (AttributeError, TypeError):
+                        target_is_graph_input = False
+                        target_is_output = False
+                        mut_target = None
+                    if (
+                        target_is_graph_input
+                        and target_is_output
+                        and mut_target is not None
+                    ):
+                        full_ranges = _compute_full_ranges_planned(op, info)
+                        info.propagation = PropagationPlan(
+                            kind="mutation_write_back",
+                            full_ranges=full_ranges,
+                            full_strides=tuple(mut_target.layout.stride),
+                            is_graph_output=True,
+                        )
+                        continue
+                    # Locally-created mutation target that IS the graph
+                    # output (not a graph input): per the comment above,
+                    # this must still go through the normal copy_out path,
+                    # patching graph_outputs by the *target's* name (buf_name
+                    # itself never appears there -- see
+                    # PropagationPlan.graph_output_name).
+                    if target_is_output and mut_target is not None:
+                        full_ranges = _compute_full_ranges_planned(op, info)
+                        info.propagation = PropagationPlan(
+                            kind="copy_out",
+                            full_ranges=full_ranges,
+                            full_strides=tuple(op.layout.stride),
+                            outside_consumer_names=(),
+                            is_graph_output=True,
+                            graph_output_name=mut_target_name,
+                        )
+                        continue
                 info.propagation = PropagationPlan(kind="loop_internal")
                 continue
 
@@ -700,7 +762,12 @@ def _log_propagation_plan(
     if not logger.isEnabledFor(logging.DEBUG):
         return
     for group_idx, (group_ops, _levels) in enumerate(groups):
-        tally: dict[str, int] = {"loop_internal": 0, "copy_out": 0, "reduction": 0}
+        tally: dict[str, int] = {
+            "loop_internal": 0,
+            "copy_out": 0,
+            "reduction": 0,
+            "mutation_write_back": 0,
+        }
         for op in group_ops:
             if not isinstance(op, ComputedBuffer):
                 continue
@@ -719,6 +786,14 @@ def _log_propagation_plan(
                     propagation.outside_consumer_names,
                     propagation.is_graph_output,
                 )
+            elif propagation.kind == "mutation_write_back":
+                logger.debug(
+                    "coarse_tile: plan group=%d %s kind=mutation_write_back "
+                    "full_ranges=%s",
+                    group_idx,
+                    op.get_name(),
+                    propagation.full_ranges,
+                )
             elif propagation.kind == "reduction":
                 reduction = propagation.reduction
                 logger.debug(
@@ -734,11 +809,12 @@ def _log_propagation_plan(
                 )
         logger.debug(
             "coarse_tile: plan group=%d tally loop_internal=%d copy_out=%d "
-            "reduction=%d",
+            "reduction=%d mutation_write_back=%d",
             group_idx,
             tally["loop_internal"],
             tally["copy_out"],
             tally["reduction"],
+            tally["mutation_write_back"],
         )
 
 
@@ -1520,7 +1596,7 @@ def _coarse_tile_common(
         if isinstance(op, ComputedBuffer)
         and (info := plan.get(id(op))) is not None
         and info.propagation is not None
-        and info.propagation.kind in ("copy_out", "reduction")
+        and info.propagation.kind in ("copy_out", "reduction", "mutation_write_back")
     }
 
     # Pass 1/2/3 (all above) may have spliced a replacement ComputedBuffer
@@ -1580,16 +1656,21 @@ def validate_writer_tile_advance(operations: list[Operation]) -> None:
         buf_name = op.get_name()
         if propagation.kind == "copy_out":
             writer_name = f"coarse_tile_copy_{buf_name}"
+            writer = name_to_op.get(writer_name)
+            if writer is None:
+                continue
+            writer_info = writer.loop_info  # type: ignore[attr-defined]
         elif propagation.kind == "reduction" and propagation.reduction.is_nested:
             writer_name = f"coarse_tile_reduce_copy_{buf_name}"
+            writer = name_to_op.get(writer_name)
+            if writer is None:
+                continue
+            writer_info = writer.loop_info  # type: ignore[attr-defined]
+        elif propagation.kind == "mutation_write_back":
+            # The op itself IS the writer — check its own output_tiled_dims.
+            writer_info = op.loop_info  # type: ignore[attr-defined]
         else:
             continue
-        writer = name_to_op.get(writer_name)
-        if writer is None:
-            # A missing writer is _log_propagation_self_check's concern
-            # (existence), not this function's (advance correctness).
-            continue
-        writer_info = writer.loop_info  # type: ignore[attr-defined]
         output_tiled_dims = writer_info.output_tiled_dims
         squeezed_advance_output = (
             getattr(writer_info, "squeezed_advance_output", None) or []
@@ -1715,6 +1796,9 @@ def _log_propagation_self_check(
     for name, kind in predicted_kind_by_name.items():
         if kind == "copy_out":
             required = [f"coarse_tile_copy_{name}"]
+        elif kind == "mutation_write_back":
+            # No synthesized buffers — the op itself IS the writer.
+            required = []
         else:
             required = [f"coarse_tile_fill_{name}", f"coarse_tile_combine_{name}"]
         missing = [r for r in required if r not in existing_names]
@@ -1727,10 +1811,15 @@ def _log_propagation_self_check(
     predicted_reduction = sum(
         1 for k in predicted_kind_by_name.values() if k == "reduction"
     )
+    predicted_mutation_write_back = sum(
+        1 for k in predicted_kind_by_name.values() if k == "mutation_write_back"
+    )
     logger.debug(
-        "coarse_tile: self-check predicted copy_out=%d reduction=%d, %d mismatches",
+        "coarse_tile: self-check predicted copy_out=%d reduction=%d "
+        "mutation_write_back=%d, %d mismatches",
         predicted_copy_out,
         predicted_reduction,
+        predicted_mutation_write_back,
         len(mismatches),
     )
     if mismatches:
@@ -1817,9 +1906,62 @@ def _insert_all_write_copy_ops(operations: list[Operation]) -> None:
             continue
         loop_info = getattr(op, "loop_info", None)
         propagation = getattr(loop_info, "propagation", None)
-        if propagation is None or propagation.kind != "copy_out":
+        if propagation is None:
             continue
-        _propagate_tiled_op(op, propagation, operations)
+        if propagation.kind == "copy_out":
+            _propagate_tiled_op(op, propagation, operations)
+        elif propagation.kind == "mutation_write_back":
+            _propagate_mutation_write_back(op, propagation)
+
+
+def _propagate_mutation_write_back(
+    op: ComputedBuffer,
+    propagation: PropagationPlan,
+) -> None:
+    """Set output_tiled_dims on a mutation_write_back op.
+
+    The op already carries MutationLayoutSHOULDREMOVE targeting a
+    graph-output buffer (e.g. copy_forced(src, acc) where acc is both a graph
+    input and the graph output).  Its MutationLayout write IS the cross-tile
+    write-back -- no separate copy op is needed, no full buffer allocation,
+    no graph-output patching.
+
+    The only missing piece is output_tiled_dims: _apply_plan left it as []
+    because the op looked loop_internal to the planner (its own buffer name
+    was not in graph outputs).  We set it now using the same
+    write_level_extents math _insert_copy_op uses for its copy-out write
+    side: the op's data.ranges are already divided, so the per-level extent
+    for each tiled dim is the divided range times the product of all
+    inner-level trip counts.
+    """
+    loop_info = op.loop_info  # type: ignore[attr-defined]
+    op_ranges = list(op.data.ranges)  # already divided by _apply_plan
+
+    write_level_extents: list[dict[int, sympy.Expr]] = [
+        {} for _ in loop_info.loop_tiled_dims
+    ]
+    for d in {d for level in loop_info.loop_tiled_dims for d in level}:
+        levels_tiling_d = [
+            i for i, dims in enumerate(loop_info.loop_tiled_dims) if d in dims
+        ]
+        running = sympy.sympify(op_ranges[d])
+        for level_idx in reversed(levels_tiling_d):
+            write_level_extents[level_idx][d] = running
+            running = running * loop_info.loop_count[level_idx]
+
+    write_deps = [
+        dep for dep in op.get_read_writes().writes if isinstance(dep, MemoryDep)
+    ]
+    output_tiled_dims = (
+        _tiled_dims_for_dep(write_deps[0], write_level_extents) if write_deps else []
+    )
+    loop_info.output_tiled_dims = output_tiled_dims
+
+    logger.debug(
+        "coarse_tile: mutation_write_back %s output_tiled_dims=%s",
+        op.get_name(),
+        output_tiled_dims,
+    )
 
 
 def _propagate_tiled_op(
@@ -1891,7 +2033,7 @@ def _propagate_tiled_op(
     )
     _patch_consumers(outside_consumers, buf_name, full_name, operations, retile_info)
     if is_graph_output:
-        _patch_graph_outputs(buf_name, full_buf)
+        _patch_graph_outputs(propagation.graph_output_name or buf_name, full_buf)
 
     logger.debug(
         "coarse_tile: write copy-out %s -> %s old_stride=%s new_stride=%s "
@@ -2315,7 +2457,31 @@ def _insert_copy_op(
     V.graph.name_to_buffer[copy_name] = copy_buf
 
     tiled_idx = operations.index(tiled_op)
-    operations.insert(tiled_idx + 1, copy_buf)
+    tiled_op_name = tiled_op.get_name()
+    outer_key = tiled_op.loop_info.loop_group_id[0]  # type: ignore[attr-defined]
+
+    # The copy-out must come AFTER any mutation ops in the same loop group
+    # that write into tiled_op's scratch buffer (e.g. copy_forced with
+    # MutationLayoutSHOULDREMOVE targeting tiled_op). Insert after the last
+    # such mutation, not immediately after tiled_op.
+    insert_after_idx = tiled_idx
+    for i, op in enumerate(operations):
+        if i <= tiled_idx:
+            continue
+        if not isinstance(op, ComputedBuffer):
+            continue
+        op_outer_key = getattr(getattr(op, "loop_info", None), "loop_group_id", (None,))
+        if not op_outer_key or op_outer_key[0] != outer_key:
+            break
+        if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+            try:
+                mutation_target = op.layout.get_buffer().get_name()
+            except Exception:
+                mutation_target = None
+            if mutation_target == tiled_op_name:
+                insert_after_idx = i
+
+    operations.insert(insert_after_idx + 1, copy_buf)
 
 
 class _NameSwapHandler(WrapperHandler):
@@ -3714,8 +3880,7 @@ def _patch_consumers(
     if not consumers or old_name == new_name:
         return
 
-    from ..insert_restickify import NameSwapHandler
-    from ..pass_utils import replace_computed_buffer_body
+    from ..pass_utils import NameSwapHandler, replace_computed_buffer_body
 
     name_map = {old_name: new_name}
     has_retile = (

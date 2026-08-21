@@ -23,11 +23,14 @@ import sympy
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec
-from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, format_op_spec_list
+from torch_spyre._inductor.constants import MAX_POOL_SIZE_BYTES
 from torch_spyre._inductor.logging_utils import get_inductor_logger
+from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, format_op_spec_list
+from torch_spyre._inductor.op_spec_validation import validate_op_specs
 
 
 logger = get_inductor_logger("sdsc_compile")
+sdsc_log = get_inductor_logger("sdsc")
 
 # ---------------------------------------------------------------------------
 # Types
@@ -57,6 +60,7 @@ def generate_bundle(
     kernel_name: str,
     output_dir: str,
     specs: Sequence,
+    pool_size: int = 0,
 ):
     """Output the SDSC Bundle for the OpSpecs in output_dir.
 
@@ -75,6 +79,13 @@ def generate_bundle(
     the KTIR emitter path, which is gated separately). Running this
     function with the flag off would silently miscompile addresses rather
     than error, so it's rejected up front instead.
+
+    ``pool_size`` is the byte count for this bundle's HBM pool (from
+    ``hbm_pool_planning.py`` via ``SpyreKernel.pool_size``). Ignored unless
+    a pool symbol is present in ``specs``. When a pool symbol is present,
+    it is emitted as ``%pool = sdscbundle.device_mem_allocate <pool_size>
+    bytes : index`` as the first statement of the bundle body — there is
+    no ``%pool_base_addr`` function parameter.
     """
     if not _spyre_config.bundle_symbolic_args:
         raise AssertionError(
@@ -87,6 +98,8 @@ def generate_bundle(
 
     specs_list: list = list(specs)
 
+    if _spyre_config.validate_op_specs:
+        validate_op_specs(specs_list, stage="before_bundle_generation")
     if logger.isEnabledFor(logging.INFO):
         logger.info(
             "OP SPECS FOR BUNDLE GENERATION\n%s",
@@ -219,15 +232,14 @@ def generate_bundle(
         f.write("module {\n")
 
         # Function signature:
-        #   - optional leading %pool_base_addr param for pool-allocated tensors
         #   - one !sdscbundle.input_arg<index> param per kernel tensor arg
         #   - one !sdscbundle.input_arg<index, granularity=G, max_value=M> param
         #     per unique dynamic-shape (mark_dynamic) symbol; emitted whenever
         #     present.
-        if has_pool or kernel_arg_sym_indices or dimension_sym_indices:
+        # Pool allocation is emitted in the body as device_mem_allocate,
+        # not as a function parameter.
+        if kernel_arg_sym_indices or dimension_sym_indices:
             params = []
-            if has_pool:
-                params.append("%pool_base_addr: !sdscbundle.input_arg<index>")
             for sym_idx in kernel_arg_sym_indices:
                 ai = symbol_kinds[sym_idx].arg_index
                 params.append(f"%arg_{ai}_base_addr: !sdscbundle.input_arg<index>")
@@ -237,26 +249,32 @@ def generate_bundle(
                     f"{dim_param_names[sym_idx]}_base: {_dim_input_arg_type(dim_sk)}"
                 )
             f.write(f"\tfunc.func @sdsc_bundle({', '.join(params)}) {{\n")
-            if has_pool:
-                f.write(
-                    "\t\t%pool = sdscbundle.input_arg_extract value from"
-                    " %pool_base_addr : !sdscbundle.input_arg<index> -> index\n"
-                )
-            for sym_idx in kernel_arg_sym_indices:
-                ai = symbol_kinds[sym_idx].arg_index
-                f.write(
-                    f"\t\t%arg_{ai} = sdscbundle.input_arg_extract value from"
-                    f" %arg_{ai}_base_addr : !sdscbundle.input_arg<index> -> index\n"
-                )
-            for sym_idx in dimension_sym_indices:
-                dim_sk = symbol_kinds[sym_idx]
-                name = dim_param_names[sym_idx]
-                f.write(
-                    f"\t\t{name} = sdscbundle.input_arg_extract value from"
-                    f" {name}_base : {_dim_input_arg_type(dim_sk)} -> index\n"
-                )
         else:
             f.write("\tfunc.func @sdsc_bundle() {\n")
+
+        assert not has_pool or 0 < pool_size <= MAX_POOL_SIZE_BYTES, (
+            f"generate_bundle: pool_size={pool_size} out of range "
+            f"(0, {MAX_POOL_SIZE_BYTES}] for a bundle with a pool symbol present"
+        )
+        if has_pool:
+            f.write(
+                f"\t\t%pool = sdscbundle.device_mem_allocate {pool_size} bytes"
+                " : index\n"
+            )
+
+        for sym_idx in kernel_arg_sym_indices:
+            ai = symbol_kinds[sym_idx].arg_index
+            f.write(
+                f"\t\t%arg_{ai} = sdscbundle.input_arg_extract value from"
+                f" %arg_{ai}_base_addr : !sdscbundle.input_arg<index> -> index\n"
+            )
+        for sym_idx in dimension_sym_indices:
+            dim_sk = symbol_kinds[sym_idx]
+            name = dim_param_names[sym_idx]
+            f.write(
+                f"\t\t{name} = sdscbundle.input_arg_extract value from"
+                f" {name}_base : {_dim_input_arg_type(dim_sk)} -> index\n"
+            )
 
         # Standard loop constants (only emitted when there are loops).
         if loop_bounds:
@@ -404,6 +422,11 @@ def generate_bundle(
         f.write("\t}\n")
         f.write("}\n")
 
+    if sdsc_log.isEnabledFor(logging.INFO):
+        bundle_path = os.path.join(output_dir, "bundle.mlir")
+        with open(bundle_path, "r") as bf:
+            sdsc_log.info("BUNDLE MLIR [bundle.mlir]\n%s", bf.read())
+
 
 # ---------------------------------------------------------------------------
 # Pass 1 helpers
@@ -448,6 +471,12 @@ def _compile_specs(
             with open(os.path.join(output_dir, file_name), "w") as f:
                 logger.info(f"Generating {f.name}")
                 json.dump(sdsc_json, f, indent=2)
+            if sdsc_log.isEnabledFor(logging.INFO):
+                sdsc_log.info(
+                    "SDSC JSON [%s]\n%s",
+                    file_name,
+                    json.dumps(sdsc_json, indent=2),
+                )
         # UnimplementedOp and other types are silently skipped.
 
 

@@ -5,6 +5,8 @@
 :maxdepth: 2
 
 inductor_artifacts
+unified_logging_framework
+op_spec_lab
 ```
 
 **Scope:** correctness — *why is the result wrong?* For performance
@@ -28,6 +30,9 @@ from the outside in:
    the report files are still available
 4. **Inspect compiler artifacts** — trace the issue through the
    compilation pipeline (FX Graph → Loop IR → `sdsc_<index>.json`)
+5. **Replay the OpSpec on its own** — capture the failing kernel as a
+   standalone script and run just the back-end half of the compile
+   ([The OpSpec Lab](op_spec_lab.md))
 
 ---
 
@@ -62,6 +67,7 @@ The following environment variables control the level of diagnostic output:
 | `SPYRE_INDUCTOR_LOG_LEVEL=DEBUG` | *Deprecated.* Use `TORCH_LOGS="+torch_spyre.inductor"` instead (DEBUG level) |
 | `SPYRE_LOG_FILE=path/to/file.log` | Redirect Spyre Inductor log output to a file |
 | `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 warnings |
+| `SPYRE_VALIDATE_OP_SPECS` | OpSpec invariant checking at each pipeline stage boundary (after creation, simplification, and before bundle generation). Enabled by default; set to `0` to disable. Catches invalid specs early with descriptive errors |
 | `TORCH_LOGS="+inductor"` | PyTorch provided tool to selectively enable Inductor or other parts of the `torch.compile` to the log |
 
 ### Programmatic Logging Control

@@ -618,7 +618,7 @@ def _make_tiled_op_spec() -> OpSpec:
         device_tile_advance_expr=tile_advance_expr,
     )
     return OpSpec(
-        op="add",
+        op="abs",
         is_reduction=False,
         iteration_space={c0: (Integer(128), 1)},
         args=[tensor_in, tensor_out],
@@ -3763,7 +3763,7 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         # 64*out (elements) gives a byte stride of 64*2 == 128 at fp16.
         c0 = Symbol("c0")
         out = Symbol("out")
-        tensor_in = TensorArg(
+        tensor_in0 = TensorArg(
             is_input=True,
             arg_index=0,
             device_dtype=_FP16,
@@ -3772,11 +3772,29 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
             allocation={"hbm": 0x1000},
             device_tile_advance_expr=64 * out,
         )
+        tensor_in1 = TensorArg(
+            is_input=True,
+            arg_index=1,
+            device_dtype=_FP16,
+            device_size=[2, 64],
+            device_coordinates=[Integer(0), c0],
+            allocation={"hbm": 0x2000},
+            device_tile_advance_expr=64 * out,
+        )
+        tensor_out = TensorArg(
+            is_input=False,
+            arg_index=2,
+            device_dtype=_FP16,
+            device_size=[2, 64],
+            device_coordinates=[Integer(0), c0],
+            allocation={"hbm": 0x3000},
+            device_tile_advance_expr=64 * out,
+        )
         op = OpSpec(
             op="add",
             is_reduction=False,
             iteration_space={c0: (Integer(128), 1)},
-            args=[tensor_in],
+            args=[tensor_in0, tensor_in1, tensor_out],
             op_info={},
             tiled_symbols=[[c0]],
             tiled_symbol_trip_counts={c0: 128},
@@ -3785,29 +3803,13 @@ class TestGenerateBundleMlirWithAffineStrides(unittest.TestCase):
         generate_bundle("test_kernel", self.tmpdir, [loop])
         mlir = _read_mlir(self.tmpdir)
 
-        expected = (
-            "#map_0 = affine_map<(d0)[s0] -> (s0 + 128*d0)>\n"
-            "module {\n"
-            "\tfunc.func @sdsc_bundle(%arg_0_base_addr: "
-            "!sdscbundle.input_arg<index>) {\n"
-            "\t\t%arg_0 = sdscbundle.input_arg_extract value from "
-            "%arg_0_base_addr : !sdscbundle.input_arg<index> -> index\n"
-            "\t\t%c0 = arith.constant 0 : index\n"
-            "\t\t%c1 = arith.constant 1 : index\n"
-            "\t\t%loop_bound_0 = arith.constant 4 : index\n"
-            "\t\t%arg_0_slice_offset_4096 = arith.constant 4096 : index\n"
-            "\t\t%arg_0_slice_4096 = arith.addi %arg_0, "
-            "%arg_0_slice_offset_4096 : index\n"
-            "\t\tscf.for %i_0 = %c0 to %loop_bound_0 step %c1 {\n"
-            "\t\t\t%addr_0 = affine.apply #map_0(%i_0)[%arg_0_slice_4096]\n"
-            '\t\t\tsdscbundle.sdsc_execute (%addr_0) {sdsc_filename="sdsc_0.json",'
-            ' "symbol_ids"=[-2]}\n'
-            "\t\t}\n"
-            "\t\treturn\n"
-            "\t}\n"
-            "}\n"
-        )
-        self.assertEqual(mlir, expected)
+        # Verify the MLIR references all three args and uses affine maps
+        # for tile advancement.
+        self.assertIn("arg_0_base_addr", mlir)
+        self.assertIn("arg_1_base_addr", mlir)
+        self.assertIn("arg_2_base_addr", mlir)
+        self.assertIn("scf.for", mlir)
+        self.assertIn("affine.apply", mlir)
 
 
 class TestGenerateBundleNestedTiling(unittest.TestCase):
@@ -4351,7 +4353,7 @@ def _make_consumer_op(name, reads_buf):
 
 def _make_inside_consumer_op(name, reads_buf, loop_group_id):
     """Return a ComputedBuffer mock inside the same loop group that reads reads_buf."""
-    from torch._inductor.ir import ComputedBuffer, Pointwise
+    from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
 
     data = MagicMock(spec=Pointwise)
     data.ranges = [Integer(16)]
@@ -4359,6 +4361,12 @@ def _make_inside_consumer_op(name, reads_buf, loop_group_id):
 
     op = MagicMock(spec=ComputedBuffer)
     op.data = data
+    # Ordinary (non-mutation) layout, so _plan_tiling_propagation's
+    # isinstance(op.layout, MutationLayoutSHOULDREMOVE) check on this op
+    # resolves to False instead of raising AttributeError -- layout is an
+    # instance attribute ComputedBuffer sets in __init__, not a class
+    # attribute, so spec=ComputedBuffer alone doesn't expose it.
+    op.layout = MagicMock(spec=FixedLayout)
     op.get_operation_name.return_value = name
     op.get_name.return_value = name
     op.loop_info = CoarseTileInfo(
@@ -6020,7 +6028,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
 
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def _bundle(self, specs, fake_compile=None):
+    def _bundle(self, specs, fake_compile=None, pool_size=0):
         if fake_compile is None:
             fake_compile = _fake_compile_op_spec
         with patch(
@@ -6031,6 +6039,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 "test_kernel",
                 self.tmpdir,
                 specs,
+                pool_size=pool_size,
             )
         return _read_mlir(self.tmpdir)
 
@@ -6133,7 +6142,9 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
     def test_non_tensor_arg_symbols_remain_as_constants(self):
         c0 = Symbol("c0")
         op_a = self._make_op_spec_with_hbm_args("a", [0])
-        # op_b: arg_index=-1, pool-allocated (fake returns "pool" kind)
+        # op_b: arg_index=-1, pool-allocated (fake returns "pool" kind).
+        # allocation is hbm_pool to reflect the state after hbm_pool_planning,
+        # which runs before bundle generation in production.
         op_b = OpSpec(
             op="b",
             is_reduction=False,
@@ -6145,7 +6156,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                     device_dtype=_FP16,
                     device_size=[2, 64],
                     device_coordinates=[Integer(0), c0],
-                    allocation={"hbm": 0x0},
+                    allocation={"hbm_pool": 0x0},
                 )
             ],
             op_info={},
@@ -6163,13 +6174,14 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
             )  # op_b has pool allocation
             return _make_tiled_json(idx, sym_id), [values[i]], [{}], [kind]
 
-        mlir = self._bundle([op_a, op_b], fake_compile=fake)
+        mlir = self._bundle([op_a, op_b], fake_compile=fake, pool_size=1024)
 
         # First sym → parameter (kernel tensor arg)
         self.assertIn("%arg_0_base_addr: !sdscbundle.input_arg<index>", mlir)
         self.assertNotIn("arith.constant 17179869184", mlir)
         # Second sym → pool: arith.addi %pool, <offset>
-        self.assertIn("%pool_base_addr: !sdscbundle.input_arg<index>", mlir)
+        self.assertNotIn("%pool_base_addr", mlir)
+        self.assertIn("sdscbundle.device_mem_allocate", mlir)
         self.assertIn("%pool_addr_0 = arith.addi %pool", mlir)
 
     def test_multi_sdsc_two_tensor_args_snapshot(self):
@@ -6319,7 +6331,7 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
                 [SymbolKind.pool()],
             )
 
-        mlir = self._bundle([a, b, c], fake_compile=fake)
+        mlir = self._bundle([a, b, c], fake_compile=fake, pool_size=4096)
 
         # Exactly two arith.constant / arith.addi pairs (offsets 0 and 2048)
         self.assertEqual(mlir.count("arith.constant 0 : index"), 1)

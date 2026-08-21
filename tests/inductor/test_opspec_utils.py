@@ -35,6 +35,9 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     _iteration_space_key,
     align_reshape_plan,
     buf_id,
+    core_divisions,
+    per_core_extent,
+    reduced_axes,
     row_major_strides,
 )
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
@@ -197,6 +200,108 @@ class TestAlignReshapePlan(unittest.TestCase):
                 [d, sympy.Mod(c, 64)],
                 [4, 64],
             )
+
+
+class TestCoreDivisions(unittest.TestCase):
+    """The grid, read off the iteration space's per-symbol work division."""
+
+    def test_undivided_is_one_core(self):
+        d0, d1 = sympy.symbols("d0 d1")
+        self.assertEqual(core_divisions({d0: (16, 1), d1: (512, 1)}), ([], 1))
+
+    def test_one_divided_symbol_owns_the_whole_grid(self):
+        d0, d1 = sympy.symbols("d0 d1")
+        divisions, cores = core_divisions({d0: (16, 1), d1: (512, 32)})
+        self.assertEqual(cores, 32)
+        self.assertEqual(divisions, [(d1, 32, 1)])
+
+    def test_two_divided_symbols_are_mixed_radix_innermost_first(self):
+        """``inner`` is the grid stride of one step of that symbol, so the flat
+        id decodes as ``(id // inner) % div``."""
+        d0, d1 = sympy.symbols("d0 d1")
+        divisions, cores = core_divisions({d0: (16, 2), d1: (512, 4)})
+        self.assertEqual(cores, 8)
+        self.assertEqual(divisions, [(d1, 4, 1), (d0, 2, 4)])
+
+
+class TestPerCoreExtent(unittest.TestCase):
+    """One core's share of each device axis, and which division it follows."""
+
+    @staticmethod
+    def _arg(size, coords):
+        return TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=size,
+            device_coordinates=coords,
+            allocation={"hbm": None},
+            name="arg0",
+        )
+
+    def test_undivided_is_the_whole_extent(self):
+        d0, d1 = sympy.symbols("d0 d1")
+        arg = self._arg([16, 512, 64], [d0, d1, sympy.Mod(d1, 64)])
+        self.assertEqual(per_core_extent(arg, {}), ([16, 512, 64], [None, None, None]))
+
+    def test_a_divided_axis_shrinks_and_names_its_symbol(self):
+        d0, d1 = sympy.symbols("d0 d1")
+        arg = self._arg([16, 512, 64], [d0, d1, sympy.Mod(d1, 64)])
+        self.assertEqual(
+            per_core_extent(arg, {d1: 32}), ([16, 16, 64], [None, d1, None])
+        )
+
+    def test_the_within_stick_axis_is_never_divided(self):
+        """A stick is the unit of transfer, so the last axis keeps its extent even
+        when its symbol is divided."""
+        d0 = sympy.symbols("d0")
+        arg = self._arg([32, 64], [sympy.floor(d0 / 64), sympy.Mod(d0, 64)])
+        self.assertEqual(per_core_extent(arg, {d0: 32}), ([1, 64], [d0, None]))
+
+    def test_a_ragged_division_raises(self):
+        d0, d1 = sympy.symbols("d0 d1")
+        arg = self._arg([16, 512, 64], [d0, d1, sympy.Mod(d1, 64)])
+        with self.assertRaises(NotImplementedError):
+            per_core_extent(arg, {d1: 7})
+
+
+class TestReducedAxes(unittest.TestCase):
+    """Which input axes a reduction consumes, read from the coordinates."""
+
+    def test_the_placeholder_axis_is_the_reduced_one(self):
+        """``sum(x[256, 2048], dim=0)`` as projected: the reduced axis survives in
+        the output as a unit extent at a constant coordinate."""
+        lanes, rows = sympy.symbols("c0 c1")
+        stick, lane = sympy.floor(lanes / 64), sympy.Mod(lanes, 64)
+        reduced, placeholder = reduced_axes(
+            [stick, rows, lane],
+            [32, 256, 64],
+            [sympy.Integer(0), stick, lane],
+            [1, 32, 64],
+        )
+        self.assertEqual(reduced, (1,))  # the 256 rows
+        self.assertEqual(placeholder, (0,))
+
+    def test_a_dropped_axis_needs_no_placeholder(self):
+        """The same reduction with the output already at rank 2."""
+        lanes, rows = sympy.symbols("c0 c1")
+        stick, lane = sympy.floor(lanes / 64), sympy.Mod(lanes, 64)
+        self.assertEqual(
+            reduced_axes([stick, rows, lane], [32, 256, 64], [stick, lane], [32, 64]),
+            ((1,), ()),
+        )
+
+    def test_nothing_reduced_raises(self):
+        lanes, rows = sympy.symbols("c0 c1")
+        with self.assertRaises(NotImplementedError):
+            reduced_axes([rows, lanes], [256, 64], [rows, lanes], [256, 64])
+
+    def test_a_resized_surviving_axis_raises(self):
+        """A kept axis whose extent changed is not a reduction of the other axes."""
+        lanes, rows = sympy.symbols("c0 c1")
+        stick, lane = sympy.floor(lanes / 64), sympy.Mod(lanes, 64)
+        with self.assertRaises(NotImplementedError):
+            reduced_axes([stick, rows, lane], [32, 256, 64], [stick, lane], [16, 64])
 
 
 if __name__ == "__main__":

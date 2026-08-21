@@ -9,6 +9,7 @@ debugging, and worked examples.
    :maxdepth: 2
 
    running_models
+   running_hf_models
    supported_operations
    tensors_and_layouts
    profiling/index

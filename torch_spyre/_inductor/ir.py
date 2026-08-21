@@ -516,6 +516,65 @@ class BroadcastAsyncFallback(ir.ExternKernel):
         V.graph.register_operation(self)
 
 
+class AllGatherAsyncFallback(ir.ExternKernel):
+    """IR node for spyre.all_gather_async.
+
+    Starts the all_gather operation asynchronously and returns immediately.
+    Output tensor has shape[0] = input.shape[0] * group_size.
+    """
+
+    def codegen(self, wrapper: PythonWrapperCodegen) -> None:
+        input_tensor = self.inputs[0]
+        input_name = input_tensor.codegen_reference()
+
+        group_size, group_name = self.constant_args
+
+        output_name = self.get_name()
+        generated_code = (
+            f"{output_name} = torch.ops.spyre.all_gather_async("
+            f"{input_name}, {group_size}, '{group_name}')"
+        )
+
+        logger.debug(
+            f"Codegen all_gather_async: {input_name} -> {output_name} "
+            f"(group_size={group_size}, group='{group_name}')"
+        )
+
+        wrapper.writeline(generated_code)
+
+    def should_allocate(self) -> bool:
+        return False
+
+    def get_mutation_names(self) -> Sequence[str]:
+        return []
+
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
+
+    def __init__(
+        self,
+        op_overload: torch._ops.OpOverload,
+        x: IRNode,
+        group_size: int,
+        group_name: str,
+    ) -> None:
+        in_layout = x.get_layout()
+        out_size = list(in_layout.size)
+        out_size[0] = out_size[0] * group_size
+        out_stride = ir.FlexibleLayout.contiguous_strides(out_size)
+        layout = FixedLayout(in_layout.device, in_layout.dtype, out_size, out_stride)
+        super().__init__(
+            None,
+            layout,
+            [x],
+            (group_size, group_name),
+            python_kernel_name="torch.ops.spyre.all_gather_async",
+            op_overload=op_overload,
+        )
+        self.name = V.graph.register_buffer(self)
+        V.graph.register_operation(self)
+
+
 class AllReduceAsyncFallback(ir.ExternKernel):
     """IR node for spyre.all_reduce_async.
 
