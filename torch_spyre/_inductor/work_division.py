@@ -450,11 +450,7 @@ def raise_if_per_core_overflow(
 ) -> None:
     """Raise Unsupported if any tensor's per-core memory span exceeds MAX_SPAN_BYTES.
 
-    Indirectly-accessed tensors (gather value tables / scatter destinations)
-    are skipped: every core addresses the same shared table at a runtime-chosen
-    row, so the table's full extent is not actually resident per-core and the
-    hardware span limit does not apply to it -- only to the tensors each core
-    slices by its own committed splits. See issue #3637.
+    Indirectly-accessed tensors (shared gather/scatter tables) are skipped.
     """
     for td in tensor_deps:
         if _is_indirectly_accessed(td):
