@@ -382,6 +382,7 @@ class TestConvSpatialBlockedVars(unittest.TestCase):
         mb, out, i, j = (_isym(name) for name in ("mb", "out", "i", "j"))
         output_td = _tensor_dep("conv_out", (2, 32, 32, 32), (mb, out, i, j))
         splits, output_dims, _ = _default_split(
+            _computed_buffer((2, 32, 32, 32), name="conv_out"),
             {mb: 2, out: 32, i: 32, j: 32},
             output_td,
             {},
@@ -726,7 +727,7 @@ class TestTopKConstraints(unittest.TestCase):
 
 class TestIndirectAccessSplitDomains(unittest.TestCase):
     _PATCH_TARGET = (
-        "torch_spyre._inductor.work_division_constraints.indirect_info_from_op"
+        "torch_spyre._inductor.work_division_constraints.indirect_forbidden_split_syms"
     )
 
     _PLACEHOLDER_OP = _computed_buffer((128,), name="indirect_placeholder_buf")
@@ -734,26 +735,22 @@ class TestIndirectAccessSplitDomains(unittest.TestCase):
         "indirect_placeholder_buf", (128,), (_isym("_placeholder"),)
     )
 
-    def test_indirect_op_pins_every_dim_to_one(self):
-        i0, i1 = _isym("i0"), _isym("i1")
+    def test_restricts_only_indirect_forbidden_dims(self):
+        data_dim, partial_entry = _isym("data_dim"), _isym("partial_entry")
         ctx = _make_context(
             self._PLACEHOLDER_OP,
             self._PLACEHOLDER_TD,
-            it_space_adjusted={i0: 4, i1: 8},
+            it_space_adjusted={data_dim: 4, partial_entry: 8, _isym("entry"): 16},
         )
-        with patch(self._PATCH_TARGET, return_value=(["value"], None, None)):
+        with patch(self._PATCH_TARGET, return_value={data_dim, partial_entry}):
             result = indirect_access_split_domains(ctx)
         self.assertEqual(
-            result.allowed_splits, {i0: frozenset({1}), i1: frozenset({1})}
+            result.allowed_splits,
+            {data_dim: frozenset({1}), partial_entry: frozenset({1})},
         )
 
-    def test_non_indirect_op_yields_no_pins(self):
-        i0, i1 = _isym("i0"), _isym("i1")
-        ctx = _make_context(
-            self._PLACEHOLDER_OP,
-            self._PLACEHOLDER_TD,
-            it_space_adjusted={i0: 4, i1: 8},
-        )
-        with patch(self._PATCH_TARGET, return_value=([], None, None)):
+    def test_non_indirect_op_yields_no_domains(self):
+        ctx = _make_context(self._PLACEHOLDER_OP, self._PLACEHOLDER_TD)
+        with patch(self._PATCH_TARGET, return_value=set()):
             result = indirect_access_split_domains(ctx)
         self.assertEqual(result.allowed_splits, {})

@@ -26,7 +26,6 @@ from unittest.mock import patch
 import torch
 from torch._inductor.dependencies import MemoryDep
 from torch.testing._internal.common_utils import run_tests, TestCase
-from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import TensorWorkDivision
 from torch_spyre._inductor.pass_utils import (
     apply_splits_from_index_coeff,
@@ -188,15 +187,6 @@ class TestItSpaceSplits(TestCase):
         )
         # s1 must NOT receive the split=4 meant for s0
         self.assertEqual(recovered, {s0: 4, s1: 1, s2: 1})
-
-    def test_ambiguous_coefficient_splits_rejected(self):
-        index = 8 * i0 + 8 * i1
-        for splits in ({i0: 4, i1: 2},):
-            with (
-                self.subTest(splits=splits),
-                self.assertRaisesRegex(Unsupported, "distinct splits"),
-            ):
-                splits_by_index_coeff(splits, index, index)
 
     def test_broadcast_dim_not_assigned_split(self):
         # Broadcast dim has stride 0 — coeff==0, so absent from stored splits

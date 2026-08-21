@@ -502,7 +502,10 @@ dim's stick count (those would abort the SuperDSC bundler) or that land on a
 collapsed/broadcast dim. The upstream seed is already stick-valid from work
 division. Every candidate, including the seed, must satisfy hard
 work-division constraints: blocked axes remain unsplit and split domains
-restrict legal factors.
+restrict legal factors. Candidate storage is coefficient-keyed so it survives
+scheduler symbol renaming. An alternative whose non-unity factors cannot be
+represented by those keys is skipped; LX retains upstream work division when
+no representable alternative remains.
 
 **Pointwise ops** get their seed, dim-flip variants (move the seed's
 single output-dim factor onto each compatible alternative output dim,

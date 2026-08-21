@@ -379,10 +379,10 @@ For each remaining op, `work_distribution_pass` does three things:
    Pass 1) for additional core assignment via `prioritize_dimensions`:
    output dimensions first by decreasing stick-adjusted size, reduction
    dimensions last. At most one reduction dimension is eligible for
-   splitting, the one that maximises
-   `core_split(size, remaining_cores)` after output dimensions have
-   absorbed their share of cores. If Pass 1 already committed a
-   reduction split, no further reduction dimensions are eligible.
+   splitting, selecting largest reachable legal factor within remaining core
+   budget after output dimensions have absorbed their share of cores. If Pass 1
+   already committed a reduction split, no further reduction dimensions are
+   eligible.
 3. It distributes all `max_cores` across committed and priority
    dimensions with `multi_dim_iteration_space_split`. The function
    first applies the committed splits as minimum requirements, then

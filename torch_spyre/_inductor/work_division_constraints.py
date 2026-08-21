@@ -41,7 +41,11 @@ from .constants import (
     TOPK_OPS,
 )
 from .errors import Unsupported
-from .pass_utils import concretize_expr, indirect_info_from_op, op_read_writes
+from .pass_utils import (
+    concretize_expr,
+    indirect_forbidden_split_syms,
+    op_read_writes,
+)
 from .logging_utils import get_inductor_logger
 from . import config
 
@@ -298,15 +302,15 @@ def topk_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
 
 
 def indirect_access_split_domains(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Restrict every dim to split=1 for indirect-access operations.
+    """Keep indirect shared-data and unsafe partial-stick dims unsplit.
 
-    The backend's indirect-addressing path runs single-core: an indexed
-    dimension's coordinate depends on runtime data, not a static per-core
-    offset, so the generic per-core span/coordinate arithmetic does not apply.
+    A gather value table and scatter destination have one shared base on every
+    core. Their data dims must therefore stay at split=1. A partial index stick
+    also stays unsplit unless gather-output padding made its entry slices
+    stick-aligned. Other index-entry dims remain available for multicore work.
     """
-    dep_names, _, _ = indirect_info_from_op(ctx.op)
-    if not dep_names:
-        return ConstraintResult()
     return ConstraintResult(
-        allowed_splits={v: frozenset({1}) for v in ctx.it_space_adjusted}
+        allowed_splits={
+            sym: frozenset({1}) for sym in indirect_forbidden_split_syms(ctx.op)
+        }
     )

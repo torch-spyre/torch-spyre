@@ -53,6 +53,7 @@ from .op_spec import IndirectAccess
 from .pass_utils import (
     SchedNodeArg,
     apply_splits_from_index_coeff,
+    select_work_division_transport_indexes,
     compute_granularity,
     compute_max_size,
     concretize_expr,
@@ -684,6 +685,30 @@ def must_split_vars(
     return accumulated_splits
 
 
+def prioritize_indirect_scatter_dimensions(
+    op: ComputedBuffer,
+    output: TensorDep,
+    it_space_adjusted: dict[Symbol, Expr],
+    symbol_meta: SymbolMeta | None = None,
+) -> tuple[list[Symbol], list[Symbol]]:
+    """Prioritize overwrite-scatter entry dims as output work.
+
+    Scatter's runtime-selected destination row hides its entry dims from output
+    coordinates. They otherwise look like reductions and never split for this
+    non-reduction op. This is priority policy, not a legality constraint.
+    """
+    output_dims, reduction_dims = prioritize_dimensions(
+        output, it_space_adjusted, symbol_meta
+    )
+    from .pass_utils import indirect_store_entry_syms
+
+    entry_dims = indirect_store_entry_syms(op)
+    promoted = [dim for dim in reduction_dims if dim in entry_dims]
+    return promoted + output_dims, [
+        dim for dim in reduction_dims if dim not in entry_dims
+    ]
+
+
 def prioritize_dimensions(
     output: TensorDep,
     it_space_adjusted: dict[Symbol, Expr],
@@ -891,8 +916,12 @@ def work_division_split_is_legal(
 
     it_space = iteration_space_from_op(op)
     rw = op_read_writes(op)
-    write_index = next(iter(rw.writes)).index
-    read_index = next((dep.index for dep in rw.reads), write_index)
+    try:
+        write_index, read_index = select_work_division_transport_indexes(
+            op, rw, it_space
+        )
+    except Unsupported:
+        return False
     per_symbol = apply_splits_from_index_coeff(
         splits, write_index, read_index, it_space
     )
@@ -1162,6 +1191,7 @@ def span_reduction_pass(
 
 
 def _default_split(
+    op: ComputedBuffer,
     it_space_adjusted: dict[Symbol, Expr],
     output_td: TensorDep,
     committed_splits: dict[Symbol, int],
@@ -1175,8 +1205,8 @@ def _default_split(
     Returns the chosen splits and the (output, reduction) priority dims the
     caller logs. Shared by work_distribution_pass and cost_model_matmul_division.
     """
-    output_dims, reduction_dims = prioritize_dimensions(
-        output_td, it_space_adjusted, symbol_meta
+    output_dims, reduction_dims = prioritize_indirect_scatter_dimensions(
+        op, output_td, it_space_adjusted, symbol_meta
     )
 
     # If span reduction already committed a reduction split, grow only that
@@ -1297,6 +1327,7 @@ def work_distribution_pass(
             return
 
     splits, output_dims, reduction_dims = _default_split(
+        op,
         it_space_adjusted,
         output_td,
         committed_splits,
@@ -1857,6 +1888,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     blocked = constraint_result.blocked
     allowed_splits = constraint_result.allowed_splits
     default_splits, _, _ = _default_split(
+        op,
         it_space_adjusted,
         output_td,
         committed_splits,

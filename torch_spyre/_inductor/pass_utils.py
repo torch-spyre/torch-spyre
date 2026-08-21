@@ -16,7 +16,7 @@ import io
 import math
 import warnings
 from dataclasses import dataclass
-from typing import Any, Callable, NamedTuple, Optional, TypeVar, Union
+from typing import Any, Callable, Iterable, NamedTuple, Optional, TypeVar, Union
 
 import regex
 import torch
@@ -1476,29 +1476,44 @@ def _coeff_splits_from_index(
     return result
 
 
-def _validate_split_coefficients(
-    splits: dict[sympy.Symbol, int], index: sympy.Expr, namespace: str
-) -> None:
-    """Reject distinct non-unity splits sharing one coefficient key."""
-    by_coeff: dict[sympy.Expr, list[tuple[sympy.Symbol, int]]] = {}
-    for sym, split in splits.items():
-        coeff = index.coeff(sym)
-        if coeff == 0:
-            if split > 1:
-                raise Unsupported(
-                    f"Cannot encode split {split} for {sym}: it has no {namespace} "
-                    "index coefficient."
-                )
-            continue
-        by_coeff.setdefault(coeff, []).append((sym, split))
+def first_non_indirect_read_index(
+    reads: "Iterable[MemoryDep]", default: sympy.Expr
+) -> sympy.Expr:
+    """Return stable split-encoding reference, preferring a direct read."""
+    first = None
+    for dep in reads:
+        if first is None:
+            first = dep
+        if isinstance(dep, MemoryDep) and not dep.is_indirect():
+            return dep.index
+    return first.index if first is not None else default
 
-    for coeff, symbol_splits in by_coeff.items():
-        non_unity = [(sym, split) for sym, split in symbol_splits if split > 1]
-        if len({split for _, split in non_unity}) > 1:
-            raise Unsupported(
-                f"Cannot encode distinct splits for symbols sharing {namespace} "
-                f"index coefficient {coeff}: {symbol_splits}."
-            )
+
+def has_lossy_split_encoding(
+    splits: dict[sympy.Symbol, int], write_index: sympy.Expr, read_index: sympy.Expr
+) -> bool:
+    """Return whether non-unity splits cannot survive coefficient encoding.
+
+    Generic encoding intentionally drops dimensions absent from both indexes for
+    compatibility with coarse tiling. LX must skip such alternatives because it
+    cannot preserve their candidate division for solver comparison or commit.
+    """
+    by_coeff: dict[tuple[str, sympy.Expr], set[int]] = {}
+    for sym, split in splits.items():
+        if split <= 1:
+            continue
+        namespace, coeff = (
+            ("output", write_index.coeff(sym))
+            if write_index.coeff(sym) != 0
+            else ("reduction", read_index.coeff(sym))
+        )
+        if coeff == 0:
+            return True
+        factors = by_coeff.setdefault((namespace, coeff), set())
+        factors.add(split)
+        if len(factors) > 1:
+            return True
+    return False
 
 
 def splits_by_index_coeff(
@@ -1514,20 +1529,15 @@ def splits_by_index_coeff(
     rejected.
 
     Only non-unity splits are stored; 1 is the default on the apply side.
+    Dimensions absent from both indexes are intentionally omitted; callers that
+    require lossless candidate encoding must use ``has_lossy_split_encoding``.
     """
     skip = lambda v: v <= 1  # noqa: E731
-    output_splits_by_symbol = {
-        sym: val for sym, val in splits.items() if write_index.coeff(sym) != 0
-    }
-    _validate_split_coefficients(output_splits_by_symbol, write_index, "output")
-    output_splits = _coeff_splits_from_index(
-        output_splits_by_symbol, write_index, skip=skip
-    )
+    output_splits = _coeff_splits_from_index(splits, write_index, skip=skip)
     # Reduction splits: symbols with coeff==0 in write_index but coeff!=0 in read_index
     reduction_only = {
         sym: val for sym, val in splits.items() if write_index.coeff(sym) == 0
     }
-    _validate_split_coefficients(reduction_only, read_index, "reduction")
     reduction_splits = _coeff_splits_from_index(reduction_only, read_index, skip=skip)
     return output_splits, reduction_splits
 
