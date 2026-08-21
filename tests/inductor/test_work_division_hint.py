@@ -586,41 +586,6 @@ def test_lx_relayout_activation_policy_is_source_wide():
         assert lx_relayout_module._is_activation_source({"input": dep}, producer)
 
 
-def test_lx_relayout_skips_sources_read_by_restickify_before_analysis():
-    source_dep = SimpleNamespace(name="source", is_indirect=lambda: False)
-    producer = SimpleNamespace(
-        layout=SimpleNamespace(),
-        get_name=lambda: "source",
-    )
-    restickify = SimpleNamespace(
-        layout=SimpleNamespace(),
-        get_name=lambda: "restickify",
-    )
-    graph = SimpleNamespace(operations=[producer, restickify])
-
-    def read_writes(op):
-        if op is producer:
-            return SimpleNamespace(reads=[], writes=[source_dep])
-        return SimpleNamespace(reads=[source_dep], writes=[])
-
-    with (
-        mock_patch.object(lx_relayout_module, "MemoryDep", SimpleNamespace),
-        mock_patch.object(lx_relayout_module, "ComputedBuffer", SimpleNamespace),
-        mock_patch.object(lx_relayout_module, "FixedTiledLayout", SimpleNamespace),
-        mock_patch.object(
-            lx_relayout_module, "op_read_writes", side_effect=read_writes
-        ),
-        mock_patch.object(
-            lx_relayout_module,
-            "op_short_name",
-            side_effect=lambda op: "restickify" if op is restickify else "pointwise",
-        ),
-        mock_patch.object(lx_relayout_module, "_single_write") as single_write,
-    ):
-        assert lx_relayout_module.collect_lx_relayout_plans(graph) == []
-        single_write.assert_not_called()
-
-
 def test_lx_relayout_planner_rejects_equal_projected_ownership():
     m = Symbol("m")
     source_view = PerCoreView(

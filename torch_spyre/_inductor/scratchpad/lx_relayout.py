@@ -215,22 +215,6 @@ def _is_activation_source(operations: dict[str, Operation], op: Operation) -> bo
     )
 
 
-def _has_restickify_consumer(
-    consumer_reads: Sequence[tuple[Operation, MemoryDep]],
-) -> bool:
-    """Keep restickify input buffers out of relayout candidate analysis.
-
-    Restickify changes physical ownership frames, so its inputs are already a
-    cross-frame barrier for LX residency (see
-    ``ScratchpadAllocator._restickify_barrier``). Apply the same source-wide
-    rule before relayout analysis can attach ownership plans to the buffer.
-    """
-
-    return any(
-        op_short_name(consumer) == "restickify" for consumer, _ in consumer_reads
-    )
-
-
 def _unsupported_relayout_transition_reason(
     source_work_division: TensorWorkDivision,
     destination_work_division: TensorWorkDivision,
@@ -267,8 +251,6 @@ def collect_lx_relayout_plans(graph: GraphLowering) -> list[LXRelayoutPlan]:
 
     result: list[LXRelayoutPlan] = []
     for source_name, consumer_reads in reads.items():
-        if _has_restickify_consumer(consumer_reads):
-            continue
         producer = operations.get(source_name)
         if (
             not isinstance(producer, ComputedBuffer)
