@@ -21,18 +21,21 @@
 #include <pybind11/native_enum.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
-#include <util/sen_data_convert.h>
-#include <util/sendefs.h>
+#include <pybind11/stl.h>
+#include <spyrecode-host-functions/sendataconvert/sen_data_convert.h>
+#include <util/sendefs/sendefs.h>
 
 #include <cstdlib>     // std::getenv
 #include <filesystem>  // NOLINT(build/c++17)
 #include <flex/flex.hpp>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "job_plan.h"
+#include "kernel_provenance_registry.h"
 
 #ifdef USE_SPYRE_CCL
 #include <pybind11/chrono.h>
@@ -43,9 +46,11 @@
 #include "logging.h"
 #include "logging_bindings.h"
 #include "logging_config.h"
+#include "perm_layout_native.h"
 #include "prepare_kernel.h"
 #include "spyre_allocator.h"
 #include "spyre_device_enum.h"
+#include "spyre_error.h"
 #include "spyre_generator_impl.h"
 #include "spyre_guard.h"
 #include "spyre_kernel.h"
@@ -88,15 +93,25 @@ void _startRuntime() {
   //   1. tls_idx (non-zero) — set via explicit set_device() call
   //   2. LOCAL_RANK env var — set by torchrun per process
   //   3. 0 — single-device / non-torchrun default
+  //
+  // tls_idx is initialised to parse_local_rank() at thread-local init time
+  // in spyre_guard.cpp (covering cases 2 and 3 automatically). The if/else
+  // here only distinguishes "tls_idx is non-zero (either from TLS init or
+  // from a set_device() call)" from "tls_idx is zero". There is no way at
+  // this point to distinguish a set_device() call from a LOCAL_RANK-seeded
+  // TLS init.
   int logical_device_id = 0;
   int tls_idx = static_cast<int>(SpyreGuardImpl::tls_idx);
   if (tls_idx != 0) {
     logical_device_id = tls_idx;
-  } else if (const char* lr = std::getenv("LOCAL_RANK")) {
-    logical_device_id = std::atoi(lr);
+  } else {
+    // parse_local_rank() returns 0 when LOCAL_RANK is unset, and throws on
+    // invalid / out-of-range values.
+    const c10::DeviceIndex rank = parse_local_rank();
+    logical_device_id = static_cast<int>(rank);
     // Match the current (c10) device to the rank so unqualified stream/pool
     // lookups don't fall back to spyre:0.
-    SpyreGuardImpl::tls_idx = static_cast<c10::DeviceIndex>(logical_device_id);
+    SpyreGuardImpl::tls_idx = rank;
   }
 
   const int num_devices = getVisibleDeviceCount();
@@ -189,6 +204,36 @@ PYBIND11_MODULE(_C, m) {
   }
 
   m.doc() = "Spyre C++ bindings";
+  m.attr("AIUPTI_ACTIVITY_NAME_MAX_BYTES") =
+      py::int_(spyre::kAIUptiActivityNameMaxBytes);
+  m.def("register_kernel_provenance", &spyre::registerKernelProvenance,
+        py::arg("event_base_name"), py::arg("debug_handle_ids"),
+        "Register direct debug-handle IDs for a provenance-aware event name");
+  m.def(
+      "lookup_kernel_provenance",
+      [](const std::string& key) -> py::object {
+        const auto ids = spyre::lookupKernelProvenance(key);
+        if (ids == nullptr) {
+          return py::none();
+        }
+        return py::cast(*ids);
+      },
+      py::arg("key"), "Return registered debug-handle IDs without mutation");
+  m.def(
+      "kernel_provenance_registry_stats",
+      []() {
+        const auto stats = spyre::kernelProvenanceRegistryStats();
+        py::dict result;
+        result["entries"] = stats.entries;
+        result["hits"] = stats.hits;
+        result["misses"] = stats.misses;
+        result["conflicts"] = stats.conflicts;
+        return result;
+      },
+      "Return process-lifetime kernel provenance registry counters");
+  m.def("extract_kernel_provenance_key", &spyre::extractKernelProvenanceKey,
+        py::arg("event_name"),
+        "Extract a canonical bundle key from a Spyre profiler event name");
   m.def("start_runtime", &spyre::startRuntime);
   m.def("free_runtime", &spyre::freeRuntime);
   m.def("device_count", &spyre::getVisibleDeviceCount);
@@ -197,12 +242,16 @@ PYBIND11_MODULE(_C, m) {
   // Initialize logging bindings
   torch_spyre::logging::init_logging_bindings(m);
 
+  // Register the native scratchpad layout packer accelerator.
+  torch_spyre::scratchpad::register_perm_layout_native(m);
+
   py::enum_<spyre::ElementArrangement>(m, "ElementArrangement")
       .value("STANDARD", spyre::ElementArrangement::STANDARD)
       .value("DL16_TO_FP32", spyre::ElementArrangement::DL16_TO_FP32)
       .value("QFP8CH", spyre::ElementArrangement::QFP8CH)
+      .value("EXX2", spyre::ElementArrangement::EXX2)
       .value("FP32_TO_DL16", spyre::ElementArrangement::FP32_TO_DL16)
-      .value("EXX2", spyre::ElementArrangement::EXX2);
+      .value("QFP8WT", spyre::ElementArrangement::QFP8WT);
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
@@ -445,6 +494,21 @@ PYBIND11_MODULE(_C, m) {
           },
           py::arg("idx"),
           "Get the pipeline_barrier flag for the step at the given index")
+      .def(
+          "get_step_name",
+          [](const spyre::JobPlan& plan,
+             size_t idx) -> std::optional<std::string> {
+            TORCH_CHECK(idx < plan.steps.size(), "Step index out of range");
+            const auto* compute =
+                dynamic_cast<const spyre::JobPlanStepCompute*>(
+                    plan.steps[idx].get());
+            if (compute == nullptr) {
+              return std::nullopt;
+            }
+            return compute->getName();
+          },
+          py::arg("idx"),
+          "Get the profiler-visible name for a compute step, or None")
       .def("__repr__", [](const spyre::JobPlan& plan) {
         return "<JobPlan steps=" + std::to_string(plan.steps.size()) +
                " job_allocation_size=" +
@@ -454,26 +518,71 @@ PYBIND11_MODULE(_C, m) {
                " pinned_buffers=" + std::to_string(plan.pinned_buffers.size()) +
                ">";
       });
+  // Symbolic argument payload types
+  py::enum_<spyre::SymbolicArgKind>(m, "SymbolicArgKind")
+      .value("kAddress", spyre::SymbolicArgKind::kAddress)
+      .value("kDimension", spyre::SymbolicArgKind::kDimension);
+
+  py::class_<spyre::SymbolicArg>(m, "SymbolicArg")
+      .def(py::init([](spyre::SymbolicArgKind kind, int64_t tensor_id,
+                       int64_t dim_index, int64_t value) {
+             return spyre::SymbolicArg{kind, tensor_id, dim_index, value};
+           }),
+           py::arg("kind"), py::arg("tensor_id"),
+           py::arg("dim_index") = int64_t{-1}, py::arg("value") = int64_t{-1})
+      .def_readwrite("kind", &spyre::SymbolicArg::kind)
+      .def_readwrite("value", &spyre::SymbolicArg::value)
+      .def_readwrite("tensor_id", &spyre::SymbolicArg::tensor_id)
+      .def_readwrite("dim_index", &spyre::SymbolicArg::dim_index)
+      .def("__repr__", [](const spyre::SymbolicArg& a) {
+        return "<SymbolicArg kind=" +
+               std::to_string(static_cast<int32_t>(a.kind)) +
+               " tensor_id=" + std::to_string(a.tensor_id) +
+               " dim_index=" + std::to_string(a.dim_index) + ">";
+      });
+
   m.def("prepare_kernel", &spyre::prepareKernel, py::arg("spyrecode_dir"),
-        py::arg("stream") = nullptr,
+        py::arg("stream") = nullptr, py::arg("profiler_name") = std::nullopt,
         "Prepare a kernel from a SpyreCode directory and return a JobPlan.\n\n"
         "Args:\n"
         "    spyrecode_dir (str): Path to the SpyreCode directory\n"
         "    stream (SpyreStream, optional): Stream to use for initialization "
         "transfers.\n"
         "        If None, uses the current stream. Defaults to None.\n\n"
+        "    profiler_name (str, optional): Bounded base name for "
+        "profiler-visible compute events. Defaults to None.\n\n"
         "Returns:\n"
         "    Prepared JobPlan ready for execution");
   // Bind the current-stream overload (resolves the current stream internally).
-  m.def("launch_jobplan",
-        static_cast<void (*)(const spyre::JobPlan&,
-                             const std::vector<at::Tensor>&)>(
-            &spyre::launchJobPlan),
-        py::arg("job_plan"), py::arg("args"),
-        "Launch a prepared JobPlan with the given tensor arguments.\n\n"
-        "Args:\n"
-        "    job_plan: The JobPlan to execute\n"
-        "    args: Sequence of input/output tensors");
+  // Without symbolic_args (back-compat, empty payload → legacy address loop).
+  m.def(
+      "launch_jobplan",
+      static_cast<void (*)(  // NOLINT(whitespace/parens)
+          const spyre::JobPlan&, const std::vector<at::Tensor>&,
+          std::vector<spyre::SymbolicArg>)>(&spyre::launchJobPlan),
+      py::arg("job_plan"), py::arg("args"),
+      py::arg("symbolic_args") = std::vector<spyre::SymbolicArg>{},
+      "Launch a prepared JobPlan with the given tensor arguments.\n\n"
+      "Args:\n"
+      "    job_plan: The JobPlan to execute\n"
+      "    args: Sequence of input/output tensors\n"
+      "    symbolic_args: Optional typed per-symbol payload. When non-empty,\n"
+      "        JobPlanStepHostCompute resolves each correction slot by kind\n"
+      "        rather than blindly iterating tensors. Empty (default)\n"
+      "        preserves today's legacy behavior.");
+
+  // Test-only seam: exposes JobPlanStepHostCompute::resolveSymbolicArgs so
+  // that Python tests can assert on the ordered int64 vector that would be
+  // handed to deeptools, without needing a live HCM or device execution.
+  // The "_" prefix signals this is not part of the stable public API.
+  m.def("_resolve_symbolic_args",
+        &spyre::JobPlanStepHostCompute::resolveSymbolicArgs, py::arg("tensors"),
+        py::arg("symbolic_args"),
+        "Test-only: resolve a symbolic_args payload to a list of int64 DMVA "
+        "addresses.\n\n"
+        "Calls JobPlanStepHostCompute::resolveSymbolicArgs — the same function "
+        "used by the typed-payload resolution path at launch time — so the "
+        "result is identical to what would be passed to deeptools.");
 
   // Allocator statistics functions
   m.def(
@@ -512,12 +621,36 @@ PYBIND11_MODULE(_C, m) {
       },
       py::arg("device"), "Reset peak allocator statistics");
 
-  // Returns true if any stream in the runtime has been shut down
-  // (unrecoverable). When true, no further work can be submitted on the
-  // affected streams.
-  m.def("has_stream_error", []() -> bool {
-    auto runtime = spyre::GlobalRuntime::get();
-    if (!runtime) return false;
-    return runtime->hasStreamError();
-  });
+  // ── Typed stream error API ───────────────────────────────────────────────
+
+  py::enum_<spyre::SpyreStreamError>(m, "SpyreStreamError")
+      .value("Success", spyre::SpyreStreamError::Success)
+      .value("Shutdown", spyre::SpyreStreamError::Shutdown);
+
+  py::enum_<spyre::SpyreDeviceState>(m, "SpyreDeviceState")
+      .value("Ok", spyre::SpyreDeviceState::Ok)
+      .value("NotInitialized", spyre::SpyreDeviceState::NotInitialized)
+      .value("StreamError", spyre::SpyreDeviceState::StreamError);
+
+  m.def(
+      "stream_get_error",
+      [](const spyre::SpyreStream& stream) {
+        return spyre::SpyreStreamGetError(stream);
+      },
+      py::arg("stream"),
+      "Return the SpyreStreamError state of a single stream.");
+
+  m.def(
+      "stream_get_error_string",
+      [](spyre::SpyreStreamError err) -> std::string {
+        return spyre::SpyreStreamGetErrorString(err);
+      },
+      py::arg("error"),
+      "Return a human-readable string for a SpyreStreamError value.");
+
+  m.def(
+      "get_device_state", []() { return spyre::SpyreGetDeviceState(); },
+      "Return the SpyreDeviceState aggregate for the process. "
+      "Returns NotInitialized when the runtime has not been created yet; "
+      "callers should treat this as 'proceed / no error'.");
 }

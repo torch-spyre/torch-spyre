@@ -8,35 +8,55 @@ import torch
 import typing
 
 __all__: list[str] = [
+    "AIUPTI_ACTIVITY_NAME_MAX_BYTES",
     "DataFormats",
     "JobPlan",
     "ElementArrangement",
+    "SpyreStreamError",
+    "SpyreDeviceState",
     "SpyreTensorLayout",
+    "SymbolicArg",
+    "SymbolicArgKind",
     "_SpyreStreamBase",
     "current_stream",
     "default_stream",
+    "get_device_state",
     "get_stream_from_pool",
-    "has_stream_error",
     "set_current_stream",
+    "stream_get_error",
+    "stream_get_error_string",
     "synchronize",
     "as_strided_with_layout",
     "empty_with_layout",
     "copy_tensor",
     "fill_tensor",
     "encode_constant",
+    "extract_kernel_provenance_key",
     "free_runtime",
     "get_device_dtype",
     "get_downcast_warning",
     "get_elem_in_stick",
     "get_spyre_tensor_layout",
+    "kernel_provenance_registry_stats",
     "launch_jobplan",
+    "lookup_kernel_provenance",
     "prepare_kernel",
+    "register_kernel_provenance",
     "set_downcast_warning",
     "set_spyre_tensor_layout",
     "spyre_empty_with_layout",
     "start_runtime",
     "to_with_layout",
 ]
+
+AIUPTI_ACTIVITY_NAME_MAX_BYTES: int
+
+def extract_kernel_provenance_key(event_name: str) -> str | None: ...
+def kernel_provenance_registry_stats() -> dict[str, int]: ...
+def lookup_kernel_provenance(key: str) -> list[str] | None: ...
+def register_kernel_provenance(
+    event_base_name: str, debug_handle_ids: collections.abc.Sequence[str]
+) -> bool: ...
 
 class DataFormats:
     """
@@ -130,6 +150,8 @@ class ElementArrangement:
       QFP8CH
 
       EXX2
+
+      QFP8WT
     """
 
     DL16_TO_FP32: typing.ClassVar[
@@ -139,12 +161,18 @@ class ElementArrangement:
         ElementArrangement
     ]  # value = <ElementArrangement.QFP8CH: 2>
     EXX2: typing.ClassVar[ElementArrangement]  # value = <ElementArrangement.EXX2: 3>
+    FP32_TO_DL16: typing.ClassVar[
+        ElementArrangement
+    ]  # value = <ElementArrangement.FP32_TO_DL16: 4>
+    QFP8WT: typing.ClassVar[
+        ElementArrangement
+    ]  # value = <ElementArrangement.QFP8WT: 5>
     STANDARD: typing.ClassVar[
         ElementArrangement
     ]  # value = <ElementArrangement.STANDARD: 0>
     __members__: typing.ClassVar[
         dict[str, ElementArrangement]
-    ]  # value = {'STANDARD': <ElementArrangement.STANDARD: 0>, 'DL16_TO_FP32': <ElementArrangement.DL16_TO_FP32: 1>, 'QFP8CH': <ElementArrangement.QFP8CH: 2>, 'EXX2': <ElementArrangement.EXX2: 3>}
+    ]  # value = {'STANDARD': <ElementArrangement.STANDARD: 0>, 'DL16_TO_FP32': <ElementArrangement.DL16_TO_FP32: 1>, 'QFP8CH': <ElementArrangement.QFP8CH: 2>, 'EXX2': <ElementArrangement.EXX2: 3>, 'QFP8WT': <ElementArrangement.QFP8WT: 5>}
     @property
     def name(self) -> str: ...
     @property
@@ -321,6 +349,42 @@ def get_downcast_warning() -> bool:
 def get_elem_in_stick(arg0: torch.dtype) -> int: ...
 def get_spyre_tensor_layout(arg0: torch.Tensor) -> SpyreTensorLayout: ...
 
+class SymbolicArgKind:
+    """
+    Members:
+
+      kAddress
+
+      kDimension
+    """
+
+    kAddress: typing.ClassVar[SymbolicArgKind]
+    kDimension: typing.ClassVar[SymbolicArgKind]
+    __members__: typing.ClassVar[dict[str, SymbolicArgKind]]
+    def __eq__(self, other: typing.Any) -> bool: ...
+    def __hash__(self) -> int: ...
+    def __init__(self, value: typing.SupportsInt) -> None: ...
+    def __int__(self) -> int: ...
+    def __repr__(self) -> str: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> int: ...
+
+class SymbolicArg:
+    kind: SymbolicArgKind
+    value: int
+    tensor_id: int
+    dim_index: int
+    def __init__(
+        self,
+        kind: SymbolicArgKind,
+        tensor_id: int,
+        dim_index: int = -1,
+        value: int = -1,
+    ) -> None: ...
+    def __repr__(self) -> str: ...
+
 class JobPlan:
     """
     A torch-spyre internal container for executing a unit of work.
@@ -339,8 +403,14 @@ class JobPlan:
         """Get the type of step at the given index (H2D, D2H, Compute, or HostCompute)"""
         ...
 
+    def get_step_name(self, idx: int) -> str | None:
+        """Get the profiler-visible name for a compute step, or None"""
+        ...
+
 def launch_jobplan(
-    job_plan: JobPlan, args: collections.abc.Sequence[torch.Tensor]
+    job_plan: JobPlan,
+    args: collections.abc.Sequence[torch.Tensor],
+    symbolic_args: list[SymbolicArg] = ...,
 ) -> None:
     """
     Launch a prepared JobPlan with the given tensor arguments.
@@ -348,11 +418,14 @@ def launch_jobplan(
     Args:
         job_plan: The JobPlan to execute
         args: Sequence of input/output tensors
+        symbolic_args: Optional typed per-symbol payload. Defaults to empty.
     """
     ...
 
 def prepare_kernel(
-    spyrecode_dir: str, stream: _SpyreStreamBase | None = None
+    spyrecode_dir: str,
+    stream: _SpyreStreamBase | None = None,
+    profiler_name: str | None = None,
 ) -> JobPlan:
     """
     Prepare a kernel from a SpyreCode directory and return a JobPlan.
@@ -361,6 +434,8 @@ def prepare_kernel(
         spyrecode_dir: Path to the SpyreCode directory
         stream: Stream to use for initialization transfers.
             If None, uses the current stream. Defaults to None.
+        profiler_name: Bounded base name for profiler-visible compute events.
+            If None, uses the existing SpyreCode or directory-derived name.
 
     Returns:
         Prepared JobPlan ready for execution
@@ -379,9 +454,42 @@ def spyre_empty_with_layout(
     arg2: torch.dtype,
     arg3: SpyreTensorLayout,
 ) -> torch.Tensor: ...
-def has_stream_error() -> bool:
-    """Returns true if any stream in the runtime has been shut down (unrecoverable)."""
-    ...
 
+class SpyreStreamError:
+    Success: typing.ClassVar[SpyreStreamError]  # value = <SpyreStreamError.Success: 0>
+    Shutdown: typing.ClassVar[
+        SpyreStreamError
+    ]  # value = <SpyreStreamError.Shutdown: 1>
+    __members__: typing.ClassVar[dict[str, SpyreStreamError]]
+    def __eq__(self, other: typing.Any) -> bool: ...
+    def __hash__(self) -> int: ...
+    def __int__(self) -> int: ...
+    def __repr__(self) -> str: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> int: ...
+
+class SpyreDeviceState:
+    Ok: typing.ClassVar[SpyreDeviceState]  # value = <SpyreDeviceState.Ok: 0>
+    NotInitialized: typing.ClassVar[
+        SpyreDeviceState
+    ]  # value = <SpyreDeviceState.NotInitialized: 1>
+    StreamError: typing.ClassVar[
+        SpyreDeviceState
+    ]  # value = <SpyreDeviceState.StreamError: 2>
+    __members__: typing.ClassVar[dict[str, SpyreDeviceState]]
+    def __eq__(self, other: typing.Any) -> bool: ...
+    def __hash__(self) -> int: ...
+    def __int__(self) -> int: ...
+    def __repr__(self) -> str: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> int: ...
+
+def stream_get_error(stream: _SpyreStreamBase) -> SpyreStreamError: ...
+def stream_get_error_string(error: SpyreStreamError) -> str: ...
+def get_device_state() -> SpyreDeviceState: ...
 def start_runtime() -> None: ...
 def to_with_layout(arg0: torch.Tensor, arg1: SpyreTensorLayout) -> torch.Tensor: ...

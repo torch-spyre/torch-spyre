@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import argparse
 import torch
 import torch.distributed as dist
 import os
@@ -19,8 +20,15 @@ DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
 C10D_BACKEND = "spyreccl"
 
 
-def run_test(comm_rank, comm_size):
-    """Run a reduce test where all ranks contribute and root receives the sum."""
+def run_test(comm_rank, comm_size, async_op=False):
+    """Run a reduce test where all ranks contribute and root receives the sum.
+
+    Args:
+        comm_rank: Rank of the current process
+        comm_size: Total number of processes
+        async_op: If True, launch the collective asynchronously and overlap CPU
+                  work with the hardware operation before calling work.wait().
+    """
     global DEVICE
 
     num_elements = 128
@@ -40,18 +48,8 @@ def run_test(comm_rank, comm_size):
     # Send input tensor to Spyre device
     input_device = input_tensor.to(DEVICE)
 
-    # Reduce with the collective library (SUM operation to root rank 0)
-    print(f"[{comm_rank} of {comm_size}] Reduce Tensor (SUM): Spyre")
-    dist.reduce(input_device, dst=0, op=dist.ReduceOp.SUM)
-
-    # Check the result at root
+    expected_tensor = None
     if comm_rank == 0:
-        result = input_device.to("cpu")
-        print(
-            f"[{comm_rank} of {comm_size}] Reduced Tensor at root (SUM of all ranks):"
-        )
-        print(f"[{comm_rank} of {comm_size}] {result[:10]} .. {result[-10:]}")
-
         # Expected result: sum of all ranks' contributions at each position
         # Position i gets: (0*num_elements + i) + (1*num_elements + i) + ... + ((comm_size-1)*num_elements + i)
         # = i*comm_size + num_elements*(0 + 1 + ... + (comm_size-1))
@@ -62,6 +60,27 @@ def run_test(comm_rank, comm_size):
                 i * comm_size + num_elements * comm_size * (comm_size - 1) / 2
             )
 
+    if async_op:
+        # Launch reduce asynchronously — returns a Work handle immediately
+        print(f"[{comm_rank} of {comm_size}] Reduce Tensor (SUM, async): Spyre")
+        work = dist.reduce(input_device, dst=0, op=dist.ReduceOp.SUM, async_op=True)
+
+        # Note: Opportunity for overlapping of host activities with asynchronous communication.
+
+        # Block until the async collective has completed
+        work.wait()
+    else:
+        # Reduce with the collective library (SUM operation to root rank 0)
+        print(f"[{comm_rank} of {comm_size}] Reduce Tensor (SUM): Spyre")
+        dist.reduce(input_device, dst=0, op=dist.ReduceOp.SUM)
+
+    # Check the result at root
+    if comm_rank == 0:
+        result = input_device.to("cpu")
+        print(
+            f"[{comm_rank} of {comm_size}] Reduced Tensor at root (SUM of all ranks):"
+        )
+        print(f"[{comm_rank} of {comm_size}] {result[:10]} .. {result[-10:]}")
         print(f"  Expected values: {expected_tensor[:10]} .. {expected_tensor[-10:]}")
 
         if torch.allclose(result, expected_tensor):
@@ -72,12 +91,21 @@ def run_test(comm_rank, comm_size):
                 f"expected {expected_tensor[:10]} but got {result[:10]}"
             )
     else:
-        print(
-            f"[{comm_rank} of {comm_size}] Non-root rank completed reduce (input consumed)"
-        )
+        mode = " (async, input consumed)" if async_op else " (input consumed)"
+        print(f"[{comm_rank} of {comm_size}] Non-root rank completed reduce{mode}")
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Distributed reduce example")
+    parser.add_argument(
+        "--async",
+        dest="async_op",
+        action="store_true",
+        default=False,
+        help="Launch reduce asynchronously (async_op=True)",
+    )
+    args = parser.parse_args()
+
     # Check that the c10d backend was loaded properly
     if dist.distributed_c10d.is_backend_available(C10D_BACKEND) is False:
         raise RuntimeError(f"Error: Missing the C10 Backend {C10D_BACKEND}")
@@ -94,8 +122,6 @@ if __name__ == "__main__":
     comm_size = dist.get_world_size()
     comm_rank = dist.get_rank()
 
-    run_test(comm_rank, comm_size)
+    run_test(comm_rank, comm_size, async_op=args.async_op)
 
     dist.destroy_process_group()
-
-# Made with Bob

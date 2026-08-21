@@ -24,7 +24,7 @@ Tests cover:
 import pytest
 import torch
 
-from torch_spyre._inductor.constants import FP8_E4M3_MAX
+from torch_spyre._inductor.constants import FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from utils_inductor import (
     cached_randn,
     compare_with_pytorch,
@@ -61,7 +61,7 @@ class TestFP8Operations:
 
         def pytorch_fn(x, scale):
             # CPU reference: direct format conversion with identity scale
-            x_fp8 = x.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+            x_fp8 = x.clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(torch.float8_e4m3fn)
             return x_fp8.to(torch.float16) * scale
 
         compare_with_pytorch(
@@ -104,7 +104,7 @@ class TestFP8Operations:
 
         def pytorch_fn(x, scale):
             # CPU reference: FP16 → FP8 → FP16 conversion with identity scale
-            x_fp8 = x.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+            x_fp8 = x.clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(torch.float8_e4m3fn)
             return x_fp8.to(torch.float16) * scale
 
         compare_with_pytorch(
@@ -242,7 +242,7 @@ class TestFP8Operations:
             return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
 
         def pytorch_fn(x, scale):
-            return (x / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(
+            return (x / scale).clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(
                 torch.float8_e4m3fn
             ).to(torch.float16) * scale
 
@@ -265,7 +265,7 @@ class TestFP8Operations:
             return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
 
         def pytorch_fn(x, scale):
-            return (x / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(
+            return (x / scale).clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(
                 torch.float8_e4m3fn
             ).to(torch.float16) * scale
 

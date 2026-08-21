@@ -56,8 +56,9 @@ The compiler picks which buffers live where.
 | Parameter | Value | Config |
 |---|---|---|
 | Total LX per core | 2 MB | fixed |
+| Program/debug reservation | 64 KB | fixed |
 | Backend-reserved fraction | 20% | `DXP_LX_FRAC_AVAIL` |
-| Usable LX per core | ~1.6 MB | `int((2<<20) * (1 - frac_avail))` |
+| Usable LX per core | ~1.55 MB | `round_up_128(int(((2<<20) - (64<<10)) * (1 - frac_avail)))` |
 | Alignment | 128-byte (stick) | implicit |
 | Cores | 1 to 32 | `SENCORES` |
 | Per-core HBM span limit | (255.996 MiB) | hardware, separate from LX |
@@ -88,7 +89,8 @@ measured result is fixed per-bundle overhead.
 
 The four stages map onto code under `torch_spyre/_inductor/scratchpad/`:
 LX-eligible op outputs (stage 2), in-place reuse (stage 3), and
-`CloneInputNodesPass` (stage 4).
+input-boundary cloning (stage 4), which `ScratchpadAllocator` performs
+inline via `_eligible_clone_inputs`, gated by `clone_at_graph_boundaries()`.
 
 ## Assumptions
 
@@ -133,19 +135,24 @@ after work division has stamped per-op core splits:
 
 ```
 deadcode_elimination
+propagate_named_dims                  # named-dimension metadata (pre-stickification)
+assign_dim_hints
+_maybe_coarse_tile_hints              # hint-driven coarse tiling, when hints produce groups
+split_multi_ops
 propagate_spyre_tensor_layouts        # assign FixedTiledLayout
+validate_ops
 optimize_restickify_locations
 finalize_layouts
 insert_restickify
+enforce_indirect_access_layout
+insert_post_mutation_restickify
 insert_bmm_padding
 dedup_and_promote_constants
-propagate_named_dims                  # named-dimension metadata
-assign_dim_hints
-coarse_tile                           # runs when hints produce groups
+_maybe_coarse_tile_span_overflow      # span-overflow coarse tiling (post-stickification)
 span_reduction                        # work-division: enforce 255.996 MiB span
 cost_model_matmul_division            # work-division: matmul cost model
 work_distribution                     # work-division: default distributor
-scratchpad_planning                   # ← THIS PASS, gated by config.lx_planning
+_maybe_scratchpad_planning            # ← THIS PASS, gated by config.lx_planning
 ```
 
 Two ordering constraints fix this slot:
@@ -193,8 +200,9 @@ the graph input and graph output, for `3MN` bytes total, a 62% reduction.
 
 **Stage 4, clone the input to LX.** The graph input is read by several
 ops. Without a clone each reader would re-fetch from HBM.
-`CloneInputNodesPass` detects multi-use inputs that fit in LX and inserts
-a `clone` op at the front of the graph. The clone reads HBM once and
+`ScratchpadAllocator._eligible_clone_inputs` detects multi-use inputs that
+fit in LX and inserts a `clone` op at the front of the graph, gated by
+`clone_at_graph_boundaries()`. The clone reads HBM once and
 writes LX; every subsequent op reads from LX. After stage 4 total HBM is
 `2MN`, the input read plus the output write, which is the theoretical
 minimum for this graph.
@@ -246,7 +254,7 @@ Scratchpad planning has three layers with separate concerns:
 
 `ScratchpadAllocator` runs pre-passes (clone insertion), gathers
 `LifetimeBoundBuffer`s, hands them to a pluggable solver, then writes the
-chosen LX addresses onto buffer layouts. `StrategyBCoOptimizingAllocator`
+chosen LX addresses onto buffer layouts. `CoOptimizingAllocator`
 extends this flow with a split-search step before the solver runs.
 :::
 
@@ -254,11 +262,17 @@ The relevant code lives under `torch_spyre/_inductor/scratchpad/`:
 
 | File | Responsibility |
 |---|---|
-| `passes.py` | `ScratchpadOptimizationPass` ABC, `CloneInputNodesPass` |
+| `passes.py` | `ScratchpadOptimizationPass` ABC, `_NameSwapHandler` |
 | `plan_solver.py` | `MemoryPlanSolver` ABC (declarative exclusion via `partition`/`excluded`), `LifetimeBoundBuffer` |
 | `greedy_solver.py` | `GreedyLayoutSolver` |
 | `firstfit_bestfit_solver.py` | `FirstFitLayoutSolver`, `BestFitLayoutSolver` |
-| `allocator.py` | `ScratchpadAllocator`, `StrategyBCoOptimizingAllocator`, and the single LX-eligibility predicate (`_residency_reasons`, one reason per buffer) |
+| `ilp_solver_ortools.py` | `CpSatLayoutSolver` (OR-Tools CP-SAT) |
+| `simulated_annealing.py` | `SimulatedAnnealingLayoutSolver` |
+| `cooling_schedules.py` | cooling schedules for the annealing search |
+| `permutation_layout.py` | `PermutationBasedLayoutSolver` |
+| `contact_profile.py` | `Profile`, buffer-contact profiling |
+| `graph_editor.py` | `GraphEditor`, the clone/rewrite helper used by input- and output-boundary cloning |
+| `allocator.py` | `ScratchpadAllocator`, `CoOptimizingAllocator`, and the single LX-eligibility predicate (`_residency_reasons`, one reason per buffer) |
 | `utils.py` | liveness, mem usage, op-name/eligibility helpers |
 
 ### Entry point
@@ -269,9 +283,10 @@ scratchpad_planning(graph, allocator=ScratchpadAllocator())
 
 `ScratchpadAllocator` runs the following pipeline:
 
-1. **Pre-passes.** `CloneInputNodesPass` walks graph inputs and inserts a
-   `clone` for any HBM input that is read more than once *and* fits on
-   LX. The clone output becomes a fresh LX-eligible buffer.
+1. **Input-boundary cloning.** When `clone_at_graph_boundaries()` is set,
+   `_eligible_clone_inputs` walks graph inputs and inserts a `clone` for any
+   HBM input that is read more than once *and* fits on LX. The clone output
+   becomes a fresh LX-eligible buffer.
 2. **Buffer analysis.** `_generate_buffers` produces one
    `LifetimeBoundBuffer` per buffer — *including* the ones that may not
    reside. Nothing is filtered out; `ScratchpadAllocator._residency_reasons`
@@ -283,8 +298,12 @@ scratchpad_planning(graph, allocator=ScratchpadAllocator())
    rest it can fit; whatever is left gets `address=None` and stays on HBM.
 4. **Push allocation.** Successful placements are written to
    `layout.allocation["lx"] = addr` on each buffer's `FixedTiledLayout`.
-5. **Post-passes.** Currently empty. Reserved for solver-driven graph
-   mutations (output cloning, op re-ordering).
+5. **Post-passes.** Reserved for solver-driven graph mutations such as op
+   re-ordering. Output-boundary cloning already runs as part of push
+   allocation: `_push_allocation` calls
+   `graph_editor.push_allocation_with_clone(..., input=False)` and
+   `change_graph_output` to promote a producer to LX and clone the value
+   back to a graph output.
 
 ### Declarative exclusion
 
@@ -312,12 +331,13 @@ The checks, in evaluation order (the first failure is the reason reported):
 
 | Reason | Why |
 |---|---|
-| `op not allowed` | not a `ComputedBuffer`, a mutation layout, or an op name outside `OP_OUTPUT_GOOD_FOR_LX_REUSE` |
+| `op not allowed` | not a `ComputedBuffer`, a mutation layout, or an op name outside `OP_OUTPUT_GOOD_FOR_LX_REUSE` (the debug flag `config.allow_all_ops_in_lx_planning` bypasses the op-name gate) |
 | `unsized (no device layout)` | no computable footprint (e.g. a `MultiOutputLayout` tuple op) |
 | `mutation target` | filled by offset writes, so one LX base mis-addresses it |
-| `tiled (advancing), not per_tile_fixed` | LX addresses cannot be `affine.apply` symbols |
+| `tiled (advancing)` | LX addresses cannot be `affine.apply` symbols; the advancing-tile check reads `loop_info` (the sole source of truth for per-tile geometry) |
 | `read by restickify (cross-frame barrier)` | the read and write frames are transposes, so a per-core LX slice is not self-sufficient (the buffer a restickify reads; its own output is safe and is not barred) |
 | `extern kernel user` | extern ops read from HBM |
+| `index tensor or indirectly accessed` | index tensors and the value tensors they index into are read via data-dependent addressing, so they must stay in HBM |
 | `graph output (no clone)` / `graph input (no clone)` | without boundary cloning there is nothing to redirect |
 | `graph output is a ReinterpretView` | output cloning cannot rewrap the view |
 | `partial/offset read` | a sliced or multi-offset read mis-addresses a single LX base |
@@ -354,6 +374,16 @@ each buffer and is the gate for whether a buffer is even eligible.
   (K-split-reduction) writer, or any unrepresentable geometry yields
   `core_div_mismatch` (`-1`) and disqualifies the buffer from LX.
 
+:::{figure} ../_static/images/lx/core-div-mismatch-spill.svg
+:alt: When writer and reader agree on the per-core split the buffer stays on LX at no off-chip cost; when they disagree it is written to HBM and read back, costing twice its size in off-chip traffic.
+:width: 100%
+
+A buffer disqualified by `core_div_mismatch` is written to HBM by its
+producer and read back by its consumer. That boundary costs `2 x S`
+off-chip bytes for a buffer of size `S`, where an on-LX buffer would have
+cost none.
+:::
+
 ### Codegen integration
 
 Once `layout.allocation["lx"]` is set:
@@ -366,7 +396,8 @@ Once `layout.allocation["lx"]` is set:
 
 ## Solvers
 
-`config.layout_solver` (`"greedy" | "firstfit" | "bestfit" | "cpsat"`)
+`config.layout_solver`
+(`"greedy" | "firstfit" | "bestfit" | "cpsat" | "simulated_annealing"`)
 picks the solver; it defaults from the `LAYOUT_SOLVER` environment
 variable (falling back to `"greedy"`).
 
@@ -424,6 +455,18 @@ with `co_optimizing_lx_planning` it is driven by the joint
 `CoOptimizingAllocator` (below), which additionally chooses each op's core
 division.
 
+### SimulatedAnnealingLayoutSolver
+
+`config.layout_solver = "simulated_annealing"` selects
+`SimulatedAnnealingLayoutSolver`, which takes a first-fit, best-fit, or
+greedy placement as the initial layout and then runs a simulated-annealing
+search over buffer orderings to reduce fragmentation. Each step reinserts a
+buffer and keeps or rejects the new ordering according to a cooling
+schedule, so the search can escape the local minima that trap the
+single-pass solvers. See
+[Simulated Annealing Layout Planner](simulated_annealing_layout.md) for the
+algorithm and the tunable schedule parameters.
+
 ## Co-optimization with work-distribution
 
 Work division optimizes each op independently for parallelism. Adjacent
@@ -431,7 +474,7 @@ ops sharing a buffer can get different splits (different shapes mean
 different optimal decompositions), which triggers `core_div_mismatch`
 and disqualifies the shared buffer from LX even when it would have fit.
 
-`StrategyBCoOptimizingAllocator` (gated by
+`CoOptimizingAllocator` (gated by
 `config.co_optimizing_lx_planning`, env var `CO_OPTIMIZING_LX_PLANNING=1`)
 treats split choices and LX placement jointly:
 
@@ -528,12 +571,12 @@ best-fit mitigate this by sorting all buffers up front before placing.
 
 ### No defragmentation
 
-`find_free_block` can locate holes between allocations but cannot
+`_find_free_block` can locate holes between allocations but cannot
 compact the address space. Allocate/deallocate cycles fragment LX.
 
 ### Co-optimization is still limited
 
-`StrategyBCoOptimizingAllocator` implements the joint
+`CoOptimizingAllocator` implements the joint
 work-division + LX planning idea. It searches pointwise dim-flips, the
 matmuls' tilings offered to neighbours, cross-matmul split transfer, and a
 shared batch-major `B/M` split for matmuls and reductions. It still never
@@ -592,21 +635,9 @@ The remaining `@expectedFailure` cases motivate the items in
 
 ## Future work
 
-The items below are not in-tree. They sit on top of the
-`MemoryPlanSolver` and `ScratchpadOptimizationPass` interfaces so they
-can be plugged in without disturbing the rest of the planner.
-
-### Non-greedy solvers
-
-Two non-greedy solver families are being prototyped on top of the same
-`MemoryPlanSolver` interface:
-
-- **Simulated Annealing** uses a first-fit or best-fit
-  allocation as the initial guess, then perturbs the order to escape
-  local minima.
-- **Integer Linear Programming** via OR-Tools formulates placement as a
-  2D bin-packing constraint and lets a general-purpose solver search
-  exhaustively for graphs small enough to be tractable.
+The extensions below build on the current co-optimization flow through the
+`MemoryPlanSolver` and `ScratchpadOptimizationPass` interfaces, so they can
+be added without disturbing the rest of the planner.
 
 ### Richer co-optimization
 
@@ -642,12 +673,10 @@ Candidates under evaluation:
   and is only worthwhile when liveness shows it pays off.
 - **Operation re-ordering.** Re-order independent ops to extend or
   shorten lifetimes for better packing.
-- **Output node cloning.** Promote a producer to LX and clone to HBM
-  only when an HBM-resident copy is required (draft PR
-  [#2028](https://github.com/torch-spyre/torch-spyre/pull/2028)).
-- **Driving cloning from the solver.** `CloneInputNodesPass` currently
-  runs as a pre-pass with a heuristic. The longer-term plan is for the
-  solver to decide which clones pay off based on the global layout.
+- **Driving cloning from the solver.** Input-boundary cloning currently
+  runs inline in `ScratchpadAllocator` with a heuristic. The longer-term
+  plan is for the solver to decide which clones pay off based on the
+  global layout.
 
 ### Cross-core ring transfers
 
@@ -697,3 +726,6 @@ bugs that the hand-written cases miss.
 - [`coarse_tiling_loops.md`](coarse_tiling_loops.md) describes coarse
   tiling, which reduces working sets so adjacent ops can fit on LX in
   the first place.
+- [`hbm_pool_planning.md`](hbm_pool_planning.md) describes the
+  complementary device-memory pass, which packs every intermediate that
+  LX planning did not claim into a shared HBM segment.

@@ -75,7 +75,7 @@ git branch -d my-feature-branch
 ## Code Quality Standards
 
 * Follow the **Google Python Style Guide** and **Google C++ Style Guide**.
-* **Use `import regex as re`, never `import re`.** The `enforce-import-regex-instead-of-re` pre-commit hook enforces this. Using the standard-library `re` module will fail pre-commit.
+* **Use `import regex` (aliased as `re` when needed), never `import re`.** The `enforce-import-regex-instead-of-re` pre-commit hook enforces this. Importing the standard-library `re` module will fail pre-commit.
 * **Line length** is 88 characters, enforced by ruff.
 * **Run pre-commit** before submitting to make sure linting passes:
 
@@ -112,11 +112,14 @@ If your PR touches documentation, build and preview it locally before submitting
 
 ```bash
 pip install -r docs/requirements.txt
-python -m sphinx docs/source docs/build/html -W --keep-going
-python -m http.server 8080 --directory docs/build/html
+cd docs
+make html SPHINXOPTS="-W --keep-going"
+python -m http.server 8000 --directory build/html
 ```
 
-Then open `http://localhost:8080` in your browser.
+Then open `http://localhost:8000` in your browser. For a live-reload
+preview that rebuilds on save, run `make livehtml` instead (requires
+`sphinx-autobuild`, already in `docs/requirements.txt`).
 
 > **Note:** Do not open the HTML files directly from the filesystem (`file://`).
 > Browsers block CSS and JavaScript when loading local files, resulting in an

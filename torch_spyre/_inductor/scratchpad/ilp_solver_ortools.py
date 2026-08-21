@@ -31,10 +31,12 @@ constraint model over :class:`CoreDivisionBuffer`s:
 * **Placement** is a global ``AddNoOverlap2D`` over optional rectangles
   (``[start_time, end_time) x [offset, offset + eff_size)``, present iff
   resident). In-place reuse (``in_place_parents`` -> per-edge ``merge_vars``) is
-  encoded by *shortening the parent's lifetime* by the single handoff tick when
+  encoded by *shortening the child's lifetime* by the single handoff tick when
   the merge fires, so the parent and its in-place child abut in time and may
   legally share an offset; the single-tick-overlap invariant
-  (``_assert_in_place_relationships``) makes this exact (``_add_no_overlap_2d``).
+  (``_assert_in_place_relationships``) makes this exact. The parent keeps its
+  full lifetime, so the footprint above a smaller child stays protected on the
+  handoff tick (``_add_no_overlap_2d``).
 * **Objective** (two-phase lexicographic, in ``_run``). *Residency is the hard
   priority.* Phase 1 minimizes total **HBM transfer traffic** via
   ``spill_cost(b) * (1 - in_buffer)`` -- the *differential* traffic a spill adds
@@ -52,7 +54,10 @@ constraint model over :class:`CoreDivisionBuffer`s:
   spill.
 
 After the solve, ``_justify`` slides each in-place-merged placement unit down to
-the lowest free address, squeezing out float gaps without raising the peak.
+the lowest free address, squeezing out float gaps the search leaves. It coarsens
+a merged unit to one rectangle over the union of its members' lifetimes, which is
+conservative enough that the squeeze can occasionally need more room than the
+solver's own answer; when it would not fit, the solver's offsets are kept.
 
 The same model also serves plain :class:`LifetimeBoundBuffer`s via
 ``plan_layout`` (the ``MemoryPlanSolver`` contract the placement-only allocator
@@ -74,7 +79,7 @@ import logging
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Generic, TypeVar, cast
+from typing import TYPE_CHECKING, Generic, Optional, TypeVar, cast
 import torch
 
 
@@ -202,13 +207,18 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
     # ------------------------------ residency ------------------------------
     def spill_cost(self) -> int:
         """Differential HBM traffic a spill adds over residency: the reads
-        residency would have served from LX (``read_count``, computed by the
-        allocator) plus the producer's write, which residency turns into a free
-        LX write. A graph input has no producer write to save; a graph output's
-        write-out is unavoidable either way, so it too cancels. Both cases are
-        exactly ``boundary != Intermediate`` -- for a plain
-        :class:`LifetimeBoundBuffer`, whose boundary is not tracked,
-        ``first_use_is_read`` marks the same distinction for inputs."""
+        residency would have served from LX plus the producer's write, which
+        residency turns into a free LX write. A graph input has no producer write
+        to save; a graph output's write-out is unavoidable either way, so it too
+        cancels. Both cases are exactly ``boundary != Intermediate`` -- for a
+        plain :class:`LifetimeBoundBuffer`, whose boundary is not tracked,
+        ``first_use_is_read`` marks the same distinction for inputs.
+
+        An input's first read is the clone-in that pinning cannot avoid, so it is
+        not one of the reads residency serves and is discounted from
+        ``read_count`` (which counts the buffer's reads, not the savings). For a
+        computed buffer the first use is the write and ``read_count`` already
+        excludes it, hence the discount is keyed on ``first_use_is_read``."""
         b = self.buffer
         boundary = getattr(b, "boundary", None)
         is_intermediate = (
@@ -216,7 +226,8 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
             if boundary is not None
             else not b.first_use_is_read
         )
-        return (b.read_count + (1 if is_intermediate else 0)) * b.size
+        reads_served = b.read_count - (1 if b.first_use_is_read else 0)
+        return (reads_served + (1 if is_intermediate else 0)) * b.size
 
     def constrain_residency(self, model, kids, bufs) -> None:
         """Placement-only: any buffer may reside, so there is no slicing gate."""
@@ -322,6 +333,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
     def __init__(
         self,
+        buffers: Sequence[LifetimeBoundBuffer],
         size: int,
         alignment: int = 128,
         time_limit_seconds: float = 600.0,
@@ -333,16 +345,14 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 "which is not installed. Install it with 'pip install ortools' "
                 "or select a different layout_solver (e.g. 'greedy')."
             )
-        super().__init__(size, alignment)
+        super().__init__(buffers, size, alignment)
         # The solver works in alignment-sized units so every offset it picks is
         # automatically aligned; plan_layout scales sizes/offsets in and out.
         self._capacity_units = self.limit // self.alignment
         self._time_limit_seconds = time_limit_seconds
         self._bottom_justify = bottom_justify
 
-    def plan_layout(
-        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
-    ) -> list[LifetimeBoundBuffer]:
+    def plan_layout(self, log_lx_usage: bool = False) -> list[LifetimeBoundBuffer]:
         """Place buffers on their already-fixed core divisions (placement-only).
 
         Same model as :meth:`plan_layout_and_core_divisions` minus the joint
@@ -352,24 +362,19 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         Dispatch is per buffer and keys on whether it carries candidate
         divisions, not on its class, so a :class:`CoreDivisionBuffer` with an
         empty candidate list is placed here rather than divided."""
-        return cast(
-            "list[LifetimeBoundBuffer]", list(self._plan_layout_generic(buffers))
-        )
+        return cast("list[LifetimeBoundBuffer]", list(self._plan_layout_generic()))
 
-    def plan_layout_and_core_divisions(
-        self, buffers: Sequence[CoreDivisionBuffer]
-    ) -> list[CoreDivisionBuffer]:
+    def plan_layout_and_core_divisions(self) -> list[CoreDivisionBuffer]:
         """Jointly choose each buffer's core division and its LX placement.
 
         The full model described in the module docstring. Every buffer must
         carry enumerated candidate divisions; the chosen index is written back
         to ``chosen_division`` for the allocator to commit."""
+        buffers = cast("Sequence[CoreDivisionBuffer]", self.buffers)
         assert all(len(b.core_divisions) != 0 for b in buffers), (
             "All buffers must have at least 1 valid core division"
         )
-        return cast(
-            "list[CoreDivisionBuffer]", list(self._plan_layout_generic(buffers))
-        )
+        return cast("list[CoreDivisionBuffer]", list(self._plan_layout_generic()))
 
     def _wrap(
         self, model: "cp_model.CpModel", buffer: LifetimeBoundBuffer
@@ -393,9 +398,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
 
     def _plan_layout_generic(
         self,
-        buffers: Sequence[LifetimeBoundBuffer | CoreDivisionBuffer],
         log_lx_usage: bool = False,
     ) -> list[LifetimeBoundBuffer | CoreDivisionBuffer]:
+        buffers = self.buffers
         if not buffers:
             return []
         assert all(b.address is None for b in buffers), (
@@ -410,7 +415,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # ``partition`` these out -- we still hand the barred buffers to the
         # model (they must stay available for slicing matching and in-place
         # chains) but pin them non-resident below, so we only need the reasons.
-        forced_reasons = dict(self.record_exclusions(buffers))
+        forced_reasons = dict(self.record_exclusions())
 
         model = cp_model.CpModel()
         # Solve on copies so we never mutate the caller's buffers.
@@ -520,8 +525,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         """In-place reuse as a relaxation of the no-overlap constraint: each
         parent->child edge gets a merge bool that, when active, pins the pair to
         one shared base. Rather than lifting a pairwise no-overlap, an active
-        merge *shortens the parent's lifetime by the single handoff tick* it
-        shares with the child (``_assert_in_place_relationships`` guarantees the
+        merge *shortens the child's lifetime by the single handoff tick* it
+        shares with the parent (``_assert_in_place_relationships`` guarantees the
         overlap is exactly that one tick): the two then become time-adjacent
         rectangles that may legally sit at the same offset under the global 2D
         no-overlap (see ``_add_no_overlap_2d``). Chains are induced transitively
@@ -531,7 +536,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         M = self._capacity_units
 
         # A storage slot is handed off linearly, so a buffer reuses at most one
-        # parent and is reused by at most one child. ``outgoing`` also drives the
+        # parent and is reused by at most one child. ``incoming`` also drives the
         # lifetime shortening in ``_add_no_overlap_2d``.
         incoming: dict[str, list] = {}
         outgoing: dict[str, list] = {}
@@ -558,13 +563,13 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             # if a buffer is resident its top must be below the peak usage.
             model.add(sb.offset + sb.eff_size <= M).OnlyEnforceIf(sb.in_buffer)
 
-        self._add_no_overlap_2d(model, bufs, outgoing)
+        self._add_no_overlap_2d(model, bufs, incoming)
 
     def _add_no_overlap_2d(
         self,
         model: "cp_model.CpModel",
         bufs: dict[str, _LifetimeBufferWithCpVars],
-        outgoing: dict[str, list],
+        incoming: dict[str, list],
     ) -> None:
         """Global 2D no-overlap: each resident buffer is an optional rectangle
         ``[start_time, end_time) x [offset, offset + eff_size)`` and no two may
@@ -572,40 +577,48 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         presence (``in_buffer``), so spilled buffers drop out for free.
 
         In-place reuse is handled *inside* this constraint rather than by
-        relaxing it: an active outgoing merge shortens the parent's time
-        interval by the single handoff tick it shares with the child
-        (``end -> end - 1``). The parent and child then abut in time at the same
-        offset (pinned equal by the merge), which the 2D constraint accepts as
-        non-overlapping -- so the child legally reuses the parent's slot. With no
-        active merge the parent keeps its full lifetime and the shared-offset
+        relaxing it: an active incoming merge shortens the child's time interval
+        by the single handoff tick it shares with the parent
+        (``start -> start + 1``). The parent and child then abut in time at the
+        same offset (pinned equal by the merge), which the 2D constraint accepts
+        as non-overlapping -- so the child legally reuses the parent's slot. With
+        no active merge the child keeps its full lifetime and the shared-offset
         placement is correctly forbidden, exactly as the pairwise encoding did.
 
-        The handoff tick stays protected because the child's interval covers it
-        at the shared offset; the merge ``eff_size`` equality means there is no
-        footprint gap. ``AddAtMostOne`` on the outgoing edges bounds the
-        shortening at one tick (a degenerate zero-width parent box is ignored by
-        the 2D propagator, which is fine -- the child holds the slot)."""
+        It is the *child* that gives up the tick, never the parent: the parent's
+        rectangle has to keep covering the handoff tick at full footprint. The
+        child may be smaller than its parent (the placement-only model only
+        requires ``child.size <= parent.size``), and the bytes above the child
+        are still holding parent data that is read on that tick, so they are not
+        free for a third buffer. Shortening the parent instead would expose them
+        -- and a parent whose whole lifetime is that one tick would drop out of
+        the propagator entirely, exposing its full slot.
+
+        ``AddAtMostOne`` on the incoming edges bounds the shortening at one tick.
+        A child whose entire lifetime is the handoff tick degenerates to a
+        zero-width box the 2D propagator ignores, which is safe here: the tick is
+        covered by the parent's box, whose footprint contains the child's at the
+        shared offset."""
         x_intervals = []
         y_intervals = []
         for sb in bufs.values():
-            outs = outgoing.get(sb.name, [])
-            if outs:
-                # at most one outgoing merge is active (AddAtMostOne), so the
-                # sum is 0 or 1: shorten the parent by the handoff tick exactly
-                # when it hands its slot to an in-place child.
-                end_var = model.new_int_var(
-                    sb.start_time, sb.end_time, f"end_{sb.name}"
+            ins = incoming.get(sb.name, [])
+            if ins:
+                # at most one incoming merge is active (AddAtMostOne), so the
+                # sum is 0 or 1: shorten the child by the handoff tick exactly
+                # when it takes over a parent's slot.
+                start_var = model.new_int_var(
+                    sb.start_time, sb.end_time, f"start_{sb.name}"
                 )
-                model.add(end_var == sb.end_time - sum(outs))
-                x_size: object = end_var - sb.start_time
-                x_end: object = end_var
+                model.add(start_var == sb.start_time + sum(ins))
+                x_start: object = start_var
+                x_size: object = sb.end_time - start_var
             else:
-                end_var = sb.end_time
+                x_start = sb.start_time
                 x_size = sb.end_time - sb.start_time
-                x_end = sb.end_time
             x_intervals.append(
                 model.new_optional_interval_var(
-                    sb.start_time, x_size, x_end, sb.in_buffer, f"x_{sb.name}"
+                    x_start, x_size, sb.end_time, sb.in_buffer, f"x_{sb.name}"
                 )
             )
             # An interval's ``end`` must be affine (a single var), so the address
@@ -670,14 +683,16 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         ``address`` (in alignment units, as the solver works them; the caller
         scales to bytes). A spilled buffer gets ``address = None``. When
         bottom_justify is set, each in-place-merged placement unit is slid down
-        to the lowest free address (preserving merges, never raising the
-        peak)."""
+        to the lowest free address (preserving merges); if that squeeze cannot
+        keep every unit inside capacity the solver's own offsets are kept, since
+        those are always legal."""
         by_name = {name: sb.buffer for name, sb in bufs.items()}
         spilled = {
             name for name, sb in bufs.items() if not solver.BooleanValue(sb.in_buffer)
         }
         footprint = {name: sb.footprint(solver) for name, sb in bufs.items()}
 
+        offsets: Optional[dict[str, int]] = None
         if self._bottom_justify:
             # A placement unit is a connected component of active merge edges: its
             # members share one base (the merge equalities), so the component
@@ -710,8 +725,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 )
                 for names in components.values()
             ]
-            offsets = self._justify(units)
-        else:
+            offsets = self._justify(units, self._capacity_units)
+
+        if offsets is None:
             offsets = {
                 name: solver.Value(sb.offset)
                 for name, sb in bufs.items()
@@ -728,12 +744,23 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         return by_name
 
     @staticmethod
-    def _justify(units: list[_PlacementUnit]) -> dict[str, int]:
+    def _justify(
+        units: list[_PlacementUnit], capacity: int
+    ) -> Optional[dict[str, int]]:
         """Slide each placement unit down to the lowest free address. Processing
         in current-base order and giving each the lowest non-conflicting slot
-        preserves the relative stacking, so the peak never increases -- it only
-        squeezes out the float gaps the search leaves. Returns a name -> address
-        map."""
+        preserves the relative stacking, so it mostly squeezes out the float gaps
+        the search leaves. Returns a name -> address map, or ``None`` if the
+        result would not fit in ``capacity``.
+
+        A merged unit is coarsened to one rectangle spanning the union of its
+        members' lifetimes at their largest footprint, which is conservative: it
+        can make two units conflict here that did not conflict in the model, and
+        the bump that resolves that conflict can push a unit's top past capacity.
+        The caller then keeps the solver's own offsets, which the model
+        constrained to fit. Returning ``None`` rather than clamping keeps this a
+        pure optimisation -- it never decides residency, and never hands back an
+        address outside the scratchpad."""
         placed: list[_PlacementUnit] = []
         offsets = {}
         for u in sorted(units, key=lambda u: (u.original_offset, u.start_time)):
@@ -752,6 +779,8 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     break  # fits in the gap below this obstacle
                 if base < hi:
                     base = hi  # otherwise bump above it
+            if base + u.footprint > capacity:
+                return None
             u.justified_offset = base
             placed.append(u)
             for n in u.members:

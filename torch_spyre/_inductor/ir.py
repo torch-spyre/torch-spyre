@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .pass_utils import PerCoreView
 
 from sympy import Expr
 import torch
@@ -94,11 +97,12 @@ class FixedTiledLayout(FixedLayout):
         size: list[Expr],
         stride: list[Expr],
         device_layout: SpyreTensorLayout,
+        offset: Expr = sympy.Integer(0),
     ) -> None:
-        super().__init__(device, dtype, size, stride)
+        super().__init__(device, dtype, size, stride, offset)
         self.device_layout: SpyreTensorLayout = device_layout
         self.allocation: dict[str, Any] = {}
-        self.per_tile_fixed: bool = False
+        self.lx_view: Optional["PerCoreView"] = None
 
     def __str__(self) -> str:
         device_index_str = "" if self.device.index is None else f":{self.device.index}"
@@ -512,6 +516,118 @@ class BroadcastAsyncFallback(ir.ExternKernel):
         V.graph.register_operation(self)
 
 
+class AllGatherAsyncFallback(ir.ExternKernel):
+    """IR node for spyre.all_gather_async.
+
+    Starts the all_gather operation asynchronously and returns immediately.
+    Output tensor has shape[0] = input.shape[0] * group_size.
+    """
+
+    def codegen(self, wrapper: PythonWrapperCodegen) -> None:
+        input_tensor = self.inputs[0]
+        input_name = input_tensor.codegen_reference()
+
+        group_size, group_name = self.constant_args
+
+        output_name = self.get_name()
+        generated_code = (
+            f"{output_name} = torch.ops.spyre.all_gather_async("
+            f"{input_name}, {group_size}, '{group_name}')"
+        )
+
+        logger.debug(
+            f"Codegen all_gather_async: {input_name} -> {output_name} "
+            f"(group_size={group_size}, group='{group_name}')"
+        )
+
+        wrapper.writeline(generated_code)
+
+    def should_allocate(self) -> bool:
+        return False
+
+    def get_mutation_names(self) -> Sequence[str]:
+        return []
+
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
+
+    def __init__(
+        self,
+        op_overload: torch._ops.OpOverload,
+        x: IRNode,
+        group_size: int,
+        group_name: str,
+    ) -> None:
+        in_layout = x.get_layout()
+        out_size = list(in_layout.size)
+        out_size[0] = out_size[0] * group_size
+        out_stride = ir.FlexibleLayout.contiguous_strides(out_size)
+        layout = FixedLayout(in_layout.device, in_layout.dtype, out_size, out_stride)
+        super().__init__(
+            None,
+            layout,
+            [x],
+            (group_size, group_name),
+            python_kernel_name="torch.ops.spyre.all_gather_async",
+            op_overload=op_overload,
+        )
+        self.name = V.graph.register_buffer(self)
+        V.graph.register_operation(self)
+
+
+class AllReduceAsyncFallback(ir.ExternKernel):
+    """IR node for spyre.all_reduce_async.
+
+    Emits an asynchronous in-place all_reduce that must be paired with a
+    subsequent wait_work call to synchronize. Used by both the functional
+    (_c10d_functional.all_reduce) and in-place (_c10d_functional.all_reduce_)
+    lowerings — the generated code is identical since the Spyre runtime always
+    operates in-place.
+    """
+
+    def codegen(self, wrapper):
+        input_name = self.inputs[0].codegen_reference()
+        reduce_op, group_name = self.constant_args
+        output_name = self.get_name()
+        wrapper.writeline(
+            f"{output_name} = torch.ops.spyre.all_reduce_async("
+            f"{input_name}, '{reduce_op}', '{group_name}')"
+        )
+
+    def should_allocate(self):
+        return False
+
+    def get_mutation_names(self):
+        # The Spyre runtime reduces in-place into the input buffer.
+        return [self.inputs[0].get_name()]
+
+    def get_unbacked_symbol_defs(self):
+        return OrderedSet()
+
+    def __init__(
+        self,
+        op_overload: torch._ops.OpOverload,
+        x: IRNode,
+        reduce_op: str,
+        group_name: str,
+    ) -> None:
+        x_device = x.get_device()
+        x_dtype = x.get_dtype()
+        x_size = x.get_size()
+        x_stride = x.get_stride()
+        layout = FixedLayout(x_device, x_dtype, x_size, x_stride)
+        super().__init__(
+            None,
+            layout,
+            [x],
+            (reduce_op, group_name),
+            python_kernel_name="torch.ops.spyre.all_reduce_async",
+            op_overload=op_overload,
+        )
+        self.name = V.graph.register_buffer(self)
+        V.graph.register_operation(self)
+
+
 class WaitWorkFallback(ir.ExternKernel):
     """IR node for spyre.wait_work — emits a runtime call to synchronize async operation.
 
@@ -521,13 +637,9 @@ class WaitWorkFallback(ir.ExternKernel):
     """
 
     def codegen(self, wrapper: PythonWrapperCodegen) -> None:
-        # Get input tensor name (the tensor from broadcast_async)
         input_tensor = self.inputs[0]
         input_name = input_tensor.codegen_reference()
 
-        print(f"  Input tensor: {input_name}")
-
-        # Generate the wait call
         output_name = self.get_name()
         generated_code = f"{output_name} = torch.ops.spyre.wait_work({input_name})"
 

@@ -230,6 +230,39 @@ def _torch_floordiv(a, b):
     return torch.div(a, b, rounding_mode="floor")
 
 
+def _torch_ge(a, b):
+    return a.__ge__(b)
+
+
+def _tensor_truediv(x: torch.Tensor, other) -> torch.Tensor:
+    return x.__truediv__(other)
+
+
+def _tensor_clamp_(x: torch.Tensor, **kwargs) -> torch.Tensor:
+    return x.clamp_(**kwargs)
+
+
+def _grouped_mm_fallback(input: torch.Tensor, weight: torch.Tensor, offs=None):
+    """
+    Fallback for torch.ops.transformers.grouped_mm_fallback.
+    Performs a grouped matrix multiply: for each group g, computes
+    input[offs[g]:offs[g+1]] @ weight[g].T
+    Falls back to a loop over groups when the custom op is unavailable.
+    """
+    if hasattr(torch.ops, "transformers") and hasattr(
+        torch.ops.transformers, "grouped_mm_fallback"
+    ):
+        return torch.ops.transformers.grouped_mm_fallback(input, weight, offs=offs)
+    # CPU fallback: weight is (num_experts, out_features, in_features)
+    num_experts = weight.shape[0]
+    if offs is not None:
+        chunks = [input[offs[g] : offs[g + 1]] for g in range(num_experts)]
+    else:
+        chunks = input.chunk(num_experts, dim=0)
+    results = [chunk @ weight[g].T for g, chunk in enumerate(chunks)]
+    return torch.cat(results, dim=0)
+
+
 # -----------------------------
 # Special / internal wrappers
 # -----------------------------
@@ -282,6 +315,10 @@ def _tensor_add_(x: torch.Tensor, other, alpha=1):
 
 def _tensor_and_(x: torch.Tensor, other):
     return x.and_(other)
+
+
+def _tensor_or_(x: torch.Tensor, other):
+    return x.or_(other)
 
 
 def _tensor_copy_(x: torch.Tensor, source: torch.Tensor):
@@ -339,6 +376,7 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.sigmoid": OpAdapter("torch.sigmoid", torch.sigmoid),
     "torch.sin": OpAdapter("torch.sin", torch.sin),
     "torch.cos": OpAdapter("torch.cos", torch.cos),
+    "torch.tanh": OpAdapter("torch.tanh", torch.tanh),
     "torch.clamp": OpAdapter("torch.clamp", torch.clamp),
     "torch.floor": OpAdapter("torch.floor", torch.floor),
     "torch.where": OpAdapter("torch.where", torch.where),
@@ -408,6 +446,8 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.ne": OpAdapter("torch.ne", _torch_ne),
     "torch.gt": OpAdapter("torch.gt", _torch_gt),
     "torch.logical_and": OpAdapter("torch.logical_and", torch.logical_and),
+    "torch.bitwise_or": OpAdapter("torch.bitwise_or", torch.bitwise_or),
+    "torch.or_": OpAdapter("torch.or_", _tensor_or_, is_inplace=True),
     # Type/device conversions
     "torch.float": OpAdapter("torch.float", _tensor_float),
     "float": OpAdapter("torch.float", _tensor_float),
@@ -416,6 +456,14 @@ OP_REGISTRY: Dict[str, OpAdapter] = {
     "torch.to": OpAdapter("torch.to", _tensor_to),
     "torch.type_as": OpAdapter("torch.Tensor.type_as", torch.Tensor.type_as),
     # Creation
+    "torch.empty_like": OpAdapter("torch.empty_like", torch.empty_like),
+    "torch.ge": OpAdapter("torch.ge", _torch_ge),
+    "torch.histc": OpAdapter("torch.histc", torch.histc),
+    "torch.clamp_": OpAdapter("torch.clamp_", _tensor_clamp_, is_inplace=True),
+    "torch.Tensor.truediv": OpAdapter("torch.Tensor.truediv", _tensor_truediv),
+    "torch.ops.transformers.grouped_mm_fallback": OpAdapter(
+        "torch.ops.transformers.grouped_mm_fallback", _grouped_mm_fallback
+    ),
     "torch.zeros": OpAdapter("torch.zeros", torch.zeros),
     "torch.zeros_like": OpAdapter("torch.zeros_like", torch.zeros_like),
     "torch.ones": OpAdapter("torch.ones", torch.ones),

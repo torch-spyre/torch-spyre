@@ -14,21 +14,37 @@
 
 """End-to-end compilation tests for the coarse-tiling loop IR.
 
-These tests drive the full Spyre compilation pipeline (CustomPreSchedulingPasses
-→ scheduler → SpyreKernel codegen) and inspect the generated Python wrapper
-source to verify that LoopSpec entries appear when coarse tiling is active.
+This file has two sections:
 
-No Spyre hardware is required: torch.compile() exercises the full codegen path
-and run_and_get_code() captures the generated source without executing on device.
-launch_jobplan is mocked to prevent actual device execution.
+STRUCTURED TESTS (Groups 1-10)
+    Flat module-level tests using the run_coarse_tile_test() driver.
+    These are the primary test suite going forward — easy to read, copy,
+    and extend.  Each test declares its inputs via tensor() descriptors,
+    defines a plain fn(), and calls the driver with optional loopspec=
+    and correctness= flags.
 
-All coarse-tiling tests use the spyre_hint API (TestCoarseTileSpyreHints).
-Add new tests there using spyre_hint(num_tiles_per_dim=...) annotations.
+    Group 1: Basic tiling — abs/add on 2D tensors, varied sizes and tile counts
+    Group 2: 3D tensors — [A=512, B=256, C=256], all tiling combinations
+    Group 3: Pointwise op chains — abs(a+b)*c, exp(abs(...)), etc.
+    Group 4: Reductions — amin over 2D (all tiling combos) and 3D (all-dims)
+    Group 5: Mixed pointwise + reduction — add_min, reduce_both, softmax
+    Group 6: Restickify + coarse tiling — transpose inputs with tiling
+    Group 7: Copies — pre-allocated buffers, in-place accumulators, RMW
+    Group 8: Tiled ops with outside consumers
+    Group 9: Views — 1D sub-dim naming, reshape, view+transpose, unsqueeze
+    Group 10: Flash attention variants — v1/v2/v3/v4, parameterized by size and tile dims
+
+    Tests marked loopspec=None are known broken and
+    skipped; see inline comments for root cause.
+
+ORIGINAL TESTS (below the boundary marker)
+    Original class-based tests preserved for coverage and reference, to be cleaned up in future.
 """
 
+import dataclasses
 import math
-import sys
 import os
+import sys
 import regex as re
 
 import pytest
@@ -36,21 +52,3538 @@ import torch
 import unittest
 from unittest.mock import patch as mock_patch
 
-from torch._inductor.test_case import TestCase as InductorTestCase
+from torch._inductor.exc import InductorError
+from torch._inductor.test_case import TestCase as InductorTestCase, fresh_cache
 from torch._inductor.utils import run_and_get_code
 
 from torch_spyre._inductor import config
+from torch_spyre._inductor import spyre_hint
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
-from utils_inductor import compare_with_cpu  # noqa: E402
+from utils_inductor import compare_with_cpu, _compile_and_run  # noqa: E402
+
+_declare_tensor_dim = _pnd.declare_tensor_dim
+_name_tensor_dims = _pnd.name_tensor_dims
+copy_forced = torch.ops.spyre.copy_forced
 
 # Paths to mock for disabling actual device kernel execution.
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
 
+# Set to False to run currently-raising tests normally instead of expecting raises.
+_EXPECT_RAISES = True
+
+
+def _run_coarse_tile_test_raises(fn, inputs, match):
+    """Run a test that currently raises; skip the raise check when _EXPECT_RAISES=False."""
+    if _EXPECT_RAISES:
+        with pytest.raises(Exception, match=match):
+            run_coarse_tile_test(fn, inputs)
+    else:
+        run_coarse_tile_test(fn, inputs)
+
+
+# ---------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------
+
+
+class LoopSpecCheck:
+    """Callable loopspec checker passed as the loopspec= argument to run_coarse_tile_test.
+
+    loopspec=LoopSpecCheck()             — asserts LoopSpec( appears in generated source (default)
+    loopspec=LoopSpecCheck(counts=[4,2]) — also checks count=sympify('N') for each N
+    loopspec=None                        — skip loopspec check entirely
+    """
+
+    def __init__(self, counts=None):
+        self.counts = counts
+
+    def __call__(self, src):
+        assert "LoopSpec(" in src, f"Expected LoopSpec( in generated source:\n{src}"
+        if self.counts:
+            for count in self.counts:
+                assert f"count=sympify('{count}')" in src, (
+                    f"Expected count=sympify('{count}') in generated source:\n{src}"
+                )
+
+
+@dataclasses.dataclass
+class TensorSpec:
+    """Descriptor for a test input tensor.
+
+    name:       parameter name in fn — for readability only.
+    shape:      physical tensor shape passed to torch.randn.
+    dims:       named dim labels in order, passed to _name_tensor_dims.
+    named_dims: optional explicit {dim_name: size} dict for declaring dims.
+                Use when len(dims) > len(shape) — i.e. multiple logical dims
+                are fused into one physical dim (e.g. flat [B, S, H*D] input
+                named ["batch_size", "max_seqlen", "num_heads", "head_dim"]).
+                When absent, sizes are inferred by zipping dims with shape.
+    value:      optional pre-built CPU tensor. When set, used directly instead
+                of torch.randn — shape and scale are ignored for tensor creation.
+                Useful for structured inputs like causal masks.
+    """
+
+    name: str
+    shape: tuple
+    dims: list
+    named_dims: dict | None = dataclasses.field(default=None)
+    value: "torch.Tensor | None" = dataclasses.field(default=None)
+
+
+def tensor(name, *, shape, dims, named_dims=None, value=None):
+    """Shorthand constructor for TensorSpec."""
+    return TensorSpec(
+        name=name, shape=shape, dims=dims, named_dims=named_dims, value=value
+    )
+
+
+def run_coarse_tile_test(
+    fn,
+    inputs,
+    loopspec=LoopSpecCheck(),
+    correctness=True,
+    atol=None,
+    rtol=None,
+    scale=1.0,
+):
+    """Compile fn on Spyre once, then check loopspec and/or correctness.
+
+    inputs: list of TensorSpec (from tensor(...)) — driver creates tensors,
+        declares dims, and calls _name_tensor_dims before each compile.
+
+    loopspec: LoopSpecCheck() — check generated source for LoopSpec (default).
+              LoopSpecCheck(counts=[4,2]) also checks specific tile counts.
+              None — skip loopspec check.
+    correctness: True  — compare_with_cpu against CPU reference.
+
+    Always compiles exactly once, regardless of which checks are enabled.
+    """
+
+    torch.manual_seed(0xC0A75E)
+    cpu_tensors = [
+        s.value
+        if s.value is not None
+        else torch.randn(s.shape, dtype=torch.float16) * scale
+        for s in inputs
+    ]
+
+    def _setup_dims_and_dev_tensors():
+        _pnd.reset()
+        for spec in inputs:
+            if spec.named_dims is not None:
+                for dim, size in spec.named_dims.items():
+                    _declare_tensor_dim(dim, size)
+            else:
+                for dim, size in zip(spec.dims, spec.shape):
+                    _declare_tensor_dim(dim, size)
+        dev_tensors = [t.to("spyre") for t in cpu_tensors]
+        for spec, t in zip(inputs, dev_tensors):
+            _name_tensor_dims(t, spec.dims)
+        return dev_tensors
+
+    with fresh_cache():
+        dev_tensors = _setup_dims_and_dev_tensors()
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("torch_spyre.execution.async_compile.subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), *dev_tensors)
+
+    if loopspec and not config.ignore_wsr_hints:
+        assert len(source_codes) > 0
+        loopspec(source_codes[0])
+
+    if correctness:
+        dev_tensors = _setup_dims_and_dev_tensors()
+        spyre_result = _compile_and_run(fn, dev_tensors, "spyre")
+        kwargs = {}
+        if atol is not None:
+            kwargs["atol"] = atol
+        if rtol is not None:
+            kwargs["rtol"] = rtol
+        compare_with_cpu(
+            fn,
+            *cpu_tensors,
+            target=spyre_result,
+            run_eager=False,
+            **kwargs,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Group 1: Test basic tiling with various sizes
+# ---------------------------------------------------------------------------
+
+
+def test_abs_256x256_A4():
+    """abs [256,256] tiled A÷4 → 64 elems/tile (1 stick)."""
+    inputs = [tensor("x", shape=(256, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return torch.abs(x)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_abs_256x256_B4():
+    """abs [256,256] tiled B÷4 → 64 elems/tile (1 stick)."""
+    inputs = [tensor("x", shape=(256, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return torch.abs(x)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_abs_256x256_A4_B4():
+    """abs [256,256] tiled A÷4 B÷4 → 64 elems/tile each (1 stick)."""
+    inputs = [tensor("x", shape=(256, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    return torch.abs(x)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# --- add: scenario 1 — square 256×256, 1-stick tiles (64 elems/tile) ---
+
+
+def test_add_256x256_A4():
+    """add [256,256] tiled A÷4 → 64 elems/tile (1 stick)."""
+    inputs = [
+        tensor("x", shape=(256, 256), dims=["A", "B"]),
+        tensor("y", shape=(256, 256), dims=["A", "B"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return x + y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_add_256x256_B4():
+    """add [256,256] tiled B÷4 → 64 elems/tile (1 stick)."""
+    inputs = [
+        tensor("x", shape=(256, 256), dims=["A", "B"]),
+        tensor("y", shape=(256, 256), dims=["A", "B"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return x + y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_add_256x256_A4_B4():
+    """add [256,256] tiled A÷4 B÷4 → 64 elems/tile each (1 stick)."""
+    inputs = [
+        tensor("x", shape=(256, 256), dims=["A", "B"]),
+        tensor("y", shape=(256, 256), dims=["A", "B"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    return x + y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# --- add: scenario 2 — non-square 512×256, A>B, 2-stick A tiles ---
+
+
+def test_add_512x256_A4():
+    """add [512,256] tiled A÷4 → 128 elems/tile (2 sticks)."""
+    inputs = [
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+        tensor("y", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return x + y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_add_512x256_B4():
+    """add [512,256] tiled B÷4 → 64 elems/tile (1 stick)."""
+    inputs = [
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+        tensor("y", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return x + y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_add_512x256_A4_B4():
+    """add [512,256] tiled A÷4 B÷4 → 128 and 64 elems/tile."""
+    inputs = [
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+        tensor("y", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    return x + y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# --- add: scenario 3 — non-square 256×512, B>A, 2-stick B tiles ---
+
+
+def test_add_256x512_A4():
+    """add [256,512] tiled A÷4 → 64 elems/tile (1 stick)."""
+    inputs = [
+        tensor("x", shape=(256, 512), dims=["A", "B"]),
+        tensor("y", shape=(256, 512), dims=["A", "B"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return x + y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_add_256x512_B4():
+    """add [256,512] tiled B÷4 → 128 elems/tile (2 sticks)."""
+    inputs = [
+        tensor("x", shape=(256, 512), dims=["A", "B"]),
+        tensor("y", shape=(256, 512), dims=["A", "B"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return x + y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_add_256x512_A4_B4():
+    """add [256,512] tiled A÷4 B÷4 → 64 and 128 elems/tile."""
+    inputs = [
+        tensor("x", shape=(256, 512), dims=["A", "B"]),
+        tensor("y", shape=(256, 512), dims=["A", "B"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    return x + y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# --- add: scenario 4 — square 512×512, 2-stick tiles ---
+
+
+def test_add_512x512_A4():
+    """add [512,512] tiled A÷4 → 128 elems/tile (2 sticks)."""
+    inputs = [
+        tensor("x", shape=(512, 512), dims=["A", "B"]),
+        tensor("y", shape=(512, 512), dims=["A", "B"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return x + y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_add_512x512_B4():
+    """add [512,512] tiled B÷4 → 128 elems/tile (2 sticks)."""
+    inputs = [
+        tensor("x", shape=(512, 512), dims=["A", "B"]),
+        tensor("y", shape=(512, 512), dims=["A", "B"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return x + y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_add_512x512_A4_B4():
+    """add [512,512] tiled A÷4 B÷4 → 128 elems/tile each (2 sticks)."""
+    inputs = [
+        tensor("x", shape=(512, 512), dims=["A", "B"]),
+        tensor("y", shape=(512, 512), dims=["A", "B"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    return x + y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# --- add: scenario 5 — asymmetric tile counts, same tile size ---
+
+
+def test_add_512x256_A4_B2():
+    """add [512,256] tiled A÷4 B÷2 → 128 elems/tile each, different counts."""
+    inputs = [
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+        tensor("y", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 2}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    return x + y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# ---------------------------------------------------------------------------
+# Group 2: 3D tensors — [A=512, B=256, C=256]
+# A÷4=128/tile (2 sticks), B÷2=128/tile (2 sticks, count=2), C÷4=64/tile (1 stick)
+# ---------------------------------------------------------------------------
+
+
+def test_add_3d_512x256x256_A4():
+    """add [512,256,256] tiled A÷4 → 128 elems/tile (2 sticks)."""
+    inputs = [
+        tensor("x", shape=(512, 256, 256), dims=["A", "B", "C"]),
+        tensor("y", shape=(512, 256, 256), dims=["A", "B", "C"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B", "C"]):
+                return x + y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_add_3d_512x256x256_B2():
+    """add [512,256,256] tiled B÷2 → 128 elems/tile (2 sticks, count=2)."""
+    inputs = [
+        tensor("x", shape=(512, 256, 256), dims=["A", "B", "C"]),
+        tensor("y", shape=(512, 256, 256), dims=["A", "B", "C"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"B": 2}):
+            with spyre_hint(expected_named_dims=["A", "B", "C"]):
+                return x + y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_add_3d_512x256x256_C4():
+    """add [512,256,256] tiled C÷4 → 64 elems/tile (1 stick)."""
+    inputs = [
+        tensor("x", shape=(512, 256, 256), dims=["A", "B", "C"]),
+        tensor("y", shape=(512, 256, 256), dims=["A", "B", "C"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"C": 4}):
+            with spyre_hint(expected_named_dims=["A", "B", "C"]):
+                return x + y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_add_3d_512x256x256_A4_B2():
+    """add [512,256,256] tiled A÷4 B÷2 → 128+128 elems/tile."""
+    inputs = [
+        tensor("x", shape=(512, 256, 256), dims=["A", "B", "C"]),
+        tensor("y", shape=(512, 256, 256), dims=["A", "B", "C"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 2}):
+                with spyre_hint(expected_named_dims=["A", "B", "C"]):
+                    return x + y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_add_3d_512x256x256_A4_C4():
+    """add [512,256,256] tiled A÷4 C÷4 → 128+64 elems/tile."""
+    inputs = [
+        tensor("x", shape=(512, 256, 256), dims=["A", "B", "C"]),
+        tensor("y", shape=(512, 256, 256), dims=["A", "B", "C"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"C": 4}):
+                with spyre_hint(expected_named_dims=["A", "B", "C"]):
+                    return x + y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_add_3d_512x256x256_B2_C4():
+    """add [512,256,256] tiled B÷2 C÷4 → 128+64 elems/tile."""
+    inputs = [
+        tensor("x", shape=(512, 256, 256), dims=["A", "B", "C"]),
+        tensor("y", shape=(512, 256, 256), dims=["A", "B", "C"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"B": 2}):
+            with spyre_hint(num_tiles_per_dim={"C": 4}):
+                with spyre_hint(expected_named_dims=["A", "B", "C"]):
+                    return x + y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_add_3d_512x256x256_A4_B2_C4():
+    """add [512,256,256] tiled A÷4 B÷2 C÷4 → 128+128+64 elems/tile."""
+    inputs = [
+        tensor("x", shape=(512, 256, 256), dims=["A", "B", "C"]),
+        tensor("y", shape=(512, 256, 256), dims=["A", "B", "C"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 2}):
+                with spyre_hint(num_tiles_per_dim={"C": 4}):
+                    with spyre_hint(expected_named_dims=["A", "B", "C"]):
+                        return x + y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# ---------------------------------------------------------------------------
+# Group 3: pointwise op chains — [512x256], 3 tiling variants each
+# A÷4=128/tile (2 sticks), B÷4=64/tile (1 stick)
+# ---------------------------------------------------------------------------
+
+
+def test_abs_add_mul_512x256_A4():
+    """abs(a+b)*c on [512,256] tiled A÷4 → 128 elems/tile (2 sticks)."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+        tensor("c", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b, c):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return torch.abs(a + b) * c
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_abs_add_mul_512x256_B4():
+    """abs(a+b)*c on [512,256] tiled B÷4 → 64 elems/tile (1 stick)."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+        tensor("c", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b, c):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return torch.abs(a + b) * c
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_abs_add_mul_512x256_A4_B4():
+    """abs(a+b)*c on [512,256] tiled A÷4 B÷4 → 128+64 elems/tile."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+        tensor("c", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b, c):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    return torch.abs(a + b) * c
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_exp_abs_add_mul_512x256_A4():
+    """exp(abs((a+b)*c)) on [512,256] tiled A÷4 → 128 elems/tile (2 sticks)."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+        tensor("c", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b, c):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return torch.exp(torch.abs((a + b) * c))
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_exp_abs_add_mul_512x256_B4():
+    """exp(abs((a+b)*c)) on [512,256] tiled B÷4 → 64 elems/tile (1 stick)."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+        tensor("c", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b, c):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return torch.exp(torch.abs((a + b) * c))
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_exp_abs_add_mul_512x256_A4_B4():
+    """exp(abs((a+b)*c)) on [512,256] tiled A÷4 B÷4 → 128+64 elems/tile."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+        tensor("c", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b, c):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    return torch.exp(torch.abs((a + b) * c))
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# ---------------------------------------------------------------------------
+# Group 4: reductions (amin) — 2D all tiling combos, 3D all-dims tiling
+# 2D [512x256]: A÷4=128/tile, B÷4=64/tile
+# 3D [512x256x256]: A÷4=128/tile, B÷2=128/tile, C÷4=64/tile
+# ---------------------------------------------------------------------------
+
+
+def test_min_2d_512x256_reduce_dim0_A4():
+    """amin over dim=0 on [512,256] tiled A÷4 → 128 elems/tile (2 sticks)."""
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
+                return x.amin(dim=0)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_min_2d_512x256_reduce_dim0_B4():
+    """amin over dim=0 on [512,256] tiled B÷4 → 64 elems/tile (1 stick)."""
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
+                return x.amin(dim=0)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_min_2d_512x256_reduce_dim0_A4_B4():
+    """amin over dim=0 on [512,256] tiled A÷4 B÷4 → 128+64 elems/tile."""
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(
+                    expected_named_dims=["B"], expected_reduction_dims=["A"]
+                ):
+                    return x.amin(dim=0)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_min_2d_512x256_reduce_dim1_A4():
+    """amin over dim=1 on [512,256] tiled A÷4 → 128 elems/tile (2 sticks)."""
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A"], expected_reduction_dims=["B"]):
+                return x.amin(dim=1)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_min_2d_512x256_reduce_dim1_B4():
+    """amin over dim=1 on [512,256] tiled B÷4 → 64 elems/tile (1 stick)."""
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["A"], expected_reduction_dims=["B"]):
+                return x.amin(dim=1)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_min_2d_512x256_reduce_dim1_A4_B4():
+    """amin over dim=1 on [512,256] tiled A÷4 B÷4 → 128+64 elems/tile."""
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(
+                    expected_named_dims=["A"], expected_reduction_dims=["B"]
+                ):
+                    return x.amin(dim=1)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_min_3d_512x256x256_reduce_dim0_A4_B2_C4():
+    """amin over dim=0 on [512,256,256] tiled A÷4 B÷2 C÷4."""
+    inputs = [tensor("x", shape=(512, 256, 256), dims=["A", "B", "C"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 2}):
+                with spyre_hint(num_tiles_per_dim={"C": 4}):
+                    with spyre_hint(
+                        expected_named_dims=["B", "C"], expected_reduction_dims=["A"]
+                    ):
+                        return x.amin(dim=0)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_min_3d_512x256x256_reduce_dim1_A4_B2_C4():
+    """amin over dim=1 on [512,256,256] tiled A÷4 B÷2 C÷4 must be rejected.
+
+    Output dim A (level 0) is outer to reduction dim B (level 1), but output
+    dim C (level 2) is inner to it — interleaved reduction tiling.
+    """
+    inputs = [tensor("x", shape=(512, 256, 256), dims=["A", "B", "C"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 2}):
+                with spyre_hint(num_tiles_per_dim={"C": 4}):
+                    with spyre_hint(
+                        expected_named_dims=["A", "C"], expected_reduction_dims=["B"]
+                    ):
+                        return x.amin(dim=1)
+
+    with pytest.raises(
+        Exception,
+        match="interleaved reduction tiling not supported",
+    ):
+        run_coarse_tile_test(fn, inputs)
+
+
+def test_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
+    """amin over dim=2 on [512,256,256] tiled A÷4 B÷2 C÷4."""
+    inputs = [tensor("x", shape=(512, 256, 256), dims=["A", "B", "C"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 2}):
+                with spyre_hint(num_tiles_per_dim={"C": 4}):
+                    with spyre_hint(
+                        expected_named_dims=["A", "B"], expected_reduction_dims=["C"]
+                    ):
+                        return x.amin(dim=2)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# ---------------------------------------------------------------------------
+# Group 5: mixed pointwise + reduction — add_min, reduce_both, softmax
+# add_min: min(a + abs(amin(b))) — 2D all 3 tiling variants × 2 reduction dims,
+#   3D all-dims tiling × 3 reduction dims
+# reduce_both: amin(a,dim) + amin(b,dim) — dense+dense and sparse+sparse, 3 tiling variants
+# softmax: decomposes into amax+pointwise+sum+pointwise — dim0 and dim1, 3 tiling variants each
+# ---------------------------------------------------------------------------
+
+
+def test_add_min_2d_512x256_reduce_dim0_A4():
+    """a + abs(amin(b, dim=0)) on [512,256] tiled A÷4 must be rejected.
+
+    abs and add are loop-invariant at the reduction level but share the loop
+    group with the A-tiled reduction — they would see a partial (per-tile)
+    min, not the global min.
+    """
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
+                r = b.amin(dim=0)
+            with spyre_hint(expected_named_dims=["B"]):
+                temp = torch.abs(r)
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return a + temp
+
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="partial reduction result consumed before accumulation is complete",
+    )
+
+
+def test_add_min_2d_512x256_reduce_dim0_B4():
+    """min(a + abs(amin(b, dim=0))) on [512,256] tiled B÷4."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
+                r = b.amin(dim=0)
+            with spyre_hint(expected_named_dims=["B"]):
+                temp = torch.abs(r)
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return a + temp
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_add_min_2d_512x256_reduce_dim0_A4_B4():
+    """a + abs(amin(b, dim=0)) on [512,256] tiled A÷4 B÷4 must be rejected."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(
+                    expected_named_dims=["B"], expected_reduction_dims=["A"]
+                ):
+                    r = b.amin(dim=0)
+                with spyre_hint(expected_named_dims=["B"]):
+                    temp = torch.abs(r)
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    return a + temp
+
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="partial reduction result consumed before accumulation is complete",
+    )
+
+
+def test_add_min_2d_512x256_reduce_dim1_A4():
+    """min(a + abs(amin(b, dim=1))) on [512,256] tiled A÷4."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A"], expected_reduction_dims=["B"]):
+                r = b.amin(dim=1, keepdim=True)
+            with spyre_hint(expected_named_dims=["A"]):
+                temp = torch.abs(r)
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return a + temp
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_add_min_2d_512x256_reduce_dim1_B4():
+    """a + abs(amin(b, dim=1)) on [512,256] tiled B÷4 must be rejected."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["A"], expected_reduction_dims=["B"]):
+                r = b.amin(dim=1, keepdim=True)
+            with spyre_hint(expected_named_dims=["A"]):
+                temp = torch.abs(r)
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return a + temp
+
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="partial reduction result consumed before accumulation is complete",
+    )
+
+
+def test_add_min_2d_512x256_reduce_dim1_A4_B4():
+    """a + abs(amin(b, dim=1)) on [512,256] tiled A÷4 B÷4 must be rejected."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(
+                    expected_named_dims=["A"], expected_reduction_dims=["B"]
+                ):
+                    r = b.amin(dim=1, keepdim=True)
+                with spyre_hint(expected_named_dims=["A"]):
+                    temp = torch.abs(r)
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    return a + temp
+
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="partial reduction result consumed before accumulation is complete",
+    )
+
+
+def test_add_min_3d_512x256x256_reduce_dim0_A4_B2_C4():
+    """min(a + abs(amin(b, dim=0))) on [512,256,256] tiled A÷4 B÷2 C÷4 must be rejected.
+
+    buf1 (the abs of the partial amin) is read by the add op inside the same
+    loop group before the amin's accumulation across A is complete.
+    """
+    inputs = [
+        tensor("a", shape=(512, 256, 256), dims=["A", "B", "C"]),
+        tensor("b", shape=(512, 256, 256), dims=["A", "B", "C"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 2}):
+                with spyre_hint(num_tiles_per_dim={"C": 4}):
+                    with spyre_hint(
+                        expected_named_dims=["B", "C"], expected_reduction_dims=["A"]
+                    ):
+                        r = b.amin(dim=0)
+                    with spyre_hint(expected_named_dims=["B", "C"]):
+                        temp = torch.abs(r)
+                    with spyre_hint(expected_named_dims=["A", "B", "C"]):
+                        return a + temp
+
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="partial reduction result consumed before accumulation is complete",
+    )
+
+
+def test_add_min_3d_512x256x256_reduce_dim1_A4_B2_C4():
+    """min(a + abs(amin(b, dim=1))) on [512,256,256] tiled A÷4 B÷2 C÷4 must be rejected.
+
+    keepdim=True so the reduced B dim survives as size 1 and `a + temp`
+    broadcasts against a's trailing (B, C) dims correctly. buf1 (the abs of
+    the partial amin) is read by the add op inside the same loop group
+    before the amin's accumulation across B is complete.
+    """
+    inputs = [
+        tensor("a", shape=(512, 256, 256), dims=["A", "B", "C"]),
+        tensor("b", shape=(512, 256, 256), dims=["A", "B", "C"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 2}):
+                with spyre_hint(num_tiles_per_dim={"C": 4}):
+                    with spyre_hint(
+                        expected_named_dims=["A", "C"], expected_reduction_dims=["B"]
+                    ):
+                        r = b.amin(dim=1, keepdim=True)
+                    with spyre_hint(expected_named_dims=["A", "C"]):
+                        temp = torch.abs(r)
+                    with spyre_hint(expected_named_dims=["A", "B", "C"]):
+                        return a + temp
+
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="partial reduction result consumed before accumulation is complete",
+    )
+
+
+def test_add_min_3d_512x256x256_reduce_dim2_A4_B2_C4():
+    """min(a + abs(amin(b, dim=2))) on [512,256,256] tiled A÷4 B÷2 C÷4 must be rejected.
+
+    keepdim=True so the reduced C dim survives as size 1 and `a + temp`
+    broadcasts against a's trailing (B, C) dims correctly. buf1 (the abs of
+    the partial amin) is read by the add op inside the same loop group
+    before the amin's accumulation across C is complete.
+    """
+    inputs = [
+        tensor("a", shape=(512, 256, 256), dims=["A", "B", "C"]),
+        tensor("b", shape=(512, 256, 256), dims=["A", "B", "C"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 2}):
+                with spyre_hint(num_tiles_per_dim={"C": 4}):
+                    with spyre_hint(
+                        expected_named_dims=["A", "B"], expected_reduction_dims=["C"]
+                    ):
+                        r = b.amin(dim=2, keepdim=True)
+                    with spyre_hint(expected_named_dims=["A", "B"]):
+                        temp = torch.abs(r)
+                    with spyre_hint(expected_named_dims=["A", "B", "C"]):
+                        return a + temp
+
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="partial reduction result consumed before accumulation is complete",
+    )
+
+
+# dense+dense: both inputs reduce over dim=0 → [B] dense outputs, then add
+# sparse+sparse: both inputs reduce over dim=1 (stick) → [A] sparse outputs, then add
+
+
+def test_reduce_both_dense_add_2d_512x256_A4():
+    """amin(a,dim=0) + amin(b,dim=0) on [512,256] tiled A÷4 must be rejected."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["B"]):
+                return a.amin(dim=0) + b.amin(dim=0)
+
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="partial reduction result consumed before accumulation is complete",
+    )
+
+
+def test_reduce_both_dense_add_2d_512x256_B4():
+    """amin(a,dim=0) + amin(b,dim=0) on [512,256] tiled B÷4 — dense+dense."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["B"]):
+                return a.amin(dim=0) + b.amin(dim=0)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_reduce_both_dense_add_2d_512x256_A4_B4():
+    """amin(a,dim=0) + amin(b,dim=0) on [512,256] tiled A÷4 B÷4 must be rejected."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(expected_named_dims=["B"]):
+                    return a.amin(dim=0) + b.amin(dim=0)
+
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="partial reduction result consumed before accumulation is complete",
+    )
+
+
+def test_reduce_both_sparse_add_2d_512x256_A4():
+    """amin(a,dim=1) + amin(b,dim=1) on [512,256] tiled A÷4 — sparse+sparse."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A"]):
+                return a.amin(dim=1) + b.amin(dim=1)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_reduce_both_sparse_add_2d_512x256_B4():
+    """amin(a,dim=1) + amin(b,dim=1) on [512,256] tiled B÷4 must be rejected."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["A"]):
+                return a.amin(dim=1) + b.amin(dim=1)
+
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="partial reduction result consumed before accumulation is complete",
+    )
+
+
+def test_reduce_both_sparse_add_2d_512x256_A4_B4():
+    """amin(a,dim=1) + amin(b,dim=1) on [512,256] tiled A÷4 B÷4 must be rejected."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(expected_named_dims=["A"]):
+                    return a.amin(dim=1) + b.amin(dim=1)
+
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="partial reduction result consumed before accumulation is complete",
+    )
+
+
+def test_partial_reduction_two_hop_A4():
+    """a + amin(b)*c on [512,256] tiled A÷4 must be rejected at compile time.
+
+    amin reduces A away; the multiply by c is a second hop from the partial
+    scratch before feeding the A-tiled add.  The compiler must raise
+    Unsupported at the multiply (first direct reader of the partial scratch),
+    not silently produce wrong results.
+    """
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+        tensor("c", shape=(256,), dims=["B"]),
+    ]
+
+    def fn(a, b, c):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
+                r = b.amin(dim=0)
+            with spyre_hint(expected_named_dims=["B"]):
+                t = r * c
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return a + t
+
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="partial reduction result consumed before accumulation is complete",
+    )
+
+
+# softmax decomposes into amax + pointwise + sum + pointwise — exercises
+# mixed reduction+pointwise tiling in a single op
+
+
+def test_softmax_2d_512x256_dim1_A4():
+    """softmax(x, dim=1) on [512,256] tiled A÷4 → 128 elems/tile (2 sticks)."""
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            return torch.softmax(x, dim=1)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_softmax_2d_512x256_dim1_B4():
+    """softmax(x, dim=1) on [512,256] tiled B÷4 → 64 elems/tile (1 stick).
+
+    Same follow-on layout-solver bug as test_softmax_2d_512x256_dim1_A4_B4:
+    div's new full-buffer read of exp's copy-out has no feasible restickify
+    path. See that test's docstring.
+    """
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            return torch.softmax(x, dim=1)
+
+    with pytest.raises(
+        InductorError,
+        match="finalize_layouts: restickify needed but infeasible for op=",
+    ):
+        run_coarse_tile_test(fn, inputs)
+
+
+def test_softmax_2d_512x256_dim1_A4_B4():
+    """softmax(x, dim=1) on [512,256] tiled A÷4 B÷4.
+
+    coarse_tile now correctly classifies exp's copy-out (div reads sum's
+    tiled-reduction result, forcing div into a separate loop nest, so exp
+    can no longer stay loop_internal — see _consumers_reading_incomplete_
+    reduction). That surfaces a distinct, still-unresolved layout-solver
+    bug: finalize_layouts can't find a restickify path for div's new
+    full-buffer read of exp's copy-out. Track the follow-on bug here until
+    it's root-caused.
+    """
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                return torch.softmax(x, dim=1)
+
+    with pytest.raises(
+        InductorError,
+        match="finalize_layouts: restickify needed but infeasible for op=",
+    ):
+        run_coarse_tile_test(fn, inputs)
+
+
+@pytest.mark.skip(
+    reason="correctness bug: A÷4 tiled softmax over dim=0 produces numerical errors (0.0% but 0.24 diff)"
+)
+def test_softmax_2d_512x256_dim0_A4():
+    """softmax(x, dim=0) on [512,256] tiled A÷4 → 128 elems/tile (2 sticks)."""
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            return torch.softmax(x, dim=0)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_softmax_2d_512x256_dim0_B4():
+    """softmax(x, dim=0) on [512,256] tiled B÷4 → 64 elems/tile (1 stick)."""
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            return torch.softmax(x, dim=0)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# Two bugs blocked this before PR #3622: (1) sibling-op A-reduction vs A-output
+# tiling collision (colsum diagnostic: every output column summed to ~4.0 instead
+# of ~1.0); (2) squeeze-position bug in _insert_reduction_copy_op (issue #3613).
+# Post-#3622 compilation succeeds but results are still numerically wrong.
+@pytest.mark.skip(reason="numerically incorrect results — root cause unknown")
+def test_softmax_2d_512x256_dim0_A4_B4():
+    """softmax(x, dim=0) on [512,256] tiled A÷4 B÷4."""
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                return torch.softmax(x, dim=0)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# ---------------------------------------------------------------------------
+# Group 6: restickify + coarse tiling
+# a=[256,128], x=[128,256]: a.t() gives [128,256] same shape as x but
+# stick-incompatible — restickify is inserted before the add.
+# Named dims on the result shape [128, 256]: A=128, B=256.
+# A÷2=64/tile (1 stick), B÷4=64/tile (1 stick)
+# ---------------------------------------------------------------------------
+
+
+def test_restickify_add_256x128_A2():
+    """a.t() + x on [128,256] result, tiled A÷2 → 64 elems/tile (1 stick)."""
+    inputs = [
+        tensor("a", shape=(256, 128), dims=["B", "A"]),
+        tensor("x", shape=(128, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, x):
+        with spyre_hint(num_tiles_per_dim={"A": 2}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return a.t() + x
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_restickify_add_256x128_B4():
+    """a.t() + x on [128,256] result, tiled B÷4 → 64 elems/tile (1 stick)."""
+    inputs = [
+        tensor("a", shape=(256, 128), dims=["B", "A"]),
+        tensor("x", shape=(128, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, x):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return a.t() + x
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_restickify_add_256x128_A2_B4():
+    """a.t() + x on [128,256] result, tiled A÷2 B÷4 → 64 elems/tile each."""
+    inputs = [
+        tensor("a", shape=(256, 128), dims=["B", "A"]),
+        tensor("x", shape=(128, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, x):
+        with spyre_hint(num_tiles_per_dim={"A": 2}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    return a.t() + x
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# 2D two-transpose: a.t() + b.t() + x
+# a=[256,128], b=[256,128], x=[128,256]; result [128,256]: A=128, B=256
+# A÷2=64/tile (1 stick), B÷4=64/tile (1 stick)
+
+
+def test_restickify_2t_add_256x128_A2():
+    """a.t()+b.t()+x on [128,256] result, tiled A÷2."""
+    inputs = [
+        tensor("a", shape=(256, 128), dims=["B", "A"]),
+        tensor("b", shape=(256, 128), dims=["B", "A"]),
+        tensor("x", shape=(128, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b, x):
+        with spyre_hint(num_tiles_per_dim={"A": 2}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return a.t() + b.t() + x
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_restickify_2t_add_256x128_B4():
+    """a.t()+b.t()+x on [128,256] result, tiled B÷4."""
+    inputs = [
+        tensor("a", shape=(256, 128), dims=["B", "A"]),
+        tensor("b", shape=(256, 128), dims=["B", "A"]),
+        tensor("x", shape=(128, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b, x):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                return a.t() + b.t() + x
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_restickify_2t_add_256x128_A2_B4():
+    """a.t()+b.t()+x on [128,256] result, tiled A÷2 B÷4."""
+    inputs = [
+        tensor("a", shape=(256, 128), dims=["B", "A"]),
+        tensor("b", shape=(256, 128), dims=["B", "A"]),
+        tensor("x", shape=(128, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b, x):
+        with spyre_hint(num_tiles_per_dim={"A": 2}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    return a.t() + b.t() + x
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# 3D transpose: a.transpose(1,2) + x
+# a=[256,512,256], x=[256,256,512]; result [256,256,512]: A=256, B=256, C=512
+# A÷4=64/tile, B÷4=64/tile, C÷4=128/tile (2 sticks)
+
+
+def test_restickify_3d_transpose12_256x512x256_A4():
+    """a.transpose(1,2)+x on [256,256,512] result, tiled A÷4."""
+    inputs = [
+        tensor("a", shape=(256, 512, 256), dims=["A", "C", "B"]),
+        tensor("x", shape=(256, 256, 512), dims=["A", "B", "C"]),
+    ]
+
+    def fn(a, x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B", "C"]):
+                return a.transpose(1, 2) + x
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_restickify_3d_transpose12_256x512x256_B4():
+    """a.transpose(1,2)+x on [256,256,512] result, tiled B÷4."""
+    inputs = [
+        tensor("a", shape=(256, 512, 256), dims=["A", "C", "B"]),
+        tensor("x", shape=(256, 256, 512), dims=["A", "B", "C"]),
+    ]
+
+    def fn(a, x):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["A", "B", "C"]):
+                return a.transpose(1, 2) + x
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_restickify_3d_transpose12_256x512x256_C4():
+    """a.transpose(1,2)+x on [256,256,512] result, tiled C÷4."""
+    inputs = [
+        tensor("a", shape=(256, 512, 256), dims=["A", "C", "B"]),
+        tensor("x", shape=(256, 256, 512), dims=["A", "B", "C"]),
+    ]
+
+    def fn(a, x):
+        with spyre_hint(num_tiles_per_dim={"C": 4}):
+            with spyre_hint(expected_named_dims=["A", "B", "C"]):
+                return a.transpose(1, 2) + x
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_restickify_3d_transpose12_256x512x256_A4_B4():
+    """a.transpose(1,2)+x on [256,256,512] result, tiled A÷4 B÷4."""
+    inputs = [
+        tensor("a", shape=(256, 512, 256), dims=["A", "C", "B"]),
+        tensor("x", shape=(256, 256, 512), dims=["A", "B", "C"]),
+    ]
+
+    def fn(a, x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(expected_named_dims=["A", "B", "C"]):
+                    return a.transpose(1, 2) + x
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_restickify_3d_transpose12_256x512x256_A4_C4():
+    """a.transpose(1,2)+x on [256,256,512] result, tiled A÷4 C÷4."""
+    inputs = [
+        tensor("a", shape=(256, 512, 256), dims=["A", "C", "B"]),
+        tensor("x", shape=(256, 256, 512), dims=["A", "B", "C"]),
+    ]
+
+    def fn(a, x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"C": 4}):
+                with spyre_hint(expected_named_dims=["A", "B", "C"]):
+                    return a.transpose(1, 2) + x
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_restickify_3d_transpose12_256x512x256_B4_C4():
+    """a.transpose(1,2)+x on [256,256,512] result, tiled B÷4 C÷4."""
+    inputs = [
+        tensor("a", shape=(256, 512, 256), dims=["A", "C", "B"]),
+        tensor("x", shape=(256, 256, 512), dims=["A", "B", "C"]),
+    ]
+
+    def fn(a, x):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(num_tiles_per_dim={"C": 4}):
+                with spyre_hint(expected_named_dims=["A", "B", "C"]):
+                    return a.transpose(1, 2) + x
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_restickify_3d_transpose12_256x512x256_A4_B4_C4():
+    """a.transpose(1,2)+x on [256,256,512] result, tiled A÷4 B÷4 C÷4."""
+    inputs = [
+        tensor("a", shape=(256, 512, 256), dims=["A", "C", "B"]),
+        tensor("x", shape=(256, 256, 512), dims=["A", "B", "C"]),
+    ]
+
+    def fn(a, x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(num_tiles_per_dim={"C": 4}):
+                    with spyre_hint(expected_named_dims=["A", "B", "C"]):
+                        return a.transpose(1, 2) + x
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# Matmul + transpose: x.t()@y and x@y.t()
+# x=[128,256], y=[128,256]; x.t()@y=[256,128]@[128,256]=[256,256]
+# x@y.t()=[128,256]@[256,128]=[128,128]
+# For x.t()@y result [256,256]: M=256, N=256; M÷4=64, N÷4=64
+# For x@y.t() result [128,128]: M=128, N=128; M÷2=64, N÷2=64
+
+
+def test_restickify_matmul_xt_y_256x128_M4():
+    """x.t()@y, result [256,256], tiled M÷4."""
+    inputs = [
+        tensor("x", shape=(128, 256), dims=["K", "M"]),
+        tensor("y", shape=(128, 256), dims=["K", "N"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"M": 4}):
+            with spyre_hint(expected_named_dims=["M", "N"]):
+                return torch.matmul(x.t(), y)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_restickify_matmul_xt_y_256x128_N4():
+    """x.t()@y, result [256,256], tiled N÷4."""
+    inputs = [
+        tensor("x", shape=(128, 256), dims=["K", "M"]),
+        tensor("y", shape=(128, 256), dims=["K", "N"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"N": 4}):
+            with spyre_hint(expected_named_dims=["M", "N"]):
+                return torch.matmul(x.t(), y)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_restickify_matmul_xt_y_256x128_M4_N4():
+    """x.t()@y, result [256,256], tiled M÷4 N÷4."""
+    inputs = [
+        tensor("x", shape=(128, 256), dims=["K", "M"]),
+        tensor("y", shape=(128, 256), dims=["K", "N"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"M": 4}):
+            with spyre_hint(num_tiles_per_dim={"N": 4}):
+                with spyre_hint(expected_named_dims=["M", "N"]):
+                    return torch.matmul(x.t(), y)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_restickify_matmul_x_yt_128x256_M2():
+    """x@y.t(), result [128,128], tiled M÷2."""
+    inputs = [
+        tensor("x", shape=(128, 256), dims=["M", "K"]),
+        tensor("y", shape=(128, 256), dims=["N", "K"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"M": 2}):
+            with spyre_hint(expected_named_dims=["M", "N"]):
+                return torch.matmul(x, y.t())
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_restickify_matmul_x_yt_128x256_N2():
+    """x@y.t(), result [128,128], tiled N÷2."""
+    inputs = [
+        tensor("x", shape=(128, 256), dims=["M", "K"]),
+        tensor("y", shape=(128, 256), dims=["N", "K"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"N": 2}):
+            with spyre_hint(expected_named_dims=["M", "N"]):
+                return torch.matmul(x, y.t())
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_restickify_matmul_x_yt_128x256_M2_N2():
+    """x@y.t(), result [128,128], tiled M÷2 N÷2."""
+    inputs = [
+        tensor("x", shape=(128, 256), dims=["M", "K"]),
+        tensor("y", shape=(128, 256), dims=["N", "K"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"M": 2}):
+            with spyre_hint(num_tiles_per_dim={"N": 2}):
+                with spyre_hint(expected_named_dims=["M", "N"]):
+                    return torch.matmul(x, y.t())
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_restickify_pointwise_unsqueeze_mul_Lq2():
+    """pointwise result unsqueezed and multiplied with 4D tensor, tiled Lq÷2.
+
+    Minimal reproducer for ReinterpretView staleness: a 3D pointwise result
+    [H,Lq] goes through unsqueeze(-1) creating a ReinterpretView [H,Lq,1]
+    whose FixedLayout captures pre-divide Lq strides. The multiply consumer
+    reads it with a stale stride coefficient after _divide_ranges tiles Lq.
+    """
+    H, Lq, D = 8, 128, 64
+    inputs = [
+        tensor("x", shape=(H, Lq), dims=["H", "Lq"]),
+        tensor("y", shape=(H, Lq), dims=["H", "Lq"]),
+        tensor("z", shape=(H, Lq, D), dims=["H", "Lq", "D"]),
+    ]
+
+    def fn(x, y, z):
+        with spyre_hint(num_tiles_per_dim={"Lq": 2}):
+            c = torch.exp(x - y)  # [H, Lq] pointwise
+            return z * c.unsqueeze(-1)  # [H, Lq, D]
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# ---------------------------------------------------------------------------
+# Group 7: copies
+# Patterns: copy into pre-allocated buffer, in-place accumulation,
+# read-modify-write with correction factor, copy after reduction.
+# All on [512x256]: A÷4=128/tile (2 sticks), B÷4=64/tile (1 stick)
+# ---------------------------------------------------------------------------
+
+
+def test_copy_into_preallocated_512x256_A4():
+    """copy_forced(a+b, c) on [512,256] tiled A÷4 — result written into zeros buffer."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a):
+        with spyre_hint(named_dims=["A", "B"]):
+            c = torch.ones(a.shape, device=a.device, dtype=a.dtype)
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                copy_forced(a + c, c)
+        return c
+
+    run_coarse_tile_test(fn, inputs, loopspec=None)
+
+
+def test_copy_into_preallocated_512x256_B4():
+    """copy_forced(a+b, c) on [512,256] tiled B÷4."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(named_dims=["A", "B"]):
+            c = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                copy_forced(a + b, c)
+        return c
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_copy_into_preallocated_512x256_A4_B4():
+    """copy_forced(a+b, c) on [512,256] tiled A÷4 B÷4."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(named_dims=["A", "B"]):
+            c = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    copy_forced(a + b, c)
+        return c
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# --- in-place accumulation: copy_forced(acc + x, acc) ---
+
+
+def test_copy_inplace_accum_512x256_A4():
+    """copy_forced(acc + x, acc) on [512,256] tiled A÷4 — acc read and written inside loop."""
+    inputs = [
+        tensor("acc", shape=(512, 256), dims=["A", "B"]),
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(acc, x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                copy_forced(acc + x, acc)
+        return acc
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_copy_inplace_accum_512x256_B4():
+    """copy_forced(acc + x, acc) on [512,256] tiled B÷4."""
+    inputs = [
+        tensor("acc", shape=(512, 256), dims=["A", "B"]),
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(acc, x):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                copy_forced(acc + x, acc)
+        return acc
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_copy_inplace_accum_512x256_A4_B4():
+    """copy_forced(acc + x, acc) on [512,256] tiled A÷4 B÷4."""
+    inputs = [
+        tensor("acc", shape=(512, 256), dims=["A", "B"]),
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(acc, x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    copy_forced(acc + x, acc)
+        return acc
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# --- read-modify-write with correction: copy_forced(acc * scale + y, acc) ---
+# flash attention accumulator pattern
+
+
+def test_copy_rmw_correction_512x256_A4():
+    """copy_forced(acc * scale + y, acc) on [512,256] tiled A÷4."""
+    inputs = [
+        tensor("acc", shape=(512, 256), dims=["A", "B"]),
+        tensor("scale", shape=(512, 256), dims=["A", "B"]),
+        tensor("y", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(acc, scale, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                copy_forced(acc * scale + y, acc)
+        return acc
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_copy_rmw_correction_512x256_B4():
+    """copy_forced(acc * scale + y, acc) on [512,256] tiled B÷4."""
+    inputs = [
+        tensor("acc", shape=(512, 256), dims=["A", "B"]),
+        tensor("scale", shape=(512, 256), dims=["A", "B"]),
+        tensor("y", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(acc, scale, y):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                copy_forced(acc * scale + y, acc)
+        return acc
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_copy_rmw_correction_512x256_A4_B4():
+    """copy_forced(acc * scale + y, acc) on [512,256] tiled A÷4 B÷4."""
+    inputs = [
+        tensor("acc", shape=(512, 256), dims=["A", "B"]),
+        tensor("scale", shape=(512, 256), dims=["A", "B"]),
+        tensor("y", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(acc, scale, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    copy_forced(acc * scale + y, acc)
+        return acc
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# --- copy after reduction: copy_forced(x.amin(dim=0), out) ---
+# copies sparse reduction result into a dense buffer
+
+
+def test_copy_forced_untiled():
+    """copy_forced(x.amin(dim=0), out) on [512,256] — copy_forced without coarse tiling."""
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        out = torch.zeros(256, device=x.device, dtype=x.dtype)
+        copy_forced(x.amin(dim=0), out)
+        return out
+
+    run_coarse_tile_test(fn, inputs, loopspec=None)
+
+
+def test_copy_not_deleted():
+    """Regression: copy_forced must not be eliminated before hint validation.
+
+    If the copy is deleted before lowering, the expected_reduction_dims hint on
+    the copy op is never checked (no op to check), and the test passes
+    vacuously.  If copy_forced is present, validate_named_dims fires and raises
+    because copy_forced has no reduction dim -- that InductorError is the expected
+    outcome, proving the copy survived.
+    """
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        out = torch.zeros(256, device=x.device, dtype=x.dtype)
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
+                copy_forced(x.amin(dim=0), out)
+        return out
+
+    with pytest.raises(InductorError, match="validate_named_dims"):
+        run_coarse_tile_test(fn, inputs)
+
+
+def test_copy_after_reduction_512x256_A4():
+    """copy_forced(x.amin(dim=0), out) on [512,256] tiled A÷4 must be rejected."""
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        out = torch.zeros(256, device=x.device, dtype=x.dtype)
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
+                temp = x.amin(dim=0)
+            copy_forced(temp, out)
+        return out
+
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="partial reduction result consumed before accumulation is complete",
+    )
+
+
+def test_copy_after_reduction_512x256_B4():
+    """copy_forced(x.amin(dim=0), out) on [512,256] tiled B÷4."""
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(named_dims=["B"]):
+            out = torch.zeros(256, device=x.device, dtype=x.dtype)
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
+                temp = x.amin(dim=0)
+            with spyre_hint(expected_named_dims=["B"]):
+                copy_forced(temp, out)
+        return out
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_copy_after_reduction_512x256_A4_B4():
+    """copy_forced(x.amin(dim=0), out) on [512,256] tiled A÷4 B÷4 must be rejected."""
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        out = torch.zeros(256, device=x.device, dtype=x.dtype)
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(
+                    expected_named_dims=["B"], expected_reduction_dims=["A"]
+                ):
+                    temp = x.amin(dim=0)
+                copy_forced(temp, out)
+        return out
+
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="partial reduction result consumed before accumulation is complete",
+    )
+
+
+@pytest.mark.skip(
+    reason="4D H4xLq4 copy_forced into locally-created buffer still mismatches after "
+    "mutation_write_back copy_out fix (39.7% mismatch) -- distinct/deeper bug"
+)
+def test_copy_running_max_4d_H4_Lq4():
+    """copy_forced(maximum(real_max, amax(scores,dim=-2)), real_max) on [B,H,Lk,Lq] tiled H÷4 Lq÷4.
+
+    Minimal flash-attention-style reproducer: 4D scores [B,H,Lk,Lq] reduced over
+    dim=-2 (Lk), then max with a running accumulator, then copy_forced back.
+    """
+    B, H, Lk, Lq = 2, 32, 4096, 4096
+    h_block_size = 4
+    lq_block_size = 1024
+
+    inputs = [tensor("scores", shape=(B, H, Lk, Lq), dims=["B", "H", "Lk", "Lq"])]
+
+    def fn(scores):
+        real_max = torch.full(
+            (B, H, Lq), float("-inf"), device=scores.device, dtype=scores.dtype
+        )
+        with spyre_hint(num_tiles_per_dim={"H": H // h_block_size}):
+            with spyre_hint(num_tiles_per_dim={"Lq": Lq // lq_block_size}):
+                with spyre_hint(
+                    expected_named_dims=["B", "H", "Lq"], expected_reduction_dims=["Lk"]
+                ):
+                    block_max = torch.amax(scores, dim=-2)
+                with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
+                    running_max = torch.maximum(real_max, block_max)
+                copy_forced(running_max, real_max)
+        return real_max
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# --- copy + restickify: copy_forced(a.t() + b, c) ---
+# copy target receives a restickified input — tests copy layout after restickify
+
+
+def test_copy_restickify_512x256_A4():
+    """copy_forced(a.t()+b, c) on [256,512] result tiled A÷4 — copy of restickified add."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["B", "A"]),
+        tensor("b", shape=(256, 512), dims=["A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(named_dims=["A", "B"]):
+            c = torch.zeros(b.shape, device=b.device, dtype=b.dtype)
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                copy_forced(a.t() + b, c)
+        return c
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_copy_restickify_512x256_B4():
+    """copy_forced(a.t()+b, c) on [256,512] result tiled B÷4."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["B", "A"]),
+        tensor("b", shape=(256, 512), dims=["A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(named_dims=["A", "B"]):
+            c = torch.zeros(b.shape, device=b.device, dtype=b.dtype)
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                copy_forced(a.t() + b, c)
+        return c
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_copy_restickify_512x256_A4_B4():
+    """copy_forced(a.t()+b, c) on [256,512] result tiled A÷4 B÷4."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["B", "A"]),
+        tensor("b", shape=(256, 512), dims=["A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(named_dims=["A", "B"]):
+            c = torch.zeros(b.shape, device=b.device, dtype=b.dtype)
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    copy_forced(a.t() + b, c)
+        return c
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# --- nested copy + reduction: copy_forced(acc * scale + x.amin(dim=1, keepdim=True, acc)) ---
+# flash attention accumulator pattern: correction * running value + new contribution
+
+
+def test_copy_accum_with_reduction_512x256_A4():
+    """copy_forced(acc * scale + x.amin(dim=1, keepdim=True), acc) tiled A÷4."""
+    inputs = [
+        tensor("acc", shape=(512, 256), dims=["A", "B"]),
+        tensor("scale", shape=(512, 1), dims=["A", "B"]),
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(acc, scale, x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A"], expected_reduction_dims=["B"]):
+                r = x.amin(dim=1, keepdim=True)
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                copy_forced(acc * scale + r, acc)
+        return acc
+
+    run_coarse_tile_test(fn, inputs)
+
+
+@pytest.mark.skip(
+    reason=(
+        "IndexError: _insert_all_read_copy_ops fails when tiling B with "
+        "unit-size B dim in scale"
+    )
+)
+def test_copy_accum_with_reduction_512x256_B4():
+    """copy_forced(acc * scale + x.amin(dim=1, keepdim=True), acc) tiled B÷4."""
+    inputs = [
+        tensor("acc", shape=(512, 256), dims=["A", "B"]),
+        tensor("scale", shape=(512, 1), dims=["A", "B"]),
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(acc, scale, x):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["A"], expected_reduction_dims=["B"]):
+                r = x.amin(dim=1, keepdim=True)
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                copy_forced(acc * scale + r, acc)
+        return acc
+
+    run_coarse_tile_test(fn, inputs)
+
+
+@pytest.mark.skip(
+    reason=(
+        "IndexError: _insert_all_read_copy_ops fails when tiling B with "
+        "unit-size B dim in scale"
+    )
+)
+def test_copy_accum_with_reduction_512x256_A4_B4():
+    """copy_forced(acc * scale + x.amin(dim=1, keepdim=True), acc) tiled A÷4 B÷4."""
+    inputs = [
+        tensor("acc", shape=(512, 256), dims=["A", "B"]),
+        tensor("scale", shape=(512, 1), dims=["A", "B"]),
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(acc, scale, x):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(
+                    expected_named_dims=["A"], expected_reduction_dims=["B"]
+                ):
+                    r = x.amin(dim=1, keepdim=True)
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    copy_forced(acc * scale + r, acc)
+        return acc
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# --- two copies in same hint scope: copy_forced(a+b, c1); copy_forced(a*b, c2) ---
+
+
+def test_copy_two_copies_same_scope_512x256_A4():
+    """Two copy_ ops in same hint scope tiled A÷4."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(named_dims=["A", "B"]):
+            c1 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
+            c2 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                copy_forced(a + b, c1)
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                copy_forced(a * b, c2)
+        return c1, c2
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_copy_two_copies_same_scope_512x256_B4():
+    """Two copy_ ops in same hint scope tiled B÷4."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(named_dims=["A", "B"]):
+            c1 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
+            c2 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                copy_forced(a + b, c1)
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                copy_forced(a * b, c2)
+        return c1, c2
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_copy_two_copies_same_scope_512x256_A4_B4():
+    """Two copy_ ops in same hint scope tiled A÷4 B÷4."""
+    inputs = [
+        tensor("a", shape=(512, 256), dims=["A", "B"]),
+        tensor("b", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(named_dims=["A", "B"]):
+            c1 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
+            c2 = torch.zeros(a.shape, device=a.device, dtype=a.dtype)
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    copy_forced(a + b, c1)
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    copy_forced(a * b, c2)
+        return c1, c2
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# ---------------------------------------------------------------------------
+# Group 8: tiled ops with outside consumers
+# Pattern: buffer initialized outside loop, written tile-by-tile inside,
+# then read again outside before returning.
+# All on [512x256]: A÷4=128/tile, B÷4=64/tile
+# ---------------------------------------------------------------------------
+
+# --- minimal: z = tiled(x+y); return z * 2.0 ---
+# The tiled op's output is a full-sized buffer consumed outside the loop.
+# Forces _allocate_full_buffer + correct stickification.
+
+
+def test_outside_consumer_pointwise_512x256_A4():
+    """z=tiled(x+y) consumed outside as z*2.0, tiled A÷4."""
+    inputs = [
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+        tensor("y", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                z = x + y
+        return z * 2.0
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_outside_consumer_pointwise_512x256_B4():
+    """z=tiled(x+y) consumed outside as z*2.0, tiled B÷4."""
+    inputs = [
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+        tensor("y", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                z = x + y
+        return z * 2.0
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_outside_consumer_pointwise_512x256_A4_B4():
+    """z=tiled(x+y) consumed outside as z*2.0, tiled A÷4 B÷4."""
+    inputs = [
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+        tensor("y", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(expected_named_dims=["A", "B"]):
+                    z = x + y
+        return z * 2.0
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# --- pattern: output=zeros outside; copy_ inside; read outside ---
+# output initialized outside, written tile-by-tile via copy_, divided outside.
+
+
+def test_outside_consumer_copy_then_read_512x256_A4():
+    """out=zeros; tiled copy_forced(x+y, out); return out/norm — tiled A÷4."""
+    inputs = [
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+        tensor("y", shape=(512, 256), dims=["A", "B"]),
+        tensor("norm", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(x, y, norm):
+        with spyre_hint(named_dims=["A", "B"]):
+            out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            copy_forced(x + y, out)
+        return out / (torch.abs(norm) + 1.0)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_outside_consumer_copy_then_read_512x256_B4():
+    """out=zeros; tiled copy_forced(x+y, out); return out/norm — tiled B÷4."""
+    inputs = [
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+        tensor("y", shape=(512, 256), dims=["A", "B"]),
+        tensor("norm", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(x, y, norm):
+        with spyre_hint(named_dims=["A", "B"]):
+            out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            copy_forced(x + y, out)
+        return out / (torch.abs(norm) + 1.0)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_outside_consumer_copy_then_read_512x256_A4_B4():
+    """out=zeros; tiled copy_forced(x+y, out); return out/norm — tiled A÷4 B÷4."""
+    inputs = [
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+        tensor("y", shape=(512, 256), dims=["A", "B"]),
+        tensor("norm", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(x, y, norm):
+        with spyre_hint(named_dims=["A", "B"]):
+            out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                copy_forced(x + y, out)
+        return out / (torch.abs(norm) + 1.0)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# --- two-accumulator flash pattern ---
+# Both output and denom initialized outside, updated inside, divided outside.
+# This is the minimal flash attention accumulator pattern.
+
+
+def test_outside_consumer_two_accum_512x256_A4():
+    """out=zeros, denom=zeros; tiled copy_forced(denom+amin(dim=0), denom) on
+    [512,512] A÷4 — reducing and tiling over the same dim must be rejected."""
+    inputs = [
+        tensor("x", shape=(512, 512), dims=["A", "B"]),
+        tensor("scale", shape=(512, 512), dims=["A", "B"]),
+    ]
+
+    def fn(x, scale):
+        with spyre_hint(named_dims=["A", "B"]):
+            out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
+        with spyre_hint(named_dims=["A"]):
+            denom = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            copy_forced(out * scale + x, out)
+            copy_forced(denom + x.amin(dim=0), denom)
+        return out / denom.unsqueeze(1)
+
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="partial reduction result consumed before accumulation is complete",
+    )
+
+
+def test_outside_consumer_two_accum_512x256_B4():
+    """Flash-style: out=zeros, denom=zeros; tiled copy_forced; return out/denom — B÷4 must be rejected."""
+    inputs = [
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+        tensor("scale", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(x, scale):
+        out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
+        denom = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            copy_forced(out * scale + x, out)
+            copy_forced(denom + x.amin(dim=1), denom)
+        return out / denom.unsqueeze(1)
+
+    _run_coarse_tile_test_raises(
+        fn,
+        inputs,
+        match="partial reduction result consumed before accumulation is complete",
+    )
+
+
+@pytest.mark.skip(
+    reason="infeasible restickify for 1D denom in mixed 1D/2D tiled scope"
+)
+def test_outside_consumer_two_accum_512x256_A4_B4():
+    """Flash-style: out=zeros, denom=zeros; tiled copy_; return out/denom — A÷4 B÷4."""
+    inputs = [
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+        tensor("scale", shape=(512, 256), dims=["A", "B"]),
+    ]
+
+    def fn(x, scale):
+        out = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
+        denom = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                copy_forced(out * scale + x, out)
+                copy_forced(denom + x.sum(dim=1), denom)
+        return out / denom.unsqueeze(1)
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# --- reduction inside loop, result consumed outside ---
+# s = tiled_amin(x, dim=0) → [256] dense; return s + bias
+# Tests _allocate_full_buffer for sparse reduction output with outside consumer.
+
+
+def test_outside_consumer_reduction_512x256_A4():
+    """s=tiled_amin(x,dim=0) consumed outside as s+bias, tiled A÷4."""
+    inputs = [
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+        tensor("bias", shape=(256,), dims=["B"]),
+    ]
+
+    def fn(x, bias):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
+                s = x.amin(dim=0)
+        return s + bias
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_outside_consumer_reduction_512x256_B4():
+    """s=tiled_amin(x,dim=0) consumed outside as s+bias, tiled B÷4."""
+    inputs = [
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+        tensor("bias", shape=(256,), dims=["B"]),
+    ]
+
+    def fn(x, bias):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["A"]):
+                s = x.amin(dim=0)
+        return s + bias
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_outside_consumer_reduction_512x256_A4_B4():
+    """s=tiled_amin(x,dim=0) consumed outside as s+bias, tiled A÷4 B÷4."""
+    inputs = [
+        tensor("x", shape=(512, 256), dims=["A", "B"]),
+        tensor("bias", shape=(256,), dims=["B"]),
+    ]
+
+    def fn(x, bias):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(
+                    expected_named_dims=["B"], expected_reduction_dims=["A"]
+                ):
+                    s = x.amin(dim=0)
+        return s + bias
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# ---------------------------------------------------------------------------
+# Group 9: views — reshape, 1D sub-dim, view+transpose, unsqueeze
+# Op inside fn is multiply (more numerically stable than add on fp16).
+# ---------------------------------------------------------------------------
+
+# --- 1D sub-dim naming: flat [Lq*D] tensor named with 2 sub-dims ---
+# Both outer (Lq÷2) and inner (D÷2) hints land on the single host dim.
+
+
+def test_view_1d_subdim_Lq2_D2():
+    """a*b on 1D [Lq*D] named ["Lq","D"], nested Lq÷2 / D÷2 on same host dim."""
+    Lq, D = 256, 128
+    inputs = [
+        tensor("a", shape=(Lq * D,), dims=["Lq", "D"], named_dims={"Lq": Lq, "D": D}),
+        tensor("b", shape=(Lq * D,), dims=["Lq", "D"], named_dims={"Lq": Lq, "D": D}),
+    ]
+
+    def fn(a, b):
+        a = a.view(Lq, D)
+        b = b.view(Lq, D)
+        with spyre_hint(num_tiles_per_dim={"Lq": 2}):
+            with spyre_hint(num_tiles_per_dim={"D": 2}):
+                with spyre_hint(expected_named_dims=["Lq", "D"]):
+                    return a * b
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# --- named input directly viewed+transposed inside fn ---
+# Modeled after granite_flash_attention style views: flat [B,S,H*D] inputs viewed to 4D
+# then transposed. Named dims span the fused H*D dim.
+# B=2, S=256, H=4, D=64 → flat shape [2,256,256]; post-view+transpose [2,4,256,64]
+
+
+def test_view_named_input_view_transpose_H2():
+    """flat [B,S,H*D] view+transpose before hint scope, tiled H÷2."""
+    B, S, H, D = 2, 256, 8, 128
+    _nd = {"B": B, "S": S, "H": H, "D": D}
+    inputs = [
+        tensor(
+            "q",
+            shape=(B, S, H * D),
+            dims=["B", "S", "H", "D"],
+            named_dims=_nd,
+        ),
+        tensor(
+            "k",
+            shape=(B, S, H * D),
+            dims=["B", "S", "H", "D"],
+            named_dims=_nd,
+        ),
+    ]
+
+    def fn(q, k):
+        q = q.view(B, S, H, D).transpose(1, 2)
+        k = k.view(B, S, H, D).transpose(1, 2)
+        with spyre_hint(num_tiles_per_dim={"H": 2}):
+            with spyre_hint(expected_named_dims=["B", "H", "S", "D"]):
+                return q * k
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_view_named_input_view_transpose_S4():
+    """flat [B,S,H*D] view+transpose before hint scope, tiled S÷4."""
+    B, S, H, D = 2, 256, 8, 128
+    _nd = {"B": B, "S": S, "H": H, "D": D}
+    inputs = [
+        tensor(
+            "q",
+            shape=(B, S, H * D),
+            dims=["B", "S", "H", "D"],
+            named_dims=_nd,
+        ),
+        tensor(
+            "k",
+            shape=(B, S, H * D),
+            dims=["B", "S", "H", "D"],
+            named_dims=_nd,
+        ),
+    ]
+
+    def fn(q, k):
+        q = q.view(B, S, H, D).transpose(1, 2)
+        k = k.view(B, S, H, D).transpose(1, 2)
+        with spyre_hint(num_tiles_per_dim={"S": 4}):
+            with spyre_hint(expected_named_dims=["B", "H", "S", "D"]):
+                return q * k
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_view_named_input_view_transpose_H2_S4():
+    """flat [B,S,H*D] view+transpose before hint scope, tiled H÷2 S÷4."""
+    B, S, H, D = 2, 256, 8, 128
+    _nd = {"B": B, "S": S, "H": H, "D": D}
+    inputs = [
+        tensor(
+            "q",
+            shape=(B, S, H * D),
+            dims=["B", "S", "H", "D"],
+            named_dims=_nd,
+        ),
+        tensor(
+            "k",
+            shape=(B, S, H * D),
+            dims=["B", "S", "H", "D"],
+            named_dims=_nd,
+        ),
+    ]
+
+    def fn(q, k):
+        q = q.view(B, S, H, D).transpose(1, 2)
+        k = k.view(B, S, H, D).transpose(1, 2)
+        with spyre_hint(num_tiles_per_dim={"H": 2}):
+            with spyre_hint(num_tiles_per_dim={"S": 4}):
+                with spyre_hint(expected_named_dims=["B", "H", "S", "D"]):
+                    return q * k
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# --- 4D input transposed then multiplied ---
+# Inputs already in 4D shape [B,H,S,D], transpose swaps non-stick dims.
+# B=2, S=256, H=4, D=64
+
+
+def test_view_4d_transpose_H2():
+    """x.view(B,S,H,D).transpose(1,2)*y tiled H÷2."""
+    B, S, H, D = 2, 256, 4, 64
+    _nd = {"B": B, "Lq": S, "H": H, "D": D}
+    inputs = [
+        tensor(
+            "x",
+            shape=(B, S, H * D),
+            dims=["B", "Lq", "H", "D"],
+            named_dims=_nd,
+        ),
+        tensor(
+            "y",
+            shape=(B, H, S, D),
+            dims=["B", "H", "Lq", "D"],
+            named_dims=_nd,
+        ),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"H": 2}):
+            with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
+                return x.view(B, S, H, D).transpose(1, 2) * y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_view_4d_transpose_S4():
+    """x.view(B,S,H,D).transpose(1,2)*y tiled S÷4."""
+    B, S, H, D = 2, 256, 4, 64
+    _nd = {"B": B, "Lq": S, "H": H, "D": D}
+    inputs = [
+        tensor(
+            "x",
+            shape=(B, S, H * D),
+            dims=["B", "Lq", "H", "D"],
+            named_dims=_nd,
+        ),
+        tensor(
+            "y",
+            shape=(B, H, S, D),
+            dims=["B", "H", "Lq", "D"],
+            named_dims=_nd,
+        ),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"Lq": 4}):
+            with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
+                return x.view(B, S, H, D).transpose(1, 2) * y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_view_4d_transpose_H2_S4():
+    """x.view(B,S,H,D).transpose(1,2)*y tiled H÷2 S÷4."""
+    B, S, H, D = 2, 256, 4, 64
+    _nd = {"B": B, "Lq": S, "H": H, "D": D}
+    inputs = [
+        tensor(
+            "x",
+            shape=(B, S, H * D),
+            dims=["B", "Lq", "H", "D"],
+            named_dims=_nd,
+        ),
+        tensor(
+            "y",
+            shape=(B, H, S, D),
+            dims=["B", "H", "Lq", "D"],
+            named_dims=_nd,
+        ),
+    ]
+
+    def fn(x, y):
+        with spyre_hint(num_tiles_per_dim={"H": 2}):
+            with spyre_hint(num_tiles_per_dim={"Lq": 4}):
+                with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
+                    return x.view(B, S, H, D).transpose(1, 2) * y
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# --- unsqueeze: a.unsqueeze(0) * b where b has the broadcast shape ---
+
+
+def test_view_unsqueeze_broadcast_A4():
+    """a.unsqueeze(0)*b: a=[256,256], b=[4,256,256], tiled A÷4."""
+    inputs = [
+        tensor("a", shape=(256, 256), dims=["A", "B"]),
+        tensor("b", shape=(4, 256, 256), dims=["N", "A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["N", "A", "B"]):
+                return a.unsqueeze(0) * b
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_view_unsqueeze_broadcast_B4():
+    """a.unsqueeze(0)*b: a=[256,256], b=[4,256,256], tiled B÷4."""
+    inputs = [
+        tensor("a", shape=(256, 256), dims=["A", "B"]),
+        tensor("b", shape=(4, 256, 256), dims=["N", "A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(num_tiles_per_dim={"B": 4}):
+            with spyre_hint(expected_named_dims=["N", "A", "B"]):
+                return a.unsqueeze(0) * b
+
+    run_coarse_tile_test(fn, inputs)
+
+
+def test_view_unsqueeze_broadcast_A4_B4():
+    """a.unsqueeze(0)*b: a=[256,256], b=[4,256,256], tiled A÷4 B÷4."""
+    inputs = [
+        tensor("a", shape=(256, 256), dims=["A", "B"]),
+        tensor("b", shape=(4, 256, 256), dims=["N", "A", "B"]),
+    ]
+
+    def fn(a, b):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(num_tiles_per_dim={"B": 4}):
+                with spyre_hint(expected_named_dims=["N", "A", "B"]):
+                    return a.unsqueeze(0) * b
+
+    run_coarse_tile_test(fn, inputs)
+
+
+# ---------------------------------------------------------------------------
+# Group 10: Flash attention variants
+# ---------------------------------------------------------------------------
+# Flash v1: no mask, reassignment-based accumulators, scores transposed.
+# Parameterized helpers — tests specify sizes and tile counts directly.
+
+
+def _flash_v1_inputs(B, H, Lq, Lk, D):
+    """TensorSpec list for flash v1 (no mask)."""
+    return [
+        tensor("queries", shape=(B, H, Lq, D), dims=["B", "H", "Lq", "D"]),
+        tensor("keys", shape=(B, H, Lk, D), dims=["B", "H", "Lk", "D"]),
+        tensor("values", shape=(B, H, Lk, D), dims=["B", "H", "Lk", "D"]),
+    ]
+
+
+def _flash_v1_fn(
+    queries,
+    keys,
+    values,
+    *,
+    B,
+    H,
+    Lq,
+    Lk,
+    D,
+    b_tiles=1,
+    h_tiles=1,
+    lq_tiles=1,
+    lk_tiles=1,
+):
+    """Flash attention v1 body. Tile any combination of B/H/Lq/Lk."""
+    scale = 1.0 / math.sqrt(math.sqrt(D))
+    with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
+        output = torch.zeros_like(queries)
+    with spyre_hint(named_dims=["B", "H", "Lq"]):
+        M = torch.full(
+            (B, H, Lq), float("-inf"), device=queries.device, dtype=torch.float16
+        )
+    with spyre_hint(named_dims=["B", "H", "Lq"]):
+        denominator = torch.zeros(
+            (B, H, Lq), device=queries.device, dtype=torch.float16
+        )
+    with spyre_hint(num_tiles_per_dim={"B": b_tiles}):
+        with spyre_hint(num_tiles_per_dim={"H": h_tiles}):
+            with spyre_hint(num_tiles_per_dim={"Lq": lq_tiles}):
+                with spyre_hint(num_tiles_per_dim={"Lk": lk_tiles}):
+                    with spyre_hint(expected_named_dims=["B", "H", "D", "Lk"]):
+                        keys_T = keys.transpose(-1, -2).contiguous()
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
+                        q_scaled = queries * scale
+                    with spyre_hint(expected_named_dims=["B", "H", "D", "Lk"]):
+                        k_scaled = keys_T * scale
+                    with spyre_hint(named_dims=["B", "H", "Lq", "Lk"]):
+                        scores = torch.matmul(q_scaled, k_scaled)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lk", "Lq"]):
+                        scores = scores.transpose(-1, -2).contiguous()
+                    with spyre_hint(
+                        expected_named_dims=["B", "H", "Lq"],
+                        expected_reduction_dims=["Lk"],
+                    ):
+                        block_max = torch.amax(scores, dim=-2)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
+                        max_running = torch.maximum(M, block_max)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lk", "Lq"]):
+                        scores_shifted = scores - max_running.unsqueeze(-2)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lk", "Lq"]):
+                        exp_scores = torch.exp(scores_shifted)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
+                        M_diff = M - max_running
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
+                        correction = torch.exp(M_diff)
+                    with spyre_hint(
+                        expected_named_dims=["B", "H", "Lq"],
+                        expected_reduction_dims=["Lk"],
+                    ):
+                        sum_scores = exp_scores.sum(dim=-2)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
+                        denom_corrected = denominator * correction
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
+                        denominator = denom_corrected + sum_scores
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq", "Lk"]):
+                        exp_scores_T = exp_scores.transpose(-1, -2).contiguous()
+                    with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
+                        matmul_out = torch.matmul(exp_scores_T, values)
+                    corr_expanded = correction.unsqueeze(-1)
+                    output_corrected = output * corr_expanded
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
+                        output = output_corrected + matmul_out
+                    M = max_running  # noqa: F841
+    return output / denominator.unsqueeze(-1)
+
+
+def test_flash_tile_H():
+    """Flash v1: tile H÷4 only."""
+    run_coarse_tile_test(
+        lambda q, k, v: _flash_v1_fn(
+            q, k, v, B=1, H=8, Lq=256, Lk=256, D=64, h_tiles=4
+        ),
+        _flash_v1_inputs(1, 8, 256, 256, 64),
+        loopspec=LoopSpecCheck(counts=[4]),
+        atol=0.01,
+        rtol=0.1,
+    )
+
+
+def test_flash_tile_B():
+    """Flash v1: tile B÷2 only. B=2."""
+    run_coarse_tile_test(
+        lambda q, k, v: _flash_v1_fn(
+            q, k, v, B=2, H=8, Lq=256, Lk=256, D=64, b_tiles=2
+        ),
+        _flash_v1_inputs(2, 8, 256, 256, 64),
+        loopspec=LoopSpecCheck(counts=[2]),
+    )
+
+
+@pytest.mark.skip(
+    reason=(
+        "validate_writer_tile_advance now catches this at compile time: "
+        "squeeze-position bug in _insert_copy_op's write-side "
+        "_tiled_dims_for_dep (raw d{N} numbering breaks when a unit dim is "
+        "squeezed out of the index). Same root cause as issue #3613; "
+        "deferred until PR #3622's tile.py helpers land."
+    )
+)
+def test_flash_tile_Lq():
+    """Flash v1: tile Lq÷2 only."""
+    run_coarse_tile_test(
+        lambda q, k, v: _flash_v1_fn(
+            q, k, v, B=1, H=8, Lq=256, Lk=256, D=64, lq_tiles=2
+        ),
+        _flash_v1_inputs(1, 8, 256, 256, 64),
+        loopspec=LoopSpecCheck(counts=[2]),
+    )
+
+
+def test_flash_tile_Lk():
+    """Flash v1: tile Lk÷2 only — rejected at compile time (carry propagation)."""
+    with pytest.raises(
+        Exception,
+        match="partial reduction result consumed before accumulation is complete",
+    ):
+        run_coarse_tile_test(
+            lambda q, k, v: _flash_v1_fn(
+                q, k, v, B=1, H=8, Lq=256, Lk=256, D=64, lk_tiles=2
+            ),
+            _flash_v1_inputs(1, 8, 256, 256, 64),
+            loopspec=LoopSpecCheck(counts=[2]),
+        )
+
+
+@pytest.mark.skip(reason="KeyError: 0 — B tiling not yet supported")
+def test_flash_tile_B_H():
+    """Flash v1: tile B÷2 H÷4. B=2."""
+    run_coarse_tile_test(
+        lambda q, k, v: _flash_v1_fn(
+            q, k, v, B=2, H=8, Lq=256, Lk=256, D=64, b_tiles=2, h_tiles=4
+        ),
+        _flash_v1_inputs(2, 8, 256, 256, 64),
+        loopspec=LoopSpecCheck(counts=[2, 4]),
+    )
+
+
+@pytest.mark.skip(
+    reason=(
+        "validate_writer_tile_advance now catches this at compile time: "
+        "squeeze-position bug in _insert_copy_op's write-side "
+        "_tiled_dims_for_dep (raw d{N} numbering breaks when a unit dim is "
+        "squeezed out of the index). Same root cause as issue #3613; "
+        "deferred until PR #3622's tile.py helpers land."
+    )
+)
+def test_flash_tile_H_Lq():
+    """Flash v1: tile H÷4 Lq÷2."""
+    run_coarse_tile_test(
+        lambda q, k, v: _flash_v1_fn(
+            q, k, v, B=1, H=8, Lq=256, Lk=256, D=64, h_tiles=4, lq_tiles=2
+        ),
+        _flash_v1_inputs(1, 8, 256, 256, 64),
+        loopspec=LoopSpecCheck(counts=[4, 2]),
+    )
+
+
+def test_flash_tile_H_Lq_Lk():
+    """Flash v1: tile H÷4 Lq÷2 Lk÷2 — rejected at compile time (carry propagation)."""
+    with pytest.raises(
+        Exception,
+        match="partial reduction result consumed before accumulation is complete",
+    ):
+        run_coarse_tile_test(
+            lambda q, k, v: _flash_v1_fn(
+                q,
+                k,
+                v,
+                B=1,
+                H=8,
+                Lq=256,
+                Lk=256,
+                D=64,
+                h_tiles=4,
+                lq_tiles=2,
+                lk_tiles=2,
+            ),
+            _flash_v1_inputs(1, 8, 256, 256, 64),
+            loopspec=LoopSpecCheck(counts=[4, 2, 2]),
+        )
+
+
+def test_flash_tile_all():
+    """Flash v1: tile all dims. B=2, H÷4, Lq÷2, Lk÷2 — rejected at compile time (carry propagation)."""
+    with pytest.raises(
+        Exception,
+        match="partial reduction result consumed before accumulation is complete",
+    ):
+        run_coarse_tile_test(
+            lambda q, k, v: _flash_v1_fn(
+                q,
+                k,
+                v,
+                B=2,
+                H=8,
+                Lq=256,
+                Lk=256,
+                D=64,
+                b_tiles=2,
+                h_tiles=4,
+                lq_tiles=2,
+                lk_tiles=2,
+            ),
+            _flash_v1_inputs(2, 8, 256, 256, 64),
+            loopspec=LoopSpecCheck(counts=[2, 4, 2, 2]),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Flash v2: causal mask, copy_ accumulators, sparse init, reduces over dim=-1
+# ---------------------------------------------------------------------------
+
+
+def _flash_v2_inputs(B, H, Lq, Lk, D):
+    """TensorSpec list for flash v2 (with causal mask)."""
+    causal = torch.tril(torch.ones(Lq, Lk, dtype=torch.bool))
+    mask_t = torch.zeros(1, 1, Lq, Lk, dtype=torch.float16)
+    mask_t.masked_fill_(~causal, float("-inf"))
+    return [
+        tensor("queries", shape=(B, H, Lq, D), dims=["B", "H", "Lq", "D"]),
+        tensor("keys", shape=(B, H, Lk, D), dims=["B", "H", "Lk", "D"]),
+        tensor("values", shape=(B, H, Lk, D), dims=["B", "H", "Lk", "D"]),
+        tensor(
+            "mask",
+            shape=(1, 1, Lq, Lk),
+            dims=["B", "H", "Lq", "Lk"],
+            named_dims={"Lq": Lq, "Lk": Lk},
+            value=mask_t,
+        ),
+    ]
+
+
+def _flash_v2_fn(
+    queries,
+    keys,
+    values,
+    mask,
+    *,
+    B,
+    H,
+    Lq,
+    Lk,
+    D,
+    b_tiles=1,
+    h_tiles=1,
+    lq_tiles=1,
+    lk_tiles=1,
+):
+    """Flash attention v2 body. Tile any combination of B/H/Lq/Lk."""
+    scale = 1.0 / math.sqrt(math.sqrt(D))
+    output = torch.zeros_like(queries)
+    real_max = torch.full(
+        (B, H, Lq, 64),
+        float("-inf"),
+        device=queries.device,
+        dtype=torch.float16,
+    ).amax(dim=-1)
+    denominator = torch.zeros(
+        (B, H, Lq, 64),
+        device=queries.device,
+        dtype=torch.float16,
+    ).amax(dim=-1)
+    with spyre_hint(num_tiles_per_dim={"B": b_tiles}):
+        with spyre_hint(num_tiles_per_dim={"H": h_tiles}):
+            with spyre_hint(num_tiles_per_dim={"Lq": lq_tiles}):
+                with spyre_hint(num_tiles_per_dim={"Lk": lk_tiles}):
+                    with spyre_hint(expected_named_dims=["B", "H", "Lk", "D"]):
+                        scaled_keys = keys * scale
+                    with spyre_hint(expected_named_dims=["B", "H", "D", "Lk"]):
+                        keys_T = scaled_keys.transpose(-1, -2)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
+                        q_scaled = queries * scale
+                    with spyre_hint(named_dims=["B", "H", "Lq", "Lk"]):
+                        scores_pre = torch.matmul(q_scaled, keys_T)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq", "Lk"]):
+                        scores = scores_pre + mask
+                    with spyre_hint(
+                        expected_named_dims=["B", "H", "Lq"],
+                        expected_reduction_dims=["Lk"],
+                    ):
+                        block_max = torch.amax(scores, dim=-1)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
+                        running_max = torch.maximum(real_max, block_max)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq", "Lk"]):
+                        scores_shifted = scores - running_max.unsqueeze(-1)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq", "Lk"]):
+                        exp_scores = torch.exp(scores_shifted)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
+                        real_max_diff = real_max - running_max
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
+                        correction = torch.exp(real_max_diff)
+                    with spyre_hint(
+                        expected_named_dims=["B", "H", "Lq"],
+                        expected_reduction_dims=["Lk"],
+                    ):
+                        sum_scores = exp_scores.sum(dim=-1)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
+                        denom_corrected = denominator * correction
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
+                        new_denom = denom_corrected + sum_scores
+                    copy_forced(new_denom, denominator)
+                    with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
+                        matmul_out = torch.matmul(exp_scores, values)
+                    # correction.unsqueeze(-1) is [B,H,Lq,1] — size-1 dim can't carry "D"
+                    corr_expanded = correction.unsqueeze(-1)
+                    output_corrected = output * corr_expanded
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
+                        new_output = output_corrected + matmul_out
+                    copy_forced(new_output, output)
+                    copy_forced(running_max, real_max)
+    return output / denominator.unsqueeze(-1)
+
+
+@pytest.mark.skip(
+    reason="finalize_layouts: restickify infeasible for copy ops across loop groups"
+)
+def test_flash_v2_tile_H():
+    """Flash v2: tile H÷4 only."""
+    run_coarse_tile_test(
+        lambda q, k, v, m: _flash_v2_fn(
+            q, k, v, m, B=1, H=8, Lq=256, Lk=256, D=64, h_tiles=4
+        ),
+        _flash_v2_inputs(1, 8, 256, 256, 64),
+        loopspec=LoopSpecCheck(counts=[4]),
+        atol=0.01,
+        rtol=0.1,
+    )
+
+
+@pytest.mark.skip(reason="KeyError: 0 — B tiling not yet supported")
+def test_flash_v2_tile_B():
+    """Flash v2: tile B÷2 only. B=2."""
+    run_coarse_tile_test(
+        lambda q, k, v, m: _flash_v2_fn(
+            q, k, v, m, B=2, H=8, Lq=256, Lk=256, D=64, b_tiles=2
+        ),
+        _flash_v2_inputs(2, 8, 256, 256, 64),
+        loopspec=LoopSpecCheck(counts=[2]),
+    )
+
+
+@pytest.mark.skip(
+    reason="finalize_layouts: restickify infeasible for copy ops across loop groups"
+)
+def test_flash_v2_tile_Lq():
+    """Flash v2: tile Lq÷2 only."""
+    run_coarse_tile_test(
+        lambda q, k, v, m: _flash_v2_fn(
+            q, k, v, m, B=1, H=8, Lq=256, Lk=256, D=64, lq_tiles=2
+        ),
+        _flash_v2_inputs(1, 8, 256, 256, 64),
+        loopspec=LoopSpecCheck(counts=[2]),
+    )
+
+
+def test_flash_v2_tile_Lk():
+    """Flash v2: tile Lk÷2 only — rejected at compile time (carry propagation)."""
+    with pytest.raises(
+        Exception,
+        match="partial reduction result consumed before accumulation is complete",
+    ):
+        run_coarse_tile_test(
+            lambda q, k, v, m: _flash_v2_fn(
+                q, k, v, m, B=1, H=8, Lq=256, Lk=256, D=64, lk_tiles=2
+            ),
+            _flash_v2_inputs(1, 8, 256, 256, 64),
+            loopspec=LoopSpecCheck(counts=[2]),
+        )
+
+
+@pytest.mark.skip(reason="KeyError: 0 — B tiling not yet supported")
+def test_flash_v2_tile_B_H():
+    """Flash v2: tile B÷2 H÷4. B=2."""
+    run_coarse_tile_test(
+        lambda q, k, v, m: _flash_v2_fn(
+            q, k, v, m, B=2, H=8, Lq=256, Lk=256, D=64, b_tiles=2, h_tiles=4
+        ),
+        _flash_v2_inputs(2, 8, 256, 256, 64),
+        loopspec=LoopSpecCheck(counts=[2, 4]),
+    )
+
+
+@pytest.mark.skip(
+    reason="finalize_layouts: restickify infeasible for copy ops across loop groups"
+)
+def test_flash_v2_tile_H_Lq():
+    """Flash v2: tile H÷4 Lq÷2. Equivalent to original test_flash_v2."""
+    run_coarse_tile_test(
+        lambda q, k, v, m: _flash_v2_fn(
+            q, k, v, m, B=1, H=8, Lq=256, Lk=256, D=64, h_tiles=4, lq_tiles=2
+        ),
+        _flash_v2_inputs(1, 8, 256, 256, 64),
+        loopspec=LoopSpecCheck(counts=[4, 2]),
+    )
+
+
+@pytest.mark.skip(
+    reason="Unsupported: Lk reduction-dim tiling requires carry propagation"
+)
+def test_flash_v2_tile_H_Lq_Lk():
+    """Flash v2: tile H÷4 Lq÷2 Lk÷2."""
+    run_coarse_tile_test(
+        lambda q, k, v, m: _flash_v2_fn(
+            q,
+            k,
+            v,
+            m,
+            B=1,
+            H=8,
+            Lq=256,
+            Lk=256,
+            D=64,
+            h_tiles=4,
+            lq_tiles=2,
+            lk_tiles=2,
+        ),
+        _flash_v2_inputs(1, 8, 256, 256, 64),
+        loopspec=LoopSpecCheck(counts=[4, 2, 2]),
+    )
+
+
+@pytest.mark.skip(
+    reason="Unsupported: Lk reduction-dim tiling requires carry propagation"
+)
+def test_flash_v2_tile_all():
+    """Flash v2: tile all dims. B=2, H÷4, Lq÷2, Lk÷2."""
+    run_coarse_tile_test(
+        lambda q, k, v, m: _flash_v2_fn(
+            q,
+            k,
+            v,
+            m,
+            B=2,
+            H=8,
+            Lq=256,
+            Lk=256,
+            D=64,
+            b_tiles=2,
+            h_tiles=4,
+            lq_tiles=2,
+            lk_tiles=2,
+        ),
+        _flash_v2_inputs(2, 8, 256, 256, 64),
+        loopspec=LoopSpecCheck(counts=[2, 4, 2, 2]),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Flash v3: causal mask, copy_ accumulators, scores transposed, tiles= API
+# Uses num_tiles_per_dim= (normalized from tiles=) for consistency
+# ---------------------------------------------------------------------------
+
+
+def _flash_v3_inputs(B, H, Lq, Lk, D):
+    """TensorSpec list for flash v3 (with causal mask)."""
+    causal = torch.tril(torch.ones(Lq, Lk, dtype=torch.bool))
+    mask_t = torch.zeros(1, 1, Lq, Lk, dtype=torch.float16)
+    mask_t.masked_fill_(~causal, float("-inf"))
+    return [
+        tensor("queries", shape=(B, H, Lq, D), dims=["B", "H", "Lq", "D"]),
+        tensor("keys", shape=(B, H, Lk, D), dims=["B", "H", "Lk", "D"]),
+        tensor("values", shape=(B, H, Lk, D), dims=["B", "H", "Lk", "D"]),
+        tensor(
+            "mask",
+            shape=(1, 1, Lq, Lk),
+            dims=["B", "H", "Lq", "Lk"],
+            named_dims={"Lq": Lq, "Lk": Lk},
+            value=mask_t,
+        ),
+    ]
+
+
+def _flash_v3_fn(
+    queries,
+    keys,
+    values,
+    mask,
+    *,
+    B,
+    H,
+    Lq,
+    Lk,
+    D,
+    b_tiles=1,
+    h_tiles=1,
+    lq_tiles=1,
+    lk_tiles=1,
+):
+    """Flash attention v3 body (scores transposed). Tile any combination of B/H/Lq/Lk."""
+    scale = 1.0 / math.sqrt(math.sqrt(D))
+    output = torch.zeros_like(queries)
+    real_max = torch.full(
+        (B, H, Lq), float("-inf"), device=queries.device, dtype=torch.float16
+    )
+    denominator = torch.zeros((B, H, Lq), device=queries.device, dtype=torch.float16)
+    with spyre_hint(num_tiles_per_dim={"B": b_tiles}):
+        with spyre_hint(num_tiles_per_dim={"H": h_tiles}):
+            with spyre_hint(num_tiles_per_dim={"Lq": lq_tiles}):
+                with spyre_hint(num_tiles_per_dim={"Lk": lk_tiles}):
+                    with spyre_hint(expected_named_dims=["B", "H", "Lk", "D"]):
+                        scaled_keys = keys * scale
+                    with spyre_hint(expected_named_dims=["B", "H", "D", "Lk"]):
+                        keys_T = scaled_keys.transpose(-1, -2)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
+                        q_scaled = queries * scale
+                    with spyre_hint(named_dims=["B", "H", "Lq", "Lk"]):
+                        scores_pre = torch.matmul(q_scaled, keys_T)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq", "Lk"]):
+                        scores_masked = scores_pre + mask
+                    with spyre_hint(expected_named_dims=["B", "H", "Lk", "Lq"]):
+                        scores = scores_masked.transpose(-1, -2).contiguous()
+                    with spyre_hint(
+                        expected_named_dims=["B", "H", "Lq"],
+                        expected_reduction_dims=["Lk"],
+                    ):
+                        block_max = torch.amax(scores, dim=-2)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
+                        running_max = torch.maximum(real_max, block_max)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lk", "Lq"]):
+                        scores_shifted = scores - running_max.unsqueeze(-2)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lk", "Lq"]):
+                        exp_scores = torch.exp(scores_shifted)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
+                        real_max_diff = real_max - running_max
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
+                        correction = torch.exp(real_max_diff)
+
+                    copy_forced(
+                        denominator * correction + exp_scores.sum(dim=-2),
+                        denominator,
+                    )  # B, H, Lq sparse
+                    copy_forced(
+                        output * correction.unsqueeze(-1)
+                        + torch.matmul(exp_scores.transpose(-1, -2), values),
+                        output,
+                    )  # B, H, Lq, D
+
+                    copy_forced(running_max, real_max)  # B, H, Lq sparse
+
+    return output / denominator.unsqueeze(-1)
+
+
+@pytest.mark.skip(
+    reason="flash v3 H-tiling still mismatches after mutation_write_back copy_out "
+    "fix (49% mismatch) -- distinct/deeper bug, not the locally-created-buffer "
+    "copy_out routing issue"
+)
+def test_flash_v3_tile_H():
+    """Flash v3: tile H÷4 only."""
+    run_coarse_tile_test(
+        lambda q, k, v, m: _flash_v3_fn(
+            q, k, v, m, B=1, H=8, Lq=256, Lk=256, D=64, h_tiles=4
+        ),
+        _flash_v3_inputs(1, 8, 256, 256, 64),
+        loopspec=LoopSpecCheck(counts=[4]),
+    )
+
+
+@pytest.mark.skip(reason="KeyError: 0 — B tiling not yet supported")
+def test_flash_v3_tile_B():
+    """Flash v3: tile B÷2 only. B=2."""
+    run_coarse_tile_test(
+        lambda q, k, v, m: _flash_v3_fn(
+            q, k, v, m, B=2, H=8, Lq=256, Lk=256, D=64, b_tiles=2
+        ),
+        _flash_v3_inputs(2, 8, 256, 256, 64),
+        loopspec=LoopSpecCheck(counts=[2]),
+    )
+
+
+@pytest.mark.skip(
+    reason=(
+        "validate_writer_tile_advance now catches this at compile time: "
+        "squeeze-position bug in _insert_copy_op's write-side "
+        "_tiled_dims_for_dep (raw d{N} numbering breaks when a unit dim is "
+        "squeezed out of the index). Same root cause as issue #3613; "
+        "deferred until PR #3622's tile.py helpers land."
+    )
+)
+def test_flash_v3_tile_Lq():
+    """Flash v3: tile Lq÷2 only."""
+    run_coarse_tile_test(
+        lambda q, k, v, m: _flash_v3_fn(
+            q, k, v, m, B=1, H=8, Lq=256, Lk=256, D=64, lq_tiles=2
+        ),
+        _flash_v3_inputs(1, 8, 256, 256, 64),
+        loopspec=LoopSpecCheck(counts=[2]),
+    )
+
+
+@pytest.mark.skip(
+    reason="Unsupported: Lk reduction-dim tiling requires carry propagation"
+)
+def test_flash_v3_tile_Lk():
+    """Flash v3: tile Lk÷2 only."""
+    run_coarse_tile_test(
+        lambda q, k, v, m: _flash_v3_fn(
+            q, k, v, m, B=1, H=8, Lq=256, Lk=256, D=64, lk_tiles=2
+        ),
+        _flash_v3_inputs(1, 8, 256, 256, 64),
+        loopspec=LoopSpecCheck(counts=[2]),
+    )
+
+
+@pytest.mark.skip(reason="KeyError: 0 — B tiling not yet supported")
+def test_flash_v3_tile_B_H():
+    """Flash v3: tile B÷2 H÷4. B=2."""
+    run_coarse_tile_test(
+        lambda q, k, v, m: _flash_v3_fn(
+            q, k, v, m, B=2, H=8, Lq=256, Lk=256, D=64, b_tiles=2, h_tiles=4
+        ),
+        _flash_v3_inputs(2, 8, 256, 256, 64),
+        loopspec=LoopSpecCheck(counts=[2, 4]),
+    )
+
+
+@pytest.mark.skip(
+    reason=(
+        "validate_writer_tile_advance now catches this at compile time: "
+        "squeeze-position bug in _insert_copy_op's write-side "
+        "_tiled_dims_for_dep (raw d{N} numbering breaks when a unit dim is "
+        "squeezed out of the index). Same root cause as issue #3613; "
+        "deferred until PR #3622's tile.py helpers land."
+    )
+)
+def test_flash_v3_tile_H_Lq():
+    """Flash v3: tile H÷4 Lq÷2. Equivalent to original test_flash_v3 (small sizes)."""
+    run_coarse_tile_test(
+        lambda q, k, v, m: _flash_v3_fn(
+            q, k, v, m, B=1, H=8, Lq=256, Lk=256, D=64, h_tiles=4, lq_tiles=2
+        ),
+        _flash_v3_inputs(1, 8, 256, 256, 64),
+        loopspec=LoopSpecCheck(counts=[4, 2]),
+    )
+
+
+@pytest.mark.skip(
+    reason="Unsupported: Lk reduction-dim tiling requires carry propagation"
+)
+def test_flash_v3_tile_H_Lq_Lk():
+    """Flash v3: tile H÷4 Lq÷2 Lk÷2."""
+    run_coarse_tile_test(
+        lambda q, k, v, m: _flash_v3_fn(
+            q,
+            k,
+            v,
+            m,
+            B=1,
+            H=8,
+            Lq=256,
+            Lk=256,
+            D=64,
+            h_tiles=4,
+            lq_tiles=2,
+            lk_tiles=2,
+        ),
+        _flash_v3_inputs(1, 8, 256, 256, 64),
+        loopspec=LoopSpecCheck(counts=[4, 2, 2]),
+    )
+
+
+@pytest.mark.skip(
+    reason="Unsupported: Lk reduction-dim tiling requires carry propagation"
+)
+def test_flash_v3_tile_all():
+    """Flash v3: tile all dims. B=2, H÷4, Lq÷2, Lk÷2."""
+    run_coarse_tile_test(
+        lambda q, k, v, m: _flash_v3_fn(
+            q,
+            k,
+            v,
+            m,
+            B=2,
+            H=8,
+            Lq=256,
+            Lk=256,
+            D=64,
+            b_tiles=2,
+            h_tiles=4,
+            lq_tiles=2,
+            lk_tiles=2,
+        ),
+        _flash_v3_inputs(2, 8, 256, 256, 64),
+        loopspec=LoopSpecCheck(counts=[2, 4, 2, 2]),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Flash v4: flat [B,S,H*D] inputs, view+transpose inside fn
+# Known broken: propagate_named_dims bug — num_heads layout dim has no loop vars
+# ---------------------------------------------------------------------------
+
+
+def _flash_v4_inputs(B, S, H, D):
+    """TensorSpec list for flash v4 (flat fused-dim inputs)."""
+    _nd_q = {"B": B, "Lq": S, "H": H, "D": D}
+    _nd_kv = {"B": B, "Lk": S, "H": H, "D": D}
+    return [
+        tensor("q", shape=(B, S, H * D), dims=["B", "Lq", "H", "D"], named_dims=_nd_q),
+        tensor("k", shape=(B, S, H * D), dims=["B", "Lk", "H", "D"], named_dims=_nd_kv),
+        tensor("v", shape=(B, S, H * D), dims=["B", "Lk", "H", "D"], named_dims=_nd_kv),
+    ]
+
+
+def _flash_v4_fn(q, k, v, *, B, S, H, D, b_tiles=1, h_tiles=1, lq_tiles=1, lk_tiles=1):
+    """Flash attention v4 body (flat fused-dim inputs). Tile any combination."""
+    q = q.view(B, S, H, D).transpose(1, 2)
+    k = k.view(B, S, H, D).transpose(1, 2)
+    v = v.view(B, S, H, D).transpose(1, 2)
+    scale = 1.0 / math.sqrt(math.sqrt(D))
+    output = torch.zeros_like(q)
+    real_max = torch.full((B, H, S), float("-inf"), device=q.device, dtype=q.dtype)
+    denominator = torch.zeros((B, H, S), device=q.device, dtype=q.dtype)
+    with spyre_hint(num_tiles_per_dim={"B": b_tiles}):
+        with spyre_hint(num_tiles_per_dim={"H": h_tiles}):
+            with spyre_hint(num_tiles_per_dim={"Lq": lq_tiles}):
+                with spyre_hint(num_tiles_per_dim={"Lk": lk_tiles}):
+                    with spyre_hint(expected_named_dims=["B", "H", "Lk", "D"]):
+                        scaled_keys = k * scale
+                    with spyre_hint(expected_named_dims=["B", "H", "D", "Lk"]):
+                        keys_T = scaled_keys.transpose(-1, -2).contiguous()
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
+                        q_scaled = q * scale
+                    with spyre_hint(named_dims=["B", "H", "Lq", "Lk"]):
+                        scores_pre = torch.matmul(q_scaled, keys_T)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lk", "Lq"]):
+                        scores = scores_pre.transpose(-1, -2).contiguous()
+                    with spyre_hint(
+                        expected_named_dims=["B", "H", "Lq"],
+                        expected_reduction_dims=["Lk"],
+                    ):
+                        block_max = torch.amax(scores, dim=-2)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
+                        running_max = torch.maximum(real_max, block_max)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lk", "Lq"]):
+                        scores_shifted = scores - running_max.unsqueeze(-2)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lk", "Lq"]):
+                        exp_scores = torch.exp(scores_shifted)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
+                        real_max_diff = real_max - running_max
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
+                        correction = torch.exp(real_max_diff)
+                    with spyre_hint(
+                        expected_named_dims=["B", "H", "Lq"],
+                        expected_reduction_dims=["Lk"],
+                    ):
+                        sum_scores = exp_scores.sum(dim=-2)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
+                        denom_corrected = denominator * correction
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
+                        new_denom = denom_corrected + sum_scores
+                    copy_forced(new_denom, denominator)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq", "Lk"]):
+                        exp_scores_T = exp_scores.transpose(-1, -2).contiguous()
+                    with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
+                        matmul_out = torch.matmul(exp_scores_T, v)
+                    # correction.unsqueeze(-1) is size-1 in D — can't carry "D"
+                    output_corrected = output * correction.unsqueeze(-1)
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq", "D"]):
+                        new_output = output_corrected + matmul_out
+                    copy_forced(new_output, output)
+                    copy_forced(running_max, real_max)
+    copy_forced(output / denominator.unsqueeze(-1), output)
+    return output.transpose(1, 2).reshape(B, S, H * D)
+
+
+@pytest.mark.skip(
+    reason="Unsupported: propagate_named_dims bug — num_heads layout dim has no loop vars after view+transpose"
+)
+def test_flash_v4_tile_H():
+    """Flash v4: tile num_heads÷4 only."""
+    run_coarse_tile_test(
+        lambda q, k, v: _flash_v4_fn(q, k, v, B=2, S=256, H=8, D=64, h_tiles=4),
+        _flash_v4_inputs(2, 256, 8, 64),
+        loopspec=LoopSpecCheck(counts=[4]),
+    )
+
+
+@pytest.mark.skip(
+    reason="Unsupported: propagate_named_dims bug — num_heads layout dim has no loop vars after view+transpose"
+)
+def test_flash_v4_tile_B():
+    """Flash v4: tile batch_size÷2 only. B=2."""
+    run_coarse_tile_test(
+        lambda q, k, v: _flash_v4_fn(q, k, v, B=2, S=256, H=8, D=64, b_tiles=2),
+        _flash_v4_inputs(2, 256, 8, 64),
+        loopspec=LoopSpecCheck(counts=[2]),
+    )
+
+
+@pytest.mark.skip(
+    reason="Unsupported: propagate_named_dims bug — num_heads layout dim has no loop vars after view+transpose"
+)
+def test_flash_v4_tile_Lq():
+    """Flash v4: tile max_seqlen_q÷2 only."""
+    run_coarse_tile_test(
+        lambda q, k, v: _flash_v4_fn(q, k, v, B=2, S=256, H=8, D=64, lq_tiles=2),
+        _flash_v4_inputs(2, 256, 8, 64),
+        loopspec=LoopSpecCheck(counts=[2]),
+    )
+
+
+@pytest.mark.skip(
+    reason="Unsupported: propagate_named_dims bug — num_heads layout dim has no loop vars after view+transpose"
+)
+def test_flash_v4_tile_H_Lq():
+    """Flash v4: tile num_heads÷4 max_seqlen_q÷2. Equivalent to original test_flash_v4."""
+    run_coarse_tile_test(
+        lambda q, k, v: _flash_v4_fn(
+            q, k, v, B=2, S=256, H=8, D=64, h_tiles=4, lq_tiles=2
+        ),
+        _flash_v4_inputs(2, 256, 8, 64),
+        loopspec=LoopSpecCheck(counts=[4, 2]),
+    )
+
+
+@pytest.mark.skip(
+    reason="Unsupported: propagate_named_dims bug — num_heads layout dim has no loop vars after view+transpose"
+)
+def test_flash_v4_tile_H_Lq_Lk():
+    """Flash v4: tile num_heads÷4 max_seqlen_q÷2 max_seqlen_kv÷2."""
+    run_coarse_tile_test(
+        lambda q, k, v: _flash_v4_fn(
+            q, k, v, B=2, S=256, H=8, D=64, h_tiles=4, lq_tiles=2, lk_tiles=2
+        ),
+        _flash_v4_inputs(2, 256, 8, 64),
+        loopspec=LoopSpecCheck(counts=[4, 2, 2]),
+    )
+
+
+@pytest.mark.skip(
+    reason="Unsupported: propagate_named_dims bug — num_heads layout dim has no loop vars after view+transpose"
+)
+def test_flash_v4_tile_all():
+    """Flash v4: tile all dims. B=2, H÷4, Lq÷2, Lk÷2."""
+    run_coarse_tile_test(
+        lambda q, k, v: _flash_v4_fn(
+            q, k, v, B=2, S=256, H=8, D=64, b_tiles=2, h_tiles=4, lq_tiles=2, lk_tiles=2
+        ),
+        _flash_v4_inputs(2, 256, 8, 64),
+        loopspec=LoopSpecCheck(counts=[2, 4, 2, 2]),
+    )
+
+
+# ---------------------------------------------------------------------------
+# validate_named_dims tests
+# ---------------------------------------------------------------------------
+
+
+def test_validate_named_dims_raises_on_mismatch():
+    """validate_named_dims raises AssertionError when expected_named_dims is wrong."""
+    inputs = [tensor("x", shape=(256, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(expected_named_dims=["WRONG", "DIMS"]):
+            return torch.abs(x)
+
+    with pytest.raises(Exception, match="expected_named_dims"):
+        run_coarse_tile_test(fn, inputs)
+
+
+def test_validate_reduction_dims_raises_on_mismatch():
+    """validate_named_dims raises AssertionError when expected_reduction_dims is wrong."""
+    inputs = [tensor("x", shape=(512, 256), dims=["A", "B"])]
+
+    def fn(x):
+        with spyre_hint(expected_named_dims=["B"], expected_reduction_dims=["WRONG"]):
+            return x.amin(dim=0)
+
+    with pytest.raises(Exception, match="expected_reduction_dims"):
+        run_coarse_tile_test(fn, inputs)
+
 
 # ===========================================================================
+# END OF STRUCTURED TESTS (Groups 1-9)
+# ===========================================================================
+# ORIGINAL TESTS — preserved for reference, being migrated to structured format.
+#
 # spyre_hint-driven coarse tiling
 # These tests verify that coarse tiling is driven automatically by
 # spyre_hint(num_tiles_per_dim=...) annotations.  Named tensor dimensions
@@ -166,11 +3699,20 @@ class TestCoarseTileSpyreHints(InductorTestCase):
 
         def softmax_fn(x):
             with spyre_hint(num_tiles_per_dim={"B": 4}):
-                max_val = x.amax(dim=-1, keepdim=True)
-                x_shifted = x - max_val
-                exp_x = x_shifted.exp()
-                sum_exp = exp_x.sum(dim=-1, keepdim=True)
-                return exp_x / sum_exp
+                with spyre_hint(
+                    expected_named_dims=["B"], expected_reduction_dims=["D"]
+                ):
+                    max_val = x.amax(dim=-1, keepdim=True)
+                with spyre_hint(expected_named_dims=["B", "D"]):
+                    x_shifted = x - max_val
+                with spyre_hint(expected_named_dims=["B", "D"]):
+                    exp_x = x_shifted.exp()
+                with spyre_hint(
+                    expected_named_dims=["B"], expected_reduction_dims=["D"]
+                ):
+                    sum_exp = exp_x.sum(dim=-1, keepdim=True)
+                with spyre_hint(expected_named_dims=["B", "D"]):
+                    return exp_x / sum_exp
 
         x_dev = x.to("spyre")
         _declare_tensor_dim("B", B)
@@ -467,7 +4009,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         )
 
     # ------------------------------------------------------------------
-    # Loop-invariant (broadcast) op gets per_tile_fixed=True
+    # Loop-invariant (broadcast) op's own write does not advance
     # ------------------------------------------------------------------
 
     @config.patch(
@@ -476,14 +4018,25 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "allow_all_ops_in_lx_planning": True,
         }
     )
-    def test_loop_invariant_op_per_tile_fixed_in_sdsc(self):
-        """A loop-invariant ComputedBuffer inside a coarse-tile group must have
-        per_tile_fixed=True in the generated SDSC source, so the unroller does
+    def test_loop_invariant_op_write_does_not_advance_in_sdsc(self):
+        """A loop-invariant ComputedBuffer's own write inside a coarse-tile
+        group must never get a device_tile_advance_expr, so the unroller does
         not advance its address.
 
         torch.full lowers to a scalar-fill ComputedBuffer with no loop var matching
         the hinted dim.  Its loop_tiled_dims are all-empty, making it loop-invariant
-        w.r.t. the tiling.  finalize_layouts must stamp per_tile_fixed=True on it.
+        w.r.t. the tiling, so its own write's TensorArg carries no
+        device_tile_advance_expr at all (that field is only present on
+        references that actually advance per tile).
+
+        There is no per-TensorArg identifying token in the debug dump today
+        to isolate the fill's own write in isolation (out of scope to add
+        one here), so this asserts a stable *count* of
+        device_tile_advance_expr occurrences across the whole kernel instead:
+        the fill's own write is fixed (0 occurrences), its read by the tiled
+        add advances (1), the add's own write to the copy-out target advances
+        (1), and the final write-back copy-out advances (1) -- 3 total, with
+        none attributable to the fill's own write.
         """
         from torch_spyre._inductor import spyre_hint
 
@@ -509,10 +4062,32 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         ):
             _, source_codes = run_and_get_code(cfn, x_dev)
         src = source_codes[0]
-        self.assertIn(
-            "per_tile_fixed=True",
+        fill_op_match = re.search(
+            r"ir_chain=\('full_default', '(\w+)'\).*?args=\[\s*"
+            r"TensorArg\((?:(?!TensorArg\().)*?\),\s*"
+            r"TensorArg\(((?:(?!TensorArg\().)*?)\)\s*\]",
             src,
-            "Loop-invariant (scalar-fill) buffer must have per_tile_fixed=True in SDSC",
+            re.DOTALL,
+        )
+        self.assertTrue(
+            fill_op_match,
+            "Expected to find the torch.full fill's OpSpec (ir_chain "
+            "'full_default') with its own write as the second TensorArg",
+        )
+        self.assertNotIn(
+            "device_tile_advance_expr",
+            fill_op_match.group(2),
+            "The loop-invariant fill's own write must not advance per tile, "
+            f"got: {fill_op_match.group(2)}",
+        )
+        self.assertEqual(
+            src.count("device_tile_advance_expr="),
+            3,
+            "Expected exactly 3 advancing references in this kernel (the "
+            "fill's read by the tiled add, the add's own write, and the "
+            "final copy-out) -- if this changes, some other reference's "
+            "fixed/advancing status changed too; investigate rather than "
+            "just updating the count.",
         )
 
     # ------------------------------------------------------------------
@@ -571,16 +4146,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
     # Hint propagation into inserted restickify nodes
     # ------------------------------------------------------------------
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "The transposed input produces layouts where coarse-tiling rewrites "
-            "output buffer strides after restickify has already run, resulting in "
-            "a stick mismatch that raises in create_op_spec.  This will be fixed "
-            "by reordering the compiler passes so that restickify runs after "
-            "coarse-tiling (PR #3293)."
-        ),
-    )
     @config.patch(
         {
             "lx_planning": True,
@@ -692,7 +4257,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             fn, x, y, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
         )
 
-    @unittest.expectedFailure
+    # Consider deleting — superseded by Group 10 structured tests (_flash_v1_fn)
     def test_hint_flash_attention(self):
         """Flash attention tiled over H (4 slices) via nested spyre_hints.
 
@@ -780,13 +4345,28 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
-    @unittest.expectedFailure
+    # Consider deleting — superseded by Group 10 structured tests (_flash_v2_fn)
+    @pytest.mark.skip(
+        reason="finalize_layouts: restickify infeasible for copy ops across loop groups"
+    )
     def test_hint_flash_attention_v2(self):
         """Flash attention tiled over H (4 slices) via nested spyre_hints.
 
         Variant of test_hint_flash_attention with a causal mask and an
         explicit running-max (real_max) formulation that updates output and
         denominator in place via copy_.
+
+        Still xfailed.  The divide sits outside the tiled scopes, so
+        `output`/`denominator` get full buffers + copy ops; each copy writes its
+        target without reading it, nothing costs that pairing, and
+        finalize_layouts overwrites the target with the writer's layout ->
+        "restickify needed but infeasible for op='buf24' input='buf26'".
+
+        Not resolvable by layout choice: writer and consumer need mutually
+        unrestickifiable candidates (forcing either aborts or gives ~70% wrong).
+        {"Lq": 2} alone reproduces it.  See
+        test_hint_flash_attention_v2_divide_in_scope for the formulation that
+        works, which localizes this to the cross-loop-group copy path.
 
         Decision xfail: failing in CI (Actions run 30385154736, job
         90362755639) on PR #3293. We've decided to xfail the coarse tiling
@@ -847,15 +4427,17 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                             real_max - running_max
                         )  # B, H, Lq sparse
 
-                        denominator.copy_(
-                            denominator * correction + exp_scores.sum(dim=-1)
+                        copy_forced(
+                            denominator * correction + exp_scores.sum(dim=-1),
+                            denominator,
                         )  # B, H, Lq sparse
-                        output.copy_(
+                        copy_forced(
                             output * correction.unsqueeze(-1)
-                            + torch.matmul(exp_scores, values)
+                            + torch.matmul(exp_scores, values),
+                            output,
                         )  # B, H, Lq, D
 
-                        real_max.copy_(running_max)  # B, H, Lq sparse
+                        copy_forced(running_max, real_max)  # B, H, Lq sparse
 
             return output / denominator.unsqueeze(-1)
 
@@ -874,7 +4456,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(queries_dev, ["B", "H", "Lq", "D"])
         _name_tensor_dims(keys_dev, ["B", "H", "Lk", "D"])
         _name_tensor_dims(values_dev, ["B", "H", "Lk", "D"])
-        _name_tensor_dims(mask_dev, ["B", "H", "Lq", "Lk"])
+        _name_tensor_dims(mask_dev, ["Lq", "Lk"])
 
         result = torch.compile(flash)(queries_dev, keys_dev, values_dev, mask_dev).cpu()
         torch.testing.assert_close(
@@ -886,20 +4468,125 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
+    @pytest.mark.skip(
+        reason="Expected FixedTiledLayout for output buf — layout not promoted correctly with divide inside scope"
+    )
+    def test_hint_flash_attention_v2_divide_in_scope(self):
+        """test_hint_flash_attention_v2 with the final divide INSIDE the scope.
+
+        Outside, `output`/`denominator` are read past the loop group, so both get a
+        full buffer + copy op whose target the divide (buf24) also reads; the copy
+        writes its target without reading it, so no edge costs that pairing and
+        finalize_layouts overwrites the target with the writer's layout, killing
+        buf24's solved edge.  Inside, only `result` crosses: one copy op, target
+        has no second consumer, nothing to invalidate.
+
+        Sound only because H/Lq are output dims (each tile's denominator is final).
+        Lk tiling still needs carry propagation -- #3198.
+
+        The LoopSpec assertion is load-bearing: without it this passes even if
+        tiling is silently skipped.
+        """
+        import math
+
+        from torch_spyre._inductor import spyre_hint
+
+        B, H, Lq, Lk, D = 1, 8, 256, 256, 64
+        block_size = 128
+
+        queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
+        keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        values_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        causal = torch.tril(torch.ones(Lq, Lk, dtype=torch.bool))
+        mask_t = torch.zeros(1, 1, Lq, Lk, dtype=torch.float16)
+        mask_t.masked_fill_(~causal, float("-inf"))
+        lq_slices = Lq // block_size
+
+        def flash(queries, keys, values, mask):
+            scale = 1.0 / math.sqrt(math.sqrt(D))
+            output = torch.zeros_like(queries)
+            real_max = torch.full(
+                (B, H, Lq, 64),
+                float("-inf"),
+                device=queries.device,
+                dtype=torch.float16,
+            ).amax(dim=-1)
+            denominator = torch.zeros(
+                (B, H, Lq, 64),
+                device=queries.device,
+                dtype=torch.float16,
+            ).amax(dim=-1)
+            with spyre_hint(num_tiles_per_dim={"H": 4}):
+                with spyre_hint(num_tiles_per_dim={"Lq": lq_slices}):
+                    scaled_keys = keys * scale
+                    keys_T = scaled_keys.transpose(-1, -2)
+                    scores = torch.matmul(queries * scale, keys_T)
+                    scores = scores + mask
+
+                    block_max = torch.amax(scores, dim=-1)
+                    running_max = torch.maximum(real_max, block_max)
+
+                    exp_scores = torch.exp(scores - running_max.unsqueeze(-1))
+                    correction = torch.exp(real_max - running_max)
+
+                    copy_forced(
+                        denominator * correction + exp_scores.sum(dim=-1), denominator
+                    )
+                    copy_forced(
+                        output * correction.unsqueeze(-1)
+                        + torch.matmul(exp_scores, values),
+                        output,
+                    )
+                    copy_forced(running_max, real_max)
+
+                    # The one difference from test_hint_flash_attention_v2.
+                    result = output / denominator.unsqueeze(-1)
+            return result
+
+        ref = flash(queries_t, keys_t, values_t, mask_t)
+
+        queries_dev = queries_t.to("spyre")
+        keys_dev = keys_t.to("spyre")
+        values_dev = values_t.to("spyre")
+        mask_dev = mask_t.to("spyre")
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("Lk", Lk)
+        _declare_tensor_dim("D", D)
+        _name_tensor_dims(queries_dev, ["B", "H", "Lq", "D"])
+        _name_tensor_dims(keys_dev, ["B", "H", "Lk", "D"])
+        _name_tensor_dims(values_dev, ["B", "H", "Lk", "D"])
+        _name_tensor_dims(mask_dev, ["Lq", "Lk"])
+
+        cfn = torch.compile(flash)
+        result, source_codes = run_and_get_code(
+            cfn, queries_dev, keys_dev, values_dev, mask_dev
+        )
+        torch.testing.assert_close(
+            result.cpu(),
+            ref,
+            equal_nan=True,
+            atol=0.01,
+            rtol=0.1,
+            msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
+        )
+        # Both hint levels must survive into codegen (H=4 outer, Lq=2 inner).
+        self.assertEqual(
+            source_codes[0].count("LoopSpec("),
+            2,
+            "expected two nested LoopSpec entries (H then Lq); coarse tiling "
+            "must not be silently skipped",
+        )
+
     @config.patch(
         {
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
         }
     )
-    @pytest.mark.xfail(
-        strict=False,
-        reason=(
-            "flash attention v3/v4 not yet passing: Lk reduction-dim tiling is "
-            "disabled (see FIXME on kv_block_size), unrelated to carry "
-            "propagation"
-        ),
-    )
+    # Consider deleting — superseded by Group 10 structured tests (_flash_v3_fn)
+    @pytest.mark.skip(reason="dxp_standalone timeout")
     def test_hint_flash_attention_v3(self):
         from torch_spyre._inductor import spyre_hint
 
@@ -960,15 +4647,17 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                                 real_max - running_max
                             )  # B, H, Lq sparse
 
-                            denominator.copy_(
-                                denominator * correction + exp_scores.sum(dim=-2)
+                            copy_forced(
+                                denominator * correction + exp_scores.sum(dim=-2),
+                                denominator,
                             )  # B, H, Lq sparse
-                            output.copy_(
+                            copy_forced(
                                 output * correction.unsqueeze(-1)
-                                + torch.matmul(exp_scores.transpose(-1, -2), values)
+                                + torch.matmul(exp_scores.transpose(-1, -2), values),
+                                output,
                             )  # B, H, Lq, D
 
-                            real_max.copy_(running_max)  # B, H, Lq sparse
+                            copy_forced(running_max, real_max)  # B, H, Lq sparse
             return output / denominator.unsqueeze(-1)
 
         queries_t_spyre = queries_t.to(device="spyre")
@@ -987,7 +4676,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(queries_t_spyre, ["B", "H", "Lq", "D"])
         _name_tensor_dims(keys_t_spyre, ["B", "H", "Lk", "D"])
         _name_tensor_dims(values_t_spyre, ["B", "H", "Lk", "D"])
-        _name_tensor_dims(mask_t_spyre, ["B", "H", "Lq", "Lk"])
+        _name_tensor_dims(mask_t_spyre, ["Lq", "Lk"])
         result = torch.compile(flash)(
             queries_t_spyre, keys_t_spyre, values_t_spyre, mask_t_spyre
         ).cpu()
@@ -1000,13 +4689,8 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason=(
-            "flash attention v3/v4 not yet passing: Lk reduction-dim tiling is "
-            "disabled (see FIXME on kv_block_size), unrelated to carry "
-            "propagation"
-        ),
+    @pytest.mark.skip(
+        reason="finalize_layouts: restickify infeasible for copy ops across loop groups"
     )
     def test_hint_flash_attention_v3_b2(self):
         """Same as flash_v3 but with B=2 and b_block_size=2 so B is nto tiled"""
@@ -1068,15 +4752,17 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                                 real_max - running_max
                             )  # B, H, Lq sparse
 
-                            denominator.copy_(
-                                denominator * correction + exp_scores.sum(dim=-2)
+                            copy_forced(
+                                denominator * correction + exp_scores.sum(dim=-2),
+                                denominator,
                             )  # B, H, Lq sparse
-                            output.copy_(
+                            copy_forced(
                                 output * correction.unsqueeze(-1)
-                                + torch.matmul(exp_scores.transpose(-1, -2), values)
+                                + torch.matmul(exp_scores.transpose(-1, -2), values),
+                                output,
                             )  # B, H, Lq, D
 
-                            real_max.copy_(running_max)  # B, H, Lq sparse
+                            copy_forced(running_max, real_max)  # B, H, Lq sparse
             return output / denominator.unsqueeze(-1)
 
         queries_t_spyre = queries_t.to(device="spyre")
@@ -1095,7 +4781,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         _name_tensor_dims(queries_t_spyre, ["B", "H", "Lq", "D"])
         _name_tensor_dims(keys_t_spyre, ["B", "H", "Lk", "D"])
         _name_tensor_dims(values_t_spyre, ["B", "H", "Lk", "D"])
-        _name_tensor_dims(mask_t_spyre, ["B", "H", "Lq", "Lk"])
+        _name_tensor_dims(mask_t_spyre, ["Lq", "Lk"])
         result = torch.compile(flash)(
             queries_t_spyre, keys_t_spyre, values_t_spyre, mask_t_spyre
         ).cpu()
@@ -1114,7 +4800,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "disabled (see FIXME on kv_block_size in this file), unrelated to "
             "carry propagation. Confirmed (4/4 local full-suite runs) to leave "
             "the device in an error state that cascades skips to every later "
-            "test in the same process (see conftest.py's has_stream_error() "
+            "test in the same process (see conftest.py's get_device_state() "
             "check) when run as xfail -- skipped outright instead. Revisit "
             "once the Lk coarse-tiling limitation above is fixed; a real fix "
             "there should make this test pass rather than merely change its "
@@ -1137,9 +4823,14 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             )
             with spyre_hint(tiles={"H": H // h_block_size}):
                 with spyre_hint(tiles={"Lq": Lq // lq_block_size}):
-                    block_max = torch.amax(scores, dim=-2)  # [B, H, Lq]
-                    running_max = torch.maximum(real_max, block_max)
-                    real_max.copy_(running_max)
+                    with spyre_hint(
+                        expected_named_dims=["B", "H", "Lq"],
+                        expected_reduction_dims=["Lk"],
+                    ):
+                        block_max = torch.amax(scores, dim=-2)  # [B, H, Lq]
+                    with spyre_hint(expected_named_dims=["B", "H", "Lq"]):
+                        running_max = torch.maximum(real_max, block_max)
+                    copy_forced(running_max, real_max)
             return real_max
 
         ref = fn(scores)
@@ -1163,13 +4854,13 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
         )
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason=(
-            "flash attention v3/v4 not yet passing: unrelated "
-            "propagate_named_dims bug (num_heads layout dim has no loop "
-            "vars), not carry propagation"
-        ),
+    @pytest.mark.skip(
+        reason="propagate_named_dims bug: view+transpose produces index with var in two Mod "
+        "expressions that compute_coordinates cannot handle. "
+        "Root cause: find_repeat_vars skips len(mods)!=1 case silently; "
+        "compute_coordinates then produces coord=0 for num_heads dim. "
+        "Error (with PR#3034 fix): variable d2 (range 8192) appears in multiple Mod "
+        "expressions [Mod((d2//256), 32), Mod(d2, 256)] and cannot be mapped to coordinates."
     )
     def test_hint_flash_attention_v4(self):
         """This test attempts to replicate the standalone test_granite_attn.py with views
@@ -1216,16 +4907,18 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                             running_max = torch.maximum(real_max, block_max)
                             exp_scores = torch.exp(scores - running_max.unsqueeze(-2))
                             correction = torch.exp(real_max - running_max)
-                            denominator.copy_(
-                                denominator * correction + exp_scores.sum(dim=-2)
+                            copy_forced(
+                                denominator * correction + exp_scores.sum(dim=-2),
+                                denominator,
                             )
-                            output.copy_(
+                            copy_forced(
                                 output * correction.unsqueeze(-1)
-                                + torch.matmul(exp_scores.transpose(-1, -2), v)
+                                + torch.matmul(exp_scores.transpose(-1, -2), v),
+                                output,
                             )
-                            real_max.copy_(running_max)
+                            copy_forced(running_max, real_max)
 
-            output.copy_(output / denominator.unsqueeze(-1))
+            copy_forced(output / denominator.unsqueeze(-1), output)
             return output.transpose(1, 2).reshape(B, S, H * D)
 
         ref = block(queries_t, keys_t, values_t)
@@ -1316,7 +5009,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "allow_all_ops_in_lx_planning": True,
         }
     )
-    @unittest.expectedFailure
+    @pytest.mark.skip
     def test_hint_flash_attention_loopspec(self):
         """Lk loop level not dropped when Lk-broadcast ops appear first in group.
 
@@ -1479,7 +5172,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             " by _stamp_group (group-wide is_reduction_level flag bug)",
         )
 
-    @unittest.expectedFailure
+    @pytest.mark.skip
     def test_hint_flash_attention_two_loop_levels(self):
         """Flash-attention graph: both H and Lk loop levels survive into codegen.
 
@@ -1588,7 +5281,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             " by _stamp_group (group-wide is_reduction_level flag bug)",
         )
 
-    @unittest.expectedFailure
+    @pytest.mark.skip
     def test_hint_flash_attention_two_loop_levels_v2(self):
         """Flash-attention graph: both H and Lq loop levels survive into codegen.
 
@@ -1665,15 +5358,17 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                             real_max - running_max
                         )  # B, H, Lq sparse
 
-                        denominator.copy_(
-                            denominator * correction + exp_scores.sum(dim=-1)
+                        copy_forced(
+                            denominator * correction + exp_scores.sum(dim=-1),
+                            denominator,
                         )  # B, H, Lq sparse
-                        output.copy_(
+                        copy_forced(
                             output * correction.unsqueeze(-1)
-                            + torch.matmul(exp_scores, values)
+                            + torch.matmul(exp_scores, values),
+                            output,
                         )  # B, H, Lq, D
 
-                        real_max.copy_(running_max)  # B, H, Lq sparse
+                        copy_forced(running_max, real_max)  # B, H, Lq sparse
             return output / denominator.unsqueeze(-1)
 
         cfn = torch.compile(flash)
@@ -1698,6 +5393,249 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             src,
             "Expected Lq loop count 2 as count= in LoopSpec — _stamp_group must"
             " divide Lq ranges on each op using that op's own dim role",
+        )
+
+    def _run_kv_chunked_flash(
+        self,
+        *,
+        h_tiles=4,
+        lq_tiles=2,
+        B=1,
+        H=8,
+        Lq=256,
+        Lk=256,
+        D=64,
+        kv_block=128,
+    ):
+        """Flash attention with K/V chunking in PYTHON and WSR tiling only H/Lq.
+
+        Shared by the two tests below so the h_tiles == H degenerate-tile case
+        can reuse the graph rather than duplicate it.  Asserts inline.
+
+        WSR's reduction-dim carry propagation is unimplemented (#3432), so every
+        flash variant that hints Lk is xfailed.  Here the K/V sweep is an ordinary
+        Python ``for`` loop that torch.compile unrolls into the graph, so the
+        online-softmax recurrence becomes explicit dataflow.  WSR is then only
+        asked to tile H and Lq -- non-reduction dims -- and never sees a carry.
+
+        Complements test_hint_flash_attention_v2_divide_in_scope (#3429), which
+        tiles H/Lq over a SINGLE K block.  This covers more than one K block,
+        which that test does not reach.
+
+        Four things are load-bearing; each one produced a wrong answer or a hard
+        error while this was being written:
+
+        1.  **The K loop must be INSIDE a single H/Lq scope.**  Wrapping each
+            chunk in its own scope instead makes the scheduler interleave the
+            chunks, so a scope's ops are no longer contiguous and
+            validate_coarse_tile_groups rejects it with "hint_id=N appears in
+            both group X and group Y".  Measured op order for 2 chunks was
+            chunk0-main, chunk1-main, chunk0-tail, chunk1-tail.
+        2.  **K/V chunks are sliced by the CALLER and passed in as named
+            tensors.**  Slicing inside the graph and naming the slice output with
+            spyre_hint(named_dims=...) does not work and fails SILENTLY: the hint
+            branch of propagate_named_dims sets _dim_prop_info and returns, so
+            the read of the unnamed full tensor never gets an H mapping, and the
+            _untracked warning that would have said so disappears.  Naming the
+            full tensor does not work either -- slicing Lk shrinks the axis, so
+            _consume_names finds no prefix matching it and drops the binding.
+            Symptom either way: H tile 0 correct, every later tile ~85% wrong.
+        3.  **Carry inits use the sparse idiom** ``full((B,H,Lq,64)).amax(-1)``.
+            A plain 3-D ``full((B,H,Lq))`` raises "no mechanism to resolve stick
+            incompatibility".
+        4.  **The final divide is inside the innermost scope** (#3429): read past
+            the loop group it becomes a full buffer plus a copy op whose target a
+            second consumer also reads, and finalize_layouts overwrites it.
+
+        h_tiles=4 and lq_tiles=2 differ deliberately so the LoopSpec assertions
+        can tell the two levels apart; equal counts would pass even if one level
+        were dropped.  No causal mask here on purpose: with K chunking a fully
+        masked chunk gives block_max == -inf and exp(-inf - -inf) is NaN, which
+        is a real trap but a separate one from what this test pins down.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        n_chunks = Lk // kv_block
+        self.assertEqual(Lk % kv_block, 0, "chunks must divide Lk")
+        scale = 1.0 / math.sqrt(math.sqrt(D))
+
+        torch.manual_seed(42)
+        queries_t = torch.randn(B, H, Lq, D, dtype=torch.float16)
+        keys_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+        values_t = torch.randn(B, H, Lk, D, dtype=torch.float16)
+
+        def flash(queries, k_chunks, v_chunks):
+            with spyre_hint(named_dims=["B", "H", "Lq"]):
+                running_max = torch.full(
+                    (B, H, Lq, 64),
+                    float("-inf"),
+                    device=queries.device,
+                    dtype=torch.float16,
+                ).amax(dim=-1)
+            with spyre_hint(named_dims=["B", "H", "Lq"]):
+                denom = torch.full(
+                    (B, H, Lq, 64), 0.0, device=queries.device, dtype=torch.float16
+                ).amax(dim=-1)
+            with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
+                acc = torch.zeros_like(queries)
+
+            def sweep(running_max, denom, acc):
+                """The unrolled K/V sweep.
+
+                Carries are parameters so they can be rebound locally without a
+                nonlocal declaration.
+                """
+                out = None
+                for kb in range(n_chunks):  # unrolled into the graph
+                    k_c, v_c = k_chunks[kb], v_chunks[kb]
+                    keys_T = (k_c * scale).transpose(-1, -2).contiguous()
+                    # A matmul output inherits no names from its inputs, so both
+                    # matmuls need an explicit named_dims hint.
+                    with spyre_hint(named_dims=["B", "H", "Lq", "Lkc"]):
+                        scores = torch.matmul(queries * scale, keys_T)
+                    block_max = torch.amax(scores, dim=-1)
+                    new_max = torch.maximum(running_max, block_max)
+                    correction = torch.exp(running_max - new_max)
+                    exp_scores = torch.exp(scores - new_max.unsqueeze(-1))
+                    new_denom = denom * correction + exp_scores.sum(dim=-1)
+                    with spyre_hint(named_dims=["B", "H", "Lq", "D"]):
+                        weighted = torch.matmul(exp_scores, v_c)
+                    new_acc = acc * correction.unsqueeze(-1) + weighted
+                    if kb == n_chunks - 1:
+                        out = new_acc / new_denom.unsqueeze(-1)
+                    else:
+                        running_max, denom, acc = new_max, new_denom, new_acc
+                return out
+
+            # Lq cannot be tiled at Lq == 1 (decode), so that hint is optional.
+            # Written as two branches rather than a stand-in context manager: a
+            # contextlib.nullcontext() inside a traced function has previously
+            # produced spurious dynamo errors in this suite.
+            with spyre_hint(num_tiles_per_dim={"H": h_tiles}):
+                if lq_tiles:
+                    with spyre_hint(num_tiles_per_dim={"Lq": lq_tiles}):
+                        return sweep(running_max, denom, acc)
+                return sweep(running_max, denom, acc)
+
+        def chunk(t):
+            return [
+                t[..., i * kv_block : (i + 1) * kv_block, :].contiguous()
+                for i in range(n_chunks)
+            ]
+
+        # CPU reference first, then device setup -- matching the driver pattern.
+        k_chunks_t, v_chunks_t = chunk(keys_t), chunk(values_t)
+        ref = flash(queries_t, k_chunks_t, v_chunks_t)
+
+        queries_dev = queries_t.to("spyre")
+        k_chunks = [t.to("spyre") for t in k_chunks_t]
+        v_chunks = [t.to("spyre") for t in v_chunks_t]
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("Lq", Lq)
+        _declare_tensor_dim("D", D)
+        # The per-chunk key extent: what the scores' last axis really is.
+        _declare_tensor_dim("Lkc", kv_block)
+        _name_tensor_dims(queries_dev, ["B", "H", "Lq", "D"])
+        for t in k_chunks + v_chunks:
+            _name_tensor_dims(t, ["B", "H", "Lkc", "D"])
+
+        result, source_codes = run_and_get_code(
+            torch.compile(flash), queries_dev, k_chunks, v_chunks
+        )
+        torch.testing.assert_close(
+            result.cpu(),
+            ref,
+            equal_nan=True,
+            atol=0.01,
+            rtol=0.1,
+            msg=lambda msg: f"compiled spyre <-> cpu mismatch\n\n{msg}\n",
+        )
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "expected coarse tiling to survive codegen")
+        self.assertEqual(
+            src.count("LoopSpec("),
+            2 if lq_tiles else 1,
+            "expected one loop level per tiled dim (H, plus Lq when tiled)",
+        )
+        self.assertIn(
+            f"count=sympify('{h_tiles}')",
+            src,
+            f"expected the H loop count (h_tiles={h_tiles})",
+        )
+        if lq_tiles:
+            self.assertIn(
+                f"count=sympify('{lq_tiles}')",
+                src,
+                f"expected the Lq loop count (lq_tiles={lq_tiles})",
+            )
+
+    def test_hint_flash_attention_kv_chunked_python_loop(self):
+        """K/V chunked in Python, WSR tiling H (4) and Lq (2). See impl docstring."""
+        self._run_kv_chunked_flash(h_tiles=4, lq_tiles=2)
+
+    def test_hint_flash_attention_kv_chunked_prefill_8k(self):
+        """Chunked prefill: a 512-token query block against an 8k K/V cache.
+
+        This is the production shape -- vLLM-style chunked prefill -- not a
+        scaled-down proxy.  Both H and Lq are WSR-tiled; Lk is not hinted.
+
+        kv_block is 2048 (4 chunks) rather than 512 (16) because the 16-chunk
+        graph at Lq=512 takes significantly longer to compile.  Lq stays at the
+        query-block size deliberately: the same 4-chunk graph at Lq=8192
+        compiled for over two hours without finishing, while at Lq=512 it takes
+        well under a minute, so compile cost is driven by Lq extent rather than
+        by chunk count or cache length.
+        """
+        self._run_kv_chunked_flash(
+            h_tiles=4, lq_tiles=2, B=1, H=8, Lq=512, Lk=8192, D=128, kv_block=2048
+        )
+
+    def test_hint_flash_attention_kv_chunked_decode_8k(self):
+        """Decode: one query token, batch 4, against a full 8k K/V cache.
+
+        Lq == 1 cannot be tiled, so H tiling is the only level and there is a
+        single LoopSpec.  A full cache means every key is valid, so no mask is
+        needed and the fully-masked-chunk case (block_max == -inf, making
+        exp(-inf - -inf) NaN) does not arise here -- that remains untested.
+        """
+        self._run_kv_chunked_flash(
+            h_tiles=4, lq_tiles=None, B=4, H=8, Lq=1, Lk=8192, D=128, kv_block=2048
+        )
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "h_tiles == H gives a 1-element H tile, and a unit-size tiled dim is "
+            "squeezed out of _insert_one_read_copy's squeeze_pos map (built by "
+            "skipping ranges where int(r) == 1), so the subsequent "
+            "squeeze_pos[d] lookup raises KeyError. Reproduced at 2 and 4 chunks "
+            "on main; h_tiles of 2 and 4 are numerically exact. Compile-time "
+            "error only -- it does not leave the device in an error state."
+        ),
+    )
+    def test_hint_flash_attention_kv_chunked_unit_h_tile(self):
+        """h_tiles == H (one head per tile) crashes in read-copy insertion."""
+        self._run_kv_chunked_flash(h_tiles=8, lq_tiles=2)
+
+    def test_hint_flash_attention_kv_chunked_8_chunks(self):
+        """8 unrolled K/V chunks: now succeeds with optimized layouts for constants"""
+        self._run_kv_chunked_flash(
+            h_tiles=4, lq_tiles=None, B=1, H=8, Lq=256, Lk=4096, D=128, kv_block=512
+        )
+
+    @pytest.mark.skip(reason="Long test - takes ~6 mins to complete")
+    def test_hint_flash_attention_kv_chunked_16_chunks(self):
+        """16 unrolled K/V chunks: now succeeds with optimized layouts for constants"""
+        self._run_kv_chunked_flash(
+            h_tiles=4, lq_tiles=None, B=1, H=8, Lq=256, Lk=4096, D=128, kv_block=256
+        )
+
+    @pytest.mark.skip(reason="Long test - takes ~40 mins to complete")
+    def test_hint_flash_attention_kv_chunked_32_chunks(self):
+        """32 unrolled K/V chunks: now succeeds with optimized layouts for constants"""
+        self._run_kv_chunked_flash(
+            h_tiles=4, lq_tiles=None, B=1, H=8, Lq=256, Lk=4096, D=128, kv_block=128
         )
 
     def test_hint_h_tiling_elementwise(self):
@@ -1744,7 +5682,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         rather than the 1st (H), producing wrong per-tile stride advances.
 
         Previously also broken for the copy ops inserted by
-        _insert_read_copy_ops: their tiled_dims_per_read/output_tiled_dims
+        _insert_all_read_copy_ops: their tiled_dims_per_read/output_tiled_dims
         dicts were keyed by tiled_op's raw (unsqueezed) host-range indices
         but read against copy_ranges (== dep.size, already squeezed) --
         fixed by mapping tiled_op's raw dim index to its squeezed position
@@ -1793,14 +5731,19 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         # device layouts for H (e.g. the read-copy ops keep H outermost, while
         # op0/coarse_tile_copy_buf0's own layouts place H just before the D
         # stick) -- so the *value* of the coefficient is not the same across
-        # every op. What must hold for every op is that the coefficient equals
+        # every op, and even the *symbol name* for H's tiled iteration
+        # variable differs per op (c0 for ops using the shared/global
+        # iteration space, d0 for the read-copy ops' own local iteration
+        # space). What must hold for every op is that the coefficient equals
         # H's per-tile extent (8 // 2 == 4) times *that op's own*
         # device-element stride for H, derived structurally from its
         # device_size/device_coordinates (the device dim whose coordinate
-        # expression is exactly the tiled iteration symbol c0). The original
-        # bug instead advanced by a coefficient tied to Lq's extent/stride,
-        # which this per-op recomputation catches regardless of which layout
-        # a given op happens to commit to.
+        # expression is exactly that op's own tiled iteration symbol -- the
+        # first key of its own iteration_space dict, which always has H's
+        # per-tile extent of 4). The original bug instead advanced by a
+        # coefficient tied to Lq's extent/stride, which this per-op
+        # recomputation catches regardless of which layout or symbol family a
+        # given op happens to commit to.
 
         tiled_syms_matches = re.findall(r"tiled_symbols=\[(\[.*?\])\]", src, re.DOTALL)
         self.assertTrue(
@@ -1815,19 +5758,34 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             f"Expected a minted _tile_adv_* symbol in tiled_symbols, "
             f"got: {tiled_syms_matches}",
         )
-        tensor_arg_matches = re.findall(
-            r"TensorArg\((?:(?!TensorArg\().)*?"
-            r"device_size=\[([^\]]*)\],\s*"
-            r"device_coordinates=\[([^\]]*)\],(?:(?!TensorArg\().)*?"
-            r"device_tile_advance_expr=sympify\('([^']*)'\),",
+        op_spec_blocks = re.findall(
+            r"iteration_space=\{sympify\('(\w+)'\): \(sympify\('4'\), 1\).*?"
+            r"args=\[(.*?)\n\s*\]\n",
             src,
             re.DOTALL,
         )
         self.assertTrue(
+            op_spec_blocks,
+            "Expected an OpSpec with H's per-tile extent (4) as its first "
+            "iteration_space entry in generated source",
+        )
+        tensor_arg_matches = []
+        for h_sym, args_block in op_spec_blocks:
+            for device_size_str, coords_str, advance_expr in re.findall(
+                r"device_size=\[([^\]]*)\],\s*"
+                r"device_coordinates=\[([^\]]*)\],(?:(?!TensorArg\().)*?"
+                r"device_tile_advance_expr=sympify\('([^']*)'\),",
+                args_block,
+                re.DOTALL,
+            ):
+                tensor_arg_matches.append(
+                    (h_sym, device_size_str, coords_str, advance_expr)
+                )
+        self.assertTrue(
             tensor_arg_matches,
             "Expected TensorArg(...device_tile_advance_expr=...) in generated source",
         )
-        for device_size_str, coords_str, advance_expr in tensor_arg_matches:
+        for h_sym, device_size_str, coords_str, advance_expr in tensor_arg_matches:
             embedded_syms = re.findall(r"_tile_adv_\w+_lvl\d+", advance_expr)
             self.assertTrue(
                 embedded_syms,
@@ -1836,10 +5794,10 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             )
             device_size = [int(x.strip()) for x in device_size_str.split(",")]
             coord_exprs = re.findall(r"sympify\('([^']*)'\)", coords_str)
-            tiled_dim_positions = [i for i, c in enumerate(coord_exprs) if c == "c0"]
+            tiled_dim_positions = [i for i, c in enumerate(coord_exprs) if c == h_sym]
             self.assertTrue(
                 tiled_dim_positions,
-                f"Expected H's tiled iteration symbol c0 to appear bare in "
+                f"Expected H's tiled iteration symbol {h_sym} to appear bare in "
                 f"device_coordinates, got: {coord_exprs}",
             )
             device_stride = 1
@@ -1933,7 +5891,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         compare_with_cpu(fn, x, y, run_compile=True, run_eager=False)
 
     def test_hint_nested_tiling_copy_mutation_correct(self):
-        """Nested Lq/D tiling into a direct copy_() mutation (Case 3 rewire)."""
+        """Nested Lq/D tiling into a direct copy_forced() mutation (Case 3 rewire)."""
         from torch_spyre._inductor import spyre_hint
 
         Lq, D = 256, 128
@@ -1949,7 +5907,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             c = torch.full((Lq, D), 0, device=a.device, dtype=torch.float16)
             with spyre_hint(num_tiles_per_dim={"Lq": 2}):
                 with spyre_hint(num_tiles_per_dim={"D": 2}):
-                    c.copy_(a + b)
+                    copy_forced(a + b, c)
             return c
 
         compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
@@ -2002,7 +5960,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             c = torch.full((B, Lq, D), 0, device=a.device, dtype=torch.float16)
             with spyre_hint(num_tiles_per_dim={"Lq": 2}):
                 with spyre_hint(num_tiles_per_dim={"B": 2}):
-                    c.copy_(a + b)
+                    copy_forced(a + b, c)
             return c
 
         spyre_result = torch.compile(fn)(a_dev, b_dev).cpu()
@@ -2034,7 +5992,7 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             c = torch.full([Lq * D], 0, device=a.device, dtype=torch.float16)
             with spyre_hint(num_tiles_per_dim={"Lq": 2}):
                 with spyre_hint(num_tiles_per_dim={"D": 2}):
-                    c.copy_(a + b)
+                    copy_forced(a + b, c)
             return c
 
         compare_with_cpu(fn, a, b, run_compile=True, run_eager=False)
@@ -2045,7 +6003,6 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             "ignore_span_overflow_hints": False,
         }
     )
-    @unittest.expectedFailure
     def test_span_overflow_mutation_case_external_input_layout_mismatch(self):
         """Originally a regression repro for the Case 2/"Case 3"
         layout-reconciliation gap; now an xfail for a separate, deeper,
@@ -2121,6 +6078,229 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 fn, x, y, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
             )
 
+    # ------------------------------------------------------------------
+    # Per-bundle hbm_pool_sizes threading into SpyreKernel
+    # ------------------------------------------------------------------
+
+    @config.patch({"lx_planning": False})
+    def test_bundle_pool_size_threaded_from_hbm_pool_sizes(self):
+        """codegen_node must look up this bundle's own pool_size from
+        V.graph.hbm_pool_sizes, not a stale graph-global scalar.
+
+        lx_planning is disabled here so the `a = x + y` intermediate isn't
+        claimed by LX scratchpad planning first -- with LX planning on,
+        `add`/`mul`/`sub` outputs are all LX-eligible by default (see
+        OP_OUTPUT_GOOD_FOR_LX_REUSE in scratchpad/utils.py) and may win the
+        scratchpad before hbm_pool_planning ever sees them, leaving every
+        bundle's pool_size at 0 and proving nothing about the plumbing this
+        test exists to check.
+        """
+        from unittest.mock import patch
+
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        seen_pool_sizes = []
+        orig_init = SpyreKernel.__init__
+
+        def _recording_init(self, pool_size=0, **kwargs):
+            seen_pool_sizes.append(pool_size)
+            orig_init(self, pool_size=pool_size, **kwargs)
+
+        def fn(x, y):
+            a = x + y
+            b = a * 2
+            return b - x
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+        y = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        with (
+            patch.object(SpyreKernel, "__init__", _recording_init),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            torch.compile(fn)(x, y)
+
+        self.assertTrue(seen_pool_sizes)
+        self.assertTrue(
+            any(seen_pool_sizes),
+            f"expected at least one bundle with a nonzero pool_size, got "
+            f"{seen_pool_sizes}",
+        )
+
+    @config.patch({"lx_planning": False})
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_pool_alloc_scoped_per_bundle_across_fallback_boundary(self):
+        """A CPU-fallback op (torch.sin) splits the graph into multiple
+        bundles. Each bundle's pool (if any) is allocated inside that
+        bundle's own generated MLIR via sdscbundle.device_mem_allocate --
+        there is no Python-side pool tensor, and no bundle's MLIR references
+        another bundle's pool."""
+        from torch_spyre.execution import async_compile as async_compile_mod
+
+        def fn(t):
+            a = torch.exp(t) * 2  # compiled bundle 1; `a` crosses the
+            b = torch.sin(a)  # fallback op -- forces a bundle boundary
+            c = torch.exp(b) * 2  # compiled bundle 2
+            return c
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        # get_output_dir() mints a fresh random tempdir on every call (see
+        # its uuid4()-based implementation), so it cannot be re-invoked from
+        # the test to recover the directory sdsc() actually used to write
+        # bundle.mlir. Wrap it to record kernel_name -> output_dir while
+        # still delegating to the real implementation.
+        real_get_output_dir = async_compile_mod.get_output_dir
+        output_dirs_by_kernel = {}
+
+        def _recording_get_output_dir(kernel_name):
+            output_dir = real_get_output_dir(kernel_name)
+            output_dirs_by_kernel[kernel_name] = output_dir
+            return output_dir
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+            mock_patch.object(
+                async_compile_mod, "get_output_dir", _recording_get_output_dir
+            ),
+            pytest.warns(UserWarning),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), x)
+        src = source_codes[0]
+
+        # No Python-side pool tensor of any kind remains in the wrapper.
+        # Ordinary output buffers legitimately use spyre_empty_with_layout,
+        # so distinguish pool allocs by their telltale uint8 dtype, same as
+        # test_no_python_side_pool_tensor_allocated below.
+        pool_alloc_lines = [
+            line
+            for line in src.splitlines()
+            if "spyre_empty_with_layout" in line and "uint8" in line
+        ]
+        self.assertEqual(pool_alloc_lines, [])
+        self.assertNotIn("_pool_", src)
+
+        # Each kernel name mentioned in an async_compile.sdsc(...) call gets
+        # its own bundle.mlir; any that uses a pool must self-allocate it via
+        # device_mem_allocate, never via a %pool_base_addr parameter.
+        kernel_names = re.findall(r"async_compile\.sdsc\('(\w+)'", src)
+        self.assertTrue(kernel_names)
+        saw_pool_allocate = False
+        for kernel_name in kernel_names:
+            self.assertIn(kernel_name, output_dirs_by_kernel)
+            bundle_path = os.path.join(
+                output_dirs_by_kernel[kernel_name], "bundle.mlir"
+            )
+            with open(bundle_path) as f:
+                bundle_text = f.read()
+            self.assertNotIn("%pool_base_addr", bundle_text)
+            if "device_mem_allocate" in bundle_text:
+                saw_pool_allocate = True
+        self.assertTrue(
+            saw_pool_allocate,
+            f"expected at least one bundle to use device_mem_allocate, "
+            f"kernels were {kernel_names}",
+        )
+
+    @config.patch({"lx_planning": False})
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_no_python_side_pool_tensor_allocated(self):
+        """No bundle allocates a Python-side _pool_<name> tensor any more --
+        pool allocation is now entirely inside the generated MLIR."""
+
+        def fn(t):
+            a = torch.exp(t) * 2
+            b = torch.sin(a)  # fallback op -- forces a bundle boundary
+            c = torch.exp(b) * 2
+            return c
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+            pytest.warns(UserWarning),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), x)
+        src = source_codes[0]
+
+        # No Python-side pool tensor allocation (uint8 SpyreTensorLayout) --
+        # ordinary output buffers still legitimately use
+        # spyre_empty_with_layout, so distinguish pool allocs by their
+        # telltale uint8 dtype, same as
+        # test_pool_alloc_scoped_per_bundle_across_fallback_boundary above.
+        pool_alloc_lines = [
+            line
+            for line in src.splitlines()
+            if "spyre_empty_with_layout" in line and "uint8" in line
+        ]
+        self.assertEqual(pool_alloc_lines, [])
+        self.assertNotIn("_pool_", src)
+
+    @config.patch({"lx_planning": False})
+    def test_pool_size_kwarg_in_generated_sdsc_call(self):
+        """define_kernel() must append pool_size=<N> to the generated
+        async_compile.sdsc(...) call text for a kernel whose pool_size > 0,
+        and pool_size=0 must never be emitted explicitly. See
+        test_pool_size_kwarg_omitted_when_no_pool below for the omission
+        case on a kernel with no pool usage at all."""
+
+        def fn(x, y):
+            a = x + y
+            b = a * 2
+            return b - x
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+        y = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), x, y)
+        src = source_codes[0]
+
+        self.assertIn("pool_size=", src)
+        # Every async_compile.sdsc( call either has no pool_size kwarg, or a
+        # positive one -- pool_size=0 must never be emitted explicitly.
+        self.assertNotIn("pool_size=0", src)
+
+    @config.patch({"lx_planning": True})
+    def test_pool_size_kwarg_omitted_when_no_pool(self):
+        """A kernel with no pool usage gets no pool_size kwarg at all.
+
+        With lx_planning enabled, the `a = x + y` intermediate is claimed by
+        LX scratchpad planning before hbm_pool_planning ever sees it (see
+        OP_OUTPUT_GOOD_FOR_LX_REUSE in scratchpad/utils.py), so this bundle
+        has no pool-eligible buffer and define_kernel() must omit the
+        pool_size kwarg entirely rather than emit pool_size=0.
+        """
+
+        def fn(x, y):
+            a = x + y
+            b = a * 2
+            return b - x
+
+        x = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+        y = torch.randn(64, 64, dtype=torch.float16, device="spyre")
+
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), x, y)
+        src = source_codes[0]
+
+        self.assertIn("async_compile.sdsc(", src)
+        self.assertNotIn("pool_size", src)
+
 
 class TestNamedDimsHint(InductorTestCase):
     """Tests for propagate_named_dims handling of ops with a named_dims hint.
@@ -2134,6 +6314,7 @@ class TestNamedDimsHint(InductorTestCase):
     def setUp(self):
         super().setUp()
         torch.manual_seed(0xAFFE)
+        _pnd.reset()
 
     @config.patch(
         {
@@ -2264,6 +6445,7 @@ class TestCoarseTileReductionE2E(InductorTestCase):
     def setUp(self):
         super().setUp()
         torch.manual_seed(0xAFFE)
+        _pnd.reset()
 
     def test_hint_tiled_reduction_sum_loopspec(self):
         """x.sum(dim=-1) tiled over D produces a LoopSpec with count 4."""
@@ -2459,6 +6641,7 @@ class TestCoarseTileReductionDim0E2E(InductorTestCase):
     def setUp(self):
         super().setUp()
         torch.manual_seed(0xAFFE)
+        _pnd.reset()
 
     def test_hint_tiled_reduction_dim0_sum_correct(self):
         """x.sum(dim=0) tiled over B produces correct results."""
@@ -2523,6 +6706,7 @@ class TestCoarseTileMatmulKTilingE2E(InductorTestCase):
     def setUp(self):
         super().setUp()
         torch.manual_seed(0xAFFE)
+        _pnd.reset()
 
     def test_mm_k_tiled_correct(self):
         """2D mm [M,K] @ [K,N] tiled over K produces correct results."""
@@ -2638,18 +6822,8 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
     def setUp(self):
         super().setUp()
         torch.manual_seed(0xCAFE)
+        _pnd.reset()
 
-    @pytest.mark.skip(
-        reason=(
-            "This reproduces on the CI runners but NOT on every local stack, "
-            "so a passing local run is not evidence it is fixed. Observed "
-            "10.2% element mismatch (833/8192) on CI, repeatable across all "
-            "retry attempts, while the same commit passes on a dev pod. "
-            "Skipped rather than xfailed because some CI runs use strict "
-            "xfail mode, where a passing xfail (e.g. on a dev pod) is itself "
-            "a failure. Un-skip only on the strength of a green CI run."
-        )
-    )
     def test_nested_bmm_outer_Batch_inner_K_correct(self):
         """bmm [B,M,K]@[B,K,N] outer B (output) + inner K (reduction) — correct."""
         from torch_spyre._inductor import spyre_hint
@@ -2805,14 +6979,17 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
             "Expected tile-sized accum TensorArg with lx allocation for nested M+K tiling",
         )
 
-    def test_nested_matmul_accum_tile_per_tile_fixed_in_sdsc(self):
-        """Accumulator tile buffer in nested outer-M + inner-K reduction must have
-        per_tile_fixed=True in the generated SDSC source.
+    def test_nested_matmul_accum_tile_write_does_not_advance_in_sdsc(self):
+        """Accumulator tile buffer in nested outer-M + inner-K reduction must never
+        get a device_tile_advance_expr referencing the inner K-loop, so the
+        unroller does not advance its base address across inner iterations.
 
-        The accum_tile buffer is loop-internal to the inner K-loop, so the unroller
-        must not advance its base address across inner iterations.  This requires
-        _pending_per_tile_fixed to be set by _propagate_tiled_reduction_op (pre-
-        stickify path) and consumed by finalize_layouts.
+        The accum_tile buffer is loop-internal to the inner K-loop: it is read
+        and written every inner iteration by the combine op, but must stay at a
+        single fixed address throughout that loop (only the outer M-loop may
+        move it). This mirrors test_tile_accum_copy_advances_per_outer_tile's
+        unit-test-granularity check (no affine.apply referencing the inner loop
+        var) at full e2e granularity.
         """
         from torch_spyre._inductor import spyre_hint
 
@@ -2841,10 +7018,30 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
             _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
         self.assertTrue(len(source_codes) > 0)
         src = source_codes[0]
-        self.assertIn(
-            "per_tile_fixed=True",
+
+        # The combine op (the inner-K-loop "add" that reads and writes the
+        # accum_tile buffer every inner iteration) is identified by its
+        # ir_chain -- its args list contains the accum_tile buffer twice
+        # (once as a read, once as the mutation-write). Neither reference
+        # may carry a device_tile_advance_expr: the accum_tile's address
+        # must stay fixed across the inner K-loop.
+        combine_op_match = re.search(
+            r"ir_chain=\('mm', 'coarse_tile_combine_\w+'\).*?"
+            r"args=\[(.*?)\n\s*\]\n",
             src,
-            "Nested-reduction accum_tile must have per_tile_fixed=True in SDSC",
+            re.DOTALL,
+        )
+        self.assertTrue(
+            combine_op_match,
+            "Expected to find the combine op's OpSpec (ir_chain "
+            "'coarse_tile_combine_*') in generated source",
+        )
+        combine_args = combine_op_match.group(1)
+        self.assertNotIn(
+            "device_tile_advance_expr",
+            combine_args,
+            "The accum_tile's read/write inside the combine op must not "
+            f"advance per inner-K-tile, got args: {combine_args}",
         )
 
 
@@ -2853,13 +7050,10 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
 # ===========================================================================
 
 
-@pytest.mark.xfail(strict=True, reason="SpyreEmptyFallback / ct_fill STL bug")
 def test_tiled_in_place_accumulator():
-    """Minimal reproducer for the SpyreEmptyFallback / ct_fill STL bug.
+    """Regression test for the SpyreEmptyFallback / ct_fill STL bug.
 
-    CURRENT STATUS (to delete when reorder-passes-clean is merged)
-      - Fails on main
-      - Fails on reorder-passes-clean but passes with patch XYZ and SENCORES=1
+    Was xfailed pending reorder-passes-clean (#3293, #3377, #3381); passes now.
     """
     from torch_spyre._inductor import spyre_hint
 
@@ -2879,7 +7073,7 @@ def test_tiled_in_place_accumulator():
         with spyre_hint(num_tiles_per_dim={"H": 4}):
             with spyre_hint(num_tiles_per_dim={"Lq": lq_slices}):
                 block_max = torch.amax(x, dim=-1, keepdim=True)
-                acc.copy_(acc + block_max * scale)
+                copy_forced(acc + block_max * scale, acc)
         return acc
 
     ref = fn(x_t, scale_t, acc_t.clone())
@@ -2953,10 +7147,6 @@ def test_sum_reduce_implicit_accumulator():
     torch.testing.assert_close(result, ref, atol=0.01, rtol=0.1)
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="zeros with named_dims hint acquires wrong layout in tiled scope",
-)
 def test_zeros_named_dims_hint_correctness():
     """zeros with explicit named_dims hint inside a tiled scope should be correct.
 

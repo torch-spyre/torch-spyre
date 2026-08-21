@@ -130,15 +130,11 @@ def _(
 
 @torch.library.custom_op("spyre::topkvalue", mutates_args=(), device_types="spyre")
 def topkvalue(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
-    if len(x.size()) != 2:
-        raise Unsupported("topk only implemented for 2-D tensors")
     pass
 
 
 @topkvalue.register_fake
 def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
-    if len(x.size()) != 2:
-        raise Unsupported("topk only implemented for 2-D tensors")
     norm_dim = dim % len(x.size())
     out_size = list(x.size())
     out_size[norm_dim] = k
@@ -147,19 +143,17 @@ def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
 
 @torch.library.custom_op("spyre::topkindex", mutates_args=(), device_types="spyre")
 def topkindex(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
-    if len(x.size()) != 2:
-        raise Unsupported("topk only implemented for 2-D tensors")
     pass
 
 
 @topkindex.register_fake
 def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
-    if len(x.size()) != 2:
-        raise Unsupported("topk only implemented for 2-D tensors")
     norm_dim = dim % len(x.size())
     out_size = list(x.size())
     out_size[norm_dim] = k
-    return x.new_empty(out_size, dtype=torch.int64)
+    # Index materializes in the input dtype, not int64: a float that lies it
+    # is an index. Matches lower_topkindex (dst_dtype = x.get_dtype()).
+    return x.new_empty(out_size, dtype=x.dtype)
 
 
 @torch.library.custom_op("spyre::gelu", mutates_args=(), device_types="spyre")
@@ -240,7 +234,16 @@ def _(input: torch.Tensor):
 @torch.library.custom_op(
     "spyre::copy_from_d2d", mutates_args=("dst",), device_types="spyre"
 )
-@compile_once("spyre.copy_from_d2d")
+# dynamic=False: dynamo's auto-dynamic promotes a SIZE to a symbol after the
+# second distinct value, exactly as it does for ints (fought off below with
+# specialize_int) -- and the Spyre lowering then silently bakes ONE concrete
+# extent into the SDSC while dynamo reuses the "dynamic" graph for every later
+# size. A d2d copy of a prefix view then writes the baked extent, not the
+# view's (#3826: overran dst and corrupted attention write-back downstream).
+# Static per-shape traces are the codebase's standing pattern -- every other
+# compile_once site already passes dynamic=False -- and cache_size_limit is
+# bumped to 1024 for precisely this one-binary-per-variant regime.
+@compile_once("spyre.copy_from_d2d", dynamic=False)
 def copy_from_d2d(
     src: torch.Tensor,
     dst: torch.Tensor,
@@ -281,46 +284,48 @@ def _(
     pass
 
 
-# Copy src into dst in-place (the mutating primitive).
-# No @compile_once needed: the body calls aten::copy_ which dispatches
-# through spyre__copy_from → copy_from_d2d / copy_tensor — no cycle back
-# to spyre::copy_ itself.
-@torch.library.custom_op("spyre::copy_", mutates_args=("dst",), device_types="spyre")
-def copy_(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    dst.copy_(src)
-    return dst
-
-
-@copy_.register_fake
-def _(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    return dst
-
-
-@torch.library.register_kernel("spyre::copy_", ["cpu"])
-def copy__cpu(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    dst.copy_(src)
-    return dst
-
-
-# Functional (out-of-place) wrapper for spyre::copy_.
-# Returns a new tensor equal to dst with src written into it.
-# The graph sees a pure value-producing node; Inductor's reinplacer will
-# rewrite copy_f → copy_ (in-place) wherever it is safe to do so.
-@torch.library.custom_op("spyre::copy_f", mutates_args=(), device_types="spyre")
-def copy_f(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    result = dst.clone()
-    torch.ops.spyre.copy_(src, result)
-    return result
-
-
-@copy_f.register_fake
-def _(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    return dst.clone()
-
-
-inplaceable_ops[torch.ops.spyre.copy_f.default] = InplaceableOp(
-    torch.ops.spyre.copy_.default, 1
+# Copy src into dst in-place, guaranteed to survive Inductor's
+# remove_noop_ops pass (unlike aten.copy_, this op is not in
+# noop_registry). Use this to guarantee a copy survives to the coarse
+# tile validator.
+@torch.library.custom_op(
+    "spyre::copy_forced", mutates_args=("dst",), device_types="spyre"
 )
+def copy_forced(src: torch.Tensor, dst: torch.Tensor) -> None:
+    dst.copy_(src)
+
+
+@copy_forced.register_fake
+def _(src: torch.Tensor, dst: torch.Tensor) -> None:
+    pass
+
+
+@torch.library.register_kernel("spyre::copy_forced", ["cpu"])
+def copy_forced_cpu(src: torch.Tensor, dst: torch.Tensor) -> None:
+    dst.copy_(src)
+
+
+# Purely functional at trace time (mutates_args=()) so aot_autograd's
+# assert_functional_graph never sees a mutation. The real write into acc is
+# introduced later by lower_spyre_opaque_copy_ at Inductor lowering time,
+# which builds a MutationLayoutSHOULDREMOVE(acc) buffer identical to the one
+# copy_forced's lowering builds. Callers must reassign:
+# acc = opaque_copy_(value, acc). Use this instead of copy_forced where
+# AOTAutograd functionalization would otherwise reject the mutation (e.g.
+# inside a decomposition traced by torch.compile).
+@torch.library.custom_op("spyre::opaque_copy_", mutates_args=(), device_types="spyre")
+def opaque_copy_(value: torch.Tensor, acc: torch.Tensor) -> torch.Tensor:
+    return value.clone()
+
+
+@opaque_copy_.register_fake
+def _(value: torch.Tensor, acc: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(value)
+
+
+@torch.library.register_kernel("spyre::opaque_copy_", ["cpu"])
+def opaque_copy__cpu(value: torch.Tensor, acc: torch.Tensor) -> torch.Tensor:
+    return value.clone()
 
 
 # Copy input into output starting at offsets along dimensions dims and
@@ -328,7 +333,10 @@ inplaceable_ops[torch.ops.spyre.copy_f.default] = InplaceableOp(
 @torch.library.custom_op(
     "spyre::overwrite", mutates_args=("output",), device_types="spyre"
 )
-@compile_once("spyre.overwrite")
+# dynamic=False for the same reason as copy_from_d2d above (#3826): a varying
+# input size must trigger a fresh static trace, never an auto-dynamic graph
+# whose frozen extent scatters the wrong number of elements.
+@compile_once("spyre.overwrite", dynamic=False)
 def overwrite(
     input: torch.Tensor,
     output: torch.Tensor,
@@ -592,6 +600,74 @@ def _(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return x.new_empty(output_shape)
 
 
+@torch.library.custom_op("spyre::conv2d", mutates_args=(), device_types="spyre")
+def spyre_conv2d(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    groups: int,
+) -> torch.Tensor:  # type: ignore[empty-body]
+    pass
+
+
+@spyre_conv2d.register_fake
+def _(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    groups: int,
+) -> torch.Tensor:
+    # Compute output shape: (N, C_out, H_out, W_out)
+    N, C_in, H_in, W_in = input.shape
+    C_out, C_in_g, kH, kW = weight.shape
+
+    H_out = (H_in + 2 * padding[0] - dilation[0] * (kH - 1) - 1) // stride[0] + 1
+    W_out = (W_in + 2 * padding[1] - dilation[1] * (kW - 1) - 1) // stride[1] + 1
+
+    output_shape = [N, C_out, H_out, W_out]
+    return input.new_empty(output_shape)
+
+
+@torch.library.custom_op(
+    "spyre::conv2d_with_bias", mutates_args=(), device_types="spyre"
+)
+def spyre_conv2d_with_bias(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    groups: int,
+) -> torch.Tensor:  # type: ignore[empty-body]
+    pass
+
+
+@spyre_conv2d_with_bias.register_fake
+def _(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    groups: int,
+) -> torch.Tensor:
+    # Compute output shape: (N, C_out, H_out, W_out)
+    N, C_in, H_in, W_in = input.shape
+    C_out, C_in_g, kH, kW = weight.shape
+
+    H_out = (H_in + 2 * padding[0] - dilation[0] * (kH - 1) - 1) // stride[0] + 1
+    W_out = (W_in + 2 * padding[1] - dilation[1] * (kW - 1) - 1) // stride[1] + 1
+
+    output_shape = [N, C_out, H_out, W_out]
+    return input.new_empty(output_shape)
+
+
 @torch.library.custom_op("spyre::constant", mutates_args=(), device_types="spyre")
 def spyre_constant(
     fill_value: torch.types.Number, dtype: torch.dtype, device: torch.device
@@ -716,6 +792,55 @@ def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return torch.empty(input.size(), dtype=torch.float16, device=input.device)
 
 
+@torch.library.custom_op("spyre::scaled_mm", mutates_args=(), device_types="spyre")
+def scaled_mm(
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+) -> torch.Tensor:  # type: ignore[empty-body]
+    """
+    Raw FP8 matrix multiplication, with no scaling or bias applied.
+
+    Scaling (scale_a, scale_b) and bias are intentionally NOT applied here -
+    they're applied afterward at the decomposition level by scaled_mm_decomp,
+    mirroring how dequantize_fp8_with_scale keeps its FP8->FP16 conversion
+    separate from the subsequent scale multiply.
+    """
+    pass
+
+
+@scaled_mm.register_fake
+def _(
+    mat1: torch.Tensor, mat2: torch.Tensor, out_dtype: torch.dtype = None
+) -> torch.Tensor:
+    output_shape = [mat1.shape[0], mat2.shape[-1]]
+    return mat1.new_empty(output_shape, dtype=out_dtype or torch.float16)
+
+
+@torch.library.custom_op(
+    "spyre::quantize_weight_fp8_with_scale", mutates_args=(), device_types="spyre"
+)
+def quantize_weight_fp8_with_scale(
+    input: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    pass
+
+
+@quantize_weight_fp8_with_scale.register_fake
+def _(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    # Output is FP8 with same shape as input
+    return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
+
+
+@torch.library.custom_op("spyre::qfp8wt", mutates_args=(), device_types="spyre")
+def qfp8wt(input: torch.Tensor) -> torch.Tensor:
+    pass
+
+
+@qfp8wt.register_fake
+def _(input: torch.Tensor) -> torch.Tensor:
+    # Output is FP8 with same shape as input
+    return torch.empty(input.size(), dtype=torch.float8_e4m3fn, device=input.device)
+
+
 @torch.library.custom_op("spyre::causal_mask", mutates_args=(), device_types="spyre")
 def causal_mask(
     seqlen_q: int,
@@ -753,6 +878,67 @@ def _(
     device: torch.device,
 ) -> torch.Tensor:
     return torch.empty(1, 1, seqlen_q, seqlen_kv, dtype=dtype, device=device)
+
+
+@torch.library.custom_op(
+    "spyre::stagger_to_standard_ea", mutates_args=(), device_types="spyre"
+)
+def stagger_to_standard_ea(x: torch.Tensor) -> torch.Tensor:
+    """Restore standard Element Arrangement (EA) from staggered EA.
+
+    The fp32todl16 conversion reorders elements when converting fp32 to fp16,
+    producing staggered EA in the output.  This op applies mm(x, P.t()) to
+    permute the last dimension back to standard EA so downstream ops see a
+    normal fp16 tensor.
+
+    The permutation matrix P encodes the hardware fp32→fp16 stagger pattern.
+    Each fp16 stick (64 elements) staggers independently:
+        stick_base = (phys // 64) * 64
+        local_phys = phys % 64
+        k, w = local_phys // 8, local_phys % 8
+        local_logical = k*4 + w            if w < 4
+                      = k*4 + (w-4) + 32   otherwise   (32 = fp16_stick // 2)
+        logical = stick_base + local_logical
+
+    ``half`` is always 32 (half of one fp16 stick), independent of N.
+    N = x.shape[-1] must be a multiple of 64.
+
+    P is built on CPU and transferred to the device.  It is determined solely
+    by N, so it is constant for a given tensor width and can be reused across
+    ops (lt, eq, etc.) that produce the same stagger pattern.
+
+    Input:  fp16 tensor with staggered EA, any shape [..., N]
+    Output: fp16 tensor with standard EA, same shape [..., N]
+    """
+    n = x.shape[-1]
+    device = x.device
+
+    # Build N×N permutation matrix on CPU, transfer to device.
+    # Each fp16 stick (64 elements) staggers independently with half=32.
+    FP16_STICK = 64
+    half = FP16_STICK // 2  # 32 — fixed, independent of n
+    P = torch.zeros(n, n, dtype=torch.float16, device="cpu")
+    for phys_j in range(n):
+        stick_base = (phys_j // FP16_STICK) * FP16_STICK
+        local_phys = phys_j % FP16_STICK
+        k, w = local_phys // 8, local_phys % 8
+        local_logical = k * 4 + w if w < 4 else k * 4 + (w - 4) + half
+        P[stick_base + local_logical, phys_j] = 1.0
+    P = P.to(device=device)
+
+    # Flatten all dims except the last into a single batch dim for mm,
+    # then restore the original shape.  This works for any rank >= 1:
+    # the stagger pattern only affects the last (stick) dimension, so
+    # flattening leading dims produces the correct row ordering for mm.
+    orig_shape = list(x.shape)
+    m = x.numel() // n
+    result = torch.mm(x.reshape(m, n), P.t()).reshape(orig_shape)
+    return result
+
+
+@stagger_to_standard_ea.register_fake
+def _(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
 
 
 @torch.library.custom_op("spyre::prod_dim_int", mutates_args=(), device_types="spyre")

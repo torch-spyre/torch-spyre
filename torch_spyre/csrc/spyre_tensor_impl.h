@@ -18,7 +18,7 @@
 
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
-#include <util/sendefs.h>
+#include <util/sendefs/sendefs.h>
 
 #include <functional>
 #include <optional>
@@ -50,6 +50,7 @@ enum class ElementArrangement {
                      // standard reductions)
   FP32_TO_DL16 = 4,  // non-sequential order produced by fp32->dl16 on-device
                      // conversions
+  QFP8WT = 5,        // 2D stick layout for FP8 weight tensors
 };
 
 inline std::string elementArrangementToString(ElementArrangement ea) {
@@ -60,6 +61,8 @@ inline std::string elementArrangementToString(ElementArrangement ea) {
       return "DL16_TO_FP32";
     case ElementArrangement::QFP8CH:
       return "QFP8CH";
+    case ElementArrangement::QFP8WT:
+      return "QFP8WT";
     case ElementArrangement::EXX2:
       return "EXX2";
     case ElementArrangement::FP32_TO_DL16:
