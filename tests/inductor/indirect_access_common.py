@@ -712,7 +712,14 @@ class IndirectAccessTestCase(InductorTestCase):
 
     # -- one driver: validate every stage, then run on the real backend ---
     def _stage_and_e2e(
-        self, kernel, *dev_args, expect, op=None, detected=None, expect_close=None
+        self,
+        kernel,
+        *dev_args,
+        expect,
+        op=None,
+        detected=None,
+        expect_close=None,
+        sdsc=True,
     ):
         """Validate every capture-path stage with check(), then run end-to-end.
 
@@ -722,9 +729,18 @@ class IndirectAccessTestCase(InductorTestCase):
         support lands. Pass expect_close=True for ops whose result must match
         the CPU reference (e.g. a supported direct op) once e2e is enabled.
 
+        `sdsc=False` skips assert_indirect_sdsc_fields (still classifies the
+        op spec + runs e2e). Needed for a bundle that is simultaneously a gather
+        AND a scatter -- e.g. index_add's gather+add+overwrite-scatter
+        decomposition -- where the scatter-only invariant "every indirect value
+        tensor is the output" does not hold (the gather's value tensor is an
+        input).
+
         Returns check()'s ScenarioResult for any further per-test assertions.
         """
-        r = self.check(kernel, *dev_args, expect=expect, op=op, detected=detected)
+        r = self.check(
+            kernel, *dev_args, expect=expect, op=op, detected=detected, sdsc=sdsc
+        )
         run_e2e(self, kernel, *dev_args, expect_close=expect_close)
         return r
 

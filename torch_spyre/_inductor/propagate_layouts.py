@@ -503,8 +503,12 @@ def _single_arg_op_layout(
             input_ea = stl.element_arrangement
 
             # Determine output EA based on conversion direction and input EA
-            if in_layout.dtype == torch.float16 and output.dtype == torch.float32:
-                # FP16 → FP32 conversion
+            if (
+                in_layout.dtype in (torch.float16, torch.bfloat16)
+                and output.dtype == torch.float32
+            ):
+                # FP16/BF16 → FP32 conversion. Both share SEN169_FP16 physical
+                # storage and the DL16TOFP32 hardware op.
                 if input_ea == ElementArrangement.STANDARD:
                     # Case 1: STANDARD → DL16_TO_FP32 (creates staggered layout)
                     fmt = ElementArrangement.DL16_TO_FP32
