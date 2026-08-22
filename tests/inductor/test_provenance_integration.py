@@ -76,7 +76,6 @@ def _assert_handles_survive_real_compile(monkeypatch, model, expect_rewrite):
     module, and (d) a fused handle carries that line among its constituents.
     """
     from torch_spyre.constants import DEVICE_NAME
-    import torch_spyre._inductor.insert_restickify as restickify
     import torch_spyre._inductor.pass_utils as pass_utils
     import torch_spyre._inductor.provenance as prov
     import torch_spyre._inductor.spyre_kernel as sk
@@ -107,7 +106,6 @@ def _assert_handles_survive_real_compile(monkeypatch, model, expect_rewrite):
     monkeypatch.setattr(prov, "build_debug_handle", _collect)
     monkeypatch.setattr(sk, "build_debug_handle", _collect)
     monkeypatch.setattr(pass_utils, "preserve_provenance", _preserve)
-    monkeypatch.setattr(restickify, "preserve_provenance", _preserve)
     monkeypatch.setattr(
         prov.SpyreGraphTransformObserver,
         "__enter__",

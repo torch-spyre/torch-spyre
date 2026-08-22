@@ -19,7 +19,9 @@ self._stage_and_e2e(...): it asserts across every capture-path stage --
 classification, op-spec structure (IndirectAccess on the output), and SDSC
 fields -- and then runs the kernel end-to-end on the real backend.
 
-All scatter scenarios run with SENCORES=1.
+The two forms that crash during compilation -- index_fill (rank-0 scalar
+Constant codegen) and masked_scatter (mask-based CPU fallback) -- stay
+capture-only via check(expect=CRASHED); there is no bundle to run end-to-end.
 
 """
 
@@ -27,6 +29,7 @@ import os
 import sys
 
 import torch
+from torch._inductor.utils import run_and_get_code
 
 sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
@@ -34,7 +37,7 @@ from indirect_access_common import (  # noqa: E402
     GATHER_OP_SPEC,
     SCATTER_OP_SPEC,
     DIRECT_OP_SPEC,
-    IndirectAccessTestCase,
+    register_multicore_variants,
 )
 
 from torch_spyre._C import (  # noqa: E402
@@ -42,12 +45,16 @@ from torch_spyre._C import (  # noqa: E402
     get_device_dtype,
     get_elem_in_stick,
 )
-from torch_spyre._inductor import config  # noqa: E402
 
 
-@config.patch({"sencores": 1})
-class TestScatter(IndirectAccessTestCase):
-    """torch scatter-family ops: one compile + all-stage checks per scenario."""
+class _ScatterScenarios:
+    """torch scatter-family ops: one compile + all-stage checks per scenario.
+
+    A plain mixin (not a TestCase, so it is not collected on its own). The
+    concrete, collectable classes ``TestScatter_cores{1,2,4,8,16,32}`` are
+    generated at the bottom of the module by ``register_multicore_variants``,
+    each pinned to its SENCORES value via ``@config.patch``.
+    """
 
     def _row_store(self, M=128, N=256, P=3, dtype=torch.int32):
         """Common row-store operands: out[M,N], src[P,N], 1-D idx[P], all named."""
@@ -1016,6 +1023,82 @@ class TestScatter(IndirectAccessTestCase):
             return torch.masked_scatter(inp, mask, src)
 
         self.check(kernel, inp, mask, src, expect=CRASHED)
+
+
+# Op-behaviour scenarios run once at the default 32 cores. They classify / lower
+# / run each op and do not depend on the core count, so sweeping them across every
+# SENCORES value added little coverage for a 7x test-count blowup.
+register_multicore_variants(_ScatterScenarios, "TestScatter", globals(), counts=(32,))
+
+
+class _ScatterMulticoreScenarios:
+    """Scatter scenarios whose BEHAVIOUR depends on the core count -- the
+    work-division split-map tests -- swept across SENCORES, unlike the
+    op-behaviour scenarios above (which run once at 32). See MULTICORE_SENCORES."""
+
+    # -- Work-division scenarios -----------------------------------------
+    # Swept across SENCORES, so each TestScatterMulticore_cores{N} variant
+    # checks the split map that N produces. The invariant for dest[i] = src: the
+    # planner must split the index-entry dim (c0) and never the destination data
+    # dim (c1 = K) -- splitting K makes every core write address 0 of the shared
+    # destination, silently returning wrong results. Shapes are chosen so the
+    # planner *would* prefer K if the guard were absent. assert_indexed_dim_split()
+    # reads the current SENCORES and expects c0 to split by
+    # min(SENCORES, index_size // 32) with c1 pinned at 1.
+    #
+    # After the split-map check each scenario runs through the shared
+    # _stage_and_e2e path (fresh inputs, since run_and_get_code has already
+    # executed the split-map compile and the overwrite-scatter mutates its
+    # destination) -- the same capture-path stage checks + e2e leg every other
+    # scatter scenario uses -- so the multicore split is also exercised
+    # end-to-end. (Skipped at sencores=1 by assert_indexed_dim_split -- nothing
+    # to divide.)
+
+    @staticmethod
+    def _scatter_fn(dst, s, idx):
+        dst[idx] = s
+        return dst
+
+    def test_work_division_entry_split_full(self):
+        """Entry dim has 32 sticks (Q=1024): it would split a full 32 ways, but
+        the indirect uint32 address cap (INDIRECT_ACCESS_MAX_CORES) holds it below
+        that, so at SENCORES=32 core_split rounds it down to 16-way while dest
+        K=64 stays unsplit. Verifies the split map and that the cap keeps a
+        full-scale entry off the 32-way path the backend rejects (a per-core
+        address past 4 GB overflows its uint32 UINT32_TO_16* encoding)."""
+
+        def make():
+            src = torch.rand(1024, 64, 1024, dtype=torch.float16).to("spyre")
+            dest = torch.zeros(128, 64, 1024, dtype=torch.float16).to("spyre")
+            i = (torch.arange(1024) % 128).int().to("spyre")
+            return dest, src, i
+
+        fn = self._scatter_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=1024, data_size=64)
+        self._stage_and_e2e(fn, *make(), expect=SCATTER_OP_SPEC)
+
+    def test_work_division_entry_split_capped(self):
+        """Entry dim has only 8 sticks (Q=256): when SENCORES exceeds 8 the split
+        caps at 8 and must never spill onto the forbidden dest K dim."""
+
+        def make():
+            src = torch.rand(256, 64, 256, dtype=torch.float16).to("spyre")
+            dest = torch.zeros(128, 64, 256, dtype=torch.float16).to("spyre")
+            i = (torch.arange(256) % 128).int().to("spyre")
+            return dest, src, i
+
+        fn = self._scatter_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=256, data_size=64)
+        self._stage_and_e2e(fn, *make(), expect=SCATTER_OP_SPEC)
+
+
+# Scenarios whose BEHAVIOUR varies with the core count -- the work-division
+# split-map tests -- are swept across all SENCORES values.
+register_multicore_variants(
+    _ScatterMulticoreScenarios, "TestScatterMulticore", globals()
+)
 
 
 if __name__ == "__main__":
