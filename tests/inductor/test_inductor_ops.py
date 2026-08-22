@@ -5396,7 +5396,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # Params are standard NCHW (x, weight[C_out,C_in,kH,kW], bias, stride);
         # the test builds the channel-last device tensors and toggles the flag.
         ("test_conv2d_direct", "test_conv2d_direct_base"): {
-            ## strides 2 and above have numerical errors when the images are 1-d, 
+            ## strides 2 and above have numerical errors when the images are 1-d,
             ## so xfailing related tests until the issue gets fixed
             "expect_fail": ["1x64x13x1_k3x1_s2", "1x64x17x1_k3x1_s2"],
             "param_sets": {
