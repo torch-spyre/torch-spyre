@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 import math
 from typing import Any, Callable, Self, Sequence, Tuple, Union
 from abc import ABC
+import itertools
 
 import torch
 import sympy
@@ -27,6 +28,7 @@ from torch._inductor.codegen.common import (
     Kernel,
 )
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ops_handler import DefaultHandler, StoreMode
 from torch._inductor.utils import IndentedBuffer, sympy_index_symbol, sympy_subs
 from torch._inductor.virtualized import V
@@ -57,9 +59,9 @@ from .pass_utils import (
     apply_splits_from_index_coeff,
     iteration_space,
     indirect_access_subs_from_kernel,
+    is_restickify_coords,
 )
 from .views import compute_coordinates, align_tensors, tiling_expr_to_device_expr
-from torch._inductor.dependencies import MemoryDep
 from .logging_utils import get_inductor_logger
 from .op_spec import (
     IndirectAccess,
@@ -862,7 +864,16 @@ class SpyreKernel(Kernel[CSEVariable]):
         work_division: dict[sympy.Symbol, int] = {}
         if hasattr(ir_node, "op_it_space_splits"):
             write_index = next(iter(self.current_node.read_writes.writes)).index
-            read_index = next(iter(self.current_node.read_writes.reads)).index
+            # Match the encoding in work_division.apply_splits: an indirect
+            # (gather) read carries data-dependent symbols whose coefficients are
+            # not a stable identity key, so prefer the first non-indirect read as
+            # the reduction-split reference index.
+            reads = self.current_node.read_writes.reads
+            read_dep = next(
+                (d for d in reads if isinstance(d, MemoryDep) and not d.is_indirect()),
+                next(iter(reads), None),
+            )
+            read_index = read_dep.index if read_dep is not None else write_index
             work_division = apply_splits_from_index_coeff(
                 ir_node.op_it_space_splits,
                 write_index,
@@ -1154,10 +1165,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 op_indirect_var_names = None
             in_coords = args[-2].device_coordinates
             out_coords = args[-1].device_coordinates
-            if all(e == 0 for e in in_coords) and not all(e == 0 for e in out_coords):
-                # Broadcast: scalar input expanding to non-scalar output.
-                op = IDENTITY_OP
-            elif in_coords[-1].free_symbols != out_coords[-1].free_symbols:
+            if is_restickify_coords(in_coords, out_coords):
                 op = RESTICKIFY_OP
             else:
                 op = IDENTITY_OP
@@ -1587,11 +1595,113 @@ def _remap_work_division(arg: TensorArg, work_division_remap) -> None:
     arg.work_division = TensorWorkDivision(new_splits, new_core_map)
 
 
+def _restickify_restore_elided_dim(op_spec) -> None:
+    """Restore a restickify's elided size-1 dim BEFORE align_tensors (in place).
+
+    A restickify swaps which host dim lands inside the 128-byte stick.  When the
+    dim on EITHER side of the swap has host size 1, upstream Inductor squeezes it
+    away and never emits a loop symbol for it, so exactly one operand's
+    within-stick (last) coordinate collapses to the constant ``0`` -- the
+    "elided" operand (the other, unaffected operand is "intact"). With no
+    iteration symbol the two operands disagree on which dim carries the stick and
+    the backend cannot build a dimension mapping.
+
+    align_tensors matches operands by shared symbol, so we restore the dim here,
+    just before align runs -- creating one fresh symbol ``new_sym`` shared by both
+    operands reduces the size-1 case to the ordinary N>=2 path where both carry a
+    within-stick symbol. Doing it later (e.g. at SDSC time, or in the scheduler's
+    ``mark_run``) is too late to affect the descriptor align has already built.
+    The two operands are rebuilt to share ``new_sym`` (64 = fp16 stick elements):
+
+    - ELIDED operand: its stick is rebuilt as
+      ``[floor(new_sym/64)] + real_dims + [Mod(new_sym, 64)]``.
+    - INTACT operand: ``new_sym`` binds to the outermost size-64 gap dim the
+      padding pass (``_pad_elided_dim``) prepended to cover the 64-plane sweep
+      (see the reuse site below).  ``new_sym`` has iteration RANGE 1, so it only
+      ever takes the value 0: SDSC codegen's back-gap mechanism absorbs the
+      size-64-vs-range-1 gap and it contributes no real stride to either operand.
+    """
+    assert len(op_spec.args) == 2, f"restickify op_spec has {len(op_spec.args)} args"
+    in_arg, out_arg = op_spec.args[0], op_spec.args[1]
+
+    def _stick_sym(arg):
+        syms = tuple(arg.device_coordinates[-1].free_symbols)
+        assert len(syms) <= 1, f"expected 0 or 1 free symbols, got {len(syms)}"
+        return syms[0] if syms else None
+
+    in_sym = _stick_sym(in_arg)
+    out_sym = _stick_sym(out_arg)
+    # Both-intact is the ordinary N>=2 case; nothing to restore.
+    if in_sym is not None and out_sym is not None:
+        return
+    # Both-elided would mean neither operand's within-stick coord carries a
+    # free symbol, contradicting is_restickify_coords's own free-symbol-mismatch test.
+    assert not (in_sym is None and out_sym is None), "both operands elided"
+
+    stick_size = in_arg.device_dtype.elems_per_stick()
+
+    def _restore(new_sym, elided_arg, intact_arg) -> None:
+        # Rebuild the elided stick as [floor(new_sym/64)] + reals + [Mod(new_sym, 64)].
+        elided_coords = list(elided_arg.device_coordinates)
+        elided_size = list(elided_arg.device_size)
+        real_coords, real_sizes = [], []
+        for i in range(len(elided_coords) - 1):  # exclude within-stick
+            if elided_coords[i].free_symbols:
+                real_coords.append(elided_coords[i])
+                real_sizes.append(elided_size[i])
+        new_elided_coords = (
+            [sympy.floor(new_sym / stick_size)]
+            + real_coords
+            + [sympy.Mod(new_sym, stick_size)]
+        )
+        new_elided_size = [1] + real_sizes + [stick_size]
+
+        # Bind new_sym to the size-64 dim _pad_elided_dim prepended, so the
+        # descriptor's total size matches the grown allocation. The grow always
+        # targets the intact operand, so that dim is present here: outermost
+        # size-64 with coordinate 0 (asserted before we overwrite it).
+        intact_coords = list(intact_arg.device_coordinates)
+        intact_size = list(intact_arg.device_size)
+        assert intact_size[0] == stick_size and intact_coords[0] == 0, (
+            f"restickify restore: expected padding-prepended size-{stick_size} "
+            f"gap dim on the intact operand, got size={intact_size[0]} "
+            f"coord={intact_coords[0]}"
+        )
+        intact_coords[0] = new_sym
+
+        # Range 1, not 64: new_sym only ever takes value 0, so it contributes
+        # no real stride and the size-64 device slot is just back-gap padding.
+        op_spec.iteration_space = {new_sym: (stick_size, 1), **op_spec.iteration_space}
+        elided_arg.device_coordinates = new_elided_coords
+        elided_arg.device_size = new_elided_size
+        intact_arg.device_coordinates = intact_coords
+        intact_arg.device_size = intact_size
+
+    # Pick an unused name; new_sym is shared by both operands below so align
+    # matches them as the same iteration var.
+    used = set(op_spec.iteration_space.keys())
+    for idx in itertools.count():
+        new_sym = sympy.Symbol(f"rs{idx}")
+        if new_sym not in used:
+            break
+
+    if in_sym is None:
+        _restore(new_sym, in_arg, out_arg)
+    else:
+        # out_sym is None
+        _restore(new_sym, out_arg, in_arg)
+
+
 def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
     # Both parameters must be provided together for gather kernels — indirect_sizes
     # decomposes symbols in align_tensors; indirect_access_subs replaces them with IndirectAccess.
-    it_space = op_spec.iteration_space
 
+    if op_spec.op == RESTICKIFY_OP:
+        # Restore a restickify's elided size-1 stick, creating a shared iteration
+        # symbol on both operands, so align_tensors matches them by that symbol.
+        _restickify_restore_elided_dim(op_spec)
+
+    it_space = op_spec.iteration_space
     new_op_space_splits, new_tensors, work_division_remap = align_tensors(
         it_space,
         [

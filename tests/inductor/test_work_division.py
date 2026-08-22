@@ -37,7 +37,7 @@ from torch_spyre._inductor.work_division_constraints import (
     collect_work_division_constraints,
     conv_spatial_blocked_vars,
     coordinate_mask_blocked_vars,
-    indirect_access_pinned_vars,
+    indirect_access_constraints,
     qfp8wt_matmul_k_pinned,
     qfp8wt_pinned_vars,
 )
@@ -349,7 +349,7 @@ class TestCollectWorkDivisionConstraints(unittest.TestCase):
             "conv_spatial_blocked_vars",
             "qfp8wt_pinned_vars",
             "qfp8wt_matmul_k_pinned",
-            "indirect_access_pinned_vars",
+            "indirect_access_constraints",
         )
         with ExitStack() as stack:
             for rule, result in zip(rules, results):
@@ -406,42 +406,50 @@ class TestCollectWorkDivisionConstraints(unittest.TestCase):
                 committed_splits={k: 2},
             )
 
-    def test_indirect_pin_conflicting_with_span_split_raises_unsupported(self):
-        i0 = _isym("i0")
-        with self.assertRaisesRegex(Unsupported, "hardware memory-span limit"):
-            self._collect(
-                (
-                    ConstraintResult(),
-                    ConstraintResult(),
-                    ConstraintResult(),
-                    ConstraintResult(),
-                    ConstraintResult(pinned={i0: 1}),
-                ),
-                committed_splits={i0: 2},
+    def test_unions_indirect_forbidden_and_force_output(self):
+        # The indirect rule (5th) contributes forbidden + force_output; the
+        # collector unions those fields across rules alongside blocked/pinned.
+        d0, e0 = _isym("d0"), _isym("e0")
+        result = self._collect(
+            (
+                ConstraintResult(),
+                ConstraintResult(),
+                ConstraintResult(),
+                ConstraintResult(),
+                ConstraintResult(forbidden={d0}, force_output={e0}),
             )
+        )
+        self.assertEqual(result.forbidden, {d0})
+        self.assertEqual(result.force_output, {e0})
 
     def test_combines_non_conflicting_rules(self):
-        r0, r1, r2, r3 = (_isym(f"r{i}") for i in range(4))
+        r0, r1, r2, r3, d0, e0 = (
+            _isym(n) for n in ("r0", "r1", "r2", "r3", "d0", "e0")
+        )
         result = self._collect(
             (
                 ConstraintResult(blocked={r0}, pinned={r2: 1}),
                 ConstraintResult(blocked={r1}, pinned={r3: 2}),
                 ConstraintResult(blocked={r1}),
                 ConstraintResult(pinned={r2: 1}),
-                ConstraintResult(),
+                ConstraintResult(forbidden={d0}, force_output={e0}),
             )
         )
         self.assertEqual(result.blocked, {r0, r1})
         self.assertEqual(result.pinned, {r2: 1, r3: 2})
+        self.assertEqual(result.forbidden, {d0})
+        self.assertEqual(result.force_output, {e0})
 
 
 class TestSpanReductionConstraints(unittest.TestCase):
     _PATCH_TARGET = "torch_spyre._inductor.work_division"
 
-    def test_multidim_indirect_reduction_stays_single_core(self):
+    def test_span_reduction_applies_pinned_reduction_dims(self):
+        # A constraint pinning both reduction dims to 1 (e.g. qfp8wt) must land in
+        # the committed splits span_reduction hands to apply_splits.
         o, r0, r1 = (_isym(name) for name in ("o", "r0", "r1"))
-        op = _computed_buffer((8,), name="indirect_reduction")
-        output_td = _tensor_dep("indirect_reduction", (8,), (o,))
+        op = _computed_buffer((8,), name="pinned_reduction")
+        output_td = _tensor_dep("pinned_reduction", (8,), (o,))
         with (
             patch(
                 f"{self._PATCH_TARGET}.iteration_space_from_op",
@@ -466,9 +474,17 @@ class TestSpanReductionConstraints(unittest.TestCase):
         self.assertEqual(apply_splits.call_args.args[1], {r0: 1, r1: 1})
 
 
-class TestIndirectAccessPinnedVars(unittest.TestCase):
-    _PATCH_TARGET = (
-        "torch_spyre._inductor.work_division_constraints.indirect_info_from_op"
+class TestIndirectAccessConstraints(unittest.TestCase):
+    """indirect_access_constraints forbids the shared table's data dims (hard,
+    never-split) and force-outputs a scatter's index-entry dim. It no longer
+    pins every dim to 1 -- the old blanket single-core behaviour -- so multicore
+    indirect access is enabled."""
+
+    _FORBIDDEN_TARGET = (
+        "torch_spyre._inductor.work_division_constraints.indirect_forbidden_split_syms"
+    )
+    _FORCE_OUTPUT_TARGET = (
+        "torch_spyre._inductor.work_division_constraints.indirect_store_entry_syms"
     )
 
     _PLACEHOLDER_OP = _computed_buffer((128,), name="indirect_placeholder_buf")
@@ -476,24 +492,26 @@ class TestIndirectAccessPinnedVars(unittest.TestCase):
         "indirect_placeholder_buf", (128,), (_isym("_placeholder"),)
     )
 
-    def test_indirect_op_pins_every_dim_to_one(self):
-        i0, i1 = _isym("i0"), _isym("i1")
-        ctx = _make_context(
-            self._PLACEHOLDER_OP,
-            self._PLACEHOLDER_TD,
-            it_space_adjusted={i0: 4, i1: 8},
-        )
-        with patch(self._PATCH_TARGET, return_value=(["value"], None, None)):
-            result = indirect_access_pinned_vars(ctx)
-        self.assertEqual(result.pinned, {i0: 1, i1: 1})
-
-    def test_non_indirect_op_yields_no_pins(self):
-        i0, i1 = _isym("i0"), _isym("i1")
-        ctx = _make_context(
-            self._PLACEHOLDER_OP,
-            self._PLACEHOLDER_TD,
-            it_space_adjusted={i0: 4, i1: 8},
-        )
-        with patch(self._PATCH_TARGET, return_value=([], None, None)):
-            result = indirect_access_pinned_vars(ctx)
+    def test_indirect_op_forbids_data_dims_and_forces_entry_output(self):
+        d0, e0 = _isym("d0"), _isym("e0")
+        ctx = _make_context(self._PLACEHOLDER_OP, self._PLACEHOLDER_TD)
+        with (
+            patch(self._FORBIDDEN_TARGET, return_value={d0}),
+            patch(self._FORCE_OUTPUT_TARGET, return_value={e0}),
+        ):
+            result = indirect_access_constraints(ctx)
+        self.assertEqual(result.forbidden, {d0})
+        self.assertEqual(result.force_output, {e0})
+        # Not the old blanket single-core pin.
         self.assertEqual(result.pinned, {})
+        self.assertEqual(result.blocked, set())
+
+    def test_non_indirect_op_yields_no_constraints(self):
+        ctx = _make_context(self._PLACEHOLDER_OP, self._PLACEHOLDER_TD)
+        with (
+            patch(self._FORBIDDEN_TARGET, return_value=set()),
+            patch(self._FORCE_OUTPUT_TARGET, return_value=set()),
+        ):
+            result = indirect_access_constraints(ctx)
+        self.assertEqual(result.forbidden, set())
+        self.assertEqual(result.force_output, set())
