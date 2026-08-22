@@ -157,12 +157,6 @@ jobs:
           if-no-files-found: error
           retention-days: 5
 
-      # - name: Report CI started to pytorch/pytorch
-      #   continue-on-error: true
-      #   uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
-      #   with:
-      #     status: in_progress
-
       - name: Compute build durations
         id: compute_durations
         run: |
@@ -183,6 +177,18 @@ jobs:
             --progress in_progress \
             --pytorch-sha "${{ inputs.pytorch_sha }}" \
             --torch-spyre-sha "${{ github.sha }}"
+
+      - name: Report CI started to pytorch/pytorch
+        # Only repository_dispatch (real PR-triggered CI) needs an
+        # in_progress ping -- pytorch/pytorch's CRCR only watches those
+        # runs live. Nightly (schedule) doesn't need one, and
+        # workflow_dispatch (manual/ad-hoc) is never relayed at all.
+        if: github.event_name == 'repository_dispatch'
+        continue-on-error: true
+        uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
+        with:
+          status: in_progress
+          job-name: linux-x86_64 / pytorch / test
 
   # ---------------------------------------------------------------------------
   # Run every upstream-beta suite (as a per-suite matrix, with retry/stall-
@@ -296,7 +302,14 @@ jobs:
         env:
           TEST_RESULTS_JSON: ${{ steps.test_results.outputs.test_results_json }}
           MAX_DURATION_SECONDS: ${{ steps.test_results.outputs.max_duration_seconds }}
-          CONCLUSION: ${{ (needs.build.result == 'success' && needs.test.result == 'success') && 'success' || 'failure' }}
+          # Only a genuine 'success' when tests actually ran (total > 0) --
+          # a build/test job that reports 'success' without collecting any
+          # tests (e.g. a matrix/artifact-download problem) must not be
+          # recorded as a passing run.
+          CONCLUSION: >-
+            ${{
+              (fromJSON(steps.test_results.outputs.test_results_json).total > 0) && 'success' || 'failure'
+            }}
           # Empty whenever `build` failed before reaching compute_durations
           # (e.g. the PyTorch/torch-spyre build itself failed) — omitted
           # below rather than passed through, since build_stage_result_payload.py
@@ -327,11 +340,49 @@ jobs:
             --torch-spyre-sha "${{ github.sha }}" \
             --result-payload-file result_payload.json
 
-      # - name: Report CI completed to pytorch/pytorch
-      #   if: always()
-      #   continue-on-error: true
-      #   uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
-      #   with:
-      #     status: completed
-      #     conclusion: ${{ (needs.build.result == 'success' && needs.test.result == 'success') && 'success' || 'failure' }}
-      #     test-results: ${{ steps.test_results.outputs.test_results_json }}
+
+      - name: Report CI completed to pytorch/pytorch (nightly)
+        # event-type: nightly only applies to the actual nightly (schedule)
+        # run -- never sent for repository_dispatch, see the step below.
+        if: always() && github.event_name == 'schedule'
+        continue-on-error: true
+        uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
+        with:
+          status: completed
+          conclusion: >-
+            ${{
+              (fromJSON(steps.test_results.outputs.test_results_json).total > 0) && 'success' || 'failure'
+            }}
+          test-results: >-
+            {
+              "passed": ${{ fromJSON(steps.test_results.outputs.test_results_json).passed }},
+              "failed": ${{ fromJSON(steps.test_results.outputs.test_results_json).failed }},
+              "skipped": ${{ fromJSON(steps.test_results.outputs.test_results_json).skipped }},
+              "total": ${{ fromJSON(steps.test_results.outputs.test_results_json).total }}
+            }
+          job-name: linux-x86_64 / pytorch / test
+          event-type: nightly
+          # Ties this callback to the upstream pytorch/pytorch commit the
+          # nightly resolution step picked, matching pytorch-redhat-ci's
+          # crcr-nightly.yml convention of keying delivery-id on the
+          # resolved source SHA rather than a run-specific token.
+          delivery-id: ${{ inputs.pytorch_sha }}
+
+      - name: Report CI completed to pytorch/pytorch (repository_dispatch)
+        if: always() && github.event_name == 'repository_dispatch'
+        continue-on-error: true
+        uses: pytorch/test-infra/.github/actions/cross-repo-ci-relay-callback@main
+        with:
+          status: completed
+          conclusion: >-
+            ${{
+              (fromJSON(steps.test_results.outputs.test_results_json).total > 0) && 'success' || 'failure'
+            }}
+          test-results: >-
+            {
+              "passed": ${{ fromJSON(steps.test_results.outputs.test_results_json).passed }},
+              "failed": ${{ fromJSON(steps.test_results.outputs.test_results_json).failed }},
+              "skipped": ${{ fromJSON(steps.test_results.outputs.test_results_json).skipped }},
+              "total": ${{ fromJSON(steps.test_results.outputs.test_results_json).total }}
+            }
+          job-name: linux-x86_64 / pytorch / test
