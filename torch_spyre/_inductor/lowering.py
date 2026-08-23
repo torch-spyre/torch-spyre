@@ -1266,8 +1266,7 @@ def lower_spyre_from_d2d(src, dst, src_off, dst_off):
 
 
 def _build_mutation_lowering(src, dst):
-    # Shared lowering body for copy_forced and opaque_copy_: builds an
-    # explicit MutationLayoutSHOULDREMOVE buffer so the mutation into dst
+    # Builds an explicit MutationLayoutSHOULDREMOVE buffer so the mutation into dst
     # survives regardless of what the scheduler would otherwise decide.
     # mutate_to() has multiple code paths and does not always mutate, so
     # the buffer is constructed by hand here instead.

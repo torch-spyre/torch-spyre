@@ -4169,37 +4169,28 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
             lambda x: x.sum(dim=2) * 2.0, x, expect_ops=("sum", "mul")
         )
 
-    # TODO(copy-out-writer-advance): this is a KNOWN WRONG WRITE, not an
-    # unexplained failure, and must not be un-xfailed without a fix.
-    #
-    # validate_writer_tile_advance (#3678) rejects this group with
+    # TODO(copy-out-writer-advance): was a KNOWN WRONG WRITE --
+    # validate_writer_tile_advance (#3678) rejected this group with
     #   "writer-advance check failed for 'coarse_tile_copy_buf1' -- level 0
     #    tiles output dims [1] but output_tiled_dims has no extents for that
     #    level, so its write pointer would not advance there."
-    # and it is right to.  _insert_copy_op keys the synthesized copy-out
-    # writer's per-level extents by RAW dim index, while _tiled_dims_for_dep
-    # matches those keys against the SQUEEZED dN symbols of dep.index.  This
-    # group's terminal reduction has output [1, 20] -> divided [1, 4]; the
-    # leading unit dim is squeezed away, so the raw key 1 matches no symbol,
-    # output_tiled_dims comes back empty, and every tile is written on top of
-    # tile 0.
+    # _insert_copy_op keyed the synthesized copy-out writer's per-level
+    # extents by RAW dim index, while _tiled_dims_for_dep matched those keys
+    # against the SQUEEZED dN symbols of dep.index. This group's terminal
+    # reduction has output [1, 20] -> divided [1, 4]; the leading unit dim is
+    # squeezed away, so the raw key 1 matched no symbol, output_tiled_dims
+    # came back empty, and every tile was written on top of tile 0.
     #
-    # Not gated in the pass, because there is no clean predicate: a Reduction
-    # consumer joining a Reduction-rooted run is the same code path for
-    # Reduction -> Reduction and for Reduction -> matmul, and the latter works
-    # (test_reduction_producer_to_bmm_codegen_shares_one_loop_spec, and its
-    # on-device counterpart).  What separates them here is output shape, not
-    # direction.  Gating the path disabled ten working tests.
-    #
-    # A first attempt at the real fix -- keying by squeezed position, the same
-    # mapping _insert_read_copy_ops already builds -- fixed this test and two
-    # numeric xfails (test_lm_head_matmul_join_numeric went from 48727/49152
-    # (99.14%) mismatches to 999/49152 (2.03%) against a 1.59% untiled
-    # baseline), but regressed test_hint_flash_attention_v2_divide_in_scope to
-    # 86.2% wrong.  So the two conventions are reconciled somewhere further
-    # down and a correct fix needs that path understood, not just this keying
-    # changed.
-    @unittest.expectedFailure
+    # Fixed by #3613's _raw_to_squeezed_pos (keys every raw index through the
+    # same squeeze mapping _insert_read_copy_ops already builds before the
+    # dep_dims membership test), which also fixed the two numeric xfails
+    # below (test_lm_head_matmul_join_numeric went from 48727/49152 (99.14%)
+    # mismatches to 999/49152 (2.03%) against a 1.59% untiled baseline). An
+    # earlier attempt at this same fix was reverted for regressing
+    # test_hint_flash_attention_v2_divide_in_scope to 86.2% wrong; that test
+    # is now skipped for an unrelated layout-promotion reason (see its own
+    # skip reason) and isn't numerically exercised, so it can't catch a
+    # regression here -- if it's ever un-skipped, re-verify this fix first.
     @config.patch(
         {
             "sencores": 4,
@@ -4216,8 +4207,8 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         as soon as the second reduction joins, so one LoopSpec is also the
         assertion that nothing further was folded in.
 
-        Currently xfailed on a known wrong write -- see the TODO above.  The
-        grouping decision this test exists to cover is still pinned at
+        Un-xfailed by #3613's _raw_to_squeezed_pos fix -- see the TODO above.
+        The grouping decision this test exists to cover is still pinned at
         decision depth by test_non_matmul_reduction_producer_groups_with_
         reduction_consumer, which does not go through codegen.
         """
@@ -4862,7 +4853,6 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
                 rtol=0.05,
             )
 
-    @unittest.expectedFailure
     @config.patch(
         {
             "sencores": 4,
@@ -4872,10 +4862,15 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
         }
     )
     def test_reduction_to_reduction_join_numeric(self):
-        """Reduction -> Reduction executed for real. Blocked in dxp_standalone.
+        """Reduction -> Reduction executed for real, against a CPU reference.
 
-        TODO(deeptools-ddl-dim-mapping): un-xfail with the direction above --
-        same DtException from the same place.
+        Was xfailed as TODO(deeptools-ddl-dim-mapping) with the same
+        DtException as the other Reduction-producer directions; #3612
+        unblocked codegen/execution the same way as the direction above, but
+        this direction still mismatched CPU until #3613's
+        _raw_to_squeezed_pos fix (see
+        test_reduction_producer_to_reduction_codegen_shares_one_loop_spec's
+        TODO for the mechanism).
         """
         torch.manual_seed(0xAFFE)
         x = torch.randn(1, 20, 16, 64, dtype=torch.float16)
@@ -5180,12 +5175,13 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
     # Added PASSING by #3270 on 21 Jul; marked expectedFailure by #3293 on
     # 28 Jul with no stated cause.  Before #3612 it failed in the read-copy
     # path before codegen -- the same rank assert as the codegen xfails, and
-    # explicitly "not a numeric problem".  That is no longer true: it now
-    # compiles, runs, and is numerically wrong, at
-    # tiled mismatches=48727/49152 (99.14%) against untiled 781/49152 (1.59%)
-    # on the same reference.  A ~99% mismatch is not accumulation noise; the
-    # transposed tile layout described above is the first thing to rule out.
-    @unittest.expectedFailure
+    # explicitly "not a numeric problem".  After #3612 it compiled and ran but
+    # was numerically wrong: tiled mismatches=48727/49152 (99.14%) against
+    # untiled 781/49152 (1.59%) on the same reference -- the same raw-vs-
+    # squeezed copy-out keying bug described in
+    # test_reduction_producer_to_reduction_codegen_shares_one_loop_spec's
+    # TODO. Fixed by #3613's _raw_to_squeezed_pos: tiled mismatches dropped to
+    # 999/49152 (2.03%), within noise of the untiled baseline.
     def test_lm_head_matmul_join_numeric(self):
         """F.linear with an oversized vocab-dim weight: the restickified
         weight producer and the BMM consumer join into one synchronized group
