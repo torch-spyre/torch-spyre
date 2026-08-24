@@ -283,34 +283,23 @@ void SpyreStream::launch(const JobPlan& plan,
                 " must be on Spyre device, got ", args[i].device());
   }
 
-  // Two-stream overlap topology (phase1-design.md §1):
-  //   S_dev  = this stream (default/current, id 0) — device Compute (+ D2H).
-  //   S_prep = the PERSISTENT host-compute stream (id 65) — HostCompute + H2D.
-  // Device compute overlaps HC/H2D because it lives on a DIFFERENT stream;
-  // every op keeps pipeline_barrier=true (strict per-stream FIFO). S_prep MUST
-  // be the same persistent flex handle each launch (edge-2 FIFO + flex's
-  // cross-launch WAR edge depend on it): getHostComputeStreamById is a pure
-  // lookup that wraps the handle registered once in initializeStreamPoolImpl.
+  // Two-stream overlap topology:
+  //   S_dev  = this stream (the default) — Compute (+ D2H).
+  //   S_prep = the persistent host-compute stream — HostCompute + H2D.
+  // Compute overlaps HC/H2D because they run on different streams; every op
+  // keeps pipeline_barrier=true (per-stream FIFO). S_prep must be the same
+  // persistent flex handle each launch: getHostComputeStreamById is a pure
+  // lookup of the handle registered once in initializeStreamPoolImpl.
   const SpyreStream& s_dev = *this;
-  // Fixed prep-stream id 65 for the PoC (single prep stream; single device).
   const SpyreStream s_prep =
       getHostComputeStreamById(kHostComputeStreamStartPerDevice, device());
 
   // Create launch context with tensor arguments.
   LaunchContext ctx{args};
 
-  // GATE (correctness over overlap): engage the S_prep/S_dev split only when
-  // the flex per-region hazard tracker is enabled (SPYRE_HAZARD_TRACKER,
-  // default on). torch-spyre emits NO cross-stream event steps -- flex inserts
-  // the cross-stream RAW/WAR edges dynamically at enqueue from the per-launch
-  // footprints. With the tracker OFF, every step runs on S_dev --
-  // byte-identical to the pre-overlap single-stream path (the fail-safe floor).
-  // Per-step routing still keys on role(), so any all-Dev plan (pure Compute /
-  // standalone D2H) stays single-stream even with the split engaged.
-  // Conversely, under the tracker ANY plan carrying a Prep-role step splits --
-  // not only the correction triple, but e.g. a bare H2D-led plan. That is
-  // intended: flex's per-region tracker inserts the edges regardless of plan
-  // shape.
+  // Split Prep-role steps onto S_prep only when the flex tracker is on; flex
+  // then inserts the cross-stream edges. Off = every step on S_dev (the
+  // single-stream floor). Routing keys on role(), so all-Dev plans never split.
   const bool should_split = get_hazard_tracker_enabled();
   for (const auto& step : plan.steps) {
     const SpyreStream& target =
@@ -508,9 +497,9 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
     flex::RuntimeStreamPriority streamPriority =
         priority < 0 ? flex::RuntimeStreamPriority::HIGH
                      : flex::RuntimeStreamPriority::NORMAL;
-    flex::RuntimeStream* flex_handle =
-        runtime->createStream(streamPriority, flex::RuntimeStreamMode::STRICT_ORDERING,
-                              /*track_hazards=*/get_hazard_tracker_enabled());
+    flex::RuntimeStream* flex_handle = runtime->createStream(
+        streamPriority, flex::RuntimeStreamMode::STRICT_ORDERING,
+        /*track_hazards=*/get_hazard_tracker_enabled());
     pool.stream_handle_map[stream_id] = flex_handle;
   }
 

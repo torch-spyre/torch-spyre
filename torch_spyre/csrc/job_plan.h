@@ -181,11 +181,9 @@ class HostBuffer {
 /**
  * @brief Which stream a JobPlanStep runs on in the two-stream overlap topology.
  *
- * Prep = the persistent host-compute/prep stream (S_prep, id 65): HostCompute
- *        and H2D. Dev = the default/current stream (S_dev, id 0): device
- * Compute and (by default) D2H. Device compute overlaps HC/H2D precisely
- * because it runs on a DIFFERENT stream, while every op keeps
- * pipeline_barrier=true (strict per-stream FIFO). See phase1-design.md §1.
+ * Prep = the persistent host-compute stream (S_prep): HostCompute and H2D.
+ * Dev = the default stream (S_dev): Compute and D2H. Compute overlaps HC/H2D by
+ * running on a different stream; every op keeps pipeline_barrier=true.
  */
 enum class StreamRole { Prep, Dev };
 

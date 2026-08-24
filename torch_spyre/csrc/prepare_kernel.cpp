@@ -625,17 +625,11 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
     }
   }
 
-  // Two-stream overlap (phase1-design.md §1): the granite decode correction is
-  // the single triple [HostCompute, H2D, ComputeOnDevice]. The step ctors tag
-  // HostCompute+H2D with role Prep and Compute with role Dev, so the launch
-  // router runs HostCompute+H2D on S_prep and Compute on S_dev while every op
-  // keeps pipeline_barrier=true (strict per-stream FIFO). torch-spyre emits NO
-  // cross-stream event steps: the flex per-region hazard tracker
-  // (SPYRE_HAZARD_TRACKER, default on) inserts the cross-stream RAW/WAR edges
-  // dynamically at enqueue from the per-launch footprints. With the tracker OFF
-  // the launch router keeps every step on S_dev -- byte-identical to the
-  // pre-overlap single-stream path. No plan rewrite happens here; the plain
-  // triple's ctor-assigned roles pass checkJobPlanStepOrdering directly.
+  // Two-stream overlap. Emit the plain triple [HostCompute, H2D, Compute]; the
+  // ctors tag it with roles [Prep, Prep, Dev]. When SPYRE_HAZARD_TRACKER is on,
+  // the launch router splits it across S_prep/S_dev and flex inserts the
+  // cross-stream H2D->Compute edge; off keeps every step on S_dev. Every op
+  // keeps pipeline_barrier=true (per-stream FIFO). No plan rewrite here.
 
   // TODO(jni): expected_input_shapes to be added once provided in SpyreCode
   // Create pinned_buffers vector from pinned_buffer_map_
@@ -667,20 +661,10 @@ JobPlanBuilder::ValidationResult JobPlanBuilder::validate(
   // - Verify shape dimensions are positive
   // - Verify shape count matches number of input tensors
 
-  // P2-14: JobPlan step ordering validation.
-  //
-  // The correction plan is the plain role-tagged triple [HostCompute(Prep),
-  // H2D(Prep), Compute(Dev)]; torch-spyre emits no cross-stream event steps
-  // (flex's per-region hazard tracker derives the RAW/WAR edges). Ordering is a
-  // PURE function over the plan projected into parallel (StepKind, StreamRole)
-  // vectors so it can be unit-tested (a role-misplacement negative test)
-  // without constructing real steps, and so both streams' subsequences are
-  // checked independently: S_prep must be HostCompute -> H2D and S_dev must be
-  // Compute. See checkJobPlanStepOrdering (job_plan.cpp) and phase1-design.md
-  // §4/§7.
-  //
-  // A legacy single-stream plan (no HostCompute) is left valid by the checker,
-  // preserving pure-ComputeOnDevice / standalone-D2H / tensor-.to() paths.
+  // Validate step ordering: the checker projects the plan into (StepKind,
+  // StreamRole) and checks each stream's subsequence -- S_prep must be
+  // HostCompute -> H2D, S_dev must be Compute. See checkJobPlanStepOrdering.
+  // A legacy plan with no HostCompute stays valid (single-stream paths).
   {
     std::vector<StepKind> kinds;
     std::vector<StreamRole> roles;

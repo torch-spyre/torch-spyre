@@ -77,30 +77,29 @@ void set_downcast_warn_enabled(bool enabled) {
   g_downcast_warn_enabled.store(enabled, std::memory_order_relaxed);
 }
 
-// SPYRE_HAZARD_TRACKER latch: when on (default), torch-spyre splits the
-// correction triple across S_prep/S_dev while flex's per-region hazard tracker
-// inserts the cross-stream RAW/WAR events dynamically at enqueue -- torch-spyre
-// emits no cross-stream event steps of its own. SPYRE_HAZARD_TRACKER=0 keeps
-// every step on S_dev: the single-stream floor, byte-identical to the
-// pre-overlap path (the STATIC event-step path was retired). Read once from the
-// env in init_from_env; latched into each torch-spyre-managed stream's
-// track_hazards at creation (see spyre_stream.cpp). Nothing is applied to the
-// flex RuntimeContext at _startRuntime.
-std::atomic<bool> g_hazard_tracker_enabled{true};  // default ON (HAZARD)
+// SPYRE_HAZARD_TRACKER: on = split the correction triple across S_prep/S_dev
+// and let flex insert the cross-stream H2D->Compute edge. off = single-stream
+// floor (all on S_dev; FIFO enforces the edge). Default OFF to match flex: if
+// we split but flex isn't tracking, nothing enforces H2D->Compute and results
+// go wrong. Read once in init_from_env; latched into each stream's
+// track_hazards.
+std::atomic<bool> g_hazard_tracker_enabled{
+    false};  // default OFF (matches flex)
 
 bool get_hazard_tracker_enabled() {
   return g_hazard_tracker_enabled.load(std::memory_order_relaxed);
 }
 
 void set_hazard_tracker_enabled(bool enabled) {
-  // Global source of truth for whether torch-spyre registers its own streams with
-  // flex's per-region hazard tracker. Registration happens at stream CREATION (via the
-  // track_hazards flag threaded into RuntimeContext::createStream), so flipping this
-  // after a stream is created affects only streams created afterward. In particular
-  // the default stream is fixed at RuntimeContext construction, so flipping this on
-  // after startup will NOT register the already-created default stream (a
-  // post-startup off->on flip is only partial). This is a TEST/tuning hook; the
-  // production value is latched from SPYRE_HAZARD_TRACKER in init_from_env before any
+  // Global source of truth for whether torch-spyre registers its own streams
+  // with flex's per-region hazard tracker. Registration happens at stream
+  // CREATION (via the track_hazards flag threaded into
+  // RuntimeContext::createStream), so flipping this after a stream is created
+  // affects only streams created afterward. In particular the default stream is
+  // fixed at RuntimeContext construction, so flipping this on after startup
+  // will NOT register the already-created default stream (a post-startup
+  // off->on flip is only partial). This is a TEST/tuning hook; the production
+  // value is latched from SPYRE_HAZARD_TRACKER in init_from_env before any
   // stream is created.
   g_hazard_tracker_enabled.store(enabled, std::memory_order_relaxed);
 }
@@ -115,9 +114,8 @@ static void init_from_env() {
     g_downcast_warn_enabled.store(enable, std::memory_order_relaxed);
   }
   // SPYRE_HAZARD_TRACKER is a correctness gate: strict "1" semantics, NOT the
-  // permissive downcast parser above. The atomic defaults ON, so leaving the
-  // env UNSET selects HAZARD; setting it to any value other than "1" (e.g. "0")
-  // selects the single-stream floor (all steps on S_dev, no overlap).
+  // permissive downcast parser above. The atomic defaults OFF, so leaving the
+  // env UNSET selects the single-stream floor; only "1" enables the split.
   if (const char* v = std::getenv("SPYRE_HAZARD_TRACKER")) {
     g_hazard_tracker_enabled.store(std::string(v) == "1",
                                    std::memory_order_relaxed);
@@ -161,10 +159,11 @@ void _startRuntime() {
   init_from_env();
   if (runtime) {
     GlobalRuntime::set(runtime);
-    // The SPYRE_HAZARD_TRACKER latch (read in init_from_env above) is applied at stream
-    // creation: each torch-spyre-managed stream is created with track_hazards =
-    // get_hazard_tracker_enabled() (see spyre_stream.cpp), so flex registers exactly the
-    // streams torch-spyre owns. Nothing to toggle on the runtime here.
+    // The SPYRE_HAZARD_TRACKER latch (read in init_from_env above) is applied
+    // at stream creation: each torch-spyre-managed stream is created with
+    // track_hazards = get_hazard_tracker_enabled() (see spyre_stream.cpp), so
+    // flex registers exactly the streams torch-spyre owns. Nothing to toggle on
+    // the runtime here.
     DEBUGINFO(s);
     DEBUGINFO("runtime started with logical_device_id ", logical_device_id);
   } else {
