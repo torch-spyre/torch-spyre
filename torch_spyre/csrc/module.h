@@ -33,8 +33,9 @@ class GlobalRuntime {
   static void set(flex::RuntimeContext* runtime) {
     instance() = runtime;
   }
+
   static void reset() {
-    flex::RuntimeContext::reset();
+    instance() = nullptr;
   }
 
   static flex::RuntimeContext* get() {
