@@ -2617,72 +2617,24 @@ for i in "${!RUN_FILES[@]}"; do
     fi
 
     # ---------------------------------------------------------------------------
-    # -m marker pre-flight
+    # -m is intentionally NOT pre-flighted here.
     #
-    # When a -m MARKEXPR is present, probe whether this specific file has any
-    # tests that match it before running.  The probe uses --collect-only which
-    # is fast as no test execution happens and runs from the file's own directory
-    # so conftest.py files are discovered correctly.
+    # This used to run a --collect-only probe first and strip -m from the real
+    # invocation whenever the probe reported 0 collected (exit code 5), on the
+    # theory that a 0-match probe means "this marker family isn't used in this
+    # file". That inference is unsound: a 0-collected probe can also mean the
+    # probe itself failed to complete cleanly (e.g. a slow cold collection of a
+    # large merged file), which is indistinguishable from a real 0-match once
+    # stderr is discarded. On a merged multi-config run, this silently dropped
+    # --skip-slow's `-m not slow__plat_<arch>` filter for large files like
+    # test_inductor_ops.py, letting ~1hr `test_large_matmul*` tests run
+    # unfiltered — see issue where standalone runs correctly filtered while
+    # `make tests TEST_TYPE=unit` did not.
     #
-    # If the probe finds 0 matching tests (exit code 5) the -m flag is stripped
-    # from _FILE_PYTEST_ARGS so the file's tests all run normally --
-    # the marker filter applies to files that USE that marker
-    # family; files that don't use it are unaffected. This fallback is for
-    # op__/dtype__/module__/platform__-style tags, where a per-file 0-match
-    # just means "this marker family isn't used here". It does NOT apply to
-    # testtype__<label> (see _OOTTestTypeMarkerPatcher): that tag is a
-    # whole-file inclusion marker driven by the config's
-    # test_suite_config.labels, so a 0-match genuinely means this file's
-    # config doesn't carry the requested label and the file must stay
-    # excluded, not fall back to running unfiltered. -m is left in place for
-    # that case; the real run below will also report 0 collected (exit 5),
-    # which the exit-code handling further down already treats as
-    # NOTEST/warning-only, not a failure.
-    #
+    # -m is always left in place; a genuine 0-match on the real run below
+    # already reports exit code 5, which the exit-code handling further down
+    # treats as NOTEST/warning-only, not a failure.
     # ---------------------------------------------------------------------------
-    _HAS_M=0
-    for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
-        [[ "$_a" == "-m" ]] && { _HAS_M=1; break; }
-    done
-
-    if [[ $_HAS_M -eq 1 ]]; then
-        # Extract just the -m args for the probe (no --junit-xml, no -v, etc.)
-        _PROBE_ARGS=()
-        _take_next=0
-        for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
-            if [[ $_take_next -eq 1 ]]; then
-                _PROBE_ARGS+=("$_a")
-                _take_next=0
-                continue
-            fi
-            if [[ "$_a" == "-m" ]]; then
-                _PROBE_ARGS+=("$_a")
-                _take_next=1
-            fi
-        done
-
-        # `|| _probe_exit=$?` is required: exit 5 (nothing collected) is the
-        # expected signal here, and under `set -e` a bare subshell would abort
-        # the whole run before the exit code could be inspected.
-        _probe_exit=0
-        (cd "$run_dir" && python3 -m pytest "$run_basename" \
-            "${_PROBE_ARGS[@]}" --collect-only -q 2>/dev/null) || _probe_exit=$?
-
-        if [[ $_probe_exit -eq 5 && "${_PROBE_ARGS[*]}" == *"testtype__"* ]]; then
-            echo "[torch_oot_device_tests_run] -m filter matched 0 tests in $(basename "$original_file") (testtype__ label not present) -- file excluded" >&2
-        elif [[ $_probe_exit -eq 5 ]]; then
-            # 0 tests match this marker in this file — strip -m from args.
-            echo "[torch_oot_device_tests_run] -m filter matched 0 tests in $(basename "$original_file"), running without -m" >&2
-            _ARGS_NO_M=()
-            _skip_m=0
-            for _a in "${_FILE_PYTEST_ARGS[@]+"${_FILE_PYTEST_ARGS[@]}"}"; do
-                if [[ $_skip_m -eq 1 ]]; then _skip_m=0; continue; fi
-                if [[ "$_a" == "-m" ]]; then _skip_m=1; continue; fi
-                _ARGS_NO_M+=("$_a")
-            done
-            _FILE_PYTEST_ARGS=("${_ARGS_NO_M[@]}")
-        fi
-    fi
 
     # -----------------------------------------------------------------------
     # Run pytest for this file.

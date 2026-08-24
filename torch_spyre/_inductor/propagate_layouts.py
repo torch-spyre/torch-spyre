@@ -62,9 +62,9 @@ from .constants import (
     ELIDED_COPY_BACK_ATTR,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
-    TOPK_OPS,
 )
 from .ir import (
+    AllGatherAsyncFallback,
     AllReduceAsyncFallback,
     FixedTiledLayout,
     SpyreConstantFallback,
@@ -83,6 +83,7 @@ from .pass_utils import (
     try_device_coordinates,
     indirect_info_from_op,
     is_stick_expr_offset_free,
+    is_topk,
     iter_var_id,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
@@ -228,6 +229,23 @@ def _output_stl_from_stick_expr(
     return _make_output_stl(output, output_dep, c_size, c_stride, out_stick_dim, dtype)
 
 
+def _dims_by_alignment(dims, sizes, stick_size: int) -> tuple[list[int], list[int]]:
+    """Split ``dims`` into (aligned, unaligned) by their extent in ``sizes``.
+
+    A caller scans the aligned dims first (no padding needed) and only falls
+    back to the unaligned dims when the aligned group yields nothing; the
+    unaligned dim it then picks is padded up to a stick boundary later by
+    ``insert_restickify_padding`` (See #1756).
+    """
+    aligned, unaligned = [], []
+    for dim in dims:
+        if concretize_expr(sizes[dim]) % stick_size == 0:
+            aligned.append(dim)
+        else:
+            unaligned.append(dim)
+    return aligned, unaligned
+
+
 def _make_output_stl(
     output, output_dep, c_size, c_stride, stick_dim, dtype=None
 ) -> SpyreTensorLayout | None:
@@ -265,19 +283,19 @@ def _candidate_output_stls(
 
     dtype = output.dtype if dtype is None else dtype
     stick_size = get_elem_in_stick(dtype)
-    result = []
-    for alt_stick_dim in range(len(output.size)):
-        if alt_stick_dim == skip_dim:
-            continue
-        if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
-            # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
-            continue
-        stl = _make_output_stl(
-            output, output_dep, c_size, c_stride, alt_stick_dim, dtype
-        )
-        if stl is not None:
-            result.append(stl)
-    return result
+    # Prefer stick-aligned dims; fall back to unaligned dims (padded later by
+    # insert_restickify_padding) only when no aligned dim yields a candidate.
+    all_dims = [d for d in range(len(output.size)) if d != skip_dim]
+    aligned_dims, unaligned_dims = _dims_by_alignment(all_dims, output.size, stick_size)
+    stls: list[SpyreTensorLayout] = []
+    for dims in (aligned_dims, unaligned_dims):
+        for d in dims:
+            stl = _make_output_stl(output, output_dep, c_size, c_stride, d, dtype)
+            if stl is not None:
+                stls.append(stl)
+        if stls:
+            break
+    return stls
 
 
 def _check_supported_input_sticks(args: list[PropArg], op_label: str) -> None:
@@ -445,36 +463,43 @@ def _single_arg_op_layout(
             if out_stl is not None:
                 return [out_stl]
 
-        # Try alternative layouts when input layout is not supported
+        # Try alternative layouts when input layout is not supported.
+        # Skip the dim already known to produce an unsupported stick.
         in_coords = host_coordinates(in_layout, dep, None)
         out_coords = host_coordinates(output, output_dep, None)
-        stick_dim = matching_dim(in_coords, x_stick_expr)
-        layouts = []
-        for in_dim in range(len(in_layout.size)):
-            if in_dim == stick_dim:
-                continue
-            if concretize_expr(in_layout.size[in_dim]) % stick_size != 0:
-                # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
-                continue
-            in_coord = in_coords[in_dim]
-            # Map input dim to output dim. If input dim carries reduction var, it's collapsed
-            if reduction_var is not None and reduction_var in in_coord.free_symbols:
-                out_stick_dim = -1
-            else:
-                out_stick_dim = _pick_stick_dim(in_coord, out_coords)
-                if out_stick_dim < 0:
-                    continue
-            out_stl = _make_output_stl(
-                output,
-                output_dep,
-                c_size,
-                c_stride,
-                out_stick_dim,
-                out_dtype_for_layout,
-            )
-            if out_stl is not None:
-                layouts.append(out_stl)
+        skip_in_dim = matching_dim(in_coords, x_stick_expr)
 
+        # Prefer stick-aligned input dims; fall back to unaligned dims (padded
+        # later by insert_restickify_padding) only when no aligned dim maps to a
+        # supported output stick.
+        all_dims = [d for d in range(len(in_layout.size)) if d != skip_in_dim]
+        aligned_dims, unaligned_dims = _dims_by_alignment(
+            all_dims, in_layout.size, stick_size
+        )
+        layouts: list[SpyreTensorLayout] = []
+        for dims in (aligned_dims, unaligned_dims):
+            for in_dim in dims:
+                in_coord = in_coords[in_dim]
+                # Map input dim to output dim. If input dim carries reduction
+                # var, it's collapsed
+                if reduction_var is not None and reduction_var in in_coord.free_symbols:
+                    out_stick_dim = -1
+                else:
+                    out_stick_dim = _pick_stick_dim(in_coord, out_coords)
+                    if out_stick_dim < 0:
+                        continue
+                out_stl = _make_output_stl(
+                    output,
+                    output_dep,
+                    c_size,
+                    c_stride,
+                    out_stick_dim,
+                    out_dtype_for_layout,
+                )
+                if out_stl is not None:
+                    layouts.append(out_stl)
+            if layouts:
+                break
         return layouts
 
     # Single-arg pointwise
@@ -502,8 +527,12 @@ def _single_arg_op_layout(
             input_ea = stl.element_arrangement
 
             # Determine output EA based on conversion direction and input EA
-            if in_layout.dtype == torch.float16 and output.dtype == torch.float32:
-                # FP16 → FP32 conversion
+            if (
+                in_layout.dtype in (torch.float16, torch.bfloat16)
+                and output.dtype == torch.float32
+            ):
+                # FP16/BF16 → FP32 conversion. Both share SEN169_FP16 physical
+                # storage and the DL16TOFP32 hardware op.
                 if input_ea == ElementArrangement.STANDARD:
                     # Case 1: STANDARD → DL16_TO_FP32 (creates staggered layout)
                     fmt = ElementArrangement.DL16_TO_FP32
@@ -1163,19 +1192,24 @@ def _multi_arg_pointwise_layouts(
     # input EA and adding STANDARD candidates would corrupt downstream ops.
     # EA omitted from key: the loop below is skipped for staggered ops, so all
     # candidates added (and looked up) here use STANDARD EA — geometry suffices.
+    #
+    # Aligned dims are scanned first; unaligned dims (padded later by
+    # insert_restickify_padding) only when nothing aligned yielded a candidate.
     seen_keys = {(tuple(r.device_size), tuple(r.stride_map)) for r in results}
-    for alt_stick_dim in range(len(output.size)) if not staggered_inputs else []:
-        # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
-        if concretize_expr(output.size[alt_stick_dim]) % stick_size != 0:
-            continue
-        pre_len = len(results)
-        _try_stick_dim(alt_stick_dim)
-        if len(results) > pre_len:
-            key = (tuple(results[-1].device_size), tuple(results[-1].stride_map))
-            if key in seen_keys:
-                results.pop()
-            else:
-                seen_keys.add(key)
+    all_dims = range(len(output.size)) if not staggered_inputs else []
+    aligned_dims, unaligned_dims = _dims_by_alignment(all_dims, output.size, stick_size)
+    for dims in (aligned_dims, unaligned_dims):
+        for alt_stick_dim in dims:
+            pre_len = len(results)
+            _try_stick_dim(alt_stick_dim)
+            if len(results) > pre_len:
+                key = (tuple(results[-1].device_size), tuple(results[-1].stride_map))
+                if key in seen_keys:
+                    results.pop()
+                else:
+                    seen_keys.add(key)
+        if results:
+            break
 
     # LX in-place: promote a same-frame input's layout to FIRST so the beam
     # commits it on a cost tie, avoiding a free-but-in-place-defeating permutation
@@ -1337,7 +1371,7 @@ def compute_layouts(
     if isinstance(data, Reduction) and data.reduction_type == "exx2":
         return _exx2_layout(op, output, output_dep, args)
 
-    if isinstance(data, Reduction) and data.reduction_type in TOPK_OPS:
+    if is_topk(op):
         return _topk_layouts(op, output, output_dep, args)
 
     aten_op = next(iter(data.origins)).target if data.origins else None
@@ -1445,9 +1479,27 @@ def _target_device_layout(target, name: str):
     # candidate layouts on the TensorBox rather than a finalized committed_stl.
     graph_input = V.graph.graph_inputs.get(name)
     layouts = getattr(graph_input, "layouts", None)
+    if not layouts:
+        # Also check candidate layouts on the producing ComputedBuffer —
+        # graph intermediates are not in graph_inputs.
+        # Exclude SpyreEmptyFallback and SpyreConstantFallback: those are
+        # synthetic buffers whose layouts are derived via separate paths.
+        # Exactly one candidate is required; the assert below enforces this.
+        buf = V.graph.get_buffer(name) if name else None
+        if buf is not None and not isinstance(
+            buf, (SpyreEmptyFallback, SpyreConstantFallback)
+        ):
+            buf_layouts = getattr(buf, "layouts", None)
+            if buf_layouts:
+                layouts = buf_layouts
 
     if not layouts:
         return None
+    assert len(layouts) == 1, (
+        f"_target_device_layout: {name!r} has {len(layouts)} candidate layouts; "
+        f"multiple mutation ops writing the same target with different layouts "
+        f"is not yet supported"
+    )
     return next(iter(layouts))
 
 
@@ -1972,6 +2024,9 @@ def propagate_spyre_tensor_layouts(
             input_name = op.inputs[0].get_name()
             input_buf = V.graph.get_buffer(input_name)
             op.layouts = list(input_buf.layouts)
+            op.restick_cost_fn = AnyInNode.from_args()
+        elif isinstance(op, AllGatherAsyncFallback):
+            op.layouts = [generic_layout(op)]
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ExternKernel):
             logger.warning(f"unhandled node type {type(op)}")

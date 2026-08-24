@@ -38,7 +38,6 @@ test_suite_config:
             # pins conv output -- conv is not in OP_OUTPUT_GOOD_FOR_LX_REUSE --
             # so this is a test-only path (backend follow-up on PR #3284).
             - LxPlanning.*::test_conv2d_direct_.*_s2_lx_planning_(pointwise|reduction)
-            - LxPlanning.*::test_topk.*_lx_planning_(pointwise|reduction)
           mode: xfail
         - names:
             - LxPlanning.*::test_(all_dim|any_dim|count_nonzero|cummax|cummin|cumprod|logcumsumexp|max_default|median|mode_|nanmean|nanmedian|nanquantile|nansum|quantile|std_|topk|conv2d|dwise_conv2d|var_).*_lx_planning_(pointwise|reduction)

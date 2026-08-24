@@ -151,7 +151,9 @@ def _(x: torch.Tensor, k: int, dim: int) -> torch.Tensor:
     norm_dim = dim % len(x.size())
     out_size = list(x.size())
     out_size[norm_dim] = k
-    return x.new_empty(out_size, dtype=torch.int64)
+    # Index materializes in the input dtype, not int64: a float that lies it
+    # is an index. Matches lower_topkindex (dst_dtype = x.get_dtype()).
+    return x.new_empty(out_size, dtype=x.dtype)
 
 
 @torch.library.custom_op("spyre::gelu", mutates_args=(), device_types="spyre")
@@ -232,7 +234,16 @@ def _(input: torch.Tensor):
 @torch.library.custom_op(
     "spyre::copy_from_d2d", mutates_args=("dst",), device_types="spyre"
 )
-@compile_once("spyre.copy_from_d2d")
+# dynamic=False: dynamo's auto-dynamic promotes a SIZE to a symbol after the
+# second distinct value, exactly as it does for ints (fought off below with
+# specialize_int) -- and the Spyre lowering then silently bakes ONE concrete
+# extent into the SDSC while dynamo reuses the "dynamic" graph for every later
+# size. A d2d copy of a prefix view then writes the baked extent, not the
+# view's (#3826: overran dst and corrupted attention write-back downstream).
+# Static per-shape traces are the codebase's standing pattern -- every other
+# compile_once site already passes dynamic=False -- and cache_size_limit is
+# bumped to 1024 for precisely this one-binary-per-variant regime.
+@compile_once("spyre.copy_from_d2d", dynamic=False)
 def copy_from_d2d(
     src: torch.Tensor,
     dst: torch.Tensor,
@@ -273,46 +284,48 @@ def _(
     pass
 
 
-# Copy src into dst in-place (the mutating primitive).
-# No @compile_once needed: the body calls aten::copy_ which dispatches
-# through spyre__copy_from → copy_from_d2d / copy_tensor — no cycle back
-# to spyre::copy_ itself.
-@torch.library.custom_op("spyre::copy_", mutates_args=("dst",), device_types="spyre")
-def copy_(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    dst.copy_(src)
-    return dst
-
-
-@copy_.register_fake
-def _(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    return dst
-
-
-@torch.library.register_kernel("spyre::copy_", ["cpu"])
-def copy__cpu(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    dst.copy_(src)
-    return dst
-
-
-# Functional (out-of-place) wrapper for spyre::copy_.
-# Returns a new tensor equal to dst with src written into it.
-# The graph sees a pure value-producing node; Inductor's reinplacer will
-# rewrite copy_f → copy_ (in-place) wherever it is safe to do so.
-@torch.library.custom_op("spyre::copy_f", mutates_args=(), device_types="spyre")
-def copy_f(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    result = dst.clone()
-    torch.ops.spyre.copy_(src, result)
-    return result
-
-
-@copy_f.register_fake
-def _(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    return dst.clone()
-
-
-inplaceable_ops[torch.ops.spyre.copy_f.default] = InplaceableOp(
-    torch.ops.spyre.copy_.default, 1
+# Copy src into dst in-place, guaranteed to survive Inductor's
+# remove_noop_ops pass (unlike aten.copy_, this op is not in
+# noop_registry). Use this to guarantee a copy survives to the coarse
+# tile validator.
+@torch.library.custom_op(
+    "spyre::copy_forced", mutates_args=("dst",), device_types="spyre"
 )
+def copy_forced(src: torch.Tensor, dst: torch.Tensor) -> None:
+    dst.copy_(src)
+
+
+@copy_forced.register_fake
+def _(src: torch.Tensor, dst: torch.Tensor) -> None:
+    pass
+
+
+@torch.library.register_kernel("spyre::copy_forced", ["cpu"])
+def copy_forced_cpu(src: torch.Tensor, dst: torch.Tensor) -> None:
+    dst.copy_(src)
+
+
+# Purely functional at trace time (mutates_args=()) so aot_autograd's
+# assert_functional_graph never sees a mutation. The real write into acc is
+# introduced later by lower_spyre_opaque_copy_ at Inductor lowering time,
+# which builds a MutationLayoutSHOULDREMOVE(acc) buffer identical to the one
+# copy_forced's lowering builds. Callers must reassign:
+# acc = opaque_copy_(value, acc). Use this instead of copy_forced where
+# AOTAutograd functionalization would otherwise reject the mutation (e.g.
+# inside a decomposition traced by torch.compile).
+@torch.library.custom_op("spyre::opaque_copy_", mutates_args=(), device_types="spyre")
+def opaque_copy_(value: torch.Tensor, acc: torch.Tensor) -> torch.Tensor:
+    return value.clone()
+
+
+@opaque_copy_.register_fake
+def _(value: torch.Tensor, acc: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(value)
+
+
+@torch.library.register_kernel("spyre::opaque_copy_", ["cpu"])
+def opaque_copy__cpu(value: torch.Tensor, acc: torch.Tensor) -> torch.Tensor:
+    return value.clone()
 
 
 # Copy input into output starting at offsets along dimensions dims and
@@ -320,7 +333,10 @@ inplaceable_ops[torch.ops.spyre.copy_f.default] = InplaceableOp(
 @torch.library.custom_op(
     "spyre::overwrite", mutates_args=("output",), device_types="spyre"
 )
-@compile_once("spyre.overwrite")
+# dynamic=False for the same reason as copy_from_d2d above (#3826): a varying
+# input size must trigger a fresh static trace, never an auto-dynamic graph
+# whose frozen extent scatters the wrong number of elements.
+@compile_once("spyre.overwrite", dynamic=False)
 def overwrite(
     input: torch.Tensor,
     output: torch.Tensor,

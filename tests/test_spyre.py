@@ -725,6 +725,12 @@ class TestSpyre(TestCase):
             (torch.float32, torch.float16),
         }
 
+        # DCI doesn't support either direction for these conversions.
+        skip_eager_conversions = {
+            (torch.float32, torch.int32),
+            (torch.int32, torch.float32),
+        }
+
         # Test supported conversions
         for src_dtype, dst_dtype in DtypeOpTable.get_table().keys():
             # Skip all FP8 conversions in eager mode - backend doesn't support them:
@@ -737,6 +743,9 @@ class TestSpyre(TestCase):
                 torch.float8_e4m3fn,
                 torch.float8_e5m2,
             ):
+                continue
+
+            if (src_dtype, dst_dtype) in skip_eager_conversions:
                 continue
 
             ctx = f"H2D {src_dtype}->{dst_dtype}"
@@ -766,6 +775,7 @@ class TestSpyre(TestCase):
             (torch.int8, torch.float16),
             (torch.float32, torch.int32),
             (torch.float16, torch.int64),
+            (torch.int32, torch.float32),
         ]
 
         for src_dtype, dst_dtype in unsupported_pairs:

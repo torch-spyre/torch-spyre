@@ -23,7 +23,9 @@ Every gather scenario now carries through to SDSC generation: check() (and the
 capture-based tests via bundle_jsons_from_captured) validate the indirect-access
 encoding of the produced bundle, not just that op specs were generated.
 
-All gather scenarios run with SENCORES=1.
+Every gather scenario is generated once per SENCORES value (1, 2, 4, 8, 16, 32)
+by register_multicore_variants, so the same checks also exercise the multicore
+work-division planner. See MULTICORE_SENCORES in indirect_access_common.
 
 There is one test per scenario -- no separate e2e variants. Each scenario
 validates the capture path and then runs the kernel on the real backend,
@@ -46,12 +48,13 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from torch._inductor.utils import run_and_get_code
 
 sys.path.insert(0, os.path.dirname(__file__))
 from indirect_access_common import (  # noqa: E402
     DIRECT_OP_SPEC,
     GATHER_OP_SPEC,
-    IndirectAccessTestCase,
+    register_multicore_variants,
     bundle_jsons_from_captured,
     capture_op_specs,
     capture_sdsc_calls,
@@ -67,25 +70,25 @@ from indirect_access_common import (  # noqa: E402
     plain_to_spyre,
 )
 
-from torch_spyre._C import DataFormats  # noqa: E402
-from torch_spyre._inductor import config  # noqa: E402
+from torch_spyre._C import (  # noqa: E402
+    DataFormats,
+    SpyreTensorLayout,
+    get_device_dtype,
+    get_elem_in_stick,
+)
 from torch_spyre._inductor.constants import IDENTITY_OP, RESTICKIFY_OP  # noqa: E402
 from torch_spyre._inductor.op_spec import find_unimplemented  # noqa: E402
 
 
-class _GatherScenarios(IndirectAccessTestCase):
+class _GatherScenarios:
     """torch gather-family ops: one compile + all-stage checks per scenario.
 
-    This is the shared scenario body; it is *not* collected on its own
-    (`__test__ = False`). Every scenario moves its gather value/source tensor
-    to "spyre" with plain `.to("spyre")` (no explicit layout pin), exercising
-    the gather-source relayout pass: the compiler picks the generic layout,
-    multi-stick sources arrive with their indexed dim behind the stick-count dim,
-    and the pass must rotate it outermost. Index tensors always use a plain
-    `.to("spyre")`.
+    A plain mixin (not a TestCase, so it is not collected on its own). The
+    concrete, collectable classes ``TestGather_cores{1,2,4,8,16,32}`` are
+    generated at the bottom of the module by ``register_multicore_variants``,
+    each pinned to its SENCORES value via ``@config.patch``.
     """
 
-    __test__ = False  # base scenario body; only TestGather collects it
     to_spyre = staticmethod(plain_to_spyre)
 
     def _xi(self, P=32, two_d=False, dtype=torch.int32, M=128, N=256, Q=192):
@@ -256,13 +259,6 @@ class _GatherScenarios(IndirectAccessTestCase):
         x, i = self._xi(P=32, dtype=torch.int64)
         self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
 
-    @pytest.mark.skip(
-        reason=(
-            "dxp_standalone SIGABRT: !allocNode->layoutDimOrder_.empty() — "
-            "P=1 gather collapses the mb loop, leaving the KERNEL_IDX with an "
-            "empty layoutDimOrder_; fix pending in SDSC coordinate generation"
-        )
-    )
     def test_advanced_indexing_single_row(self):
         x, i = self._xi(P=1)
         self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
@@ -395,13 +391,6 @@ class _GatherScenarios(IndirectAccessTestCase):
         x, i = self._xi3d(P=32, dtype=torch.int64)
         self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
 
-    @pytest.mark.skip(
-        reason=(
-            "dxp_standalone SIGABRT: !allocNode->layoutDimOrder_.empty() — "
-            "P=1 gather collapses the mb loop, leaving the KERNEL_IDX with an "
-            "empty layoutDimOrder_; fix pending in SDSC coordinate generation"
-        )
-    )
     def test_advanced_indexing_3d_single_row(self):
         x, i = self._xi3d(P=1)
         self._stage_and_e2e(lambda x, i: x[i], x, i, expect=GATHER_OP_SPEC)
@@ -472,24 +461,6 @@ class _GatherScenarios(IndirectAccessTestCase):
         j = torch.randint(0, A, (32,), dtype=torch.int32).to("spyre")
         self.name_dims(j, {"P": 32})
         self._stage_and_e2e(lambda x, i, j: x[i] + x[j], x, i, j, expect=GATHER_OP_SPEC)
-
-    @pytest.mark.skip(
-        reason=(
-            "per-core tensor span 512 MB (B=2, S=128, D=512, F=2048, fp16) "
-            "exceeds 256 MB hardware limit; work-division cannot split the "
-            "S=128 coordinate further"
-        )
-    )
-    def test_moe(self):
-        """MoE expert selection: expert_w[expert_ids] with 3D weights and 2D int64 index."""
-        E, D, F, B, S = 8, 512, 2048, 2, 128
-        expert_w = self.to_spyre(torch.rand(E, D, F, dtype=torch.float16))
-        expert_ids = torch.randint(0, E, (B, S), dtype=torch.int64).to("spyre")
-        self.name_dims(expert_w, {"E": E, "D": D, "F": F})
-        self.name_dims(expert_ids, {"B": B, "S": S})
-        self._stage_and_e2e(
-            lambda w, i: w[i], expert_w, expert_ids, expect=GATHER_OP_SPEC
-        )
 
     def test_paged_kv(self):
         """Paged KV-cache gather: keys[slot_idxs] with 3D cache and 2D int64 slot index."""
@@ -597,7 +568,7 @@ class _GatherScenarios(IndirectAccessTestCase):
 
     def test_gather_after_producer_exp_4d(self):
         """x.exp()[i] -- 4D gather with producer layout rewrite."""
-        M, N, K, L, P = 32, 32, 32, 64, 8
+        M, N, K, L, P = 128, 4, 4, 64, 8
         x = self.to_spyre(torch.rand(M, N, K, L, dtype=torch.float16))
         i = torch.randint(0, M, (P,), dtype=torch.int32).to("spyre")
         self.name_dims(x, {"M": M, "N": N, "K": K, "L": L})
@@ -1085,17 +1056,311 @@ class _GatherScenarios(IndirectAccessTestCase):
         self._stage_and_e2e(kernel, x, y, i, j, expect=GATHER_OP_SPEC)
 
 
-@config.patch({"sencores": 1})
-class TestGather(_GatherScenarios):
-    """Every gather scenario with a plain `.to("spyre")` source (no explicit
-    layout). The compiler picks the generic layout, so a multi-stick source
-    arrives with its indexed dim behind the stick-count dim; the gather-source
-    relayout pass must rotate it outermost.
-    """
+# Op-behaviour scenarios run once at the default 32 cores. They classify / lower
+# / run each op and do not depend on the core count, so sweeping all ~90 of them
+# across every SENCORES value added little coverage for a 7x test-count blowup.
+register_multicore_variants(_GatherScenarios, "TestGather", globals(), counts=(32,))
 
-    __test__ = True
+
+class _GatherMulticoreScenarios:
+    """Gather scenarios whose BEHAVIOUR depends on the core count -- swept across
+    SENCORES, unlike the op-behaviour scenarios above (which run once at 32). The
+    work-division split-map tests assert core_split at each count; the cross-core
+    test checks shared-table correctness under a real multi-core split; and
+    test_moe changes its shape by core count. See MULTICORE_SENCORES."""
+
     to_spyre = staticmethod(plain_to_spyre)
 
+    def test_moe(self):
+        """MoE expert selection: expert_w[expert_ids] with 3D weights and 2D int64 index."""
+        from torch_spyre._inductor import config
+
+        E, D, B, S = 8, 512, 2, 128
+        # 512 MB unsplit output overflows the 256 MB single-core span; shrink it
+        # only for SENCORES=1 and 2, where the output cannot be split across cores.
+        # TODO : Set one large size for all cores when span reduction is handled.
+        F = 2048 if config.sencores >= 3 else 512
+        expert_w = self.to_spyre(torch.rand(E, D, F, dtype=torch.float16))
+        expert_ids = torch.randint(0, E, (B, S), dtype=torch.int64).to("spyre")
+        self.name_dims(expert_w, {"E": E, "D": D, "F": F})
+        self.name_dims(expert_ids, {"B": B, "S": S})
+        self._stage_and_e2e(
+            lambda w, i: w[i], expert_w, expert_ids, expect=GATHER_OP_SPEC
+        )
+
+    def test_embedding_large_vocab_table_no_span_overflow(self):
+        """Vocab-scale table (V=262144, E=2816, ~1.4 GB): would overflow the
+        256 MB span limit if the indirectly-accessed vocab dim was used in full.
+        full, but that dim is never actually resident per-core."""
+        V, E = 262144, 2816
+        eps = get_elem_in_stick(torch.float16)
+        stick_count = (E + eps - 1) // eps
+        stl = SpyreTensorLayout(
+            device_size=[V, stick_count, eps],
+            stride_map=[E, eps, 1],
+            device_dtype=get_device_dtype(torch.float16),
+        )
+        table = torch.rand(V, E, dtype=torch.float16).to("spyre", device_layout=stl)
+        token_ids = torch.randint(0, V, (2, 128), dtype=torch.int64).to("spyre")
+        self.name_dims(table, {"V": V, "E": E})
+        self.name_dims(token_ids, {"B": 2, "S": 128})
+        self._stage_and_e2e(lambda t, i: t[i], table, token_ids, expect=GATHER_OP_SPEC)
+
+    # -- Work-division scenarios -----------------------------------------
+    # Swept across SENCORES, so each TestGatherMulticore_cores{N} variant
+    # checks the split map that N produces. The invariant for out = x[i]: the
+    # planner must split the index dim (c0) and never the value-table data dim
+    # (c1 = K) -- splitting K makes every core read address 0 of the shared
+    # table, silently returning wrong results. Shapes are chosen so the planner
+    # *would* prefer K (its largest output-coordinate dim) if the guard were
+    # absent. assert_indexed_dim_split() reads the current SENCORES and expects
+    # c0 to split by min(SENCORES, index_size // 32) with c1 pinned at 1.
+    #
+    # After the split-map check each scenario runs through the shared
+    # _stage_and_e2e path (fresh inputs, since run_and_get_code has already
+    # executed the split-map compile) -- the same capture-path stage checks +
+    # e2e leg every other gather scenario uses -- so the multicore split is also
+    # exercised end-to-end. (Skipped at sencores=1 by assert_indexed_dim_split
+    # -- nothing to divide.)
+
+    @staticmethod
+    def _gather_fn(table, idx):
+        return table[idx]
+
+    def test_work_division_index_split_full(self):
+        """Index dim has 32 sticks (Q=1024): it would split a full 32 ways, but
+        the indirect uint32 address cap (INDIRECT_ACCESS_MAX_CORES) holds it to
+        16-way at SENCORES=32 while K=64 stays unsplit -- verifying the split map
+        and that the cap keeps a full-scale index off the 32-way path the backend
+        rejects (a per-core address past 4 GB overflows uint32)."""
+
+        def make():
+            x = torch.rand(128, 64, 1024, dtype=torch.float16).to("spyre")
+            i = (torch.arange(1024) % 128).int().to("spyre")
+            return x, i
+
+        fn = self._gather_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=1024, data_size=64)
+        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
+
+    def test_work_division_index_split_capped(self):
+        """Index dim has only 8 sticks (Q=256): when SENCORES exceeds 8 the split
+        caps at 8 and must never spill onto the forbidden K dim."""
+
+        def make():
+            x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
+            i = (torch.arange(256) % 128).int().to("spyre")
+            return x, i
+
+        fn = self._gather_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=256, data_size=64)
+        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
+
+    def test_work_division_unaligned_data_dim(self):
+        """An unaligned value-table data dim (K=48, not divisible by any core
+        count) stays unsplit at every SENCORES."""
+
+        def make():
+            x = torch.rand(128, 48, 256, dtype=torch.float16).to("spyre")
+            i = (torch.arange(256) % 128).int().to("spyre")
+            return x, i
+
+        fn = self._gather_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=256, data_size=48)
+        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
+
+    # -- stick-aligned vs partial-last-stick index-entry counts -----------
+    # The index-entry dim is the index tensor's stick dim, so work division
+    # splits it in whole 32-entry sticks. A STICK-ALIGNED count (a multiple of
+    # 32) has always split cleanly. A NON-aligned count (a partial last stick)
+    # used to be forced onto one core, because an even per-core slice straddles
+    # the index stick boundary and the backend cannot step a sticked dim across it;
+    # the fix pads the gather output's entry dim up to the next whole stick
+    # (enforce_indirect_access_layout) so the split lands stick-aligned. Both
+    # kinds are swept across every SENCORES; the expected split for either is
+    # min(SENCORES, ceil(count / 32)) with the K data dim always pinned at 1.
+
+    def test_work_division_index_split_aligned_six_sticks(self):
+        """Stick-aligned index with exactly 6 sticks (P=192): a non-power-of-two
+        stick count, so the split is the largest divisor of 6 that fits the core
+        count -- 6 at SENCORES>=6, 3 at 4 cores, 2 at 2 -- exercising the
+        SENCORES=6 case. Complements the 8- and 32-stick aligned cases.
+        """
+
+        def make():
+            x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
+            i = (torch.arange(192) % 128).int().to("spyre")
+            return x, i
+
+        fn = self._gather_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=192, data_size=64)
+        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
+
+    def test_work_division_index_split_partial_stick(self):
+        """Non-stick-aligned index (P=40 = one full stick + a partial second):
+        the entry dim is padded up to ceil(40/32)=2 whole sticks so the split
+        lands stick-aligned (2 across any SENCORES>=2) instead of an even slice
+        that would straddle the index stick boundary and miscompile."""
+
+        def make():
+            x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
+            i = (torch.arange(40) % 128).int().to("spyre")
+            return x, i
+
+        fn = self._gather_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=40, data_size=64)
+        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
+
+    def test_work_division_index_split_partial_stick_mid(self):
+        """Non-stick-aligned index spanning several sticks (P=250, ceil=8 sticks):
+        the padded split scales past a single partial stick -- the non-aligned
+        counterpart of the aligned 8-stick test_work_division_index_split_capped,
+        splitting by the same largest divisor of 8 that fits the core count."""
+
+        def make():
+            x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
+            i = (torch.arange(250) % 128).int().to("spyre")
+            return x, i
+
+        fn = self._gather_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=250, data_size=64)
+        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
+
+    def test_work_division_index_split_partial_stick_full(self):
+        """Non-stick-aligned index at 32-stick scale (P=1000, ceil=32): the padded
+        split would reach a full 32-way division, but the indirect uint32 address
+        cap holds it to 16-way at SENCORES=32 -- the partial-stick counterpart of
+        test_work_division_index_split_full."""
+
+        def make():
+            x = torch.rand(128, 64, 256, dtype=torch.float16).to("spyre")
+            i = (torch.arange(1000) % 128).int().to("spyre")
+            return x, i
+
+        fn = self._gather_fn
+        _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *make())
+        self.assert_indexed_dim_split(source_codes[0], index_size=1000, data_size=64)
+        self._stage_and_e2e(fn, *make(), expect=GATHER_OP_SPEC)
+
+    # -- shared value table: cross-core read correctness ------------------
+    def test_gather_cross_core_shared_value(self):
+        """Every output row gathers a value row in a DIFFERENT core's work slice,
+        and must still be correct -- the value table is shared, not partitioned.
+
+        The table is row-identifying (weight[r, :] == r, exact in fp16 for
+        r < 2048), and the index maps output row i -> value row (i + V/2) % V:
+        always a half-table hop, so under any multi-core split the fetched row
+        belongs to another core's slice. The gather must match the CPU reference
+        exactly (expect_close=True) -- if the shared value tensor's per-core base
+        ever drifted with the work-division slice, a core would read a shifted
+        row and diverge. Runs at 32 cores, where the indirect uint32 address cap
+        holds the split to 16-way (still cross-core: a V/2 hop lands 8 cores
+        away), exercising the shared-table property at a real multicore split.
+        """
+        V, E = 1024, 128
+        weight = self.to_spyre(
+            torch.arange(V, dtype=torch.float16).unsqueeze(1).repeat(1, E)
+        )
+        idx = ((torch.arange(V) + V // 2) % V).to(torch.int32).to("spyre")
+        self.name_dims(weight, {"V": V, "E": E})
+        self.name_dims(idx, {"P": V})
+        self._stage_and_e2e(
+            lambda w, i: torch.embedding(w, i),
+            weight,
+            idx,
+            expect=GATHER_OP_SPEC,
+            expect_close=True,
+        )
+
+
+# Scenarios whose BEHAVIOUR varies with the core count -- the work-division
+# split-map tests, the cross-core correctness test, and test_moe (core-dependent
+# shape) -- are swept across all SENCORES values.
+register_multicore_variants(_GatherMulticoreScenarios, "TestGatherMulticore", globals())
+
+
+# ---------------------------------------------------------------------------
+# Registered through register_multicore_variants with a single count (32,) — so
+# it is a runtime-generated TestCase like the TestGather_cores* classes rather
+# than a literal class def. Pinned to sencores=32 because that is the only count
+# that exercises all 32 partial-stick buckets
+# ---------------------------------------------------------------------------
+class _EmbeddingAllIndexBucketsScenario:
+    """torch.embedding over every partial-stick index-stick count at sencores=32.
+
+    The index is int32 (32 entries/stick), so ceil(N/32) is the number of index
+    sticks -- and at SENCORES=32 the entry dim splits core_split(sticks, 32) ==
+    sticks ways, i.e. the stick count is also the core count.
+    For each count s:
+      N = s*32 - offset  (offset ∈ [1,31] seeded from s)
+      → N is non-stick-aligned, _pad_output_for_stick_aligned_split fires
+      → entry dim and hidden dim are co-split to keep per-core span ≤ 256 MB
+      → classified as GATHER_OP_SPEC, then validated end-to-end on the backend.
+    """
+
+    _A = 30000  # TODO : Increase the size when span reduction is handled.
+    _STICK = 4096
+
+    @staticmethod
+    def _embedding_fn(weight, input_ids):
+        return torch.embedding(weight, input_ids)
+
+    def _make(self, N):
+        weight = torch.rand(self._A, self._STICK, dtype=torch.float16).to("spyre")
+        input_ids = (torch.arange(N) % self._A).int().to("spyre")
+        return weight, input_ids
+
+    @staticmethod
+    def _n_for_index_sticks(sticks: int) -> int:
+        """Non-stick-aligned N spanning `sticks` index sticks: N = sticks*32 - offset."""
+        rng = torch.Generator()
+        rng.manual_seed(sticks)
+        offset = int(torch.randint(1, 32, (1,), generator=rng).item())
+        return sticks * 32 - offset
+
+    def _run_for_index_sticks(self, sticks: int):
+        N = self._n_for_index_sticks(sticks)
+        torch._dynamo.reset()
+        self._stage_and_e2e(self._embedding_fn, *self._make(N), expect=GATHER_OP_SPEC)
+
+
+def _make_index_sticks_test(sticks: int):
+    """One test method for a single partial-stick index-stick (== core) count."""
+
+    def test(self):
+        self._run_for_index_sticks(sticks)
+
+    # `sticks` index sticks == `sticks` cores at SENCORES=32 (core_split == sticks).
+    test.__name__ = test.__qualname__ = f"test_gather_{sticks:02d}_index_sticks"
+    test.__doc__ = (
+        f"Classify + e2e torch.embedding across {sticks} partial index stick(s) "
+        f"({sticks} cores at SENCORES=32)."
+    )
+    return test
+
+
+# Generate one collectible test method per index-stick count on the scenario
+# mixin BEFORE register_multicore_variants mixes it into the concrete TestCase,
+# so each stick count is an independent test rather than one serial 32-iteration
+# loop.
+for _sticks in range(1, 33):
+    _sticks_test = _make_index_sticks_test(_sticks)
+    setattr(_EmbeddingAllIndexBucketsScenario, _sticks_test.__name__, _sticks_test)
+del _sticks, _sticks_test
+
+
+register_multicore_variants(
+    _EmbeddingAllIndexBucketsScenario,
+    "TestEmbeddingAllIndexBuckets",
+    globals(),
+    counts=(32,),
+)
 
 if __name__ == "__main__":
     from torch._inductor.test_case import run_tests

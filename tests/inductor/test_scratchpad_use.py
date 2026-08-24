@@ -59,7 +59,7 @@ def test_nested_spyre_context_runs_pre_scheduling_once():
         def __call__(self, graph):
             calls.append(graph)
 
-    graph = SimpleNamespace()
+    graph = SimpleNamespace(graph=SimpleNamespace(owning_module=None))
     with (
         patch.object(passes, "CustomPreSchedulingPasses", CountingPreSchedulingPasses),
         patch.object(GraphLowering, "_update_scheduler", lambda _self: None),

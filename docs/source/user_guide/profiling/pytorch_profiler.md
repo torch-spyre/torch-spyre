@@ -16,7 +16,7 @@ Two modes are available:
 import torch
 from torch.profiler import profile, ProfilerActivity
 
-compiled = torch.compile(model, backend="spyre")
+compiled = torch.compile(model)
 
 with profile(activities=[ProfilerActivity.CPU]) as prof:
     output = compiled(x_spyre)

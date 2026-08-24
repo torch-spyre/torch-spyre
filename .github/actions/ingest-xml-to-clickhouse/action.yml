@@ -27,7 +27,13 @@ inputs:
     required: false
     default: ''
   run-id:
-    description: Triggering run id recorded against the rows.
+    description: >
+      UUID identifying the test run, threaded from the dispatching orchestrator so
+      test_runs joins artifact_results. Empty on a GHA-only run, which mints its own.
+    required: false
+    default: ''
+  gha-run-id:
+    description: Numeric GitHub Actions run id, used as the dedup key.
     required: false
     default: ''
   triggered-at:
@@ -191,6 +197,7 @@ runs:
           --branch "${{ inputs.branch }}" \
           --sha "${{ inputs.sha }}" \
           --run-id "${{ inputs.run-id }}" \
+          --gha-run-id "${{ inputs.gha-run-id }}" \
           --triggered-at "${{ inputs.triggered-at }}" \
           --pr-number "${{ inputs.pr-number }}" \
           --trigger-type "${{ inputs.trigger-type }}" \

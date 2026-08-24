@@ -35,7 +35,13 @@ from torch_spyre._C import ElementArrangement
 
 from .constants import BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP
 from .errors import Unsupported
-from .pass_utils import concretize_expr, indirect_info_from_op, op_read_writes
+from .pass_utils import (
+    concretize_expr,
+    indirect_forbidden_split_syms,
+    indirect_store_entry_syms,
+    is_topk,
+    op_read_writes,
+)
 from .logging_utils import get_inductor_logger
 from . import config
 
@@ -70,10 +76,23 @@ class ConstraintResult:
     exactly the given split (composes by equality; two constraints pinning the
     same dim to different values is a modeling conflict, not something to
     silently resolve — see collect_work_division_constraints).
+
+    ``forbidden`` dims must NEVER be split anywhere — a hard correctness rule
+    stronger than ``blocked``. Unlike ``blocked`` (which the distribution passes
+    honour but span reduction may still override to satisfy the memory-span
+    limit), a ``forbidden`` dim is filtered out of the span-reduction candidate
+    set too, so it is never split under any circumstance. Used for shared
+    gather/scatter table data dims.
+
+    ``force_output`` dims are promoted to output-split priority even when they
+    don't appear in the output coordinates (a scatter's index-entry dim, whose
+    destination row is runtime-chosen). Composes by union.
     """
 
     blocked: set[Symbol] = dataclasses.field(default_factory=set)
     pinned: dict[Symbol, int] = dataclasses.field(default_factory=dict)
+    forbidden: set[Symbol] = dataclasses.field(default_factory=set)
+    force_output: set[Symbol] = dataclasses.field(default_factory=set)
 
 
 def collect_work_division_constraints(
@@ -91,6 +110,8 @@ def collect_work_division_constraints(
     """
     blocked: set[Symbol] = set()
     pinned: dict[Symbol, int] = {}
+    forbidden: set[Symbol] = set()
+    force_output: set[Symbol] = set()
     for constraint in (
         coordinate_mask_blocked_vars,
         conv_spatial_blocked_vars,
@@ -98,7 +119,7 @@ def collect_work_division_constraints(
         qfp8wt_matmul_k_pinned,
         topk_pinned_search_space_vars,
         topk_k_split_constraint,
-        indirect_access_pinned_vars,
+        indirect_access_constraints,
     ):
         result = constraint(ctx)
 
@@ -112,6 +133,8 @@ def collect_work_division_constraints(
                 f"the constraint is not honoured for those dims."
             )
         blocked |= result.blocked - forced
+        forbidden |= result.forbidden
+        force_output |= result.force_output
 
         for sym, split in result.pinned.items():
             committed_split = ctx.committed_splits.get(sym)
@@ -129,7 +152,12 @@ def collect_work_division_constraints(
                 )
             pinned[sym] = split
 
-    return ConstraintResult(blocked=blocked, pinned=pinned)
+    return ConstraintResult(
+        blocked=blocked,
+        pinned=pinned,
+        forbidden=forbidden,
+        force_output=force_output,
+    )
 
 
 def coordinate_mask_blocked_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
@@ -241,11 +269,7 @@ def topk_pinned_search_space_vars(ctx: WorkDivConstraintContext) -> ConstraintRe
     the top-k results. Splitting the search-space would require merging
     partial top-k results across cores, which the hardware does not support.
     """
-    from .constants import TOPK_OPS
-
-    if not isinstance(ctx.op.data, Reduction):
-        return ConstraintResult()
-    if ctx.op.data.reduction_type not in TOPK_OPS:
+    if not is_topk(ctx.op):
         return ConstraintResult()
 
     return ConstraintResult(pinned={v: 1 for v in ctx.reduction_vars})
@@ -260,12 +284,9 @@ def topk_k_split_constraint(ctx: WorkDivConstraintContext) -> ConstraintResult:
     work_distribution planner picks the minimal k-split rather than a
     larger one that leaves more cores for other dims.
     """
-    from .constants import TOPK_OPS
     from sympy import divisors
 
-    if not isinstance(ctx.op.data, Reduction):
-        return ConstraintResult()
-    if ctx.op.data.reduction_type not in TOPK_OPS:
+    if not is_topk(ctx.op):
         return ConstraintResult()
 
     # Find k's symbol (output dim absent from every input's device coords).
@@ -303,14 +324,26 @@ def topk_k_split_constraint(ctx: WorkDivConstraintContext) -> ConstraintResult:
     return ConstraintResult()
 
 
-def indirect_access_pinned_vars(ctx: WorkDivConstraintContext) -> ConstraintResult:
-    """Pin every dim to split=1 for ops with indirect (gather/scatter-style) access.
+def indirect_access_constraints(ctx: WorkDivConstraintContext) -> ConstraintResult:
+    """Split rules for indirect (gather/scatter-style) access. Empty for other ops.
 
-    The backend's indirect-addressing path runs single-core: an indexed
-    dimension's coordinate depends on runtime data, not a static per-core
-    offset, so the generic per-core span/coordinate arithmetic does not apply.
+    ``forbidden`` — a gather value table / scatter destination stays at the same
+    base address on every core, its row chosen at runtime by IndirectAccess.
+    Splitting a data (non-row) dimension would give each core a different base
+    into that shared table and miscompile, so those dims must NEVER be split — a
+    hard constraint : span reduction must not split them either. Also covers the
+    partial-last-stick index-entry dim.
+
+    ``force_output`` — a scatter's destination row is runtime-chosen, so its
+    index-entry dim never appears in the output coordinates and would otherwise
+    be classed as a reduction dim and left unsplit. Promoting it lets each core
+    write a disjoint set of source rows in parallel.
+
+    Together these supersede the old blanket single-core pin: the entry/output
+    dims stay splittable, enabling multicore indirect access.
     """
-    dep_names, _, _ = indirect_info_from_op(ctx.op)
-    if not dep_names:
-        return ConstraintResult()
-    return ConstraintResult(pinned={v: 1 for v in ctx.it_space_adjusted})
+    forbidden = indirect_forbidden_split_syms(ctx.op)
+    return ConstraintResult(
+        forbidden=forbidden,
+        force_output=indirect_store_entry_syms(ctx.op, forbidden),
+    )

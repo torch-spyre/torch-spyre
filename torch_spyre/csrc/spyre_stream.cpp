@@ -276,7 +276,8 @@ void SpyreStream::fillAsync(const flex::CompositeAddress* dst, double value,
 }
 
 void SpyreStream::launch(const JobPlan& plan,
-                         const std::vector<at::Tensor>& args) const {
+                         const std::vector<at::Tensor>& args,
+                         std::vector<SymbolicArg> symbolic_args) const {
   // Validate all tensors are on Spyre device
   for (size_t i = 0; i < args.size(); ++i) {
     TORCH_CHECK(args[i].is_privateuseone(), "SpyreStream::launch: argument ", i,
@@ -294,8 +295,11 @@ void SpyreStream::launch(const JobPlan& plan,
   const SpyreStream s_prep =
       getHostComputeStreamById(kHostComputeStreamStartPerDevice, device());
 
-  // Create launch context with tensor arguments.
-  LaunchContext ctx{args};
+  // Create launch context with tensor arguments and typed symbolic payload.
+  // symbolic_args is moved in so the closure in
+  // JobPlanStepHostCompute::construct can capture it by value without an extra
+  // copy.
+  LaunchContext ctx{args, std::move(symbolic_args)};
 
   // Split Prep-role steps onto S_prep only when the flex tracker is on; flex
   // then inserts the cross-stream edges. Off = every step on S_dev (the
