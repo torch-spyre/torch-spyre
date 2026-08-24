@@ -207,6 +207,30 @@ def _remap_result(result, lookup):
     return _map_result(result, lambda t: lookup.get(id(t), t))
 
 
+def _check_same_device(args, kwargs):
+    """Raise if the tensor arguments span more than one device."""
+    devices = set()
+
+    def collect(x):
+        if isinstance(x, torch.Tensor):
+            devices.add(x.device)
+        elif isinstance(x, (list, tuple)):
+            for e in x:
+                collect(e)
+
+    for a in args:
+        collect(a)
+    for v in kwargs.values():
+        collect(v)
+
+    if len(devices) > 1:
+        d0, d1 = sorted(devices, key=str)[:2]
+        raise RuntimeError(
+            "Expected all tensors to be on the same device, but found at "
+            f"least two devices, {d0} and {d1}!"
+        )
+
+
 def _make_offset_safe_dispatch(op):
     """Build a dispatch wrapper that keeps nonzero-offset Spyre tensors correct
     across the standalone-compiled kernel.
@@ -228,6 +252,7 @@ def _make_offset_safe_dispatch(op):
     normalize_results = not (write_positions or write_names)
 
     def dispatch(*args, compiled=None, **kwargs):
+        _check_same_device(args, kwargs)
         write_back = []  # (clone, original) for each substituted write view
 
         def prep_write(x):
