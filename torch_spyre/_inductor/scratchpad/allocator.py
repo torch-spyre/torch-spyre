@@ -313,7 +313,7 @@ class ScratchpadAllocator:
         buffers = self._prepare_buffers(graph)
         solver = self._build_solver(buffers)
         allocation = self._solve(solver, graph)
-        accepted_lx_relayouts = self._finalize_lx_relayout_allocation(allocation)
+        accepted_lx_relayouts = self._finalize_lx_relayout_allocation(allocation, graph)
         self._post_solve(graph, allocation)
         reasons = self._get_spill_reasons(solver, allocation)
         self._push_allocation(graph, allocation, accepted_lx_relayouts)
@@ -354,6 +354,7 @@ class ScratchpadAllocator:
     def _finalize_lx_relayout_allocation(
         self,
         allocation: Sequence[LifetimeBoundBuffer],
+        graph: GraphLowering,
     ) -> list[LXRelayoutPlan]:
         plans = [plan for buffer in allocation for plan in buffer.lx_relayout_plans]
         if not plans:
@@ -1939,16 +1940,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         assert not any(buffer.lx_relayout_plans for buffer in result), (
             "CoOptimizingAllocator does not support LX relayout"
         )
-        # Materialization guard: the solver can now CHOOSE relayouts, but the
-        # commit path that materializes them does not exist yet. Committing a
-        # fired edge without its shuffle would hand the consumer a mismatched
-        # LX slicing - fail loudly instead of producing wrong code.
-        assert not any(
-            getattr(buffer, "chosen_relayouts", None) for buffer in result
-        ), (
-            "solver chose LX relayouts but their materialization is not "
-            "implemented yet; run with SPYRE_LX_SOLVER_RELAYOUT=0"
-        )
         return result
 
     def _extract_op_features(self, graph, output_name, buffers, is_lx):
@@ -1969,6 +1960,89 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         op = graph.get_buffer(output_name)
         ws = _work_slices(op, CoreDivision(sym_core_divs[0], sym_core_divs[1]))
         return extract_op_features(op, ws, is_lx)
+
+    def _finalize_lx_relayout_allocation(
+        self,
+        allocation: Sequence[LifetimeBoundBuffer],
+        graph: GraphLowering,
+    ) -> list[LXRelayoutPlan]:
+        """Turn the solver's fired relayout edges into materializable plans.
+
+        The solver already guaranteed everything the greedy path checks after
+        the fact: both endpoints are placed (the destination rectangle's
+        presence literal IS the decision variable), the pair's divisions are
+        pinned by the same literals that carried the cost, and the 2D
+        no-overlap kept source and destination disjoint. What remains is
+        reconstructing the two PerCoreViews under the CHOSEN divisions - the
+        same prep machinery the enumeration priced them with - and handing
+        ``materialize_lx_relayouts`` the plans with solved addresses.
+        """
+        plans: list[LXRelayoutPlan] = []
+        by_name = {b.name: b for b in allocation}
+        op_by_name = {op.get_name(): op for op in graph.operations}
+        prep_cache: dict = {}
+        for consumer in allocation:
+            chosen = getattr(consumer, "chosen_relayouts", None)
+            if not chosen:
+                continue
+            for parent, (i, j, dest_address) in chosen.items():
+                source = by_name[parent]
+                assert source.chosen_division == i and consumer.chosen_division == j, (
+                    f"relayout pair ({i}, {j}) disagrees with committed divisions "
+                    f"({source.chosen_division}, {consumer.chosen_division}) on "
+                    f"{parent} -> {consumer.name}"
+                )
+                assert source.address is not None, (
+                    f"relayout source {parent} has no LX address"
+                )
+                parent_op = op_by_name[parent]
+                consumer_op = op_by_name[consumer.name]
+                write_dep = next(
+                    w
+                    for w in op_read_writes(parent_op).writes
+                    if w.name == parent and hasattr(w, "index")
+                )
+                read_dep = next(
+                    r
+                    for r in op_read_writes(consumer_op).reads
+                    if r.name == parent and hasattr(r, "index")
+                )
+                ((src_view, src_partial, src_ok),) = self._views_for_divs(
+                    parent_op,
+                    write_dep,
+                    parent,
+                    [source.core_divisions[i]],
+                    prep_cache,
+                )
+                ((dst_view, _dst_partial, dst_ok),) = self._views_for_divs(
+                    consumer_op,
+                    read_dep,
+                    parent,
+                    [consumer.core_divisions[j]],
+                    prep_cache,
+                )
+                # The views must reproduce what the enumeration priced; any
+                # drift here means the solver decided on one geometry and we
+                # would execute another.
+                assert src_ok and dst_ok and not src_partial, (
+                    f"relayout views for {parent} -> {consumer.name} are no "
+                    "longer representable under the chosen divisions"
+                )
+                assert src_view != dst_view, (
+                    f"relayout {parent} -> {consumer.name} chose equal views"
+                )
+                plans.append(
+                    LXRelayoutPlan(
+                        parent,
+                        (consumer.name,),
+                        src_view,
+                        dst_view,
+                        source.core_divisions[i].cores_used,
+                        source_address=source.address,
+                        destination_address=dest_address,
+                    )
+                )
+        return plans
 
     def _post_solve(self, graph: GraphLowering, allocation: Sequence[Any]) -> None:
         # The divisions must be committed such that any buffer clones can correctly
@@ -2716,10 +2790,11 @@ def select_allocator() -> ScratchpadAllocator:
     )
 
     if config.co_optimizing_lx_planning:
-        if config.lx_planner_relayout:
+        if config.lx_planner_relayout and not config.lx_solver_relayout:
             logger.debug(
                 "LX relayout is not supported by CoOptimizingAllocator; "
-                "continuing without relayout"
+                "continuing without relayout (the solver-decided path is "
+                "available via SPYRE_LX_SOLVER_RELAYOUT=1)"
             )
         if config.layout_solver == "simulated_annealing":
             return CoOptimizingAllocator(
