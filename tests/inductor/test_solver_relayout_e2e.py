@@ -179,5 +179,23 @@ def test_relayout_fires_naturally_on_a_hinted_graph(monkeypatch):
     assert dict(plan.source_view.work_slice_dims) == {0: 2, 2: 4}
     assert dict(plan.destination_view.work_slice_dims) == {0: 4, 2: 2}
     assert plan.num_cores == 8
+
+    # The full per-core ownership mapping, via the same authority the
+    # compatibility gate uses. Source: core c owns M-half floor(c/4) and
+    # B-quarter c%4; destination: M-quarter floor(c/2) and B-half c%2.
+    from torch_spyre._inductor.scratchpad.lx_relayout import _core_slices
+
+    assert _core_slices(plan.source_view, 8) == {
+        c: {0: c // 4, 2: c % 4} for c in range(8)
+    }
+    assert _core_slices(plan.destination_view, 8) == {
+        c: {0: c // 2, 2: c % 2} for c in range(8)
+    }
+    # Addresses are solver placement choices (assert legality, not values):
+    # per-core footprint is 2.10 MB / 8 = 262144 B per side, both slices
+    # resident simultaneously and disjoint.
+    per_core = 2097152 // 8
+    lo, hi = sorted((plan.source_address, plan.destination_address))
+    assert lo + per_core <= hi, "source and destination overlap in LX"
     ref = torch.relu(torch.neg(host.float())).to(torch.float16)
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
