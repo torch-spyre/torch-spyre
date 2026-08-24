@@ -15,6 +15,7 @@
 import dataclasses
 import math
 from collections import Counter
+from collections.abc import Iterable
 from typing import Any
 
 from sympy import Expr, Integer, Symbol
@@ -420,9 +421,8 @@ def _get_padded_iteration_space(
         layout = layouts[sdsc_arg.layout]
         stick_dim_order = layout["stick_dim_order"]
         stick_size = layout["stick_size"]
-        dev_size = op_spec_arg.device_size[-2::-1]
-        for idx, dim in enumerate(dim_order):
-            if idx >= len(dev_size) or dim not in stick_dim_order:
+        for dim in dim_order:
+            if dim not in stick_dim_order:
                 continue
             effective_stick_size = (
                 stick_size[0] if len(stick_size) == 1 else stick_size[0] * stick_size[1]
@@ -1020,6 +1020,11 @@ def _get_op_dim_labels(ndim: int, is_matmul: bool, is_conv2d: bool) -> list[str]
         return CONV2D_DIM_LABELS[len(CONV2D_DIM_LABELS) - ndim :]
     else:
         return INPUT_DIM_LABELS[: ndim - 1] + OUTPUT_DIM_LABELS[:1]
+
+
+def _first_free_dim_label(taken: Iterable[Symbol]) -> Symbol:
+    names = {sym.name for sym in taken}
+    return Symbol(next(lbl for lbl in INPUT_DIM_LABELS if lbl not in names))
 
 
 def _get_tensor_layout_labels(use_op_dims: bool, op_name: str) -> list[str]:
@@ -1818,12 +1823,12 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     # On-device type-conversion ops (DL16TOFP32/FP32TODL16, not identity)
     # require at least one outer spatial dim beyond the stick; inject a
     # virtual mb=1 row when the op's tensor has only the stick dim.
+    # op_dim_order is empty for a degenerate stick dim, which has no loop symbol.
     mb_sym: Symbol | None = None
     if (
         (DtypeOpTable.is_dtype_op(op_spec.op) or op_spec.op == "qfp8ch")
         and op_spec.op != IDENTITY_OP
-        and op_stick_dim is not None
-        and all(d is op_stick_dim for d in op_dim_order)
+        and (op_dim_order == [] or op_dim_order == [op_stick_dim])
     ):
         mb_sym = Symbol(INPUT_DIM_LABELS[0])
         sdsc_iteration_space = {mb_sym: 1, **sdsc_iteration_space}
@@ -1850,16 +1855,12 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             idx_dim_order, _ = _get_device_dim_order(idx_arg, symbol_mapping)
             if not idx_dim_order:
                 # P=1: all-constant coords, no loop variable.
-                _existing_names = {s.name for s in op_dim_order}
-                _p1_label = next(
-                    lbl for lbl in INPUT_DIM_LABELS if lbl not in _existing_names
-                )
-                mb_sym = Symbol(_p1_label)
+                mb_sym = _first_free_dim_label(op_dim_order)
                 _inject_index_dim(mb_sym, prepend=True)
                 logger.debug(
                     "P=1 gather detected (index tensor %d): injecting virtual %s=1",
                     idx,
-                    _p1_label,
+                    mb_sym.name,
                 )
                 break
 
@@ -1872,19 +1873,13 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                 idx_arg, symbol_mapping
             )
             if idx_dim_order and idx_stick_dim is None:
-                _existing_names = {s.name for s in op_dim_order} | {
-                    s.name for s in idx_dim_order
-                }
-                _stick_label = next(
-                    lbl for lbl in INPUT_DIM_LABELS if lbl not in _existing_names
-                )
-                stick_sym = Symbol(_stick_label)
+                stick_sym = _first_free_dim_label([*op_dim_order, *idx_dim_order])
                 _inject_index_dim(stick_sym, prepend=False)
                 index_stick_syms[idx] = stick_sym
                 logger.debug(
                     "Index tensor %d: stick coordinate absent; injecting %s",
                     idx,
-                    _stick_label,
+                    stick_sym.name,
                 )
 
     if op_stick_dim is None:
@@ -1924,10 +1919,10 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             else:
                 sdsc_iteration_space[stick_sym] = int(op_spec.node_output_ranges[1])
         else:
-            stick_sym = Symbol(INPUT_DIM_LABELS[ndim])
-            sdsc_iteration_space[stick_sym] = op_spec.args[
-                0
-            ].device_dtype.elems_per_stick()
+            # A degenerate dim has logical size 1; _get_padded_iteration_space
+            # later pads it up to a full stick, per arg by that arg's own width.
+            stick_sym = _first_free_dim_label(sdsc_iteration_space)
+            sdsc_iteration_space[stick_sym] = 1
         work_slices[stick_sym] = 1
         dim_splits[stick_sym] = 1
 

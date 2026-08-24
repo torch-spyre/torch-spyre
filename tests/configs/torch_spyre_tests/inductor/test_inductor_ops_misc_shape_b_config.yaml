@@ -39,6 +39,9 @@ test_suite_config:
             - TestOps::test_to_dtype.*
             - TestOps::test_round_trip_to_dtype.*
             - TestOps::test_reduction_with_to_dtype.*
+            # upcast+reduction layout regressions: a size-1 num-sticks dim
+            # colliding with a same-stride host dim, and a stick-dim slice
+            - TestOps::test_upcast_reduction.*
             - TestOps::test_add_constant.*
             - TestOps::test_repeat.*
             - TestOps::test_restickify_fp32_unsupported_xfail

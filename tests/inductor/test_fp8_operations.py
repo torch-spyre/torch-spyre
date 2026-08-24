@@ -21,8 +21,12 @@ Tests cover:
 - quantize/dequantize: Comprehensive roundtrip tests with various scales and input ranges
 """
 
+import math
+
 import pytest
 import torch
+
+from torch._inductor.exc import InductorError
 
 from torch_spyre._inductor.constants import FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from utils_inductor import (
@@ -224,6 +228,9 @@ class TestFP8Operations:
             (1, 128, 1024),
             (1, 128, 2048),
             (1, 128, 4096),
+            (1, 2, 200),
+            (1, 2, 193),
+            (1, 2, 256),
         ],
     )
     def test_quantize_dequantize_fp8_production_shapes(self, shape):
@@ -247,6 +254,83 @@ class TestFP8Operations:
             ).to(torch.float16) * scale
 
         compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.5, rtol=0.1)
+
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (1, 2, 129),
+            (1, 2, 192),
+            (1, 2, 320),
+            (1, 2, 520),
+            (1, 128, 192),
+            (1, 128, 576),
+        ],
+    )
+    def test_quantize_fp8_odd_input_stick_count_rejected(self, shape):
+        """Quantizing an odd number of FP16 sticks is rejected, not miscompiled.
+
+        FP8 holds 128 elements per stick against FP16's 64, so an innermost extent
+        spanning an odd number of FP16 sticks would have to fill half an FP8 stick.
+        The missing half has no source data, so the operation is refused until the
+        input can be padded.
+        """
+        x = cached_randn(shape, dtype=torch.float16, scale=1.0) * 2.0 + 1.0
+        scale = torch.tensor([1.0], dtype=torch.float16)
+
+        def spyre_fn(x, scale):
+            x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+            return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
+
+        compiled = torch.compile(spyre_fn, backend="inductor")
+        # Inductor wraps the backend's Unsupported in an InductorError.
+        with pytest.raises(InductorError, match="the input needs padding to"):
+            compiled(x.to("spyre"), scale.to("spyre"))
+
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (1, 64),
+            (2, 64),
+            (3, 64),
+            (4, 64),
+            (5, 64),
+            (8, 64),
+            (64, 64),
+            (1, 1, 64),
+            (2, 2, 64),
+            (2, 4, 64),
+        ],
+    )
+    def test_quantize_dequantize_fp8_single_stick_rows(self, shape):
+        """A single-stick innermost extent round-trips every row, not just some.
+
+        The FP8 output holds half as many sticks as its FP16 input, so the number
+        of sticks each layout carries has to be rescaled on the dim that counts
+        them.  When a shape leaves that count at 1 -- an innermost extent of one
+        full FP16 stick -- the rescale must still land on the counting dim and
+        nowhere else, or rows outside the one it does reach read memory the
+        conversion never wrote.
+
+        The inputs are powers of two that FP8 E4M3 represents exactly, so a
+        correct round trip is the identity and the comparison needs no tolerance:
+        a partially written output shows up as an exact mismatch rather than as
+        drift that a tolerance could absorb.
+        """
+        exact_in_fp8 = torch.tensor([0.25, 0.5, 1.0, 2.0], dtype=torch.float16)
+        numel = math.prod(shape)
+        x = exact_in_fp8[torch.arange(numel) % len(exact_in_fp8)].reshape(shape)
+        scale = torch.tensor([1.0], dtype=torch.float16)
+
+        def spyre_fn(x, scale):
+            x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale)
+            return torch.ops.spyre.dequantize_fp8_with_scale(x_fp8, scale)
+
+        def pytorch_fn(x, scale):
+            return (x / scale).clamp(FP8_E4M3FN_MIN, FP8_E4M3FN_MAX).to(
+                torch.float8_e4m3fn
+            ).to(torch.float16) * scale
+
+        compare_with_pytorch(spyre_fn, pytorch_fn, x, scale, atol=0.0, rtol=0.0)
 
     def _run_quantize_dequantize_fp8_test(
         self,
