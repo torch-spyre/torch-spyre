@@ -376,6 +376,16 @@ def adjust_it_space_for_sticks(
     return adjusted_space, max_elems
 
 
+def _is_indirectly_accessed(td: TensorDep) -> bool:
+    """True if any of ``td``'s device coordinates carries an IndirectAccess marker.
+
+    Such a tensor is a gather value table or scatter destination: every core
+    addresses it at a runtime-chosen row, so it is never split and none of its
+    dims should be treated as a normal iteration-space axis.
+    """
+    return any(coord.has(IndirectAccess) for coord in td.device_coords[:-1])
+
+
 def get_per_core_span(
     td: TensorDep,
     splits: dict[Symbol, int],
@@ -401,7 +411,7 @@ def get_per_core_span(
     device_size = td.layout.device_layout.device_size
     itemsize = td.layout.dtype.itemsize
     for d, coord in enumerate(td.device_coords[:-1]):
-        if hasattr(coord, "has") and coord.has(IndirectAccess):
+        if coord.has(IndirectAccess):
             # Data-dependent gather axis: any core may address any row, so the
             # whole device extent counts toward the span and this axis is never
             # split. Returning the full extent here also avoids looking up the
@@ -438,8 +448,13 @@ def raise_if_per_core_overflow(
     op_name: str,
     symbol_meta: SymbolMeta,
 ) -> None:
-    """Raise Unsupported if any tensor's per-core memory span exceeds MAX_SPAN_BYTES."""
+    """Raise Unsupported if any tensor's per-core memory span exceeds MAX_SPAN_BYTES.
+
+    Indirectly-accessed tensors (shared gather/scatter tables) are skipped.
+    """
     for td in tensor_deps:
+        if _is_indirectly_accessed(td):
+            continue
         per_core_span = get_per_core_span(td, splits, it_space_orig, symbol_meta)
         if per_core_span > MAX_SPAN_BYTES:
             dl = td.layout.device_layout
