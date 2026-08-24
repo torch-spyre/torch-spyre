@@ -316,11 +316,16 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # (a permutation), priced by the fitted relayout law. Sibling of
     # ``cd_parent_matches`` (which holds the free, equal-view pairs); populated
     # only under ``config.lx_solver_relayout``, for the CP-SAT solver's
-    # relayout decision variables (nothing reads it yet).
+    # relayout decision variables.
     cd_parent_relayouts: dict[str, list[tuple[int, int, float]]] = field(
         default_factory=dict
     )
     chosen_division: Optional[int] = None
+    # Solver-chosen relayouts feeding this consumer: parent_buf_name ->
+    # (parent_div_idx, this_div_idx, destination_address_bytes). Written back by
+    # the CP-SAT solver when a relayout decision variable fires; consumed by
+    # the commit path that materializes the relayouts (not implemented yet).
+    chosen_relayouts: dict[str, tuple[int, int, int]] = field(default_factory=dict)
     boundary: BufferType = BufferType.Intermediate
 
     @property
@@ -374,6 +379,17 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
         sym_output_splits = {key: sym("output", key) for key in output_keys}
         sym_reduction_splits = {key: sym("reduction", key) for key in reduction_keys}
         return (sym_output_splits, sym_reduction_splits)
+
+
+def relayout_symbol(consumer: str, parent: str) -> sympy.Symbol:
+    """The sympy symbol carrying one relayout edge's cost in the objective.
+
+    Shared by the allocator (which appends the symbol to the cost expression)
+    and the CP-SAT solver (which binds it to the float-weighted sum over the
+    edge's pair literals), so the two sides can never disagree on name or
+    assumptions - a mismatch would be a NameError at lambdify time.
+    """
+    return sympy.Symbol(f"relayout_ns__{consumer}__{parent}", nonnegative=True)
 
 
 def check_in_place_parent_is_read(

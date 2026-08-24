@@ -63,6 +63,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     MemoryPlanSolver,
     SolveError,
     BufferType,
+    relayout_symbol,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
@@ -1923,9 +1924,30 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             )
         except (ValueError, RuntimeError):
             cost_expr = None
+
+        # One additive symbol per relayout-eligible edge; the solver binds each
+        # to the float-weighted sum over that edge's pair literals, so the
+        # objective charges exactly the chosen pair's fitted shuffle cost and
+        # zero when the edge is off. Skipped when the bundle scoring failed:
+        # the solver then runs its fallback objective, under which every
+        # relayout edge is pinned off.
+        if cost_expr is not None:
+            for buf in solver.buffers:
+                for parent in getattr(buf, "cd_parent_relayouts", {}):
+                    cost_expr = cost_expr + relayout_symbol(buf.name, parent)
         result = solver.plan_layout_and_core_divisions(cost_expr)
         assert not any(buffer.lx_relayout_plans for buffer in result), (
             "CoOptimizingAllocator does not support LX relayout"
+        )
+        # Materialization guard: the solver can now CHOOSE relayouts, but the
+        # commit path that materializes them does not exist yet. Committing a
+        # fired edge without its shuffle would hand the consumer a mismatched
+        # LX slicing - fail loudly instead of producing wrong code.
+        assert not any(
+            getattr(buffer, "chosen_relayouts", None) for buffer in result
+        ), (
+            "solver chose LX relayouts but their materialization is not "
+            "implemented yet; run with SPYRE_LX_SOLVER_RELAYOUT=0"
         )
         return result
 
@@ -2495,8 +2517,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         ``collect_lx_relayout_plans``; the per-pair gates (permutation
         compatibility, projectable ownership on both frames, the law's fitted
         split range) live in ``solver_relayout_pair_cost``. Gated on
-        ``config.lx_solver_relayout``; no solver variable consumes the
-        tables yet.
+        ``config.lx_solver_relayout``.
         """
         if not config.lx_solver_relayout or config.ktir_emitter:
             return {}
