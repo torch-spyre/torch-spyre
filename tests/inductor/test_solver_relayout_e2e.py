@@ -127,3 +127,57 @@ def test_flag_off_materializes_nothing(monkeypatch):
     # 2**-9 relative, and 2**-7 absolute for values in [4, 8).
     ref = (torch.relu(torch.neg(host.float())) + 1.0).to(torch.float16)
     torch.testing.assert_close(out.cpu(), ref, rtol=2**-8, atol=2**-6)
+
+
+def test_relayout_fires_naturally_on_a_hinted_graph(monkeypatch):
+    """The measurement harness's own graph, un-forced: neg hinted {B:4, M:2}
+    feeding relu hinted {B:2, M:4}. Co-opt candidates honor work_div hints
+    (user hints take ownership of the split decision), so the two ops are
+    pinned to genuinely different divisions: no match exists, the relayout
+    table holds exactly the canonical measured pair, and the solver fires it
+    on economics alone (~8.8 us shuffle vs ~80 us demoted round trip). The
+    only patch below is a read-only spy."""
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+
+    recorded = []
+    real_materialize = alloc_mod.materialize_lx_relayouts
+
+    def spy(graph, plans):
+        recorded.extend(plans)
+        return real_materialize(graph, plans)
+
+    monkeypatch.setattr(alloc_mod, "materialize_lx_relayouts", spy)
+
+    torch._inductor.codecache.FxGraphCache.clear()
+    torch._dynamo.reset()
+
+    def fn(t):
+        with spyre_hint(work_div={"B": 4, "M": 2}):
+            hidden = torch.neg(t)
+        with spyre_hint(work_div={"B": 2, "M": 4}):
+            return torch.relu(hidden)
+
+    torch.manual_seed(0)
+    host = torch.randn(8, 256, 512, dtype=torch.float16)
+    for name, size in (("B", 8), ("M", 256), ("K", 512)):
+        _pnd.declare_tensor_dim(name, size)
+    x = _pnd.name_tensor_dims(host.to("spyre"), ["B", "M", "K"])
+    with config.patch(
+        {
+            "co_optimizing_lx_planning": True,
+            "layout_solver": "cpsat",
+            "lx_solver_relayout": True,
+        }
+    ):
+        out = torch.compile(fn, dynamic=False)(x)
+
+    assert len(recorded) == 1, f"expected one natural relayout: {recorded}"
+    plan = recorded[0]
+    # The canonical measured pair: producer {B:4, M:2} vs consumer {B:2, M:4}
+    # on device [256, 8, 8, 64] (dim 0 <- M, dim 2 <- B).
+    assert dict(plan.source_view.work_slice_dims) == {0: 2, 2: 4}
+    assert dict(plan.destination_view.work_slice_dims) == {0: 4, 2: 2}
+    assert plan.num_cores == 8
+    ref = torch.relu(torch.neg(host.float())).to(torch.float16)
+    torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)

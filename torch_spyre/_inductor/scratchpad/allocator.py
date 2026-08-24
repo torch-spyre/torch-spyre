@@ -51,6 +51,7 @@ from torch_spyre._inductor.pass_utils import (
 )
 from torch_spyre._C import get_device_size_in_bytes
 from torch_spyre._inductor.work_division import (
+    _has_work_div_hint,
     enumerate_work_division_candidates,
     work_division_splits_are_legal,
 )
@@ -1492,6 +1493,13 @@ def build_residency_edge(
     )
 
 
+def _op_has_work_div_hint(op: Operation) -> bool:
+    """True when a user work_div hint governs ``op``'s division."""
+    if not isinstance(op, ComputedBuffer):
+        return False
+    return _has_work_div_hint(op)
+
+
 def _fixed_core_division(op: Operation) -> CoreDivision:
     """The op's committed symbol-keyed division, or a one-core division."""
     ownership = getattr(op, "iteration_space_ownership", None)
@@ -2101,6 +2109,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if op.name in fixed_division_ops:
                 divs = _legal_fixed_division(
                     op, [_fixed_core_division(op)], "offset mutation component"
+                )
+            elif not config.ignore_work_division_hints and _op_has_work_div_hint(op):
+                # User hints take ownership of the split decision - the same
+                # contract the committed work-division path honors
+                # (work_division.py). The committed division already reflects
+                # the hint, so pin the candidate list to it; re-dividing a
+                # hinted op would silently override the user.
+                divs = _legal_fixed_division(
+                    op, [_fixed_core_division(op)], "user work_div hint"
                 )
             elif self.prune and isinstance(op, ComputedBuffer):
                 divs = [
