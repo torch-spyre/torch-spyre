@@ -104,8 +104,12 @@ from torch_spyre._inductor.scratchpad.lx_relayout import (
     LXRelayoutPlan,
     collect_lx_relayout_plans,
     materialize_lx_relayouts,
+    solver_relayout_edge_context,
+    solver_relayout_pair_cost,
+    work_division_from_view,
 )
 from torch_spyre._inductor.cost_model import CostParams
+from torch_spyre._inductor.pass_utils import PerCoreView
 
 _COST_PARAMS = CostParams(
     # we need a expression of both compute, mem_t
@@ -2265,6 +2269,15 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 prep_cache,
                 residency_by_buf,
             )
+            cd_parent_relayouts = self._cd_parent_relayouts(
+                op,
+                buf_divisions,
+                parent_proj,
+                divisions,
+                op_by_name,
+                prep_cache,
+                residency_by_buf,
+            )
 
             for input_name in parent_proj:
                 if input_name in input_clone_matches:
@@ -2317,6 +2330,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     core_divisions=buf_divisions,
                     parents=parent_proj,
                     cd_parent_matches=cd_parent_matches,
+                    cd_parent_relayouts=cd_parent_relayouts,
                     residency_reason=residency_reason,
                     lifetime_end_override=lifetime_end_overrides.get(output_name),
                     boundary=BufferType.Output
@@ -2458,6 +2472,131 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 continue
             matches[parent] = edge.match_pairs(divisions[parent], consumer_divs)
         return matches
+
+    def _cd_parent_relayouts(
+        self,
+        consumer_op: Optional[Operation],
+        consumer_divs: list[CoreDivision],
+        parent_names: list[str],
+        divisions: dict[str, list[CoreDivision]],
+        op_by_name: dict[str, Operation],
+        prep_cache: dict,
+        residency_by_buf: dict[str, Optional[str]],
+    ) -> dict[str, list[tuple[int, int, float]]]:
+        """Priced relayout candidates for each divided producer this op reads.
+
+        Sibling of :meth:`_cd_parent_matches`: where that method records the
+        division pairs whose per-core views are EQUAL (residency is free), this
+        one records the pairs whose views DIFFER but are relayout-compatible -
+        the producer could stay LX-resident by paying a shuffle - as
+        ``(P_div_idx, consumer_div_idx, cost_ns)`` triples priced by the fitted
+        relayout law. The division-independent edge gates (single non-indirect
+        write, activation source, pointwise-or-matmul consumer, ...) mirror
+        ``collect_lx_relayout_plans``; the per-pair gates (permutation
+        compatibility, projectable ownership on both frames, the law's fitted
+        split range) live in ``solver_relayout_pair_cost``. Gated on
+        ``config.lx_solver_relayout``; no solver variable consumes the
+        tables yet.
+        """
+        if not config.lx_solver_relayout or config.ktir_emitter:
+            return {}
+        if consumer_op is None:
+            return {}
+        relayouts: dict[str, list[tuple[int, int, float]]] = {}
+        for parent in parent_names:
+            if parent not in op_by_name:
+                continue
+            # The source must be residency-eligible: a relayout keeps it in LX.
+            if residency_by_buf.get(parent, "not in graph") is not None:
+                continue
+            parent_op = op_by_name[parent]
+            context = solver_relayout_edge_context(
+                parent_op, consumer_op, parent, op_by_name
+            )
+            if context is None:
+                continue
+            write_dep, read_dep, prod_coords, cons_coords, prod_syms, cons_syms = (
+                context
+            )
+            parent_divs = divisions[parent]
+            # Same per-candidate view screens as _cd_parent_matches: the source
+            # gets LX-pinned exactly like a matched producer, so the same
+            # coherence bars apply (partial-reduction write, unrepresentable
+            # slicing, multi-dim-split matmul output).
+            parent_is_matmul = _is_matmul_op(parent_op)
+            prod_views: list[Optional[PerCoreView]] = [
+                view
+                if (
+                    repr_ok
+                    and not partial
+                    and not (parent_is_matmul and len(view.work_slice_dims) > 1)
+                )
+                else None
+                for view, partial, repr_ok in self._views_for_divs(
+                    parent_op, write_dep, parent, parent_divs, prep_cache
+                )
+            ]
+            cons_views: list[Optional[PerCoreView]] = [
+                view if repr_ok else None
+                for view, _partial, repr_ok in self._views_for_divs(
+                    consumer_op, read_dep, parent, consumer_divs, prep_cache
+                )
+            ]
+            device_dims = list(parent_op.layout.device_layout.device_size)
+            out_elems = math.prod(device_dims)
+            dtype_bytes = parent_op.get_dtype().itemsize
+
+            # Ownership must project into loop symbols on both frames (the
+            # committed path's work_division_from_view gates), cached per view:
+            # several candidates often induce the same view.
+            projectable: dict[tuple, bool] = {}
+
+            def _projects(view, coords, syms, frame) -> bool:
+                key = (view, frame)
+                if key not in projectable:
+                    try:
+                        work_division_from_view(view, coords, syms)
+                        projectable[key] = True
+                    except ValueError:
+                        projectable[key] = False
+                return projectable[key]
+
+            pair_cost: dict[tuple, Optional[float]] = {}
+            triples: list[tuple[int, int, float]] = []
+            for i, pv in enumerate(prod_views):
+                if pv is None:
+                    continue
+                for j, cv in enumerate(cons_views):
+                    if cv is None or pv == cv:
+                        continue
+                    ncores = parent_divs[i].cores_used
+                    if ncores != consumer_divs[j].cores_used:
+                        continue
+                    if not (
+                        _projects(pv, prod_coords, prod_syms, "prod")
+                        and _projects(pv, cons_coords, cons_syms, "cons")
+                        and _projects(cv, cons_coords, cons_syms, "cons")
+                    ):
+                        continue
+                    key = (pv, cv, ncores)
+                    if key not in pair_cost:
+                        pair_cost[key] = solver_relayout_pair_cost(
+                            pv, cv, ncores, device_dims, out_elems, dtype_bytes
+                        )
+                    cost = pair_cost[key]
+                    if cost is not None:
+                        triples.append((i, j, cost))
+            if triples:
+                relayouts[parent] = triples
+                logger.debug(
+                    "[lx solver relayout] %s -> %s: %d priced candidate pair(s), "
+                    "cheapest %.1f ns",
+                    parent,
+                    consumer_op.get_name(),
+                    len(triples),
+                    min(t[2] for t in triples),
+                )
+        return relayouts
 
     @staticmethod
     def _views_for_divs(op, dep, buf_name, divs, prep_cache: dict):

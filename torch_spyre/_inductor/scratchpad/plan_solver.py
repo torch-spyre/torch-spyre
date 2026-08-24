@@ -310,6 +310,16 @@ class CoreDivisionBuffer(LifetimeBoundBuffer):
     # an absent/empty entry means no compatible division, so the gate forbids
     # the merge/residency across that edge.
     cd_parent_matches: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
+    # parent_buf_name -> (parent_div_idx, this_div_idx, cost_ns) triples for
+    # division pairs where the parent could stay LX-resident by RELAYING OUT to
+    # this consumer's slicing: the two views differ but are relayout-compatible
+    # (a permutation), priced by the fitted relayout law. Sibling of
+    # ``cd_parent_matches`` (which holds the free, equal-view pairs); populated
+    # only under ``config.lx_solver_relayout``, for the CP-SAT solver's
+    # relayout decision variables (nothing reads it yet).
+    cd_parent_relayouts: dict[str, list[tuple[int, int, float]]] = field(
+        default_factory=dict
+    )
     chosen_division: Optional[int] = None
     boundary: BufferType = BufferType.Intermediate
 
