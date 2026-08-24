@@ -80,7 +80,7 @@ def _make_matmul_op_spec() -> OpSpec:
         _make_tensor_arg(is_input=False, arg_index=2),
     ]
     return OpSpec(
-        op="matmul",
+        op="batchmatmul",
         is_reduction=True,
         iteration_space={
             _C_ROW: (Integer(128), 1),
