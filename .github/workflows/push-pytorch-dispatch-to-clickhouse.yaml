@@ -58,7 +58,7 @@ permissions:
   contents: read
   # Needed for OIDC when doing CRCR HUD reporting
   # logic in build_test_pytorch_source.yaml is commented for now.
-  # id-token: write
+  id-token: write
 
 jobs:
   ingest:
