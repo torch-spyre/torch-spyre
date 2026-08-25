@@ -900,7 +900,7 @@ def triu_mask(
     """
     cols = torch.arange(w, device="cpu", dtype=torch.int32).unsqueeze(0)  # [1, W]
     rows = torch.arange(h, device="cpu", dtype=torch.int32).unsqueeze(1)  # [H, 1]
-    mask = ((cols - rows) >= diagonal).to(dtype=dtype)                    # [H, W]
+    mask = ((cols - rows) >= diagonal).to(dtype=dtype)  # [H, W]
     return mask.to(device=device)
 
 
