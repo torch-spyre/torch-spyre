@@ -80,7 +80,7 @@ def _make_matmul_op_spec() -> OpSpec:
         _make_tensor_arg(is_input=False, arg_index=2),
     ]
     return OpSpec(
-        op="matmul",
+        op="batchmatmul",
         is_reduction=True,
         iteration_space={
             _C_ROW: (Integer(128), 1),
@@ -348,11 +348,13 @@ class TestValidateOpSpecsErrors(unittest.TestCase):
 
     def test_unknown_op_no_output_passes(self):
         """Unknown/synthetic ops without output args are valid."""
-        c0 = Symbol("c0")
         op = OpSpec(
             op="synthetic_test_op",
             is_reduction=False,
-            iteration_space={c0: (Integer(128), 1)},
+            iteration_space={
+                _C_ROW: (Integer(128), 1),
+                _C_COL: (Integer(256), 1),
+            },
             args=[_make_tensor_arg(is_input=True, arg_index=0)],
             op_info={},
             tiled_symbols=[],
@@ -364,7 +366,7 @@ class TestValidateOpSpecsErrors(unittest.TestCase):
         op = _make_valid_op_spec()
         op.args[0] = dataclasses.replace(op.args[0], allocation={"bad_key": 42})
         with self.assertRaises(OpSpecValidationError) as ctx:
-            validate_op_specs([op], stage="test")
+            validate_op_specs([op], stage="before_bundle_generation")
         self.assertIn("exactly one of hbm/lx/hbm_pool", str(ctx.exception))
 
     def test_allocation_multiple_keys(self):
@@ -374,7 +376,7 @@ class TestValidateOpSpecsErrors(unittest.TestCase):
             op.args[0], allocation={"hbm": 0x1000, "lx": 0x2000}
         )
         with self.assertRaises(OpSpecValidationError) as ctx:
-            validate_op_specs([op], stage="test")
+            validate_op_specs([op], stage="before_bundle_generation")
         self.assertIn("exactly one of hbm/lx/hbm_pool", str(ctx.exception))
 
 

@@ -29,67 +29,69 @@ Invariants checked:
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Sequence
+import functools
+import inspect
+import textwrap
 
 import regex
 import sympy
 
+from . import constants
+from .dtype_ops import DtypeOpTable
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess, LoopSpec, OpSpec, TensorArg, UnimplementedOp
 
 logger = get_inductor_logger("op_spec_validation")
 
-# Known op names from SpyreOpFuncs and special ops
-MATMUL_OPS = frozenset({"matmul", "batchmatmul", "batchmatmulfp8"})
 
-REDUCTION_OPS = frozenset({"sum", "mean", "max", "min", "topkvalue", "topkindex"})
+@functools.lru_cache(maxsize=1)
+def _pointwise_ops() -> frozenset[str]:
+    """Op names produced by SpyreOpFuncs's static methods.
 
-POINTWISE_OPS = frozenset(
-    {
-        "abs",
-        "add",
-        "clip",
-        "equal",
-        "exp",
-        "floor",
-        "greaterequal",
-        "greaterthan",
-        "gelufwd",
-        "layernormnorm",
-        "layernormscale",
-        "lesserequal",
-        "lesserthan",
-        "log",
-        "maximum",
-        "minimum",
-        "mul",
-        "notequal",
-        "neg",
-        "reciprocal",
-        "qfp8ch",
-        "relufwd",
-        "rsqrt",
-        "sigmoid",
-        "softplus",
-        "sqrt",
-        "sub",
-        "tanh",
-        "realdiv",
-        "silu",
-        "where3",
-    }
-)
+    Statically extracts the literal op-name argument from each method's
+    ``return PointwiseOp("name", ...)`` statement(s), rather than calling the
+    methods (which would require guessing each method's call signature,
+    including varargs like ``layernormnorm`` and keyword args like
+    ``softplus``). Methods whose op name is computed rather than a literal
+    (e.g. ``to_dtype``, resolved via DtypeOpTable) contribute no literal and
+    are correctly excluded -- those are dtype-cast ops, not pointwise ops.
 
-DTYPE_OPS = frozenset(
-    {
-        "identity",
-        "dl16tofp32",
-        "fp32todl16",
-        "fp8todl16",
-    }
-)
+    Imported and evaluated lazily (rather than at module load) because
+    spyre_kernel imports validate_op_specs from this module, so resolving
+    SpyreOpFuncs at op_spec_validation's own import time would be circular.
+    """
+    from .spyre_kernel import SpyreOpFuncs
 
-SPECIAL_OPS = frozenset({"ReStickifyOpHBM"})
+    tree = ast.parse(textwrap.dedent(inspect.getsource(SpyreOpFuncs)))
+    (class_node,) = tree.body
+    names: set[str] = set()
+    for node in ast.walk(class_node):
+        if not isinstance(node, ast.Return) or node.value is None:
+            continue
+        call = node.value
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "PointwiseOp"
+            and call.args
+            and isinstance(call.args[0], ast.Constant)
+            and isinstance(call.args[0].value, str)
+        ):
+            names.add(call.args[0].value)
+    return frozenset(names)
+
+
+# Known op names, derived by inspecting the modules that actually define
+# them so this file cannot silently drift out of sync as ops are added.
+MATMUL_OPS = constants.MATMUL_REDUCTION_OPS
+
+REDUCTION_OPS = constants.SINGLE_INPUT_REDUCTION_OPS
+
+DTYPE_OPS = DtypeOpTable.op_names()
+
+SPECIAL_OPS = frozenset({constants.RESTICKIFY_OP})
 
 BINARY_OPS = frozenset(
     {
@@ -108,7 +110,22 @@ BINARY_OPS = frozenset(
     }
 )
 
-ALL_KNOWN_OPS = MATMUL_OPS | REDUCTION_OPS | POINTWISE_OPS | DTYPE_OPS | SPECIAL_OPS
+
+@functools.lru_cache(maxsize=1)
+def _all_known_ops() -> frozenset[str]:
+    return MATMUL_OPS | REDUCTION_OPS | _pointwise_ops() | DTYPE_OPS | SPECIAL_OPS
+
+
+def __getattr__(name: str):
+    # POINTWISE_OPS/ALL_KNOWN_OPS are computed lazily (see _pointwise_ops) to
+    # avoid a circular import with spyre_kernel, but are still exposed as
+    # plain module attributes for callers/tests via PEP 562.
+    if name == "POINTWISE_OPS":
+        return _pointwise_ops()
+    if name == "ALL_KNOWN_OPS":
+        return _all_known_ops()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 VALID_ALLOCATION_KEYS = frozenset({"hbm", "lx", "hbm_pool"})
 
@@ -253,7 +270,7 @@ def _check_mandatory_fields(op_spec: OpSpec, stage: str) -> None:
 
 def _check_op_name(op_spec: OpSpec, stage: str) -> None:
     """OS-2: Op name should be a known operation."""
-    if op_spec.op not in ALL_KNOWN_OPS:
+    if op_spec.op not in _all_known_ops():
         logger.warning(
             "Unknown op name %r in OpSpec at stage %s. "
             "This may be valid for new ops not yet registered.",
@@ -363,7 +380,7 @@ def _check_args(op_spec: OpSpec, stage: str) -> None:
 
         _check_allocation(op_spec, arg, i, stage)
 
-    if not has_output and op_spec.op in ALL_KNOWN_OPS:
+    if not has_output and op_spec.op in _all_known_ops():
         raise OpSpecValidationError(
             op_spec,
             "OpSpec must have at least one output TensorArg (is_input=False)",
@@ -529,7 +546,7 @@ def _check_op_specific_constraints(op_spec: OpSpec, stage: str) -> None:
             stage,
         )
 
-    if op in POINTWISE_OPS and op_spec.is_reduction:
+    if op in _pointwise_ops() and op_spec.is_reduction:
         raise OpSpecValidationError(
             op_spec,
             f"pointwise op {op!r} must have is_reduction=False",
