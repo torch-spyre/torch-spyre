@@ -114,3 +114,49 @@ def test_split_product_must_equal_core_count():
         solver_relayout_pair_cost(_SRC, _DST, 4, _DEVICE_DIMS, _OUT_ELEMS, _DTYPE_BYTES)
         is None
     )
+
+
+def test_coarse_tiled_endpoints_are_declined_at_the_edge_gate():
+    """An endpoint carrying loop_info can never host a relayout: the fitted
+    law has no loop_trip factor, a tiled producer's buffer is per-tile
+    scratch, and a tiled consumer reads through a per-iteration staging op.
+
+    Probes are real-enough ComputedBuffers (created via __new__ to pass the
+    isinstance check) whose ``layout`` is a recording property: the gate is
+    the first check, so a tiled endpoint must be rejected WITHOUT the layout
+    ever being touched - distinguishing gate-rejection from the downstream
+    rejections that any fake would also hit. (The full compile-path variant
+    lives in test_solver_relayout_e2e.py, skipped until the co-opt substrate
+    survives coarse-tiled graphs at all; its non-vacuity was verified by
+    running it with the gate reverted.)"""
+    from torch._inductor.ir import ComputedBuffer
+
+    from torch_spyre._inductor.scratchpad.lx_relayout import (
+        solver_relayout_edge_context,
+    )
+
+    def probe(tiled):
+        class _Probe(ComputedBuffer):
+            layout_accessed = False
+
+            @property
+            def layout(self):
+                type(self).layout_accessed = True
+                return None
+
+        obj = _Probe.__new__(_Probe)
+        obj.loop_info = object() if tiled else None
+        return obj
+
+    for prod_tiled, cons_tiled in ((True, False), (False, True), (True, True)):
+        prod, cons = probe(prod_tiled), probe(cons_tiled)
+        assert solver_relayout_edge_context(prod, cons, "buf0", {}) is None
+        assert not type(prod).layout_accessed and not type(cons).layout_accessed, (
+            "a coarse-tiled endpoint reached checks past the loop_info gate"
+        )
+
+    # Control: an untiled pair proceeds past the gate into the layout check,
+    # proving the probes are capable of registering deeper progression.
+    prod, cons = probe(False), probe(False)
+    assert solver_relayout_edge_context(prod, cons, "buf0", {}) is None
+    assert type(prod).layout_accessed

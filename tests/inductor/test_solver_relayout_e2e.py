@@ -199,3 +199,75 @@ def test_relayout_fires_naturally_on_a_hinted_graph(monkeypatch):
     assert lo + per_core <= hi, "source and destination overlap in LX"
     ref = torch.relu(torch.neg(host.float())).to(torch.float16)
     torch.testing.assert_close(out.cpu(), ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skip(
+    reason="co-opt+cpsat crashes on any coarse-tiled graph before relayout "
+    "is even considered (symbolic relationals in coarse_underfill_eff and "
+    "the LX-spill derate reached by tiled ops; #3810 review finding). "
+    "Unskip when the substrate handles symbolic coarse-tile features; the "
+    "gate itself is covered by unit tests in "
+    "test_solver_relayout_candidates.py."
+)
+def test_coarse_tiled_edges_are_never_offered(monkeypatch):
+    """A coarse-tiled graph must enumerate NO relayout candidates.
+
+    Both ops sit in one coarse-tile hint scope, so the producer's buffer is
+    per-tile scratch and the edge lives inside the loop. The fitted law has
+    no loop_trip factor and the committed-path planner forbids in-loop
+    relayouts; the solver path must decline at enumeration (loop_info gate),
+    not merely decline to fire."""
+    import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
+    from torch_spyre._inductor import spyre_hint
+
+    tables = []
+    orig_tables = alloc_mod.CoOptimizingAllocator._cd_parent_relayouts
+
+    def spy_tables(self, *args, **kwargs):
+        out = orig_tables(self, *args, **kwargs)
+        if out:
+            tables.append(out)
+        return out
+
+    monkeypatch.setattr(
+        alloc_mod.CoOptimizingAllocator, "_cd_parent_relayouts", spy_tables
+    )
+
+    recorded = []
+    real_materialize = alloc_mod.materialize_lx_relayouts
+
+    def spy_mat(graph, plans):
+        recorded.extend(plans)
+        return real_materialize(graph, plans)
+
+    monkeypatch.setattr(alloc_mod, "materialize_lx_relayouts", spy_mat)
+
+    torch._inductor.codecache.FxGraphCache.clear()
+    torch._dynamo.reset()
+
+    def fn(t, u):
+        with spyre_hint(num_tiles_per_dim={"A": 4}):
+            with spyre_hint(expected_named_dims=["A", "B"]):
+                z = torch.abs(t) + u
+                return z * 2
+
+    torch.manual_seed(0)
+    ha = torch.randn(512, 256, dtype=torch.float16)
+    hb = torch.randn(512, 256, dtype=torch.float16)
+    for name, size in (("A", 512), ("B", 256)):
+        _pnd.declare_tensor_dim(name, size)
+    a = _pnd.name_tensor_dims(ha.to("spyre"), ["A", "B"])
+    b = _pnd.name_tensor_dims(hb.to("spyre"), ["A", "B"])
+    with config.patch(
+        {
+            "co_optimizing_lx_planning": True,
+            "layout_solver": "cpsat",
+            "lx_solver_relayout": True,
+        }
+    ):
+        out = torch.compile(fn, dynamic=False)(a, b)
+
+    assert tables == [], f"coarse-tiled edges were offered relayout: {tables}"
+    assert recorded == []
+    ref = ((torch.abs(ha.float()) + hb.float()) * 2).to(torch.float16)
+    torch.testing.assert_close(out.cpu(), ref, rtol=2**-8, atol=2**-6)

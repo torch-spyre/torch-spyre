@@ -460,6 +460,19 @@ def solver_relayout_edge_context(
     consumer_coords, producer_symbols, consumer_symbols)``, or ``None`` when the
     edge can never host a relayout.
     """
+    # A coarse-tiled endpoint can never host a relayout. The fitted law has
+    # no loop_trip factor (the committed-path planner already guarantees "a
+    # relayout cannot be inside a coarse-tiling loop"), a tiled producer's
+    # buffer is per-tile scratch rather than the full tensor, and a tiled
+    # consumer reads cross-group data through a per-iteration staging op.
+    # The MutationLayout check below only screens the loop's DRAIN op; the
+    # staging and tiled compute ops are plain Pointwise buffers, so the
+    # loop_info presence is the reliable marker.
+    if (
+        getattr(producer, "loop_info", None) is not None
+        or getattr(consumer, "loop_info", None) is not None
+    ):
+        return None
     if (
         not isinstance(producer, ComputedBuffer)
         or not isinstance(producer.layout, FixedTiledLayout)
