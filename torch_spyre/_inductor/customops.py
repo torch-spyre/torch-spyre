@@ -828,9 +828,8 @@ def quantscalepertokenfp8(
     """
     Compute per-token quantization scale for FP8 conversion.
 
-    Maps to the deeptools ``quantscalepertokenfp8`` fused operator
-    (``quant_scale_per_token.ddl``).  The hardware executes the following
-    sequence of FP16 operations per token:
+    Maps to the deeptools ``quantscalepertokenfp8`` fused operator.
+    The hardware executes the following sequence of FP16 operations per token:
 
     1. ``amax = max(abs(input), dim=-1, keepdim=True)``
        — absolute-maximum reduction over the hidden (stick) dimension.

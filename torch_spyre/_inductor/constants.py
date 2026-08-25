@@ -186,22 +186,14 @@ FP8_E4M3FN_INFO = torch.finfo(torch.float8_e4m3fn)
 FP8_E4M3FN_MAX = float(FP8_E4M3FN_INFO.max)
 FP8_E4M3FN_MIN = float(FP8_E4M3FN_INFO.min)
 
-# DDL template constant for quantscalepertokenfp8 clipMin parameter
-# Required by the DeepTools DDL template (quant_scale_per_token.ddl) for operation compilation.
-# Value: 4096 (0x1000) - the SEN169_FP16 encoding of 1.1920928955078125e-07
-# (encode_constant(1.1920928955078125e-07, SEN169_FP16) == 4096).
-# The hardware clamps the computed scale from below to this value.
-QUANTSCALEPERTOKENFP8_CLIP_MIN = 4096
+# clipMin for quantscalepertokenfp8: lower clamp bound for the computed scale.
+# Passed as a float; encode_constant will encode it to SEN169_FP16 (== 4096 / 0x1000).
+QUANTSCALEPERTOKENFP8_CLIP_MIN = 1.1920928955078125e-07
 
-# The float value that QUANTSCALEPERTOKENFP8_CLIP_MIN represents in SEN169_FP16.
-QUANTSCALEPERTOKENFP8_CLIP_MIN_VALUE = 1.1920928955078125e-07
-
-# DDL template constant for quantscalepertokenfp8 clipMax parameter
-# Required by the DeepTools DDL template (quant_scale_per_token.ddl) for operation compilation.
-# Value: 32255 (0x7DFF) - Raw DDL template constant, not an FP16-encoded value.
-# Note: This is NOT encode_constant(65504.0, SEN169_FP16) which produces 24063 (0x5DFF).
-# This is a magic constant specific to the DDL template's upper-bound clipping logic.
-QUANTSCALEPERTOKENFP8_CLIP_MAX = 32255
+# clipMax for quantscalepertokenfp8: upper clamp bound for the computed scale.
+# float32 max saturates to SEN169_FP16's maximum finite value (32255 / 0x7DFF).
+# Passed as a float; encode_constant will encode it via the normal path.
+QUANTSCALEPERTOKENFP8_CLIP_MAX = float(torch.finfo(torch.float32).max)
 
 
 # Operation name for per-token FP8 quantization scale computation

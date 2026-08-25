@@ -1861,16 +1861,13 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3FN_MAX):
     """
     Lower quantscalepertokenfp8 as a Reduction operation.
 
-    Maps to the deeptools ``quantscalepertokenfp8`` fused operator
-    (``quant_scale_per_token.ddl``). Uses standard reduction inner_fn pattern
-    like exx2 and mean.
+    Maps to the deeptools ``quantscalepertokenfp8`` fused operator.
+    Uses standard reduction inner_fn pattern like exx2 and mean.
 
-    Constants forwarded to the DDL template:
+    Constants forwarded to the deeptools operator:
     - mulConst: 1/scale_ub, passed as a float and FP16-encoded by generate_constant_info
-    - clipMin: QUANTSCALEPERTOKENFP8_CLIP_MIN (4096 / 0x1000), raw integer, lower clamp bound
-    - clipMax: QUANTSCALEPERTOKENFP8_CLIP_MAX (32255 / 0x7DFF), raw integer, upper clamp bound
-
-    clipMin and clipMax are in constants_raw so they bypass encode_constant.
+    - clipMin: QUANTSCALEPERTOKENFP8_CLIP_MIN (1.1920928955078125e-07), float, FP16-encoded
+    - clipMax: QUANTSCALEPERTOKENFP8_CLIP_MAX (float32 max), float, FP16-encodes to 32255 / 0x7DFF
     """
     if x.get_size() == [] or len(x.get_size()) < 1:
         raise ValueError(
@@ -1917,14 +1914,10 @@ def lower_quantscalepertokenfp8(x, scale_ub=FP8_E4M3FN_MAX):
 
     op_info = {
         "constants": {
-            "mulConst": mul_const,  # Float value, will be FP16-encoded by generate_constant_info
-            "clipMin": QUANTSCALEPERTOKENFP8_CLIP_MIN,  # 4096: DDL template constant (raw integer)
-            "clipMax": QUANTSCALEPERTOKENFP8_CLIP_MAX,  # 32255: DDL template constant (raw integer)
+            "mulConst": mul_const,  # Float, FP16-encoded by generate_constant_info
+            "clipMin": QUANTSCALEPERTOKENFP8_CLIP_MIN,  # Float, FP16-encoded by generate_constant_info
+            "clipMax": QUANTSCALEPERTOKENFP8_CLIP_MAX,  # Float, FP16-encodes to 32255 (SEN169_FP16 max)
         },
-        "constants_raw": (
-            "clipMin",
-            "clipMax",
-        ),  # Only clipMin and clipMax are raw integers; mulConst will be FP16-encoded
     }
 
     # Use same pattern as exx2 - pass all kwargs including inner_fn

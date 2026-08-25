@@ -32,7 +32,7 @@ from utils_inductor import (
 from torch_spyre._inductor.constants import (
     FP8_E4M3FN_MAX,
     FP8_E4M3FN_MIN,
-    QUANTSCALEPERTOKENFP8_CLIP_MIN_VALUE,
+    QUANTSCALEPERTOKENFP8_CLIP_MIN,
 )
 
 # Maximum spacing between adjacent representable values in FP8 E4M3
@@ -421,7 +421,7 @@ class TestFP8Operations:
         def pytorch_fn(x):
             amax = torch.amax(torch.abs(x), dim=-1, keepdim=True)
             scale = amax / FP8_E4M3FN_MAX
-            return scale.clamp(min=QUANTSCALEPERTOKENFP8_CLIP_MIN_VALUE)
+            return scale.clamp(min=QUANTSCALEPERTOKENFP8_CLIP_MIN)
 
         compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=1e-3, rtol=2e-3)
 
@@ -511,7 +511,7 @@ class TestFP8Operations:
             scale = amax / FP8_E4M3FN_MAX
             # Reflect hardware clipMin clamp: scale never collapses to zero.
             # rtol=2e-3 accounts for FP16 encoding of mulConst (up to ~9.8e-4 rel error).
-            return scale.clamp(min=QUANTSCALEPERTOKENFP8_CLIP_MIN_VALUE)
+            return scale.clamp(min=QUANTSCALEPERTOKENFP8_CLIP_MIN)
 
         compare_with_pytorch(spyre_fn, pytorch_fn, x, atol=1e-3, rtol=2e-3)
 
