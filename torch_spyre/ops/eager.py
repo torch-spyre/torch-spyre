@@ -208,7 +208,7 @@ def _remap_result(result, lookup):
 
 
 def _check_same_device(operands):
-    """Raise if tensor ``(value, is_write)`` operands span more than one device, 
+    """Raise if tensor ``(value, is_write)`` operands span more than one device,
     exempting a single non-write 0-dim CPU tensor (mirrors TensorIterator's ``allow_cpu_scalars_``
     unlike ``fallbacks._ensure_device``, which moves tensors instead of rejecting)."""
     mandatory_device = None
