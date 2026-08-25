@@ -1169,6 +1169,14 @@ def _non_indirect_coord_syms(coords: list[Expr]) -> set[Symbol]:
     syms: set[Symbol] = set()
     for coord in coords:
         if hasattr(coord, "has") and coord.has(IndirectAccess):
+            # A coordinate can mix the runtime-chosen row with data syms when
+            # the layout folds the row dim into an outer one -- a paged KV cache
+            # reads as `d0 + 128*IndirectAccess(idx)`. Those data syms still
+            # address into the shared table, so report them (#3984).
+            inner: set[Symbol] = set()
+            for term in coord.atoms(IndirectAccess):
+                inner |= term.free_symbols
+            syms |= coord.free_symbols - inner
             continue
         syms |= coord.free_symbols
     return syms
