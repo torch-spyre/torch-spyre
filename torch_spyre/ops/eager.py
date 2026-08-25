@@ -207,28 +207,38 @@ def _remap_result(result, lookup):
     return _map_result(result, lambda t: lookup.get(id(t), t))
 
 
-def _check_same_device(args, kwargs):
-    """Raise if the tensor arguments span more than one device."""
-    devices = set()
+def _check_same_device(operands):
+    """Raise if tensor ``(value, is_write)`` operands span more than one device, 
+    exempting a single non-write 0-dim CPU tensor (mirrors TensorIterator's ``allow_cpu_scalars_``
+    unlike ``fallbacks._ensure_device``, which moves tensors instead of rejecting)."""
+    mandatory_device = None
+    scalar_exempted = False
 
-    def collect(x):
+    def visit(x, is_write):
+        nonlocal mandatory_device, scalar_exempted
         if isinstance(x, torch.Tensor):
-            devices.add(x.device)
+            if (
+                not is_write
+                and not scalar_exempted
+                and x.device.type == "cpu"
+                and x.dim() == 0
+            ):
+                scalar_exempted = True
+                return
+            if mandatory_device is None:
+                mandatory_device = x.device
+            elif x.device != mandatory_device:
+                raise RuntimeError(
+                    "Expected all tensors to be on the same device, but "
+                    f"found at least two devices, {mandatory_device} and "
+                    f"{x.device}!"
+                )
         elif isinstance(x, (list, tuple)):
             for e in x:
-                collect(e)
+                visit(e, is_write)
 
-    for a in args:
-        collect(a)
-    for v in kwargs.values():
-        collect(v)
-
-    if len(devices) > 1:
-        d0, d1 = sorted(devices, key=str)[:2]
-        raise RuntimeError(
-            "Expected all tensors to be on the same device, but found at "
-            f"least two devices, {d0} and {d1}!"
-        )
+    for value, is_write in operands:
+        visit(value, is_write)
 
 
 def _make_offset_safe_dispatch(op):
@@ -252,7 +262,10 @@ def _make_offset_safe_dispatch(op):
     normalize_results = not (write_positions or write_names)
 
     def dispatch(*args, compiled=None, **kwargs):
-        _check_same_device(args, kwargs)
+        _check_same_device(
+            [(a, i in write_positions) for i, a in enumerate(args)]
+            + [(v, k in write_names) for k, v in kwargs.items()]
+        )
         write_back = []  # (clone, original) for each substituted write view
 
         def prep_write(x):
@@ -416,6 +429,12 @@ def _make_inplace_kernel(functional_op):
     """
 
     def kernel(self, *args, **kwargs):
+        # functional_op's schema has no write arg marking self as output, so check device write-status here first.
+        _check_same_device(
+            [(self, True)]
+            + [(a, False) for a in args]
+            + [(v, False) for v in kwargs.values()]
+        )
         result = functional_op(self, *args, **kwargs)
         # PyTorch's in-place contract: the promoted result dtype must be
         # castable back to ``self``. ``copy_`` would happily downcast (int32
