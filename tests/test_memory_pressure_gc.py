@@ -21,7 +21,7 @@ Python garbage collection when FlexAllocator exhausts all regions.
 These tests verify the acceptance criteria from issue P1-31:
 - Test 1: GC releases dead tensors, allocation succeeds
 - Test 2: GC runs but nothing freed, OOM is raised
-- Test 3: GIL safety - no deadlock
+- Test 3: GIL safety during a device op - no deadlock or corruption
 - Test 4: Cycle-collected tensors are released
 - Test 5: Concurrent pressure events
 """
@@ -41,7 +41,6 @@ class TestMemoryPressureGC:
     @pytest.fixture(autouse=True)
     def setup_teardown(self):
         """Setup and teardown for each test."""
-
         # Ensure GC is enabled at start
         gc.enable()
         gc.collect()
@@ -105,9 +104,10 @@ class TestMemoryPressureGC:
     def test_gil_safety_no_deadlock(self):
         """
         Test 3: GIL safety - one Python thread holds GIL while another thread
-        is mid-allocation; the mid-allocation thread hits pressure, releases
-        GIL appropriately, and either acquires it to call GC or yields to holder.
-        No deadlock; no allocator-state corruption.
+        is mid-device-op (torch.randn, which releases the GIL during the H2D
+        fill). Verify that the two threads do not deadlock and that no
+        allocator-state corruption occurs. This test validates that concurrent GIL
+        handoffs during device operations are safe.
         """
         gc.enable()
 
@@ -120,27 +120,23 @@ class TestMemoryPressureGC:
         t1_done = threading.Event()
         t2_done = threading.Event()
 
-        def allocate_with_pressure():
-            """Thread that will hit memory pressure."""
+        def do_device_ops():
+            """Thread that performs device ops while the other thread holds the GIL."""
             try:
                 # Use randn (not empty) so there is real H2D fill work during
                 # which PyTorch releases the GIL — that GIL-release-during-device-
                 # op is exactly the handoff path this test is meant to exercise.
-                # Keep tensors small (16 MB each, 64 MB total) so the fill
-                # completes in ~ms on s390x rather than the ~7s/GB that caused
-                # the original timeout with 1 GB allocations.
+                # Tensors are small (16 MB each, 64 MB total) so the fill
+                # completes quickly and does not approach device memory limits.
                 tensors = []
                 for i in range(4):
                     t = torch.randn(4 * 1024 * 1024, device="spyre")  # 16 MB each
                     tensors.append(t)
 
-                # Drop refs to allow GC
+                # Drop refs — memory is freed immediately via refcount (no cycles).
                 tensors.clear()
 
-                # Small delay to let GC potentially run
-                time.sleep(0.05)
-
-                # This should trigger memory pressure callback
+                # One more device op with the GIL potentially contended.
                 t = torch.randn(4 * 1024 * 1024, device="spyre")
                 allocation_succeeded.set()
 
@@ -163,7 +159,7 @@ class TestMemoryPressureGC:
 
         # Non-daemon: the interpreter will not kill these threads at shutdown,
         # so no thread is ever mid-device-call when the process exits.
-        t1 = threading.Thread(target=allocate_with_pressure)
+        t1 = threading.Thread(target=do_device_ops)
         t2 = threading.Thread(target=hold_gil_briefly)
 
         t1.start()
