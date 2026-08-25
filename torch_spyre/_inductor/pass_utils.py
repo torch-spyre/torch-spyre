@@ -2323,6 +2323,7 @@ def _per_core_view_from_prep(
 
     device_size = prep.device_size
     stride_map = prep.stride_map
+    elems_per_stick = prep.elems_per_stick
     device_stride_to_dim = prep.device_stride_to_dim
     stick_host_stride = prep.stick_host_stride
     num_stick_dim = prep.num_stick_dim
@@ -2356,6 +2357,25 @@ def _per_core_view_from_prep(
         dev_dim = device_stride_to_dim.get(h)
         if h == stick_host_stride:
             dev_dim = num_stick_dim
+        # A lower-rank reshape can flatten outer axes into the stickified axis.
+        # Mapping that loop only by its host-stride then falsely attributes the
+        # split to num_stick_dim. The full physical capacity of that host axis
+        # is known exactly, so an iteration spanning beyond it proves compound
+        # ownership that PerCoreView cannot express. Keep the buffer in HBM.
+        if h == stick_host_stride and dev_dim is not None:
+            iter_extent_expr = iter_space[sym]
+            if isinstance(iter_extent_expr, tuple):
+                iter_extent_expr = iter_extent_expr[0]
+            iter_extent = concretize_expr(iter_extent_expr)
+            stickified_extent = num_stick * elems_per_stick
+            if iter_extent > stickified_extent:
+                logger.debug(
+                    f"iteration {sym} extent {iter_extent} spans beyond mapped "
+                    f"stickified dim {dev_dim} extent {stickified_extent}; "
+                    f"returning empty_view"
+                )
+                return unrepresentable
+
         # Multi-stick-stride rescue: a consumer view subdivides the stickified
         # axis at k sticks per step (h = k * num_stick_stride). Only safe when
         # split*k fully covers num_stick_dim — partial coverage would
