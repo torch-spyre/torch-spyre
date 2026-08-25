@@ -59,6 +59,15 @@ _SHAPE_ENV_DEFAULT_LOWER = 2
 logger = get_inductor_logger("pass_utils")
 
 
+def stl_eq(a: SpyreTensorLayout, b: SpyreTensorLayout) -> bool:
+    """Value-equality for SpyreTensorLayout (the C++ type has no __eq__)."""
+    return (
+        list(a.stride_map) == list(b.stride_map)
+        and list(a.device_size) == list(b.device_size)
+        and a.device_dtype == b.device_dtype
+    )
+
+
 class SchedNodeArg(NamedTuple):
     dep: MemoryDep
     layout: "FixedTiledLayout"

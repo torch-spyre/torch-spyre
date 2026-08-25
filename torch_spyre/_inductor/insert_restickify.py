@@ -20,7 +20,7 @@ import torch
 
 from .constants import ELIDED_COPY_BACK_ATTR
 from .ir import FixedTiledLayout, SpyreEmptyFallback
-from .optimize_restickify import EdgeCostMap
+from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
 from .pass_utils import redirect_computed_buffer_reads
 from torch._inductor.graph import GraphLowering
@@ -303,23 +303,8 @@ def finalize_layouts(graph: GraphLowering) -> None:
                         accum_buf = graph.get_buffer(accum_name)
                         accum_layout = accum_buf.layout
                         if isinstance(accum_layout, FixedTiledLayout):
-                            # finalize_layouts already committed a generic STL
-                            # (from propagate_spyre_tensor_layouts) to accum_full.
-                            # Replace with the reduction op's actual STL so that
-                            # fill, combine, and copy all agree on the device
-                            # coordinate system.  Skip if already has the right
-                            # STL (span-overflow path where _allocate_full_buffer
-                            # already derived it from _resize_device_layout).
-                            if accum_layout.device_layout != op.layout.device_layout:
-                                accum_buf.layout = FixedTiledLayout(
-                                    accum_layout.device,
-                                    accum_layout.dtype,
-                                    accum_layout.size,
-                                    accum_layout.stride,
-                                    op.layout.device_layout,
-                                )
+                            pass
                         else:
-                            # FixedLayout: wrap with the reduction op's STL.
                             accum_buf.layout = _fixed_tiled(
                                 accum_layout, op.layout.device_layout
                             )
@@ -328,12 +313,16 @@ def finalize_layouts(graph: GraphLowering) -> None:
         # is incompatible with what this op requires on that edge.
         if not cost_fn:
             continue
-        # Mutation ops targeting a SpyreEmptyFallback: the optimizer commits the
-        # mutation op's output STL via AllSameNode (matching the new-value inputs).
-        # The SpyreEmptyFallback was separately committed by AnyInNode (candidates[0]),
-        # which may differ.  Overwrite the accumulator's FixedTiledLayout to match the
-        # mutation op's committed STL so the backend sees consistent layouts.
-        if isinstance(getattr(op, "layout", None), MutationLayoutSHOULDREMOVE):
+        # Mutation ops targeting a SpyreEmptyFallback: the beam commits the
+        # accumulator's STL via the co-output dep on each writer, so the
+        # accumulator and all its writers agree on the same STL.  Stamp the
+        # accumulator's layout here so the backend sees a FixedTiledLayout.
+        #
+        # Skip fill ops (AnyInNode): they have no real inputs and therefore no
+        # layout preference — the combine/copy op determines the correct STL.
+        if not isinstance(cost_fn, AnyInNode) and isinstance(
+            getattr(op, "layout", None), MutationLayoutSHOULDREMOVE
+        ):
             mut_target = op.layout.target
             while isinstance(mut_target, ReinterpretView):
                 mut_target = mut_target.data
@@ -345,17 +334,26 @@ def finalize_layouts(graph: GraphLowering) -> None:
             )
             if isinstance(mut_target_buf, SpyreEmptyFallback) and committed is not None:
                 accum_layout = mut_target_buf.get_layout()
+                if isinstance(accum_layout, FixedTiledLayout):
+                    existing_stl = accum_layout.device_layout
+                    if existing_stl != committed:
+                        print(
+                            f"WARNING: Two mutation ops write SpyreEmptyFallback "
+                            f"{mut_target_name!r} with conflicting layouts: "
+                            f"existing={list(existing_stl.stride_map)} "
+                            f"new={list(committed.stride_map)} "
+                            f"op={op.get_name()!r}"
+                        )
                 if isinstance(accum_layout, (FixedTiledLayout, FixedLayout)):
-                    new_layout = FixedTiledLayout(
+                    mut_target_buf.layout = FixedTiledLayout(
                         accum_layout.device,
                         accum_layout.dtype,
                         accum_layout.size,
                         accum_layout.stride,
                         committed,
                     )
-                    mut_target_buf.layout = new_layout
             elif isinstance(mut_target_buf, SpyreEmptyFallback) and committed is None:
-                # committed_stl was cleaned up; fall back to the accumulator's layout.
+                # committed_stl was cleaned up; fall back to the target's layout.
                 accum_layout = mut_target_buf.get_layout()
                 if isinstance(accum_layout, FixedTiledLayout):
                     committed = accum_layout.device_layout
