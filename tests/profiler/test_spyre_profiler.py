@@ -1105,3 +1105,189 @@ def test_kernel_time_overlap(tmp_path):
             f"{len(overlaps)} Spyre device overlap(s) detected:\n"
             + "\n".join(overlap_details)
         )
+
+
+def _find_duplicate_kernel_start_timestamps(events):
+    """Return complete Spyre kernel events and duplicate start timestamp groups."""
+    kernel_events = []
+    timestamp_groups = {}
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("ph") != "X" or event.get("cat") != "kernel":
+            continue
+
+        timestamp = event.get("ts")
+        name = event.get("name", "unknown")
+
+        assert (
+            isinstance(timestamp, (int, float))
+            and not isinstance(timestamp, bool)
+            and math.isfinite(timestamp)
+        ), (
+            f"Spyre kernel event {name} must have a finite numeric timestamp "
+            f"(ts={timestamp})"
+        )
+
+        kernel_events.append(event)
+
+        if timestamp not in timestamp_groups:
+            timestamp_groups[timestamp] = []
+
+        timestamp_groups[timestamp].append(event)
+
+    duplicate_groups = [
+        (timestamp, grouped_events)
+        for timestamp, grouped_events in timestamp_groups.items()
+        if len(grouped_events) > 1
+    ]
+
+    duplicate_groups.sort(key=lambda group: group[0])
+
+    return kernel_events, duplicate_groups
+
+
+def test_find_duplicate_kernel_start_timestamps():
+    """Verify duplicate start timestamp detection with synthetic kernel events."""
+    clean_events = [
+        {"ph": "X", "cat": "kernel", "name": "kernel_1", "ts": 0, "dur": 10},
+        {"ph": "X", "cat": "kernel", "name": "kernel_2", "ts": 10, "dur": 10},
+    ]
+
+    duplicate_events = [
+        {"ph": "X", "cat": "kernel", "name": "kernel_1", "ts": 0, "dur": 10},
+        {"ph": "X", "cat": "kernel", "name": "kernel_2", "ts": 0, "dur": 5},
+    ]
+
+    kernel_memory_same_timestamp = [
+        {"ph": "X", "cat": "kernel", "name": "kernel_1", "ts": 0, "dur": 10},
+        {
+            "ph": "X",
+            "cat": "gpu_memcpy",
+            "name": "Memcpy (HtoD)",
+            "ts": 0,
+            "dur": 10,
+        },
+    ]
+
+    clean_kernel_events, clean_duplicates = _find_duplicate_kernel_start_timestamps(
+        clean_events
+    )
+    duplicate_kernel_events, duplicate_groups = _find_duplicate_kernel_start_timestamps(
+        duplicate_events
+    )
+    memory_kernel_events, memory_duplicates = _find_duplicate_kernel_start_timestamps(
+        kernel_memory_same_timestamp
+    )
+
+    assert len(clean_kernel_events) == 2
+    assert clean_duplicates == []
+
+    assert len(duplicate_kernel_events) == 2
+    assert len(duplicate_groups) == 1
+
+    duplicate_timestamp, kernels = duplicate_groups[0]
+    assert duplicate_timestamp == 0
+    assert len(kernels) == 2
+    assert kernels[0]["name"] == "kernel_1"
+    assert kernels[1]["name"] == "kernel_2"
+
+    assert len(memory_kernel_events) == 1
+    assert memory_duplicates == []
+
+
+def test_find_duplicate_kernel_start_timestamps_invalid_events():
+    """Verify invalid kernel start timestamps are rejected."""
+    missing_timestamp_event = [
+        {"ph": "X", "cat": "kernel", "name": "kernel_missing_ts", "dur": 10}
+    ]
+
+    boolean_timestamp_event = [
+        {
+            "ph": "X",
+            "cat": "kernel",
+            "name": "kernel_boolean_ts",
+            "ts": True,
+            "dur": 10,
+        }
+    ]
+
+    non_finite_timestamp_event = [
+        {
+            "ph": "X",
+            "cat": "kernel",
+            "name": "kernel_nan_ts",
+            "ts": float("nan"),
+            "dur": 10,
+        }
+    ]
+
+    with pytest.raises(AssertionError):
+        _find_duplicate_kernel_start_timestamps(missing_timestamp_event)
+
+    with pytest.raises(AssertionError):
+        _find_duplicate_kernel_start_timestamps(boolean_timestamp_event)
+
+    with pytest.raises(AssertionError):
+        _find_duplicate_kernel_start_timestamps(non_finite_timestamp_event)
+
+
+@pytest.mark.requires_spyre_profiler
+def test_duplicate_kernel_start_timestamps(tmp_path):
+    """Verify kernel start timestamps are unique in a Spyre profiler trace."""
+    trace_file = tmp_path / "duplicate_kernel_start_timestamp_trace.json"
+
+    x = torch.randn((64, 64), dtype=torch.float16, device="spyre")
+    y = torch.randn((64, 64), dtype=torch.float16, device="spyre")
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
+    ) as prof:
+        result = torch.matmul(x, y)
+        result = F.gelu(result)
+        result = torch.sum(result)
+        torch.spyre.synchronize()
+
+    prof.export_chrome_trace(str(trace_file))
+
+    assert trace_file.exists(), "Chrome trace file was not created"
+
+    with trace_file.open("r", encoding="utf-8") as trace:
+        trace_data = json.load(trace)
+
+    assert isinstance(trace_data, dict), "Trace JSON must be a dictionary"
+    assert "traceEvents" in trace_data, "Chrome trace is missing the 'traceEvents' key"
+
+    trace_events = trace_data["traceEvents"]
+    assert isinstance(trace_events, list), "'traceEvents' must contain a list"
+
+    kernel_events, duplicate_groups = _find_duplicate_kernel_start_timestamps(
+        trace_events
+    )
+
+    assert len(kernel_events) >= 2, (
+        "Expected at least two Spyre kernel events for duplicate timestamp validation"
+    )
+
+    if duplicate_groups:
+        duplicate_details = []
+
+        for timestamp, grouped_events in duplicate_groups[:10]:
+            event_details = []
+
+            for event in grouped_events:
+                details = (
+                    f"{event.get('name', 'unknown')} "
+                    f"(ts={event.get('ts')}, dur={event.get('dur', 'unknown')}, "
+                    f"pid={event.get('pid', 'unknown')}, "
+                    f"tid={event.get('tid', 'unknown')})"
+                )
+                event_details.append(details)
+
+            duplicate_details.append(f"ts={timestamp}: {', '.join(event_details)}")
+
+        pytest.fail(
+            f"{len(duplicate_groups)} duplicate kernel start timestamp group(s) "
+            f"detected:\n" + "\n".join(duplicate_details)
+        )
