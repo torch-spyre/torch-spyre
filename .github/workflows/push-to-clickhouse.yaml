@@ -229,7 +229,7 @@ jobs:
           workflow: ${{ env.TRIGGERING_WORKFLOW }}
           branch: ${{ env.TRIGGERING_BRANCH }}
           sha: ${{ env.TRIGGERING_SHA }}
-          run-id: ${{ env.TRIGGERING_RUN_ID }}
+          gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
           triggered-at: ${{ env.TRIGGERING_AT }}
           pr-number: ${{ steps.resolve-pr.outputs.pr_number }}
           trigger-type: ${{ steps.extract-tier.outputs.tier }}

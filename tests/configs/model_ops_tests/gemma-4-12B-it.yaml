@@ -101,7 +101,6 @@ test_suite_config:
                     in get_placeholder_mask, code: special_image_mask = input_ids == self.config.image_token_id'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.eq.1
                 - name: torch.or_
                   sample_inputs_func:
@@ -121,7 +120,6 @@ test_suite_config:
                   description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1034
                     in forward, code: multimodal_mask = image_mask | video_mask | audio_mask'
                   tags:
-                    - tensorsoncpu
                     - torch.or_.1
                 - name: torch.clone
                   sample_inputs_func:
@@ -138,7 +136,6 @@ test_suite_config:
                   description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1039
                     in forward, code: llm_input_ids = input_ids.clone()'
                   tags:
-                    - tensorsoncpu
                     - torch.clone.1
                 - name: torch.where
                   sample_inputs_func:
@@ -163,7 +160,6 @@ test_suite_config:
                     in forward, code: llm_input_ids = torch.where(multimodal_mask, self.config.text_config.pad_token_id, llm_input_ids)'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.where.1
                 - name: torch.nn.functional.embedding
                   sample_inputs_func:
@@ -194,7 +190,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.nn.functional.embedding.1
                 - name: torch.to
                   sample_inputs_func:
@@ -211,7 +206,6 @@ test_suite_config:
                     in forward, code: return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.to.1
                 - name: torch.mul
                   sample_inputs_func:
@@ -234,7 +228,6 @@ test_suite_config:
                     in forward, code: return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.mul.1
                 - name: torch.getitem
                   sample_inputs_func:
@@ -252,7 +245,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.getitem.1
                 - name: torch.float
                   sample_inputs_func:
@@ -268,7 +260,6 @@ test_suite_config:
                     in forward, code: inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.float.1
                 - name: torch.Tensor.expand
                   sample_inputs_func:
@@ -288,7 +279,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.Tensor.expand.1
                 - name: torch.to
                   sample_inputs_func:
@@ -306,7 +296,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.to.2
                 - name: torch.getitem
                   sample_inputs_func:
@@ -325,7 +314,6 @@ test_suite_config:
                     in forward, code: position_ids_expanded = position_ids[:, None, :].float()'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.getitem.2
                 - name: torch.float
                   sample_inputs_func:
@@ -342,7 +330,6 @@ test_suite_config:
                   description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L274
                     in forward, code: position_ids_expanded = position_ids[:, None, :].float()'
                   tags:
-                    - tensorsoncpu
                     - torch.float.2
                 - name: torch.float
                   sample_inputs_func:
@@ -358,7 +345,6 @@ test_suite_config:
                     in forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.float.3
                 - name: torch.matmul
                   sample_inputs_func:
@@ -381,7 +367,6 @@ test_suite_config:
                     in forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.matmul.1
                 - name: torch.transpose
                   sample_inputs_func:
@@ -400,7 +385,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.transpose.1
                 - name: torch.cat
                   sample_inputs_func:
@@ -425,7 +409,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.cat.1
                 - name: torch.cos
                   sample_inputs_func:
@@ -441,7 +424,6 @@ test_suite_config:
                     in forward, code: cos = emb.cos() * attention_scaling'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.cos.1
                 - name: torch.mul
                   sample_inputs_func:
@@ -459,7 +441,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.mul.2
                 - name: torch.sin
                   sample_inputs_func:
@@ -475,7 +456,6 @@ test_suite_config:
                     in forward, code: sin = emb.sin() * attention_scaling'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.sin.1
                 - name: torch.to
                   sample_inputs_func:
@@ -493,7 +473,6 @@ test_suite_config:
                     in forward, code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.to.3
                 - name: torch.getitem
                   sample_inputs_func:
@@ -511,7 +490,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.getitem.3
                 - name: torch.float
                   sample_inputs_func:
@@ -527,7 +505,6 @@ test_suite_config:
                     in forward, code: inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.float.4
                 - name: torch.Tensor.expand
                   sample_inputs_func:
@@ -547,7 +524,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.Tensor.expand.2
                 - name: torch.to
                   sample_inputs_func:
@@ -565,7 +541,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.to.4
                 - name: torch.matmul
                   sample_inputs_func:
@@ -588,7 +563,6 @@ test_suite_config:
                     in forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.matmul.2
                 - name: torch.transpose
                   sample_inputs_func:
@@ -607,7 +581,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.transpose.2
                 - name: torch.cat
                   sample_inputs_func:
@@ -632,7 +605,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.cat.2
                 - name: torch.cos
                   sample_inputs_func:
@@ -648,7 +620,6 @@ test_suite_config:
                     in forward, code: cos = emb.cos() * attention_scaling'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.cos.2
                 - name: torch.mul
                   sample_inputs_func:
@@ -666,7 +637,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.mul.3
                 - name: torch.sin
                   sample_inputs_func:
@@ -682,7 +652,6 @@ test_suite_config:
                     in forward, code: sin = emb.sin() * attention_scaling'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.sin.2
                 - name: torch.to
                   sample_inputs_func:
@@ -700,7 +669,6 @@ test_suite_config:
                     in forward, code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.to.5
                 - name: torch.float
                   sample_inputs_func:
@@ -716,7 +684,6 @@ test_suite_config:
                     in forward, code: normed_output = self._norm(hidden_states.float())'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.float.5
                 - name: torch.pow
                   sample_inputs_func:
@@ -734,7 +701,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.pow.1
                 - name: torch.mean
                   sample_inputs_func:
@@ -754,7 +720,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.mean.1
                 - name: torch.add
                   sample_inputs_func:
@@ -772,7 +737,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.add.1
                 - name: torch.pow
                   sample_inputs_func:
@@ -790,7 +754,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.pow.2
                 - name: torch.mul
                   sample_inputs_func:
@@ -813,7 +776,6 @@ test_suite_config:
                     in _norm, code: return hidden_states * torch.pow(mean_squared, -0.5)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.mul.4
                 - name: torch.float
                   sample_inputs_func:
@@ -829,7 +791,6 @@ test_suite_config:
                     in forward, code: normed_output = normed_output * self.weight.float()'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.float.6
                 - name: torch.mul
                   sample_inputs_func:
@@ -852,7 +813,6 @@ test_suite_config:
                     in forward, code: normed_output = normed_output * self.weight.float()'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.mul.5
                 - name: torch.type_as
                   sample_inputs_func:
@@ -876,7 +836,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - bf16operation
-                    - tensorsoncpu
                     - torch.type_as.1
                 - name: torch.nn.functional.linear
                   sample_inputs_func:
@@ -901,7 +860,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.nn.functional.linear.1
                 - name: torch.Tensor.view
                   sample_inputs_func:
@@ -919,7 +877,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.Tensor.view.1
                 - name: torch.float
                   sample_inputs_func:
@@ -935,7 +892,6 @@ test_suite_config:
                     in forward, code: normed_output = self._norm(hidden_states.float())'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.float.7
                 - name: torch.pow
                   sample_inputs_func:
@@ -953,7 +909,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.pow.3
                 - name: torch.mean
                   sample_inputs_func:
@@ -973,7 +928,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.mean.2
                 - name: torch.add
                   sample_inputs_func:
@@ -991,7 +945,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.add.2
                 - name: torch.pow
                   sample_inputs_func:
@@ -1009,7 +962,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.pow.4
                 - name: torch.mul
                   sample_inputs_func:
@@ -1032,7 +984,6 @@ test_suite_config:
                     in _norm, code: return hidden_states * torch.pow(mean_squared, -0.5)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.mul.6
                 - name: torch.float
                   sample_inputs_func:
@@ -1048,7 +999,6 @@ test_suite_config:
                     in forward, code: normed_output = normed_output * self.weight.float()'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.float.8
                 - name: torch.mul
                   sample_inputs_func:
@@ -1071,7 +1021,6 @@ test_suite_config:
                     in forward, code: normed_output = normed_output * self.weight.float()'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.mul.7
                 - name: torch.type_as
                   sample_inputs_func:
@@ -1095,7 +1044,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - bf16operation
-                    - tensorsoncpu
                     - torch.type_as.2
                 - name: torch.unsqueeze
                   sample_inputs_func:
@@ -1113,7 +1061,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.unsqueeze.1
                 - name: torch.mul
                   sample_inputs_func:
@@ -1136,7 +1083,6 @@ test_suite_config:
                     in apply_rotary_pos_emb, code: return (x * cos) + (rotate_half(x) * sin)'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.mul.8
                 - name: torch.getitem
                   sample_inputs_func:
@@ -1154,7 +1100,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.getitem.4
                 - name: torch.neg
                   sample_inputs_func:
@@ -1170,7 +1115,6 @@ test_suite_config:
                     in rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.neg.1
                 - name: torch.cat
                   sample_inputs_func:
@@ -1195,7 +1139,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.cat.3
                 - name: torch.add
                   sample_inputs_func:
@@ -1218,7 +1161,6 @@ test_suite_config:
                     in apply_rotary_pos_emb, code: return (x * cos) + (rotate_half(x) * sin)'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.add.3
                 - name: torch.transpose
                   sample_inputs_func:
@@ -1237,7 +1179,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.transpose.3
                 - name: torch.nn.functional.linear
                   sample_inputs_func:
@@ -1262,7 +1203,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.nn.functional.linear.2
                 - name: torch.Tensor.view
                   sample_inputs_func:
@@ -1280,7 +1220,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.Tensor.view.2
                 - name: torch.float
                   sample_inputs_func:
@@ -1296,7 +1235,6 @@ test_suite_config:
                     in forward, code: normed_output = self._norm(hidden_states.float())'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.float.9
                 - name: torch.pow
                   sample_inputs_func:
@@ -1314,7 +1252,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.pow.5
                 - name: torch.mean
                   sample_inputs_func:
@@ -1334,7 +1271,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.mean.3
                 - name: torch.add
                   sample_inputs_func:
@@ -1352,7 +1288,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.add.4
                 - name: torch.pow
                   sample_inputs_func:
@@ -1370,7 +1305,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.pow.6
                 - name: torch.mul
                   sample_inputs_func:
@@ -1393,7 +1327,6 @@ test_suite_config:
                     in _norm, code: return hidden_states * torch.pow(mean_squared, -0.5)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.mul.9
                 - name: torch.mul
                   sample_inputs_func:
@@ -1416,7 +1349,6 @@ test_suite_config:
                     in forward, code: normed_output = normed_output * self.weight.float()'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.mul.10
                 - name: torch.type_as
                   sample_inputs_func:
@@ -1440,7 +1372,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - bf16operation
-                    - tensorsoncpu
                     - torch.type_as.3
                 - name: torch.mul
                   sample_inputs_func:
@@ -1463,7 +1394,6 @@ test_suite_config:
                     in apply_rotary_pos_emb, code: return (x * cos) + (rotate_half(x) * sin)'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.mul.11
                 - name: torch.getitem
                   sample_inputs_func:
@@ -1481,7 +1411,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.getitem.5
                 - name: torch.neg
                   sample_inputs_func:
@@ -1497,7 +1426,6 @@ test_suite_config:
                     in rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.neg.2
                 - name: torch.cat
                   sample_inputs_func:
@@ -1522,7 +1450,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.cat.4
                 - name: torch.add
                   sample_inputs_func:
@@ -1545,7 +1472,6 @@ test_suite_config:
                     in apply_rotary_pos_emb, code: return (x * cos) + (rotate_half(x) * sin)'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.add.5
                 - name: torch.transpose
                   sample_inputs_func:
@@ -1564,7 +1490,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.transpose.4
                 - name: torch.zeros
                   sample_inputs_func:
@@ -1577,7 +1502,6 @@ test_suite_config:
                     self.keys = torch.zeros('
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.zeros.1
                 - name: torch.to
                   sample_inputs_func:
@@ -1596,7 +1520,6 @@ test_suite_config:
                     self.cumulative_length = self.cumulative_length.to(self.device)'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.to.6
                 - name: torch.arange
                   sample_inputs_func:
@@ -1608,7 +1531,6 @@ test_suite_config:
                     = torch.arange(kv_length, device=self.device) + self.cumulative_length'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.arange.1
                 - name: torch.add
                   sample_inputs_func:
@@ -1634,7 +1556,6 @@ test_suite_config:
                   description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L529 in update, code: cache_position
                     = torch.arange(kv_length, device=self.device) + self.cumulative_length'
                   tags:
-                    - tensorsoncpu
                     - torch.add.6
                 - name: torch.index_copy_
                   sample_inputs_func:
@@ -1668,7 +1589,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.index_copy_.1
                 - name: torch.add_
                   sample_inputs_func:
@@ -1686,7 +1606,6 @@ test_suite_config:
                   description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L539 in update, code: self.cumulative_length.add_(kv_length)'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.add_.1
                 - name: torch.getitem
                   sample_inputs_func:
@@ -1704,7 +1623,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.getitem.6
                 - name: torch.Tensor.expand
                   sample_inputs_func:
@@ -1726,7 +1644,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.Tensor.expand.3
                 - name: torch.reshape
                   sample_inputs_func:
@@ -1744,7 +1661,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.reshape.1
                 - name: torch.nn.functional.scaled_dot_product_attention
                   sample_inputs_func:
@@ -1778,7 +1694,6 @@ test_suite_config:
                     code: attn_output = torch.nn.functional.scaled_dot_product_attention('
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.nn.functional.scaled_dot_product_attention.1
                 - name: torch.transpose
                   sample_inputs_func:
@@ -1797,7 +1712,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.transpose.5
                 - name: torch.Tensor.contiguous
                   sample_inputs_func:
@@ -1813,7 +1727,6 @@ test_suite_config:
                     code: attn_output = attn_output.transpose(1, 2).contiguous()'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.Tensor.contiguous.1
                 - name: torch.reshape
                   sample_inputs_func:
@@ -1831,7 +1744,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.reshape.2
                 - name: torch.Tensor.contiguous
                   sample_inputs_func:
@@ -1847,7 +1759,6 @@ test_suite_config:
                     in forward, code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.Tensor.contiguous.2
                 - name: torch.nn.functional.linear
                   sample_inputs_func:
@@ -1872,7 +1783,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.nn.functional.linear.3
                 - name: torch.add
                   sample_inputs_func:
@@ -1895,7 +1805,6 @@ test_suite_config:
                     in forward, code: hidden_states = residual + hidden_states'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.add.7
                 - name: torch.nn.functional.linear
                   sample_inputs_func:
@@ -1920,7 +1829,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.nn.functional.linear.4
                 - name: torch.nn.functional.gelu
                   sample_inputs_func:
@@ -1937,7 +1845,6 @@ test_suite_config:
                   description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/activations.py#L51 in forward, code: return self.act(input)'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.nn.functional.gelu.1
                 - name: torch.mul
                   sample_inputs_func:
@@ -1960,7 +1867,6 @@ test_suite_config:
                     in forward, code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.mul.12
                 - name: torch.nn.functional.linear
                   sample_inputs_func:
@@ -1985,7 +1891,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.nn.functional.linear.5
                 - name: torch.Tensor.mul
                   sample_inputs_func:
@@ -2008,7 +1913,6 @@ test_suite_config:
                     in forward, code: hidden_states *= self.layer_scalar'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.Tensor.mul.1
                 - name: torch.nn.functional.scaled_dot_product_attention
                   sample_inputs_func:
@@ -2042,7 +1946,6 @@ test_suite_config:
                     code: attn_output = torch.nn.functional.scaled_dot_product_attention('
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.nn.functional.scaled_dot_product_attention.2
                 - name: torch.nn.functional.scaled_dot_product_attention
                   sample_inputs_func:
@@ -2076,7 +1979,6 @@ test_suite_config:
                     code: attn_output = torch.nn.functional.scaled_dot_product_attention('
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.nn.functional.scaled_dot_product_attention.3
                 - name: torch.nn.functional.scaled_dot_product_attention
                   sample_inputs_func:
@@ -2110,7 +2012,6 @@ test_suite_config:
                     code: attn_output = torch.nn.functional.scaled_dot_product_attention('
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.nn.functional.scaled_dot_product_attention.4
                 - name: torch.nn.functional.scaled_dot_product_attention
                   sample_inputs_func:
@@ -2144,7 +2045,6 @@ test_suite_config:
                     code: attn_output = torch.nn.functional.scaled_dot_product_attention('
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.nn.functional.scaled_dot_product_attention.5
                 - name: torch.nn.functional.linear
                   sample_inputs_func:
@@ -2169,7 +2069,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.nn.functional.linear.6
                 - name: torch.float
                   sample_inputs_func:
@@ -2185,7 +2084,6 @@ test_suite_config:
                     in forward, code: normed_output = self._norm(hidden_states.float())'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.float.10
                 - name: torch.pow
                   sample_inputs_func:
@@ -2203,7 +2101,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.pow.7
                 - name: torch.mean
                   sample_inputs_func:
@@ -2223,7 +2120,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.mean.4
                 - name: torch.mul
                   sample_inputs_func:
@@ -2246,7 +2142,6 @@ test_suite_config:
                     in _norm, code: return hidden_states * torch.pow(mean_squared, -0.5)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.mul.13
                 - name: torch.float
                   sample_inputs_func:
@@ -2262,7 +2157,6 @@ test_suite_config:
                     in forward, code: normed_output = normed_output * self.weight.float()'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.float.11
                 - name: torch.mul
                   sample_inputs_func:
@@ -2285,7 +2179,6 @@ test_suite_config:
                     in forward, code: normed_output = normed_output * self.weight.float()'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.mul.14
                 - name: torch.type_as
                   sample_inputs_func:
@@ -2309,7 +2202,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - bf16operation
-                    - tensorsoncpu
                     - torch.type_as.4
                 - name: torch.unsqueeze
                   sample_inputs_func:
@@ -2327,7 +2219,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.unsqueeze.2
                 - name: torch.mul
                   sample_inputs_func:
@@ -2350,7 +2241,6 @@ test_suite_config:
                     in apply_rotary_pos_emb, code: return (x * cos) + (rotate_half(x) * sin)'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.mul.15
                 - name: torch.getitem
                   sample_inputs_func:
@@ -2368,7 +2258,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.getitem.7
                 - name: torch.neg
                   sample_inputs_func:
@@ -2384,7 +2273,6 @@ test_suite_config:
                     in rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.neg.3
                 - name: torch.cat
                   sample_inputs_func:
@@ -2409,7 +2297,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.cat.5
                 - name: torch.add
                   sample_inputs_func:
@@ -2432,7 +2319,6 @@ test_suite_config:
                     in apply_rotary_pos_emb, code: return (x * cos) + (rotate_half(x) * sin)'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.add.8
                 - name: torch.transpose
                   sample_inputs_func:
@@ -2451,7 +2337,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.transpose.6
                 - name: torch.nn.functional.linear
                   sample_inputs_func:
@@ -2476,7 +2361,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.nn.functional.linear.7
                 - name: torch.float
                   sample_inputs_func:
@@ -2492,7 +2376,6 @@ test_suite_config:
                     in forward, code: normed_output = self._norm(hidden_states.float())'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.float.12
                 - name: torch.pow
                   sample_inputs_func:
@@ -2510,7 +2393,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.pow.8
                 - name: torch.mean
                   sample_inputs_func:
@@ -2530,7 +2412,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.mean.5
                 - name: torch.add
                   sample_inputs_func:
@@ -2548,7 +2429,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.add.9
                 - name: torch.pow
                   sample_inputs_func:
@@ -2566,7 +2446,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.pow.9
                 - name: torch.mul
                   sample_inputs_func:
@@ -2589,7 +2468,6 @@ test_suite_config:
                     in _norm, code: return hidden_states * torch.pow(mean_squared, -0.5)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.mul.16
                 - name: torch.mul
                   sample_inputs_func:
@@ -2612,7 +2490,6 @@ test_suite_config:
                     in forward, code: normed_output = normed_output * self.weight.float()'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.mul.17
                 - name: torch.type_as
                   sample_inputs_func:
@@ -2636,7 +2513,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - bf16operation
-                    - tensorsoncpu
                     - torch.type_as.5
                 - name: torch.mul
                   sample_inputs_func:
@@ -2659,7 +2535,6 @@ test_suite_config:
                     in apply_rotary_pos_emb, code: return (x * cos) + (rotate_half(x) * sin)'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.mul.18
                 - name: torch.getitem
                   sample_inputs_func:
@@ -2677,7 +2552,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.getitem.8
                 - name: torch.neg
                   sample_inputs_func:
@@ -2693,7 +2567,6 @@ test_suite_config:
                     in rotate_half, code: return torch.cat((-x2, x1), dim=-1)'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.neg.4
                 - name: torch.cat
                   sample_inputs_func:
@@ -2718,7 +2591,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.cat.6
                 - name: torch.add
                   sample_inputs_func:
@@ -2741,7 +2613,6 @@ test_suite_config:
                     in apply_rotary_pos_emb, code: return (x * cos) + (rotate_half(x) * sin)'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.add.10
                 - name: torch.transpose
                   sample_inputs_func:
@@ -2760,7 +2631,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.transpose.7
                 - name: torch.index_copy_
                   sample_inputs_func:
@@ -2794,7 +2664,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.index_copy_.2
                 - name: torch.getitem
                   sample_inputs_func:
@@ -2812,7 +2681,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.getitem.9
                 - name: torch.getitem
                   sample_inputs_func:
@@ -2830,7 +2698,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.getitem.10
                 - name: torch.nn.functional.scaled_dot_product_attention
                   sample_inputs_func:
@@ -2864,7 +2731,6 @@ test_suite_config:
                     code: attn_output = torch.nn.functional.scaled_dot_product_attention('
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.nn.functional.scaled_dot_product_attention.6
                 - name: torch.transpose
                   sample_inputs_func:
@@ -2883,7 +2749,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.transpose.8
                 - name: torch.Tensor.contiguous
                   sample_inputs_func:
@@ -2899,7 +2764,6 @@ test_suite_config:
                     code: attn_output = attn_output.transpose(1, 2).contiguous()'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.Tensor.contiguous.3
                 - name: torch.reshape
                   sample_inputs_func:
@@ -2917,7 +2781,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.reshape.3
                 - name: torch.Tensor.contiguous
                   sample_inputs_func:
@@ -2933,7 +2796,6 @@ test_suite_config:
                     in forward, code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.Tensor.contiguous.4
                 - name: torch.nn.functional.linear
                   sample_inputs_func:
@@ -2958,7 +2820,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.nn.functional.linear.8
                 - name: torch.nn.functional.scaled_dot_product_attention
                   sample_inputs_func:
@@ -2992,7 +2853,6 @@ test_suite_config:
                     code: attn_output = torch.nn.functional.scaled_dot_product_attention('
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.nn.functional.scaled_dot_product_attention.7
                 - name: torch.nn.functional.scaled_dot_product_attention
                   sample_inputs_func:
@@ -3026,7 +2886,6 @@ test_suite_config:
                     code: attn_output = torch.nn.functional.scaled_dot_product_attention('
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.nn.functional.scaled_dot_product_attention.8
                 - name: torch.getitem
                   sample_inputs_func:
@@ -3044,7 +2903,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.getitem.11
                 - name: torch.nn.functional.linear
                   sample_inputs_func:
@@ -3069,7 +2927,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.nn.functional.linear.9
                 - name: torch.truediv
                   sample_inputs_func:
@@ -3087,7 +2944,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.truediv.1
                 - name: torch.tanh
                   sample_inputs_func:
@@ -3103,7 +2959,6 @@ test_suite_config:
                     in torch_dynamo_resume_in_forward_at_1313, code: logits = torch.tanh(logits)'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.tanh.1
                 - name: torch.mul
                   sample_inputs_func:
@@ -3121,7 +2976,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.mul.19
                 - name: torch.eq
                   sample_inputs_func:
@@ -3140,7 +2994,6 @@ test_suite_config:
                     in get_placeholder_mask, code: special_image_mask = input_ids == self.config.image_token_id'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.eq.2
                 - name: torch.or_
                   sample_inputs_func:
@@ -3160,7 +3013,6 @@ test_suite_config:
                   description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1034
                     in forward, code: multimodal_mask = image_mask | video_mask | audio_mask'
                   tags:
-                    - tensorsoncpu
                     - torch.or_.2
                 - name: torch.clone
                   sample_inputs_func:
@@ -3177,7 +3029,6 @@ test_suite_config:
                   description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1039
                     in forward, code: llm_input_ids = input_ids.clone()'
                   tags:
-                    - tensorsoncpu
                     - torch.clone.2
                 - name: torch.where
                   sample_inputs_func:
@@ -3202,7 +3053,6 @@ test_suite_config:
                     in forward, code: llm_input_ids = torch.where(multimodal_mask, self.config.text_config.pad_token_id, llm_input_ids)'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.where.2
                 - name: torch.nn.functional.embedding
                   sample_inputs_func:
@@ -3233,7 +3083,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.nn.functional.embedding.2
                 - name: torch.mul
                   sample_inputs_func:
@@ -3256,7 +3105,6 @@ test_suite_config:
                     in forward, code: return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.mul.20
                 - name: torch.getitem
                   sample_inputs_func:
@@ -3275,7 +3123,6 @@ test_suite_config:
                     in forward, code: position_ids_expanded = position_ids[:, None, :].float()'
                   tags:
                     - constant
-                    - tensorsoncpu
                     - torch.getitem.12
                 - name: torch.float
                   sample_inputs_func:
@@ -3292,7 +3139,6 @@ test_suite_config:
                   description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L274
                     in forward, code: position_ids_expanded = position_ids[:, None, :].float()'
                   tags:
-                    - tensorsoncpu
                     - torch.float.13
                 - name: torch.float
                   sample_inputs_func:
@@ -3308,7 +3154,6 @@ test_suite_config:
                     in forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.float.14
                 - name: torch.matmul
                   sample_inputs_func:
@@ -3331,7 +3176,6 @@ test_suite_config:
                     in forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.matmul.3
                 - name: torch.transpose
                   sample_inputs_func:
@@ -3350,7 +3194,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.transpose.9
                 - name: torch.cat
                   sample_inputs_func:
@@ -3375,7 +3218,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.cat.7
                 - name: torch.cos
                   sample_inputs_func:
@@ -3391,7 +3233,6 @@ test_suite_config:
                     in forward, code: cos = emb.cos() * attention_scaling'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.cos.3
                 - name: torch.mul
                   sample_inputs_func:
@@ -3409,7 +3250,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.mul.21
                 - name: torch.sin
                   sample_inputs_func:
@@ -3425,7 +3265,6 @@ test_suite_config:
                     in forward, code: sin = emb.sin() * attention_scaling'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.sin.3
                 - name: torch.to
                   sample_inputs_func:
@@ -3443,7 +3282,6 @@ test_suite_config:
                     in forward, code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.to.7
                 - name: torch.matmul
                   sample_inputs_func:
@@ -3466,7 +3304,6 @@ test_suite_config:
                     in forward, code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.matmul.4
                 - name: torch.transpose
                   sample_inputs_func:
@@ -3485,7 +3322,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.transpose.10
                 - name: torch.cat
                   sample_inputs_func:
@@ -3510,7 +3346,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.cat.8
                 - name: torch.cos
                   sample_inputs_func:
@@ -3526,7 +3361,6 @@ test_suite_config:
                     in forward, code: cos = emb.cos() * attention_scaling'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.cos.4
                 - name: torch.mul
                   sample_inputs_func:
@@ -3544,7 +3378,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.mul.22
                 - name: torch.sin
                   sample_inputs_func:
@@ -3560,7 +3393,6 @@ test_suite_config:
                     in forward, code: sin = emb.sin() * attention_scaling'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.sin.4
                 - name: torch.to
                   sample_inputs_func:
@@ -3578,7 +3410,6 @@ test_suite_config:
                     in forward, code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.to.8
                 - name: torch.float
                   sample_inputs_func:
@@ -3594,7 +3425,6 @@ test_suite_config:
                     in forward, code: normed_output = self._norm(hidden_states.float())'
                   tags:
                     - bf16operation
-                    - tensorsoncpu
                     - torch.float.15
                 - name: torch.pow
                   sample_inputs_func:
@@ -3612,7 +3442,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.pow.10
                 - name: torch.mean
                   sample_inputs_func:
@@ -3632,7 +3461,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.mean.6
                 - name: torch.add
                   sample_inputs_func:
@@ -3650,7 +3478,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.add.11
                 - name: torch.pow
                   sample_inputs_func:
@@ -3668,7 +3495,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - constant
-                    - tensorsoncpu
                     - torch.pow.11
                 - name: torch.mul
                   sample_inputs_func:
@@ -3691,7 +3517,6 @@ test_suite_config:
                     in _norm, code: return hidden_states * torch.pow(mean_squared, -0.5)'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.mul.23
                 - name: torch.mul
                   sample_inputs_func:
@@ -3714,7 +3539,6 @@ test_suite_config:
                     in forward, code: normed_output = normed_output * self.weight.float()'
                   tags:
                     - fp32operation
-                    - tensorsoncpu
                     - torch.mul.24
                 - name: torch.type_as
                   sample_inputs_func:
@@ -3738,7 +3562,6 @@ test_suite_config:
                   tags:
                     - fp32operation
                     - bf16operation
-                    - tensorsoncpu
                     - torch.type_as.6
                 - name: torch.getitem
                   sample_inputs_func:
@@ -3756,7 +3579,6 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.getitem.13
                 - name: torch.nn.functional.linear
                   sample_inputs_func:
@@ -3781,5 +3603,4 @@ test_suite_config:
                   tags:
                     - bf16operation
                     - constant
-                    - tensorsoncpu
                     - torch.nn.functional.linear.10

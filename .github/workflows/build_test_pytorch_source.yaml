@@ -106,6 +106,7 @@ jobs:
 
 
       - name: 'Report stage: torch_build'
+        continue-on-error: true
         run: |
           echo "T_TORCH_BUILD_START=$(date +%s)" >> "$GITHUB_ENV"
           uv run --with clickhouse-connect --with regex \
@@ -132,6 +133,7 @@ jobs:
           retention-days: 5
 
       - name: 'Report stage: torch_spyre_build'
+        continue-on-error: true
         run: |
           echo "T_TORCH_SPYRE_BUILD_START=$(date +%s)" >> "$GITHUB_ENV"
           uv run --with clickhouse-connect --with regex \
@@ -165,6 +167,7 @@ jobs:
           echo "torch_spyre_build_seconds=$(( NOW - T_TORCH_SPYRE_BUILD_START ))" >> "$GITHUB_OUTPUT"
 
       - name: 'Report stage: running_tests'
+        continue-on-error: true
         run: |
           uv run --with clickhouse-connect --with regex \
             torch-spyre/.github/scripts/ingest_pytorch_dispatch.py \
@@ -316,6 +319,7 @@ jobs:
           retention-days: 30
 
       - name: 'Report stage: completed'
+        continue-on-error: true
         env:
           TEST_RESULTS_JSON: ${{ steps.test_results.outputs.test_results_json }}
           MAX_DURATION_SECONDS: ${{ steps.test_results.outputs.max_duration_seconds }}

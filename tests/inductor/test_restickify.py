@@ -595,6 +595,51 @@ def test_bmm_with_inplace_mutation():
     _compare(func, x, weight, cache)
 
 
+def test_mutation_target_multi_candidate_layout():
+    """Issue #3845: a mutation op and its target can diverge on device layout in
+    the beam search.  ``c = a + b`` is an ordinary ComputedBuffer with two
+    genuine candidate STLs (row-stick vs. column-stick, since 128x256 is
+    non-square); ``copy_forced(d, c)`` then mutates it.  Unlike the
+    SpyreEmptyFallback accumulator case above (test_bmm_with_inplace_mutation,
+    where the target starts as a fresh torch.zeros() buffer and already has
+    working multi-candidate coupling), the mutation op here has no genuine
+    MemoryDep read-edge to its target at all -- propagate_layouts synthesizes
+    a coupling edge from the target's own write MemoryDep so the beam search
+    can price the constraint that this op's output STL must match whatever
+    the target eventually commits to.  This reproducer is independent of
+    coarse_tiling and spyre_hint, isolating the root propagate_layouts gap.
+    """
+    M, N = 128, 256
+    a = torch.randn((M, N), dtype=torch.float16) * 0.01
+    b = torch.randn((M, N), dtype=torch.float16) * 0.01
+    d = torch.randn((M, N), dtype=torch.float16) * 0.01
+
+    def fn(a, b, d):
+        c = a + b
+        torch.ops.spyre.copy_forced(d, c)
+        return c
+
+    _compare(fn, a, b, d)
+
+
+def test_mutation_target_restick_on_src_not_target():
+    # d is (N, M) so d.t() is (M, N) col-major — a different layout than c = a+b
+    # (row-major).  The restickify must land on d.t() (src), not on c (the mutation
+    # target).  validate_no_restickify_on_mutation_targets is wired into passes.py by
+    # this PR and fires during compilation if the target is incorrectly restickified.
+    M, N = 128, 256
+    a = torch.randn((M, N), dtype=torch.float16) * 0.01
+    b = torch.randn((M, N), dtype=torch.float16) * 0.01
+    d = torch.randn((N, M), dtype=torch.float16) * 0.01
+
+    def fn(a, b, d):
+        c = a + b
+        torch.ops.spyre.copy_forced(d.t(), c)
+        return c
+
+    _compare(fn, a, b, d, optimal_cost=M * N)
+
+
 # Optimizer correctness + optimality tests: verify both output values and
 # minimum-cost restickify plan across a range of graph patterns.
 
