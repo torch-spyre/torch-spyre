@@ -22,7 +22,6 @@ cases:
       code: special_image_mask = input_ids == self.config.image_token_id'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.or_.1_spyre
     op: torch.or_
     inputs:
@@ -40,7 +39,6 @@ cases:
           device: cuda
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1034 in forward,
       code: multimodal_mask = image_mask | video_mask | audio_mask'
-    marks: tensorsoncpu
   - name: torch.clone.1_spyre
     op: torch.clone
     inputs:
@@ -55,7 +53,6 @@ cases:
             high: 1000
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1039 in forward,
       code: llm_input_ids = input_ids.clone()'
-    marks: tensorsoncpu
   - name: torch.where.1_spyre
     op: torch.where
     inputs:
@@ -79,7 +76,6 @@ cases:
       code: llm_input_ids = torch.where(multimodal_mask, self.config.text_config.pad_token_id, llm_input_ids)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.nn.functional.embedding.1_spyre
     op: torch.nn.functional.embedding
     inputs:
@@ -108,7 +104,6 @@ cases:
       code: return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.to.1_spyre
     op: torch.to
     inputs:
@@ -124,7 +119,6 @@ cases:
       code: return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.mul.1_spyre
     op: torch.mul
     inputs:
@@ -144,7 +138,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L558 in forward,
       code: return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)'
-    marks: tensorsoncpu
   - name: torch.getitem.1_spyre
     op: torch.getitem
     inputs:
@@ -160,7 +153,6 @@ cases:
       code: inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.float.1_spyre
     op: torch.float
     inputs:
@@ -173,7 +165,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L273 in forward,
       code: inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
-    marks: tensorsoncpu
   - name: torch.Tensor.expand.1_spyre
     op: torch.Tensor.expand
     inputs:
@@ -191,7 +182,6 @@ cases:
       code: inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.to.2_spyre
     op: torch.to
     inputs:
@@ -207,7 +197,6 @@ cases:
       code: inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.getitem.2_spyre
     op: torch.getitem
     inputs:
@@ -225,7 +214,6 @@ cases:
       code: position_ids_expanded = position_ids[:, None, :].float()'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.float.2_spyre
     op: torch.float
     inputs:
@@ -240,7 +228,6 @@ cases:
             high: 1000
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L274 in forward,
       code: position_ids_expanded = position_ids[:, None, :].float()'
-    marks: tensorsoncpu
   - name: torch.float.3_spyre
     op: torch.float
     inputs:
@@ -253,7 +240,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L278 in forward,
       code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
-    marks: tensorsoncpu
   - name: torch.matmul.1_spyre
     op: torch.matmul
     inputs:
@@ -273,7 +259,6 @@ cases:
           init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L278 in forward,
       code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
-    marks: tensorsoncpu
   - name: torch.transpose.1_spyre
     op: torch.transpose
     inputs:
@@ -290,7 +275,6 @@ cases:
       code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.cat.1_spyre
     op: torch.cat
     inputs:
@@ -311,7 +295,6 @@ cases:
       code: emb = torch.cat((freqs, freqs), dim=-1)'
     marks:
       - constant
-      - tensorsoncpu
     kwmap:
       dim: -1
   - name: torch.cos.1_spyre
@@ -326,7 +309,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L280 in forward,
       code: cos = emb.cos() * attention_scaling'
-    marks: tensorsoncpu
   - name: torch.mul.2_spyre
     op: torch.mul
     inputs:
@@ -342,7 +324,6 @@ cases:
       code: cos = emb.cos() * attention_scaling'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.sin.1_spyre
     op: torch.sin
     inputs:
@@ -355,7 +336,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L281 in forward,
       code: sin = emb.sin() * attention_scaling'
-    marks: tensorsoncpu
   - name: torch.to.3_spyre
     op: torch.to
     inputs:
@@ -368,7 +348,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L283 in forward,
       code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
-    marks: tensorsoncpu
     kwmap:
       dtype: torch.float16
   - name: torch.getitem.3_spyre
@@ -386,7 +365,6 @@ cases:
       code: inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.float.4_spyre
     op: torch.float
     inputs:
@@ -399,7 +377,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L273 in forward,
       code: inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
-    marks: tensorsoncpu
   - name: torch.Tensor.expand.2_spyre
     op: torch.Tensor.expand
     inputs:
@@ -417,7 +394,6 @@ cases:
       code: inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.to.4_spyre
     op: torch.to
     inputs:
@@ -433,7 +409,6 @@ cases:
       code: inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.matmul.2_spyre
     op: torch.matmul
     inputs:
@@ -453,7 +428,6 @@ cases:
           init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L278 in forward,
       code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
-    marks: tensorsoncpu
   - name: torch.transpose.2_spyre
     op: torch.transpose
     inputs:
@@ -470,7 +444,6 @@ cases:
       code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.cat.2_spyre
     op: torch.cat
     inputs:
@@ -491,7 +464,6 @@ cases:
       code: emb = torch.cat((freqs, freqs), dim=-1)'
     marks:
       - constant
-      - tensorsoncpu
     kwmap:
       dim: -1
   - name: torch.cos.2_spyre
@@ -506,7 +478,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L280 in forward,
       code: cos = emb.cos() * attention_scaling'
-    marks: tensorsoncpu
   - name: torch.mul.3_spyre
     op: torch.mul
     inputs:
@@ -522,7 +493,6 @@ cases:
       code: cos = emb.cos() * attention_scaling'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.sin.2_spyre
     op: torch.sin
     inputs:
@@ -535,7 +505,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L281 in forward,
       code: sin = emb.sin() * attention_scaling'
-    marks: tensorsoncpu
   - name: torch.to.5_spyre
     op: torch.to
     inputs:
@@ -548,7 +517,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L283 in forward,
       code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
-    marks: tensorsoncpu
     kwmap:
       dtype: torch.float16
   - name: torch.float.5_spyre
@@ -563,7 +531,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L190 in forward,
       code: normed_output = self._norm(hidden_states.float())'
-    marks: tensorsoncpu
   - name: torch.pow.1_spyre
     op: torch.pow
     inputs:
@@ -579,7 +546,6 @@ cases:
       code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.mean.1_spyre
     op: torch.mean
     inputs:
@@ -595,7 +561,6 @@ cases:
       code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
     marks:
       - constant
-      - tensorsoncpu
     kwmap:
       keepdim: true
   - name: torch.add.1_spyre
@@ -613,7 +578,6 @@ cases:
       code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.pow.2_spyre
     op: torch.pow
     inputs:
@@ -629,7 +593,6 @@ cases:
       code: return hidden_states * torch.pow(mean_squared, -0.5)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.mul.4_spyre
     op: torch.mul
     inputs:
@@ -649,7 +612,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L187 in _norm,
       code: return hidden_states * torch.pow(mean_squared, -0.5)'
-    marks: tensorsoncpu
   - name: torch.float.6_spyre
     op: torch.float
     inputs:
@@ -662,7 +624,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L192 in forward,
       code: normed_output = normed_output * self.weight.float()'
-    marks: tensorsoncpu
   - name: torch.mul.5_spyre
     op: torch.mul
     inputs:
@@ -682,7 +643,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L192 in forward,
       code: normed_output = normed_output * self.weight.float()'
-    marks: tensorsoncpu
   - name: torch.type_as.1_spyre
     op: torch.type_as
     inputs:
@@ -702,7 +662,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L193 in forward,
       code: return normed_output.type_as(hidden_states)'
-    marks: tensorsoncpu
   - name: torch.nn.functional.linear.1_spyre
     op: torch.nn.functional.linear
     inputs:
@@ -725,7 +684,6 @@ cases:
       code: query_states = self.q_proj(hidden_states).view(hidden_shape)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.Tensor.view.1_spyre
     op: torch.Tensor.view
     inputs:
@@ -741,7 +699,6 @@ cases:
       code: query_states = self.q_proj(hidden_states).view(hidden_shape)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.float.7_spyre
     op: torch.float
     inputs:
@@ -754,7 +711,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L190 in forward,
       code: normed_output = self._norm(hidden_states.float())'
-    marks: tensorsoncpu
   - name: torch.pow.3_spyre
     op: torch.pow
     inputs:
@@ -770,7 +726,6 @@ cases:
       code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.mean.2_spyre
     op: torch.mean
     inputs:
@@ -786,7 +741,6 @@ cases:
       code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
     marks:
       - constant
-      - tensorsoncpu
     kwmap:
       keepdim: true
   - name: torch.add.2_spyre
@@ -804,7 +758,6 @@ cases:
       code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.pow.4_spyre
     op: torch.pow
     inputs:
@@ -820,7 +773,6 @@ cases:
       code: return hidden_states * torch.pow(mean_squared, -0.5)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.mul.6_spyre
     op: torch.mul
     inputs:
@@ -840,7 +792,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L187 in _norm,
       code: return hidden_states * torch.pow(mean_squared, -0.5)'
-    marks: tensorsoncpu
   - name: torch.float.8_spyre
     op: torch.float
     inputs:
@@ -853,7 +804,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L192 in forward,
       code: normed_output = normed_output * self.weight.float()'
-    marks: tensorsoncpu
   - name: torch.mul.7_spyre
     op: torch.mul
     inputs:
@@ -873,7 +823,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L192 in forward,
       code: normed_output = normed_output * self.weight.float()'
-    marks: tensorsoncpu
   - name: torch.type_as.2_spyre
     op: torch.type_as
     inputs:
@@ -893,7 +842,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L193 in forward,
       code: return normed_output.type_as(hidden_states)'
-    marks: tensorsoncpu
   - name: torch.unsqueeze.1_spyre
     op: torch.unsqueeze
     inputs:
@@ -909,7 +857,6 @@ cases:
       code: cos = cos.unsqueeze(unsqueeze_dim)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.mul.8_spyre
     op: torch.mul
     inputs:
@@ -929,7 +876,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L312 in apply_rotary_pos_emb,
       code: return (x * cos) + (rotate_half(x) * sin)'
-    marks: tensorsoncpu
   - name: torch.getitem.4_spyre
     op: torch.getitem
     inputs:
@@ -945,7 +891,6 @@ cases:
       code: x1 = x[..., : x.shape[-1] // 2]'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.neg.1_spyre
     op: torch.neg
     inputs:
@@ -958,7 +903,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L290 in rotate_half,
       code: return torch.cat((-x2, x1), dim=-1)'
-    marks: tensorsoncpu
   - name: torch.cat.3_spyre
     op: torch.cat
     inputs:
@@ -979,7 +923,6 @@ cases:
       code: return torch.cat((-x2, x1), dim=-1)'
     marks:
       - constant
-      - tensorsoncpu
     kwmap:
       dim: -1
   - name: torch.add.3_spyre
@@ -1001,7 +944,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L312 in apply_rotary_pos_emb,
       code: return (x * cos) + (rotate_half(x) * sin)'
-    marks: tensorsoncpu
   - name: torch.transpose.3_spyre
     op: torch.transpose
     inputs:
@@ -1018,7 +960,6 @@ cases:
       code: query_states = query_states.transpose(1, 2)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.nn.functional.linear.2_spyre
     op: torch.nn.functional.linear
     inputs:
@@ -1041,7 +982,6 @@ cases:
       code: key_states = self.k_proj(hidden_states).view(hidden_shape)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.Tensor.view.2_spyre
     op: torch.Tensor.view
     inputs:
@@ -1057,7 +997,6 @@ cases:
       code: key_states = self.k_proj(hidden_states).view(hidden_shape)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.float.9_spyre
     op: torch.float
     inputs:
@@ -1070,7 +1009,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L190 in forward,
       code: normed_output = self._norm(hidden_states.float())'
-    marks: tensorsoncpu
   - name: torch.pow.5_spyre
     op: torch.pow
     inputs:
@@ -1086,7 +1024,6 @@ cases:
       code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.mean.3_spyre
     op: torch.mean
     inputs:
@@ -1102,7 +1039,6 @@ cases:
       code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
     marks:
       - constant
-      - tensorsoncpu
     kwmap:
       keepdim: true
   - name: torch.add.4_spyre
@@ -1120,7 +1056,6 @@ cases:
       code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.pow.6_spyre
     op: torch.pow
     inputs:
@@ -1136,7 +1071,6 @@ cases:
       code: return hidden_states * torch.pow(mean_squared, -0.5)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.mul.9_spyre
     op: torch.mul
     inputs:
@@ -1156,7 +1090,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L187 in _norm,
       code: return hidden_states * torch.pow(mean_squared, -0.5)'
-    marks: tensorsoncpu
   - name: torch.mul.10_spyre
     op: torch.mul
     inputs:
@@ -1176,7 +1109,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L192 in forward,
       code: normed_output = normed_output * self.weight.float()'
-    marks: tensorsoncpu
   - name: torch.type_as.3_spyre
     op: torch.type_as
     inputs:
@@ -1196,7 +1128,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L193 in forward,
       code: return normed_output.type_as(hidden_states)'
-    marks: tensorsoncpu
   - name: torch.mul.11_spyre
     op: torch.mul
     inputs:
@@ -1216,7 +1147,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L312 in apply_rotary_pos_emb,
       code: return (x * cos) + (rotate_half(x) * sin)'
-    marks: tensorsoncpu
   - name: torch.getitem.5_spyre
     op: torch.getitem
     inputs:
@@ -1232,7 +1162,6 @@ cases:
       code: x1 = x[..., : x.shape[-1] // 2]'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.neg.2_spyre
     op: torch.neg
     inputs:
@@ -1245,7 +1174,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L290 in rotate_half,
       code: return torch.cat((-x2, x1), dim=-1)'
-    marks: tensorsoncpu
   - name: torch.cat.4_spyre
     op: torch.cat
     inputs:
@@ -1266,7 +1194,6 @@ cases:
       code: return torch.cat((-x2, x1), dim=-1)'
     marks:
       - constant
-      - tensorsoncpu
     kwmap:
       dim: -1
   - name: torch.add.5_spyre
@@ -1288,7 +1215,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L312 in apply_rotary_pos_emb,
       code: return (x * cos) + (rotate_half(x) * sin)'
-    marks: tensorsoncpu
   - name: torch.transpose.4_spyre
     op: torch.transpose
     inputs:
@@ -1305,7 +1231,6 @@ cases:
       code: key_states = key_states.transpose(1, 2)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.zeros.1_spyre
     op: torch.zeros
     inputs:
@@ -1314,7 +1239,6 @@ cases:
       = torch.zeros('
     marks:
       - constant
-      - tensorsoncpu
     kwmap:
       dtype: torch.float16
       device: cpu
@@ -1335,7 +1259,6 @@ cases:
       = self.cumulative_length.to(self.device)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.arange.1_spyre
     op: torch.arange
     inputs:
@@ -1344,7 +1267,6 @@ cases:
       device=self.device) + self.cumulative_length'
     marks:
       - constant
-      - tensorsoncpu
     kwmap:
       device: cpu
   - name: torch.add.6_spyre
@@ -1370,7 +1292,6 @@ cases:
             high: 1000
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L529 in update, code: cache_position = torch.arange(kv_length,
       device=self.device) + self.cumulative_length'
-    marks: tensorsoncpu
   - name: torch.index_copy_.1_spyre
     op: torch.index_copy_
     inputs:
@@ -1402,7 +1323,6 @@ cases:
       cache_position, key_states)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.add_.1_spyre
     op: torch.add_
     inputs:
@@ -1419,7 +1339,6 @@ cases:
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/cache_utils.py#L539 in update, code: self.cumulative_length.add_(kv_length)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.getitem.6_spyre
     op: torch.getitem
     inputs:
@@ -1435,7 +1354,6 @@ cases:
       = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.Tensor.expand.3_spyre
     op: torch.Tensor.expand
     inputs:
@@ -1455,7 +1373,6 @@ cases:
       = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.reshape.1_spyre
     op: torch.reshape
     inputs:
@@ -1471,7 +1388,6 @@ cases:
       hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.nn.functional.scaled_dot_product_attention.1_spyre
     op: torch.nn.functional.scaled_dot_product_attention
     inputs:
@@ -1498,7 +1414,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
       code: attn_output = torch.nn.functional.scaled_dot_product_attention('
-    marks: tensorsoncpu
     kwmap:
       dropout_p: 0.0
       scale: 1.0
@@ -1519,7 +1434,6 @@ cases:
       code: attn_output = attn_output.transpose(1, 2).contiguous()'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.Tensor.contiguous.1_spyre
     op: torch.Tensor.contiguous
     inputs:
@@ -1532,7 +1446,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L164 in sdpa_attention_forward,
       code: attn_output = attn_output.transpose(1, 2).contiguous()'
-    marks: tensorsoncpu
   - name: torch.reshape.2_spyre
     op: torch.reshape
     inputs:
@@ -1548,7 +1461,6 @@ cases:
       code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.Tensor.contiguous.2_spyre
     op: torch.Tensor.contiguous
     inputs:
@@ -1561,7 +1473,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L472 in forward,
       code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
-    marks: tensorsoncpu
   - name: torch.nn.functional.linear.3_spyre
     op: torch.nn.functional.linear
     inputs:
@@ -1584,7 +1495,6 @@ cases:
       code: attn_output = self.o_proj(attn_output)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.add.7_spyre
     op: torch.add
     inputs:
@@ -1604,7 +1514,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L534 in forward,
       code: hidden_states = residual + hidden_states'
-    marks: tensorsoncpu
   - name: torch.nn.functional.linear.4_spyre
     op: torch.nn.functional.linear
     inputs:
@@ -1627,7 +1536,6 @@ cases:
       code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.nn.functional.gelu.1_spyre
     op: torch.nn.functional.gelu
     inputs:
@@ -1639,7 +1547,6 @@ cases:
           device: cuda
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/activations.py#L51 in forward, code: return self.act(input)'
-    marks: tensorsoncpu
     kwmap:
       approximate: tanh
   - name: torch.mul.12_spyre
@@ -1661,7 +1568,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L492 in forward,
       code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
-    marks: tensorsoncpu
   - name: torch.nn.functional.linear.5_spyre
     op: torch.nn.functional.linear
     inputs:
@@ -1684,7 +1590,6 @@ cases:
       code: down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.Tensor.mul.1_spyre
     op: torch.Tensor.mul
     inputs:
@@ -1704,7 +1609,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L543 in forward,
       code: hidden_states *= self.layer_scalar'
-    marks: tensorsoncpu
   - name: torch.nn.functional.scaled_dot_product_attention.2_spyre
     op: torch.nn.functional.scaled_dot_product_attention
     inputs:
@@ -1731,7 +1635,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
       code: attn_output = torch.nn.functional.scaled_dot_product_attention('
-    marks: tensorsoncpu
     kwmap:
       dropout_p: 0.0
       scale: 1.0
@@ -1762,7 +1665,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
       code: attn_output = torch.nn.functional.scaled_dot_product_attention('
-    marks: tensorsoncpu
     kwmap:
       dropout_p: 0.0
       scale: 1.0
@@ -1793,7 +1695,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
       code: attn_output = torch.nn.functional.scaled_dot_product_attention('
-    marks: tensorsoncpu
     kwmap:
       dropout_p: 0.0
       scale: 1.0
@@ -1824,7 +1725,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
       code: attn_output = torch.nn.functional.scaled_dot_product_attention('
-    marks: tensorsoncpu
     kwmap:
       dropout_p: 0.0
       scale: 1.0
@@ -1851,7 +1751,6 @@ cases:
       code: query_states = self.q_proj(hidden_states).view(hidden_shape)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.float.10_spyre
     op: torch.float
     inputs:
@@ -1864,7 +1763,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L190 in forward,
       code: normed_output = self._norm(hidden_states.float())'
-    marks: tensorsoncpu
   - name: torch.pow.7_spyre
     op: torch.pow
     inputs:
@@ -1880,7 +1778,6 @@ cases:
       code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.mean.4_spyre
     op: torch.mean
     inputs:
@@ -1896,7 +1793,6 @@ cases:
       code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
     marks:
       - constant
-      - tensorsoncpu
     kwmap:
       keepdim: true
   - name: torch.mul.13_spyre
@@ -1918,7 +1814,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L187 in _norm,
       code: return hidden_states * torch.pow(mean_squared, -0.5)'
-    marks: tensorsoncpu
   - name: torch.float.11_spyre
     op: torch.float
     inputs:
@@ -1931,7 +1826,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L192 in forward,
       code: normed_output = normed_output * self.weight.float()'
-    marks: tensorsoncpu
   - name: torch.mul.14_spyre
     op: torch.mul
     inputs:
@@ -1951,7 +1845,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L192 in forward,
       code: normed_output = normed_output * self.weight.float()'
-    marks: tensorsoncpu
   - name: torch.type_as.4_spyre
     op: torch.type_as
     inputs:
@@ -1971,7 +1864,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L193 in forward,
       code: return normed_output.type_as(hidden_states)'
-    marks: tensorsoncpu
   - name: torch.unsqueeze.2_spyre
     op: torch.unsqueeze
     inputs:
@@ -1987,7 +1879,6 @@ cases:
       code: cos = cos.unsqueeze(unsqueeze_dim)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.mul.15_spyre
     op: torch.mul
     inputs:
@@ -2007,7 +1898,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L312 in apply_rotary_pos_emb,
       code: return (x * cos) + (rotate_half(x) * sin)'
-    marks: tensorsoncpu
   - name: torch.getitem.7_spyre
     op: torch.getitem
     inputs:
@@ -2023,7 +1913,6 @@ cases:
       code: x1 = x[..., : x.shape[-1] // 2]'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.neg.3_spyre
     op: torch.neg
     inputs:
@@ -2036,7 +1925,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L290 in rotate_half,
       code: return torch.cat((-x2, x1), dim=-1)'
-    marks: tensorsoncpu
   - name: torch.cat.5_spyre
     op: torch.cat
     inputs:
@@ -2057,7 +1945,6 @@ cases:
       code: return torch.cat((-x2, x1), dim=-1)'
     marks:
       - constant
-      - tensorsoncpu
     kwmap:
       dim: -1
   - name: torch.add.8_spyre
@@ -2079,7 +1966,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L312 in apply_rotary_pos_emb,
       code: return (x * cos) + (rotate_half(x) * sin)'
-    marks: tensorsoncpu
   - name: torch.transpose.6_spyre
     op: torch.transpose
     inputs:
@@ -2096,7 +1982,6 @@ cases:
       code: query_states = query_states.transpose(1, 2)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.nn.functional.linear.7_spyre
     op: torch.nn.functional.linear
     inputs:
@@ -2119,7 +2004,6 @@ cases:
       code: key_states = self.k_proj(hidden_states).view(hidden_shape)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.float.12_spyre
     op: torch.float
     inputs:
@@ -2132,7 +2016,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L190 in forward,
       code: normed_output = self._norm(hidden_states.float())'
-    marks: tensorsoncpu
   - name: torch.pow.8_spyre
     op: torch.pow
     inputs:
@@ -2148,7 +2031,6 @@ cases:
       code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.mean.5_spyre
     op: torch.mean
     inputs:
@@ -2164,7 +2046,6 @@ cases:
       code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
     marks:
       - constant
-      - tensorsoncpu
     kwmap:
       keepdim: true
   - name: torch.add.9_spyre
@@ -2182,7 +2063,6 @@ cases:
       code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.pow.9_spyre
     op: torch.pow
     inputs:
@@ -2198,7 +2078,6 @@ cases:
       code: return hidden_states * torch.pow(mean_squared, -0.5)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.mul.16_spyre
     op: torch.mul
     inputs:
@@ -2218,7 +2097,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L187 in _norm,
       code: return hidden_states * torch.pow(mean_squared, -0.5)'
-    marks: tensorsoncpu
   - name: torch.mul.17_spyre
     op: torch.mul
     inputs:
@@ -2238,7 +2116,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L192 in forward,
       code: normed_output = normed_output * self.weight.float()'
-    marks: tensorsoncpu
   - name: torch.type_as.5_spyre
     op: torch.type_as
     inputs:
@@ -2258,7 +2135,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L193 in forward,
       code: return normed_output.type_as(hidden_states)'
-    marks: tensorsoncpu
   - name: torch.mul.18_spyre
     op: torch.mul
     inputs:
@@ -2278,7 +2154,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L312 in apply_rotary_pos_emb,
       code: return (x * cos) + (rotate_half(x) * sin)'
-    marks: tensorsoncpu
   - name: torch.getitem.8_spyre
     op: torch.getitem
     inputs:
@@ -2294,7 +2169,6 @@ cases:
       code: x1 = x[..., : x.shape[-1] // 2]'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.neg.4_spyre
     op: torch.neg
     inputs:
@@ -2307,7 +2181,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L290 in rotate_half,
       code: return torch.cat((-x2, x1), dim=-1)'
-    marks: tensorsoncpu
   - name: torch.cat.6_spyre
     op: torch.cat
     inputs:
@@ -2328,7 +2201,6 @@ cases:
       code: return torch.cat((-x2, x1), dim=-1)'
     marks:
       - constant
-      - tensorsoncpu
     kwmap:
       dim: -1
   - name: torch.add.10_spyre
@@ -2350,7 +2222,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L312 in apply_rotary_pos_emb,
       code: return (x * cos) + (rotate_half(x) * sin)'
-    marks: tensorsoncpu
   - name: torch.transpose.7_spyre
     op: torch.transpose
     inputs:
@@ -2367,7 +2238,6 @@ cases:
       code: key_states = key_states.transpose(1, 2)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.index_copy_.2_spyre
     op: torch.index_copy_
     inputs:
@@ -2399,7 +2269,6 @@ cases:
       cache_position, key_states)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.getitem.9_spyre
     op: torch.getitem
     inputs:
@@ -2415,7 +2284,6 @@ cases:
       = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.getitem.10_spyre
     op: torch.getitem
     inputs:
@@ -2431,7 +2299,6 @@ cases:
       code: key = key[:, :, :q_length, :]'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.nn.functional.scaled_dot_product_attention.6_spyre
     op: torch.nn.functional.scaled_dot_product_attention
     inputs:
@@ -2458,7 +2325,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
       code: attn_output = torch.nn.functional.scaled_dot_product_attention('
-    marks: tensorsoncpu
     kwmap:
       dropout_p: 0.0
       scale: 1.0
@@ -2479,7 +2345,6 @@ cases:
       code: attn_output = attn_output.transpose(1, 2).contiguous()'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.Tensor.contiguous.3_spyre
     op: torch.Tensor.contiguous
     inputs:
@@ -2492,7 +2357,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L164 in sdpa_attention_forward,
       code: attn_output = attn_output.transpose(1, 2).contiguous()'
-    marks: tensorsoncpu
   - name: torch.reshape.3_spyre
     op: torch.reshape
     inputs:
@@ -2508,7 +2372,6 @@ cases:
       code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.Tensor.contiguous.4_spyre
     op: torch.Tensor.contiguous
     inputs:
@@ -2521,7 +2384,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L472 in forward,
       code: attn_output = attn_output.reshape(*input_shape, -1).contiguous()'
-    marks: tensorsoncpu
   - name: torch.nn.functional.linear.8_spyre
     op: torch.nn.functional.linear
     inputs:
@@ -2544,7 +2406,6 @@ cases:
       code: attn_output = self.o_proj(attn_output)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.nn.functional.scaled_dot_product_attention.7_spyre
     op: torch.nn.functional.scaled_dot_product_attention
     inputs:
@@ -2571,7 +2432,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
       code: attn_output = torch.nn.functional.scaled_dot_product_attention('
-    marks: tensorsoncpu
     kwmap:
       dropout_p: 0.0
       scale: 1.0
@@ -2602,7 +2462,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/integrations/sdpa_attention.py#L154 in sdpa_attention_forward,
       code: attn_output = torch.nn.functional.scaled_dot_product_attention('
-    marks: tensorsoncpu
     kwmap:
       dropout_p: 0.0
       scale: 1.0
@@ -2622,7 +2481,6 @@ cases:
       code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.nn.functional.linear.9_spyre
     op: torch.nn.functional.linear
     inputs:
@@ -2645,7 +2503,6 @@ cases:
       code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.truediv.1_spyre
     op: torch.truediv
     inputs:
@@ -2661,7 +2518,6 @@ cases:
       code: logits = logits / final_logit_softcapping'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.tanh.1_spyre
     op: torch.tanh
     inputs:
@@ -2674,7 +2530,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1338 in torch_dynamo_resume_in_forward_at_1313,
       code: logits = torch.tanh(logits)'
-    marks: tensorsoncpu
   - name: torch.mul.19_spyre
     op: torch.mul
     inputs:
@@ -2690,7 +2545,6 @@ cases:
       code: logits = logits * final_logit_softcapping'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.eq.2_spyre
     op: torch.eq
     inputs:
@@ -2708,7 +2562,6 @@ cases:
       code: special_image_mask = input_ids == self.config.image_token_id'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.or_.2_spyre
     op: torch.or_
     inputs:
@@ -2726,7 +2579,6 @@ cases:
           device: cuda
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1034 in forward,
       code: multimodal_mask = image_mask | video_mask | audio_mask'
-    marks: tensorsoncpu
   - name: torch.clone.2_spyre
     op: torch.clone
     inputs:
@@ -2741,7 +2593,6 @@ cases:
             high: 1000
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L1039 in forward,
       code: llm_input_ids = input_ids.clone()'
-    marks: tensorsoncpu
   - name: torch.where.2_spyre
     op: torch.where
     inputs:
@@ -2765,7 +2616,6 @@ cases:
       code: llm_input_ids = torch.where(multimodal_mask, self.config.text_config.pad_token_id, llm_input_ids)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.nn.functional.embedding.2_spyre
     op: torch.nn.functional.embedding
     inputs:
@@ -2794,7 +2644,6 @@ cases:
       code: return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.mul.20_spyre
     op: torch.mul
     inputs:
@@ -2814,7 +2663,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L558 in forward,
       code: return super().forward(input_ids) * self.embed_scale.to(self.weight.dtype)'
-    marks: tensorsoncpu
   - name: torch.getitem.12_spyre
     op: torch.getitem
     inputs:
@@ -2832,7 +2680,6 @@ cases:
       code: position_ids_expanded = position_ids[:, None, :].float()'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.float.13_spyre
     op: torch.float
     inputs:
@@ -2847,7 +2694,6 @@ cases:
             high: 1000
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L274 in forward,
       code: position_ids_expanded = position_ids[:, None, :].float()'
-    marks: tensorsoncpu
   - name: torch.float.14_spyre
     op: torch.float
     inputs:
@@ -2860,7 +2706,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L278 in forward,
       code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
-    marks: tensorsoncpu
   - name: torch.matmul.3_spyre
     op: torch.matmul
     inputs:
@@ -2880,7 +2725,6 @@ cases:
           init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L278 in forward,
       code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
-    marks: tensorsoncpu
   - name: torch.transpose.9_spyre
     op: torch.transpose
     inputs:
@@ -2897,7 +2741,6 @@ cases:
       code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.cat.7_spyre
     op: torch.cat
     inputs:
@@ -2918,7 +2761,6 @@ cases:
       code: emb = torch.cat((freqs, freqs), dim=-1)'
     marks:
       - constant
-      - tensorsoncpu
     kwmap:
       dim: -1
   - name: torch.cos.3_spyre
@@ -2933,7 +2775,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L280 in forward,
       code: cos = emb.cos() * attention_scaling'
-    marks: tensorsoncpu
   - name: torch.mul.21_spyre
     op: torch.mul
     inputs:
@@ -2949,7 +2790,6 @@ cases:
       code: cos = emb.cos() * attention_scaling'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.sin.3_spyre
     op: torch.sin
     inputs:
@@ -2962,7 +2802,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L281 in forward,
       code: sin = emb.sin() * attention_scaling'
-    marks: tensorsoncpu
   - name: torch.to.7_spyre
     op: torch.to
     inputs:
@@ -2975,7 +2814,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L283 in forward,
       code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
-    marks: tensorsoncpu
     kwmap:
       dtype: torch.float16
   - name: torch.matmul.4_spyre
@@ -2997,7 +2835,6 @@ cases:
           init: xavier
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L278 in forward,
       code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
-    marks: tensorsoncpu
   - name: torch.transpose.10_spyre
     op: torch.transpose
     inputs:
@@ -3014,7 +2851,6 @@ cases:
       code: freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.cat.8_spyre
     op: torch.cat
     inputs:
@@ -3035,7 +2871,6 @@ cases:
       code: emb = torch.cat((freqs, freqs), dim=-1)'
     marks:
       - constant
-      - tensorsoncpu
     kwmap:
       dim: -1
   - name: torch.cos.4_spyre
@@ -3050,7 +2885,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L280 in forward,
       code: cos = emb.cos() * attention_scaling'
-    marks: tensorsoncpu
   - name: torch.mul.22_spyre
     op: torch.mul
     inputs:
@@ -3066,7 +2900,6 @@ cases:
       code: cos = emb.cos() * attention_scaling'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.sin.4_spyre
     op: torch.sin
     inputs:
@@ -3079,7 +2912,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L281 in forward,
       code: sin = emb.sin() * attention_scaling'
-    marks: tensorsoncpu
   - name: torch.to.8_spyre
     op: torch.to
     inputs:
@@ -3092,7 +2924,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L283 in forward,
       code: return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)'
-    marks: tensorsoncpu
     kwmap:
       dtype: torch.float16
   - name: torch.float.15_spyre
@@ -3107,7 +2938,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L190 in forward,
       code: normed_output = self._norm(hidden_states.float())'
-    marks: tensorsoncpu
   - name: torch.pow.10_spyre
     op: torch.pow
     inputs:
@@ -3123,7 +2953,6 @@ cases:
       code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.mean.6_spyre
     op: torch.mean
     inputs:
@@ -3139,7 +2968,6 @@ cases:
       code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
     marks:
       - constant
-      - tensorsoncpu
     kwmap:
       keepdim: true
   - name: torch.add.11_spyre
@@ -3157,7 +2985,6 @@ cases:
       code: mean_squared = hidden_states.pow(2).mean(-1, keepdim=True) + self.eps'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.pow.11_spyre
     op: torch.pow
     inputs:
@@ -3173,7 +3000,6 @@ cases:
       code: return hidden_states * torch.pow(mean_squared, -0.5)'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.mul.23_spyre
     op: torch.mul
     inputs:
@@ -3193,7 +3019,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L187 in _norm,
       code: return hidden_states * torch.pow(mean_squared, -0.5)'
-    marks: tensorsoncpu
   - name: torch.mul.24_spyre
     op: torch.mul
     inputs:
@@ -3213,7 +3038,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L192 in forward,
       code: normed_output = normed_output * self.weight.float()'
-    marks: tensorsoncpu
   - name: torch.type_as.6_spyre
     op: torch.type_as
     inputs:
@@ -3233,7 +3057,6 @@ cases:
           init: rand
     description: 'https://github.com/huggingface/transformers/blob/v5.14.1/src/transformers/models/gemma4_unified/modeling_gemma4_unified.py#L193 in forward,
       code: return normed_output.type_as(hidden_states)'
-    marks: tensorsoncpu
   - name: torch.getitem.13_spyre
     op: torch.getitem
     inputs:
@@ -3249,7 +3072,6 @@ cases:
       code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
     marks:
       - constant
-      - tensorsoncpu
   - name: torch.nn.functional.linear.10_spyre
     op: torch.nn.functional.linear
     inputs:
@@ -3272,4 +3094,3 @@ cases:
       code: logits = self.lm_head(hidden_states[:, slice_indices, :])'
     marks:
       - constant
-      - tensorsoncpu

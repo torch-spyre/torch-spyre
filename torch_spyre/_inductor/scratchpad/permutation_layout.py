@@ -35,8 +35,12 @@ from torch_spyre._C import NativePermutationLayoutSolver
 from torch_spyre._inductor.scratchpad.contact_profile import Profile
 from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
-    assert_in_place_parent_is_read,
+    check_in_place_parent_is_read,
 )
+
+# The native packer holds every tick in an int64, so a plan the two packers are
+# meant to agree on cannot carry a use it could not represent.
+_INT64_MAX = 2**63 - 1
 
 
 def _quality_for(buf: LifetimeBoundBuffer, size: int) -> float:
@@ -119,9 +123,24 @@ class PermutationBasedLayoutSolverBase(ABC):
         eligible: Optional[list[bool]] = None,
     ):
         n = len(buffers)
-        assert sorted(permutation) == list(range(n)), (
-            "permutation must be a permutation of range(len(buffers))"
-        )
+        # Checked in the native constructor's order, so that a plan wrong in more
+        # than one way reports the same first complaint from either packer.
+        if alignment <= 0:
+            raise ValueError("alignment must be positive")
+        if sorted(permutation) != list(range(n)):
+            raise ValueError("permutation must be a permutation of range(len(buffers))")
+        for i, buf in enumerate(buffers):
+            if buf.size < 0:
+                raise ValueError(f"buffer {i}: size must be non-negative")
+            # LifetimeBoundBuffer deliberately allows empty uses (registration can
+            # precede them), but a packer reads start_time/end_time off them.
+            if not buf.uses:
+                raise ValueError("buffer uses must be non-empty")
+            # Python has no overflow here, but the native packer derives
+            # end_time as uses[-1] + 1 in int64. Rejected in both so the choice
+            # of packer stays invisible.
+            if buf.uses[-1] >= _INT64_MAX:
+                raise ValueError(f"buffer {i}: last use must be below INT64_MAX")
         self.buffers = buffers
         self.permutation = list(permutation)
         self.capacity = capacity
@@ -131,7 +150,8 @@ class PermutationBasedLayoutSolverBase(ABC):
         # duplicate makes ``in_place_parents=["a"]`` ambiguous -- the dict
         # comprehension above silently keeps the last such buffer. Reject
         # instead of resolving to an arbitrary one.
-        assert len(self._name_to_idx) == n, "buffer names must be unique"
+        if len(self._name_to_idx) != n:
+            raise ValueError("buffer names must be unique")
 
         # Per-buffer size as a flat list, for fast access in the placement hot
         # loop (avoids a dataclass attribute lookup per candidate). Mutable via
@@ -149,7 +169,8 @@ class PermutationBasedLayoutSolverBase(ABC):
         # HBM). Mutable via :meth:`set_eligible`; deep-copied by :meth:`copy`.
         # Defaults to all-True, which reproduces the layout-only solver exactly.
         self._eligible = [True] * n if eligible is None else list(eligible)
-        assert len(self._eligible) == n, "eligible must have one flag per buffer"
+        if len(self._eligible) != n:
+            raise ValueError("eligible must have one flag per buffer")
 
         # Per-buffer set of possible in-place partners (its declared parents and
         # the children that declare it). Static -- a function of names and
@@ -218,6 +239,36 @@ class PermutationBasedLayoutSolverBase(ABC):
 
     # --- shared helpers -----------------------------------------------------
 
+    def _check_index(self, idx: int, method: str) -> None:
+        """Reject a buffer index outside ``range(len(buffers))``.
+
+        Python would read ``idx=-1`` as the last buffer and silently mutate (or
+        report on) that one, where the native packer raises. The two are meant to
+        be interchangeable, so raise its ``ValueError``, with its message.
+        """
+        if not 0 <= idx < len(self.buffers):
+            raise ValueError(f"{method} index out of range")
+
+    def _check_swap_index(self, i: int) -> None:
+        """Reject a swap position with no successor to swap with.
+
+        Valid positions are ``0 .. len(buffers) - 2``. Lives on the base but is
+        called from each concrete :meth:`swap`, which is all the base declares.
+        Same reasoning as :meth:`_check_index`: unchecked, ``swap(-1)`` exchanges
+        the last permutation entry with the first.
+        """
+        if not 0 <= i < len(self.buffers) - 1:
+            raise ValueError("swap index out of range")
+
+    def _check_indices(self, i: int, j: int, method: str) -> None:
+        """:meth:`_check_index` for a method taking two buffer indices. Called by
+        every :meth:`rotate` before its ``i == j`` no-op, so an out-of-range
+        ``rotate(999, 999)`` raises instead of returning 0.0 (as in the native
+        packer)."""
+        n = len(self.buffers)
+        if not (0 <= i < n and 0 <= j < n):
+            raise ValueError(f"{method} index out of range")
+
     def resize(self, idx: int, new_size: int) -> float:
         """Change buffer ``idx``'s footprint to ``new_size`` in place and
         re-place. Returns the change in :meth:`quality` (new minus old).
@@ -233,6 +284,7 @@ class PermutationBasedLayoutSolverBase(ABC):
         on -- the incremental result then diverges from a from-scratch place.
         Zero is allowed: the allocator clamps unsized entries to 0.
         """
+        self._check_index(idx, "resize")
         if new_size < 0:
             raise ValueError("resize size must be non-negative")
         old_total = self.total_quality
@@ -246,7 +298,7 @@ class PermutationBasedLayoutSolverBase(ABC):
         # total; since we just overwrote it, ``idx`` (if allocated) still
         # contributes its *old* quality here, so swap in the delta now. Harmless to
         # the from-scratch reference (its ``_build`` resets the total anyway).
-        if self.is_fully_allocated(idx):
+        if self._is_allocated(idx):
             self.total_quality += self._qualities[idx] - old_q
         self._reflow_resized(idx)
         return self.total_quality - old_total
@@ -261,6 +313,9 @@ class PermutationBasedLayoutSolverBase(ABC):
         (Plan §2.2 / §7.3): the SA engine flips this as a division change makes a
         buffer's tiling edge (in)compatible.
         """
+        # Before the unchanged-flag no-op, so an out-of-range ``set_eligible``
+        # cannot return 0.0 instead of raising (as in the native packer).
+        self._check_index(idx, "set_eligible")
         if self._eligible[idx] == flag:
             return 0.0
         old_total = self.total_quality
@@ -274,8 +329,8 @@ class PermutationBasedLayoutSolverBase(ABC):
         # A product of swaps, even over the full distance, beats a permutation-edit + _build():
         # most of the swaps are O(1) no-ops, so the chain is far cheaper than an O(n^2) rebuild in
         # the realistic (sparse-overlap) regime. (A rebuild only wins for dense overlap, where it
-        # is a symptom of swap propagation degenerating -- a thing to fix, not to route around. See
-        # benchmarks/copy_vs_swap_results.md.)
+        # is a symptom of swap propagation degenerating -- a thing to fix, not to route around.)
+        self._check_indices(i, j, "rotate")
         delta = 0.0
         if i < j:
             for k in range(i, j):
@@ -312,6 +367,7 @@ class PermutationBasedLayoutSolverBase(ABC):
         search, where it used to read ``buffers[idx].size``) so that it reads the
         plan-local ``_sizes``, which :meth:`resize` mutates.
         """
+        self._check_index(idx, "top_or_inf")
         top = self._top(idx)
         return math.inf if top is None else float(top)
 
@@ -323,6 +379,13 @@ class PermutationBasedLayoutSolverBase(ABC):
         gate lives in :meth:`_placement_decision`), so "has an address" and
         "fully allocated" coincide.
         """
+        self._check_index(idx, "is_fully_allocated")
+        return self._is_allocated(idx)
+
+    def _is_allocated(self, idx: int) -> bool:
+        """:meth:`is_fully_allocated` without the bounds check, for the internal
+        callers that hold an index they just derived. Mirrors the native packer's
+        split between the exported accessor and the raw predicate."""
         return self.addresses[idx] is not None
 
     def overlaps(self, i: int, j: int) -> bool:
@@ -332,6 +395,12 @@ class PermutationBasedLayoutSolverBase(ABC):
         in-place parent and child (``parent.end_time == child.start_time + 1``)
         overlap at exactly that boundary tick (``child.start_time``).
         """
+        self._check_indices(i, j, "overlaps")
+        return self._overlaps(i, j)
+
+    def _overlaps(self, i: int, j: int) -> bool:
+        """:meth:`overlaps` without the bounds check. Same reasoning as
+        :meth:`_is_allocated`; this one is on the placement hot loop."""
         return self.buffers[i].overlaps_in_time(self.buffers[j])
 
     def _in_place_pair(self, i: int, j: int) -> Optional[tuple[int, int]]:
@@ -366,18 +435,19 @@ class PermutationBasedLayoutSolverBase(ABC):
                     # A write-only computed parent has nothing to hand over, so
                     # the pair is not expressible rather than merely unprofitable.
                     # Checked here because this is the one place that resolves
-                    # declared pairs. The other two in-place invariants asserted
-                    # by ``_assert_in_place_relationships`` are placement-time
-                    # gates here rather than preconditions -- an oversized child
-                    # is simply not placed in-place, see ``_can_inplace`` -- so
-                    # asserting them would reject plans this solver handles.
-                    assert_in_place_parent_is_read(self.buffers[parent], buf.name)
+                    # declared pairs. Of the three in-place invariants checked
+                    # by ``_check_in_place_relationships`` only the size one is
+                    # a placement-time gate here rather than a precondition --
+                    # an oversized child is simply not placed in-place, see
+                    # ``_can_inplace`` -- so checking it would reject plans this
+                    # solver handles.
+                    check_in_place_parent_is_read(self.buffers[parent], buf.name)
                     # Single-tick handoff: a valid in-place pair overlaps at
                     # exactly one tick, the child's first. Both in-place
                     # candidate generators upstream enforce it
                     # (``allocator._determine_in_place`` and
                     # ``_determine_in_place_division_invariant``), and
-                    # ``_assert_in_place_relationships`` re-checks it. The
+                    # ``_check_in_place_relationships`` re-checks it. The
                     # incremental machinery *relies* on it and cannot re-derive
                     # it: ``_placement_decision`` co-locates any overlapping
                     # partner that fits, while the in-place dirtying in
@@ -386,15 +456,16 @@ class PermutationBasedLayoutSolverBase(ABC):
                     # profiles at that single tick. On a multi-tick overlap they
                     # under-seed (stale addresses); when the child starts first
                     # they index outside the parent's span. Fail here instead.
-                    assert (
+                    if (
                         self.buffers[parent].end_time
-                        == self.buffers[child].start_time + 1
-                    ), (
-                        f"in-place pair ({self.buffers[parent].name}, "
-                        f"{buf.name}) must hand off at a single tick: parent "
-                        f"end_time {self.buffers[parent].end_time} != child "
-                        f"start_time {self.buffers[child].start_time} + 1"
-                    )
+                        != self.buffers[child].start_time + 1
+                    ):
+                        raise ValueError(
+                            f"in-place pair ({self.buffers[parent].name}, "
+                            f"{buf.name}) must hand off at a single tick: parent "
+                            f"end_time {self.buffers[parent].end_time} != child "
+                            f"start_time {self.buffers[child].start_time} + 1"
+                        )
                     partners[child].add(parent)
                     partners[parent].add(child)
         return partners
@@ -656,15 +727,16 @@ class ReferencePermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
                 continue
             prior = self.permutation[:pos]
             candidates = [
-                p for p in prior if self.overlaps(idx, p) and self._eligible[p]
+                p for p in prior if self._overlaps(idx, p) and self._eligible[p]
             ]
             self.addresses[idx] = self._address_from_candidates(idx, candidates)
-            if self.is_fully_allocated(idx):
+            if self._is_allocated(idx):
                 self.total_quality += self._qualities[idx]
                 self.total_allocated_count += 1
 
     def swap(self, i: int) -> float:
         """Swap permutation entries ``i``/``i+1`` and rebuild from scratch."""
+        self._check_swap_index(i)
         old_total = self.total_quality
         perm = self.permutation
         perm[i], perm[i + 1] = perm[i + 1], perm[i]
@@ -719,7 +791,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
             lambda pos, idx: [
                 p
                 for p in self.permutation[:pos]
-                if self.overlaps(idx, p) and self._eligible[p]
+                if self._overlaps(idx, p) and self._eligible[p]
             ]
         )
         # Persistent position index, maintained in O(1) by swap().
@@ -732,7 +804,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         self.overlap_dict: dict[int, set[int]] = {i: set() for i in range(n)}
         for a in range(n):
             for b in range(a + 1, n):
-                if self.overlaps(a, b):
+                if self._overlaps(a, b):
                     self.overlap_dict[a].add(b)
                     self.overlap_dict[b].add(a)
         # Minimum |i - j| at which rotate() uses the remove/reinsert fast path
@@ -850,8 +922,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         Returns:
             The change in :meth:`quality` (new minus old).
         """
-        n = len(self.buffers)
-        assert 0 <= i < n - 1
+        self._check_swap_index(i)
         perm = self.permutation
         x, y = perm[i], perm[i + 1]
         perm[i], perm[i + 1] = y, x
@@ -861,7 +932,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
             # eligible stacking order: reordering across it leaves every eligible
             # buffer's contacts and address untouched. Only the positions moved.
             return 0
-        if not self.overlaps(x, y):
+        if not self._overlaps(x, y):
             # Independent buffers: their order does not affect any address.
             return 0
 
@@ -931,7 +1002,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
             pos_z = self.position[z]
             old_addr = self.addresses[z]
             old_partner = self.inplace_reuse.get(z)
-            if self.is_fully_allocated(z):
+            if self._is_allocated(z):
                 self.total_quality -= self._qualities[z]
                 self.total_allocated_count -= 1
             self._recompute_address(z)
@@ -984,7 +1055,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
             if w in flipped:
                 continue
             flipped.add(w)
-            if self.is_fully_allocated(w):
+            if self._is_allocated(w):
                 self.total_quality -= self._qualities[w]
                 self.total_allocated_count -= 1
             self.addresses[w] = None
@@ -1108,6 +1179,9 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
         selects the fast path; the threshold is a tunable instance attribute
         (set it to 1 to force the fast path on every rotation).
         """
+        # Checked here as well as in ``super().rotate``: neither the ``i == j``
+        # no-op nor the fast path below goes through it.
+        self._check_indices(i, j, "rotate")
         if i == j:
             return 0
         if not self._eligible[self.permutation[i]]:
@@ -1382,7 +1456,7 @@ class PermutationBasedLayoutSolver(PermutationBasedLayoutSolverBase):
                 list(self.above_profile[idx].labels),
             )
             seed = {lbl for lbl in old_above.label_set() if lbl is not None}
-            if self.is_fully_allocated(idx):
+            if self._is_allocated(idx):
                 self.total_quality -= self._qualities[idx]
                 self.total_allocated_count -= 1
             self.addresses[idx] = None

@@ -22,8 +22,7 @@ from .constants import ELIDED_COPY_BACK_ATTR
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .optimize_restickify import EdgeCostMap
 from .logging_utils import get_inductor_logger
-from .loop_info import copy_op_metadata
-from .provenance import preserve_provenance
+from .pass_utils import redirect_computed_buffer_reads
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -37,7 +36,6 @@ from torch._inductor.ir import (
     TensorBox,
 )
 from torch_spyre._C import SpyreTensorLayout
-from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.virtualized import V
 
 from torch.utils._ordered_set import OrderedSet
@@ -71,24 +69,6 @@ def _record_restickify(
     restickify_plan[op.get_name()].append(
         {"arg_name": dep_name, "target_layout": target_layout}
     )
-
-
-class NameSwapHandler(WrapperHandler):
-    """
-    Wrapper to patch a node's inner_fn to use new buffer names after inserting
-    nodes upstream that change the input buffers.
-
-    This is the canonical example of the correct WrapperHandler wrapping
-    pattern for compiler passes. See CLAUDE.md "Compiler Pass Conventions"
-    and issue #2797.
-    """
-
-    def __init__(self, inner, name_map: dict[str, str]):
-        super().__init__(inner)
-        self._name_map = name_map
-
-    def load(self, name, index):
-        return super().load(self._name_map.get(name, name), index)
 
 
 def _create_restickify_node(
@@ -229,39 +209,13 @@ def insert_restickify_on_node_inputs(
             restick_buff.loop_info = op.loop_info
 
     # Patch inner_fn once with the full name_map covering all restickified args.
-    orig_inner = op.data.inner_fn
-
-    def new_inner_fn(*args, _map=name_map, _orig_inner=orig_inner):
-        with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
-            return _orig_inner(*args)
-
-    object.__setattr__(op.data, "inner_fn", new_inner_fn)
-
-    # Reconstruct ComputedBuffer as a fresh object so the instance-keyed cache
-    # on get_default_sizes_body can be cleanly invalidated below.
-    new_consumer_buffer = ComputedBuffer(
-        name=op.get_name(),
-        layout=op.layout,
-        data=op.data,
-        _split_size=op._split_size,
-        _original_inner_fn=op._original_inner_fn,
-        _original_ranges=op._original_ranges,
-        _original_reduction_ranges=op._original_reduction_ranges,
-    )
-    new_consumer_buffer.operation_name = op.operation_name
-    preserve_provenance(
+    redirect_computed_buffer_reads(
         op,
-        new_consumer_buffer,
+        name_map,
+        operations,
         pass_name="insert_restickify",
         reason="redirect consumer to restickified input",
     )
-    copy_op_metadata(op, new_consumer_buffer)
-    # Replace op in the operations list with the reconstructed buffer.
-    operations[op_index] = new_consumer_buffer
-    V.graph.name_to_buffer[new_consumer_buffer.get_name()] = new_consumer_buffer
-
-    # Invalidate the sizes/body cache so it is recomputed on next access with the patched inner_fn.
-    ComputedBuffer.get_default_sizes_body.clear_cache(new_consumer_buffer)
 
 
 def insert_restickify(graph: GraphLowering) -> None:
@@ -607,3 +561,38 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
             target_name,
             mutation_name,
         )
+
+
+def validate_no_restickify_on_mutation_targets(graph: GraphLowering) -> None:
+    """Assert that no restickify was inserted on a mutation target buffer.
+
+    A mutation op (MutationLayoutSHOULDREMOVE) writes directly into its target buffer.
+    Restickifying that buffer would redirect the write to a temporary, silently breaking
+    the in-place semantics.
+
+    Must run after insert_restickify (so restickify_plan is populated) and before
+    the scheduler (which resolves MutationLayoutSHOULDREMOVE to a concrete buffer
+    address, after which mutation target identity is no longer recoverable).
+    """
+    assert hasattr(graph, "restickify_plan"), (
+        "validate_no_restickify_on_mutation_targets must run after insert_restickify"
+    )
+    restickify_plan = graph.restickify_plan
+    for op in graph.operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        layout = op.get_layout()
+        if not isinstance(layout, MutationLayoutSHOULDREMOVE):
+            continue
+        target = layout.target
+        while isinstance(target, ReinterpretView):
+            target = target.data
+        if not hasattr(target, "get_name"):
+            continue
+        target_name = target.get_name()
+        for entry in restickify_plan.get(op.get_name(), []):
+            if entry["arg_name"] == target_name:
+                raise AssertionError(
+                    f"restickify inserted on mutation target buffer {target_name!r} "
+                    f"as input to its own mutation op {op.get_name()!r}"
+                )

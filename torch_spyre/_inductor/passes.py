@@ -38,7 +38,7 @@ from torch._inductor.scheduler import BaseSchedulerNode
 from .logging_utils import get_inductor_logger
 from .provenance import SpyreGraphTransformObserver, reset_provenance_warnings
 
-from .padding import insert_bmm_padding
+from .padding import insert_bmm_padding, insert_restickify_padding
 from .temp_passes import (
     bmm_unflatten_pass,
     decompose_addmm,
@@ -69,6 +69,7 @@ from .insert_restickify import (
     finalize_layouts,
     insert_post_mutation_restickify,
     insert_restickify,
+    validate_no_restickify_on_mutation_targets,
 )
 from .enforce_indirect_access_layout import enforce_indirect_access_layout
 from .hbm_pool_planning import hbm_pool_planning
@@ -465,8 +466,10 @@ class CustomPreSchedulingPasses:
             optimize_restickify_locations,
             finalize_layouts,
             insert_restickify,
+            validate_no_restickify_on_mutation_targets,
             enforce_indirect_access_layout,
             insert_post_mutation_restickify,
+            insert_restickify_padding,
             insert_bmm_padding,
             #
             dedup_and_promote_constants,

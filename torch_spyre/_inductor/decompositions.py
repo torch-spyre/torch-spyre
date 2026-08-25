@@ -427,6 +427,24 @@ def spyre__sdpa_overrideable(
         key = key.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
         value = value.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
 
+    # A decode query commonly arrives as a logical [B, H, 1, D] view of
+    # physical [B, 1, H, D] storage.  The score matmul can accept that view as
+    # stick-compatible even though it consumes a canonical heads-outer layout,
+    # so whether the query is read correctly can depend on an unrelated LX
+    # allocation decision.  Ordinary clones are removed by Inductor; copying
+    # into a fresh contiguous destination forces a real canonical buffer.
+    if max_seqlen_q == 1:
+        query_for_scores = torch.ops.spyre.opaque_copy_(
+            query,
+            torch.zeros(
+                (batch_size, num_heads, max_seqlen_q, head_dim),
+                device=query.device,
+                dtype=query.dtype,
+            ),
+        )
+    else:
+        query_for_scores = query
+
     kv_block_size = 64
     q_block_size = 64
 
@@ -481,7 +499,7 @@ def spyre__sdpa_overrideable(
                             -1, -2
                         )  # batch_size, num_heads, head_dim, max_seqlen_kv
                         scores = torch.matmul(
-                            query * scaling_factor, keys_T
+                            query_for_scores * scaling_factor, keys_T
                         )  # batch_size, num_heads, max_seqlen_q, max_seqlen_kv
 
                         if is_causal:
@@ -1267,3 +1285,36 @@ def spyre_masked_scatter(
     # input rank-aligned with the output.
     gathered = source_2d[row_idx].reshape(self.shape)
     return torch.where(mask, gathered, self)
+
+
+@register_spyre_decompositions([torch.ops.aten.index_add.default])
+def spyre_index_add(
+    self: torch.Tensor,
+    dim: int,
+    index: torch.Tensor,
+    source: torch.Tensor,
+    *,
+    alpha: Union[int, float] = 1,
+) -> torch.Tensor:
+    """`index_add` as gather + add + overwrite-scatter, fully on device.
+
+    `out.index_add_(dim, index, source * alpha)` is a read-modify-write:
+    read the current values at the target slots, add the (scaled) source, and
+    write them back, using primitives Spyre runs on the indirect-access engine:
+
+      * `index_select`  -> on-device indirect gather
+      * `index_put`     -> on-device indirect overwrite store
+
+    PRECONDITION -- `index` must contain NO DUPLICATE values. A read-modify-
+    write cannot sum colliding writes: every duplicate reads the same old value
+    and the overwrite store keeps only the last writer, so duplicate indices are
+    SILENTLY WRONG.
+    """
+    dim = dim % self.dim()
+    if alpha != 1:
+        source = source * alpha
+    # Read current destination values, then add the source onto them.
+    gathered = torch.index_select(self, dim, index)
+    updated = gathered + source
+    indices: list[Optional[torch.Tensor]] = [None] * dim + [index]
+    return torch.index_put(self, indices, updated, accumulate=False)

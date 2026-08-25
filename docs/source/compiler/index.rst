@@ -49,6 +49,7 @@ test coverage, bug classification), see :doc:`/contributing/op_enablement`.
 
    adding_operations
    indirect_access
+   indirect_access_work_division
 
 .. toctree::
    :maxdepth: 2
