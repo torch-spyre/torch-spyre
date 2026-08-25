@@ -25,6 +25,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
 )
 from torch_spyre._inductor.scratchpad.permutation_layout import (
+    NativePermutationLayoutSolver,
     PermutationBasedLayoutSolver,
     buffer_quality,
 )
@@ -36,8 +37,8 @@ from torch_spyre._inductor.scratchpad.cooling_schedules import (
 )
 from torch_spyre._inductor.scratchpad.simulated_annealing import (
     SimulatedAnnealingLayoutSolver,
-    SimulatedAnnealingSolverWithBuffers,
 )
+from torch_spyre._inductor import config
 
 # Heavy randomized anneals over many seeds, larger problems and longer
 # schedules. Skipped by default (slow); opt in with the env var.
@@ -57,9 +58,20 @@ def _random_buffers(rng, n, horizon=12, max_size=200):
         if rng.random() < 0.25:
             parent = buffers[rng.randrange(child_i)]
             child = buffers[child_i]
-            new_start = parent.uses[-1]
-            new_last = max(child.uses[-1], parent.uses[-1])
-            child.uses = [new_start] if new_start == new_last else [new_start, new_last]
+            if parent.read_count == 0:
+                # A write-only parent has nothing to hand over, so the pair is
+                # not expressible at all (see ``check_in_place_parent_is_read``).
+                # Drawing one is possible because a base buffer may land on a
+                # single-tick lifetime; skip rather than reshaping the parent,
+                # which could invalidate a pair already wired to it.
+                continue
+            # The child is defined at the parent's last live tick. Its own read
+            # has to fall strictly after that write, both because uses is
+            # strictly increasing and so that the child can itself be drawn as a
+            # parent later in this loop; extend by a tick when the child's own
+            # end is too early to supply one.
+            handoff = parent.uses[-1]
+            child.uses = [handoff, max(child.uses[-1], handoff + 1)]
             child.size = rng.randint(1, parent.size)
             child.in_place_parents = [parent.name]
     return buffers
@@ -241,8 +253,9 @@ class CoolingScheduleTests(TestCase):
             buffers = _random_buffers(rng, n)
             cap = max(b.size for b in buffers) * rng.randint(2, 4)
             b1, b2 = copy.deepcopy(buffers), copy.deepcopy(buffers)
-            SimulatedAnnealingLayoutSolver(cap, 128).plan_layout(b1)  # default schedule
-            SimulatedAnnealingLayoutSolver(cap, 128).plan_layout(b2)
+            # default schedule
+            SimulatedAnnealingLayoutSolver(b1, cap, 128).plan_layout()
+            SimulatedAnnealingLayoutSolver(b2, cap, 128).plan_layout()
             self.assertEqual(
                 [b.address for b in b1], [b.address for b in b2], f"seed={seed}"
             )
@@ -262,13 +275,14 @@ class CoolingScheduleTests(TestCase):
 class SimulatedAnnealingTests(TestCase):
     def _run(self, buffers, capacity, *, initial, seed, alignment=128):
         solver = SimulatedAnnealingLayoutSolver(
+            buffers,
             capacity,
             alignment,
             initial=initial,
             schedule=_short_schedule(),
             random=rnd.Random(seed),
         )
-        return solver.plan_layout(buffers)
+        return solver.plan_layout()
 
     def test_solve_skips_annealing_when_initial_already_complete(self):
         # The capacity fits all three buffers in any order, so the initial
@@ -280,7 +294,7 @@ class SimulatedAnnealingTests(TestCase):
             LifetimeBoundBuffer("c", 64, [0, 1]),
         ]
         cap = 10_000
-        solver = SimulatedAnnealingSolverWithBuffers(
+        solver = SimulatedAnnealingLayoutSolver(
             buffers,
             cap,
             128,
@@ -313,7 +327,7 @@ class SimulatedAnnealingTests(TestCase):
         schedule = ExponentialCoolingSchedule(
             t_initial=8.0, t_final=1.0, steps_per_epoch=2, epochs=4
         )  # 8 cooling steps if never interrupted
-        solver = SimulatedAnnealingSolverWithBuffers(
+        solver = SimulatedAnnealingLayoutSolver(
             buffers,
             cap,
             1,
@@ -339,7 +353,7 @@ class SimulatedAnnealingTests(TestCase):
             LifetimeBoundBuffer("b", 90, [0, 1]),  # [0, 2), stacks on a -> evicted
             LifetimeBoundBuffer("c", 10, [5, 6]),  # [5, 7), disjoint
         ]
-        solver = SimulatedAnnealingSolverWithBuffers(
+        solver = SimulatedAnnealingLayoutSolver(
             buffers,
             100,
             1,
@@ -408,12 +422,71 @@ class SimulatedAnnealingTests(TestCase):
             # peak-load seed, and reheating cycles.
             schedule = SelfCalibratingReheatingSchedule(total_steps=200, cycles=3)
             solver = SimulatedAnnealingLayoutSolver(
-                cap, 128, initial=initial, schedule=schedule, random=rnd.Random(seed)
+                buffers,
+                cap,
+                128,
+                initial=initial,
+                schedule=schedule,
+                random=rnd.Random(seed),
             )
-            solver.plan_layout(buffers)
+            solver.plan_layout()
 
             _assert_feasible(buffers, cap)
             self.assertGreaterEqual(_committed_total(buffers), initial_quality, seed)
+
+
+class NativePackerEquivalenceTests(TestCase):
+    """The C++ packer is the default accelerator and must reproduce the canonical
+    Python packer exactly. Native quality is bit-exact against Python and the RNG
+    is seeded, so the entire annealing trajectory -- and hence the finalized
+    buffer addresses, the plan quality, and the committed permutation -- must be
+    IDENTICAL whether the search runs on the Python packer or the native one.
+    Any divergence here is a wiring/parity bug, not a tolerance to loosen."""
+
+    def _run(self, buffers, capacity, initial, seed, *, native):
+        # The factory reads config.native_layout_packer at construction time, so
+        # the knob must be patched across the whole solver lifetime (construct +
+        # solve + the reconstruction in solve() + finalize).
+        with config.patch(native_layout_packer=native):
+            solver = SimulatedAnnealingLayoutSolver(
+                buffers,
+                capacity,
+                128,
+                initial=initial,
+                schedule=_short_schedule(),
+                random=rnd.Random(seed),
+            )
+            # Guard against the knob silently selecting the wrong packer and
+            # masking a real divergence: with the flag set we must actually be
+            # running on the C++ solver.
+            if native:
+                self.assertIsInstance(solver.plan, NativePermutationLayoutSolver)
+            else:
+                self.assertIsInstance(solver.plan, PermutationBasedLayoutSolver)
+            solver.solve()
+            solver.finalize()
+            return (
+                [b.address for b in buffers],
+                solver.plan.quality(),
+                list(solver.plan.permutation),
+            )
+
+    def test_python_and_native_produce_identical_plans(self):
+        for seed in range(40):
+            rng = rnd.Random(seed)
+            n = rng.randint(2, 8)
+            buffers = _random_buffers(rng, n)
+            cap = max(b.size for b in buffers) * rng.randint(2, 4)
+            initial = list(range(n))
+            rng.shuffle(initial)
+
+            py = self._run(
+                copy.deepcopy(buffers), cap, list(initial), seed, native=False
+            )
+            nat = self._run(
+                copy.deepcopy(buffers), cap, list(initial), seed, native=True
+            )
+            self.assertEqual(py, nat, f"seed={seed}")
 
 
 @unittest.skipUnless(
@@ -439,13 +512,14 @@ class SimulatedAnnealingStressTests(TestCase):
                 t_initial=200.0, t_final=0.5, steps_per_epoch=8, epochs=6
             )
             solver = SimulatedAnnealingLayoutSolver(
+                buffers,
                 cap,
                 128,
                 initial=initial,
                 schedule=schedule,
                 random=rnd.Random(seed * 7 + 1),
             )
-            solver.plan_layout(buffers)
+            solver.plan_layout()
 
             _assert_feasible(buffers, cap)
             self.assertGreaterEqual(_committed_total(buffers), initial_quality, seed)

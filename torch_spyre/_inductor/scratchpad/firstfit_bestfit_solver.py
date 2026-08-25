@@ -13,21 +13,20 @@
 # limitations under the License.
 
 import heapq
-from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import Optional, Callable
 
 from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
     MemoryPlanSolver,
-    _assert_in_place_relationships,
+    _check_in_place_relationships,
 )
 from torch_spyre._inductor.scratchpad.utils import round_up_to_alignment
 
 __all__ = [
     "FirstFitLayoutSolver",
     "BestFitLayoutSolver",
-    "_assert_in_place_relationships",
+    "_check_in_place_relationships",
 ]
 
 
@@ -183,19 +182,18 @@ class FirstFitLayoutSolver(MemoryPlanSolver):
                 return gap
         return None
 
-    def plan_layout(
-        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
-    ) -> list[LifetimeBoundBuffer]:
+    def plan_layout(self, log_lx_usage: bool = False) -> list[LifetimeBoundBuffer]:
+        buffers = self.buffers
         if not buffers:
             return []
         assert all(buf.address is None for buf in buffers), (
             "Buffers cannot be previously or partially planned"
         )
-        _assert_in_place_relationships(buffers)
+        _check_in_place_relationships(buffers)
 
         # Barred buffers keep address=None and are never candidates for a gap,
         # nor obstacles in one (they occupy no LX).
-        placeable, _ = self.partition(buffers)
+        placeable, _ = self.partition()
         buffers_filtered = [
             buffer for buffer in placeable if buffer.end_time >= buffer.start_time + 1
         ]

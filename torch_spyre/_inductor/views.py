@@ -151,6 +151,10 @@ def compute_coordinates(
     may contain symbolic expressions (e.g. a dynamic batch dimension); the
     algorithm concretizes range values only for comparison logic, while the
     output coordinate expressions remain symbolic.
+
+    Raises ``Unsupported`` if ``index`` walks a dimension backwards (a loop
+    variable with a negative coefficient, as produced by ``prims.rev``): a
+    device coordinate can only ascend.
     """
     assert all(isinstance(s, (int, sympy.Integer)) for s in stride), (
         f"compute_coordinates requires concrete strides, got {stride}"
@@ -185,6 +189,26 @@ def compute_coordinates(
         # TODO(issue#1373): replace with sympy predicates to avoid concretization.
         concrete_step = _concretize_for_cmp(step)
         concrete_limit = _concretize_for_cmp(limit)
+
+        # ``limit`` below ``step`` means the access walks the dimension
+        # backwards (the index carries a term like ``N - 1 - var``, as
+        # ``prims.rev`` / ``Tensor.flip`` produces).  Every dim test below
+        # compares a non-negative ``stride[dim]`` against ``concrete_step``, so
+        # a descending term can match no dim and would be dropped from
+        # ``coordinates`` entirely -- silently yielding the coordinate for
+        # ``var == 0`` at every iteration.  Device coordinates can only ascend,
+        # so reject it loudly instead (see issue #3558).
+        #
+        # Testing ``limit - step`` rather than ``step``'s sign isolates the
+        # direction from any additive constant folded into both: for a term
+        # ``a*var + b`` over range ``R``, ``limit - step == a*(R - 1)``, so the
+        # comparison sees ``a``'s sign alone.
+        if concrete_limit < concrete_step:
+            raise Unsupported(
+                f"index term for {var} runs backwards (step {step}, limit "
+                f"{limit}): reversed traversal of a tensor dimension cannot "
+                f"be expressed as a device coordinate"
+            )
 
         # find primary dim with largest stride less than or equal to step
         primary_stride = 0
@@ -361,7 +385,9 @@ def normalize_coordinates(
 
     Split dimension into n dimensions if expression has n>1 terms.
     Split dim_size into n according to iteration range of each term.
-    Fuse contiguous dimensions if corresponding terms can be fused.
+    Fuse contiguous dimensions if corresponding terms can be fused.  Size-1
+    device dims with a constant zero coordinate are dropped, and do not stop
+    the dims on either side of them from fusing.
     """
     # terms in non-increasing stride order
     terms = []
@@ -480,11 +506,43 @@ def normalize_coordinates(
     # never fuse last dimension = stick dimension!
     fused_terms = []
     fused_term = terms[0]
+    # Whether a transparent placeholder term was skipped since ``fused_term``
+    # was last (re)set.  A placeholder is a size-1 device dim with a constant
+    # zero coordinate, e.g. the squeezed ``seq`` dim that
+    # ``get_generic_stick_layout`` puts *between* ``H`` and the non-stick half
+    # of ``D`` for a ``[B, H, 1, D]`` attention output.  It occupies no space
+    # and is discarded by the flush guards below, but because this scan only
+    # compares neighbouring list entries it would flush the pending term and
+    # break a fusion run between two dims that ``compute_coordinates`` already
+    # treats as stride-adjacent (``next_stride`` ignores ``size == 1`` dims).
+    # Splitting an otherwise contiguous axis that way makes ``align_tensors``
+    # mint an extra loop variable for it, and for a matmul that produces a
+    # second reduction dim, which the backend cannot schedule (a bmm contracts
+    # exactly one dim; deeptools aborts with ``out_reuse_dim.size() == 1``).
+    skipped_placeholder = False
     for term in terms[1:-1]:
+        if term.var is None and term.dim_size == 1 and term.offset == 0:
+            skipped_placeholder = True
+            continue
         if (
             fused_term.num == 1
             and fused_term.var == term.var
             and fused_term.den == term.mod
+            # Fusing *across* a placeholder must not change the address that
+            # any (dim, coordinate) pair encodes.  It provably does not when
+            # the pair is densely packed (``den == term.den * term.dim_size``),
+            # the inner term skips no elements (``num == 1``), and the outer
+            # term carries no offset -- the outer offset counts in units of the
+            # outer ``den`` and is not rescaled when ``den`` shrinks on fusion.
+            # Adjacent terms keep the historical predicate unchanged.
+            and (
+                not skipped_placeholder
+                or (
+                    term.num == 1
+                    and fused_term.offset == 0
+                    and fused_term.den == term.den * term.dim_size
+                )
+            )
         ):
             # fuse terms
             fused_term.num = term.num
@@ -495,6 +553,7 @@ def normalize_coordinates(
             if fused_term.dim_size > 1 or fused_term.var is not None:
                 fused_terms.append(fused_term)
             fused_term = term
+        skipped_placeholder = False
     if fused_term.dim_size > 1 or fused_term.var is not None:
         fused_terms.append(fused_term)
     # add term for stick dimension
@@ -508,7 +567,9 @@ def align_tensors(
     tensors: list[Dict[str, list[sympy.Expr]]],
     indirect_sizes: "dict[sympy.Symbol, int] | None" = None,
 ) -> tuple[
-    (dict[sympy.Symbol, tuple[sympy.Expr, int]], list[dict[str, list[sympy.Expr]]])
+    dict[sympy.Symbol, tuple[sympy.Expr, int]],
+    list[dict[str, list]],
+    dict[sympy.Symbol, tuple[tuple[sympy.Symbol, int], ...]],
 ]:
     """
     Transform op iteration space and tensor arguments to satisfy codegen requirements.
@@ -632,6 +693,7 @@ def align_tensors(
     new_var_ranges = {}
     new_op_it_space_splits = {}
     remap = {}  # map old var to new vars in splits order
+    work_division_remap = {}
     for var, split in splits.items():
         div = op_it_space_splits[var] if var in op_it_space_splits else 1
         if len(split) > 1:
@@ -642,6 +704,7 @@ def align_tensors(
                 new_var_ranges[new_var] = split[i + 1] // split[i]
                 remap[var].append(new_var)
 
+            bases = {}
             # distribute work division for old var to new vars
             for v in reversed(remap[var]):
                 # Re-intersect the committed split against the basis work
@@ -655,8 +718,10 @@ def align_tensors(
                 else:
                     # Non-stick var (or synthetic sub-dim): element range.
                     basis = new_var_ranges[v]
+                bases[v] = int(basis)
                 new_op_it_space_splits[v] = math.gcd(div, basis)
                 div //= new_op_it_space_splits[v]
+            work_division_remap[var] = tuple((v, bases[v]) for v in remap[var])
         else:
             # no splits keep existing var, range, and work division
             # may happen with a single stick since the stick size is omitted
@@ -680,6 +745,7 @@ def align_tensors(
             new_op_it_space_splits[var] = (
                 op_it_space_splits[var] if var in op_it_space_splits else 1
             )
+            work_division_remap[var] = ((var, 1),)
     # create new tensors with new sizes and coordinate expressions matching new vars
     new_tensors = []
     for j, terms in enumerate(all_terms):
@@ -798,7 +864,7 @@ def align_tensors(
         if k not in indirect_syms
     }
 
-    return new_iteration_space, new_tensors
+    return new_iteration_space, new_tensors, work_division_remap
 
 
 def tiling_expr_to_device_expr(

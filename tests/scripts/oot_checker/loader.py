@@ -49,6 +49,34 @@ def load_all_patterns(config_files: list[Path]) -> dict[str, list[PatternEntry]]
     return result
 
 
+def load_labels(config_files: list[Path]) -> dict[Path, list | None]:
+    """
+    Read test_suite_config.labels from each config file.
+
+    Parameters
+    ----------
+    config_files : list[Path]
+        Paths to OOT YAML config files.
+
+    Returns
+    -------
+    dict[Path, list | None]
+        Maps each config file to its declared labels list, or None when the
+        labels key is absent/null -- distinguishing "never set" from an
+        explicit empty list.
+    """
+    result: dict[Path, list | None] = {}
+    for cf in config_files:
+        try:
+            cfg = yaml.safe_load(cf.read_text()) or {}
+        except Exception as e:
+            _warn(f"Cannot load {cf}: {e}")
+            continue
+        tsc = cfg.get("test_suite_config") or {}
+        result[cf] = tsc.get("labels")
+    return result
+
+
 def _warn(msg: str) -> None:
     import sys
 

@@ -100,12 +100,12 @@ class TestStableId:
         a = _stable_id(s, "aten.mm.default", ("n0", "op0"))
         b = _stable_id(s, "aten.mm.default", ("n0", "op0"))
         assert a == b
-        assert a >= 0
+        assert 0 <= a < 2**63
 
     @pytest.mark.parametrize(
         "a, b",
         [
-            # each component must affect the hash: aten_op, source line, ir_chain
+            # Each headline component affects the hash.
             (
                 (SourceLoc("m.py", 1), "aten.mm.default", ("n0",)),
                 (SourceLoc("m.py", 1), "aten.add.Tensor", ("n0",)),
@@ -122,6 +122,37 @@ class TestStableId:
     )
     def test_distinguishes_content(self, a, b):
         assert _stable_id(*a) != _stable_id(*b)
+
+    def test_distinguishes_complete_source_ranges(self):
+        first = SourceLoc("m.py", 1, 2, 3, 4)
+        changed_end = SourceLoc("m.py", 1, 2, 3, 5)
+
+        assert _stable_id(first, "aten.mm.default", ("n0",)) != _stable_id(
+            changed_end, "aten.mm.default", ("n0",)
+        )
+
+    def test_distinguishes_fused_membership_and_order(self):
+        first = DebugHandle(
+            id=11,
+            source=SourceLoc("m.py", 10),
+            aten_op="aten.add.Tensor",
+            ir_chain=("add",),
+        )
+        second = DebugHandle(
+            id=12,
+            source=SourceLoc("m.py", 20),
+            aten_op="aten.relu.default",
+            ir_chain=("relu",),
+        )
+        source = SourceLoc("m.py", 1)
+
+        first_only = _stable_id(source, None, ("add", "relu", "op0"), (first,))
+        second_only = _stable_id(source, None, ("add", "relu", "op0"), (second,))
+        forward = _stable_id(source, None, ("add", "relu", "op0"), (first, second))
+        reverse = _stable_id(source, None, ("add", "relu", "op0"), (second, first))
+
+        assert first_only != second_only
+        assert forward != reverse
 
 
 class TestProvenanceTransform:
@@ -284,6 +315,35 @@ class TestBuildDebugHandle:
         assert h.source is None  # distinct sources
         assert h.aten_op is None  # distinct atens
 
+    def test_fused_constituents_participate_in_parent_id(self):
+        first = build_debug_handle(
+            _buffer(
+                [
+                    _node("add", "/m.py", 10, "aten.add.Tensor"),
+                    _node("relu", "/m.py", 20, "aten.relu.default"),
+                ],
+                name="op1",
+            )
+        )
+        changed = build_debug_handle(
+            _buffer(
+                [
+                    _node("add", "/m.py", 11, "aten.add.Tensor"),
+                    _node("relu", "/m.py", 21, "aten.relu.default"),
+                ],
+                name="op1",
+            )
+        )
+
+        assert first is not None and changed is not None
+        assert first.source is None and changed.source is None
+        assert first.aten_op is None and changed.aten_op is None
+        assert first.ir_chain == changed.ir_chain
+        assert tuple(child.id for child in first.fused_from) != tuple(
+            child.id for child in changed.fused_from
+        )
+        assert first.id != changed.id
+
     def test_skips_torch_internal_frame(self):
         n = _node("x", aten="aten.linear.default")
         n.meta["stack_trace"] = (
@@ -321,6 +381,9 @@ class TestBuildDebugHandle:
         handle = build_debug_handle(buf)
         assert handle is not None
         assert handle.transform_history == history
+        without_history = build_debug_handle(_buffer([n]))
+        assert without_history is not None
+        assert handle.id == without_history.id
 
     def test_single_origin_no_trace_is_honest_empty(self):
         # A single compiler-generated origin with no stack_trace and no
@@ -408,6 +471,7 @@ class TestSDSCSpecDebugHandle:
             layouts={},
             args=[],
             constants={},
+            conv_params={},
             coordinate_masking={},
             **kw,
         )

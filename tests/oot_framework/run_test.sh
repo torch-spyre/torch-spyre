@@ -98,24 +98,51 @@ fi
 #                  (comma count + 1) or torch.spyre.device_count() as fallback.
 #                  Falls back to serial execution when only one card is found.
 #
+# --mode=<gating|validate>
+#                  Mode of running this script
+#                    gating   (default) -- current behaviour: failed tests
+#                              propagates to a non-zero exit code (e.g. for CI jobs
+#                              that needing gating on all tests passed).
+#                    validate -- test failures are recorded in the printed
+#                              summary as usual but won't gate a CI job. 
+#                              All other non-zero exits are captured anyway.
+#
 # Usage:
 #   run_test.sh config.yaml                 # default: all tests run serially
 #   run_test.sh config.yaml --include-slow  # same, explicit
 #   run_test.sh config.yaml --skip-slow     # skip slow tests on this platform
 #   run_test.sh config.yaml --parallel      # parallelize tests across all Spyre cards
+#   run_test.sh config.yaml --mode=validate # test failures don't fail the script
 # ------------------------------------------------------------------------------------
 _SKIP_SLOW=0
 _PARALLEL=0
+_MODE="gating"
 _FILTERED_ARGS=()
+_take_next_mode=0
 for _arg in "$@"; do
+    if [[ $_take_next_mode -eq 1 ]]; then
+        _MODE="$_arg"
+        _take_next_mode=0
+        continue
+    fi
     case "$_arg" in
         --skip-slow)    _SKIP_SLOW=1 ;;
         --include-slow) _SKIP_SLOW=0 ;;
         --parallel)     _PARALLEL=1 ;;
+        --mode=*)       _MODE="${_arg#--mode=}" ;;
+        --mode)         _take_next_mode=1 ;;
         *)              _FILTERED_ARGS+=("$_arg") ;;
     esac
 done
 set -- "${_FILTERED_ARGS[@]+"${_FILTERED_ARGS[@]}"}"
+
+case "$_MODE" in
+    gating|validate) ;;
+    *)
+        echo "ERROR: --mode must be 'gating' or 'validate' (got: '$_MODE')" >&2
+        exit 1
+        ;;
+esac
 # ---------------------------------------------------------------------------
 # Multi-config support
 #
@@ -1666,6 +1693,10 @@ Path(out_path).write_text(merged)
 print(f"[torch_oot_device_tests_run] Merged {len(shard_paths)} XML shard(s) -> {out_path}", flush=True)
 '
 
+# Command prefix _run_pytest_isolated applies to the pytest/torchrun invocation.
+# Empty for normal runs; the signal-retry path sets it to bound its re-run.
+_OOT_TIMEOUT_PREFIX=()
+
 # ---------------------------------------------------------------------------
 # _run_pytest_isolated <run_dir> <run_basename> <exit_tmp> <output_tmp> \
 #                      [pytest_args...]
@@ -1683,6 +1714,10 @@ _run_pytest_isolated() {
     local _dir="$1" _base="$2" _exit_tmp="$3" _out_tmp="$4"
     shift 4
     local _args=("$@")
+    # Empty unless the caller is the signal-retry path, which bounds its re-run
+    # against a wedged device (see _run_xdist_fallback). Normal runs are unbounded
+    # so a legitimately long suite is never cut short.
+    local _tmo=("${_OOT_TIMEOUT_PREFIX[@]+"${_OOT_TIMEOUT_PREFIX[@]}"}")
     (
         set +euo pipefail
         cd "$_dir"
@@ -1713,15 +1748,66 @@ _run_pytest_isolated() {
             # Create log directory
             mkdir -p "${_LOGDIR}"
 
-            # Run with split_output.sh wrapper
-            _run_cmd torchrun --nproc-per-node "$_NPROC" --no-python bash "${_dir}/split_output.sh" python3 -u -m pytest "$_base" "${_args[@]}"
+            # Run with split_output.sh wrapper.
+            #
+            # torchrun's elastic agent can keep running for a while AFTER every
+            # rank's pytest worker has already exited (rendezvous / c10d store
+            # teardown), emitting no stdout during that window. The run-test
+            # harness stall-watcher only sees "no new output" and, on a suite
+            # that has actually finished (e.g. "13 passed"), kills the whole
+            # process group at STALL_TIMEOUT_SECS and reports a spurious
+            # exit 147 for a run that passed. Bound the agent so a lingering
+            # teardown is reaped in seconds instead of stalling for minutes.
+            #
+            # The optional _tmo prefix is the signal-retry path's own tighter
+            # bound (empty on a normal run); the two nest and the inner one
+            # here bounds teardown for every distributed run.
+            #
+            # The limit only guards the POST-completion teardown: it is set far
+            # above any real distributed test runtime, and the harness
+            # stall-watcher still guards genuine mid-test hangs, so this never
+            # truncates a test that is doing work. timeout returns the child's
+            # own exit code when the child exits first, so a passing run stays
+            # passing; a real timeout surfaces as 124 (and --kill-after forces
+            # SIGKILL if the agent ignores SIGTERM).
+            _DIST_RUN_TIMEOUT="${TORCH_SPYRE_DIST_RUN_TIMEOUT:-30m}"
+            _DIST_KILL_AFTER="${TORCH_SPYRE_DIST_KILL_AFTER:-30s}"
+            _run_cmd "${_tmo[@]+"${_tmo[@]}"}" timeout --kill-after="${_DIST_KILL_AFTER}" "${_DIST_RUN_TIMEOUT}" \
+                torchrun --nproc-per-node "$_NPROC" --no-python bash "${_dir}/split_output.sh" python3 -u -m pytest "$_base" "${_args[@]}"
+
+            # split_output.sh tees only rank 0 to stdout, so on failure the
+            # non-zero ranks' output is the only record of the root cause --
+            # torchrun reports their exit code but not why (e.g. a card that
+            # failed to open). Emit them before the directory is removed.
+            if [[ "$(cat "$_exit_tmp" 2>/dev/null || echo 1)" != "0" ]]; then
+                for _rank_log in "${_LOGDIR}"/output-at-rank-*.txt; do
+                    [[ -f "$_rank_log" ]] || continue
+                    [[ "$_rank_log" == *output-at-rank-0.txt ]] && continue
+                    echo "===== BEGIN $(basename "$_rank_log") ====="
+                    cat "$_rank_log"
+                    echo "===== END $(basename "$_rank_log") ====="
+                done
+            fi
 
             # Clean up log directory
             rm -rf "${_LOGDIR}"
         else
             echo "[torch_oot_device_tests_run] Running serial test"
-            # Regular pytest for non-distributed tests
-            _run_cmd python3 -m pytest "$_base" "${_args[@]}"
+            # Regular pytest for non-distributed tests.
+            #
+            # Wall-clock cap. The harness stall-watcher only fires after N seconds
+            # of NO output, so a suite wedged while still emitting -- or stuck
+            # before pytest prints anything -- runs to GitHub's 6h job timeout and
+            # blocks the merge queue on an otherwise-green run. Set far above any
+            # real suite runtime, so a healthy run is never truncated; timeout
+            # passes the child's own exit code through when it exits first.
+            _SERIAL_RUN_TIMEOUT="${TORCH_SPYRE_SERIAL_RUN_TIMEOUT:-60m}"
+            _SERIAL_KILL_AFTER="${TORCH_SPYRE_SERIAL_KILL_AFTER:-30s}"
+            _serial_tmo=()
+            if [[ -n "$_SERIAL_RUN_TIMEOUT" ]] && command -v timeout >/dev/null 2>&1; then
+                _serial_tmo=(timeout --kill-after="$_SERIAL_KILL_AFTER" "$_SERIAL_RUN_TIMEOUT")
+            fi
+            _run_cmd "${_tmo[@]+"${_tmo[@]}"}" "${_serial_tmo[@]+"${_serial_tmo[@]}"}" python3 -m pytest "$_base" "${_args[@]}"
         fi
     ) || true
 }
@@ -1787,8 +1873,22 @@ _run_xdist_fallback() {
     local _xdist_args=("-n1" "${_extra[@]+"${_extra[@]}"}")
     [[ -n "$_shard_xml" ]] && _xdist_args+=("--junit-xml=${_shard_xml}")
 
+    # This retry re-runs on the SAME device that just killed pytest with a signal.
+    # When the cause is a wedged AIU card (VFIO/RAS stall) rather than a software
+    # crash, the re-run blocks on the device forever: no output, and on CI the
+    # /dev/vfio card stays locked for the whole outer job cap. Bound it so a dead
+    # card costs one shard instead of the pool. Override via OOT_FALLBACK_TIMEOUT
+    # (0 or "" disables); SIGKILL because a VFIO-blocked process ignores SIGTERM.
+    local _fb_timeout="${OOT_FALLBACK_TIMEOUT-15m}"
     local _xdist_out_tmp="/tmp/_spyre_xdist_out_${$}_$$.tmp"
+    if [[ -n "$_fb_timeout" && "$_fb_timeout" != "0" ]] && command -v timeout >/dev/null 2>&1; then
+        echo "[torch_oot_device_tests_run]     Retry bounded to ${_fb_timeout} (wedged-device guard)."
+        _OOT_TIMEOUT_PREFIX=("timeout" "--signal=KILL" "$_fb_timeout")
+    else
+        _OOT_TIMEOUT_PREFIX=()
+    fi
     _run_pytest_isolated "$_dir" "$_base" "$_exit_tmp" "$_xdist_out_tmp" "${_xdist_args[@]}"
+    _OOT_TIMEOUT_PREFIX=()
 
     local _xexit=139
     if [[ -f "$_exit_tmp" ]]; then
@@ -1827,9 +1927,13 @@ _run_xdist_fallback() {
     fi
     rm -f "$_xdist_out_tmp"
 
-    # Propagate test failures from the xdist fallback run.
+    # Propagate test failures from the xdist fallback run. As above, in
+    # --mode=validate a test-failure exit (1) is recorded in the summary but
+    # does not fail the script; other non-zero exits are unaffected by mode.
     if [[ $_xexit -eq 1 ]]; then
-        [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+        if [[ "$_MODE" != "validate" ]]; then
+            [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+        fi
     elif [[ $_xexit -ne 0 && $_xexit -ne 5 ]]; then
         OVERALL_EXIT=$_xexit
     fi
@@ -2284,7 +2388,13 @@ _run_parallel_across_cards() {
                 # Exit-code handling.
                 case $_exit in
                     0) ;;
-                    1)  [[ $_card_overall -eq 0 ]] && _card_overall=1 ;;
+                    1)
+                        # Test failure — masked in --mode=validate (see serial
+                        # loop above for the equivalent, non-parallel path).
+                        if [[ "$_MODE" != "validate" ]]; then
+                            [[ $_card_overall -eq 0 ]] && _card_overall=1
+                        fi
+                        ;;
                     5)  echo "[torch_oot_device_tests_run] WARNING: no tests collected for card ${_subshell_card} slice of $(basename "$original_file")" >&2 ;;
                     127)
                         echo "[torch_oot_device_tests_run_err] FATAL: python3/pytest not found for $original_file" >&2
@@ -2307,7 +2417,14 @@ _run_parallel_across_cards() {
                             ) || true
                             if [[ -f "$_exit_tmp" ]]; then
                                 local _xexit; _xexit=$(< "$_exit_tmp"); rm -f "$_exit_tmp"
-                                [[ $_xexit -ne 0 && $_xexit -ne 5 && $_card_overall -eq 0 ]] && _card_overall=$_xexit
+                                if [[ $_xexit -eq 1 ]]; then
+                                    # Test failure on retry — masked in --mode=validate.
+                                    if [[ "$_MODE" != "validate" ]]; then
+                                        [[ $_card_overall -eq 0 ]] && _card_overall=1
+                                    fi
+                                elif [[ $_xexit -ne 0 && $_xexit -ne 5 ]]; then
+                                    [[ $_card_overall -eq 0 ]] && _card_overall=$_xexit
+                                fi
                                 if [[ -n "$_shard_xml" && -f "$_shard_xml" ]]; then
                                     python3 -c "$_XML_INJECT_PY" "$_shard_xml" "$YAML_CONFIG" || true
                                 fi
@@ -2500,60 +2617,24 @@ for i in "${!RUN_FILES[@]}"; do
     fi
 
     # ---------------------------------------------------------------------------
-    # -m marker pre-flight
+    # -m is intentionally NOT pre-flighted here.
     #
-    # When a -m MARKEXPR is present, probe whether this specific file has any
-    # tests that match it before running.  The probe uses --collect-only which
-    # is fast as no test execution happens and runs from the file's own directory
-    # so conftest.py files are discovered correctly.
+    # This used to run a --collect-only probe first and strip -m from the real
+    # invocation whenever the probe reported 0 collected (exit code 5), on the
+    # theory that a 0-match probe means "this marker family isn't used in this
+    # file". That inference is unsound: a 0-collected probe can also mean the
+    # probe itself failed to complete cleanly (e.g. a slow cold collection of a
+    # large merged file), which is indistinguishable from a real 0-match once
+    # stderr is discarded. On a merged multi-config run, this silently dropped
+    # --skip-slow's `-m not slow__plat_<arch>` filter for large files like
+    # test_inductor_ops.py, letting ~1hr `test_large_matmul*` tests run
+    # unfiltered — see issue where standalone runs correctly filtered while
+    # `make tests TEST_TYPE=unit` did not.
     #
-    # If the probe finds 0 matching tests (exit code 5) the -m flag is stripped
-    # from _FILE_PYTEST_ARGS so the file's tests all run normally. 
-    # the marker filter applies to files that USE that marker
-    # family; files that don't use it are unaffected.
-    #
+    # -m is always left in place; a genuine 0-match on the real run below
+    # already reports exit code 5, which the exit-code handling further down
+    # treats as NOTEST/warning-only, not a failure.
     # ---------------------------------------------------------------------------
-    _HAS_M=0
-    for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
-        [[ "$_a" == "-m" ]] && { _HAS_M=1; break; }
-    done
-
-    if [[ $_HAS_M -eq 1 ]]; then
-        # Extract just the -m args for the probe (no --junit-xml, no -v, etc.)
-        _PROBE_ARGS=()
-        _take_next=0
-        for _a in "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}"; do
-            if [[ $_take_next -eq 1 ]]; then
-                _PROBE_ARGS+=("$_a")
-                _take_next=0
-                continue
-            fi
-            if [[ "$_a" == "-m" ]]; then
-                _PROBE_ARGS+=("$_a")
-                _take_next=1
-            fi
-        done
-
-        # `|| _probe_exit=$?` is required: exit 5 (nothing collected) is the
-        # expected signal here, and under `set -e` a bare subshell would abort
-        # the whole run before the exit code could be inspected.
-        _probe_exit=0
-        (cd "$run_dir" && python3 -m pytest "$run_basename" \
-            "${_PROBE_ARGS[@]}" --collect-only -q 2>/dev/null) || _probe_exit=$?
-
-        if [[ $_probe_exit -eq 5 ]]; then
-            # 0 tests match this marker in this file — strip -m from args.
-            echo "[torch_oot_device_tests_run] -m filter matched 0 tests in $(basename "$original_file"), running without -m" >&2
-            _ARGS_NO_M=()
-            _skip_m=0
-            for _a in "${_FILE_PYTEST_ARGS[@]+"${_FILE_PYTEST_ARGS[@]}"}"; do
-                if [[ $_skip_m -eq 1 ]]; then _skip_m=0; continue; fi
-                if [[ "$_a" == "-m" ]]; then _skip_m=1; continue; fi
-                _ARGS_NO_M+=("$_a")
-            done
-            _FILE_PYTEST_ARGS=("${_ARGS_NO_M[@]}")
-        fi
-    fi
 
     # -----------------------------------------------------------------------
     # Run pytest for this file.
@@ -2619,6 +2700,11 @@ for i in "${!RUN_FILES[@]}"; do
     # triggered the fallback path below, which handles XML injection itself).
     if [[ -n "$_SHARD_XML" && -f "$_SHARD_XML" && $_exit -lt 128 ]]; then
         python3 -c "$_XML_INJECT_PY" "$_SHARD_XML" "$YAML_CONFIG" || true
+    elif [[ -n "$_SHARD_XML" && -f "$_SHARD_XML" && $_exit -ge 128 ]]; then
+        # Say so explicitly. Otherwise a signal exit is visible only as a MISSING
+        # "Tags injected" line for one shard, which reads as a hang in the injector
+        # rather than as pytest having been killed.
+        echo "[torch_oot_device_tests_run] XML tag injection SKIPPED for $(basename "$_SHARD_XML") (signal exit $_exit) — retrying below."
     fi
 
     # -----------------------------------------------------------------------
@@ -2638,8 +2724,12 @@ for i in "${!RUN_FILES[@]}"; do
         1)
             # Some tests failed or errored — pytest already reported them.
             # Propagate so CI marks the job as failed when mandatory_success
-            # tests do not pass.
-            [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+            # tests do not pass. In --mode=validate this is intentionally not
+            # propagated: the failure is still visible in the printed
+            # summary, but the script itself exits 0 for this case.
+            if [[ "$_MODE" != "validate" ]]; then
+                [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+            fi
             ;;
         5)
             # No tests collected — warn but do not fail the overall run.

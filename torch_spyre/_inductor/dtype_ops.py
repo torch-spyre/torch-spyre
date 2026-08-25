@@ -29,6 +29,8 @@ from torch_spyre._inductor.constants import (
     DL16TOFP32_OP,
     FP32TODL16_OP,
     FP8TODL16_OP,
+    FP32TOINT32_OP,
+    INT32TOFP32_OP,
 )
 
 # Spyre has no native bool: a bool tensor reuses whichever physical format
@@ -68,11 +70,21 @@ class DtypeOpTable:
         (torch.float8_e4m3fn, torch.float16),
     ]
 
+    _FP32_TO_INT32_DTYPES = [
+        (torch.float32, torch.int32),
+    ]
+
+    _INT32_TO_FP32_DTYPES = [
+        (torch.int32, torch.float32),
+    ]
+
     _TYPECAST_OPS_TABLE = {
         **{pair: IDENTITY_OP for pair in _IDENTITY_DTYPES},
         **{pair: DL16TOFP32_OP for pair in _FP16_TO_FP32_DTYPES},
         **{pair: FP32TODL16_OP for pair in _FP32_TO_FP16_DTYPES},
         **{pair: FP8TODL16_OP for pair in _FP8_TO_FP16_DTYPES},
+        **{pair: FP32TOINT32_OP for pair in _FP32_TO_INT32_DTYPES},
+        **{pair: INT32TOFP32_OP for pair in _INT32_TO_FP32_DTYPES},
     }
 
     _TYPECAST_OP_NAMES = set(_TYPECAST_OPS_TABLE.values())
@@ -155,3 +167,8 @@ class DtypeOpTable:
     @classmethod
     def is_dtype_op(cls, op: str) -> bool:
         return op in cls._TYPECAST_OP_NAMES
+
+    @classmethod
+    def op_names(cls) -> frozenset[str]:
+        """All op names this table can produce (e.g. for op-name validation)."""
+        return frozenset(cls._TYPECAST_OP_NAMES)

@@ -22,7 +22,6 @@ from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
     InputBuffer,
-    MutationLayoutSHOULDREMOVE,
     Operation,
     Pointwise,
     Reduction,
@@ -232,16 +231,6 @@ def named_dims_for_sym(op: ComputedBuffer, sym: sympy.Symbol) -> list[tuple[str,
     return [(n, _named_dims[n]) for n in names if n in _named_dims]
 
 
-def named_dims_for_coord(
-    op: ComputedBuffer, coord: sympy.Expr
-) -> list[tuple[str, int]] | None:
-    """Return [(name, size), ...] for the named dims covered by a host coord expression."""
-    sym = _lone_sym(coord)
-    if sym is None:
-        return None
-    return named_dims_for_sym(op, sym)
-
-
 def get_input_named_dims(inputs: list, op=None) -> dict:
     """
     Merge named dim mappings from all inputs into a single loop-var → names dict.
@@ -421,8 +410,6 @@ def _propagate_named_dims_impl(graph: GraphLowering) -> None:
         if op.is_no_op():
             _set_no_named_dims(op)
         elif isinstance(op, ComputedBuffer):
-            if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
-                continue
             hint = False
             for hint_dict in get_op_hints(op).values():
                 if "named_dims" in hint_dict:

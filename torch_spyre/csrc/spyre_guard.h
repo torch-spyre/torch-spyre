@@ -16,9 +16,25 @@
 
 #pragma once
 
+#include <c10/core/DeviceType.h>
 #include <torch/library.h>
 
 namespace spyre {
+
+// Parse LOCAL_RANK from the environment.
+//
+// Uses strtoll + end-pointer check (not atoi) so that non-numeric or empty
+// strings are detected. Validates that the result is non-negative and fits in
+// c10::DeviceIndex (int8_t) without truncation. Returns 0 when LOCAL_RANK is
+// unset. Throws std::invalid_argument on malformed input and std::range_error
+// if the value is negative or exceeds c10::DeviceIndex's range.
+//
+// Do NOT call this directly from a thread_local initializer — use the
+// file-local parse_local_rank_safe() wrapper in spyre_guard.cpp instead, which
+// catches and returns 0 so that std::terminate is not called on worker threads
+// that have no surrounding try/catch.  _startRuntime() calls this function on
+// the guarded path where exceptions propagate normally.
+c10::DeviceIndex parse_local_rank();
 
 struct SpyreGuardImpl final : c10::impl::DeviceGuardImplInterface {
   static thread_local c10::DeviceIndex

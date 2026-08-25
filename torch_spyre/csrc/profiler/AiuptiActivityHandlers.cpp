@@ -17,12 +17,14 @@
  */
 #include <libaiupti/aiupti_runtime_cbid.h>
 
+#include <nlohmann/json.hpp>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "AiuptiActivityProfiler.h"
+#include "kernel_provenance_registry.h"
 
 namespace KINETO_NAMESPACE {
 
@@ -166,6 +168,12 @@ inline std::string runtimeCbidName(AIUpti_runtime_api_trace_cbid cbid) {
       return "aiuClockCalibration";
     case AIUPTI_RUNTIME_TRACE_CBID_COMPILE_GRAPH:
       return "aiuCompileGraph";
+    case AIUPTI_RUNTIME_TRACE_CBID_PARSE_RESPONSE:
+      return "aiuParseResponse";
+    case AIUPTI_RUNTIME_TRACE_CBID_ISSUE_CALLBACK:
+      return "aiuIssueCallback";
+    case AIUPTI_RUNTIME_TRACE_CBID_VERIFY_ASYC_MSGS:
+      return "aiuVerifyAsyncMsgs";
     default:
       break;
   }
@@ -264,6 +272,13 @@ void AiuptiActivityProfilerSession::handleKernelActivity(
   kernel_activity->addMetadataQuoted("context",
                                      std::to_string(activity->context_id));
   kernel_activity->addMetadata("correlation", activity->correlation_id);
+  if (const auto key = spyre::extractKernelProvenanceKey(activity->name)) {
+    kernel_activity->addMetadataQuoted("provenance_key", *key);
+    if (const auto ids = spyre::lookupKernelProvenance(*key)) {
+      kernel_activity->addMetadata("debug_handles",
+                                   nlohmann::json(*ids).dump());
+    }
+  }
 
   recordStream(kernel_activity->device, kernel_activity->resource);
 

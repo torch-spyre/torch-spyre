@@ -34,7 +34,7 @@ def _coordinates(splits, num_cores, **kwargs):
     mapping = core_to_slice_mapping(dims, splits, num_cores, **kwargs)
     core_id = sympy.Symbol("core_id")
     return [
-        tuple(int(mapping[str(dim)].subs(core_id, core)) for dim in dims)
+        tuple(int(mapping[dim].subs(core_id, core)) for dim in dims)
         for core in range(num_cores)
     ]
 
@@ -162,7 +162,7 @@ def test_planner_and_sdsc_use_the_same_mapping(monkeypatch, op, reduction_contig
 
     sdsc_spec, renamed = parse_op_spec(op_spec)
     sdsc_output_mapping = {
-        device_dim: sdsc_spec.core_id_to_work_slice[str(renamed[dim])]
+        device_dim: sdsc_spec.core_id_to_work_slice[renamed[dim]]
         for device_dim, dim in enumerate(dims[:2])
     }
     assert representable

@@ -16,6 +16,7 @@
 
 #include "spyre_stream.h"
 
+#include <ATen/record_function.h>
 #include <c10/core/Device.h>
 #include <c10/core/Stream.h>
 
@@ -70,6 +71,12 @@ struct StreamPool {
 
   // Per-device initialization flags
   std::unordered_map<c10::DeviceIndex, std::once_flag> device_init_flags;
+
+  // Set to true once initializeStreamPoolImpl has been called.
+  bool initialized = false;
+  // Records the device_index passed to initializeStreamPoolImpl (valid only
+  // when initialized == true), used in error messages.
+  c10::DeviceIndex initialized_device_index = -1;
 };
 
 StreamPool& getStreamPool() {
@@ -146,7 +153,8 @@ bool SpyreStream::query() const {
 }
 
 void SpyreStream::synchronize() const {
-  c10::DeviceGuard guard(stream_.device());
+  RECORD_FUNCTION("host::synchronize", {});
+  c10::DeviceGuard device_guard(stream_.device());
 
   DEBUGINFO("SpyreStream::synchronize() - stream ", id(), " on device ",
             static_cast<int>(device().index()));
@@ -241,36 +249,45 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
 }
 
 void SpyreStream::launchH2D(flex::DmaParams* params) const {
+  RECORD_FUNCTION("launch::H2D", {});
   resolveRuntimeHandle()->launchOperationH2D(params);
 }
 
 void SpyreStream::launchD2H(flex::DmaParams* params) const {
+  RECORD_FUNCTION("launch::D2H", {});
   resolveRuntimeHandle()->launchOperationD2H(params);
 }
 
 void SpyreStream::launchCompute(flex::ComputeParams* params) const {
+  RECORD_FUNCTION("launch::Compute", {});
   resolveRuntimeHandle()->launchOperationCompute(params);
 }
 
 void SpyreStream::launchHostCallback(flex::HostCallbackParams* params) const {
+  RECORD_FUNCTION("launch::HostCallback", {});
   resolveRuntimeHandle()->launchOperationHostCallback(params);
 }
 
 void SpyreStream::fillAsync(const flex::CompositeAddress* dst, double value,
                             DataFormats dtype, bool use_dmai) const {
+  RECORD_FUNCTION("launch::Memset", {});
   resolveRuntimeHandle()->fillAsync(dst, value, dtype, use_dmai);
 }
 
 void SpyreStream::launch(const JobPlan& plan,
-                         const std::vector<at::Tensor>& args) const {
+                         const std::vector<at::Tensor>& args,
+                         std::vector<SymbolicArg> symbolic_args) const {
   // Validate all tensors are on Spyre device
   for (size_t i = 0; i < args.size(); ++i) {
     TORCH_CHECK(args[i].is_privateuseone(), "SpyreStream::launch: argument ", i,
                 " must be on Spyre device, got ", args[i].device());
   }
 
-  // Create launch context with tensor arguments
-  LaunchContext ctx{args};
+  // Create launch context with tensor arguments and typed symbolic payload.
+  // symbolic_args is moved in so the closure in
+  // JobPlanStepHostCompute::construct can capture it by value without an extra
+  // copy.
+  LaunchContext ctx{args, std::move(symbolic_args)};
 
   // Each JobPlanStep builds its flex operation params and launches them on
   // this stream in order. flex owns the RuntimeOperation lifecycle.
@@ -282,6 +299,15 @@ void SpyreStream::launch(const JobPlan& plan,
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
   auto& pool = getStreamPool();
   std::unique_lock<std::shared_mutex> lock(pool.mutex);
+
+  // Check that this is the first and only device initialization
+  TORCH_CHECK(!pool.initialized,
+              "initializeStreamPoolImpl already called with device_index ",
+              static_cast<int>(pool.initialized_device_index),
+              "; cannot reinitialize with device_index ",
+              static_cast<int>(device_index));
+  pool.initialized = true;
+  pool.initialized_device_index = device_index;
 
   // Initialize mapping from StreamId → RuntimeStream*.
   // RuntimeStream instances are owned by GlobalRuntime.
@@ -304,7 +330,7 @@ void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
         pool.stream_handle_map.find(sid) == pool.stream_handle_map.end(),
         "Host compute stream id ", sid,
         " is already registered; only one Spyre device per process is "
-        "supported");
+        "supported.");
     pool.stream_handle_map[sid] =
         runtime->createStream(flex::RuntimeStreamPriority::NORMAL);
     pool.host_compute_streams[device_index].push_back(sid);

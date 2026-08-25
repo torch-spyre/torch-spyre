@@ -18,9 +18,10 @@ import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, NamedTuple, Optional, TypeVar, Union
 
+import regex
 import torch
 import sympy
-from sympy import Expr
+from sympy import Expr, Symbol
 from torch._inductor.ir import (
     Buffer,
     ComputedBuffer,
@@ -31,6 +32,7 @@ from torch._inductor.ir import (
     Pointwise,
     Reduction,
 )
+from torch._inductor.ops_handler import WrapperHandler
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.dependencies import MemoryDep, ReadWrites, StarDep, is_indirect
 from torch._inductor.virtualized import V
@@ -40,8 +42,8 @@ from torch_spyre._inductor.op_spec import IndirectAccess
 
 from . import config
 from .core_mapping import core_to_slice_mapping
-from .constants import ELIDED_COPY_BACK_ATTR, MATMUL_REDUCTION_OPS
-from .ir import FixedTiledLayout, SpyreConstantFallback, SpyreEmptyFallback
+from .constants import ELIDED_COPY_BACK_ATTR, MATMUL_REDUCTION_OPS, TOPK_OPS
+from .ir import FixedTiledLayout, SpyreConstantFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
 from .provenance import preserve_provenance
@@ -61,8 +63,8 @@ def _fixed_read_layout(buf) -> "FixedTiledLayout":
     layout = buf.get_layout()
     if isinstance(layout, MutationLayoutSHOULDREMOVE):
         # Reading real_layout() through a mutation layout is only valid once
-        # the target buffer's own layout is a committed FixedTiledLayout. Two
-        # producers of this shape:
+        # the target buffer's own layout is a committed FixedTiledLayout.
+        # Three producers of this shape:
         #  - the copy-back elision optimization (propagate_layouts.py), which
         #    stamps ELIDED_COPY_BACK_ATTR on the producer; or
         #  - coarse_tile.py's nested output-dim + reduction-dim tiling
@@ -70,13 +72,18 @@ def _fixed_read_layout(buf) -> "FixedTiledLayout":
         #    SpyreEmptyFallback accumulator (accum_tile) — a legitimate
         #    in-group consumer (e.g. the next outer-tile iteration's copy-in)
         #    reads that copy op's own output the same way an ordinary
-        #    producer's output would be read.
+        #    producer's output would be read; or
+        #  - coarse_tile.py's copy_out path for a MutationLayoutSHOULDREMOVE op
+        #    whose target is a locally-created graph-output buffer (e.g.
+        #    copy_forced(src, c) where c is returned directly) -- _insert_copy_op's
+        #    inserted coarse_tile_copy_* op reads the mutation op's own output
+        #    the same way. The mutation target there is an ordinary
+        #    ComputedBuffer, not a SpyreEmptyFallback, so this case is
+        #    recognized by layout alone.
         mutation_target = layout.get_buffer()
         is_elided = getattr(buf, ELIDED_COPY_BACK_ATTR, False)
-        is_carry_into_accum = isinstance(
-            mutation_target, SpyreEmptyFallback
-        ) and isinstance(mutation_target.get_layout(), FixedTiledLayout)
-        if not (is_elided or is_carry_into_accum):
+        is_committed_target = isinstance(mutation_target.get_layout(), FixedTiledLayout)
+        if not (is_elided or is_committed_target):
             raise RuntimeError(f"unexpected mutation layout on read buffer {buf}")
         layout = layout.real_layout()
     if not isinstance(layout, FixedTiledLayout):
@@ -108,6 +115,17 @@ def op_read_writes(op: Operation) -> ReadWrites:
         rw = op.get_read_writes()
         op.__dict__["_ts_cached_read_writes"] = rw
     return rw
+
+
+def op_short_name(op: Operation) -> str:
+    """Resolve an operation's short name, including fused FX origins."""
+
+    for fx_node in (getattr(op, "origin_node", None), *getattr(op, "origins", ())):
+        target = getattr(fx_node, "target", None)
+        for attr in ("_opname", "__name__", "name"):
+            if name := getattr(target, attr, None):
+                return str(name)
+    return "None"
 
 
 def invalidate_op_read_writes(op: Operation) -> None:
@@ -366,20 +384,41 @@ def op_out_coords(op: ComputedBuffer) -> list[sympy.Expr]:
     return host_coordinates(op.get_layout(), output_dep, indirect_sizes_from_op(op))
 
 
-def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
-    """Return names of deps whose loaded values are used as indices in scatter output_indexer.
+def is_restickify_coords(in_coords: list[Expr], out_coords: list[Expr]) -> bool:
+    """Return whether a single-input pointwise copy is a RESTICKIFY (vs IDENTITY).
 
-    For Scatter ops the indirect index is encoded in the output_indexer closure.
-    Extract the index buffer names directly from the 'indices' closure variable.
+    ``in_coords`` / ``out_coords`` are the operands' device-space coordinates.
+    It is a restickify iff a *different* host dim lands within the stick (the
+    within-stick coords carry different free symbols) -- except a broadcast (an
+    all-zero input expanding to non-scalar output), which is an identity fill.
+
+    The authoritative test, shared by the codegen store side and the padding
+    pass matcher (``is_restickify_op``) so the two cannot disagree.
+    """
+    if all(e == 0 for e in in_coords) and not all(e == 0 for e in out_coords):
+        return False  # broadcast: scalar input expanding to non-scalar output
+    return in_coords[-1].free_symbols != out_coords[-1].free_symbols
+
+
+def _scatter_index_buf_names_ordered(op: ComputedBuffer) -> list[str]:
+    """Return names of the index tensors used in a Scatter op's output_indexer.
+
+    For Scatter ops the indirect index is encoded in the output_indexer
+    closure. Extract the index buffer names directly from the 'indices'
+    closure variable, preserving the order of `indices` (position within that
+    list is the scattered dimension). Returns [] if op isn't a Scatter, or if
+    the closure doesn't expose an 'indices' variable in the expected shape
+    (e.g. because Inductor renamed it), in which case a warning is logged
+    since downstream passes will silently miss the scatter index tensors.
     """
     from torch._inductor.ir import Scatter
 
     if not isinstance(op.data, Scatter):
-        return set()
+        return []
 
     fn = op.data.output_indexer
     if fn.__closure__ is None:
-        return set()
+        return []
 
     freevars = fn.__code__.co_freevars
     try:
@@ -387,18 +426,38 @@ def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
             name: cell.cell_contents for name, cell in zip(freevars, fn.__closure__)
         }
     except ValueError:
-        return set()
+        return []
 
-    if "indices" not in cells:
+    indices = None
+    if "indices" in cells:
+        indices = cells["indices"]
+    elif "index_loader" in cells:
+        # Fallback: PyTorch Inductor may use index_loader instead of direct indices.
+        # Try to extract the indices from index_loader's closure.
+        index_loader = cells["index_loader"]
+        if hasattr(index_loader, "__closure__") and index_loader.__closure__:
+            loader_freevars = index_loader.__code__.co_freevars
+            try:
+                loader_cells = {
+                    name: cell.cell_contents
+                    for name, cell in zip(loader_freevars, index_loader.__closure__)
+                }
+                if "indices" in loader_cells:
+                    indices = loader_cells["indices"]
+            except (ValueError, AttributeError):
+                pass
+
+    if indices is None:
         logger.warning(
-            "Scatter.output_indexer closure has no 'indices' variable — "
-            "Inductor may have renamed it. Scatter index tensors will not be "
-            "excluded from stick compatibility checks. (freevars: %s)",
+            "Scatter.output_indexer closure has no 'indices' variable or "
+            "'index_loader' — Inductor structure may have changed. "
+            "Scatter index tensors will not be excluded from stick compatibility "
+            "checks. (freevars: %s)",
             list(freevars),
         )
-        return set()
-    indices = cells["indices"]
-    names = set()
+        return []
+
+    names = []
     for idx_tensor in indices:
         if idx_tensor is None:
             continue
@@ -407,8 +466,109 @@ def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
         while hasattr(node, "data"):
             node = node.data
         if hasattr(node, "name") and node.name is not None:
-            names.add(node.name)
+            names.append(node.name)
     return names
+
+
+def _find_scatter_index_buf_names(op: ComputedBuffer) -> set[str]:
+    """Return names of deps whose loaded values are used as indices in scatter output_indexer."""
+    return set(_scatter_index_buf_names_ordered(op))
+
+
+def _build_indirect_store_subs(
+    op: ComputedBuffer,
+) -> "tuple[dict[sympy.Symbol, sympy.Expr], dict[sympy.Symbol, int] | None]":
+    """Map indirect symbols in scatter writes to (IndexedBase subs, sizes).
+
+    For Scatter ops, the scatter indices are loop vars in write_dep.index.
+    Identify which loop vars come from scatter index buffers by extracting
+    those buffers and seeing which symbols appear in their index expressions.
+    Returns ({sym: IndexedBase[...]}, None) -- sizes is always None since the
+    scattered-dim size isn't recoverable from op alone; see compute_coordinates,
+    which treats sizes=None as "skip unknown symbols silently."
+    """
+    from sympy import IndexedBase
+
+    rw = op.get_read_writes()
+    writes = [
+        d
+        for d in rw.writes
+        if isinstance(d, MemoryDep) and isinstance(d.index, sympy.Basic)
+    ]
+    if not writes:
+        return {}, None
+    write_dep = writes[0]
+
+    # Extract scatter index symbols (symbols in write_dep.index not in loop ranges).
+    all_write_syms = write_dep.index.free_symbols
+    loop_syms = set(write_dep.ranges.keys())
+    scatter_index_syms = all_write_syms - loop_syms
+
+    if not scatter_index_syms:
+        # No scatter symbols found.
+        return {}, None
+
+    # Try to map scatter symbols to index buffers from the closure.
+    index_buf_names = _scatter_index_buf_names_ordered(op)
+    if index_buf_names:
+        # Build map of all read deps by name
+        read_deps = [d for d in rw.reads if isinstance(d, MemoryDep)]
+        dep_by_name = {d.name: d for d in read_deps}
+
+        # Recover each symbol's relative creation order from its numeric
+        # tmp<N> suffix. Inductor's LoopBody.add_indirect assigns indirect
+        # placeholder symbols with a monotonic counter as output_indexer
+        # iterates over `indices` in position order (lowering.py's
+        # index_output_size_and_inner_fn), and the placeholder is later
+        # substituted 1:1 with the real tmp<N> CSE variable. So sorting by
+        # suffix recovers the same order as `indices` -- free_symbols itself
+        # is an unordered set and cannot be zipped directly.
+        def _sym_sort_key(s: sympy.Symbol) -> tuple[int, int, str]:
+            m = regex.search(r"(\d+)$", s.name)
+            return (0, int(m.group(1)), "") if m else (1, 0, s.name)
+
+        ordered_syms = sorted(scatter_index_syms, key=_sym_sort_key)
+
+        # CSE can dedupe two indices entries that load the same buffer at the
+        # same index expression, so len(ordered_syms) may be < len(indices).
+        # Only pair positionally when counts agree -- pairing at a mismatched
+        # count would silently attribute one index buffer's symbol to
+        # another, which is the exact bug this replaces.
+        subs = {}
+        if len(ordered_syms) == len(index_buf_names):
+            for sym, index_buf_name in zip(ordered_syms, index_buf_names):
+                if index_buf_name not in dep_by_name:
+                    continue
+                index_dep = dep_by_name[index_buf_name]
+                subs[sym] = IndexedBase(index_dep.name)[index_dep.index]
+        else:
+            logger.warning(
+                "_build_indirect_store_subs: %d scatter symbols but %d index "
+                "buffers (CSE likely deduped identical index loads) -- "
+                "cannot safely pair symbols to buffers positionally; "
+                "falling back to placeholder subs. symbols=%s indices=%s",
+                len(ordered_syms),
+                len(index_buf_names),
+                ordered_syms,
+                index_buf_names,
+            )
+        if subs:
+            return subs, None
+
+    # Fallback: if we couldn't extract index buffer names from the closure,
+    # create placeholder subs so that scatter_access_subs can be built.
+    # The actual buffer names don't matter for layout enforcement.
+    subs = {
+        sym: IndexedBase(f"scatter_idx_{i}")[sym]
+        for i, sym in enumerate(scatter_index_syms)
+    }
+
+    # The valid range for a scatter-index symbol isn't recoverable here (it's
+    # the mutation target's scattered-dim size, not visible from op alone).
+    # Return None, matching indirect_info_from_op's documented convention:
+    # sizes=None tells compute_coordinates to skip unknown symbols silently
+    # rather than raising Unsupported or misreading a fabricated size.
+    return subs, None
 
 
 def indirect_info_from_op(
@@ -426,6 +586,24 @@ def indirect_info_from_op(
     """
     if op is None:
         return set(), {}, None
+
+    from torch._inductor.ir import Scatter
+
+    # For scatter ops, extract info from the write side instead of reads.
+    if isinstance(op.data, Scatter):
+        subs, sizes = _build_indirect_store_subs(op)
+        scatter_names: set[str] = set()
+        for expr in subs.values():
+            if hasattr(expr, "base") and hasattr(expr.base, "name"):
+                scatter_names.add(expr.base.name)
+        access_subs = {
+            sym: IndirectAccess(sympy.Symbol(expr.base.name))
+            for sym, expr in subs.items()
+            if hasattr(expr, "base")
+        }
+        return scatter_names, access_subs, sizes
+
+    # For gather and other ops, use the read side.
     subs, sizes = _build_indirect_load_subs(op)
     names: set[str] = {expr.base.name for expr in subs.values()}
     names |= _find_scatter_index_buf_names(op)
@@ -557,22 +735,79 @@ def _build_indirect_load_subs(
     return subs, sizes
 
 
+def indirect_store_sizes(
+    dep: MemoryDep, layout: "FixedTiledLayout"
+) -> "dict[sympy.Symbol, int]":
+    """Map each store-side indirect symbol to its destination row extent.
+
+    The indirect symbol selects a scatter-destination row; its valid range is
+    the destination's host extent along the scattered dimension, recovered by
+    matching the symbol's linear coefficient in the write index to a host
+    stride. device_coordinates() needs these integer ranges (not IndirectAccess
+    markers) to process the row symbol as an ordinary loop var; unlike gather,
+    there is no load-side indirect_indexing() call to recover the size from on
+    the store side, so we derive it from the layout instead.
+    """
+    host_size = [concretize_expr(s) for s in layout.size]
+    host_stride = [concretize_expr(s) for s in layout.stride]
+    sizes: dict[sympy.Symbol, int] = {}
+    index = dep.index
+    for sym in index.free_symbols:
+        if sym in dep.ranges:
+            continue
+        coeff = index.coeff(sym)
+        for dim, st in enumerate(host_stride):
+            if st == coeff:
+                sizes[sym] = host_size[dim]
+                break
+    return sizes
+
+
+def _wrap_indirect_subs(
+    raw: dict[sympy.Symbol, sympy.Expr],
+) -> "dict[sympy.Symbol, sympy.Expr]":
+    """Convert index buffer references to IndirectAccess markers.
+
+    Takes mappings like {sym → IndexedBase(name)[index]} and converts them to
+    {sym → IndirectAccess(name)}. Used by both load and store builders to mark
+    which dimensions are accessed indirectly.
+    """
+    return {
+        sym: IndirectAccess(sympy.Symbol(expr.base.name)) for sym, expr in raw.items()
+    }
+
+
 def indirect_access_subs_from_op(
     op: ComputedBuffer,
 ) -> "dict[sympy.Symbol, sympy.Expr]":
-    """Build {indirect_sym → IndirectAccess(name)} for a ComputedBuffer (pre-scheduler).
+    """Find all indirect accesses in an operation and mark them appropriately.
 
-    Used before scheduling, when indirect_vars is not yet available.
-    Re-executes inner_fn via _IndirectIndexFinder to discover which buffer's
-    load produced each indirect index. The resulting subs can be passed to
-    device_coordinates() to replace indirect symbols with IndirectAccess(name).
+    Called before scheduling to identify which dimensions are accessed through
+    runtime indices. Handles both gather (indirect reads) and scatter (indirect
+    writes). Returns substitutions that mark these dimensions with IndirectAccess
+    so the work division planner knows not to split them incorrectly.
 
-    Note: internally calls indirect_info_from_op(), re-executing inner_fn. If you
-    already have the result of indirect_info_from_op(), use the access_subs field
-    directly rather than calling this function.
+    Uses indirect_info_from_op() for the load side (already returns IndirectAccess
+    markers), then merges scatter store-side subs via _build_indirect_store_subs.
     """
-    _, access_subs, _ = indirect_info_from_op(op)
-    return access_subs
+    _, load_subs, _ = indirect_info_from_op(op)
+    store_subs_raw, _ = _build_indirect_store_subs(op)
+    store_subs = _wrap_indirect_subs(store_subs_raw)
+    return {**load_subs, **store_subs}
+
+
+def indirect_store_subs_from_op(
+    op: ComputedBuffer,
+) -> "dict[sympy.Symbol, sympy.Expr]":
+    """Find indirect accesses in scatter writes only.
+
+    This is the write-only version of `indirect_access_subs_from_op`. Marks
+    the scatter destination's row dimension as IndirectAccess so it stays at a
+    shared base address across cores (same treatment as gather value tables).
+    Returns empty for non-scatter operations.
+    """
+    store_subs_raw, _ = _build_indirect_store_subs(op)
+    return _wrap_indirect_subs(store_subs_raw)
 
 
 def indirect_access_subs_from_kernel(
@@ -776,6 +1011,252 @@ def try_device_coordinates(
         return device_coordinates(stl, dep, indirect_sizes)
     except Unsupported:
         return None
+
+
+def _find_entry_output_dim(op) -> "tuple[int, int, int] | None":
+    """Locate a gather's index-entry dim on the output; the one coordinate search.
+
+    The entry dim is the index tensor's STICK dim (its rows are selected at
+    runtime), which on the gather output is a NON-stick dim (the row selector).
+    Multi-core work division splits this dim in whole index sticks, so a split
+    is only legal when the output can hold a stick-aligned slice -- i.e. when the
+    output extent is a whole multiple of the index ``eps``.
+
+    Returns ``(eps, out_pos, out_extent)`` -- the index elems_per_stick, the
+    entry dim's device position in the output layout, and the output
+    device_size there -- or ``None`` when ``op`` is not a gather-style indirect
+    access, the output layout is not yet a committed ``FixedTiledLayout``, or the
+    entry dim coincides with the output's own stick dim (a geometry the
+    stick-alignment padding does not cover). Valid from
+    ``enforce_indirect_access_layout`` onward, once every buffer's layout is
+    committed.
+    """
+    subs = indirect_access_subs_from_op(op)
+    if not subs:
+        return None
+    index_names = {e.args[0].name for e in subs.values() if e.args}
+
+    rw = op.get_read_writes()
+    out_dep = next(iter(rw.writes), None)
+    if out_dep is None:
+        return None
+
+    # Fail safe: callers use this only to *enable* a split / pad a paddable
+    # gather output. If the output can't be analysed (e.g. a scatter writes its
+    # destination indirectly, so device_coordinates can't resolve the entry
+    # coord), return None so the caller stays conservative rather than erroring.
+    try:
+        out_stl = _fixed_read_layout(op).device_layout
+        out_coords = device_coordinates(out_stl, out_dep, None)
+        for d in rw.reads:
+            if not (isinstance(d, MemoryDep) and d.name in index_names):
+                continue
+            idx_stl = _fixed_read_layout(V.graph.get_buffer(d.name)).device_layout
+            stick_expr = device_coordinates(idx_stl, d, None)[-1]
+            if len(stick_expr.free_symbols) != 1:
+                continue
+            stick_var = next(iter(stick_expr.free_symbols))
+            eps = idx_stl.elems_per_stick()
+            # The entry dim must be a NON-stick dim of the output (exclude the
+            # last, stick, coordinate). On a scatter the entry coord is an
+            # IndirectAccess (its free symbol is the index buffer, not the
+            # iteration stick var), so no match -> None -> partial scatter stays
+            # forbidden, which is correct: its in-place dest can't be padded.
+            for pos, coord in enumerate(out_coords[:-1]):
+                if coord.free_symbols == {stick_var}:
+                    return eps, pos, int(out_stl.device_size[pos])
+    except (RuntimeError, AssertionError, KeyError, ValueError, Unsupported):
+        return None
+    return None
+
+
+def is_output_stick_aligned_for_entry(op) -> bool:
+    """Whether a gather output already holds a whole-stick slice for its entry dim.
+
+    The work-division guard uses this to decide the partial-last-stick split:
+    True means the stick-aligned split is legal (the output extent is a multiple
+    of the index ``eps`` -- either naturally, or because the padding pass grew
+    it); False means keep the split forbidden. Returns False for anything that is
+    not a paddable gather entry (scatter, non-committed layout), so the guard
+    stays conservative.
+    """
+    found = _find_entry_output_dim(op)
+    if found is None:
+        return False
+    eps, _out_pos, out_extent = found
+    return out_extent % eps == 0
+
+
+def padded_entry_output_stl(op) -> "SpyreTensorLayout | None":
+    """The gather output's device layout grown so the entry dim is a whole stick.
+
+    The padding pass applies this returned layout; the coordinate search and the
+    size math both stay here. Returns ``None`` when there is nothing to do -- not
+    a paddable gather entry, or the entry dim is already stick-aligned. The
+    logical size is unchanged: only the physical ``device_size`` grows, and the
+    D2H copy extracts the logical view from the larger allocation.
+    """
+    found = _find_entry_output_dim(op)
+    if found is None:
+        return None
+    eps, out_pos, out_extent = found
+    if out_extent % eps == 0:
+        return None
+    out_stl = _fixed_read_layout(op).device_layout
+    device_size = list(out_stl.device_size)
+    device_size[out_pos] = ((out_extent + eps - 1) // eps) * eps
+    logger.info(
+        "padded_entry_output_stl: %s entry dim (pos %d) %d -> %d for "
+        "stick-aligned multi-core split",
+        op.get_name(),
+        out_pos,
+        out_extent,
+        device_size[out_pos],
+    )
+    return SpyreTensorLayout(
+        device_size=device_size,
+        stride_map=list(out_stl.stride_map),
+        device_dtype=out_stl.device_dtype,
+    )
+
+
+def _shared_indirect_coords(op: "ComputedBuffer") -> list[list[Expr]]:
+    """Device-coordinate lists for tensors shared across cores with runtime rows.
+
+    Covers gather value tables (indirect reads) and scatter destinations
+    (indirect writes). Each returned list is the device_coordinates of one shared
+    tensor, with the runtime-chosen row marked by IndirectAccess. These tensors
+    stay at the same base address on every core, so their data dimensions must
+    not be split. Returns empty for regular operations.
+    """
+    coords_lists: list[list[Expr]] = []
+
+    # Gather value tables: filtered out of the normal arg list, recovered here.
+    # device_coordinates needs the *integer* index range for each indirect symbol
+    # (indirect_sizes), not the IndirectAccess marker map. Compute the coordinates
+    # with the raw indirect symbol treated as a normal loop var, then xreplace the
+    # subs to mark the runtime-chosen row.
+    subs = indirect_access_subs_from_op(op)
+    if subs:
+        ind_sizes = indirect_sizes_from_op(op)
+        for d in op.get_read_writes().reads:
+            if isinstance(d, MemoryDep) and d.is_indirect():
+                layout = _fixed_read_layout(V.graph.get_buffer(d.name))
+                coords = device_coordinates(layout.device_layout, d, ind_sizes)
+                coords_lists.append([c.xreplace(subs) for c in coords])
+
+    # Scatter destination: the write, with its runtime-chosen row marked the same
+    # way (integer row extent for coordinates, then xreplace to IndirectAccess).
+    store_subs = indirect_store_subs_from_op(op)
+    if store_subs:
+        write = next(iter(op.get_read_writes().writes))
+        # Resolve the scatter destination's layout, leniently unwrapping the
+        # in-place-mutation layout (mirrors work_division._resolve_layout; inlined
+        # to avoid a pass_utils -> work_division import cycle). _fixed_read_layout
+        # is too strict here — it rejects a scatter's mutation output.
+        layout = op.get_layout()
+        if isinstance(layout, MutationLayoutSHOULDREMOVE):
+            layout = layout.real_layout()
+        ind_sizes = indirect_store_sizes(write, layout)
+        coords = device_coordinates(layout.device_layout, write, ind_sizes)
+        coords_lists.append([c.xreplace(store_subs) for c in coords])
+
+    return coords_lists
+
+
+def _non_indirect_coord_syms(coords: list[Expr]) -> set[Symbol]:
+    """Extract coordinate symbols, skipping the runtime-chosen row dimension."""
+    syms: set[Symbol] = set()
+    for coord in coords:
+        if hasattr(coord, "has") and coord.has(IndirectAccess):
+            continue
+        syms |= coord.free_symbols
+    return syms
+
+
+def shared_indirect_data_syms(op: "ComputedBuffer") -> set[Symbol]:
+    """Find data dimensions of shared tables that must not be split.
+
+    These are the column/stick dimensions of tables shared across cores (gather
+    value tables or scatter destinations). We can't split these dimensions
+    because the table needs to stay at the same base address on every core.
+    Splitting a data dimension would require different base addresses per core,
+    breaking the shared access pattern. Returns empty for regular operations.
+    """
+    syms: set[Symbol] = set()
+    for coords in _shared_indirect_coords(op):
+        syms |= _non_indirect_coord_syms(coords)
+    return syms
+
+
+def indirect_forbidden_split_syms(op: "ComputedBuffer") -> set[Symbol]:
+    """Iteration dims that must not be core-split for an indirect op.
+
+    1. **Shared-table data dims** — the non-row dims of a shared gather/scatter
+       table must not advance per core (all cores share the same base address).
+
+    2. **Partial-last-stick entry dims** — splitting a partial last index stick
+       across cores straddles the stick boundary. Forbidden unless the gather
+       output was already padded to a stick boundary by
+       ``enforce_indirect_access_layout``, which makes the split safe. Scatter
+       output rows are chosen at runtime so can never be padded; they stay unsplit.
+    """
+    syms = shared_indirect_data_syms(op)  # (1)
+
+    # (2) Forbid a partial-last-stick index-entry dim UNLESS the gather output is
+    # provably stick-aligned for it. The partial check keys off the INDEX's
+    # *logical* entry count (d.ranges[stick_var], e.g. 40), which is never padded
+    # -- the stick-alignment fix grows the gather OUTPUT's device_size, not the
+    # index. is_output_stick_aligned_for_entry reads that (possibly padded)
+    # output extent, so the split is allowed only when the output can hold a
+    # whole-stick slice. It stays forbidden when the output is NOT aligned: a
+    # SCATTER (its in-place dest can't be resized -> returns False) or a gather
+    # whose output the pass could not grow -- those fall back to a single core,
+    # not miscompile. Applies to BOTH gather and scatter
+    output_aligned = is_output_stick_aligned_for_entry(op)
+    subs = indirect_access_subs_from_op(op)
+    index_names = {e.args[0].name for e in subs.values() if e.args}
+    for d in op.get_read_writes().reads:
+        if not (isinstance(d, MemoryDep) and d.name in index_names):
+            continue
+        layout = _fixed_read_layout(V.graph.get_buffer(d.name))
+        stick_expr = device_coordinates(layout.device_layout, d, None)[-1]
+        if len(stick_expr.free_symbols) != 1:
+            continue
+        stick_var = next(iter(stick_expr.free_symbols))
+        eps = layout.device_layout.elems_per_stick()
+        partial = (
+            stick_var in d.ranges and concretize_expr(d.ranges[stick_var]) % eps != 0
+        )
+        if partial and not output_aligned:
+            syms.add(stick_var)
+
+    return syms
+
+
+def indirect_store_entry_syms(
+    op: "ComputedBuffer", forbidden: "set[Symbol] | None" = None
+) -> set[Symbol]:
+    """Find which dimensions of a scatter can be safely parallelized.
+
+    For scatter operations, we can split along the index-entry dimension (giving
+    each core different source rows to write). The destination stays shared with
+    its row chosen at runtime. This is safe because each core writes to different
+    entries.
+
+    ``forbidden`` may be a precomputed ``indirect_forbidden_split_syms(op)`` to
+    avoid recomputing it (the caller often already has it); it is computed here
+    when omitted.
+    """
+    from torch._inductor.ir import Scatter
+
+    if not isinstance(op.data, Scatter) or op.data.scatter_mode is not None:
+        return set()
+    if not indirect_store_subs_from_op(op):
+        return set()
+    if forbidden is None:
+        forbidden = indirect_forbidden_split_syms(op)
+    return set(iteration_space_from_op(op)) - forbidden
 
 
 def iter_var_id(stick_expr) -> int:
@@ -1188,6 +1669,79 @@ def replace_computed_buffer_body(
     return new_buf
 
 
+class NameSwapHandler(WrapperHandler):
+    """Patch an inner_fn's ``load`` calls to read renamed buffers.
+
+    Used after inserting a producer upstream (e.g. a restickify or an identity
+    clone) that supersedes an existing input: the consumer's inner_fn still
+    names the old buffer, so wrap it to remap each ``load(old_name, ...)`` to
+    ``load(new_name, ...)``.
+
+    This is the canonical WrapperHandler wrapping pattern for compiler passes:
+    wrap, never rebuild index expressions from scratch (they go stale — see
+    CLAUDE.md "Compiler Pass Conventions" and issue #2797).
+    """
+
+    def __init__(self, inner, name_map: dict[str, str]):
+        super().__init__(inner)
+        self._name_map = name_map
+
+    def load(self, name, index):
+        return super().load(self._name_map.get(name, name), index)
+
+
+def redirect_computed_buffer_reads(
+    op: ComputedBuffer,
+    name_map: dict[str, str],
+    operations: list[Operation],
+    *,
+    pass_name: str,
+    reason: str | None = None,
+) -> ComputedBuffer:
+    """Redirect ``op``'s reads through ``name_map`` and reconstruct the buffer.
+
+    Wraps ``op.data.inner_fn`` with ``NameSwapHandler`` so every ``load`` of a
+    remapped buffer resolves to its replacement, then reconstructs the frozen
+    ``ComputedBuffer`` so the instance-keyed ``get_default_sizes_body`` cache is
+    cleanly invalidated (the reconstruct is the reason both this helper and
+    ``replace_computed_buffer_body`` rebuild rather than mutate in place).
+
+    Returns the replacement ComputedBuffer.
+    """
+    # Patch inner_fn once with the full name_map covering all remapped args.
+    orig_inner = op.data.inner_fn
+
+    def new_inner_fn(*args, _map=name_map, _orig_inner=orig_inner):
+        with V.set_ops_handler(NameSwapHandler(V.ops, _map)):
+            return _orig_inner(*args)
+
+    object.__setattr__(op.data, "inner_fn", new_inner_fn)
+
+    # Reconstruct ComputedBuffer as a fresh object so the instance-keyed cache
+    # on get_default_sizes_body can be cleanly invalidated below.
+    new_buf = ComputedBuffer(
+        name=op.get_name(),
+        layout=op.layout,
+        data=op.data,
+        _split_size=op._split_size,
+        _original_inner_fn=op._original_inner_fn,
+        _original_ranges=op._original_ranges,
+        _original_reduction_ranges=op._original_reduction_ranges,
+    )
+    new_buf.operation_name = op.operation_name
+    preserve_provenance(op, new_buf, pass_name=pass_name, reason=reason)
+    copy_op_metadata(op, new_buf)
+
+    op_idx = operations.index(op)
+    operations[op_idx] = new_buf
+    V.graph.name_to_buffer[new_buf.get_name()] = new_buf
+
+    # Invalidate the sizes/body cache so it is recomputed on next access with
+    # the patched inner_fn.
+    ComputedBuffer.get_default_sizes_body.clear_cache(new_buf)
+    return new_buf
+
+
 def lower_pad_sequence(
     arg_fx_node: torch.fx.Node,
     padded_size: list[int],
@@ -1435,6 +1989,15 @@ def _is_matmul_op(op: Operation) -> bool:
     )
 
 
+def is_topk(op: Operation) -> bool:
+    """Return True iff ``op`` is a ``ComputedBuffer`` computing a topk reduction."""
+    return (
+        isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Reduction)
+        and op.data.reduction_type in TOPK_OPS
+    )
+
+
 # TODO: Select and store the core mapping before LX planning, then pass the
 # winning mapping to codegen.
 class _ViewPrep(NamedTuple):
@@ -1498,6 +2061,10 @@ def _prepare_per_core_view(
     buf_layout = buf_op.layout
     if not isinstance(buf_layout, FixedTiledLayout):
         return None
+
+    if is_topk(op):
+        return None
+
     dev_layout = buf_layout.device_layout
     device_size = dev_layout.device_size
     stride_map = dev_layout.stride_map
@@ -1556,6 +2123,7 @@ def _per_core_view_from_prep(
     # can't be placed on a device dim); cross-op view comparisons must treat it
     # as "no match", since its empty view means "couldn't tell", not "whole".
     unrepresentable = (PerCoreView(work_slice_dims=(), core_to_slot=()), False, False)
+
     # No real split -> whole-buffer view, representable regardless of layout. Must
     # precede the ``prep is None`` guard to match the original ordering.
     if not any(n > 1 for d in coeff_splits for n in d.values()):
@@ -1670,7 +2238,7 @@ def _per_core_view_from_prep(
         if prep.is_matmul and config.core_id_k_fast_emission
         else None
     )
-    core_to_slot_by_name = core_to_slice_mapping(
+    core_to_slot = core_to_slice_mapping(
         iter_symbols,
         dim_splits,
         num_cores,
@@ -1681,9 +2249,7 @@ def _per_core_view_from_prep(
     # compare equal even if they name their iter axes differently.
     pruned_core_to_slot: list[tuple[int, "Expr"]] = []
     for sym, dev_dim in sym_to_device_dim.items():
-        expr = core_to_slot_by_name.get(str(sym))
-        if expr is not None:
-            pruned_core_to_slot.append((dev_dim, expr))
+        pruned_core_to_slot.append((dev_dim, core_to_slot[sym]))
     pruned_core_to_slot.sort(key=lambda x: x[0])
 
     view = PerCoreView(
@@ -1808,8 +2374,6 @@ def format_operations(operations: list[Operation]) -> str:
                 buf.write(f"\n  dim_hints={dim_hints}")
             if loop_info := getattr(op, "loop_info", None):
                 buf.write(f"\n  loop_info={loop_info}")
-            if pending_per_tile_fixed := getattr(op, "_pending_per_tile_fixed", None):
-                buf.write(f"\n  _pending_per_tile_fixed={pending_per_tile_fixed}")
             buf.write(f"\n  {op.data}")
         buf.write("\n\n")
     return buf.getvalue()

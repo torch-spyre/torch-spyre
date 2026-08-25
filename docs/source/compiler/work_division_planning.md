@@ -46,7 +46,8 @@ and dispatched from `CustomPreSchedulingPasses` in
 [passes.py](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/_inductor/passes.py).
 
 The planner only sees ops whose IR data is `Pointwise` or `Reduction`
-(and excluding TopK reductions, which return early). `FallbackKernel`,
+(TopK reductions use dedicated constraints; see [TopK work
+division](#topk-work-division)). `FallbackKernel`,
 `ExternKernel`, `SpyreConstantFallback`, and `SpyreEmptyFallback`
 allocation kernels are filtered out earlier and never reach the passes.
 
@@ -415,6 +416,22 @@ may include at most one reduction variable. If more than one reduction
 variable would have to be split to satisfy the 255.996 MiB span limit, the
 compiler raises an error.
 
+(topk-work-division)=
+
+## TopK work division
+
+TopK reductions use constraint-based work division:
+
+1. **k is split, capped at 4 rows per core.** The hardware can only produce
+   up to 4 top-k rows per core, so the smallest divisor `d` of `k` with
+   `k / d <= 4` is chosen. If no valid divisor exists within max_cores, the
+   compiler raises `Unsupported`.
+2. **The search-space dimension is never split.** The dimension being
+   searched (the `dim` argument to `torch.topk`) must stay whole on one core.
+
+Other output/batch dimensions are distributed across the remaining core budget
+under the constraint that total cores used is `k_cores * product(other_dims) <= max_cores`.
+
 ## Worked example: large matmul on 32 cores
 
 Take a single matmul with `A: [8192, 32768]`, `W: [32768, 4096]`,
@@ -490,6 +507,16 @@ controls this codegen-side permutation. The name is legacy from when
 k-fast was also a planner. The permutation runs whenever any planner
 picks a K-split.
 
+:::{figure} ../_static/images/work-division/core-id-k-mapping.svg
+:alt: Default core order places the two K slices of one output tile four cores apart; contiguous_dim on K places them on adjacent cores.
+:width: 100%
+
+`contiguous_dim` selects which dimension varies fastest across `core_id`.
+Setting it to the K dimension puts the cores that reduce the same output
+tile next to each other, so their partial sums accumulate over one ring
+hop instead of several.
+:::
+
 ### Scratchpad planning
 
 Each pass plans one op at a time. When two adjacent ops share a tensor
@@ -563,7 +590,7 @@ the accepted split decision. Validation checks that:
 User work-division hints are intentionally authoritative. If Pass 1
 (`span_reduction`) already committed minimum splits for the 255.996 MiB span limit,
 and the user hint asks for fewer splits, the compiler logs a warning and applies
-the strict user hint. `warn_if_per_core_overflow` then logs a critical message if
+the strict user hint. `raise_if_per_core_overflow` then raises `Unsupported` if
 the resulting per-core span exceeds the hardware limit.
 
 Set `SPYRE_INDUCTOR_IGNORE_HINTS=1` to ignore `spyre_hint(work_div={...})`
@@ -581,8 +608,8 @@ annotations and use the automatic work-distribution planner.
   the requested component yet.
 - Only `Pointwise` and `Reduction` IR nodes are dispatched for work
   division. `ExternKernel` and `FallbackKernel` nodes are skipped.
-- TOPK reductions currently run single-core, so `work_div` hints on TOPK
-  operations are ignored with a warning.
+- TopK reductions use constraint-based work division, so `work_div` hints
+  are not supported for TopK operations.
 - Each pass plans one op at a time. Adjacent ops can pick incompatible
   per-core splits for a shared tensor, which the LX scratchpad planner
   then treats as a core-division mismatch.

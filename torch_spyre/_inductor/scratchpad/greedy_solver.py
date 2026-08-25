@@ -19,7 +19,7 @@ from typing import Optional
 from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
     MemoryPlanSolver,
-    _assert_in_place_relationships,
+    _check_in_place_relationships,
 )
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
@@ -29,11 +29,22 @@ logger = get_inductor_logger("scratchpad.greedy_solver")
 
 
 class GreedyLayoutSolver(MemoryPlanSolver):
-    def __init__(self, size: int, alignment: int = 128):
-        super().__init__(size, alignment)
+    supports_paired_buffers = True
+
+    def __init__(
+        self, buffers: Sequence[LifetimeBoundBuffer], size: int, alignment: int = 128
+    ):
+        super().__init__(buffers, size, alignment)
         # `usage` tracks live placements during planning. It is specific to the
         # greedy time-stepping algorithm; the gap-based solvers don't use it.
         self.usage: list[LifetimeBoundBuffer] = []
+        # Names of parents whose slot has already been handed to an in-place
+        # child. A slot is handed off once: from the handoff on it belongs to
+        # that child, so a second child declaring the same parent must be placed
+        # on its own slot instead of landing on top of the first.
+        self.reused_parents: set[str] = set()
+        self.paired_group_by_name: dict[str, tuple[LifetimeBoundBuffer, ...]] = {}
+        self.rejected_paired_buffers: set[str] = set()
 
     def _get_lowest_addr_in_use(self):
         return min(
@@ -46,6 +57,27 @@ class GreedyLayoutSolver(MemoryPlanSolver):
             (rec.address + rec.size for rec in self.usage if rec.address is not None),
             default=0,
         )
+
+    def _occupied_spans(self) -> list[tuple[int, int]]:
+        """Merged ``[start, end)`` address spans currently in use.
+
+        An in-place handoff keeps both the dying parent and its child in
+        ``usage`` at the same address for the tick their lifetimes share, so
+        entries can nest. Merging the spans first means the gap scan cannot read
+        a shared slot as two abutting ones and hand out an address that is still
+        inside the parent.
+        """
+        merged: list[list[int]] = []
+        for lo, hi in sorted(
+            (rec.address, rec.address + rec.size)
+            for rec in self.usage
+            if rec.address is not None
+        ):
+            if merged and lo <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], hi)
+            else:
+                merged.append([lo, hi])
+        return [(lo, hi) for lo, hi in merged]
 
     def _find_free_block(self, size_needed: int) -> Optional[int]:
         assert all(x.address is not None for x in self.usage)
@@ -62,27 +94,29 @@ class GreedyLayoutSolver(MemoryPlanSolver):
             return address
 
         # Search for a gap between existing allocations
-        self.usage.sort(key=lambda x: (x.address is None, x.address))
-        for i in range(len(self.usage) - 1):
-            assert (current_address := self.usage[i].address) is not None
-            assert (next_address := self.usage[i + 1].address) is not None
-            frag_st = (
-                math.ceil((current_address + self.usage[i].size) / self.alignment)
-                * self.alignment
-            )
-            if next_address - frag_st >= size_needed:
+        occupied = self._occupied_spans()
+        for (_, span_end), (next_start, _) in zip(occupied, occupied[1:]):
+            frag_st = math.ceil(span_end / self.alignment) * self.alignment
+            if next_start - frag_st >= size_needed:
                 return frag_st
 
         return None
 
-    def _try_allocate(self, buffer: LifetimeBoundBuffer):
+    def _try_allocate_one(self, buffer: LifetimeBoundBuffer) -> None:
         # Check if the current buffer can be in-placed
         for in_place_opt in buffer.in_place_parents:
+            if in_place_opt in self.reused_parents:
+                continue
             matched_obj = next((u for u in self.usage if u.name == in_place_opt), None)
             if matched_obj is not None and buffer.size <= matched_obj.size:
                 buffer.address = matched_obj.address
                 self.usage.append(buffer)
-                self.usage.remove(matched_obj)
+                # The parent stays in `usage` until its own end_time. It is still
+                # live for the handoff tick, and the child covers only the low
+                # `buffer.size` bytes of its slot, so the footprint above that is
+                # still holding the parent's data and is not free for anyone
+                # else. `_try_deallocate` drops the parent at the right tick.
+                self.reused_parents.add(in_place_opt)
                 return None
 
         # Decide where to allocate the block from
@@ -95,6 +129,30 @@ class GreedyLayoutSolver(MemoryPlanSolver):
         else:
             buffer.address = None
 
+    def _try_allocate(self, buffer: LifetimeBoundBuffer) -> None:
+        if buffer.address is not None or buffer.name in self.rejected_paired_buffers:
+            return
+
+        group = self.paired_group_by_name.get(buffer.name)
+        if group is None:
+            self._try_allocate_one(buffer)
+            return
+
+        # Keep each tentative member in usage so the next member sees its
+        # reservation. A failure restores the exact pre-group solver state.
+        previous_usage = list(self.usage)
+        previous_reused_parents = set(self.reused_parents)
+        for member in group:
+            self._try_allocate_one(member)
+            if member.address is not None:
+                continue
+            self.usage = previous_usage
+            self.reused_parents = previous_reused_parents
+            self.rejected_paired_buffers.update(item.name for item in group)
+            for item in group:
+                item.address = None
+            return
+
     def _try_deallocate(self, bufs: list[LifetimeBoundBuffer] | LifetimeBoundBuffer):
         if isinstance(bufs, LifetimeBoundBuffer):
             bufs = [bufs]
@@ -103,10 +161,8 @@ class GreedyLayoutSolver(MemoryPlanSolver):
             if buf in self.usage:
                 self.usage.remove(buf)
 
-    def plan_layout(
-        self, buffers: Sequence[LifetimeBoundBuffer], log_lx_usage: bool = False
-    ) -> list[LifetimeBoundBuffer]:
-        """Allocates addresses to the provided buffer list
+    def plan_layout(self, log_lx_usage: bool = False) -> list[LifetimeBoundBuffer]:
+        """Allocates addresses to :attr:`buffers`.
 
         Accepts a set of buffers with pre-defined sizes and lifetimes. These buffers are
         allocated addresses with 0 -> `limit` where the maximum starting address of
@@ -127,26 +183,48 @@ class GreedyLayoutSolver(MemoryPlanSolver):
                 allocations and find where gaps exceed current size. Allocate if
                 current gap is larger than current size + alignment.
 
-        Args:
-            buffers (list[LifetimeBoundBuffer]): The set of buffers to be planned.
-
         Returns:
             list[LifetimeBoundBuffer]: The supplied buffers with addresses assigned.
         """
+        buffers = self.buffers
         if not buffers:
             return []
         assert all(buf.address is None for buf in buffers), (
             "Buffers cannot be previously or partially planned"
         )
-        _assert_in_place_relationships(buffers)
+        _check_in_place_relationships(buffers)
 
         # Barred buffers keep address=None and never enter the time-stepping
         # loop, so they can neither be placed nor occupy space others need.
-        placeable, _ = self.partition(buffers)
+        placeable, _ = self.partition()
         if not placeable:
             return list(buffers)
 
         self.usage = []
+        self.reused_parents = set()
+        self.paired_group_by_name = {}
+        self.rejected_paired_buffers = set()
+        buffer_by_name = {buffer.name: buffer for buffer in buffers}
+        placeable_names = {buffer.name for buffer in placeable}
+        # paired_with lives only on the root; expand it so the first member
+        # encountered by the time walk triggers the complete group.
+        for root in buffers:
+            if not root.paired_with:
+                continue
+            group = (root, *root.paired_with)
+            assert len({member.name for member in group}) == len(group), (
+                f"paired-buffer group for {root.name} contains duplicates"
+            )
+            for member in group:
+                assert buffer_by_name.get(member.name) is member, (
+                    f"paired buffer {member.name} is not in this solve"
+                )
+                assert member.name not in self.paired_group_by_name, (
+                    f"buffer {member.name} belongs to multiple paired groups"
+                )
+                self.paired_group_by_name[member.name] = group
+            if any(member.name not in placeable_names for member in group):
+                self.rejected_paired_buffers.update(member.name for member in group)
 
         # Walk through all transition points in chronological order.
         # Include end_time + 1 so deallocation fires even when no other
