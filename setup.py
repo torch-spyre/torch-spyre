@@ -155,8 +155,6 @@ else:
             "or set the SPYRE_COMMS_INSTALL_DIR to the Spyre Comms install directory."
         )
 
-INCLUDE_DIRS += [os.environ["SEN_COMMON_HEADERS"]]
-
 use_new_system = os.environ.get("NEW_SYSTEM_SETUP", "0") == "1"
 if use_new_system:
     LIBRARIES = ["flex"]
@@ -177,6 +175,8 @@ if COMPILE_AIUPTI:  # Include kineto and libaiupti headers
         INCLUDE_DIRS += [LIBAIUPTI_DIR / "include"]
 
     LIBRARIES.insert(-1, "aiupti")  # Build dependency on flex
+
+INCLUDE_DIRS += [os.environ["SEN_COMMON_HEADERS"]]
 
 if use_spyre_ccl:
     LIBRARIES.append("spyre_comms")
