@@ -586,6 +586,72 @@ def test_lx_relayout_activation_policy_is_source_wide():
         assert lx_relayout_module._is_activation_source({"input": dep}, producer)
 
 
+def test_lx_relayout_planner_rejects_equal_projected_ownership():
+    m = Symbol("m")
+    source_view = PerCoreView(
+        ((1, 32),),
+        ((1, Mod(_CORE_ID, 32)),),
+    )
+    destination_view = PerCoreView(
+        ((0, 32),),
+        ((0, Mod(_CORE_ID, 32)),),
+    )
+    coordinates = [m, m]
+    source_work_division = work_division_from_view(source_view, coordinates, (m,))
+    destination_work_division = work_division_from_view(
+        destination_view, coordinates, (m,)
+    )
+    assert source_view != destination_view
+    assert source_work_division == destination_work_division
+
+    source_dep = SimpleNamespace(name="source", is_indirect=lambda: False)
+    producer = SimpleNamespace(
+        layout=SimpleNamespace(device_layout=SimpleNamespace()),
+        data=SimpleNamespace(),
+        get_name=lambda: "source",
+    )
+    consumer = SimpleNamespace(
+        layout=SimpleNamespace(),
+        data=SimpleNamespace(),
+        get_name=lambda: "consumer",
+    )
+    graph = SimpleNamespace(operations=[producer, consumer])
+
+    def read_writes(op):
+        if op is producer:
+            return SimpleNamespace(reads=[], writes=[source_dep])
+        return SimpleNamespace(reads=[source_dep], writes=[])
+
+    with (
+        mock_patch.object(lx_relayout_module, "MemoryDep", SimpleNamespace),
+        mock_patch.object(lx_relayout_module, "ComputedBuffer", SimpleNamespace),
+        mock_patch.object(lx_relayout_module, "FixedTiledLayout", SimpleNamespace),
+        mock_patch.object(lx_relayout_module, "Pointwise", SimpleNamespace),
+        mock_patch.object(
+            lx_relayout_module, "op_read_writes", side_effect=read_writes
+        ),
+        mock_patch.object(
+            lx_relayout_module,
+            "_per_core_view_on_buf",
+            side_effect=[
+                (source_view, False, True),
+                (destination_view, False, True),
+            ],
+        ),
+        mock_patch.object(lx_relayout_module, "_op_num_cores", return_value=32),
+        mock_patch.object(
+            lx_relayout_module, "try_device_coordinates", return_value=coordinates
+        ),
+        mock_patch.object(
+            lx_relayout_module, "iteration_space_from_op", return_value=(m,)
+        ),
+        mock_patch.object(
+            lx_relayout_module, "op_short_name", return_value="pointwise"
+        ),
+    ):
+        assert lx_relayout_module.collect_lx_relayout_plans(graph) == []
+
+
 def _compile_spec(spec, normalize=True):
     if normalize:
         simplify_op_spec(spec)

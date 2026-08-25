@@ -3925,15 +3925,16 @@ class TestGenerateBundleAffineLoopPath(unittest.TestCase):
         self._c_b = Symbol("c_b")
 
     def _bundle(self, specs, fake_compile):
-        with patch(
-            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
-            side_effect=fake_compile,
-        ):
-            generate_bundle(
-                "test_kernel",
-                self.tmpdir,
-                specs,
-            )
+        with config.patch({"sdsc_cache": False}):
+            with patch(
+                "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+                side_effect=fake_compile,
+            ):
+                generate_bundle(
+                    "test_kernel",
+                    self.tmpdir,
+                    specs,
+                )
         return _read_mlir(self.tmpdir)
 
     # --- Group 1: flat row-tiling ---
@@ -6031,16 +6032,17 @@ class TestGenerateBundleMlirSymbolicArgs(unittest.TestCase):
     def _bundle(self, specs, fake_compile=None, pool_size=0):
         if fake_compile is None:
             fake_compile = _fake_compile_op_spec
-        with patch(
-            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
-            side_effect=fake_compile,
-        ):
-            generate_bundle(
-                "test_kernel",
-                self.tmpdir,
-                specs,
-                pool_size=pool_size,
-            )
+        with config.patch({"sdsc_cache": False}):
+            with patch(
+                "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+                side_effect=fake_compile,
+            ):
+                generate_bundle(
+                    "test_kernel",
+                    self.tmpdir,
+                    specs,
+                    pool_size=pool_size,
+                )
         return _read_mlir(self.tmpdir)
 
     def _make_op_spec_with_hbm_args(self, name: str, arg_indices: list) -> OpSpec:
@@ -6494,15 +6496,16 @@ class TestSymbolKind(unittest.TestCase):
                 json1 = _make_tiled_json(idx, -(symbol_id_offset + 1))
                 return json1, [base + off], [{}], kinds
 
-        with patch(
-            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
-            side_effect=fake,
-        ):
-            generate_bundle(
-                "test_kernel",
-                self.tmpdir,
-                [a, b],
-            )
+        with config.patch({"sdsc_cache": False}):
+            with patch(
+                "torch_spyre._inductor.codegen.bundle.compile_op_spec",
+                side_effect=fake,
+            ):
+                generate_bundle(
+                    "test_kernel",
+                    self.tmpdir,
+                    [a, b],
+                )
         mlir = _read_mlir(self.tmpdir)
 
         # Only one input_arg param (the kernel base)

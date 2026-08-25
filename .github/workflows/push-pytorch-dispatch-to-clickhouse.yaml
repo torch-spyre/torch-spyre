@@ -108,6 +108,7 @@ jobs:
           echo "VIRTUAL_ENV $VIRTUAL_ENV"
 
       - name: Classify dispatch and ingest into ClickHouse
+        continue-on-error: true
         run: |
           source .venv/bin/activate
           python3 .github/scripts/ingest_pytorch_dispatch.py \
@@ -278,6 +279,7 @@ jobs:
 
       - name: Record gate rejection in ClickHouse
         if: steps.extract.outputs.should_build == 'false'
+        continue-on-error: true
         run: |
           uv run --with clickhouse-connect --with regex \
             .github/scripts/ingest_pytorch_dispatch.py \

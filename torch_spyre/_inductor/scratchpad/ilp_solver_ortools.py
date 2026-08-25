@@ -34,7 +34,7 @@ constraint model over :class:`CoreDivisionBuffer`s:
   encoded by *shortening the child's lifetime* by the single handoff tick when
   the merge fires, so the parent and its in-place child abut in time and may
   legally share an offset; the single-tick-overlap invariant
-  (``_assert_in_place_relationships``) makes this exact. The parent keeps its
+  (``_check_in_place_relationships``) makes this exact. The parent keeps its
   full lifetime, so the footprint above a smaller child stays protected on the
   handoff tick (``_add_no_overlap_2d``).
 * **Objective** (two-phase lexicographic, in ``_run``). *Residency is the hard
@@ -99,7 +99,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     LifetimeBoundBuffer,
     SolveError,
     BufferType,
-    _assert_in_place_relationships,
+    _check_in_place_relationships,
 )
 
 __all__ = ["CpSatLayoutSolver"]
@@ -234,7 +234,7 @@ class _LifetimeBufferWithCpVars(Generic[_BufT]):
 
     def constrain_merge(self, model, parent: "_LifetimeBufferWithCpVars", edge) -> None:
         """Extra conditions on an active in-place merge. None when the division
-        is fixed: ``_assert_in_place_relationships`` already checks the child
+        is fixed: ``_check_in_place_relationships`` already checks the child
         fits in the parent's slot."""
 
     # ------------------------------- extract -------------------------------
@@ -407,7 +407,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             "Buffers cannot be previously or partially planned"
         )
 
-        _assert_in_place_relationships(buffers)
+        _check_in_place_relationships(buffers)
 
         # Declarative exclusion, shared with every other solver: whatever the
         # allocator barred (each buffer's ``residency_reason``), plus the
@@ -526,7 +526,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         parent->child edge gets a merge bool that, when active, pins the pair to
         one shared base. Rather than lifting a pairwise no-overlap, an active
         merge *shortens the child's lifetime by the single handoff tick* it
-        shares with the parent (``_assert_in_place_relationships`` guarantees the
+        shares with the parent (``_check_in_place_relationships`` guarantees the
         overlap is exactly that one tick): the two then become time-adjacent
         rectangles that may legally sit at the same offset under the global 2D
         no-overlap (see ``_add_no_overlap_2d``). Chains are induced transitively

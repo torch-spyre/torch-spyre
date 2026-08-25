@@ -38,13 +38,13 @@ from .constants import (
     SPYRE_FP32_OPS,
     BATCH_MATMUL_OP,
     BATCH_MATMUL_FP8_OP,
-    CONV2D_FWD_OP,
     CONV_OPS,
+    DEPTHWISE_CONV_REDUCTION_OPS,
     IDENTITY_OP,
     POOL_OPS,
     RESTICKIFY_OP,
     SEGMENT_OFFSETS,
-    DEPTHWISE_CONV2D_OP,
+    TWO_INPUT_REDUCTION_OPS,
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
 from . import config as _spyre_config
@@ -965,23 +965,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
             debug_handle = None
 
-        if not is_reduction and op != "ReStickifyOpHBM" and not indirect_var_names:
-            stick_vars = {
-                next(iter(arg.device_coordinates[-1].free_symbols))
-                for arg in args
-                if arg.device_coordinates and arg.device_coordinates[-1].free_symbols
-            }
-            assert len(stick_vars) <= 1, (
-                f"create_op_spec: stick mismatch for op={op!r} "
-                f"ir_chain={getattr(debug_handle, 'ir_chain', '?')}: "
-                f"args have different stick loop variables: "
-                + ", ".join(
-                    str(arg.device_coordinates[-1])
-                    for arg in args
-                    if arg.device_coordinates
-                )
-            )
-
         # Carry the node's full logical output ranges (NCHW, incl. unit dims)
         # so codegen can derive surviving dim roles and the channel count from
         # live IR instead of a lowering-time size snapshot.  Store raw ranges
@@ -1211,7 +1194,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
             )
 
-        if value.op in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP, CONV2D_FWD_OP]:
+        if value.op in TWO_INPUT_REDUCTION_OPS:
             # Two-input reductions: matmul (activation @ weight) and conv2d
             # (activation * weight, reduced over in/ki/kj). Both build
             # [input, weight, output] tensor args.
@@ -1229,7 +1212,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 self.create_tensor_arg(False, real_dst_name, dst),
             ]
             self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
-        elif value.op == DEPTHWISE_CONV2D_OP:
+        elif value.op in DEPTHWISE_CONV_REDUCTION_OPS:
             if (
                 len(value.arguments) < 2
                 or (not isinstance(value.arguments[0], TensorAccess))

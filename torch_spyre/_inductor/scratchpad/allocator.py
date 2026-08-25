@@ -764,7 +764,7 @@ class ScratchpadAllocator:
         - matching device layout (so the storage can alias);
         - single handoff tick (``parent_end == child_start``: the same op that reads
           the parent as its last use writes the child), the invariant the solvers'
-          in-place relaxation relies on (see ``_assert_in_place_relationships``);
+          in-place relaxation relies on (see ``_check_in_place_relationships``);
         - matching per-core footprint and no core-division mismatch on the child.
 
         With ``division_invariant`` the last condition (per-core size + core-div) is
@@ -1723,7 +1723,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             for input_buf in info["op_inputs"]:
                 # Graph inputs / constants now appear in ``op_inputs`` but are not
                 # solver buffers, so they can't be in-place aliasing parents (the
-                # solver's ``_assert_in_place_relationships`` would fail to resolve
+                # solver's ``_check_in_place_relationships`` would fail to resolve
                 # them). Skip them, matching the base allocator's guard.
                 if input_buf not in mem_usage or not lifetimes[input_buf]:
                     continue

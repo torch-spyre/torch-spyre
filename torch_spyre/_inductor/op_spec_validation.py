@@ -29,67 +29,69 @@ Invariants checked:
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Sequence
+import functools
+import inspect
+import textwrap
 
 import regex
 import sympy
 
+from . import constants
+from .dtype_ops import DtypeOpTable
 from .logging_utils import get_inductor_logger
 from .op_spec import IndirectAccess, LoopSpec, OpSpec, TensorArg, UnimplementedOp
 
 logger = get_inductor_logger("op_spec_validation")
 
-# Known op names from SpyreOpFuncs and special ops
-MATMUL_OPS = frozenset({"matmul", "batchmatmul", "batchmatmulfp8"})
 
-REDUCTION_OPS = frozenset({"sum", "mean", "max", "min", "topkvalue", "topkindex"})
+@functools.lru_cache(maxsize=1)
+def _pointwise_ops() -> frozenset[str]:
+    """Op names produced by SpyreOpFuncs's static methods.
 
-POINTWISE_OPS = frozenset(
-    {
-        "abs",
-        "add",
-        "clip",
-        "equal",
-        "exp",
-        "floor",
-        "greaterequal",
-        "greaterthan",
-        "gelufwd",
-        "layernormnorm",
-        "layernormscale",
-        "lesserequal",
-        "lesserthan",
-        "log",
-        "maximum",
-        "minimum",
-        "mul",
-        "notequal",
-        "neg",
-        "reciprocal",
-        "qfp8ch",
-        "relufwd",
-        "rsqrt",
-        "sigmoid",
-        "softplus",
-        "sqrt",
-        "sub",
-        "tanh",
-        "realdiv",
-        "silu",
-        "where3",
-    }
-)
+    Statically extracts the literal op-name argument from each method's
+    ``return PointwiseOp("name", ...)`` statement(s), rather than calling the
+    methods (which would require guessing each method's call signature,
+    including varargs like ``layernormnorm`` and keyword args like
+    ``softplus``). Methods whose op name is computed rather than a literal
+    (e.g. ``to_dtype``, resolved via DtypeOpTable) contribute no literal and
+    are correctly excluded -- those are dtype-cast ops, not pointwise ops.
 
-DTYPE_OPS = frozenset(
-    {
-        "identity",
-        "dl16tofp32",
-        "fp32todl16",
-        "fp8todl16",
-    }
-)
+    Imported and evaluated lazily (rather than at module load) because
+    spyre_kernel imports validate_op_specs from this module, so resolving
+    SpyreOpFuncs at op_spec_validation's own import time would be circular.
+    """
+    from .spyre_kernel import SpyreOpFuncs
 
-SPECIAL_OPS = frozenset({"ReStickifyOpHBM"})
+    tree = ast.parse(textwrap.dedent(inspect.getsource(SpyreOpFuncs)))
+    (class_node,) = tree.body
+    names: set[str] = set()
+    for node in ast.walk(class_node):
+        if not isinstance(node, ast.Return) or node.value is None:
+            continue
+        call = node.value
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "PointwiseOp"
+            and call.args
+            and isinstance(call.args[0], ast.Constant)
+            and isinstance(call.args[0].value, str)
+        ):
+            names.add(call.args[0].value)
+    return frozenset(names)
+
+
+# Known op names, derived by inspecting the modules that actually define
+# them so this file cannot silently drift out of sync as ops are added.
+MATMUL_OPS = constants.MATMUL_REDUCTION_OPS
+
+REDUCTION_OPS = constants.SINGLE_INPUT_REDUCTION_OPS
+
+DTYPE_OPS = DtypeOpTable.op_names()
+
+SPECIAL_OPS = frozenset({constants.RESTICKIFY_OP})
 
 BINARY_OPS = frozenset(
     {
@@ -108,7 +110,27 @@ BINARY_OPS = frozenset(
     }
 )
 
-ALL_KNOWN_OPS = MATMUL_OPS | REDUCTION_OPS | POINTWISE_OPS | DTYPE_OPS | SPECIAL_OPS
+
+@functools.lru_cache(maxsize=1)
+def _all_known_ops() -> frozenset[str]:
+    return MATMUL_OPS | REDUCTION_OPS | _pointwise_ops() | DTYPE_OPS | SPECIAL_OPS
+
+
+def __getattr__(name: str):
+    # POINTWISE_OPS/ALL_KNOWN_OPS are computed lazily (see _pointwise_ops) to
+    # avoid a circular import with spyre_kernel, but are still exposed as
+    # plain module attributes for callers/tests via PEP 562.
+    if name == "POINTWISE_OPS":
+        return _pointwise_ops()
+    if name == "ALL_KNOWN_OPS":
+        return _all_known_ops()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+NORM_OPS = frozenset({"exx2"})
+TOPK_OPS = frozenset(constants.TOPK_OPS)
+
+STICK_STAGE = "after_simplification"
 
 VALID_ALLOCATION_KEYS = frozenset({"hbm", "lx", "hbm_pool"})
 
@@ -213,6 +235,7 @@ def _validate_op_spec(op_spec: OpSpec, stage: str, loop_depth: int) -> None:
     _check_args(op_spec, stage)
     _check_symbol_consistency(op_spec, stage)
     _check_tiled_symbols(op_spec, stage, loop_depth)
+    _check_stick_constraints(op_spec, stage)
     _check_op_specific_constraints(op_spec, stage)
 
 
@@ -253,7 +276,7 @@ def _check_mandatory_fields(op_spec: OpSpec, stage: str) -> None:
 
 def _check_op_name(op_spec: OpSpec, stage: str) -> None:
     """OS-2: Op name should be a known operation."""
-    if op_spec.op not in ALL_KNOWN_OPS:
+    if op_spec.op not in _all_known_ops():
         logger.warning(
             "Unknown op name %r in OpSpec at stage %s. "
             "This may be valid for new ops not yet registered.",
@@ -363,7 +386,7 @@ def _check_args(op_spec: OpSpec, stage: str) -> None:
 
         _check_allocation(op_spec, arg, i, stage)
 
-    if not has_output and op_spec.op in ALL_KNOWN_OPS:
+    if not has_output and op_spec.op in _all_known_ops():
         raise OpSpecValidationError(
             op_spec,
             "OpSpec must have at least one output TensorArg (is_input=False)",
@@ -492,6 +515,269 @@ def _check_tiled_symbols(op_spec: OpSpec, stage: str, loop_depth: int) -> None:
             )
 
 
+def _arg_free_syms(arg: TensorArg) -> set[sympy.Symbol]:
+    syms: set[sympy.Symbol] = set()
+    for coord in arg.device_coordinates:
+        if isinstance(coord, sympy.Expr):
+            syms.update(coord.free_symbols)
+    return syms
+
+
+def _arg_stick_syms(arg: TensorArg) -> set[sympy.Symbol]:
+    if not arg.device_coordinates:
+        return set()
+    return arg.device_coordinates[-1].free_symbols
+
+
+def _indirect_index_tensor_names(op_spec: OpSpec) -> set[str]:
+    """Return names of index tensors referenced via IndirectAccess in any arg's coords.
+
+    At after_simplification, indirect symbols have been replaced with
+    IndirectAccess(tensor_name).  The index tensor is the arg whose name
+    appears as the argument to IndirectAccess in another arg's coordinates.
+    """
+    names: set[str] = set()
+    for arg in op_spec.args:
+        for coord in arg.device_coordinates:
+            if isinstance(coord, sympy.Expr):
+                for node in sympy.preorder_traversal(coord):
+                    if isinstance(node, IndirectAccess):
+                        names.add(str(node.args[0]))
+    return names
+
+
+def _check_stick_constraints(op_spec: OpSpec, stage: str) -> None:
+    """Verify stick constraints for all op classes.
+
+    Only runs after IndirectAccess substitution (after_simplification and
+    later) so that index tensors are identifiable and excluded.
+    """
+    if stage != STICK_STAGE:
+        return
+
+    op = op_spec.op
+
+    if op in MATMUL_OPS:
+        _check_stick_matmul(op_spec, stage)
+    elif op in NORM_OPS:
+        _check_stick_norm(op_spec, stage)
+    elif op in TOPK_OPS:
+        _check_stick_topk(op_spec, stage)
+    elif op == constants.RESTICKIFY_OP:
+        _check_stick_restickify(op_spec, stage)
+    elif op in _pointwise_ops() | DTYPE_OPS | REDUCTION_OPS:
+        # avgpoolfwd is in REDUCTION_OPS but its full constraint (window dims
+        # must not appear in the stick) is deferred — _check_stick_all_same
+        # only catches the case where different args have different sticks.
+        _check_stick_all_same(op_spec, stage)
+
+
+def _check_stick_all_same(op_spec: OpSpec, stage: str) -> None:
+    """All non-index-tensor args must share the same stick symbol.
+
+    Used for pointwise, dtype-cast, and non-topk/norm reduction ops.
+    """
+    index_tensor_names = _indirect_index_tensor_names(op_spec)
+    stick_vars: set[sympy.Symbol] = set()
+    for arg in op_spec.args:
+        # Gather index args have arg.name set at creation (opspec_name= in
+        # create_tensor_arg); args without a name are never index tensors.
+        if arg.name is not None and arg.name in index_tensor_names:
+            continue
+        syms = _arg_stick_syms(arg)
+        if syms:
+            stick_vars.add(next(iter(syms)))
+
+    if len(stick_vars) > 1:
+        coords_str = ", ".join(
+            str(arg.device_coordinates[-1])
+            for arg in op_spec.args
+            if arg.device_coordinates
+        )
+        raise OpSpecValidationError(
+            op_spec,
+            "args have different stick loop variables",
+            f"stick symbols={stick_vars!r}; stick coordinates: {coords_str}",
+            stage,
+        )
+
+
+def _check_stick_restickify(op_spec: OpSpec, stage: str) -> None:
+    """ReStickifyOpHBM: input and output must have different stick symbols."""
+    stick_vars: set[sympy.Symbol] = set()
+    for arg in op_spec.args:
+        syms = _arg_stick_syms(arg)
+        if syms:
+            stick_vars.add(next(iter(syms)))
+
+    if len(stick_vars) < 2:
+        coords_str = ", ".join(
+            str(arg.device_coordinates[-1])
+            for arg in op_spec.args
+            if arg.device_coordinates
+        )
+        raise OpSpecValidationError(
+            op_spec,
+            "ReStickifyOpHBM input and output must have different stick loop variables",
+            f"stick symbols={stick_vars!r}; stick coordinates: {coords_str}",
+            stage,
+        )
+
+
+def _check_stick_norm(op_spec: OpSpec, stage: str) -> None:
+    """exx2: the input stick symbol must be the reduction (normalization) symbol.
+
+    The reduction symbol is the free symbol present in input coords but absent
+    from output coords.
+    """
+    input_syms: set[sympy.Symbol] = set()
+    for arg in op_spec.args:
+        if arg.is_input:
+            input_syms.update(_arg_free_syms(arg))
+
+    output_syms: set[sympy.Symbol] = set()
+    for arg in op_spec.args:
+        if not arg.is_input:
+            output_syms.update(_arg_free_syms(arg))
+
+    reduction_syms = input_syms - output_syms
+    if not reduction_syms:
+        return
+
+    stick_syms: set[sympy.Symbol] = set()
+    for arg in op_spec.args:
+        if arg.is_input:
+            stick_syms.update(_arg_stick_syms(arg))
+
+    if not stick_syms & reduction_syms:
+        raise OpSpecValidationError(
+            op_spec,
+            f"{op_spec.op} stick symbol must be the reduction (normalization) symbol",
+            f"stick symbols={stick_syms!r}, reduction symbols={reduction_syms!r}",
+            stage,
+        )
+
+
+def _check_stick_topk(op_spec: OpSpec, stage: str) -> None:
+    """topkvalue/topkindex: neither the reduction dim nor the k dim may be in the stick.
+
+    reduction_sym = in input coords, absent from output coords.
+    k_sym         = in output coords, absent from input coords (the kept-k axis).
+    Any surviving dimension is allowed in the stick.
+    """
+    input_syms: set[sympy.Symbol] = set()
+    for arg in op_spec.args:
+        if arg.is_input:
+            input_syms.update(_arg_free_syms(arg))
+
+    output_syms: set[sympy.Symbol] = set()
+    for arg in op_spec.args:
+        if not arg.is_input:
+            output_syms.update(_arg_free_syms(arg))
+
+    forbidden_syms = (input_syms - output_syms) | (output_syms - input_syms)
+    if not forbidden_syms:
+        return
+
+    stick_syms: set[sympy.Symbol] = set()
+    for arg in op_spec.args:
+        stick_syms.update(_arg_stick_syms(arg))
+
+    bad_syms = stick_syms & forbidden_syms
+    if bad_syms:
+        reduction_syms = input_syms - output_syms
+        k_syms = output_syms - input_syms
+        parts = []
+        if bad_syms & reduction_syms:
+            parts.append(f"reduction symbols {bad_syms & reduction_syms!r}")
+        if bad_syms & k_syms:
+            parts.append(f"k symbols {bad_syms & k_syms!r}")
+        raise OpSpecValidationError(
+            op_spec,
+            f"{op_spec.op} stick must not contain the reduction or k dimension",
+            f"stick contains {' and '.join(parts)}; "
+            f"stick symbols={stick_syms!r}, forbidden={forbidden_syms!r}",
+            stage,
+        )
+
+
+def _check_stick_matmul(op_spec: OpSpec, stage: str) -> None:
+    """batchmatmul/batchmatmulfp8: verify Input1/Input2/Output stick roles.
+
+    Dimension roles identified by set arithmetic on coord free symbols:
+      reduction_sym: in Input1 and Input2, absent from Output
+      generated_sym: in Input2 and Output, absent from Input1
+
+    Input2 (y) is the input whose symbols overlap with the output but not the
+    other input. Returns early if the two inputs cannot be distinguished
+    (symmetric arg symbols — degenerate case).
+
+    Required stick (innermost coord free symbol):
+      Input1: reduction_sym  (all dtypes — for FP8/INT8/INT4 multi-dim sticks
+                               the innermost element is still reduction_sym)
+      Input2: generated_sym  (all dtypes — innermost element is generated_sym)
+      Output: generated_sym  (always DF16)
+    """
+    inputs = [a for a in op_spec.args if a.is_input]
+    outputs = [a for a in op_spec.args if not a.is_input]
+
+    if len(inputs) < 2 or len(outputs) < 1:
+        return
+
+    out_syms: set[sympy.Symbol] = set()
+    for arg in outputs:
+        out_syms.update(_arg_free_syms(arg))
+
+    a_syms = _arg_free_syms(inputs[0])
+    b_syms = _arg_free_syms(inputs[1])
+
+    gen_from_b = (b_syms & out_syms) - a_syms
+    gen_from_a = (a_syms & out_syms) - b_syms
+
+    if gen_from_b:
+        x_arg, y_arg = inputs[0], inputs[1]
+        generated_sym = next(iter(gen_from_b))
+    elif gen_from_a:
+        x_arg, y_arg = inputs[1], inputs[0]
+        generated_sym = next(iter(gen_from_a))
+    else:
+        return
+
+    reduction_syms = _arg_free_syms(x_arg) - out_syms
+    if not reduction_syms:
+        return
+    reduction_sym = next(iter(reduction_syms))
+
+    out_stick: set[sympy.Symbol] = set()
+    for arg in outputs:
+        out_stick.update(_arg_stick_syms(arg))
+
+    errors = []
+    if reduction_sym not in _arg_stick_syms(x_arg):
+        errors.append(
+            f"Input1 stick must contain reduction_sym={reduction_sym!r}; "
+            f"got {_arg_stick_syms(x_arg)!r}"
+        )
+    if generated_sym not in _arg_stick_syms(y_arg):
+        errors.append(
+            f"Input2 stick must contain generated_sym={generated_sym!r}; "
+            f"got {_arg_stick_syms(y_arg)!r}"
+        )
+    if generated_sym not in out_stick:
+        errors.append(
+            f"Output stick must contain generated_sym={generated_sym!r}; "
+            f"got {out_stick!r}"
+        )
+
+    if errors:
+        raise OpSpecValidationError(
+            op_spec,
+            f"{op_spec.op} stick constraint violated",
+            "; ".join(errors),
+            stage,
+        )
+
+
 def _check_op_specific_constraints(op_spec: OpSpec, stage: str) -> None:
     """OS-7: Op-specific constraints on arg counts and is_reduction."""
     op = op_spec.op
@@ -529,7 +815,7 @@ def _check_op_specific_constraints(op_spec: OpSpec, stage: str) -> None:
             stage,
         )
 
-    if op in POINTWISE_OPS and op_spec.is_reduction:
+    if op in _pointwise_ops() and op_spec.is_reduction:
         raise OpSpecValidationError(
             op_spec,
             f"pointwise op {op!r} must have is_reduction=False",
