@@ -210,20 +210,27 @@ def _remap_result(result, lookup):
 def _check_same_device(operands):
     """Raise if tensor ``(value, is_write)`` operands span more than one device,
     exempting a single non-write 0-dim CPU tensor (mirrors TensorIterator's ``allow_cpu_scalars_``
-    unlike ``fallbacks._ensure_device``, which moves tensors instead of rejecting)."""
+    unlike ``fallbacks._ensure_device``, which moves tensors instead of rejecting).
+
+    Returns ``(mandatory_device, exempted_tensor)``: the device every
+    non-exempt operand agreed on (``None`` if there were none), and the
+    exempted CPU scalar tensor if one was found (``None`` otherwise) -- the
+    caller must still materialize it onto ``mandatory_device`` before handing
+    it to a standalone-compiled kernel, which cannot accept a raw CPU input.
+    """
     mandatory_device = None
-    scalar_exempted = False
+    exempted = None
 
     def visit(x, is_write):
-        nonlocal mandatory_device, scalar_exempted
+        nonlocal mandatory_device, exempted
         if isinstance(x, torch.Tensor):
             if (
                 not is_write
-                and not scalar_exempted
+                and exempted is None
                 and x.device.type == "cpu"
                 and x.dim() == 0
             ):
-                scalar_exempted = True
+                exempted = x
                 return
             if mandatory_device is None:
                 mandatory_device = x.device
@@ -239,6 +246,17 @@ def _check_same_device(operands):
 
     for value, is_write in operands:
         visit(value, is_write)
+
+    return mandatory_device, exempted
+
+
+def _replace_tensor(x, old, new):
+    """Substitute ``old`` for ``new`` by identity, recursing into list/tuple."""
+    if x is old:
+        return new
+    if isinstance(x, (list, tuple)):
+        return type(x)(_replace_tensor(e, old, new) for e in x)
+    return x
 
 
 def _make_offset_safe_dispatch(op):
@@ -262,10 +280,17 @@ def _make_offset_safe_dispatch(op):
     normalize_results = not (write_positions or write_names)
 
     def dispatch(*args, compiled=None, **kwargs):
-        _check_same_device(
+        device, exempted = _check_same_device(
             [(a, i in write_positions) for i, a in enumerate(args)]
             + [(v, k in write_names) for k, v in kwargs.items()]
         )
+        if exempted is not None:
+            # The compiled kernel only accepts spyre-device inputs -- move the
+            # exempted CPU scalar over rather than leaving it for Inductor,
+            # which has no notion of a live CPU graph input.
+            moved = exempted.to(device)
+            args = tuple(_replace_tensor(a, exempted, moved) for a in args)
+            kwargs = {k: _replace_tensor(v, exempted, moved) for k, v in kwargs.items()}
         write_back = []  # (clone, original) for each substituted write view
 
         def prep_write(x):
