@@ -23,13 +23,18 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest import TestCase
 
 from torch_spyre._inductor import config
-from torch_spyre._inductor.scratchpad.allocator import _lx_planning_size
+from torch_spyre._inductor.scratchpad.allocator import (
+    CoOptimizingAllocator,
+    _lx_planning_size,
+)
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionLayoutSolver,
     MemoryPlanSolver,
     CoreDivision,
     CoreDivisionBuffer,
     LifetimeBoundBuffer,
+    TileAxis,
+    TileSpec,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 
@@ -1477,6 +1482,118 @@ class TestTopologicalSort(TestCase):
             self._names([root, mid, a, b], lambda buf: -buf.size),
             ["root", "mid", "b", "a"],
         )
+
+
+def _ftl_pointwise(shape, name="buf0", dtype=None):
+    """A device-free ComputedBuffer(Pointwise) with a FixedTiledLayout."""
+    import sympy
+    import torch
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise
+    from torch._inductor.dependencies import MemoryDep
+    from torch_spyre._C import SpyreTensorLayout
+    from torch_spyre._inductor.ir import FixedTiledLayout
+
+    if dtype is None:
+        dtype = torch.float16
+    size = list(shape)
+    stride = [int(s) for s in FlexibleLayout.contiguous_strides(size)]
+    within_stick = len(size) - 1
+    dim_order = [i for i in range(len(size)) if i != within_stick] + [within_stick]
+    dev = SpyreTensorLayout([int(s) for s in size], stride, dtype, dim_order)
+    layout = FixedTiledLayout("spyre:0", dtype, size, stride, dev)
+    data = MagicMock(spec=Pointwise)
+    data.ranges = list(size)
+    op = ComputedBuffer(name=name, layout=layout, data=data)
+    op.operation_name = name
+    syms = sympy.symbols(" ".join(f"d{i}" for i in range(len(shape))))
+    if not isinstance(syms, tuple):
+        syms = (syms,)
+    index = sum(s * int(st) for s, st in zip(syms, stride))
+    op.get_read_writes = MagicMock(
+        return_value=SimpleNamespace(
+            reads=set(), writes={MemoryDep(name, index, syms, tuple(shape))}
+        )
+    )
+    return op
+
+
+class TestTilingAwareViews(TestCase):
+    """R2.6 -- the per-core view prep is keyed by tiling; two candidates that
+    differ only in tiling must never share a prep entry (the central stage-4
+    risk: a wrong view would grant residency on a slicing agreement that does
+    not hold)."""
+
+    def _write_dep(self, op):
+        return next(iter(op.get_read_writes().writes))
+
+    def test_prepare_per_core_view_accepts_buf_layout_override(self):
+        from torch_spyre._inductor.pass_utils import _prepare_per_core_view
+        from torch_spyre._inductor.wsr.tile_prediction import predict_frame
+
+        op = _ftl_pointwise((512, 256, 128))
+        frame = predict_frame(op, TileSpec((TileAxis(0, 4),)))
+        # A tiling-aware caller supplies the predicted (tiled) layout directly,
+        # never touching V.graph -- the committed layout is still untiled.
+        prep = _prepare_per_core_view(
+            op,
+            self._write_dep(op),
+            op.get_name(),
+            parts=frame.view_parts(),
+            buf_layout=frame.layout,
+        )
+        self.assertIsNotNone(prep)
+
+    def test_different_tilings_do_not_share_prep(self):
+        op = _ftl_pointwise((512, 256, 128))
+        dep = self._write_dep(op)
+        t1 = TileSpec((TileAxis(0, 2),))
+        t2 = TileSpec((TileAxis(0, 4),))
+        divs = [
+            CoreDivision(output_splits={0: 1}, tiling=t1),
+            CoreDivision(output_splits={0: 1}, tiling=t2),
+        ]
+        prep_cache: dict = {}
+        CoOptimizingAllocator._views_for_divs(op, dep, op.get_name(), divs, prep_cache)
+        # Two distinct cache entries, keyed by the differing tiling.
+        self.assertEqual(len(prep_cache), 2)
+        self.assertEqual({k[3] for k in prep_cache}, {t1, t2})
+
+    def test_same_tiling_shares_prep_across_splits(self):
+        # The prep is candidate-invariant *within* a tiling: two candidates with
+        # the same tiling but different core splits reuse one prep entry.
+        op = _ftl_pointwise((512, 256, 128))
+        dep = self._write_dep(op)
+        t = TileSpec((TileAxis(0, 4),))
+        divs = [
+            CoreDivision(output_splits={0: 1}, tiling=t),
+            CoreDivision(output_splits={0: 2}, tiling=t),
+        ]
+        prep_cache: dict = {}
+        CoOptimizingAllocator._views_for_divs(op, dep, op.get_name(), divs, prep_cache)
+        self.assertEqual(len(prep_cache), 1)
+
+    def test_untiled_candidate_key_carries_empty_spec(self):
+        # With auto_coarse_tiling off, every candidate is untiled and the key's
+        # tiling slot is the empty spec -- inert, one entry.
+        op = _ftl_pointwise((512, 256, 128))
+        dep = self._write_dep(op)
+        divs = [CoreDivision(output_splits={0: 1}), CoreDivision(output_splits={0: 2})]
+        prep_cache: dict = {}
+        # Untiled candidates read the committed layout via V.graph; register op.
+        from torch import fx
+        from torch._inductor.graph import GraphLowering
+        from torch._inductor.virtualized import V
+
+        gm = fx.symbolic_trace(lambda: None)
+        with V.set_graph_handler(GraphLowering(gm)) as _:
+            V.graph.name_to_buffer[op.get_name()] = op
+            CoOptimizingAllocator._views_for_divs(
+                op, dep, op.get_name(), divs, prep_cache
+            )
+        self.assertEqual(len(prep_cache), 1)
+        self.assertEqual(next(iter(prep_cache))[3], TileSpec())
 
 
 if __name__ == "__main__":

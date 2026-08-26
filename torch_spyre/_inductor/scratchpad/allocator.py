@@ -2144,15 +2144,20 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         via ``_per_core_view_from_prep``, so cost scales with the op rather than
         its candidate count.
 
-        ``prep_cache`` is keyed by ``(op name, dep, buf_name)``: a producer's
-        write-dep and a consumer's read-dep on the same buffer can be equal
-        ``MemoryDep``s, so the op name keeps their preps distinct while a parent
-        read by several consumers reuses its write-view prep.
+        ``prep_cache`` is keyed by ``(op name, dep, buf_name, tiling)``: a
+        producer's write-dep and a consumer's read-dep on the same buffer can be
+        equal ``MemoryDep``s, so the op name keeps their preps distinct while a
+        parent read by several consumers reuses its write-view prep. The tiling
+        is part of the key because a candidate's per-core view is taken on its
+        *tiled* frame -- two candidates differing only in tiling see different
+        divided ranges and a different resized layout, so they must not share a
+        prep (R2.6). With ``auto_coarse_tiling`` off every ``cd.tiling`` is the
+        empty spec and the key is unchanged in effect.
         """
-        key = (op.get_name(), dep, buf_name)
         out = []
         for cd in divs:
             coeff = (cd.output_splits, cd.reduction_splits)
+            key = (op.get_name(), dep, buf_name, cd.tiling)
             # Build the op-level prep once per key, on first sight, regardless
             # of whether this candidate splits. ``_per_core_view_from_prep``
             # still short-circuits to the whole-buffer view for a no-split
@@ -2160,9 +2165,32 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # distinct from a genuine ``None`` prep, so a later candidate (or a
             # cache reuse) can't silently get a stale/``None`` view.
             if key not in prep_cache:
-                prep_cache[key] = _prepare_per_core_view(op, dep, buf_name)
+                prep_cache[key] = CoOptimizingAllocator._prep_for_candidate(
+                    op, dep, buf_name, cd
+                )
             out.append(_per_core_view_from_prep(prep_cache[key], coeff))
         return out
+
+    @staticmethod
+    def _prep_for_candidate(op, dep, buf_name, cd):
+        """The ``_prepare_per_core_view`` prep for one candidate.
+
+        Untiled: the committed layout, exactly as before. Tiled: the *predicted*
+        per-tile frame (``wsr.tile_prediction.predict_frame``) supplies the
+        divided iteration space, rescaled indices, and -- when ``buf_name`` is the
+        op's own output -- the resized layout, since the committed layout is
+        still untiled at solve time. Imported lazily so the solver-facing modules
+        stay free of the predictor.
+        """
+        if cd.tiling.is_untiled:
+            return _prepare_per_core_view(op, dep, buf_name)
+        from torch_spyre._inductor.wsr.tile_prediction import predict_frame
+
+        frame = predict_frame(op, cd.tiling)
+        override = frame.layout if buf_name == op.get_name() else None
+        return _prepare_per_core_view(
+            op, dep, buf_name, parts=frame.view_parts(), buf_layout=override
+        )
 
 
 def _make_cpsat_solver(
