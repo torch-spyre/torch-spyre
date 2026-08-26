@@ -1,0 +1,155 @@
+name: Profiler build (USE_SPYRE_PROFILER)
+
+# ---------------------------------------------------------------------------
+# Profiler-enabled CI build for #1857.
+#
+# Builds torch-spyre with USE_SPYRE_PROFILER=1 + the kineto-spyre wheel and
+# runs the existing "Test Spyre Profiler" suite so its requires_spyre_profiler
+# tests EXECUTE instead of skipping (tests/conftest.py:494-505).
+#
+# STATUS: scaffold, BLOCKED on #927 (the USE_SPYRE_PROFILER build flag does not
+# exist yet). The profiler job is intentionally NON-BLOCKING (continue-on-error)
+# until #927 merges and the kineto wheel source is wired in (see TODOs below).
+# To make it blocking later: remove `continue-on-error: true` and add this job
+# to the required status checks in branch protection.
+#
+# OPEN COORDINATION ITEM: the kineto-spyre wheel source is not yet decided
+# (Artifactory / pre-baked image / GitHub release). See docs/ci_profiler_build_plan.md
+# and issues #1857 / #927. The "Install kineto-spyre wheel" step below is a
+# placeholder until the CI/CD team provides the location.
+#
+# EXPECTED RESULT: until #927 merges and the wheel source is wired, this job is
+# expected to be RED (absorbed by continue-on-error) — that is intentional.
+# ---------------------------------------------------------------------------
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: Runner label appended to the fixed labels (e.g. linux)
+        required: true
+        type: string
+      image_label:
+        description: Image scaleSetLabel to select
+        required: false
+        type: string
+        default: image_spyre_backend
+  pull_request:
+    paths:
+      - torch_spyre/profiler/**
+      - torch_spyre/csrc/profiler/**
+      - tests/profiler/**
+      - tests/configs/**/*profiler*
+      - .github/workflows/profiler_build.yaml
+  schedule:
+    # Nightly profiler build (02:30 UTC), independent of PR traffic.
+    - cron: 30 2 * * *
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test_profiler:
+    name: Test Spyre Profiler (USE_SPYRE_PROFILER=1)
+    # NON-BLOCKING until #927 lands; remove to make this a required check.
+    continue-on-error: true
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - ${{ inputs.runner_label || 'linux' }}
+      - ${{ inputs.image_label || 'image_spyre_backend' }}
+    timeout-minutes: 60
+    env:
+      # GitHub Actions sets CI=true which breaks pytest inductor tests.
+      CI: ''
+      # The flag under test (#927). NOTE: setting this as env is NOT sufficient
+      # on its own — build-torch-spyre runs `uv sync --frozen` with no
+      # --reinstall-package, so an env-only change does not recompile the
+      # editable C++ extension. The explicit forced-rebuild step below is what
+      # actually makes the flag take effect. See #1857 (rebuild risk).
+      USE_SPYRE_PROFILER: '1'
+
+    steps:
+      - name: Checkout composite actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: torch-spyre
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+
+      - uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
+
+      # Reconcile the pre-baked .venv / torch against the checked-out lock FIRST.
+      # (Done before the wheel install: `uv sync --frozen` prunes anything not in
+      # the lockfile, so it would otherwise remove a manually-installed wheel.)
+      - name: Reconcile environment
+        uses: ./.github/actions/build-torch-spyre
+
+      # TODO(#1857): replace with the real kineto-spyre wheel source once the
+      # CI/CD team decides it (Artifactory / pre-baked image / GH release).
+      # Expected: torch-2.9.1+aiu.kineto.1.1. Installed AFTER `uv sync` (so it
+      # isn't pruned) and BEFORE the rebuild (so the profiler C++ links against
+      # the wheel-provided libKineto + libAIUpti).
+      - name: Install kineto-spyre wheel
+        working-directory: torch-spyre
+        run: |
+          source "$HOME/.bashrc"
+          source .venv/bin/activate
+          echo "::warning::kineto-spyre wheel source not yet wired (see #1857 FR-003)"
+          # uv pip install <kineto-spyre-wheel-location>
+
+      # FORCE a clean rebuild of the editable C++ extension WITH the flag set.
+      # build-torch-spyre's `uv sync --frozen` will not recompile torch-spyre on
+      # an env-var-only change, so without this the profiler flag is a no-op.
+      - name: Rebuild torch-spyre with profiler enabled
+        working-directory: torch-spyre
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          source .venv/bin/activate
+          # Drop stale objects/.so so the profiler sources are actually compiled
+          # (setup.py reuses build/; an incremental build can keep stale state).
+          python setup.py clean || true
+          USE_SPYRE_PROFILER=1 uv pip install -e . \
+            --no-build-isolation --no-deps --force-reinstall --verbose
+          # Smoke-test that the package imports after the rebuild. NOTE: this is
+          # NOT proof the flag took effect — torch_spyre.profiler imports even
+          # with USE_SPYRE_PROFILER=0. Once #927 lands, assert a flag-gated
+          # symbol here (e.g. torch_spyre.profiler.is_available() is True).
+          python -c "import torch_spyre.profiler; print('profiler import OK')"
+
+      - name: Derive report paths
+        run: |
+          CONFIG="torch_spyre_tests/test_spyre_profiler_config.yaml"
+          REPORT_NAME="$(basename "${CONFIG%.yaml}.xml")"
+          echo "REPORT_NAME=${REPORT_NAME}" >> "$GITHUB_ENV"
+          echo "REPORT_PATH=${GITHUB_WORKSPACE}/${REPORT_NAME}" >> "$GITHUB_ENV"
+
+      - name: Run Test Spyre Profiler suite
+        uses: ./.github/actions/run-test-suite
+        with:
+          suite_name: Test Spyre Profiler
+          config: tests/configs/torch_spyre_tests/test_spyre_profiler_config.yaml
+          extra_test_flags: -v
+          junit_xml_path: ${{ env.REPORT_PATH }}
+          report_name: ${{ env.REPORT_NAME }}
+          pre_run: |
+            unset _IBM_AIU_SETUP
+            rm -rf /tmp/etc/ibm/spyre/topo.json
+            source /etc/profile.d/ibm-aiu-setup.sh
+
+      - name: Upload JUnit XML report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.REPORT_NAME }}
+          path: ${{ env.REPORT_PATH }}
+          if-no-files-found: warn
+          retention-days: 10
