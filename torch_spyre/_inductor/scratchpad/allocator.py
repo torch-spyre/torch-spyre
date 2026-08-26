@@ -1487,7 +1487,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         for op in graph.operations:
             if op.name in fixed_division_ops:
                 divs = [_fixed_core_division(op)]
-            elif self.prune:
+            elif self.prune and isinstance(op, ComputedBuffer):
                 divs = [
                     _core_division(op, splits)
                     for splits in _enum_split_options(op, profiles, matmul_roles)
