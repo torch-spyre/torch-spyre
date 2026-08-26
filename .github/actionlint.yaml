@@ -18,3 +18,5 @@ self-hosted-runner:
     - image_spyre_backend
     - image_torch_spyre
     - image_spyre_inference
+    # cardless ClickHouse-ingest set (spyre-frameworks #1235/#1236)
+    - image_ingest
