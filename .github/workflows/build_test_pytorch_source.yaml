@@ -90,7 +90,7 @@ jobs:
           # Pin uv rather than resolving "latest": a just-published release is not yet on
           # releases.astral.sh, so every runner 404s there and falls back to GitHub
           # Releases, which rate-limits (429) once the fleet requests it concurrently.
-          version: "0.12.5"
+          version: 0.12.5
 
       - name: Write dispatch payload to file
         env:
@@ -250,7 +250,7 @@ jobs:
           # Pin uv rather than resolving "latest": a just-published release is not yet on
           # releases.astral.sh, so every runner 404s there and falls back to GitHub
           # Releases, which rate-limits (429) once the fleet requests it concurrently.
-          version: "0.12.5"
+          version: 0.12.5
 
       # actions4gh/setup-gh@v1.0.2 extracts the gh tarball but never lands
       # the binary on PATH before it calls `gh auth login`, so every job
