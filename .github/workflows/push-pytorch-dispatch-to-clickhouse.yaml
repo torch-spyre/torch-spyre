@@ -68,9 +68,8 @@ jobs:
     if: github.event_name == 'repository_dispatch'
     runs-on:
       - x86_64
-      - spyre_pf_x0
       - linux
-      - image_spyre_backend
+      - image_ingest
     timeout-minutes: 10
 
     env:
@@ -132,9 +131,8 @@ jobs:
     name: Gate on merged PR to main, extract build SHA
     runs-on:
       - x86_64
-      - spyre_pf_x0
       - linux
-      - image_spyre_backend
+      - image_ingest
     outputs:
       pytorch_sha: ${{ steps.extract.outputs.pytorch_sha }}
       should_build: ${{ steps.extract.outputs.should_build }}
