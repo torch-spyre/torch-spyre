@@ -33,6 +33,11 @@ runs:
   steps:
     - name: Install uv
       uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      with:
+        # Pin uv rather than resolving "latest": a just-published release is not yet on
+        # releases.astral.sh, so every runner 404s there and falls back to GitHub
+        # Releases, which rate-limits (429) once the fleet requests it concurrently.
+        version: "0.12.5"
 
     - name: Restore ccache
       id: ccache_restore

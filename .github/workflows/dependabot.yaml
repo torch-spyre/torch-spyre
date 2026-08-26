@@ -27,6 +27,11 @@ jobs:
         with:
           python-version: '3.12'
       - uses: astral-sh/setup-uv@6ee6290f1cbc4156c0bdd66691b2c144ef8df19a  # v7.1.3
+        with:
+          # Pin uv rather than resolving "latest": a just-published release is not yet on
+          # releases.astral.sh, so every runner 404s there and falls back to GitHub
+          # Releases, which rate-limits (429) once the fleet requests it concurrently.
+          version: "0.12.5"
       - name: Recompile requirements
         run: ./tools/update-requirements.sh
 
