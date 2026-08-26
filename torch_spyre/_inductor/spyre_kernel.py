@@ -58,7 +58,7 @@ from .pass_utils import (
     finite_upper_or_none,
     apply_splits_from_index_coeff,
     iteration_space,
-    select_work_division_indexes,
+    select_work_division_transport_indexes,
     indirect_access_subs_from_kernel,
     is_restickify_coords,
 )
@@ -868,7 +868,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         ir_node = self.current_node.node  # ComputedBuffer
         work_division: dict[sympy.Symbol, int] = {}
         if hasattr(ir_node, "op_it_space_splits"):
-            write_index, read_index = select_work_division_indexes(
+            write_index, read_index = select_work_division_transport_indexes(
                 ir_node, self.current_node.read_writes, it_space
             )
             work_division = apply_splits_from_index_coeff(

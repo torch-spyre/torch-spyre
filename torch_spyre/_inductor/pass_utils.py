@@ -1534,10 +1534,28 @@ def commit_iteration_space_ownership(
     op.iteration_space_ownership = make_iteration_space_ownership(op, splits)
 
 
-def select_work_division_indexes(
+def select_work_division_transport_indexes(
     op: Operation, rw: ReadWrites, it_space: dict[sympy.Symbol, sympy.Expr]
 ) -> tuple[sympy.Expr, sympy.Expr]:
-    """Choose the shared write/read references for coefficient transport."""
+    """Choose the write/read indexes for legacy coefficient-keyed transport.
+
+    Pre-scheduler work division is keyed by iteration symbols, but Scheduler's
+    ``op_it_space_splits`` transport keys output splits by a write-index
+    coefficient and reduction-only splits by a read-index coefficient. Encoding
+    and later decoding must select the same indexes: changing the read can map a
+    reduction symbol to a different coefficient.
+
+    The write reference is the first ``MemoryDep`` write. Normally the read
+    reference is the first non-indirect ``MemoryDep`` read, falling back to the
+    first memory read and then the write for read-free operations. ``keep_by_index``
+    operations instead choose the read whose free symbols overlap the most with
+    the iteration symbols absent from the write, because that read best exposes
+    their reduction axes.
+
+    Raises:
+        Unsupported: if the operation has no ``MemoryDep`` write and therefore
+            cannot be represented by this transport.
+    """
     write = next((d for d in rw.writes if isinstance(d, MemoryDep)), None)
     if write is None:
         raise Unsupported(f"{op.get_name()} has no MemoryDep write for work division")
@@ -1566,7 +1584,7 @@ def finalize_work_division_for_scheduler(graph: GraphLowering) -> None:
             continue
         rw = op_read_writes(op)
         try:
-            write_index, read_index = select_work_division_indexes(
+            write_index, read_index = select_work_division_transport_indexes(
                 op, rw, iteration_space_from_op(op)
             )
         except Unsupported:
