@@ -14,11 +14,10 @@
 
 """Unit tests for splits_by_index_coeff and apply_splits_from_index_coeff.
 
-These functions encode pre-scheduler core-division splits so they can be
-recovered after the scheduler renames iteration-space symbols.  The key
-invariant: the coefficient of a symbol in a tensor's flat index expression
-is determined by the layout strides, which are fixed across the
-pre-scheduling / codegen boundary.
+These functions encode final scheduler-boundary core-division splits so they
+can be recovered after the scheduler renames iteration-space symbols. The key
+invariant: the coefficient of a symbol in a tensor's flat index expression is
+determined by layout strides, which are fixed across that boundary.
 """
 
 import sympy

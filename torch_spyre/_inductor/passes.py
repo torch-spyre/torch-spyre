@@ -78,7 +78,7 @@ from .work_division import (
     work_distribution,
     cost_model_matmul_division,
 )
-from .pass_utils import format_operations
+from .pass_utils import format_operations, finalize_work_division_for_scheduler
 from .scratchpad.allocator import (
     scratchpad_planning,
 )
@@ -485,6 +485,8 @@ class CustomPreSchedulingPasses:
             #
             # LX Planning
             _maybe_scratchpad_planning,
+            # Scheduler boundary
+            finalize_work_division_for_scheduler,
         ]
 
     def __call__(self, graph: GraphLowering) -> None:

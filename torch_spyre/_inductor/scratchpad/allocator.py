@@ -37,6 +37,7 @@ from torch._inductor.graph import GraphLowering
 
 from torch_spyre._inductor.pass_utils import (
     apply_splits_from_index_coeff,
+    commit_iteration_space_ownership,
     concretize_expr,
     indirect_info_from_op,
     iteration_space_from_op,
@@ -1112,12 +1113,32 @@ def _lx_planning_size() -> int:
     return round_up_to_alignment(frontend_reservation, _LX_ALLOCATION_GRANULARITY_BYTES)
 
 
+def _core_division(op: Operation, splits: dict[sympy.Symbol, int]) -> CoreDivision:
+    """Classify one symbol-keyed candidate for its producing operation."""
+    rw = op_read_writes(op)
+    write = next((d for d in rw.writes if isinstance(d, MemoryDep)), None)
+    if write is None:
+        return CoreDivision()
+    output = {
+        s: int(v) for s, v in splits.items() if write.index.coeff(s) != 0 and v > 1
+    }
+    reduction = {
+        s: int(v) for s, v in splits.items() if write.index.coeff(s) == 0 and v > 1
+    }
+    return CoreDivision(output_splits=output, reduction_splits=reduction)
+
+
+def _division_splits(op: Operation, division: CoreDivision) -> dict[sympy.Symbol, int]:
+    return {
+        sym: int(division.output_splits.get(sym, division.reduction_splits.get(sym, 1)))
+        for sym in iteration_space_from_op(op)
+    }
+
+
 def _fixed_core_division(op: Operation) -> CoreDivision:
-    """The op's upstream-committed division (``op.op_it_space_splits``) as a single
-    pinned :class:`CoreDivision`; a never-divided op yields a one-core empty split.
-    """
-    seed: tuple[dict, dict] = getattr(op, "op_it_space_splits", None) or ({}, {})
-    return CoreDivision(output_splits=dict(seed[0]), reduction_splits=dict(seed[1]))
+    """The op's committed symbol-keyed division, or a one-core division."""
+    ownership = getattr(op, "iteration_space_ownership", None)
+    return _core_division(op, ownership.work_slices if ownership is not None else {})
 
 
 DEFAULT_VARIANT_CAP = 6
@@ -1583,8 +1604,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         Every op gets at least one ``CoreDivision`` so the slicing-match gate can
         constrain it. Pointwise / Reduction ops get the enumerated candidates;
-        every other op falls back to a single fixed division read off its
-        committed ``op_it_space_splits``. No op-kind pre-filter -- residency is
+        every other op falls back to its committed symbol-keyed division. No
+        op-kind pre-filter -- residency is
         gated per buffer (``_residency_by_buf``) and by the solver, so ineligible
         ops still participate as producers/consumers in the match.
 
@@ -1601,18 +1622,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         max_cores = config.sencores
         fixed_division_ops = ops_in_offset_mutation_component(graph)
 
-        ops = graph.operations
-        matmul_bases, matmul_roles = _find_distinct_matmul_splits(ops)
-
         result = {}
         for op in graph.operations:
-            if op.name in fixed_division_ops:
+            if op.name in fixed_division_ops or self.prune:
                 divs = [_fixed_core_division(op)]
-            elif self.prune:
-                divs = [
-                    CoreDivision(output_splits=dict(out), reduction_splits=dict(red))
-                    for out, red in _enum_split_options(op, matmul_bases, matmul_roles)
-                ]
             else:
                 divs = self._enumerate_core_divisions(op, max_cores)
             result[op.name] = divs
@@ -1622,48 +1635,36 @@ class CoOptimizingAllocator(ScratchpadAllocator):
     def _enumerate_core_divisions(
         self, op: Operation, max_cores: int
     ) -> list[CoreDivision]:
-        """Core-division candidates for one eligible op (see ``_division_map``).
-
-        Each ``enumerate_work_division_candidates`` split is encoded into the
-        stride-keyed ``(output_splits, reduction_splits)`` form and deduped by
-        slicing signature. Ops without a divisible iteration space, or whose
-        space can't be enumerated, fall back to a single fixed division.
-        """
+        """Symbol-keyed core-division candidates for one eligible operation."""
         fixed = [_fixed_core_division(op)]
         if not isinstance(op, ComputedBuffer) or not isinstance(
             op.data, (Pointwise, Reduction)
         ):
             return fixed
-        rw = op_read_writes(op)
-        write = next(iter(rw.writes), None)
-
-        # this is essentially a dead branch but serves as a type narrowing below
-        if write is None:
-            return fixed
-        write_index = write.index
-        first_read = next(iter(rw.reads), None)
-        read_index = first_read.index if first_read is not None else write_index
-
         try:
             candidates = enumerate_work_division_candidates(op, max_cores)
         except Unsupported as exc:
-            # Symbolic stick dims etc. can't be enumerated; leave the op on its
-            # upstream-chosen split (fixed division).
             logger.debug("skip joint division for %s: %s", op.name, exc)
             return fixed
-
         cds: list[CoreDivision] = []
         seen: set[tuple] = set()
-        for cand in candidates:
-            out_s, red_s = splits_by_index_coeff(cand, write_index, read_index)
+        for candidate in candidates:
+            division = _core_division(op, candidate)
             key = (
-                tuple(sorted(out_s.items())),
-                tuple(sorted(red_s.items())),
+                tuple(
+                    sorted(
+                        division.output_splits.items(), key=lambda item: str(item[0])
+                    )
+                ),
+                tuple(
+                    sorted(
+                        division.reduction_splits.items(), key=lambda item: str(item[0])
+                    )
+                ),
             )
-            if key in seen:
-                continue
-            seen.add(key)
-            cds.append(CoreDivision(output_splits=out_s, reduction_splits=red_s))
+            if key not in seen:
+                seen.add(key)
+                cds.append(division)
         return cds or fixed
 
     def _commit_divisions(
@@ -1671,8 +1672,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         graph: GraphLowering,
         allocation: Sequence[CoreDivisionBuffer],
     ) -> None:
-        """Write the solver's chosen division back to ``op.op_it_space_splits``
-        for *every* buffer the solver assigned one.
+        """Commit the solver's chosen symbol-keyed division for every buffer.
 
         The solver optimizes a core division for all buffers, not just resident
         ones: a resident producer and its consumers are pinned by
@@ -1689,11 +1689,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             op = op_by_name.get(buf.name)
             if op is None or buf.chosen_division is None:
                 continue
+            if not hasattr(op, "iteration_space_ownership"):
+                continue
             cd = buf.core_divisions[buf.chosen_division]
-            op.op_it_space_splits = (
-                dict(cd.output_splits),
-                dict(cd.reduction_splits),
-            )
+            commit_iteration_space_ownership(op, _division_splits(op, cd))
 
     def _determine_in_place_division_invariant(
         self, graph: GraphLowering
@@ -2000,7 +1999,6 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             if read_dep is None or write is None:
                 matches[cname] = []
                 continue
-            iter_space = iteration_space_from_op(consumer)
             views = self._views_for_divs(
                 consumer, read_dep, input_name, consumer_divs, prep_cache
             )
@@ -2011,21 +2009,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 k = next((idx for idx, v in enumerate(clone_views) if v == view), None)
                 if k is None:
                     cd = consumer_divs[j]
-                    per_sym = apply_splits_from_index_coeff(
-                        (cd.output_splits, cd.reduction_splits),
-                        write.index,
-                        read_dep.index,
-                        iter_space,
-                    )
-                    clone_out, _ = splits_by_index_coeff(
-                        per_sym, read_dep.index, read_dep.index
-                    )
+                    per_sym = _division_splits(consumer, cd)
                     k = len(clone_divs)
                     clone_divs.append(
-                        CoreDivision(
-                            output_splits=clone_out, reduction_splits={}
-                        )  # a clone op cannot have a division split
-                    )
+                        CoreDivision(output_splits=per_sym, reduction_splits={})
+                    )  # a clone op cannot have a reduction split
                     clone_views.append(view)
                 if clone_divs[k].cores_used == consumer_divs[j].cores_used:
                     pairs.append((k, j))
@@ -2159,16 +2147,12 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         key = (op.get_name(), dep, buf_name)
         out = []
         for cd in divs:
-            coeff = (cd.output_splits, cd.reduction_splits)
-            # Build the op-level prep once per key, on first sight, regardless
-            # of whether this candidate splits. ``_per_core_view_from_prep``
-            # still short-circuits to the whole-buffer view for a no-split
-            # candidate, but always populating the cache keeps an absent entry
-            # distinct from a genuine ``None`` prep, so a later candidate (or a
-            # cache reuse) can't silently get a stale/``None`` view.
             if key not in prep_cache:
                 prep_cache[key] = _prepare_per_core_view(op, dep, buf_name)
-            out.append(_per_core_view_from_prep(prep_cache[key], coeff))
+            splits = _division_splits(op, cd)
+            out.append(
+                _per_core_view_from_prep(prep_cache[key], splits, cd.reduction_splits)
+            )
         return out
 
 

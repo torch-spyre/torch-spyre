@@ -138,9 +138,6 @@ def test_planner_and_sdsc_use_the_same_mapping(monkeypatch, op, reduction_contig
     op_spec = _bmm_op_spec(op)
     dims = tuple(op_spec.iteration_space)
     splits = dict(zip(dims, (2, 4, 4)))
-    monkeypatch.setattr(
-        pass_utils_module, "apply_splits_from_index_coeff", lambda *_: splits
-    )
     prep = pass_utils_module._ViewPrep(
         iter_space=op_spec.iteration_space,
         write_index=dims[0],
@@ -157,7 +154,7 @@ def test_planner_and_sdsc_use_the_same_mapping(monkeypatch, op, reduction_contig
         is_matmul=pass_utils_module._is_matmul_op(FakeComputedBuffer(op)),
     )
     planner_view, _, representable = pass_utils_module._per_core_view_from_prep(
-        prep, ({1: 2, 2: 4}, {3: 4})
+        prep, splits, {dims[2]: 4}
     )
 
     sdsc_spec, renamed = parse_op_spec(op_spec)
