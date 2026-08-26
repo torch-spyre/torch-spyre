@@ -37,7 +37,6 @@ jobs:
           # releases.astral.sh, so every runner 404s there and falls back to GitHub
           # Releases, which rate-limits (429) once the fleet requests it concurrently.
           version: "0.12.5"
-        with:
           enable-cache: true
           cache-dependency-glob: requirements/*
       - run: uv venv
