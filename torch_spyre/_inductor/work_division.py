@@ -728,13 +728,8 @@ def collect_indirect_value_tds(op: ComputedBuffer) -> list[TensorDep]:
     return tds
 
 
-def apply_splits(
-    op: ComputedBuffer,
-    splits: dict,
-    output_td: TensorDep,
-) -> None:
+def apply_splits(op: ComputedBuffer, splits: dict) -> None:
     """Commit symbol-keyed work division; scheduler transport is finalized later."""
-    del output_td
     commit_iteration_space_ownership(op, splits)
 
 
@@ -970,12 +965,8 @@ def _apply_user_hint(
     return splits
 
 
-def _commit_user_splits(
-    op: ComputedBuffer,
-    splits: dict[Symbol, int],
-    output_td: TensorDep,
-) -> None:
-    apply_splits(op, splits, output_td)
+def _commit_user_splits(op: ComputedBuffer, splits: dict[Symbol, int]) -> None:
+    apply_splits(op, splits)
 
 
 def span_reduction_pass(
@@ -1069,7 +1060,7 @@ def span_reduction_pass(
             f"({reduction_vars_to_split}), but the backend supports at most 1."
         )
 
-    apply_splits(op, min_splits, output_td)
+    apply_splits(op, min_splits)
 
     if symbol_meta and math.prod(min_splits.values()) > 1:
         logger.info(
@@ -1241,7 +1232,7 @@ def work_distribution_pass(
                     f"Applying strict user hint; this may violate the hardware "
                     f"{MAX_SPAN_BYTES / (1024**2):.3f} MB span limit."
                 )
-            _commit_user_splits(op, user_splits, output_td)
+            _commit_user_splits(op, user_splits)
 
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
@@ -1267,7 +1258,7 @@ def work_distribution_pass(
         op=op,
     )
 
-    apply_splits(op, splits, output_td)
+    apply_splits(op, splits)
 
     if symbol_meta and math.prod(splits.values()) > 1:
         logger.info(
@@ -1860,7 +1851,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     if splits == default_splits:
         return False
 
-    apply_splits(op, splits, output_td)
+    apply_splits(op, splits)
     raise_if_per_core_overflow(all_tds, it_space, splits, op.get_name(), symbol_meta)
 
     if logger.isEnabledFor(logging.DEBUG):

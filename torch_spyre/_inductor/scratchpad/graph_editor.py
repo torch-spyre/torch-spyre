@@ -20,6 +20,7 @@ from torch_spyre._inductor.pass_utils import (
     copy_op_metadata,
     iteration_space_from_op,
     invalidate_op_read_writes,
+    op_read_writes,
 )
 from torch._inductor.virtualized import V
 from torch._inductor.ir import (
@@ -165,12 +166,31 @@ class GraphEditor:
         # retain direct symbol ownership instead of round-tripping through index
         # coefficients. A clone has no reduction split.
         metadata_owner = getattr(metadata_source, "iteration_space_ownership", None)
-        if metadata_owner is not None:
+        if input and metadata_owner is not None:
+            read = next(
+                (
+                    dep
+                    for dep in op_read_writes(metadata_source).reads
+                    if dep.name == buf_name
+                ),
+                None,
+            )
+            clone_write = next(iter(op_read_writes(new_com_buf).writes))
+            by_coeff = {
+                read.index.coeff(sym): split
+                for sym, split in metadata_owner.work_slices.items()
+                if read is not None and read.index.coeff(sym) != 0
+            }
             clone_splits = {
-                sym: metadata_owner.work_slices.get(sym, 1)
+                sym: by_coeff.get(clone_write.index.coeff(sym), 1)
                 for sym in iteration_space_from_op(new_com_buf)
             }
-            commit_iteration_space_ownership(new_com_buf, clone_splits)
+        else:
+            clone_splits = {
+                sym: metadata_owner.work_slices.get(sym, 1) if metadata_owner else 1
+                for sym in iteration_space_from_op(new_com_buf)
+            }
+        commit_iteration_space_ownership(new_com_buf, clone_splits)
 
         if input:
             source_users = []
