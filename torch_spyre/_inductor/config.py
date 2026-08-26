@@ -164,7 +164,7 @@ sdsc_cache: bool = os.environ.get("SPYRE_INDUCTOR_SDSC_CACHE", "1") == "1"
 # TODO(isuruf): Change to firstfit when deeptools PR4298 lands
 layout_solver: Literal[
     "greedy", "bestfit", "firstfit", "cpsat", "simulated_annealing"
-] = os.environ.get("LAYOUT_SOLVER", "greedy")  # type: ignore[assignment]
+] = os.environ.get("LAYOUT_SOLVER", "cpsat")  # type: ignore[assignment]
 
 # OpSpec validation at pipeline stage boundaries. Enabled by default to catch
 # invariant violations early. Set SPYRE_VALIDATE_OP_SPECS=0 to disable.

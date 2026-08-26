@@ -776,7 +776,7 @@ used. The tables are organized by the challenge that each hook addresses.
 | `SpyreCCLBackend` | `c10d::Backend` (registered as `"spyreccl"`) | Multi-card collective communication via `torch.distributed` | `init_process_group(backend="spyreccl")`. Implements synchronous `send`, `recv`, `broadcast`, `barrier`, `gather`, `allgather`, `reduce`, `allreduce`. Reuses the rank's flex runtime instance and default stream. |
 
 Initialization is lazy and thread-safe. Importing `torch_spyre` registers the device name and
-module. `flex::initializeRuntime()` starts only on the first device use.
+module. `flex::RuntimeContext::create()` starts only on the first device use.
 
 ### Challenge 2: tiled tensor layout (FixedTiledLayout)
 

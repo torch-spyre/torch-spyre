@@ -92,7 +92,7 @@ from torch.utils._ordered_set import OrderedSet
 from torch_spyre._C import SpyreTensorLayout
 
 from .. import config
-from ..constants import BATCH_MATMUL_OP
+from ..constants import BATCH_MATMUL_OP, MATMUL_REDUCTION_OPS
 from ..errors import Unsupported
 from ..logging_utils import get_inductor_logger
 from ..loop_info import (
@@ -103,7 +103,12 @@ from ..loop_info import (
     ReductionPlan,
     copy_op_metadata,
 )
-from ..pass_utils import op_out_coords, host_coordinates, indirect_sizes_from_op
+from ..pass_utils import (
+    op_out_coords,
+    host_coordinates,
+    identify_matmul_inputs,
+    indirect_sizes_from_op,
+)
 from ..ir import FixedTiledLayout, SpyreConstantFallback, _resize_device_layout
 from .tile import compute_tile_index, compute_tile_stride
 
@@ -305,6 +310,10 @@ def plan_coarse_tile_groups(
                 _tiled_dims_for_dep(write_deps[0], per_level_extents, op)
                 if write_deps
                 else []
+            )
+
+            _check_matmul_broadcast_batch_tiling(
+                op, read_deps, write_deps, per_level_extents
             )
 
             plan[id(op)] = CoarseTileInfo(
@@ -1040,6 +1049,103 @@ def _tiled_dims_for_dep(
         ]
         for level in per_level_extents
     ]
+
+
+def _check_matmul_broadcast_batch_tiling(
+    op: ComputedBuffer,
+    read_deps: list[MemoryDep],
+    write_deps: list[MemoryDep],
+    per_level_extents: list[dict[int, Expr]],
+) -> None:
+    """Reject coarse-tiling a matmul's broadcast batch dim with >1 elem/tile.
+
+    torch-spyre#3888: when a matmul operand (x) is broadcast over a batch
+    dim (e.g. torch.matmul(x.unsqueeze(0), w) with no real batch dim on x)
+    and that dim is coarse-tiled with more than one element per tile, the
+    backend's SDSC batched-matmul scheduling primitive cannot express the
+    result: the native device compiler aborts with
+    ``sbf-ddc: DtException: inp0_reuse_dim.size() == 1`` in
+    ``L3DlOpsScheduler.cpp``. Confirmed via the generated ``sdsc_*.json``:
+    tile size 1 (one batch element per tile) never materializes a reuse-dim
+    key on the matmul's ``N_`` dims at all (128 separate kernel invocations);
+    tile size 2 stamps ``N_.kj_ = 2`` and the native scheduler rejects it.
+    This is a genuine backend limitation, not a torch-spyre layout bug --
+    see issue #3927 for the writeup shared with the deeptools backend team.
+
+    Rather than emit a kernel the native compiler will reject, raise
+    Unsupported here at plan time so the failure is immediate and points at
+    the actual cause instead of an opaque subprocess crash deep in codegen.
+    """
+    if not (
+        isinstance(op.data, Reduction)
+        and op.data.reduction_type in MATMUL_REDUCTION_OPS
+    ):
+        return
+    if len(read_deps) != 2 or not write_deps:
+        return
+
+    out_dep = write_deps[0]
+    x_dep, y_dep = identify_matmul_inputs(read_deps, out_dep)
+    if x_dep is None or y_dep is None:
+        return
+
+    # Candidates for "absent from x, present in y and the output": the true
+    # generated (N) dim of the matmul is always exactly one such var. A
+    # *second* one is only possible when x is broadcast over an extra batch
+    # dim it carries no symbol for at all (see issue #3888/#3927) -- that
+    # excess var, not the legitimate N var, is what this check must flag.
+    candidates = (
+        y_dep.index.free_symbols & out_dep.index.free_symbols
+    ) - x_dep.index.free_symbols
+    if len(candidates) <= 1:
+        return  # unambiguous N var (or none) -- nothing to flag.
+
+    # Ambiguous: more than one var is absent from x but present in y and the
+    # output. Exactly one is the true generated (N) dim; the rest are excess
+    # broadcast-batch vars x carries no symbol for at all. broadcast_batch_vars
+    # (issue #3888) resolves this via op.loop_info.loop_tiled_dims, but that
+    # isn't stamped yet at plan time -- so here we can only tell "ambiguous"
+    # from "unambiguous", not which candidate is the real N dim. Treat every
+    # candidate whose *tiled* extent exceeds 1 element/tile as excess: the
+    # real N dim's own generation loop is not a coarse-tile dim (it's the
+    # matmul's inherent output dim, not something plan_coarse_tile_groups
+    # tiles down), so it will not appear in per_level_extents at all.
+    #
+    # Candidate symbols are always Inductor's dense "d{N}" iteration vars
+    # (same numbering _raw_to_squeezed_pos/_host_dim_to_index_symbol assign
+    # squeezed dims), so the str(sym).startswith("d") parse below recovers
+    # the squeezed index. A future Inductor change to variable naming would
+    # make this silently skip the candidate rather than raise -- if that
+    # happens, the excess dim falls through to the native compiler's opaque
+    # inp0_reuse_dim.size() == 1 abort instead of this clean Unsupported.
+    excess_dims = {
+        int(str(sym)[1:])
+        for sym in candidates
+        if str(sym).startswith("d") and str(sym)[1:].isdigit()
+    }
+    raw_to_squeezed = _raw_to_squeezed_pos(op)
+
+    for level in per_level_extents:
+        for raw_dim, extent in level.items():
+            # .get(raw_dim) (no fallback): a raw_dim absent from
+            # raw_to_squeezed was squeezed out (unit-size, extent == 1) and
+            # has no d{i} symbol at all, so it can never legitimately match
+            # an excess_dims entry (those are squeezed indices). Falling
+            # back to raw_dim itself would risk an accidental collision with
+            # an unrelated squeezed index; None never collides.
+            if raw_to_squeezed.get(raw_dim) not in excess_dims:
+                continue
+            if isinstance(extent, (int, sympy.Integer)) and int(extent) <= 1:
+                continue  # one broadcast element per tile -- backend handles this.
+            raise Unsupported(
+                f"matmul {op.get_name()!r}: coarse-tiling broadcast batch "
+                f"dim d{raw_dim} with {extent} elements/tile is not "
+                "supported -- the backend's batched-matmul scheduling "
+                "primitive requires exactly 1 broadcast element per kernel "
+                "invocation (inp0_reuse_dim.size() == 1). Retile this "
+                "dimension with 1 element per tile (num_tiles_per_dim == "
+                "the dim's full size), or see issue #3927."
+            )
 
 
 def _stick_host_dim(op: ComputedBuffer, device_layout) -> int | None:

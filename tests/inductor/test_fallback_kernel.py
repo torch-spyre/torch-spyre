@@ -423,7 +423,12 @@ class TestInGraphCpuComputedBuffers(unittest.TestCase):
         gate (mem_usage_by_buf over the filtered graph_view)."""
         self._run_and_check(self)
 
-    @config.patch({"co_optimizing_lx_planning": True})
+    # Pin greedy: this covers the co-opt allocator over the greedy inner solver
+    # (ExhaustiveSearchSolver-wrapped), the path this CPU-buffer guard was written
+    # for. The cpsat *joint* co-opt path does not yet apply the same guard, but
+    # co_optimizing_lx_planning is off by default so it is never on the default
+    # compile path; enabling cpsat co-opt is deferred to the co-opt follow-up.
+    @config.patch({"co_optimizing_lx_planning": True, "layout_solver": "greedy"})
     def test_cpu_pointwise_chain_compiles_co_optimizing(self):
         """Co-optimizing allocator: `mem_usage_by_buf` runs on the RAW graph in
         `_build_cd_bound_buffers` / `_determine_in_place_division_invariant`,
