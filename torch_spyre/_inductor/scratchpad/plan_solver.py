@@ -247,12 +247,26 @@ class CoreDivision:
         """Per-core slicing signature, or ``None`` for a reduction-split division
         (a ``None`` never compares equal, so partial-reduction divisions never
         match). Only used within one operation's symbol namespace."""
-        return tuple(sorted(self.output_splits.items())) if self.is_clean else None
+        return (
+            tuple(sorted(self.output_splits.items(), key=lambda item: str(item[0])))
+            if self.is_clean
+            else None
+        )
 
     @property
     def label(self) -> str:
-        out = ",".join(f"s{s}/{f}" for s, f in sorted(self.output_splits.items()))
-        red = ",".join(f"~s{s}/{f}" for s, f in sorted(self.reduction_splits.items()))
+        out = ",".join(
+            f"s{s}/{f}"
+            for s, f in sorted(
+                self.output_splits.items(), key=lambda item: str(item[0])
+            )
+        )
+        red = ",".join(
+            f"~s{s}/{f}"
+            for s, f in sorted(
+                self.reduction_splits.items(), key=lambda item: str(item[0])
+            )
+        )
         return " ".join(p for p in (out, red) if p) or "whole"
 
 
