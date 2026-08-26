@@ -62,6 +62,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import logging
+from enum import Enum
 from typing import NamedTuple
 
 import sympy
@@ -1326,24 +1327,34 @@ def _loop_var_to_ranges_pos(out_coords: list, sym: sympy.Symbol) -> int | None:
     return None
 
 
-def _loop_var_to_reduction_ranges_pos(
-    op: ComputedBuffer, sym: sympy.Symbol
-) -> int | None:
-    """Return position of loop variable sym in op.data.reduction_ranges, or None.
+def reduction_loop_vars(op: ComputedBuffer) -> list[sympy.Symbol]:
+    """Return the op's reduction loop variables, ordered as in
+    ``op.data.reduction_ranges``.
 
     Uses dep-tracking symbols (d0, d1, ...) rather than SymT.R0_INDEX symbols
     (r0_0, r0_1, ...) which are a different namespace.  Finds reduction symbols
     by set-subtracting output index symbols from input index symbols, in
     dep.ranges order (which matches reduction_ranges order).
+
+    This is the single source of truth for that derivation. Both directions go
+    through it: ``_loop_var_to_reduction_ranges_pos`` (loop_var -> position) and
+    coarse tiling's reduction-axis lowering (its inverse, position -> loop_var,
+    in ``scratchpad.coarse_tiling.tile_spec_to_dim_hints``).
     """
     assert isinstance(op.data, Reduction)
     rw = op.get_read_writes()
     out_dep = next(iter(rw.writes))
     out_syms = out_dep.index.free_symbols
     in_dep = next(d for d in rw.reads if hasattr(d, "index"))
-    reduction_syms = [s for s in in_dep.ranges if s not in out_syms]
+    return [s for s in in_dep.ranges if s not in out_syms]
+
+
+def _loop_var_to_reduction_ranges_pos(
+    op: ComputedBuffer, sym: sympy.Symbol
+) -> int | None:
+    """Return position of loop variable sym in op.data.reduction_ranges, or None."""
     try:
-        return reduction_syms.index(sym)
+        return reduction_loop_vars(op).index(sym)
     except ValueError:
         return None
 
@@ -2051,6 +2062,51 @@ def _validate_planned_reduction_tiling(
             )
 
 
+class BoundaryRole(Enum):
+    """How a tiled op's own output buffer must be materialized.
+
+    This is the single source of truth for the classification that
+    :func:`_propagate_tiled_op` applies and that the stage-4 predictor
+    (``wsr.tile_prediction``) reads to price a candidate without applying it.
+    Extracting it keeps one copy of the rule (M6).
+    """
+
+    UNTILED = 0  # not tiled, or loop-invariant: nothing is materialized
+    LOOP_INTERNAL = 1  # per-tile scratch, reused in place -> LX-eligible
+    BOUNDARY = 2  # drained across a loop boundary: full_buf + a write copy
+    REDUCTION = 3  # reduction-tiled: accumulator + identity fill + combine op
+
+
+def decide_boundary_role(
+    op: ComputedBuffer,
+    operations: list[Operation],
+) -> BoundaryRole:
+    """Classify a tiled op's output-buffer role -- a pure predicate, no mutation.
+
+    Mirrors :func:`_propagate_tiled_op`'s branch structure exactly: the reduction
+    path (``_propagate_tiled_reduction_op``, which sets ``output_tiled_dims=[]``
+    unconditionally and materializes an accumulator/fill/combine) is
+    ``REDUCTION``; an untiled or loop-invariant op is ``UNTILED``; a tiled op
+    with no outside consumer and no graph output is ``LOOP_INTERNAL`` (per-tile
+    scratch); anything drained across a loop-group boundary is ``BOUNDARY``.
+    """
+    loop_info = getattr(op, "loop_info", None)
+    if loop_info is None:
+        return BoundaryRole.UNTILED
+    if isinstance(op.data, Reduction) and any(
+        dims for dims in getattr(loop_info, "loop_tiled_reduction_dims", [])
+    ):
+        return BoundaryRole.REDUCTION
+    if all(not dims for dims in loop_info.loop_tiled_dims):
+        return BoundaryRole.UNTILED
+    outside_consumers, is_graph_output = _find_outside_consumers(
+        op.get_name(), loop_info.loop_group_id, operations
+    )
+    if not outside_consumers and not is_graph_output:
+        return BoundaryRole.LOOP_INTERNAL
+    return BoundaryRole.BOUNDARY
+
+
 def _insert_all_write_copy_ops(operations: list[Operation]) -> None:
     """Pass 3: build full buffer + copy-out for every planned copy-out op.
 
@@ -2703,9 +2759,23 @@ class _NameSwapHandler(WrapperHandler):
 
 
 def _rescale_index(
-    index: Expr, full_strides: list[Expr], tile_strides: list[Expr]
+    index: Expr,
+    full_strides: list[Expr],
+    tile_strides: list[Expr],
+    strict: bool = True,
 ) -> Expr:
     """Rescale an affine index's per-dimension coefficients.
+
+    ``strict`` (default) requires every non-constant term to match a
+    ``full_strides`` entry -- correct for a *write* index, whose every term is
+    one of the output layout's own strides. A *read* index is rescaled against
+    the output strides too, but an input whose layout differs from the output
+    (a matmul operand, a broadcast/transpose) carries terms in its own stride
+    basis that no output stride matches; those are unaffected by an output-dim
+    tiling and must pass through unchanged, so predicted read indices call this
+    with ``strict=False``. (The real coarse_tile rescales a consumer read
+    against the dep's *own* coefficients -- see ``_patch_retiled_load_indexes``;
+    lenient pass-through is the prediction-time analogue.)
 
     `index` is affine in some set of loop variables, with one additive term
     per dimension whose coefficient equals the matching entry in
@@ -2803,10 +2873,14 @@ def _rescale_index(
                 del remaining[i]
                 break
         else:
-            raise RuntimeError(
-                f"_rescale_index: no matching full_stride for term {term} "
-                f"in index {index}; full_strides={full_strides}"
-            )
+            if strict:
+                raise RuntimeError(
+                    f"_rescale_index: no matching full_stride for term {term} "
+                    f"in index {index}; full_strides={full_strides}"
+                )
+            # Lenient (read-index) mode: a term in the input's own stride basis
+            # is unaffected by an output-dim tiling -- keep it as is.
+            new_index += term
     return new_index
 
 

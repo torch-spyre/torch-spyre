@@ -56,6 +56,7 @@ from torch_spyre._inductor.scratchpad.plan_solver import (
     MemoryPlanSolver,
     SolveError,
     BufferType,
+    TileSpec,
 )
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.firstfit_bestfit_solver import (
@@ -1560,6 +1561,72 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # is updated with clones in ``_push_allocation``.
         self._commit_divisions(graph, allocation)
 
+    def plan_allocation(self, graph: GraphLowering):
+        """Joint solve, then -- if the solve selected any coarse tiling --
+        materialize it and re-plan the tiled graph placement-only.
+
+        The first solve chooses core divisions *and* tilings jointly, pricing the
+        tiled candidates through their predicted (stage-4) views. If it picks a
+        non-empty tiling for any op, ``CoarseTilingPass`` applies exactly those
+        choices (mutating the IR the same way a pre-stickification hint would),
+        and the allocation is redone over the materialized graph so new boundary
+        buffers get placed and the applied ops get their final divisions. The
+        second pass enumerates no further tilings (``_suppress_tiling``), so it
+        terminates, and it mirrors the hint path (allocate an already-tiled
+        graph).
+
+        Ordering is solve-before-apply: a ``SolveError`` from the first solve
+        propagates over the *unmutated* graph, so ``scratchpad_planning``'s greedy
+        fallback never runs on a half-tiled graph (a second-solve ``SolveError``
+        falls back over the fully-tiled graph, which is a valid outcome).
+        """
+        self._run_passes(self.pre_optimization_passes, graph)
+        buffers = self._prepare_buffers(graph)
+        solver = self._build_solver(buffers)
+        allocation = self._solve(solver)
+
+        choices = self._chosen_tilings(graph, allocation)
+        if choices:
+            from torch_spyre._inductor.scratchpad.coarse_tiling import CoarseTilingPass
+
+            op_count = len(graph.operations)
+            CoarseTilingPass(choices).apply_pass(graph)
+            assert len(graph.operations) >= op_count, (
+                "coarse tiling apply must not drop operations"
+            )
+            # Re-plan over the materialized tiling. Pre-passes are empty for this
+            # allocator; suppress further tiling so the second solve only places.
+            self._suppress_tiling = True
+            try:
+                buffers = self._prepare_buffers(graph)
+                solver = self._build_solver(buffers)
+                allocation = self._solve(solver)
+            finally:
+                self._suppress_tiling = False
+
+        accepted_lx_relayouts = self._finalize_lx_relayout_allocation(allocation)
+        self._post_solve(graph, allocation)
+        reasons = self._get_spill_reasons(solver, allocation)
+        self._push_allocation(graph, allocation, accepted_lx_relayouts)
+        self._log_lx_pinning(graph, reasons)
+        self._run_passes(self.post_optimization_passes, graph)
+
+    def _chosen_tilings(
+        self, graph: GraphLowering, allocation: Sequence[Any]
+    ) -> dict[str, TileSpec]:
+        """The non-empty tiling the solve chose for each op, keyed by operation
+        name (the key ``CoarseTilingPass``/``derive_tiling_groups`` consume)."""
+        op_by_name = {op.name: op for op in graph.operations}
+        choices: dict[str, TileSpec] = {}
+        for buf in allocation:
+            op = op_by_name.get(buf.name)
+            if op is None or buf.chosen_division is None:
+                continue
+            cd = buf.core_divisions[buf.chosen_division]
+            if not cd.tiling.is_untiled:
+                choices[op.get_operation_name()] = cd.tiling
+        return choices
+
     def _get_spill_reasons(
         self,
         solver: MemoryPlanSolver,
@@ -1647,17 +1714,103 @@ class CoOptimizingAllocator(ScratchpadAllocator):
 
         cds: list[CoreDivision] = []
         seen: set[tuple] = set()
-        for cand in candidates:
-            out_s, red_s = splits_by_index_coeff(cand, write_index, read_index)
-            key = (
-                tuple(sorted(out_s.items())),
-                tuple(sorted(red_s.items())),
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            cds.append(CoreDivision(output_splits=out_s, reduction_splits=red_s))
+        # Each tiling option gets its own division enumeration: the legal split
+        # set and the coeff encoding are both tiling-relative (a tiled dim has
+        # fewer/other divisors and a smaller per-core span, and the index
+        # coefficients splits are keyed by are rewritten under the tiling). The
+        # untiled option reuses the already-enumerated `candidates` and the op's
+        # own indices; a non-empty option re-enumerates on the tiled frame and
+        # encodes against the predicted tiled write/read index.
+        for tiling in self._tiling_candidates(op, max_cores):
+            if tiling.is_untiled:
+                tcands = candidates
+                w_idx, r_idx = write_index, read_index
+            else:
+                from torch_spyre._inductor.wsr.tile_prediction import predict_frame
+
+                try:
+                    tcands = enumerate_work_division_candidates(
+                        op, max_cores, tiling=tiling
+                    )
+                    frame = predict_frame(op, tiling)
+                except Unsupported as exc:
+                    logger.debug(
+                        "skip tiled division for %s under %s: %s",
+                        op.name,
+                        tiling.label,
+                        exc,
+                    )
+                    continue
+                w_idx, r_idx = frame.write_index, frame.read_index
+            for cand in tcands:
+                out_s, red_s = splits_by_index_coeff(cand, w_idx, r_idx)
+                key = (
+                    tuple(sorted(out_s.items())),
+                    tuple(sorted(red_s.items())),
+                    tiling,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                cds.append(
+                    CoreDivision(
+                        output_splits=out_s,
+                        reduction_splits=red_s,
+                        tiling=tiling,
+                    )
+                )
         return cds or fixed
+
+    def _tiling_candidates(self, op: Operation, max_cores: int) -> list[TileSpec]:
+        """Coarse-tiling options to pair with ``op``'s divisions (untiled first).
+
+        Always offers the untiled ``TileSpec`` -- with the gate off it is the
+        only option, so enumeration and every downstream plan stay bit-identical
+        to today. When auto coarse tiling is enabled on the CP-SAT co-opt path,
+        an *un-hinted* op (one the pre-stickification passes have not already
+        tiled, i.e. ``loop_info is None``) also offers real tilings, filtered by
+        op kind:
+
+        - **Restickify ops** offer nothing: they are layout-conversion copies,
+          and coarse-tiling one fragments the graph into mismatched groups the
+          backend scheduler cannot handle.
+        - **Matmuls** (``_is_matmul_op``) offer nothing: neither tiling form is
+          correct in this post-stickification path. Output-dim tiling hits the
+          ``_resize_device_layout`` gap (#3218, xfailed) and the backend rejects
+          the SDSC; K/reduction tiling routes through the accumulator/combine
+          path whose matmul numerics are ~2 orders off CPU (see ``_mlp_case``).
+          Both work only pre-stickification via hints, so until #3218 lands the
+          solver leaves matmuls untiled.
+        - **Everything else** (pointwise, non-matmul reduction) offers only
+          output-axis tilings (``is_clean``). Reduction tiling of e.g. softmax's
+          max/sum is numerically fragile, so it is dropped there.
+
+        A hinted op keeps its pinned tiling untouched (loop_info already set),
+        so the solve never re-tiles or un-tiles it.
+        """
+        untiled = [TileSpec()]
+        if getattr(self, "_suppress_tiling", False):
+            return untiled
+        if not (
+            config.unified_tiling
+            and config.auto_coarse_tiling
+            and config.layout_solver == "cpsat"
+        ):
+            return untiled
+        if getattr(op, "loop_info", None) is not None:
+            return untiled
+        if self._get_op_name(op) == "restickify" or _is_matmul_op(op):
+            return untiled
+        from torch_spyre._inductor.wsr.enumerate_tilings import enumerate_tile_options
+
+        try:
+            options = enumerate_tile_options(op, max_cores)
+        except Unsupported:
+            return untiled
+        # enumerate_tile_options returns the untiled spec first; the is_clean
+        # filter keeps it (the untiled spec is is_clean) and the output-only
+        # specs, preserving that order.
+        return [t for t in options if t.is_clean]
 
     def _commit_divisions(
         self,
@@ -2144,15 +2297,20 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         via ``_per_core_view_from_prep``, so cost scales with the op rather than
         its candidate count.
 
-        ``prep_cache`` is keyed by ``(op name, dep, buf_name)``: a producer's
-        write-dep and a consumer's read-dep on the same buffer can be equal
-        ``MemoryDep``s, so the op name keeps their preps distinct while a parent
-        read by several consumers reuses its write-view prep.
+        ``prep_cache`` is keyed by ``(op name, dep, buf_name, tiling)``: a
+        producer's write-dep and a consumer's read-dep on the same buffer can be
+        equal ``MemoryDep``s, so the op name keeps their preps distinct while a
+        parent read by several consumers reuses its write-view prep. The tiling
+        is part of the key because a candidate's per-core view is taken on its
+        *tiled* frame -- two candidates differing only in tiling see different
+        divided ranges and a different resized layout, so they must not share a
+        prep (R2.6). With ``auto_coarse_tiling`` off every ``cd.tiling`` is the
+        empty spec and the key is unchanged in effect.
         """
-        key = (op.get_name(), dep, buf_name)
         out = []
         for cd in divs:
             coeff = (cd.output_splits, cd.reduction_splits)
+            key = (op.get_name(), dep, buf_name, cd.tiling)
             # Build the op-level prep once per key, on first sight, regardless
             # of whether this candidate splits. ``_per_core_view_from_prep``
             # still short-circuits to the whole-buffer view for a no-split
@@ -2160,9 +2318,32 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             # distinct from a genuine ``None`` prep, so a later candidate (or a
             # cache reuse) can't silently get a stale/``None`` view.
             if key not in prep_cache:
-                prep_cache[key] = _prepare_per_core_view(op, dep, buf_name)
+                prep_cache[key] = CoOptimizingAllocator._prep_for_candidate(
+                    op, dep, buf_name, cd
+                )
             out.append(_per_core_view_from_prep(prep_cache[key], coeff))
         return out
+
+    @staticmethod
+    def _prep_for_candidate(op, dep, buf_name, cd):
+        """The ``_prepare_per_core_view`` prep for one candidate.
+
+        Untiled: the committed layout, exactly as before. Tiled: the *predicted*
+        per-tile frame (``wsr.tile_prediction.predict_frame``) supplies the
+        divided iteration space, rescaled indices, and -- when ``buf_name`` is the
+        op's own output -- the resized layout, since the committed layout is
+        still untiled at solve time. Imported lazily so the solver-facing modules
+        stay free of the predictor.
+        """
+        if cd.tiling.is_untiled:
+            return _prepare_per_core_view(op, dep, buf_name)
+        from torch_spyre._inductor.wsr.tile_prediction import predict_frame
+
+        frame = predict_frame(op, cd.tiling)
+        override = frame.layout if buf_name == op.get_name() else None
+        return _prepare_per_core_view(
+            op, dep, buf_name, parts=frame.view_parts(), buf_layout=override
+        )
 
 
 def _make_cpsat_solver(

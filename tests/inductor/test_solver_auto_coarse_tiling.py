@@ -345,12 +345,9 @@ class AutomatedCoarseTilingTests(
         auto_tiling: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, _Nest]]:
         """Compile ``case`` and return (cpu_result, device_result, tiling)."""
-        # Raises the "gate is missing" NotImplementedError before compiling.
-        if auto_tiling:
-            # TODO: Implement coarse tiling configuration
-            raise NotImplementedError("unified-tiling: config.auto_coarse_tiling")
-
         # declare the tensor dimensions
+        if hint_mode == "partial":
+            raise NotImplementedError("Partial hinting is currently unsupported")
         named_dims = case.dims_for(hint_mode)
         if named_dims is not None:
             for arg, dims in zip(case.args, named_dims):
@@ -368,7 +365,19 @@ class AutomatedCoarseTilingTests(
         else:
             model = case.body
         CollectTilingPasses.tiling = {}
-        # TODO: Patch coarse tiling config here
+        # Auto tiling needs the joint CP-SAT co-opt path on (R8.1): the solver
+        # carries and applies the tiling candidates only under
+        # co_optimizing_lx_planning + layout_solver="cpsat". The two gates
+        # default off, so they are patched on only for the auto modes.
+        tiling_cfg = (
+            dict(
+                co_optimizing_lx_planning=True,
+                unified_tiling=True,
+                auto_coarse_tiling=True,
+            )
+            if auto_tiling
+            else {}
+        )
         # force_disable_caches belongs to torch's inductor config, not Spyre's;
         # CustomPreSchedulingPasses is a plain module attribute that
         # enable_spyre_context re-imports per compile, so it is swapped with
@@ -378,6 +387,7 @@ class AutomatedCoarseTilingTests(
             ts_inductor_config.patch(
                 allow_all_ops_in_lx_planning=True,
                 layout_solver=layout_solver,
+                **tiling_cfg,
             ),
             patch.object(ts_passes, "CustomPreSchedulingPasses", CollectTilingPasses),
         ):
@@ -684,20 +694,19 @@ class AutomatedCoarseTilingTests(
 
     @staticmethod
     def case_decorators(params):
-        """Mark the combos that cannot pass until the tile search is built.
+        """Per-combo decorators.
 
-        These entries are never edited again: each combo stops xfailing on its
-        own, the moment the last unbuilt piece on its path lands, because
-        ``expected_unimplemented`` keys on the exception rather than on a list
-        maintained by hand.  A combo turning green is the signal to delete its
-        row here.
+        The ``unhinted``/``partial`` combos were ``@expected_unimplemented`` while
+        the solver-driven tile search was unbuilt; that marker retired itself the
+        moment those modes passed (it fails a clean run), so only the ortools
+        skip for the cpsat solver remains.
         """
         decorators = []
         if params["solver_method"] == "cpsat":
             decorators.append(
                 unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
             )
-        if params["hint_mode"] in ("unhinted", "partial"):
+        if params["hint_mode"] in ("partial",):
             decorators.append(expected_unimplemented)
         return decorators
 

@@ -778,6 +778,7 @@ def apply_splits(
 def enumerate_work_division_candidates(
     op: ComputedBuffer,
     max_cores: int,
+    tiling: "TileSpec | None" = None,
 ) -> list[dict[Symbol, int]]:
     """Return every permissible core-division split for ``op``.
 
@@ -791,11 +792,29 @@ def enumerate_work_division_candidates(
     For ``TOPK`` reductions, k's factors are restricted to divisors ``d``
     with ``k / d <= _TOPK_MAX_K_PER_CORE``, and the search-space dim is
     pinned to 1 via the ``topk_pinned_search_space_vars`` constraint.
+
+    When ``tiling`` is a non-empty :class:`~...plan_solver.TileSpec`, divisions
+    are enumerated on the *per-tile* frame: each tiled dim's iteration extent is
+    divided by its tile count (the same host_dim -> loop-symbol resolution the
+    predictor uses in ``_predict_iter_space``), so factor sets and per-core spans
+    reflect the tiled op. The output tensor's span is still measured against its
+    untiled layout, which over-estimates (contiguous strides over the full size)
+    and so never admits an illegal split; input spans are exact. Coeff-encoding
+    the returned symbol-keyed splits against the tiled indices is the caller's
+    job (``splits_by_index_coeff`` with the predicted tiled write/read index).
     """
     # TODO: Enumerate compute bound ops and for seeds or compute optimized
     # work division where HBM bandwidth can saturate compute.
 
     it_space = iteration_space_from_op(op)
+    if tiling is not None and not tiling.is_untiled:
+        from torch_spyre._inductor.wsr.tile_prediction import (
+            _output_and_reduction_counts,
+            _predict_iter_space,
+        )
+
+        output_counts, reduction_counts = _output_and_reduction_counts(tiling)
+        it_space = _predict_iter_space(op, output_counts, reduction_counts)
     op_is_topk = is_topk(op)
 
     input_tds, output_td = collect_tensor_deps(
