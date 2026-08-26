@@ -1414,7 +1414,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 never constructs this allocator without a valid factory.
             pre_optimization_passes: Graph passes applied before layout planning.
             post_optimization_passes: Graph passes applied after layout planning.
-            prune: Restrict DFS fallback to committed divisions.
+            prune: Enable heuristic pruning of the core-division search space.
         """
         super().__init__(
             layout_planning=layout_planning,
