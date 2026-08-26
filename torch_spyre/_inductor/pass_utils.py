@@ -1657,6 +1657,9 @@ def _repoint_mutation_targets(
         if target is old_buf:
             layout.target = new_buf
             continue
+        # Buffer/ComputedBuffer (a bare target) has no `.data`, so the walk
+        # is guaranteed to terminate there without wrongly descending into
+        # an already-bare buffer.
         holder = target
         while hasattr(holder, "data"):
             inner = holder.data
