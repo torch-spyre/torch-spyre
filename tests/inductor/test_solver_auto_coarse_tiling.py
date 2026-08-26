@@ -23,19 +23,32 @@ import torch
 import unittest
 
 from collections.abc import Callable, Sequence
+from types import SimpleNamespace
 from typing import Optional
 
-from unittest.mock import patch
+import sympy
+from unittest.mock import MagicMock, patch
 
 from torch._inductor import config as t_inductor_config
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
 
+from torch_spyre._C import SpyreTensorLayout
+from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 from torch_spyre.constants import DEVICE_NAME
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor import spyre_hint
+from torch_spyre._inductor.errors import Unsupported
+from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.propagate_hints import DimHint
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
+from torch_spyre._inductor.scratchpad.allocator import (
+    _spec_within_read_distance,
+    select_allocator,
+)
+from torch_spyre._inductor.scratchpad.plan_solver import TileSpec
 import torch_spyre._inductor.wsr.propagate_named_dims as _pnd
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -254,6 +267,16 @@ class _TilingCase:
         *name* is the only way to withhold a hint -- again, the
         decomposition-hinted case, where the caller cannot delete a scope the
         compiler emitted.
+    partial_expects_discovery:
+        Whether the partial mode requires the compiler to add a level *beyond*
+        the pins.  True for a model with a free axis left unpinned (the MLP's
+        ``Dout``, SwiGLU's ``Dh``), which the tile search then finds.  False when
+        pinning the caller's subset leaves nothing the search may safely take:
+        softmax pins its only tileable output axis (``C``), and its other axis is
+        the reduction one, which the search excludes as numerically fragile -- so
+        the pin surviving *is* the whole contract, and demanding a discovered
+        level on top would demand the one tiling that is known wrong.  The pin is
+        still asserted preserved either way.
     """
 
     body: Callable[..., torch.Tensor]
@@ -264,6 +287,7 @@ class _TilingCase:
     atol: float
     rtol: float
     partial_named_dims: Optional[tuple[Sequence[str], ...]] = None
+    partial_expects_discovery: bool = True
 
     @property
     def hinted_nest(self) -> _Counts:
@@ -345,11 +369,6 @@ class AutomatedCoarseTilingTests(
         auto_tiling: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, _Nest]]:
         """Compile ``case`` and return (cpu_result, device_result, tiling)."""
-        # Raises the "gate is missing" NotImplementedError before compiling.
-        if auto_tiling:
-            # TODO: Implement coarse tiling configuration
-            raise NotImplementedError("unified-tiling: config.auto_coarse_tiling")
-
         # declare the tensor dimensions
         named_dims = case.dims_for(hint_mode)
         if named_dims is not None:
@@ -368,7 +387,19 @@ class AutomatedCoarseTilingTests(
         else:
             model = case.body
         CollectTilingPasses.tiling = {}
-        # TODO: Patch coarse tiling config here
+        # Auto tiling needs the joint CP-SAT co-opt path on (R8.1): the solver
+        # carries and applies the tiling candidates only under
+        # co_optimizing_lx_planning + layout_solver="cpsat". The two gates
+        # default off, so they are patched on only for the auto modes.
+        tiling_cfg = (
+            dict(
+                co_optimizing_lx_planning=True,
+                unified_tiling=True,
+                auto_coarse_tiling=True,
+            )
+            if auto_tiling
+            else {}
+        )
         # force_disable_caches belongs to torch's inductor config, not Spyre's;
         # CustomPreSchedulingPasses is a plain module attribute that
         # enable_spyre_context re-imports per compile, so it is swapped with
@@ -378,6 +409,7 @@ class AutomatedCoarseTilingTests(
             ts_inductor_config.patch(
                 allow_all_ops_in_lx_planning=True,
                 layout_solver=layout_solver,
+                **tiling_cfg,
             ),
             patch.object(ts_passes, "CustomPreSchedulingPasses", CollectTilingPasses),
         ):
@@ -539,12 +571,20 @@ class AutomatedCoarseTilingTests(
             f"the applied tiling {tiling} lost a pinned level: the pins "
             f"{list(case.partial_pins)} should all still be there",
         )
-        self.assertTrue(
-            discovered,
-            f"the pins {list(case.partial_pins)} survived but nothing was "
-            f"added: the tile search left every unpinned dimension untiled "
-            f"({tiling})",
-        )
+        if case.partial_expects_discovery:
+            self.assertTrue(
+                discovered,
+                f"the pins {list(case.partial_pins)} survived but nothing was "
+                f"added: the tile search left every unpinned dimension untiled "
+                f"({tiling})",
+            )
+        else:
+            self.assertFalse(
+                discovered,
+                f"nothing was expected beyond the pins {list(case.partial_pins)}, "
+                f"but the tile search added {list(discovered.values())} -- this "
+                f"model has no dimension it may safely tile past its pin ({tiling})",
+            )
         self._assert_matches_cpu(case, device, cpu)
 
     # ------------------------------------------------------------------
@@ -560,8 +600,10 @@ class AutomatedCoarseTilingTests(
         compile and is *numerically wrong* today -- the tiled max and sum drain
         through coarse_tile_combine/reduce_copy and land further from CPU than
         the output magnitude itself -- so C is the whole prescribed plan.  The
-        partial mode pins that same single level; what it leaves to the
-        compiler is R, plus any finer division of C.
+        partial mode pins that same single level and, uniquely among these
+        models, expects *no* discovery on top (``partial_expects_discovery`` is
+        False): the only other axis is R, which the tile search excludes for the
+        very reason above, so the pin surviving is the whole contract.
         """
         return _TilingCase(
             body=functools.partial(torch.softmax, dim=0),
@@ -569,6 +611,10 @@ class AutomatedCoarseTilingTests(
             named_dims=(["R", "C"],),
             pins=(("C", 4),),  # Reduction axis is not tiled for now
             partial_pins=(("C", 4),),
+            # C is the only tileable output axis, so pinning it leaves the search
+            # nothing safe to add (R is the excluded reduction axis): the pin
+            # surviving is the whole partial contract here.
+            partial_expects_discovery=False,
             # A good run lands at 2e-5 on outputs of order 1/512; the
             # reduction-tiled one lands at 3e-3, and this has to separate them.
             atol=5e-4,
@@ -684,23 +730,206 @@ class AutomatedCoarseTilingTests(
 
     @staticmethod
     def case_decorators(params):
-        """Mark the combos that cannot pass until the tile search is built.
+        """Per-combo decorators.
 
-        These entries are never edited again: each combo stops xfailing on its
-        own, the moment the last unbuilt piece on its path lands, because
-        ``expected_unimplemented`` keys on the exception rather than on a list
-        maintained by hand.  A combo turning green is the signal to delete its
-        row here.
+        The ``unhinted``/``partial`` combos were ``@expected_unimplemented`` while
+        the solver-driven tile search was unbuilt; that marker retired itself the
+        moment those modes passed (it fails a clean run), so only the ortools
+        skip for the cpsat solver remains.
         """
         decorators = []
         if params["solver_method"] == "cpsat":
             decorators.append(
                 unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
             )
-        if params["hint_mode"] in ("unhinted", "partial"):
-            decorators.append(expected_unimplemented)
         return decorators
 
     def run_case(self, params: dict, factory: Callable) -> None:
         """Body of one generated method: build the model, check its contract."""
         self._CHECKS[params["hint_mode"]](self, factory(self), params["solver_method"])
+
+
+# ---------------------------------------------------------------------------
+# Read-distance (span-limit) enforcement on the discovery path
+# ---------------------------------------------------------------------------
+# Device-free op builders, mirroring the span-overflow / enumerate-tilings
+# tests: a real FixedTiledLayout ComputedBuffer over a lightweight Pointwise
+# mock is all _tiling_candidates -> enumerate_tile_options -> the read-distance
+# filter needs.
+def _fixed_tiled_layout(shape, dtype=torch.float16):
+    size = list(shape)
+    stride = list(FlexibleLayout.contiguous_strides(size))
+    stride_ints = [int(s) for s in stride]
+    size_ints = [int(s) for s in size]
+    within_stick_dim = len(size_ints) - 1
+    dim_order = [i for i in range(len(size_ints)) if i != within_stick_dim]
+    dim_order.append(within_stick_dim)
+    device_layout = SpyreTensorLayout(size_ints, stride_ints, dtype, dim_order)
+    return FixedTiledLayout("spyre:0", dtype, size, stride, device_layout)
+
+
+def _pointwise_op(shape, name="buf0"):
+    data = MagicMock(spec=Pointwise)
+    data.ranges = list(shape)
+    layout = _fixed_tiled_layout(shape)
+    op = ComputedBuffer(name=name, layout=layout, data=data)
+    op.operation_name = name
+    syms = sympy.symbols(" ".join(f"d{i}" for i in range(len(shape))))
+    if not isinstance(syms, tuple):
+        syms = (syms,)
+    index = sympy.Integer(0)
+    for sym, stride in zip(syms, layout.stride):
+        index += sym * int(stride)
+    write = MemoryDep(name, index, syms, tuple(shape))
+    op.get_read_writes = MagicMock(
+        return_value=SimpleNamespace(reads=set(), writes={write})
+    )
+    return op
+
+
+def _matmul_op(out_shape=(128, 256), k=64, name="mm"):
+    """A minimal matmul ``ComputedBuffer`` for ``_tiling_candidates`` unit tests.
+
+    Mirrors ``_pointwise_op`` but gives the op a ``Reduction`` ``data`` carrying
+    a matmul reduction type, so ``_is_matmul_op`` recognises it. Like the
+    pointwise mock it declares no reads, keeping the read-distance filter
+    permissive; the enumerator's own filters (output-axis ``is_clean``, stick-dim
+    exclusion) are what these tests exercise, so the reduction ranges only need
+    to exist, not to enumerate.
+    """
+    data = MagicMock(spec=Reduction)
+    data.ranges = list(out_shape)
+    data.reduction_ranges = [k]
+    data.reduction_type = BATCH_MATMUL_OP
+    layout = _fixed_tiled_layout(out_shape)
+    op = ComputedBuffer(name=name, layout=layout, data=data)
+    op.operation_name = name
+    syms = sympy.symbols(" ".join(f"d{i}" for i in range(len(out_shape))))
+    if not isinstance(syms, tuple):
+        syms = (syms,)
+    index = sympy.Integer(0)
+    for sym, stride in zip(syms, layout.stride):
+        index += sym * int(stride)
+    write = MemoryDep(name, index, syms, tuple(out_shape))
+    op.get_read_writes = MagicMock(
+        return_value=SimpleNamespace(reads=set(), writes={write})
+    )
+    return op
+
+
+# (1, 8195, 256, 64) fp16 = 268.7 MB, just over the 256 MiB read-distance limit;
+# splitting dim 1 (8195 = 5*11*149) by 5 -> 53.7 MB brings it back under.
+_OVERFLOW_SHAPE = (1, 8195, 256, 64)
+# dim 1 is prime with no divisor <= _MAX_AUTO_TILE_SPLIT_COUNT, so it cannot be
+# tiled; even the largest legal split of dim 2 leaves the span over the limit,
+# so no discovered tiling (untiled included) fits.
+_UNTILEABLE_OVERFLOW_SHAPE = (1, 1048583, 256, 64)
+
+
+@unittest.skipUnless(_HAS_ORTOOLS, "the cpsat solver needs ortools")
+class DiscoveryReadDistanceTests(unittest.TestCase):
+    """The auto-tiling discovery path never offers the solve an over-span tiling.
+
+    Integration check for the real ``_tiling_candidates`` wiring (config gates ->
+    ``enumerate_tile_options`` -> the read-distance filter): under
+    ``auto_coarse_tiling`` an unpinned op whose untiled read overflows
+    ``MAX_SPAN_BYTES`` loses the untiled option -- it must be tiled to fit --
+    while a fitting op keeps it, and an op that cannot be tiled to fit raises
+    ``Unsupported``, matching the span-overflow planner's own gate. No device or
+    solve is needed: ``_tiling_candidates`` is a pure function of the op and
+    config.
+    """
+
+    _AUTO_CFG = dict(
+        co_optimizing_lx_planning=True,
+        unified_tiling=True,
+        auto_coarse_tiling=True,
+        layout_solver="cpsat",
+        sencores=4,
+    )
+
+    def _candidates(self, op, **overrides):
+        cfg = {**self._AUTO_CFG, **overrides}
+        with ts_inductor_config.patch(cfg):
+            alloc = select_allocator()
+            return alloc._tiling_candidates(op, cfg["sencores"])
+
+    def test_untiled_dropped_for_overspan_unhinted_op(self):
+        op = _pointwise_op(_OVERFLOW_SHAPE)
+        options = self._candidates(op)
+
+        # The untiled read overflows, so untiled is not offered -- the solve is
+        # forced to tile -- but a fitting tiling remains.
+        self.assertNotIn(TileSpec(), options)
+        self.assertTrue(options)
+        # And every option the solve is offered actually fits the limit.
+        with ts_inductor_config.patch(self._AUTO_CFG):
+            for spec in options:
+                self.assertTrue(
+                    _spec_within_read_distance(op, spec, 4),
+                    f"discovery offered an over-span tiling {spec}",
+                )
+
+    def test_untiled_kept_for_fitting_unhinted_op(self):
+        op = _pointwise_op((1, 2, 16, 64))
+        options = self._candidates(op)
+
+        # Nothing overflows, so untiled stays on the menu.
+        self.assertIn(TileSpec(), options)
+
+    def test_raises_when_no_discovered_tiling_fits(self):
+        op = _pointwise_op(_UNTILEABLE_OVERFLOW_SHAPE)
+
+        with self.assertRaisesRegex(Unsupported, "read-distance limit"):
+            self._candidates(op)
+
+    def test_no_filtering_without_auto_coarse_tiling(self):
+        # Discovery off -> the op stays untiled and the read-distance filter never
+        # runs, even when the untiled read overflows: the drop is discovery's job.
+        op = _pointwise_op(_OVERFLOW_SHAPE)
+        options = self._candidates(op, auto_coarse_tiling=False)
+
+        self.assertEqual(options, [TileSpec()])
+
+    def test_matmul_offered_output_tiling(self):
+        # A matmul is no longer excluded by an op-kind guard: under discovery it
+        # is offered its row/M-axis (host_dim 0, non-reduction) output tilings,
+        # exactly like any other op.  This locks in the removal of the former
+        # `_is_matmul_op(op)` short-circuit in `_tiling_candidates`.
+        op = _matmul_op(out_shape=(128, 256))
+        options = self._candidates(op)
+
+        self.assertIn(TileSpec(), options)  # untiled still offered (read fits)
+        tiled = [t for t in options if not t.is_untiled]
+        self.assertTrue(
+            tiled,
+            "matmul was offered no tiling -- the removed matmul guard has "
+            f"silently returned (options were {options})",
+        )
+        for spec in tiled:
+            self.assertEqual(
+                [a.host_dim for a in spec.axes],
+                [0],
+                f"matmul offered a non-M-axis output tiling {spec}",
+            )
+
+    def test_matmul_never_offered_reduction_or_stick_tiling(self):
+        # Removing the guard does not open the numerically-fragile forms: the
+        # `is_clean` filter still drops every reduction (K) tiling, and the
+        # enumerator never emits the stick (innermost / N) dim.  So no offered
+        # spec tiles a reduction axis or the last host dim.
+        out_shape = (128, 256)
+        stick_dim = len(out_shape) - 1
+        op = _matmul_op(out_shape=out_shape)
+        options = self._candidates(op)
+
+        for spec in options:
+            self.assertFalse(
+                any(a.is_reduction for a in spec.axes),
+                f"matmul offered a reduction tiling {spec} (K-tiling is "
+                "~2 orders off CPU -- see _mlp_case)",
+            )
+            self.assertFalse(
+                any(a.host_dim == stick_dim for a in spec.axes),
+                f"matmul offered a stick-dim tiling {spec}",
+            )

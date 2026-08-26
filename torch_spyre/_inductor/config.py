@@ -177,4 +177,15 @@ validate_op_specs: bool = os.environ.get("SPYRE_VALIDATE_OP_SPECS", "1") == "1"
 # incomplete build, not a supported mode, and raises rather than falling back.
 native_layout_packer: bool = _get_env_bool("TORCH_SPYRE_NATIVE_PACKER", True)
 
+# Unified coarse-tiling: let the co-optimizing CP-SAT solve carry coarse-tiling
+# candidates on its core divisions and apply the tiling it selects, rather than
+# only honouring pre-stickification hints. Both gates default off and are inert
+# unless the joint CP-SAT co-opt path is active (co_optimizing_lx_planning and
+# layout_solver == "cpsat"); the machinery warns once and no-ops otherwise.
+#   unified_tiling     -- master switch for the solver-driven tiling machinery.
+#   auto_coarse_tiling -- also discover tilings for un-hinted ops (needs
+#                         unified_tiling; off => every un-hinted op stays untiled).
+unified_tiling: bool = os.environ.get("UNIFIED_TILING", "0") == "1"
+auto_coarse_tiling: bool = os.environ.get("AUTO_COARSE_TILING", "0") == "1"
+
 install_config_module(sys.modules[__name__])

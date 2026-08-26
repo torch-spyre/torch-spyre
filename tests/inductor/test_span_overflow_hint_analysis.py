@@ -65,6 +65,12 @@ from torch_spyre._inductor.wsr.coarse_tile_span_overflow import (
     span_overflow_groups,
 )
 from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.scratchpad.allocator import (
+    _drop_read_distance_violations,
+    _op_read_span_is_evaluable,
+    _spec_within_read_distance,
+)
+from torch_spyre._inductor.scratchpad.plan_solver import TileAxis, TileSpec
 from torch_spyre._inductor.scheduler import (
     CountedLoopSchedulerNode,
     build_loop_scheduler_nodes,
@@ -5285,3 +5291,71 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
             "untiled baseline at the same reduction depth, suggesting the "
             "join introduces extra error beyond ordinary fp16 noise.",
         )
+
+
+class TestReadDistanceDrop(InductorTestCase):
+    """Device-free tests for the discovery-path read-distance filter.
+
+    ``_drop_read_distance_violations`` (allocator.py) is what keeps the CP-SAT
+    ``auto_coarse_tiling`` discovery from handing the solve a tiling whose
+    per-core read span overflows ``MAX_SPAN_BYTES`` -- the limit the
+    span-overflow planner enforces but the solver's cost model does not. These
+    build the same lightweight ``FixedTiledLayout`` ops the planner tests use and
+    assert the filtered option set directly, no solver or device needed.
+    """
+
+    def test_no_overflow_returns_options_unchanged(self):
+        op = _pointwise_op((1, 2, 16, 64), name="small_op")
+        options = [TileSpec(), TileSpec((TileAxis(host_dim=1, count=2),))]
+
+        with config.patch({"sencores": 4}):
+            kept = _drop_read_distance_violations(op, options, max_cores=4)
+
+        # Nothing overflows -> the untiled option and every tiling survive.
+        self.assertEqual(kept, options)
+
+    def test_untiled_dropped_when_full_read_overflows(self):
+        op = _pointwise_op(_E2E_SHAPE)
+        relieving = TileSpec((TileAxis(host_dim=1, count=_E2E_SPLIT_COUNT),))
+        options = [TileSpec(), relieving]
+
+        with config.patch({"sencores": 4}):
+            kept = _drop_read_distance_violations(op, options, max_cores=4)
+
+        # The op's untiled read overflows the read-distance limit, so untiled is
+        # dropped; the split that brings it back under the limit survives.
+        self.assertNotIn(TileSpec(), kept)
+        self.assertIn(relieving, kept)
+
+    def test_raises_when_no_option_fits(self):
+        # dim 1 is a prime with no divisor <= _MAX_AUTO_TILE_SPLIT_COUNT, so it
+        # cannot be tiled; even the largest legal split of dim 2 leaves the read
+        # span above MAX_SPAN_BYTES. Neither untiled nor any tiling fits.
+        op = _pointwise_op((1, 1048583, 256, 64))
+        options = [TileSpec(), TileSpec((TileAxis(host_dim=2, count=64),))]
+
+        with config.patch({"sencores": 4}):
+            with self.assertRaisesRegex(Unsupported, "read-distance limit"):
+                _drop_read_distance_violations(op, options, max_cores=4)
+
+    def test_non_evaluable_op_returns_options_unchanged(self):
+        # A layout with no static span metadata cannot be evaluated, so the
+        # filter must leave the option set alone (fail open) rather than drop or
+        # raise on something it cannot measure.
+        options = [TileSpec(), TileSpec((TileAxis(host_dim=1, count=2),))]
+
+        self.assertFalse(_op_read_span_is_evaluable(MagicMock()))
+        kept = _drop_read_distance_violations(MagicMock(), options, max_cores=4)
+        self.assertEqual(kept, options)
+
+    def test_spec_within_read_distance_matches_span(self):
+        op = _pointwise_op(_E2E_SHAPE)
+        with config.patch({"sencores": 4}):
+            self.assertFalse(_spec_within_read_distance(op, TileSpec(), max_cores=4))
+            self.assertTrue(
+                _spec_within_read_distance(
+                    op,
+                    TileSpec((TileAxis(host_dim=1, count=_E2E_SPLIT_COUNT),)),
+                    max_cores=4,
+                )
+            )

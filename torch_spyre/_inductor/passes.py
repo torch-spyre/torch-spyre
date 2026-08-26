@@ -326,6 +326,28 @@ def _maybe_reorder_unhinted_interlopers(graph: GraphLowering) -> None:
     reorder_unhinted_interlopers(graph)
 
 
+def _solver_owns_tiling() -> bool:
+    """True when the CP-SAT co-opt solve is the single authority on coarse tiling.
+
+    Under unified tiling the scratchpad solve reads each op's hints as
+    ``TileSpec`` candidates and applies the tiling it selects
+    (``CoarseTilingPass``), so the pre-stickification hint pass must stand down.
+    A tiling it materialized would stamp ``loop_info`` the solve refuses to
+    re-tile, so a pin applied early could never compose with a discovered level
+    -- the two-phase problem this path exists to avoid. (The span-overflow pass
+    is left running: it is span-pressure driven, not hint driven, and an op it
+    tiles the solve simply leaves alone.) Gated on the same trio that selects
+    ``CoOptimizingAllocator``; ``auto_coarse_tiling`` is deliberately not
+    required here, because honouring carried-forward pins is the master switch's
+    job and discovery is only the extra it enables.
+    """
+    return (
+        config.co_optimizing_lx_planning
+        and config.unified_tiling
+        and config.layout_solver == "cpsat"
+    )
+
+
 @_runs(
     hints_to_coarse_tile_groups,
     validate_coarse_tile_groups,
@@ -337,7 +359,7 @@ def _maybe_coarse_tile_hints(graph: GraphLowering) -> None:
     span_overflow_groups is intentionally absent: it requires FixedTiledLayout
     (device_layout) and must run post-stickification.
     """
-    if config.ignore_wsr_hints:
+    if config.ignore_wsr_hints or _solver_owns_tiling():
         return
     groups = hints_to_coarse_tile_groups(graph)
     if not groups:

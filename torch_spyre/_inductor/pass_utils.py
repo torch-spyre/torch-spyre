@@ -2155,6 +2155,7 @@ def _prepare_per_core_view(
     buf_name: str,
     *,
     parts: "Optional[tuple[dict, sympy.Expr, sympy.Expr]]" = None,
+    buf_layout: "Optional[FixedTiledLayout]" = None,
 ) -> Optional[_ViewPrep]:
     """Compute the candidate-invariant pieces of a per-core view once.
 
@@ -2167,6 +2168,13 @@ def _prepare_per_core_view(
     Default (None) reads them off ``op`` -- the *pre*-scheduler ranges, which is
     what LX planning sees. Post-fusion callers pass the ``SchedulerNode``'s
     ranges instead, so they model the order codegen will actually emit.
+
+    ``buf_layout`` overrides ``buf_name``'s committed layout. It is how a
+    tiling-aware caller supplies the *predicted* per-tile layout for a candidate
+    whose tiling has not been applied yet (``wsr.tile_prediction``): at solve
+    time ``buf_name``'s committed layout is still the untiled one, so the view
+    would otherwise be taken on the wrong frame. Default (None) reads the
+    committed layout as before.
     """
     if parts is not None:
         iter_space, write_index, read_index = parts
@@ -2179,8 +2187,8 @@ def _prepare_per_core_view(
         read_index = next((d.index for d in rw.reads), write_index)
         iter_space = iteration_space_from_op(op)
 
-    buf_op = V.graph.get_buffer(buf_name)
-    buf_layout = buf_op.layout
+    if buf_layout is None:
+        buf_layout = V.graph.get_buffer(buf_name).layout
     if not isinstance(buf_layout, FixedTiledLayout):
         return None
 
