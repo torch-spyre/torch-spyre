@@ -297,10 +297,16 @@ def make_SampleInput(
                     val = ast.literal_eval(val)
                 except (ValueError, SyntaxError):
                     pass
+                # A dtype written as a YAML scalar ("torch.float32") is not a
+                # Python literal, so ast.literal_eval leaves it a str and .to()
+                # then rejects it as a device string. Resolve it here, the same
+                # way the kwmap branch below resolves a dtype= kwarg.
+                if isinstance(val, str) and val.startswith("torch."):
+                    val = parse_dtype(val)
                 # if test target is tensor.to("cuda:0"), replace "cuda:0" with test_device
                 op_name = case.get("op")
                 if test_device is not None and op_name == "torch.to":
-                    if "cuda" in val:
+                    if isinstance(val, str) and "cuda" in val:
                         val = test_device
             cpu_args.append(val)  # python scalar or list, etc.
         elif "py" in inp:
