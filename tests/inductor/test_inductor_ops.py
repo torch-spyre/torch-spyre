@@ -1303,6 +1303,46 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        ("test_keep_by_index", "test_keep_by_index_cpu"): {
+            "param_sets": {
+                "2d_dim0": (
+                    unique_randn_along_dim((67, 256), dim=0),
+                    8,
+                    0,
+                    -1.0,
+                ),
+                "2d_dim1": (
+                    unique_randn_along_dim((256, 64), dim=1),
+                    12,
+                    1,
+                    -1.0,
+                ),
+                "3d_dim0": (
+                    unique_randn_along_dim((67, 71, 256), dim=0),
+                    2,
+                    0,
+                    0.0,
+                ),
+                "4d_dim0": (
+                    unique_randn_along_dim((6, 17, 7, 64), dim=0),
+                    2,
+                    0,
+                    -1.0,
+                ),
+                "4d_dim2": (
+                    unique_randn_along_dim((6, 17, 64, 64), dim=2),
+                    16,
+                    2,
+                    0.0,
+                ),
+                "4d_dim3": (
+                    unique_randn_along_dim((6, 17, 4, 128), dim=3),
+                    4,
+                    3,
+                    -1.0,
+                ),
+            },
+        },
         ("test_reduce_keepdim0", "test_reduce_keepdim0_cpu"): {
             "ops_dict": CORE_REDUCTION_OPS_DICT,
             "param_sets": COMMON_REDUCTION_KEEPDIM_PARAM_SETS,
@@ -6107,6 +6147,49 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 [x],
                 "spyre",
             )
+
+    def test_keep_by_index_cpu(self, x, k: int, dim: int, fill_value: float):
+        _, indices = torch.topk(x, k, dim=dim, largest=True)
+
+        def fn(x, indices):
+            return torch.ops.spyre.keep_by_index(x, indices, dim, fill_value)
+
+        compiled_fn = torch.compile(fn)
+        result_spyre = compiled_fn(
+            x.to("spyre"), indices.to(torch.float16).to("spyre")
+        ).cpu()
+        expected = fn(x, indices)
+
+        torch.testing.assert_close(result_spyre, expected, atol=0.1, rtol=0.1)
+
+    def test_keep_by_index_moe_router(self):
+        """Repro: keep_by_index router mask -> SpyreReduction stick clash.
+
+        Isolates the blocker from Gemma-4 MoE prefill router with keep_by_index.
+        The reduction on k-dimension needs to find the indices read (which has k)
+        instead of the values read to encode splits correctly.
+        Real shapes: T=64 tokens, E=128 experts, K=8 top-K.
+        """
+        T, E, K = 64, 128, 8
+
+        def keep_by_index_tail(probs, sel):
+            mask = torch.ops.spyre.keep_by_index(probs, sel, -1, 0.0)
+            return mask / mask.sum(-1, keepdim=True)
+
+        probs = torch.rand(T, E, dtype=torch.float16)
+        sel = (torch.rand(T, K) * E).floor().to(torch.float16)
+
+        probs_dev = probs.to("spyre")
+        sel_dev = sel.to("spyre")
+
+        out = torch.compile(keep_by_index_tail, dynamic=False)(probs_dev, sel_dev)
+        out_c = out.cpu()
+
+        ref_mask = torch.ops.spyre.keep_by_index(probs, sel, -1, 0.0)
+        ref = ref_mask / ref_mask.sum(-1, keepdim=True)
+
+        assert out.shape == (T, E)
+        torch.testing.assert_close(out_c.float(), ref.float(), atol=1e-2, rtol=1e-2)
 
     def test_min_tuple_output_keepdim0(self):
         x = unique_randn_along_dim((5, 7), dim=1)
