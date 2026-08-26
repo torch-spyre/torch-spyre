@@ -36,6 +36,7 @@ Options:
     --save-inputs     also dump recorded input values (and pool bytes) to a .pt
                       beside each script, for byte-exact replay
     --no-execute      capture without a device or dxp_standalone (see below)
+    --emitter EMITTER sdsc (default) or ktir: which backend the frontend targets
     --no-explain-header
                       omit the decoded OpSpec explanation from each script
 
@@ -62,6 +63,7 @@ from torch._inductor.utils import IndentedBuffer
 
 import torch_spyre  # noqa: F401  -- registers the "spyre" device
 from torch_spyre._inductor import config as spyre_config
+from torch_spyre._inductor.codegen.ktir import dialect_available
 from torch_spyre._inductor.op_spec import IndirectAccess, TensorArg
 from torch_spyre._inductor.spyre_kernel import (
     _codegen_op_spec_list,
@@ -78,6 +80,12 @@ from runner import TEMPLATE_IMPORTS, runner_template  # noqa: E402
 # Mock targets for --no-execute, matching docs/tools/capture_coarse_tile_ir.py.
 _PREPARE_KERNEL = "torch_spyre.execution.kernel_runner.prepare_kernel"
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
+# The KTIR path's two extra --no-execute targets. dbo-opt is invoked through a
+# method rather than plain subprocess.run, and would otherwise reject the emitted
+# KTIR for having written no spyrecode.json.
+_ASYNC_COMPILE = "torch_spyre.execution.async_compile"
+_KTIR_PREREQUISITES = f"{_ASYNC_COMPILE}._check_ktir_device_prerequisites"
+_COMPILE_KTIR = f"{_ASYNC_COMPILE}.SpyreAsyncCompile._compile_ktir_with_dbo"
 
 # Scripts were written, but the target raised before it finished, so the capture
 # covers only the kernels compiled up to that point.  Distinct from 1 ("nothing
@@ -132,6 +140,11 @@ class KernelRecord:
     that has already exited.  ``sencores`` is provenance only -- work division is
     already baked into ``iteration_space``.  ``bundle_symbolic_args`` is not, and
     the emitted script pins it: see ``pin_bundle_symbolic_args`` in runner.py.
+
+    ``ktir_emitter`` is which backend actually compiled this kernel, read from
+    the method that was called rather than from the config, and it decides what
+    the replay can do: only a KTIR-emitter spec carries the per-buffer names
+    ``generate_ktir`` needs, and only it must not be compiled through ``sdsc``.
     """
 
     name: str
@@ -139,6 +152,7 @@ class KernelRecord:
     index: int
     sencores: int
     bundle_symbolic_args: bool
+    ktir_emitter: bool = False
     args: list = dataclasses.field(default_factory=list)
     pool_bytes: int = 0
     observed_run: bool = False
@@ -199,35 +213,61 @@ class _RunRecorder:
 
 
 @contextlib.contextmanager
-def capture_kernels(save_inputs: bool = False, no_execute: bool = False):
-    """Record every sdsc() call made inside the block.
+def capture_kernels(
+    save_inputs: bool = False, no_execute: bool = False, emitter: str = "sdsc"
+):
+    """Record every kernel compiled inside the block.
 
     Yields the list of :class:`KernelRecord`, appended to as compilation happens.
     ``force_disable_caches`` is patched on for the duration: a warm fxgraph cache
     skips recompilation and the capture would silently produce nothing.
+
+    ``emitter`` chooses what the frontend targets.  Under ``"ktir"`` the
+    scheduler emits ``async_compile.ktir(...)`` rather than ``.sdsc(...)``, and
+    ``create_tensor_arg`` populates the per-buffer names ``generate_ktir``
+    requires -- so this flag, not a post-hoc conversion, is what makes a captured
+    script's ``--stage ktir`` work at all.  Both methods are spied either way:
+    which one a given kernel reaches is a property of that kernel, not of the
+    flag, and one missed method is a silent empty capture.
     """
     records: list = []
-    real_sdsc = SpyreAsyncCompile.sdsc
+    originals = {"sdsc": SpyreAsyncCompile.sdsc, "ktir": SpyreAsyncCompile.ktir}
 
-    def spy(self, kernel_name, specs):
-        rec = KernelRecord(
-            name=kernel_name,
-            specs=list(specs),
-            index=len(records),
-            sencores=spyre_config.sencores,
-            bundle_symbolic_args=spyre_config.bundle_symbolic_args,
-        )
-        records.append(rec)
-        return _RunRecorder(real_sdsc(self, kernel_name, specs), rec, save_inputs)
+    def spy(method: str):
+        real = originals[method]
+
+        def wrapper(self, kernel_name, specs, *args, **kwargs):
+            rec = KernelRecord(
+                name=kernel_name,
+                specs=list(specs),
+                index=len(records),
+                sencores=spyre_config.sencores,
+                bundle_symbolic_args=spyre_config.bundle_symbolic_args,
+                ktir_emitter=method == "ktir",
+            )
+            records.append(rec)
+            inner = real(self, kernel_name, specs, *args, **kwargs)
+            return _RunRecorder(inner, rec, save_inputs)
+
+        return wrapper
 
     with contextlib.ExitStack() as stack:
         stack.enter_context(inductor_config.patch({"force_disable_caches": True}))
-        stack.enter_context(patch.object(SpyreAsyncCompile, "sdsc", spy))
+        if emitter == "ktir":
+            stack.enter_context(spyre_config.patch(ktir_emitter=True))  # type: ignore[attr-defined]
+        for method in originals:
+            stack.enter_context(patch.object(SpyreAsyncCompile, method, spy(method)))
         if no_execute:
-            # Bundle generation still runs -- it is what validates the spec. Note
-            # patching subprocess.run also stubs any subprocess the target spawns.
+            # Emission still runs -- generate_bundle/generate_ktir is what
+            # validates the spec -- so only what consumes its output is stubbed.
+            # The KTIR prerequisite check goes too: it demands a device.mlir and
+            # dbo-opt, neither of which a capture that compiles nothing needs.
+            # Note patching subprocess.run also stubs any subprocess the target
+            # spawns.
             stack.enter_context(patch(_PREPARE_KERNEL))
             stack.enter_context(patch(_LAUNCH_JOBPLAN))
+            stack.enter_context(patch(_KTIR_PREREQUISITES))
+            stack.enter_context(patch(_COMPILE_KTIR))
             stack.enter_context(patch("subprocess.run"))
         yield records
 
@@ -314,6 +354,8 @@ def _provenance(rec: KernelRecord, source: str, total: int, no_execute: bool) ->
         f"Environment:     torch {torch.__version__}, "
         f"SENCORES={rec.sencores}, "
         f"bundle_symbolic_args={rec.bundle_symbolic_args}",
+        "Emitter:         "
+        + ("ktir (generate_ktir)" if rec.ktir_emitter else "sdsc (generate_bundle)"),
         f"Kernel args:     {n_spec_args} in the spec, "
         f"{len(rec.args)} observed at .run()",
     ]
@@ -322,17 +364,25 @@ def _provenance(rec: KernelRecord, source: str, total: int, no_execute: bool) ->
             f"Pool:            {rec.pool_bytes} bytes, passed to .run() "
             "ahead of the args"
         )
+    # The stage offered is the emitter this kernel actually compiled through,
+    # which is the one certain to accept the spec.  The other may not: an SDSC
+    # spec names no buffers, so generate_ktir refuses it outright, and a baked
+    # KTIR spec is refused by generate_bundle.  Both stages stay on the CLI.
+    if rec.ktir_emitter:
+        stage, artifact = "ktir", "<kernel>.ktir"
+    else:
+        stage, artifact = "bundle", "sdsc_N.json + bundle.mlir"
     lines += [
         "",
         "Run it:",
         "    python <this file>                 # compile and launch on the device",
-        "    python <this file> --stage bundle  # sdsc_N.json + bundle.mlir only",
+        f"    python <this file> --stage {stage:8}# {artifact} only",
     ]
     if not rec.observed_run:
         lines += [
             "",
             "WARNING: no .run() was observed for this kernel, so input shapes and",
-            "layouts below are empty. --stage bundle still works; fill in SHAPES",
+            f"layouts below are empty. --stage {stage} still works; fill in SHAPES",
             "and LAYOUTS by hand to run it.",
         ]
     if no_execute:
@@ -404,6 +454,7 @@ from torch_spyre._inductor.op_spec import (
 KERNEL_NAME = "{rec.name}"
 POOL_BYTES = {rec.pool_bytes}
 BUNDLE_SYMBOLIC_ARGS = {rec.bundle_symbolic_args}
+KTIR_EMITTER = {rec.ktir_emitter}
 # Named after this file, not the kernel: two graphs can share a fused kernel
 # name, and write_kernel disambiguates the scripts (name_1.py) -- so a
 # kernel-keyed .pt would be shared and the second capture would clobber the first.
@@ -459,6 +510,7 @@ if __name__ == "__main__":
         pool_bytes=POOL_BYTES,
         pool_contents=pool_contents,
         bundle_symbolic_args=BUNDLE_SYMBOLIC_ARGS,
+        ktir_emitter=KTIR_EMITTER,
     )
 '''
 
@@ -509,6 +561,15 @@ def main(argv=None) -> int:
         help="Stub the backend compile and launch, so no device is needed.",
     )
     parser.add_argument(
+        "--emitter",
+        choices=("sdsc", "ktir"),
+        default="sdsc",
+        help=(
+            "Backend the frontend targets. ktir turns on config.ktir_emitter, so"
+            " the captured specs carry the buffer names --stage ktir needs."
+        ),
+    )
+    parser.add_argument(
         "--no-explain-header",
         action="store_true",
         help="Omit the decoded OpSpec explanation from each emitted script.",
@@ -519,8 +580,20 @@ def main(argv=None) -> int:
     if not os.path.exists(script):
         raise SystemExit(f"no such script: {script}")
 
+    # Said before the capture rather than raised: the specs are recorded before
+    # the emitter runs, so a machine without the bindings still gets every script
+    # -- and those scripts replay wherever the bindings are.  Failing fast here
+    # would take that away to avoid one traceback.
+    if args.emitter == "ktir" and not dialect_available():
+        print(
+            "note: --emitter ktir, but the mlir_ktdp bindings are not importable"
+            "\n      here, so each kernel's KTIR emission raises ImportError and"
+            "\n      the capture ends at the first one (exit 3). The scripts are"
+            "\n      still written. `uv sync --group ktir` installs the bindings."
+        )
+
     failure = None
-    with capture_kernels(args.save_inputs, args.no_execute) as records:
+    with capture_kernels(args.save_inputs, args.no_execute, args.emitter) as records:
         # Run as if invoked directly, so the target's __main__ block still fires.
         sys.argv = [script]
         try:
@@ -599,7 +672,7 @@ def main(argv=None) -> int:
             f"\nnote: {os.path.basename(script)} raised"
             f" {type(failure).__name__} partway through (traceback above)."
             "\n      The scripts above cover the kernels compiled before that"
-            f"\n      point; later kernels never reached sdsc(). Exit {EXIT_PARTIAL}."
+            f"\n      point; later kernels never compiled. Exit {EXIT_PARTIAL}."
         )
         return EXIT_PARTIAL
     return 0
