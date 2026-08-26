@@ -974,6 +974,14 @@ def find_matmul_generated_var(
     batch dim x is broadcast over rather than the true generated dim -- see
     broadcast_batch_vars.
 
+    coarse_tile.py's plan-time check (_check_matmul_broadcast_batch_tiling)
+    already rejects the >1-element/tile broadcast-batch configuration before
+    layout propagation runs, so in the tiled case this disambiguation should
+    only ever need to resolve the (always-supported) 1-element/tile case. The
+    two checks are intentionally layered as belt-and-suspenders: the plan-time
+    check gives an early, precise diagnostic; this one keeps propagation
+    correct even if that guard is ever loosened or bypassed.
+
     Raises Unsupported if the count is not exactly 1.
     """
     generated_vars = (

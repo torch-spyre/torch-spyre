@@ -1110,6 +1110,14 @@ def _check_matmul_broadcast_batch_tiling(
     # real N dim's own generation loop is not a coarse-tile dim (it's the
     # matmul's inherent output dim, not something plan_coarse_tile_groups
     # tiles down), so it will not appear in per_level_extents at all.
+    #
+    # Candidate symbols are always Inductor's dense "d{N}" iteration vars
+    # (same numbering _raw_to_squeezed_pos/_host_dim_to_index_symbol assign
+    # squeezed dims), so the str(sym).startswith("d") parse below recovers
+    # the squeezed index. A future Inductor change to variable naming would
+    # make this silently skip the candidate rather than raise -- if that
+    # happens, the excess dim falls through to the native compiler's opaque
+    # inp0_reuse_dim.size() == 1 abort instead of this clean Unsupported.
     excess_dims = {
         int(str(sym)[1:])
         for sym in candidates
@@ -1119,7 +1127,13 @@ def _check_matmul_broadcast_batch_tiling(
 
     for level in per_level_extents:
         for raw_dim, extent in level.items():
-            if raw_to_squeezed.get(raw_dim, raw_dim) not in excess_dims:
+            # .get(raw_dim) (no fallback): a raw_dim absent from
+            # raw_to_squeezed was squeezed out (unit-size, extent == 1) and
+            # has no d{i} symbol at all, so it can never legitimately match
+            # an excess_dims entry (those are squeezed indices). Falling
+            # back to raw_dim itself would risk an accidental collision with
+            # an unrelated squeezed index; None never collides.
+            if raw_to_squeezed.get(raw_dim) not in excess_dims:
                 continue
             if isinstance(extent, (int, sympy.Integer)) and int(extent) <= 1:
                 continue  # one broadcast element per tile -- backend handles this.
