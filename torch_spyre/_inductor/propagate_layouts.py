@@ -82,6 +82,7 @@ from .pass_utils import (
     device_coordinates,
     try_device_coordinates,
     indirect_info_from_op,
+    is_keep_by_index,
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
@@ -789,6 +790,57 @@ def _dev_coord_for_var(dev_coords, arg_host_coords, var):
     return None
 
 
+def _find_layout_avoiding_var_on_stick(
+    arg: PropArg,
+    avoid_var: sympy.Symbol,
+    label: str,
+) -> SpyreTensorLayout:
+    """Find required STL for ``arg`` whose stick does not carry ``avoid_var``.
+
+    1. Return the first layout whose stick already excludes avoid_var (zero cost).
+    2. Else return the first layout that can be restickified to move avoid_var
+       off the stick, onto a surviving coordinate.
+    3. Else raise Unsupported.
+    """
+    for stl in arg.layouts:
+        dev_coords = device_coordinates(stl, arg.dep, None)
+        if dev_coords is None:
+            continue
+        if avoid_var not in dev_coords[-1].free_symbols:
+            return stl
+
+    arg_host_coords = host_coordinates(arg.layout, arg.dep, None)
+    surviving_vars = set()
+    for coord in arg_host_coords:
+        if len(coord.free_symbols) > 0 and avoid_var not in coord.free_symbols:
+            surviving_vars.update(coord.free_symbols)
+
+    if not surviving_vars:
+        raise Unsupported(
+            f"{label}: no surviving coordinates after removing {avoid_var}"
+        )
+    surviving_var = next(iter(surviving_vars))
+
+    for stl in arg.layouts:
+        dev_coords = device_coordinates(stl, arg.dep, None)
+        if dev_coords is None:
+            continue
+        target_stick_expr = _dev_coord_for_var(
+            dev_coords, arg_host_coords, surviving_var
+        )
+        if target_stick_expr is None:
+            continue
+        result = compute_restickify_target_layout(
+            stl, arg.layout, target_stick_expr, arg_host_coords, dev_coords
+        )
+        if result is not None:
+            return result
+
+    raise Unsupported(
+        f"{label}: cannot restickify layout to move {avoid_var} off the stick"
+    )
+
+
 def find_stick_compatible_input_layout(
     arg: PropArg,
     reduction_var: sympy.Symbol,
@@ -1325,6 +1377,87 @@ def _topk_layouts(
     return results
 
 
+def _keep_by_index_layouts(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[PropArg],
+) -> list[SpyreTensorLayout]:
+    """Layout propagation for keep_by_index.
+
+    Output shape matches values input (arg0). Search dimension cannot be the
+    stick for arg0 or output. Indices (arg1) k dimension cannot be the stick.
+
+    Algorithm:
+      1. Identify search_var: dimension in values not in indices
+      2. Find required layout for values where search_var is NOT on stick
+      3. Find required layout for indices where k dimension is NOT on stick
+      4. Compute output STL with stick matching values' output stick position
+    """
+    _check_supported_input_sticks(args, "keep_by_index")
+    values = args[0]
+    indices = args[1]
+    out_coords = host_coordinates(output, output_dep, None)
+    values_coords = host_coordinates(values.layout, values.dep, None)
+
+    # Find search_var: the loop variable in values not present in indices
+    # (unlike reductions, keep_by_index preserves all dimensions)
+    indices_coords = host_coordinates(indices.layout, indices.dep, None)
+    search_var = None
+    for v_coord in values_coords:
+        if len(v_coord.free_symbols) == 0:
+            continue
+        # Check if this coordinate appears in indices
+        found_in_indices = any(v_coord.equals(i_coord) for i_coord in indices_coords)
+        if not found_in_indices:
+            search_var = next(iter(v_coord.free_symbols))
+            break
+
+    if search_var is None:
+        raise Unsupported("keep_by_index: could not identify search dimension")
+
+    values_req_stl = _find_layout_avoiding_var_on_stick(
+        values, search_var, "keep_by_index"
+    )
+
+    # Find reduction_var: loop variable in indices not in values (the k dimension)
+    reduction_var = None
+    for i_coord in indices_coords:
+        if len(i_coord.free_symbols) == 0:
+            continue
+        found_in_values = any(i_coord.equals(v_coord) for v_coord in values_coords)
+        if not found_in_values:
+            reduction_var = next(iter(i_coord.free_symbols))
+            break
+
+    if reduction_var is None:
+        raise Unsupported("keep_by_index: could not identify k dimension")
+
+    indices_req_stl = _find_layout_avoiding_var_on_stick(
+        indices, reduction_var, "keep_by_index"
+    )
+
+    # Compute output STL: stick position matches values' required layout
+    x_stick_expr = device_coordinates(values_req_stl, values.dep, None)[-1]
+    out_stick_dim = matching_dim(out_coords, x_stick_expr)
+
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+
+    if out_stick_dim is None:
+        out_dim_order = list(range(len(output.size))) + [-1]
+    else:
+        out_dim_order = [d for d in range(len(output.size)) if d != out_stick_dim]
+        out_dim_order += [out_stick_dim]
+
+    out_stl = SpyreTensorLayout(c_size, c_stride, output.dtype, out_dim_order)
+
+    op.restick_cost_fn = FixedInOutNode.from_args(
+        [values, indices], out_stl, [values_req_stl, indices_req_stl], op
+    )
+    return [out_stl]
+
+
 def compute_layouts(
     op: Operation,
     output: FixedLayout,
@@ -1374,7 +1507,11 @@ def compute_layouts(
     if is_topk(op):
         return _topk_layouts(op, output, output_dep, args)
 
+    if is_keep_by_index(op):
+        return _keep_by_index_layouts(op, output, output_dep, args)
+
     aten_op = next(iter(data.origins)).target if data.origins else None
+
     if aten_op == spyreop.layernormnorm.default:
         # layernormnorm is pointwise but special: it has multiple args, input and
         # output must have matching size/stride, and x's stick must match
