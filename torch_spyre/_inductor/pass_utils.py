@@ -1516,6 +1516,9 @@ def make_iteration_space_ownership(
         )
         else None
     )
+    # Keep the selected mapping with the splits for the planned codegen handoff.
+    # Scheduler still reconstructs it from coefficient transport today; meanwhile
+    # retaining it lets the boundary diagnose aliases with different ownership.
     return TensorWorkDivision(
         work_slices,
         core_to_slice_mapping(

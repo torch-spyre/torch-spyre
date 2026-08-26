@@ -1878,7 +1878,14 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                     per_sym = _division_splits(consumer, cd)
                     k = len(clone_divs)
                     clone_divs.append(
-                        CoreDivision(output_splits=per_sym, reduction_splits={})
+                        CoreDivision(
+                            output_splits={
+                                sym: split
+                                for sym, split in per_sym.items()
+                                if split > 1
+                            },
+                            reduction_splits={},
+                        )
                     )  # a clone op cannot have a reduction split
                     clone_views.append(view)
                 if clone_divs[k].cores_used == consumer_divs[j].cores_used:
