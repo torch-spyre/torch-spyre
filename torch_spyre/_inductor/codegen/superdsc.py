@@ -135,7 +135,6 @@ class SDSCSpec:
         default_factory=dict
     )
     indirect_access_indices: list[int] = dataclasses.field(default_factory=list)
-    constants_raw: list[str] | tuple[str, ...] = dataclasses.field(default_factory=list)
     debug_handle: DebugHandle | None = None
     # Generic pool/window fields.  Neutral defaults mean generate_sdsc treats a
     # non-pool op exactly as before; parse_op_spec fills these for pool ops via
@@ -2235,19 +2234,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         constants = (
             dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
         )
-    constants_raw = (
-        list(op_spec.op_info.get("constants_raw", [])) if op_spec.op_info else []
-    )
-
-    # Validate constants_raw references exist in constants
-    if constants_raw:
-        invalid_keys = set(constants_raw) - set(constants.keys())
-        if invalid_keys:
-            raise ValueError(
-                f"[parse_op_spec] Operation '{op_spec.op}': constants_raw contains keys not in constants: {invalid_keys}. "
-                f"Available constants: {list(constants.keys())}"
-            )
-
     coordinate_masking = _get_coordinate_mask(
         sdsc_iteration_space, args[-1], padding, op_spec.op
     )
@@ -2403,7 +2389,6 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             coordinate_masking=coordinate_masking,
             symbolic_dims=symbolic_dims,
             indirect_access_indices=indirect_access_indices,
-            constants_raw=constants_raw,
             debug_handle=op_spec.debug_handle,
             # At most one of these is non-empty for a given op (pool / depthwise
             # / forward-conv are mutually exclusive), so the keys never collide.

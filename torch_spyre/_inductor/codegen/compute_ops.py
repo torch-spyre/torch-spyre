@@ -201,7 +201,6 @@ def generate_constant_info(
     data_format: DataFormats,
     constants: dict[str, Any],
     num_cores: int,
-    constants_raw: list[str] | None = None,
 ) -> dict[str, Any] | str:
     """Generate constant information for SDSC.
 
@@ -209,9 +208,6 @@ def generate_constant_info(
         data_format: The data format for encoding constants
         constants: Dictionary of constant name to value
         num_cores: Number of cores
-        constants_raw: Optional list of constant names that should be treated as
-                      raw integers (not FP16-encoded). Used for constants that
-                      represent dimension sizes or other integer metadata.
 
     Returns:
         Dictionary of constant information for SDSC JSON, or the literal string "{}"
@@ -222,36 +218,16 @@ def generate_constant_info(
     # between a missing constantInfo_ field and an empty one.
     if len(constants.keys()) == 0:
         return "{}"
-    constants_raw = constants_raw or []
-
-    # Validate constants_raw references exist in constants
-    invalid_keys = set(constants_raw) - set(constants.keys())
-    if invalid_keys:
-        raise ValueError(
-            f"[generate_constant_info] constants_raw contains keys not in constants: {invalid_keys}. "
-            f"Available constants: {list(constants.keys())}"
-        )
 
     constant_info: dict[str, Any] = {}
     for name, value in constants.items():
-        # For raw constants (integer values that should not be FP16-encoded).
-        # Used for constants whose bit pattern cannot be produced by encode_constant
-        # from any representable float value.
-        if name in constants_raw:
-            if not isinstance(value, int):
-                raise ValueError(
-                    f"Raw constant '{name}' must be an int, got {type(value).__name__} ({value!r}). "
-                    f"Non-integer values would be silently truncated."
-                )
-            encoded_value = value
-        else:
-            try:
-                encoded_value = encode_constant(value, data_format)
-            except (ValueError, TypeError) as e:
-                raise ValueError(
-                    f"Cannot encode constant '{name}' with value {value} "
-                    f"(type: {type(value).__name__}) to {data_format.name}: {e}"
-                ) from e
+        try:
+            encoded_value = encode_constant(value, data_format)
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"Cannot encode constant '{name}' with value {value} "
+                f"(type: {type(value).__name__}) to {data_format.name}: {e}"
+            ) from e
 
         ci = {
             "dataFormat_": data_format.name,
@@ -1686,7 +1662,6 @@ def generate_sdsc(
                                 sdsc_spec.data_format,
                                 sdsc_spec.constants,
                                 sdsc_spec.num_cores,
-                                sdsc_spec.constants_raw,
                             ),
                             "computeOp_": [
                                 {
