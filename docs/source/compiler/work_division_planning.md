@@ -391,6 +391,21 @@ For each remaining op, `work_distribution_pass` does three things:
 
 The final splits overwrite `op.iteration_space_ownership`.
 
+### Hard split domains
+
+Operation constraints may provide `allowed_splits`, the exact legal factors for
+an iteration dimension. Domains are intersected when multiple constraints apply.
+A domain containing `1` permits leaving that dimension unsplit. A domain that
+excludes `1`, such as `{2, 4, 8}`, also establishes a mandatory baseline: the
+planner reserves its smallest factor (`2`) before greedy distribution, then may
+grow it only to a legal multiple (`4` or `8`) if core budget remains. Thus an
+explicit legal-factor domain can encode a minimum split without a separate
+constraint field. `{2}` instead pins the dimension to exactly `2`.
+
+Span reduction's `min_splits` are separate hardware-span commitments. They are
+applied first and must themselves be members of any applicable
+`allowed_splits` domain.
+
 :::{admonition} What gets written to `iteration_space_ownership`
 :class: note
 
