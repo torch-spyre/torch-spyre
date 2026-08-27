@@ -467,6 +467,11 @@ single-pass solvers. See
 [Simulated Annealing Layout Planner](simulated_annealing_layout.md) for the
 algorithm and the tunable schedule parameters.
 
+Note this is placement-only. With `co_optimizing_lx_planning` the same config
+value instead selects `SaCoOptimizingSolver`, a *different* class that anneals
+the core divisions and the placement jointly — see
+[Joint core-division + LX placement](sa_co_optimization.md).
+
 ## Co-optimization with work-distribution
 
 Work division optimizes each op independently for parallelism. Adjacent
@@ -560,6 +565,14 @@ the producer/consumer slicing-match constraints to the CP-SAT solver,
 which chooses the core divisions and LX placements jointly in one
 constraint model. It falls back to the greedy allocator when `ortools`
 is unavailable.
+
+### Joint SA co-optimization
+
+Setting `layout_solver = "simulated_annealing"` together with
+`co_optimizing_lx_planning` routes through the same `CoOptimizingAllocator`,
+driven by `SaCoOptimizingSolver`, which anneals the division vector and the
+layout permutation as one joint state and scores it with the cost model. See
+[Joint core-division + LX placement](sa_co_optimization.md).
 
 ## Current limitations
 
