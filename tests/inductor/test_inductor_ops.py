@@ -6872,6 +6872,29 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, needs_device=True, cpu_compile=False)
 
+    def test_full_bfloat16_cpu(self):
+        """Compiled BF16 ``full`` stays in native Spyre lowering."""
+
+        def fn():
+            return torch.full(
+                (4, 64), 1.5, dtype=torch.bfloat16, device=utils_inductor.DEVICE
+            )
+
+        with fresh_inductor_cache():
+            actual, source_codes = run_and_get_code(torch.compile(fn, dynamic=False))
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        torch.testing.assert_close(
+            actual.cpu(), torch.full((4, 64), 1.5, dtype=torch.bfloat16)
+        )
+        generated = "\n".join(source_codes)
+        self.assertIn("async_compile.sdsc(", generated)
+        self.assertFalse(
+            any(
+                " = torch.ops.aten.full.default(" in line
+                for line in generated.splitlines()
+            )
+        )
+
     def test_dim_op_cpu(self, op, dim, *args):
         def fn(*args):
             return op(dim, *args)
